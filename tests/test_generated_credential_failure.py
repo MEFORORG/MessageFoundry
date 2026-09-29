@@ -41,7 +41,12 @@ from messagefoundry.auth.service import AuthService, TemporaryPasswordUnavailabl
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
-from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
+from tests._admin_account import (
+    ADMIN_PASSWORD,
+    ADMIN_USERNAME,
+    create_admin,
+    create_local_user_chosen,
+)
 
 PW = "a-strong-test-passphrase"
 
@@ -51,9 +56,9 @@ _EVERY_TRIGRAM = [
 ]
 
 
-def _unissuable(**kw: object) -> AuthSettings:
+def _unissuable() -> AuthSettings:
     """Settings under which no generated candidate can clear the policy."""
-    base = AuthSettings(password_check_breached=False, require_mfa=False, **kw)  # type: ignore[arg-type]
+    base = AuthSettings(password_check_breached=False, require_mfa=False)
     return base.model_copy(update={"password_extra_context_words": _EVERY_TRIGRAM})
 
 
@@ -89,7 +94,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
     try:
         # Seeded under ordinary settings, then run under the unissuable list.
         seeding = AuthService(store, AuthSettings(require_mfa=False))
-        admin = await create_admin(seeding)
+        await create_admin(seeding)
         target = await create_local_user_chosen(
             seeding,
             username="holder",
@@ -141,7 +146,6 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
         assert await seeding.identity_for_token(session.token) is not None, "a session was revoked"
         audit = [r["action"] for r in await store.list_audit(limit=50)]
         assert "auth.password_reset" not in audit and "auth.mfa_reset" not in audit
-        assert admin.user_id
     finally:
         await store.close()
 
@@ -165,7 +169,7 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _signed_in_admin(engine: Engine, service: AuthService, c: httpx.AsyncClient) -> str:
+async def _signed_in_admin(service: AuthService, c: httpx.AsyncClient) -> str:
     admin = await create_admin(service)
     row = await service.store.get_user(admin.user_id)
     assert row is not None and row.password_hash is not None
@@ -181,8 +185,6 @@ async def _signed_in_admin(engine: Engine, service: AuthService, c: httpx.AsyncC
 
 
 async def _grant(c: httpx.AsyncClient, token: str, purpose: str) -> str:
-    from tests._admin_account import ADMIN_PASSWORD
-
     r = await c.post(
         "/me/reauth", json={"password": ADMIN_PASSWORD, "purpose": purpose}, headers=_auth(token)
     )
@@ -190,21 +192,19 @@ async def _grant(c: httpx.AsyncClient, token: str, purpose: str) -> str:
     return str(r.json()["token"])
 
 
-class _NoIssue:
-    """A token source whose every token carries the one site term, so the generator cannot issue."""
+#: A token source whose every token carries the one site term, so the generator cannot issue.
+_NO_ISSUE = SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40)
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._mp = monkeypatch
 
-    def __enter__(self) -> None:
-        self._mp.setattr(
-            service_module,
-            "secrets",
-            SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
-        )
-
-    def __exit__(self, *_exc: object) -> None:
-        self._mp.undo()
+def _one_term_settings() -> AuthSettings:
+    return AuthSettings(
+        require_mfa=False,
+        login_rate_limit_enabled=False,
+        # The refusal and the retry are one machine-speed pair; PR 1781's human-timing floor on
+        # admin writes (BACKLOG #2301) would answer the retry 429.
+        admin_write_min_interval_seconds=0,
+        password_extra_context_words=["globex"],
+    )
 
 
 @pytest.mark.parametrize(
@@ -217,15 +217,7 @@ class _NoIssue:
 async def test_a_refused_reset_keeps_the_account_and_the_grant(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str, purpose: str
 ) -> None:
-    settings = AuthSettings(
-        require_mfa=False,
-        login_rate_limit_enabled=False,
-        # The refusal and the retry are one machine-speed pair; PR 1781's human-timing floor on
-        # admin writes (BACKLOG #2301) would answer the retry 429.
-        admin_write_min_interval_seconds=0,
-        password_extra_context_words=["globex"],
-    )
-    service = AuthService(engine.store, settings)
+    service = AuthService(engine.store, _one_term_settings())
     await service.initialize()
     target = await create_local_user_chosen(
         service,
@@ -239,10 +231,11 @@ async def test_a_refused_reset_keeps_the_account_and_the_grant(
     carol = await service.login("carol", PW)
     assert carol.ok and carol.token is not None
     async with _client(engine, service) as c:
-        token = await _signed_in_admin(engine, service, c)
+        token = await _signed_in_admin(service, c)
         token = await _grant(c, token, purpose)
         before = await _state(engine.store, target)
-        with _NoIssue(monkeypatch):
+        with monkeypatch.context() as m:
+            m.setattr(service_module, "secrets", _NO_ISSUE)
             refused = await c.post(f"/users/{target}/{path}", headers=_auth(token))
         assert refused.status_code == 503, refused.text
         assert "password_extra_context_words" in refused.json()["detail"]
@@ -260,20 +253,13 @@ async def test_a_refused_reset_keeps_the_account_and_the_grant(
 async def test_a_refused_create_writes_no_row(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    settings = AuthSettings(
-        require_mfa=False,
-        login_rate_limit_enabled=False,
-        # The refusal and the retry are one machine-speed pair; PR 1781's human-timing floor on
-        # admin writes (BACKLOG #2301) would answer the retry 429.
-        admin_write_min_interval_seconds=0,
-        password_extra_context_words=["globex"],
-    )
-    service = AuthService(engine.store, settings)
+    service = AuthService(engine.store, _one_term_settings())
     await service.initialize()
     async with _client(engine, service) as c:
-        token = await _signed_in_admin(engine, service, c)
+        token = await _signed_in_admin(service, c)
         body = {"username": "newbie", "roles": ["viewer"], "email": "n@x.org"}
-        with _NoIssue(monkeypatch):
+        with monkeypatch.context() as m:
+            m.setattr(service_module, "secrets", _NO_ISSUE)
             refused = await c.post("/users", headers=_auth(token), json=body)
         assert refused.status_code == 503, refused.text
         assert await service.store.get_user_by_username("newbie") is None
@@ -291,11 +277,11 @@ async def test_the_startup_probe_logs_an_error_and_does_not_raise(
     try:
         bad = AuthService(store, _unissuable())
         with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
-            assert await bad.probe_credential_generation() is False
+            assert bad.probe_credential_generation() is False
         text = " ".join(r.getMessage() for r in caplog.records)
         assert "password_extra_context_words" in text and "startup" in text
         good = AuthService(store, AuthSettings())
-        assert await good.probe_credential_generation() is True
+        assert good.probe_credential_generation() is True
     finally:
         await store.close()
 
@@ -309,3 +295,36 @@ def test_the_verify_probe_fails_on_an_unissuable_policy_and_passes_otherwise() -
     assert "password_extra_context_words" in bad.detail
     good = checks.check_credential_generation(AuthSettings())
     assert good.status is Status.PASS, good.detail
+
+
+# --- the refund: only what this process spent, only for the two issuing routes -------------------
+
+
+async def test_a_refund_restores_only_a_spent_grant_of_a_refundable_action() -> None:
+    """RED when: the spent-grant record covers every action, or a refund can mint or re-arm."""
+    from messagefoundry.auth.service import (
+        STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+        STEP_UP_ACTION_ADMIN_RESET_MFA,
+    )
+    from messagefoundry.auth.tokens import hash_token
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        token = "a-synthetic-session-token"
+        # Never granted: nothing to give back, so a refund cannot mint.
+        assert service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is False
+        for action in (STEP_UP_ACTION_ADMIN_RESET_MFA, STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY):
+            service._grant_action_step_up(hash_token(token), action)
+            assert await service.has_action_step_up(token, action) is True
+            assert await service.has_action_step_up(token, action) is False  # single-use
+        # The issuing route's grant comes back once, and a second refund finds nothing.
+        assert service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is True
+        assert service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is False
+        assert await service.has_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is True
+        # Any other action's spent grant was never recorded, whatever a route calls.
+        assert (
+            service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY) is False
+        )
+    finally:
+        await store.close()

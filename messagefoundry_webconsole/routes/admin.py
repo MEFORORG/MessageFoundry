@@ -489,12 +489,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # this route reads a field off one. Without the annotation a console built against a
             # newer engine would read `expires_at` off an older one and raise AttributeError at
             # reset time — the exact skew SUPPORTED_ENGINE_SEAMS exists to refuse loudly at startup.
+            # `session` is the cookie session, so a refused issue refunds the grant the gate spent.
             result: PasswordResetResponse = await admin.reset_user_password(
-                # The cookie session, so a refused issue refunds the grant the gate spent.
-                user_id,
-                service=service,
-                identity=identity,
-                session=session_token(request),
+                user_id, service=service, identity=identity, session=session_token(request)
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:

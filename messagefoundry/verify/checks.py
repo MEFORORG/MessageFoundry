@@ -395,25 +395,14 @@ def check_credential_generation(auth: AuthSettings) -> CheckResult:
     generator fail every time. The same probe the engine runs at start; this reports it before the
     service is started. No store, no secret printed: the generated value is discarded."""
     from messagefoundry.auth.policy import PasswordPolicy
-    from messagefoundry.auth.service import (
-        _PROBE_USERNAME,
-        TemporaryPasswordUnavailable,
-        generate_policy_password,
-    )
+    from messagefoundry.auth.service import credential_generation_problem
 
     rid, title = "auth.credential_generation", "Temporary credentials can be issued"
     if not auth.enabled:
         return CheckResult(rid, title, Status.SKIP, "sign-in is off, so no credential is issued")
-    try:
-        generate_policy_password(PasswordPolicy.from_settings(auth), username=_PROBE_USERNAME)
-    except TemporaryPasswordUnavailable as exc:
-        return CheckResult(
-            rid,
-            title,
-            Status.FAIL,
-            f"{exc}. Creating an account, resetting a password and resetting an account's factors "
-            "will answer 503 until it is fixed.",
-        )
+    problem = credential_generation_problem(PasswordPolicy.from_settings(auth))
+    if problem is not None:
+        return CheckResult(rid, title, Status.FAIL, problem)
     return CheckResult(
         rid, title, Status.PASS, "a generated credential clears the configured password policy"
     )

@@ -345,6 +345,24 @@ async def _sleep_until(deadline: float) -> None:
 # (fail-safe: a dropped grant just re-prompts, never a bypass), mirroring `_new_ip_seen`'s self-eviction.
 _ACTION_STEP_UP_GRANT_MAX = 4096
 
+
+def _prune_grants(grants: dict[tuple[str, str], float], now: float) -> None:
+    """Drop every expired entry from a per-action grant map (monotonic clock)."""
+    for key in [k for k, deadline in grants.items() if deadline <= now]:
+        del grants[key]
+
+
+def _bounded_grant_put(
+    grants: dict[tuple[str, str], float], key: tuple[str, str], deadline: float, now: float
+) -> None:
+    """Prune ``grants``, evict its OLDEST entry at :data:`_ACTION_STEP_UP_GRANT_MAX` (fail-safe: a
+    dropped grant just re-prompts, never a bypass), then store ``key``."""
+    _prune_grants(grants, now)
+    if key not in grants and len(grants) >= _ACTION_STEP_UP_GRANT_MAX:
+        del grants[min(grants, key=grants.__getitem__)]
+    grants[key] = deadline
+
+
 # Action identifiers for the per-action step-up grants (ADR 0077). Named constants so the JSON API deps,
 # the /ui twins, and the tests all reference the SAME grant string (a typo would only ever fail closed —
 # an unmatched grant re-prompts — but the shared constants keep the wiring legible). WP245 (ASVS 7.5.1)
@@ -377,6 +395,14 @@ STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — s
 # attribute that affects authentication (ASVS 7.5.1). Bound to its own action and single-use, and
 # MFA-gated, for the same reason `admin_reset_password` is.
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
+
+#: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
+#: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
+#: Amendment A, Manager decision 2026-09-29). No other action's grant is recorded, so no other
+#: route can restore one, whatever it calls.
+_REFUNDABLE_ACTIONS = frozenset(
+    {STEP_UP_ACTION_ADMIN_RESET_PASSWORD, STEP_UP_ACTION_ADMIN_RESET_MFA}
+)
 
 #: The closed-set reason a federated login is refused with when its verified ``(issuer, sub)`` is
 #: bound to no account (ADR 0184 AC-4). Named because the browser layer maps it to a login-page code.
@@ -622,9 +648,24 @@ class TemporaryPasswordUnavailable(RuntimeError):
 #: the name: at least "password", "passphrase", "secret", "token", "account" and "cert".
 _RESET_GENERATION_ATTEMPTS = 64
 
-#: The username the startup generator probe screens against: synthetic, long, and unlike any real
-#: account name, so the own-username clause cannot be the reason the probe fails.
+#: The username the generator probe screens against: synthetic, long, and unlike any real account
+#: name, so the own-username clause cannot be the reason the probe fails.
 _PROBE_USERNAME = "mf-startup-credential-probe"
+
+
+def credential_generation_problem(policy: PasswordPolicy) -> str | None:
+    """Try the temporary-credential generator once under ``policy`` and a synthetic username (ADR 0197
+    Amendment A, Manager decision 2026-09-29). ``None`` when it can issue; otherwise the refusal,
+    followed by what it breaks. The generated value is discarded. The one probe behind both the
+    engine's startup check and ``messagefoundry verify``'s ``auth.credential_generation``."""
+    try:
+        generate_policy_password(policy, username=_PROBE_USERNAME)
+    except TemporaryPasswordUnavailable as exc:
+        return (
+            f"{exc}. Creating an account, resetting a password and resetting an account's factors "
+            "will answer 503 until it is fixed."
+        )
+    return None
 
 
 def _temporary_password_chars(min_length: int) -> int:
@@ -1674,9 +1715,10 @@ class AuthService:
         # same accepted per-process caveat). Minted ONLY by reauth(purpose=...) — never by login or
         # verify_mfa — so a login-seeded step-up window can't authorize a durable factor-binding action.
         self._action_step_up_grants: dict[tuple[str, str], float] = {}
-        # Grants spent by ``has_action_step_up`` whose route then failed BEFORE any side effect, kept
-        # so ``refund_action_step_up`` can restore them with their ORIGINAL deadline (ADR 0197
-        # Amendment A, Manager decision 2026-09-29). Bounded and pruned like the live grants.
+        # Grants of a REFUNDABLE action (:data:`_REFUNDABLE_ACTIONS`) that ``has_action_step_up``
+        # spent, kept so ``refund_action_step_up`` can restore one with its ORIGINAL deadline when
+        # its route then failed BEFORE any side effect (ADR 0197 Amendment A, Manager decision
+        # 2026-09-29). Bounded and pruned like the live grants; no other action is ever recorded.
         self._spent_action_step_up_grants: dict[tuple[str, str], float] = {}
         # One in-flight post-session re-proof per account (BACKLOG #1138): user_id -> [lock, users].
         # Process-local like the caches above; an entry lives only while someone holds or awaits it.
@@ -1918,11 +1960,6 @@ class AuthService:
             await self._store.upsert_role(
                 role_id=role.value, display_name=label, description=description, builtin=True
             )
-
-    def _generate_policy_password(self, username: str | None = None) -> str:
-        """:func:`generate_policy_password` under this service's policy. Raises
-        :class:`TemporaryPasswordUnavailable` when no candidate clears it."""
-        return generate_policy_password(self._policy, username=username)
 
     async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:
         """True iff some enabled administrator other than ``exclude_id`` exists.
@@ -5271,12 +5308,9 @@ class AuthService:
             if h == old_hash:
                 del self._action_step_up_grants[(h, action)]
                 self._action_step_up_grants[(new_hash, action)] = deadline
-        # The spent-grant record too (ADR 0197 Amendment A): a refund after a rotation must land on
-        # the hash that still authenticates, not the retired one.
-        for (h, action), deadline in list(self._spent_action_step_up_grants.items()):
-            if h == old_hash:
-                del self._spent_action_step_up_grants[(h, action)]
-                self._spent_action_step_up_grants[(new_hash, action)] = deadline
+        # The spent-grant record (``_spent_action_step_up_grants``) is deliberately NOT moved: a
+        # refund comes only from the request that spent the grant, keyed by the token THAT request
+        # carried, so a moved record could never be found by it.
         self._webauthn_challenges.rekey(old_hash, new_hash)
         seen = self._new_ip_seen.pop(old_hash, None)
         if seen is not None:
@@ -6269,20 +6303,16 @@ class AuthService:
         on the same clock as the session window. On the global-bound overflow the OLDEST grant is
         evicted (fail-safe: a dropped grant just re-prompts, never a bypass)."""
         now = time.monotonic()
-        self._prune_action_step_up_grants(now)
-        key = (token_hash, action)
-        if key not in self._action_step_up_grants and (
-            len(self._action_step_up_grants) >= _ACTION_STEP_UP_GRANT_MAX
-        ):
-            oldest = min(self._action_step_up_grants, key=self._action_step_up_grants.__getitem__)
-            del self._action_step_up_grants[oldest]
-        self._action_step_up_grants[key] = now + self._settings.step_up_max_age_seconds
+        _bounded_grant_put(
+            self._action_step_up_grants,
+            (token_hash, action),
+            now + self._settings.step_up_max_age_seconds,
+            now,
+        )
 
     def _prune_action_step_up_grants(self, now: float) -> None:
         """Drop expired per-action grants (monotonic clock — a wall-clock step can't widen the window)."""
-        expired = [k for k, deadline in self._action_step_up_grants.items() if deadline <= now]
-        for key in expired:
-            del self._action_step_up_grants[key]
+        _prune_grants(self._action_step_up_grants, now)
 
     async def has_action_step_up(self, token: str | None, action: str) -> bool:
         """Whether the caller holds a fresh step-up grant BOUND to ``action`` — and **consume** it
@@ -6297,24 +6327,11 @@ class AuthService:
         # pop = single-use: the grant is gone whether or not it was still live (a stale pop is harmless).
         key = (hash_token(token), action)
         deadline = self._action_step_up_grants.pop(key, None)
-        live = deadline is not None and deadline > now
-        if live:
-            assert deadline is not None
-            self._remember_spent_grant(key, deadline, now)
-        return live
-
-    def _remember_spent_grant(self, key: tuple[str, str], deadline: float, now: float) -> None:
-        expired = [k for k, d in self._spent_action_step_up_grants.items() if d <= now]
-        for k in expired:
-            del self._spent_action_step_up_grants[k]
-        if key not in self._spent_action_step_up_grants and (
-            len(self._spent_action_step_up_grants) >= _ACTION_STEP_UP_GRANT_MAX
-        ):
-            oldest = min(
-                self._spent_action_step_up_grants, key=self._spent_action_step_up_grants.__getitem__
-            )
-            del self._spent_action_step_up_grants[oldest]
-        self._spent_action_step_up_grants[key] = deadline
+        if deadline is None or deadline <= now:
+            return False
+        if action in _REFUNDABLE_ACTIONS:
+            _bounded_grant_put(self._spent_action_step_up_grants, key, deadline, now)
+        return True
 
     def refund_action_step_up(self, token: str | None, action: str) -> bool:
         """Give back the step-up grant this session spent on ``action``, when the route it opened
@@ -6328,7 +6345,9 @@ class AuthService:
 
         It restores only a grant this process actually spent, and only with its ORIGINAL deadline,
         so it can never mint a grant, never extend one, and never restore one that has expired. A
-        second refund of the same grant finds nothing. Returns whether a grant was restored."""
+        second refund of the same grant finds nothing. Only :data:`_REFUNDABLE_ACTIONS` are ever
+        recorded, so no other action's grant can be restored. Returns whether a grant was
+        restored."""
         if not token:
             return False
         key = (hash_token(token), action)
@@ -6689,7 +6708,7 @@ class AuthService:
         """:func:`lockable_account_census` over this service's store and settings."""
         return await lockable_account_census(self._store, self._settings)
 
-    async def probe_credential_generation(self) -> bool:
+    def probe_credential_generation(self) -> bool:
         """Run the temporary-credential generator once, at startup, under the configured policy and a
         synthetic username (ADR 0197 Amendment A, Manager decision 2026-09-29, prompted by PR 1761).
 
@@ -6700,17 +6719,10 @@ class AuthService:
         but an operator should learn of it at start, not at the first account creation. So this logs
         an ERROR and returns ``False``; it never raises and never refuses the start. The credential
         is discarded. A borderline list can still pass this one run and fail a later one."""
-        try:
-            generate_policy_password(self._policy, username=_PROBE_USERNAME)
-        except TemporaryPasswordUnavailable:
-            _log.error(
-                "startup probe: the engine could not generate a temporary credential under the "
-                "configured password policy, so creating an account, resetting a password and "
-                "resetting an account's factors will all answer 503. The likely cause is "
-                "[auth].password_extra_context_words; remove short or very common terms and restart"
-            )
-            return False
-        return True
+        problem = credential_generation_problem(self._policy)
+        if problem is not None:
+            _log.error("startup probe: %s", problem)
+        return problem is None
 
     async def report_lockable_account_census(self) -> LockableAccountCensus:
         """Run :meth:`lockable_account_census` at startup: WARN and write one audit row when it
@@ -7288,7 +7300,7 @@ class AuthService:
         issued: IssuedCredential | None = None
         temp_hash: str | None = None
         if user.auth_provider == AuthProvider.LOCAL.value:
-            temp = self._generate_policy_password(username=user.username)
+            temp = generate_policy_password(self._policy, username=user.username)
             temp_hash = await self._argon2(hash_password, temp)
             await self._store.set_password(
                 user_id,
@@ -7804,7 +7816,7 @@ class AuthService:
         once (ADR 0197 Amendment A, N-B2 part 1, AC-A2).
 
         The administrator no longer chooses it. The credential is the 192-bit
-        :meth:`_generate_policy_password` the password reset already issues, written with
+        :func:`generate_policy_password` the password reset already issues, written with
         ``password_generated`` set, so wrong passwords arm no sign-in lock until the holder replaces
         it. That is what stops anyone who knows the username locking the account before its first
         sign-in. The returned :class:`CreatedLocalAccount` carries the deadline the login gate will
@@ -7830,7 +7842,7 @@ class AuthService:
                 )
             email = _require_single_mailbox(email)
         user_id = uuid4().hex
-        temp = self._generate_policy_password(username=username)
+        temp = generate_policy_password(self._policy, username=username)
         # Hashed before the insert so the handler below covers the store call alone.
         password_hash = await self._argon2(hash_password, temp)
         try:
@@ -8137,7 +8149,7 @@ class AuthService:
             raise ValueError("no such user")
         if user.auth_provider != AuthProvider.LOCAL.value:
             raise ValueError("only local users have a password to reset")
-        temp = self._generate_policy_password(username=user.username)
+        temp = generate_policy_password(self._policy, username=user.username)
         await self._store.set_password(
             user_id,
             password_hash=await self._argon2(hash_password, temp),

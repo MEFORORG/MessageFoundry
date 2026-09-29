@@ -7778,7 +7778,7 @@ def create_managed_app(
                 # ADR 0197 Amendment A, Manager decision 2026-09-29: learn at start, not at the first
                 # account creation, that the password policy leaves no credential to issue. It logs
                 # an ERROR and returns; it never refuses the start.
-                await auth.probe_credential_generation()
+                auth.probe_credential_generation()
                 if not auth.webauthn_available() and await store.any_webauthn_credentials():
                     # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
                     # not installed (engine moved/reinstalled, same DB) — affected users stay
