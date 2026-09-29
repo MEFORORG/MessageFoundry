@@ -17,7 +17,10 @@ the reconciler default) to the live defaults, and asserts the two corrected fals
 from __future__ import annotations
 
 import ast
+import asyncio
+import functools
 import inspect
+import itertools
 import re
 import textwrap
 import typing
@@ -38,6 +41,7 @@ from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthProvider, AuthService, _directory_login_refusal
 from messagefoundry.config.settings import ApiSettings, AuthSettings
 from messagefoundry.config.wiring import Http
+from messagefoundry.store.store import LockoutCounter, lockout_escalates
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -1770,3 +1774,242 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
     assert auth.oidc_require_mfa_claim is True
     assert auth.oidc_required_acr_values == []
     assert auth.oidc_mfa_amr_values == ["mfa"]
+
+
+#: Every package that could declare an engine-API or console route.
+_ROUTE_PACKAGES = (_ROOT / "messagefoundry", _ROOT / "messagefoundry_webconsole")
+
+
+def _service_cert_call_sites() -> list[tuple[str, str, list[str]]]:
+    """Each ``require_service_cert(...)`` call: its file, the nearest enclosing function, and that
+    function's decorators. Found by AST over every source file, so a second gated route reds."""
+    out: list[tuple[str, str, list[str]]] = []
+    for pkg in _ROUTE_PACKAGES:
+        for path in sorted(pkg.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            parent = {
+                child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+            }
+            for n in ast.walk(tree):
+                if not (
+                    isinstance(n, ast.Call)
+                    and ast.unparse(n.func).split(".")[-1] == "require_service_cert"
+                ):
+                    continue
+                up: ast.AST | None = parent.get(n)
+                while up is not None and not isinstance(up, ast.AsyncFunctionDef | ast.FunctionDef):
+                    up = parent.get(up)
+                name, decorators = ("<module>", []) if up is None else (up.name, up.decorator_list)
+                rel = path.relative_to(_ROOT).as_posix()
+                out.append((rel, name, [ast.unparse(d) for d in decorators]))
+    return out
+
+
+def _name_reference_sites(name: str) -> list[tuple[str, str]]:
+    """Each Name or Attribute reference to ``name`` in code (not in a string or a comment): its file
+    and the MODULE-LEVEL function or class holding it, so a closure reports its factory."""
+    out: list[tuple[str, str]] = []
+    for pkg in _ROUTE_PACKAGES:
+        for path in sorted(pkg.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for top in tree.body:
+                holder = getattr(top, "name", "<module>")
+                for n in ast.walk(top):
+                    if (
+                        (isinstance(n, ast.Name) and n.id == name)
+                        or (isinstance(n, ast.Attribute) and n.attr == name)
+                        or (isinstance(n, ast.alias) and name in (n.name, n.asname))
+                    ):
+                        out.append((path.relative_to(_ROOT).as_posix(), holder))
+    return out
+
+
+def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double() -> None:
+    """ASVS 6.1.3 was held at partial a sixth time (BACKLOG #1133, vault PR 2036) on two sentences.
+
+    1. The L5b paragraph told an MFA-pending bearer-token service account it could move to the mTLS
+       service-identity plane. It cannot: ``require_service_cert`` gates one route,
+       ``GET /service/identity``. The paragraph also called the ``require_mfa_scope`` row the
+       authority on "why mTLS is not a third" remedy, having just offered it as one of two.
+    2. The Local pathway row said "each lock doubles ... where the owner has that way past it".
+       ``lockout_escalates`` doubles the second-step lock on every local account and the sign-in lock
+       only on a local account with TOTP enrolled.
+
+    The reviewer also found the ``administrators`` scope is no remedy for an Administrator-role
+    account, and that ``require_mfa = false`` is one. Each is pinned against the code below.
+    """
+    # 1a. require_service_cert guards exactly one route, and it is GET /service/identity.
+    sites = _service_cert_call_sites()
+    assert sites == [
+        ("messagefoundry/api/app.py", "service_identity", ["app.get('/service/identity')"])
+    ], (
+        f"require_service_cert is now called from {sites}; restate the L5b paragraph and the mTLS row."
+    )
+    # The primitive that admits a certificate identity is referenced only inside that dependency, so
+    # an aliased import or a direct call on a second route cannot widen the plane unseen.
+    refs = _name_reference_sites("resolve_client_cert_identity")
+    assert refs == [("messagefoundry/api/security.py", "require_service_cert")], (
+        f"resolve_client_cert_identity is now referenced from {refs}; a certificate identity may "
+        "reach a route other than GET /service/identity."
+    )
+
+    # 1b. _mfa_required_for: the Administrator role stays in scope under both values, and
+    # require_mfa = false frees any un-enrolled account. Called on a stand-in self, so this pins the
+    # rule the doc states rather than a whole AuthService.
+    admin, other = frozenset({Role.ADMINISTRATOR}), frozenset({Role.OPERATOR})
+    user = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)
+
+    def required(scope: str, roles: frozenset[Role], *, on: bool, enrolled: bool) -> bool:
+        fake = SimpleNamespace(_settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope))
+        return bool(
+            AuthService._mfa_required_for(
+                fake,  # type: ignore[arg-type]
+                user,  # type: ignore[arg-type]
+                roles,
+                second_factor_enrolled=enrolled,
+            )
+        )
+
+    for scope in ("administrators", "every_local_account"):
+        assert required(scope, admin, on=True, enrolled=False), (
+            f"an un-enrolled Administrator is no longer MFA-required under {scope!r}; the L5b "
+            "paragraph and the require_mfa_scope row say the scope frees no Administrator."
+        )
+        assert not required(scope, admin, on=False, enrolled=False), (
+            "require_mfa = false no longer frees an un-enrolled Administrator; the doc names it as "
+            "the remedy for that account."
+        )
+        for roles in (admin, other):
+            assert required(scope, roles, on=False, enrolled=True), (
+                "an enrolled account no longer owes its factor with require_mfa off; the doc says "
+                "it must satisfy it under either setting."
+            )
+    assert required("every_local_account", other, on=True, enrolled=False)
+    assert not required("administrators", other, on=True, enrolled=False), (
+        "the administrators scope no longer frees a local non-Administrator; the doc names it as "
+        "that account's remedy."
+    )
+    assert not required("administrators", other, on=False, enrolled=False)
+    assert not required("every_local_account", other, on=False, enrolled=False)
+
+    # What an UNSTAMPED session owes, which is what the MFA gate asks. It adds the directory floor,
+    # so the directory half of both remedies is pinned here: under `administrators` an un-enrolled
+    # directory session stays pending, and require_mfa = false frees it.
+    def owes(
+        provider: str, scope: str, roles: frozenset[Role], *, on: bool, enrolled: bool
+    ) -> bool:
+        async def role_ids(_user_id: object) -> list[str]:
+            return [r.value for r in roles]
+
+        async def second_factor(_user: object) -> bool:
+            return enrolled
+
+        fake = SimpleNamespace(
+            _settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope),
+            _store=SimpleNamespace(get_user_role_ids=role_ids),
+            _second_factor_enrolled=second_factor,
+        )
+        fake._mfa_required_for = functools.partial(
+            AuthService._mfa_required_for,
+            fake,  # type: ignore[arg-type]
+        )
+        account = SimpleNamespace(id="u1", auth_provider=provider)
+        return bool(
+            asyncio.run(
+                AuthService._unverified_session_owes_factor(
+                    fake,  # type: ignore[arg-type]
+                    account,  # type: ignore[arg-type]
+                )
+            )
+        )
+
+    ad, local = AuthProvider.AD.value, AuthProvider.LOCAL.value
+    assert owes(ad, "administrators", other, on=True, enrolled=False), (
+        "an unstamped directory session is no longer MFA-pending under administrators; the L5b "
+        "paragraph and the require_mfa_scope row say it stays pending under both values."
+    )
+    assert not owes(local, "administrators", other, on=True, enrolled=False)
+    for provider, scope, roles in itertools.product(
+        (ad, local), ("administrators", "every_local_account"), (admin, other)
+    ):
+        assert not owes(provider, scope, roles, on=False, enrolled=False), (
+            f"require_mfa = false no longer frees an un-enrolled {provider} session; the doc "
+            "says it frees any account that has not enrolled a factor, whatever its role."
+        )
+        assert owes(provider, scope, roles, on=False, enrolled=True), (
+            f"an enrolled {provider} account no longer owes its factor with require_mfa off."
+        )
+
+    # 2. lockout_escalates: the whole truth table, so a third condition or a dropped one reds.
+    counters = typing.get_args(LockoutCounter)
+    assert set(counters) == {"sign_in", "second_step"}
+    for counter in counters:
+        for provider in ("local", "ad"):
+            for totp in (False, True):
+                want = provider == "local" and (counter == "second_step" or totp)
+                got = lockout_escalates(counter, auth_provider=provider, totp_enabled=totp)
+                assert got is want, (
+                    f"lockout_escalates({counter!r}, {provider!r}, totp={totp}) is now {got}; the "
+                    "Local row, control 1 and Table A say only the second-step lock on a local "
+                    "account and the sign-in lock on a local account with TOTP double."
+                )
+
+    security = " ".join(_doc_text().split())
+    configuration = " ".join(
+        (_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8").split()
+    )
+    settings_src = " ".join(
+        (_ROOT / "messagefoundry" / "config" / "settings.py").read_text(encoding="utf-8").split()
+    )
+    for label, text in (
+        ("SECURITY.md", security),
+        ("CONFIGURATION.md", configuration),
+        ("settings.py", settings_src),
+    ):
+        for retired in (
+            "account moves to the mTLS service-identity plane",
+            "why mTLS is not a third",
+            "move it to mTLS",
+            "where the owner has that way past it",
+            "The one remaining fix is **set this to `administrators`**",
+            "(or keeps the bind on loopback)",
+            "**There is one remedy.** Set `require_mfa_scope",
+            "when the API is bound **off-loopback** with `require_mfa`",
+        ):
+            assert retired not in text, (
+                f"{label} says {retired!r} again; against the code it is false (BACKLOG #1133)."
+            )
+        assert not re.search(r"\bmoves? (?:it |the account )?to (?:the )?mTLS", text), (
+            f"{label} offers mTLS as a place to move an account again; it serves one route."
+        )
+
+    for token in (
+        "two settings answer it, each with a limit. Setting the scope to `administrators` frees "
+        "only a **local** account that does not hold the Administrator role.",
+        "The Administrator role stays in scope under either value (`AuthService._mfa_required_for`)",
+        "Setting `[security].require_mfa = false` frees any account that has not enrolled a factor",
+        "Nor is the mTLS service-identity plane: a certificate identity is admitted on one route "
+        "only, `GET /service/identity`",
+        "why neither AD nor mTLS is a third",
+        "An account that has enrolled a factor still owes it under either setting; an OIDC sign-in "
+        "meets it while `[auth].oidc_require_mfa_claim` is on, the default.",
+    ):
+        assert token in security, f"docs/SECURITY.md must state {token!r} (BACKLOG #1133)."
+    local_row = next(r for r in _primary_table()[1:] if r[0].startswith("**Local**"))
+    doubling = (
+        "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
+        "account, and the sign-in lock does so only on a local account with TOTP enrolled; every "
+        "other lock keeps `lockout_minutes`"
+    )
+    assert doubling in " ".join(local_row[2].split()), (
+        "the Local row's brute-force cell must state which locks double, as lockout_escalates does."
+    )
+    for token in (
+        "**Set this to `administrators`**, which frees only a **local** account that does not "
+        "hold the Administrator role",
+        "Or **set `require_mfa = false`**, which frees any account that has not enrolled a factor",
+        "**With `require_mfa` kept on, there is one remedy.** Set `require_mfa_scope",
+    ):
+        assert token in configuration, (
+            f"docs/CONFIGURATION.md must state {token!r} (BACKLOG #1133)."
+        )
