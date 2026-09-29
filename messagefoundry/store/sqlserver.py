@@ -743,10 +743,10 @@ def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tu
 
     Two deliberate non-issues: (1) when the group's trailing read is the applock, the rendered batch
     carries TWO ``SET NOCOUNT ON`` (one prepended here, one inside ``_SQL_APPLOCK``) — idempotent and
-    harmless, left as-is rather than string-surgery on a reliability-core constant. (2) ``SET NOCOUNT
-    ON`` is a session setting that persists on the pooled connection. The unbatched path already runs
-    the same ``SET NOCOUNT ON`` (via the finalize applock) on every handoff, so batching adds no new
-    exposure.
+    harmless, left as-is rather than string-surgery on a reliability-core constant. (2) Whether this
+    ``SET NOCOUNT ON`` outlives the call is the question the paragraph below answers. Either way the
+    unbatched path already runs the same ``SET NOCOUNT ON`` (via the finalize applock) on every
+    handoff, so batching adds no new exposure.
 
     **CORRECTED 2026-09-26 (ADR 0157 Inc 3, PR 1576 CI).** This docstring used to say
     ``SQLRowCount`` is still populated under NOCOUNT. With a session-wide ``SET NOCOUNT ON`` (an

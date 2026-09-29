@@ -16,8 +16,8 @@ positioning-safety proof depends on:
   ``messages.status`` was NOT advanced. The load-bearing guarantee: no unserialized write commits.
 * (c) SERIALIZATION — concurrent batched finalizers of the same message do not corrupt / lost-update
   the disposition (the applock discipline holds under batching).
-* (d) NOCOUNT PARITY — a ``cursor.rowcount``-dependent op (``_execute``) on the same pooled connection
-  returns the correct count after a batched handoff (``SET NOCOUNT ON`` doesn't corrupt it).
+* (d) NOCOUNT PARITY — a ``cursor.rowcount``-dependent op (``_execute``) returns the correct count after
+  a batched handoff. The pool is not pinned, so it may not run on the handoff's connection.
 * (e) A/B DISPOSITION PARITY — a full route→transform→deliver pass yields the identical disposition +
   row structure with the flag ON vs OFF, with zero lost/duplicate rows.
 

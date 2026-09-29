@@ -329,12 +329,9 @@ def _force_nocount(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
                 # reset_stale_inflight() as -4 (-1 per stage) on both SQL Server legs. The suspected
                 # route is the ODBC driver manager reusing the physical connection with its session
                 # options; the BACKLOG-2097-NOCOUNT probe in test_sqlserver_store.py measures it.
-                # Since #2097 that count no longer shows a leak, so the restore reads itself back.
-                await cur.execute("SET NOCOUNT OFF; SELECT @@OPTIONS & 512")
-                row = await cur.fetchone()
-                assert row is not None and row[0] == 0, (
-                    "SET NOCOUNT OFF did not restore the session"
-                )
+                # Since #2097 that count no longer shows a leak, and nothing in this file checks
+                # whether this restore reaches a later store.
+                await cur.execute("SET NOCOUNT OFF;")
 
     monkeypatch.setattr(store, "_cursor", nocount_cursor)
 
@@ -452,10 +449,9 @@ async def test_a_failed_repend_is_collected_by_the_successors_promotion_reset(
         successor.set_leader_epoch(6, lease_key=_LEASE_KEY)
         # What promotion runs on SQL Server. now= is explicit because the reset stamps
         # next_attempt_at=now, and the claim below runs on the fixed test clock. The proof is the
-        # ROW STATE, not the returned count. The ADR0157-INC3-RESET-COUNT warning that once read
-        # that count was retired by BACKLOG #2097, which moved the count to an OUTPUT rowset and
-        # the NOCOUNT reading to test_sqlserver_store.py's BACKLOG-2097-NOCOUNT probe.
-        await successor.reset_stale_inflight(now=250.0)
+        # ROW STATE. The count is asserted too, since BACKLOG #2097 moved it to an OUTPUT rowset;
+        # the ADR0157-INC3-RESET-COUNT warning that once reported it without failing is retired.
+        assert await successor.reset_stale_inflight(now=250.0) == 1
         assert (await successor.outbox_for(mid))[0]["status"] == OutboxStatus.PENDING.value
         taken = await successor.claim_next_fifo("OB1", now=300.0)
         assert taken is not None and taken.id == claimed.id

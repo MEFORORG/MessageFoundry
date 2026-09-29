@@ -5097,8 +5097,10 @@ async def test_backlog_2097_nocount_persistence_probe() -> None:
       the reading; no session-identity field is reported, because a pooled reset and a recycled
       session id both make those misleading.
 
-    Grep the CI warnings summary for ``BACKLOG-2097-NOCOUNT``. A non-zero ``parameterized`` or
-    ``reopened`` reading would mean a pooled session can carry NOCOUNT.
+    Grep the CI warnings summary for ``BACKLOG-2097-NOCOUNT``. When ``baseline`` is 0, a non-zero
+    ``parameterized`` reading means the parameterized call left NOCOUNT on. A non-zero ``reopened``
+    reading means a fresh store was handed a session that carried it. A non-zero ``baseline`` is its
+    own finding: the session arrived with NOCOUNT on, and ``parameterized`` then proves nothing.
 
     Residual risk, stated rather than hidden: the third arm closes a NOCOUNT-on session on purpose. The
     cleanup restores whichever session ``second`` is handed. If a driver-manager pool hands it a
