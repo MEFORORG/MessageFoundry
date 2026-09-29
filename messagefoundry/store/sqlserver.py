@@ -2904,8 +2904,10 @@ class SqlServerStore:
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-            await store._load_state_cache()  # ADR 0005 read-through cache warm-up
-            await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
+            if not read_only:
+                # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
+                await store._load_state_cache()  # ADR 0005 read-through cache warm-up
+                await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
             # in a finally, same as close() above: wait_closed() cannot complete while the pool is
@@ -3925,7 +3927,8 @@ class SqlServerStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            await self.checkpoint_cipher_invocations(settle=True)
+            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+                await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were

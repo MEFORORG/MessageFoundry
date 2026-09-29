@@ -410,6 +410,11 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     try:
         async with db.execute("SELECT EXISTS (SELECT 1 FROM store_salt)") as cur:
             salted = await cur.fetchone()
-    except sqlite3.OperationalError:  # no salt table: this file never had a salt minted
-        return True
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return True  # no salt table: this file never had a salt minted
+        # Anything else (a busy or unreadable file) answers nothing about the salt: say so, and
+        # fall back to the plain remedy, as an unreadable count does above.
+        log.warning("could not read store_salt to pick the schema remedy: %s", exc)
+        return False
     return not (salted and salted[0])

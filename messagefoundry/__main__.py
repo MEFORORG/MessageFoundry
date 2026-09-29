@@ -6426,7 +6426,6 @@ def _audit_verify(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
-        StoreGrantsMissingError,
         StoreNotFoundError,
         open_store,
     )
@@ -6484,8 +6483,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
-        StoreGrantsMissingError,
-    ) as exc:  # #1916; #1780: a server database with no store, or no row grants. Could not start.
+    ) as exc:  # #1916; #1780: a server database with no store. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6530,7 +6528,6 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
-        StoreGrantsMissingError,
         StoreNotFoundError,
         open_store,
     )
@@ -6574,11 +6571,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     try:
         count, head = run_guarded(run())
-    except (
-        KeylessAuditChainRefused,
-        StoreNotFoundError,
-        StoreGrantsMissingError,
-    ) as exc:  # #1916, #1780, as audit-verify
+    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database

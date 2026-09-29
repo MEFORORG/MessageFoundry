@@ -99,3 +99,40 @@ async def test_open_closes_the_pool_when_a_later_init_step_raises(
         await PostgresStore.open(_settings())
 
     assert pool.closed == 1
+
+
+async def test_a_read_only_open_writes_nothing_and_loads_no_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1780: a read-only open skips the at-open writes and, as on SQLite, the two cache
+    loads, which decrypt every cell. Each skipped step raises here, so reaching one fails the open."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+    seen: list[str] = []
+
+    async def _ensure(self: PostgresStore, **kwargs: object) -> bool:
+        seen.append(f"ensure read_only={kwargs.get('read_only')}")
+        return False
+
+    async def _audit(self: PostgresStore) -> None:
+        seen.append("audit")
+
+    async def _forbidden(self: PostgresStore, *args: object, **kwargs: object) -> None:
+        raise AssertionError("a read-only open reached a step it must skip")
+
+    monkeypatch.setattr(PostgresStore, "_ensure_schema", _ensure)
+    monkeypatch.setattr(PostgresStore, "_load_audit_chain_meta", _audit)
+    for step in (
+        "_ensure_store_salt",
+        "checkpoint_cipher_invocations",
+        "_encrypt_existing_rows",
+        "_load_state_cache",
+        "_load_reference_cache",
+    ):
+        monkeypatch.setattr(PostgresStore, step, _forbidden)
+
+    store = await PostgresStore.open(_settings(), read_only=True)
+
+    assert seen == ["ensure read_only=True", "audit"]
+    assert store._read_only is True
+    assert pool.closed == 0

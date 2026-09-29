@@ -2531,15 +2531,19 @@ class StoreNotFoundError(RuntimeError):
         Raised by a ``create=False`` open under ``[store].schema_management = auto``, and by a
         ``read_only`` open in either mode. An ordinary ``external`` open refuses the same database as
         not provisioned instead, because no open builds anything there."""
+        where = (
+            "[store].db_schema and the role's USAGE on that schema"
+            if backend is StoreBackend.POSTGRES
+            else "the login's default schema"
+        )
         return cls(
             database or "",
             message=(
                 f"no MessageFoundry store in the {backend.value} database {database!r}: it has no "
                 "schema_meta table this login can see, and this command does not build one (check "
-                "[store].database and the login's default schema. Under [store].schema_management = "
-                "'external', the default, a DBA builds the store with "
-                f"`{PROVISION_SCHEMA_COMMAND}`; under 'auto', `messagefoundry serve` builds it on "
-                "its first run)"
+                f"[store].database and {where}. Under [store].schema_management = 'external', the "
+                f"default, a DBA builds the store with `{PROVISION_SCHEMA_COMMAND}`; under 'auto', "
+                "`messagefoundry serve` builds it on its first run)"
             ),
         )
 
