@@ -649,7 +649,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   meet the same refusal; its alert names the configuration, not a credential. A login reply that
   names the credential or the account stays a credential fault, even beside a limit or a TLS demand.
   So does any other 530 at the login, and now a 4xx that names the credential, such as
-  `430 Invalid username or password`. Both faults follow `credential_fault_policy`: the default
+  `430 Invalid username or password`, unless it also names a connection limit. Both faults follow `credential_fault_policy`: the default
   `stop` stops the lane, on the single-message and the batch path, and `dead_letter`
   dead-letters the message. With `validate_directory` on, the per-send listing passes both through
   and retries every other fault. (`BACKLOG #2083`)

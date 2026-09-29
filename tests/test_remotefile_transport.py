@@ -387,6 +387,22 @@ async def test_destination_cleans_temp_on_failed_rename(monkeypatch: pytest.Monk
     assert not client.files  # nothing left behind
 
 
+@pytest.mark.parametrize(
+    "marker", [{"credential_fault": True}, {"config_fault": True}], ids=["credential", "config"]
+)
+async def test_destination_keeps_temp_after_a_connection_fault_on_rename(
+    monkeypatch: pytest.MonkeyPatch, marker: dict[str, bool]
+) -> None:
+    # BACKLOG #2083 fix round 4 review: the rename opens its own session, so a connection fault can
+    # meet it there. Removing the temp would open one more session: another refused login against
+    # the partner account, or the same refusal again. The store branch already skipped it.
+    client = _FakeClient(rename_exc=_RemoteError("refused", permanent=True, **marker))
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    with pytest.raises(NegativeAckError):
+        await dest.send("x")
+    assert not any(op == "remove" for op, _ in client.ops)
+
+
 # === source ==================================================================
 
 
@@ -2237,6 +2253,13 @@ def _ftps_client() -> _FtpClient:
         # there. Review round 3: the widened word list had made these permanent dead-letters.
         ("greeting", "530 Too many connections from your IP; connections are blocked for 60 s"),
         ("greeting", "530-Unauthorized access is prohibited.\n530 Too many connections"),
+        # Fix round 4 review: a full stop inside a token, or after "max", does not end the phrase.
+        (
+            "login",
+            "530 Sorry, the maximum number of clients (5) from 192.0.2.10 are already connected.",
+        ),
+        ("login", "530 Maximum connections for host ftp.example.com reached"),
+        ("login", "530 Sorry, max. number of clients reached"),
     ],
 )
 def test_a_connection_limit_reply_is_transient(
@@ -2268,9 +2291,8 @@ def test_a_tls_refusal_is_a_configuration_fault_not_a_credential_fault(
     with pytest.raises(_RemoteError) as caught:
         _ftps_client().list_dir("/in")
     assert caught.value.permanent is True, "no retry makes the server offer TLS"
-    assert caught.value.credential_fault is False, (
-        "no credential was at fault; do not stop the lane"
-    )
+    assert caught.value.credential_fault is False, "no credential was at fault"
+    assert caught.value.config_fault is True, "every row meets it alike, so it stops the lane"
     assert "TLS configuration fault" in str(caught.value)
 
 
@@ -2304,6 +2326,10 @@ def test_a_tls_refusal_is_a_configuration_fault_not_a_credential_fault(
         "530 Unauthorized: too many sessions",
         "530 Too many connections from this user, try again after unlock",
         "530 Too many sessions: user unauthenticated",
+        # Fix round 4 review: "authenticated" is TLS vocabulary only inside a TLS demand. Beside a
+        # limit it names the credential, as "unauthenticated" above already did.
+        "530 User not authenticated: too many connections",
+        "530 Not authenticated; too many sessions",
         # Fix round 3. Round 2's list did not have these words at all.
         "530 Too many sessions: account deactivated",
         "530 Too many users; access revoked",
@@ -2422,6 +2448,9 @@ def test_a_tls_demand_at_the_login_is_a_configuration_fault(
         "530 User must be a member of group ftps-users",
         "530 Home directory must exist (sslhome)",
         "530 Account must be reactivated at https://tlsportal.example",
+        # Fix round 4 review: a TLS name joined to "/" or "_" is a path or a group, not a demand.
+        "530 Home directory must be under /srv/tls",
+        "530 Users must be in group encrypted_users",
     ],
 )
 def test_a_tls_hint_on_an_account_refusal_is_still_a_credential_fault(
@@ -2601,8 +2630,12 @@ async def test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row(
     [
         ("430 Invalid username or password", True),
         ("421 Too many connections (8) from this IP", False),  # CONTROL: a busy server
+        # Fix round 4 review: a 4xx naming a connection limit stays transient beside a credential
+        # word ("blocked", "refused"), as every 4xx was before #2083.
+        ("421 Too many users - blocked for 60 s", False),
+        ("421 Too many connections; connection refused", False),
     ],
-    ids=["430-credential", "421-busy-control"],
+    ids=["430-credential", "421-busy-control", "421-busy-blocked", "421-busy-refused"],
 )
 def test_a_4xx_login_refusal_naming_the_credential_is_a_credential_fault(
     monkeypatch: pytest.MonkeyPatch, reply: str, credential_fault: bool
@@ -2628,6 +2661,7 @@ def test_a_refused_greeting_is_permanent_but_not_a_credential_fault(
         _ftps_client().list_dir("/in")
     assert caught.value.permanent is True
     assert caught.value.credential_fault is False
+    assert caught.value.config_fault is True, "every row meets it alike, so it stops the lane"
     assert _ScriptedFtp.instances[0].steps == ["greeting"]
 
 

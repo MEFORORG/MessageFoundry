@@ -205,6 +205,8 @@ from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
 __all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
 type Direction = Literal["inbound", "outbound"]
+#: A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083).
+type _LaneFault = Literal["credential", "configuration"]
 """Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
 enforces uniqueness per table, and the API's ``_dual_role_control`` carries a ``role=`` to
 disambiguate the pair), so every per-connection map that can hold an entry for either direction
@@ -1303,9 +1305,10 @@ class RegistryRunner:
         # so it reads as an operator pause that no reload lifts; this lets a reload that removes the
         # schedule resume the lane (#2069). Any later start or stop of the lane drops the entry.
         self._schedule_parked: set[str] = set()
-        # Lanes halted by a STOP that only an operator may lift: a credential fault (#109), the
-        # internal-error STOP policy, or a pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault
-        # bound, the #2074 claimer-death bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
+        # Lanes halted by a STOP that only an operator may lift, at least: a credential fault (#109),
+        # a connection configuration fault (#2083), the internal-error STOP policy, or a pooled
+        # dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death bound;
+        # see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
         # one (see _schedule_holds, which also names every path that clears a record). Keyed by
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
@@ -2854,9 +2857,10 @@ class RegistryRunner:
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
-        # An operator-required STOP (#109 credential fault, or the internal-error STOP policy) outranks
-        # the calendar. The start branch must not re-arm it: that re-tries a bad credential at every
-        # window open, which is the partner lockout the STOP exists to prevent. The OUTBOUND park must
+        # An operator-required STOP (at least a #109 credential fault, a #2083 configuration fault, or
+        # the internal-error STOP policy) outranks the calendar. The start branch must not re-arm it:
+        # that re-tries a bad credential at every window open, which is the partner lockout the STOP
+        # exists to prevent. The OUTBOUND park must
         # not run either, because the park is a pause and a pause is what a window open resumes (and a
         # pooled pause_lane overwrites the STOPPED phase outright). The INBOUND park still runs: it only
         # unbinds the listener, which leaves the halted router/transform workers exactly as they are and
@@ -2933,8 +2937,8 @@ class RegistryRunner:
         self._record_failed(name, exc, kind="inbound")
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
-        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
-        credential fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
+        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (at least a
+        #109 credential fault, a #2083 configuration fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
         claimer-death STOP via :meth:`_pooled_stop_hold`). Called at the STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
@@ -6936,7 +6940,7 @@ class RegistryRunner:
             await self.store.mark_batch_done(ids)
         return _ItemOutcome.PROCESSED, retry_until
 
-    def _lane_stopping_fault(self, exc: NegativeAckError) -> str | None:
+    def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:
         """Which connection fault ``exc`` is, when it must STOP the lane and keep the queue:
         ``"credential"`` (#109, ADR 0095), ``"configuration"`` (BACKLOG #2083), or ``None`` for an
         ordinary reject. Only a permanent fault stops, and only under the default
@@ -6953,7 +6957,7 @@ class RegistryRunner:
         return None
 
     async def _stop_lane_retaining(
-        self, name: str, ids: Sequence[str], exc: NegativeAckError, fault: str
+        self, name: str, ids: Sequence[str], exc: NegativeAckError, fault: _LaneFault
     ) -> None:
         """STOP outbound ``name`` on a connection fault and release every claimed row in ``ids``
         back to PENDING un-errored (the claim's attempt given back, no backoff, no last_error), so the

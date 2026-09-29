@@ -481,12 +481,13 @@ _FTP_PROT_P = "PBSZ/PROT P"
 #: number of clients (5) for this user are already connected.", Serv-U's "530 Sorry, no more than 10
 #: users allowed", "Too many connections" or "too many users" from several others, and "Connection
 #: limit reached". A "maximum ... clients" must go on to say they are already connected, or that the
-#: limit is reached or exceeded; the word "maximum" and a noun alone are not enough. The nouns are
-#: clients, connections, users and sessions only. "Login" is left out on purpose: "530 Maximum login
-#: attempts exceeded" is a credential refusal, not a limit.
+#: limit is reached or exceeded; the word "maximum" and a noun alone are not enough. A full stop
+#: ends the phrase, except one inside a token ("192.0.2.10", "ftp.example.com") or after "max". The
+#: nouns are clients, connections, users and sessions only. "Login" is left out on purpose: "530
+#: Maximum login attempts exceeded" is a credential refusal, not a limit.
 _FTP_CONNECTION_LIMIT = re.compile(
-    r"\bmax(?:imum)?\b[^.]{0,60}?\b(?:clients?|connections?|users?|sessions?)\b"
-    r"[^.]{0,40}?\b(?:already\s+(?:connected|logged\s+in)|reached|exceeded)\b"
+    r"\bmax(?:imum)?\b\.?(?:[^.\n]|\.(?=\w)){0,60}?\b(?:clients?|connections?|users?|sessions?)\b"
+    r"(?:[^.\n]|\.(?=\w)){0,40}?\b(?:already\s+(?:connected|logged\s+in)|reached|exceeded)\b"
     r"|\btoo\s+many\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
     r"|\bno\s+more\s+than\s+\d+\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
     r"|\b(?:client|connection|user|session)s?\s+limit\s+(?:reached|exceeded)\b",
@@ -516,14 +517,22 @@ _FTP_CREDENTIAL_WORDS = re.compile(
     re.IGNORECASE,
 )
 
-#: TLS vocabulary taken out before the credential words are looked for: the ``AUTH TLS`` command
-#: ("must use AUTH TLS first"), and "authenticate" ("You must authenticate over TLS"). Neither is
-#: about the credential. "Authentication failed" still counts, by "failed".
+#: TLS vocabulary taken out before the credential words are looked for, in a TLS demand only: the
+#: ``AUTH TLS`` command ("must use AUTH TLS first"), and "authenticate" ("You must authenticate over
+#: TLS"). There neither is about the credential. "Authentication failed" still counts, by "failed".
+#: Beside a connection limit they stay credential words: "530 Not authenticated; too many
+#: connections" is a refused login, and retrying it would move a partner lockout counter.
 _FTP_TLS_VOCABULARY = re.compile(r"\bAUTH\s+(?:TLS|SSL)\b|\bauthenticat\w*", re.IGNORECASE)
 
 #: A TLS name as a whole token: "SSL", "TLS", "TLSv1.2", "FTPS", or a word starting "encrypt". Not
-#: "SSL-VPN", "ftps-users", "sslhome" or "the SSL VPN", which name an account's group or path.
-_TLS_NAME_PATTERN = r"(?:\b(?:ssl|tls|ftps)(?:v?[\d.]*\d)?\b(?!-)(?!\W{1,3}vpn\b)|\bencrypt\w*)"
+#: "SSL-VPN", "ftps-users", "sslhome", "the SSL VPN", "/srv/tls" or "encrypted_users", which name an
+#: account's group or path: a name joined to "-", "_" or "/" is part of a longer token.
+_TLS_NAME_PATTERN = (
+    # "/" joins a path, except between two TLS names, as in ProFTPD's "SSL/TLS required".
+    r"(?:(?<!_)(?:(?<!/)|(?<=ssl/)|(?<=tls/))\b(?:ssl|tls|ftps)(?:v?[\d.]*\d)?\b"
+    r"(?![-_])(?!/(?!(?:ssl|tls)\b))(?!\W{1,3}vpn\b)"
+    r"|(?<![/_])\bencrypt[a-z]*\b(?![-_/]))"
+)
 
 #: A reply line that demands TLS as one phrase: a TLS name then "required" or "mandatory" within
 #: three words, or "must", "have to" or "requires" then a TLS name within four. vsftpd's "530
@@ -543,10 +552,13 @@ def _last_reply_line(reply: str) -> str:
     return lines[-1] if lines else ""
 
 
-def _names_credential(reply: str) -> bool:
+def _names_credential(reply: str, *, in_tls_demand: bool = False) -> bool:
     """True when a reply carries a credential or account word anywhere (``_FTP_CREDENTIAL_WORDS``).
-    An underscore is read as a space, and TLS vocabulary (``_FTP_TLS_VOCABULARY``) is taken out."""
-    text = _FTP_TLS_VOCABULARY.sub(" ", reply.replace("_", " "))
+    An underscore is read as a space. With ``in_tls_demand``, TLS vocabulary
+    (``_FTP_TLS_VOCABULARY``) is taken out first."""
+    text = reply.replace("_", " ")
+    if in_tls_demand:
+        text = _FTP_TLS_VOCABULARY.sub(" ", text)
     return bool(_FTP_CREDENTIAL_WORDS.search(text))
 
 
@@ -581,7 +593,9 @@ def _demands_tls(reply: str) -> bool:
     connection's TLS setting (BACKLOG #2083, fix round 3). The caller asks only for a plain session;
     an FTPS control channel is already TLS. The demand must be one phrase on the last line
     (``_FTP_TLS_DEMAND``), and a credential word anywhere keeps the credential-fault class."""
-    return bool(_FTP_TLS_DEMAND.search(_last_reply_line(reply))) and not _names_credential(reply)
+    return bool(_FTP_TLS_DEMAND.search(_last_reply_line(reply))) and not _names_credential(
+        reply, in_tls_demand=True
+    )
 
 
 def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _RemoteError:
@@ -600,7 +614,8 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _Re
       worker stops the lane rather than retrying into an account lockout.
 
     These are the 5xx rules. A 4xx is transient, except a 4xx at the login that names the credential
-    ("430 Invalid username or password"): :meth:`_FtpClient._connect` makes that a credential fault.
+    ("430 Invalid username or password") and no connection limit: :meth:`_FtpClient._connect` makes
+    that a credential fault.
 
     The configuration faults carry ``config_fault`` (fix round 4). Every queued row would meet the
     same refusal, so on the delivery path the worker stops the lane and keeps the queue, as it does
@@ -691,9 +706,17 @@ class _FtpClient(_RemoteClient):
             raise _ftp_connect_refusal(step, exc, tls=self._tls) from exc
         except ftplib.error_temp as exc:
             ftp.close()
-            if step == _FTP_LOGIN and _names_credential(str(exc)):
+            reply = str(exc)
+            if (
+                step == _FTP_LOGIN
+                and _names_credential(reply)
+                and not _FTP_CONNECTION_LIMIT.search(_last_reply_line(reply))
+            ):
                 # A 4xx that names the credential ("430 Invalid username or password") is a refused
                 # login too: retried, it would lock the partner account (BACKLOG #2083, fix round 3).
+                # A 4xx naming a connection limit stays transient even beside such a word ("421 Too
+                # many users - blocked for 60 s"): RFC 959 makes a 4xx transient, and every 4xx was
+                # retried before #2083 (fix round 4 review).
                 raise _RemoteError(
                     f"FTP login refused: {exc}", permanent=True, credential_fault=True
                 ) from exc
@@ -1759,10 +1782,13 @@ class RemoteFileDestination(DestinationConnector):
             raise
         try:
             self._client.rename(tmp, final)
-        except _RemoteError:
+        except _RemoteError as exc:
             # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so the
-            # delivery is classified (retry/dead-letter) by send().
-            self._remove_temp(tmp, name, "rename")
+            # delivery is classified (retry/dead-letter) by send(). The rename opens its own session,
+            # so a connection fault there skips the cleanup for the store branch's reason: another
+            # session would be one more refused login, or the same refusal again.
+            if not exc.connection_fault:
+                self._remove_temp(tmp, name, "rename")
             raise
 
     def _remove_temp(self, tmp: str, name: str, after: str) -> None:
