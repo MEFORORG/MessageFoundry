@@ -58,8 +58,9 @@ at least these; it is not complete.
 1. **The strict object model is built only on request.** Ingress reads the control id, message
    type and summary through the tolerant peek (`parsing/peek.py`), and the strict `hl7apy` model is
    opt-in per connection. This is narrower than it sounds: the Router itself still receives the
-   whole parsed message, as a Handler does. (`docs/PHI.md` §3's bullet "Peek, not full-parse, on
-   the hot path" says routing reads only the fields a Router asks for, which overstates this.)
+   whole parsed message, as a Handler does. `docs/PHI.md` §3's bullet on the peek said routing
+   reads only the fields a Router asks for, which overstated this; the change that adds this ADR
+   corrects it.
 2. **Gated PHI properties in API responses are withheld by default.** `api/phi_gate.py` defines
    `PhiGatedModel`. A property in its `GATEABLE_PROPERTIES` (summary, error, metadata, last_error,
    detail) serializes as `null` in JSON until something explicitly releases it for that instance,
@@ -148,7 +149,8 @@ deployment requirement.
 
 **Out of scope** — The ASVS record's own wording (the vault scorecard cell, a record act); the
 decrypted in-process caches (BACKLOG #1185, and #1174 part C, in review); host-level memory
-protection; correcting `docs/PHI.md` §3's peek bullet.
+protection. (`docs/PHI.md` §3's peek bullet, once listed here, is corrected in the same
+change.)
 
 ## To resolve on acceptance
 

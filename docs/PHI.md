@@ -726,10 +726,14 @@ the platform's concern, not covered by the [§7](#7-logging--phi-redaction) inve
 
 PHI is exposed for the **minimum window and surface** needed to route and transform it:
 
-- **Peek, not full-parse, on the hot path.** Routing/filtering reads only the specific HL7 fields a
-  Router asks for via the tolerant `Peek` ([parsing/peek.py](../messagefoundry/parsing/peek.py)); the
-  version-aware full object model (hl7apy) is built only on the opt-in strict path. The engine never
-  materializes more of a message than the work requires.
+- **Peek at ingress; the strict model only on request.** Before the ACK, the listener reads only
+  the control id, message type and summary through the tolerant `Peek`
+  ([parsing/peek.py](../messagefoundry/parsing/peek.py)). The version-aware strict object model
+  (hl7apy) is built only on a connection's opt-in strict path. **This does not narrow what a Router
+  or Handler sees:** each receives the whole decrypted message, parsed, because routing and
+  transformation are the site's own Python ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
+  An earlier version of this bullet said routing reads only the fields a Router asks for; that was
+  not what the code does (BACKLOG #1174).
 - **Encrypt-after-use at the boundary.** A decrypted body lives in heap only for the lifetime of one
   pipeline stage; the store cipher re-encrypts every PHI column the moment it is written back
   ([store/crypto.py](../messagefoundry/store/crypto.py)), so persisted data never lingers in plaintext
