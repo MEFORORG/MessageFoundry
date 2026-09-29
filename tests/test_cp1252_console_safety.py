@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Five gated surfaces cannot abort a stock Windows console (BACKLOG #1030).
+"""Every root holding Python, and scripts/ PowerShell, cannot abort a stock Windows console.
 
-The surfaces are named under SCOPE below, with the roots still outside them. This file was
+BACKLOG #1030. The surfaces are named under SCOPE below. This file was
 scripts-only when it shipped, and widening it is the item's whole point, so the summary line
 counts surfaces rather than naming one.
 
@@ -65,13 +65,15 @@ THREE PROPERTIES THIS KEEPS, each of which the item names:
     break a terminal.
   * IT NEVER SILENTLY DROPS A FILE. A file that will not decode as UTF-8 is a FAILURE, not a skip.
 
-SCOPE, STATED RATHER THAN IMPLIED. Five surfaces and two predicates, in file order:
-``scripts/**/*.py`` here and ``scripts/**/*.ps1`` next gate on ENCODABILITY; ``messagefoundry/`` in
-the third section and ``harness/`` plus ``tests/`` in the fourth gate on REACHING a console. Which
-predicate a surface gets is a measurement, not a preference, and the section that applies it
-carries the count. The fourth section also names the roots that are still OUT, with their sizes.
+SCOPE, STATED RATHER THAN IMPLIED. Two predicates, in file order: ``scripts/**/*.py`` here and
+``scripts/**/*.ps1`` next gate on ENCODABILITY; every other root holding Python gates on REACHING a
+console, one parametrized row per root (``_REACH_ROOTS``): messagefoundry/, harness/, tests/,
+messagefoundry_webconsole/, packaging/, samples/, tee/, fuzz/, docker/ and docs/. Which predicate a
+surface gets is a measurement, not a preference, and the section that applies it carries the count.
 
-``docs/`` IS DELIBERATELY OUT, AND ITS POSITIVE CONTROL DIED UNDER IT. ``docs/BACKLOG.md`` was both
+``docs/`` PROSE IS DELIBERATELY OUT, AND ITS POSITIVE CONTROL DIED UNDER IT. (The two Python files
+under docs/ are a reach row like any other root; this paragraph is about Markdown, which no stream
+executes.) ``docs/BACKLOG.md`` was both
 a sanctioned holdout for the banner alphabet and this detector's control at 29 distinct non-cp1252
 codepoints; the ledger left for the maintainer-internal repository (BACKLOG #1250) and the 23-line
 stub that remains carries ZERO -- measured 2026-09-21, same instrument. Re-running the old control
@@ -684,16 +686,12 @@ _LOG_METHODS = frozenset(
 
 @functools.cache
 def _modules_under(root: Path) -> tuple[Path, ...]:
-    """Every Python file under ``root``, recursively. Shared by all three reach surfaces.
+    """Every Python file under ``root``, recursively. Shared by every reach root.
 
-    Cached, because the three tests per surface would otherwise re-walk the same tree; a TUPLE, so
+    Cached, because the tests per root would otherwise re-walk the same tree; a TUPLE, so
     the cached result cannot be mutated out from under a sibling test that has not run yet.
     """
     return tuple(sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts))
-
-
-def _engine_modules() -> tuple[Path, ...]:
-    return _modules_under(_ENGINE)
 
 
 def _dotted(node: ast.expr) -> list[str]:
@@ -765,19 +763,6 @@ def _console_hits(tree: ast.Module) -> list[tuple[int, str]]:
     return sorted(set(hits))
 
 
-def test_the_engine_scan_actually_covers_something() -> None:
-    """The same positive control the scripts half carries, for the same reason.
-
-    It pins __main__.py by name because a `messagefoundry/**/*.py` git pathspec DROPS every
-    top-level file -- measured on this repo: 240 files against 267 from three other spellings, and
-    the 27 it loses include __main__.py, the one file whose hardening this whole scope rests on.
-    """
-    found = _engine_modules()
-    print(f"scanned {len(found)} python files under messagefoundry/")
-    assert len(found) >= 200, f"only {len(found)} engine files -- the walk is not finding them"
-    assert (_ENGINE / "__main__.py") in found
-
-
 class _RootScan(NamedTuple):
     """What one pass over a root found: the gate's two lists, plus the files it could not read."""
 
@@ -790,7 +775,7 @@ class _RootScan(NamedTuple):
 def _scan_root(root: Path) -> _RootScan:
     """ONE read and ONE parse per file, shared by the two tests that consume this root.
 
-    One implementation for all three reach surfaces. A second hand-written copy of this loop is how
+    One implementation for every reach root. A second hand-written copy of this loop is how
     two roots end up disagreeing about what a hardened file is, and the disagreement is silent.
 
     Cached and returning tuples, because the gate test and the readability test below must stay
@@ -801,51 +786,48 @@ def _scan_root(root: Path) -> _RootScan:
     A file that fails to decode or parse lands in `unreadable` and contributes nothing to the other
     two lists. That is not a silent skip; the test that asserts on `unreadable` names it.
     """
-    offenders: list[str] = []
-    exempted: list[str] = []
-    unreadable: list[str] = []
+    found: dict[str, list[str]] = {"offender": [], "exempted": [], "unreadable": []}
     for path in _modules_under(root):
-        rel = path.relative_to(_ROOT)
+        rel = path.relative_to(_ROOT).as_posix()
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
-            unreadable.append(f"{rel}: not UTF-8: {exc}")
+            found["unreadable"].append(f"{rel}: not UTF-8: {exc}")
             continue
-        try:
-            tree = ast.parse(text)
-        except SyntaxError as exc:
-            unreadable.append(f"{rel}: will not parse: {exc}")
-            continue
-        hits = _console_hits(tree)
-        if not hits:
-            continue
-        shown = ", ".join(f"line {ln} U+{ord(c):04X}" for ln, c in hits[:6])
-        if _calls_the_chokepoint(tree):
-            exempted.append(f"{rel} ({shown})")
-            continue
-        offenders.append(
-            f"{rel} sends {len(hits)} non-cp1252 character(s) [{shown}] to a console and does "
-            f"NOT call {_CHOKEPOINT_MODULE}.{_CHOKEPOINT} -- on a stock Windows console print() "
-            f"aborts and a log record is DROPPED with only a stderr notice"
-        )
-    return _RootScan(tuple(offenders), tuple(exempted), tuple(unreadable))
+        verdict = _classify(rel, text)
+        if verdict is not None:
+            found[verdict[0]].append(verdict[1])
+    return _RootScan(tuple(found["offender"]), tuple(found["exempted"]), tuple(found["unreadable"]))
 
 
-def test_no_engine_module_puts_an_unencodable_character_on_a_console() -> None:
-    """The engine gate: a console-bound literal stays cp1252-safe unless its file hardens stdout."""
-    scan = _scan_root(_ENGINE)
-    print(f"console-bound and hardened, therefore allowed: {list(scan.exempted) or 'none'}")
-    assert not scan.offenders, "\n  ".join(
-        ["engine modules that can lose or abort console output:", *scan.offenders]
+def _classify(rel: str, text: str) -> tuple[str, str] | None:
+    """One file's verdict under the reach gate: ``(kind, message)``, or None when it is clean.
+
+    ``kind`` is ``offender``, ``exempted`` or ``unreadable``. Split out of ``_scan_root`` so the
+    planted-glyph control below drives the SAME decision on a real file's text that the gate
+    drives on the file itself, rather than a reconstruction of it.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        return "unreadable", f"{rel}: will not parse: {exc}"
+    hits = _console_hits(tree)
+    if not hits:
+        return None
+    shown = ", ".join(f"line {ln} U+{ord(c):04X}" for ln, c in hits[:6])
+    if _calls_the_chokepoint(tree):
+        return "exempted", f"{rel} ({shown})"
+    return "offender", (
+        f"{rel} sends {len(hits)} non-cp1252 character(s) [{shown}] to a console and does "
+        f"NOT call {_CHOKEPOINT_MODULE}.{_CHOKEPOINT} -- on a stock Windows console print() "
+        f"aborts and a log record is DROPPED with only a stderr notice"
     )
 
 
-def test_every_engine_module_decodes_as_utf8_and_parses() -> None:
-    """Never a silent skip, for both reasons: a file that will not decode is the likeliest to carry
-    the bytes this gate hunts, and a file that will not parse would make _printed_unencodable return
-    an empty list that is indistinguishable from a clean one."""
-    broken = _scan_root(_ENGINE).unreadable
-    assert not broken, "engine modules the scan could not read:\n  " + "\n  ".join(broken)
+# The engine's own coverage control, gate and readability test are rows of the parametrized reach
+# tests further down (`_REACH_ROOTS`), not hand-written wrappers here. PR 1403 left them as three
+# separate functions beside the parametrization, which is exactly the shape the one-implementation
+# rule in `_scan_root` exists to prevent: two copies of a control drift apart silently.
 
 
 # --- the engine detector's own controls ----------------------------------------------------------
@@ -1025,50 +1007,80 @@ def test_the_scripts_direct_form_must_set_a_codec_or_an_error_handler() -> None:
 # this module is now walked like any other file; `test_this_module_is_not_exempt_from_its_own_gate`
 # below pins that, because this is the file in the repository that talks about hardening most.
 #
-# WHAT IS STILL OUT, AND THIS IS A FLOOR RATHER THAN A CENSUS. At least six roots hold Python this
-# gate does not reach. Measured 2026-09-21, about 101 files: messagefoundry_webconsole/ (35 files),
-# packaging/ (26), samples/ (18), tee/ (18), docker/ (2) and docs/ (2). All six measure ZERO
-# console-bound hits today, which is a reason to leave them for a separate pass and NOT evidence
-# that they are safe: a root with nothing to find is exactly the root that acquires the first one
-# unwatched. Two deserve naming. packaging/ IS the second pytest collection root -- pyproject's
-# `testpaths` names `packaging/messagefoundry-webconsole/tests` -- so the paragraph above about
-# test trees applies to it in full, and it is out by scope rather than by argument. tee/ vendors
-# messagefoundry/anon/ behind a CLI that prints to an operator console.
+# THE SEVEN SMALLER ROOTS ARE IN NOW, ON THE SAME PREDICATE (BACKLOG #1030's remainder). PR 1403
+# named six roots it left out, "at least six", and a tracked-file census on 2026-09-29 found a
+# seventh it had not named: fuzz/. Counts that day, tracked Python files: messagefoundry_webconsole/
+# 35, packaging/ 35 (26 when PR 1403 counted it), samples/ 18, tee/ 18, fuzz/ 3, docker/ 2, docs/ 2.
+# ALL SEVEN MEASURED ZERO console-bound hits on that run, so bringing them in changed no file. That
+# zero is why they were left out before, and it is exactly why they are in now: a root with nothing
+# to find is the root that acquires the first one unwatched. The planted-glyph control below proves
+# the zero on each root is the detector looking rather than the detector blind.
+#
+# Two deserve naming. packaging/ IS the second pytest collection root -- pyproject's `testpaths`
+# names `packaging/messagefoundry-webconsole/tests` -- so the paragraph above about test trees
+# applies to it in full. tee/ vendors messagefoundry/anon/ behind a CLI that prints to an operator
+# console.
+#
+# THE ENGINE IS A ROW HERE TOO. Its three tests were hand-written wrappers beside this
+# parametrization until this change; they are rows of it now, so one control governs all nine roots.
 # =================================================================================================
 
 _HARNESS = _ROOT / "harness"
 _TESTS = _ROOT / "tests"
 
-#: ``(label, root, floor, file pinned by name)``. The two halves catch opposite breakages, and the
-#: FLOOR alone is not enough for either root here. A ``<root>/**/*.py`` git pathspec DROPS every
-#: top-level file -- measured on the engine half above -- so each row pins the top-level file whose
-#: loss would matter most: harness/__main__.py is the entry point whose hardening exempts it, and
-#: this module is the one file whose disappearance from the walk would make every result below
-#: meaningless.
+#: ``(label, root, floor, files pinned by name)``. The floor and the pins catch opposite breakages,
+#: and the FLOOR alone is not enough for any root here. A ``<root>/**/*.py`` git pathspec DROPS
+#: every top-level file -- measured on the engine -- so every root that HAS a top-level file pins
+#: one. A walk that stops recursing loses the nested files, which under tests/ is one file of about
+#: a thousand and sails past any floor -- so every root that HAS a nested file pins one of those too.
+#: Pins are relative to the root. A root with only one shape (fuzz/ is all top-level; docker/, docs/
+#: and packaging/ are all nested) pins only that shape, because it has nothing else to lose.
 #:
-#: THE FLOOR CANNOT SEE THE OPPOSITE REGRESSION UNDER tests/, WHICH IS WHY IT IS NOT THE WHOLE
-#: CONTROL. A walk that degraded from rglob to glob loses 61 of harness/'s 75 files and trips the
-#: floor of 60; under tests/ it loses ONE of 853 and sails past any floor, and the pinned file is
-#: itself top-level so that half clears too. Both halves would be blind on that row. The nested
-#: assertion in the coverage test below is what discriminates there, and it can produce a different
-#: answer: it goes red on exactly the degradation the floor cannot see.
-_REACH_ROOTS: tuple[tuple[str, Path, int, str], ...] = (
-    ("harness", _HARNESS, 60, "__main__.py"),
-    ("tests", _TESTS, 700, "test_cp1252_console_safety.py"),
+#: harness/__main__.py and messagefoundry/__main__.py are the entry points whose hardening exempts
+#: them, and this module is the one file whose disappearance from the walk would make every result
+#: below meaningless.
+_REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
+    ("messagefoundry", _ENGINE, 250, ("__main__.py", "pipeline/wiring_runner.py")),
+    ("harness", _HARNESS, 60, ("__main__.py", "reconcile/__main__.py")),
+    # Its ONLY nested file, measured 2026-09-29: 1 of 1,021. If it is ever legitimately removed,
+    # the shape check below fails LOUDLY and points here rather than reporting a clean tree.
+    (
+        "tests",
+        _TESTS,
+        700,
+        ("test_cp1252_console_safety.py", "fixtures/handler_taint/handler-security.py"),
+    ),
+    (
+        "messagefoundry_webconsole",
+        _ROOT / "messagefoundry_webconsole",
+        25,
+        ("mount.py", "pages/messages.py"),
+    ),
+    ("packaging", _ROOT / "packaging", 25, ("messagefoundry-webconsole/tests/conftest.py",)),
+    ("samples", _ROOT / "samples", 12, ("send_mllp.py", "config/IB_ACME_ADT.py")),
+    ("tee", _ROOT / "tee", 12, ("__main__.py", "anon/hl7.py")),
+    ("fuzz", _ROOT / "fuzz", 2, ("fuzz_parsers.py",)),
+    ("docker", _ROOT / "docker", 2, ("smoke/send_adt.py",)),
+    (
+        "docs",
+        _ROOT / "docs",
+        2,
+        ("benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/b5_microbench.py",),
+    ),
 )
 
-_REACH_ROOT_IDS = [label for label, _root, _floor, _pinned in _REACH_ROOTS]
+_REACH_ROOT_IDS = [label for label, _root, _floor, _pins in _REACH_ROOTS]
 
-#: ``(label, root)`` only, for the tests that use neither the floor nor the pin. Carrying all four
-#: fields into them would read as though the floor and the pin participate in the gate itself.
-_REACH_ROOT_PATHS = tuple((label, root) for label, root, _floor, _pinned in _REACH_ROOTS)
+#: ``(label, root)`` only, for the tests that use neither the floor nor the pins. Carrying all four
+#: fields into them would read as though the floor and the pins participate in the gate itself.
+_REACH_ROOT_PATHS = tuple((label, root) for label, root, _floor, _pins in _REACH_ROOTS)
 
 
-@pytest.mark.parametrize(("label", "root", "floor", "pinned"), _REACH_ROOTS, ids=_REACH_ROOT_IDS)
-def test_the_harness_and_test_scans_actually_cover_something(
-    label: str, root: Path, floor: int, pinned: str
+@pytest.mark.parametrize(("label", "root", "floor", "pins"), _REACH_ROOTS, ids=_REACH_ROOT_IDS)
+def test_every_reach_scan_actually_covers_something(
+    label: str, root: Path, floor: int, pins: tuple[str, ...]
 ) -> None:
-    """PRINT AND PIN WHAT WAS SCANNED, the same positive control the three walks above carry.
+    """PRINT AND PIN WHAT WAS SCANNED, the same positive control the scripts walks carry.
 
     A scan whose file list collapses to nothing reports a clean result forever, and this repository
     has produced a false zero on exactly this census before.
@@ -1079,17 +1091,18 @@ def test_the_harness_and_test_scans_actually_cover_something(
     assert len(found) >= floor, (
         f"only {len(found)} files under {label}/ -- the walk is not finding them"
     )
-    assert (root / pinned) in found, f"the walk under {label}/ lost its top-level {pinned}"
-    # The floor is blind to this under tests/, where 852 of 853 files sit at the top level. If the
-    # last nested file under a root is ever legitimately removed, this fails LOUDLY and points at
-    # the control rather than reporting a clean tree it never walked.
-    assert nested, (
-        f"the walk under {label}/ found no file below the top level -- it has stopped recursing"
-    )
+    for pin in pins:
+        assert (root / pin) in found, f"the walk under {label}/ lost {pin}"
+    # The pins must cover each shape the root actually has, or the row is blind to one breakage.
+    # Re-derived from what was found, so a row cannot quietly pin only the easy shape.
+    if len(nested) < len(found):
+        assert any(len(Path(pin).parts) == 1 for pin in pins), f"{label}: pin a top-level file"
+    if nested:
+        assert any(len(Path(pin).parts) > 1 for pin in pins), f"{label}: pin a nested file"
 
 
 @pytest.mark.parametrize(("label", "root"), _REACH_ROOT_PATHS, ids=_REACH_ROOT_IDS)
-def test_no_harness_or_test_module_puts_an_unencodable_character_on_a_console(
+def test_no_module_under_a_reach_root_puts_an_unencodable_character_on_a_console(
     label: str, root: Path
 ) -> None:
     """The gate: a console-bound literal stays cp1252-safe unless its own file hardens stdout."""
@@ -1103,11 +1116,39 @@ def test_no_harness_or_test_module_puts_an_unencodable_character_on_a_console(
 
 
 @pytest.mark.parametrize(("label", "root"), _REACH_ROOT_PATHS, ids=_REACH_ROOT_IDS)
-def test_every_harness_and_test_module_decodes_as_utf8_and_parses(label: str, root: Path) -> None:
-    """Never a silent skip. A file that will not parse makes ``_printed_unencodable`` return an
-    empty list that is indistinguishable from a clean one, which is the false zero in miniature."""
+def test_every_module_under_a_reach_root_decodes_as_utf8_and_parses(label: str, root: Path) -> None:
+    """Never a silent skip. A file that will not decode is the likeliest to carry the bytes this gate
+    hunts, and a file that will not parse makes ``_printed_unencodable`` return an empty list that is
+    indistinguishable from a clean one, which is the false zero in miniature."""
     broken = _scan_root(root).unreadable
     assert not broken, f"modules under {label}/ the scan could not read:\n  " + "\n  ".join(broken)
+
+
+@pytest.mark.parametrize(("label", "root", "floor", "pins"), _REACH_ROOTS, ids=_REACH_ROOT_IDS)
+def test_a_glyph_planted_in_a_real_file_of_each_root_is_caught(
+    label: str, root: Path, floor: int, pins: tuple[str, ...]
+) -> None:
+    """THE POSITIVE CONTROL FOR EACH ROOT'S ZERO. Seven of these roots measured zero hits the day
+    they were brought in, and a zero is only evidence if the same decision, on that root's own real
+    text, can say something else. So a print carrying U+2192 is appended to each pinned file's real
+    text and driven through ``_classify``, the function the gate uses on the file itself.
+
+    The verdict may be ``offender`` or ``exempted`` -- a pinned entry point that calls the chokepoint
+    is exempt by design -- but it must name the planted line. ``None`` means the detector did not
+    see a console-bound glyph in a real file of this root, and every green above would be vacuous.
+    """
+    arrow = chr(0x2192)
+    for pin in pins:
+        real = (root / pin).read_text(encoding="utf-8")
+        before = _classify(pin, real)
+        assert before is None or before[0] != "unreadable", before
+        # real + "\n" puts a blank line after the file's last line, so the print is two lines on.
+        planted_line = real.count("\n") + 2
+        planted = real + "\n" + 'print("depth ' + arrow + ' 3")\n'
+        assert (planted_line, arrow) in _console_hits(ast.parse(planted)), f"{label}/{pin}"
+        verdict = _classify(pin, planted)
+        assert verdict is not None, f"{label}/{pin}: the planted glyph was not seen"
+        assert verdict[0] in ("offender", "exempted"), f"{label}/{pin}: {verdict[1]}"
 
 
 def test_this_module_is_not_exempt_from_its_own_gate() -> None:
