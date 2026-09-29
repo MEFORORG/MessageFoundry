@@ -208,7 +208,8 @@ _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 class BackupError(RuntimeError):
     """A backup run failed at a named phase (``snapshot``/``encrypt``/``write``/``verify``/
-    ``destination``). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
+    ``destination``). The same alert also carries kind ``cleanup``, for a good run whose staging
+    could not be cleared (see :attr:`BackupResult.staging_leftover`). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
     record it in the ``dr_backup`` ERROR audit row — the message is the ``safe_exc``-scrubbed cause
     (PHI-free)."""
 
@@ -477,10 +478,18 @@ class BackupRunner:
         # a sibling engine shard's live run survives it. Both run off the loop.
         staging_root, secure = self._staging_root(dest_dir)
         await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
+        loop = asyncio.get_running_loop()
+        opening = loop.run_in_executor(
+            None,
+            functools.partial(_open_staging, staging_root, _BACKUP_STAGING_PREFIX, secure=secure),
+        )
         try:
-            work = await asyncio.to_thread(
-                _open_staging, staging_root, _BACKUP_STAGING_PREFIX, secure=secure
-            )
+            work = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            # The open may still land after this cancel. Release it then, or its lock would stay held
+            # and its directory would look live to every sweep for the life of the process.
+            opening.add_done_callback(_release_when_opened)
+            raise
         except OSError as exc:
             raise BackupError(
                 "write",
@@ -542,12 +551,16 @@ class BackupRunner:
             # Submitted to the executor at once and shielded: a second cancellation must not cancel
             # the release before it starts, which would leave the lock held and the directory
             # looking live to every sweep for the life of the process.
-            release = asyncio.get_running_loop().run_in_executor(
+            release = loop.run_in_executor(
                 None, functools.partial(work.release, unless_claimed=True)
             )
             leftover = await asyncio.shield(release)
-            if leftover is not None:
-                exc.add_note(leftover)
+            if leftover is None:
+                raise
+            if isinstance(exc, BackupError):
+                # First, so the 200-character cut the failure record applies keeps the directory.
+                raise BackupError(exc.kind, f"{leftover}; the run failed: {exc}") from exc
+            exc.add_note(leftover)
             raise
 
         verify: VerifyResult | None = None
@@ -562,8 +575,9 @@ class BackupRunner:
         except BackupError as exc:
             if staging_leftover is None:
                 raise
-            # The staging teardown failed too; that must not ride only in the log.
-            raise BackupError(exc.kind, f"{exc}; separately, {staging_leftover}") from exc
+            # The staging teardown failed too; that must not ride only in the log. It leads, so the
+            # 200-character cut the failure record applies keeps the directory.
+            raise BackupError(exc.kind, f"{staging_leftover}; the run failed: {exc}") from exc
 
         # keep-N prune runs only after that rename, so the candidate set contains this archive and
         # every earlier archive that also passed — and nothing that failed (AC-6).
@@ -771,8 +785,14 @@ class BackupRunner:
             )
         except BaseException as exc:
             leftover = work.release()
-            if leftover is not None:
-                exc.add_note(leftover)
+            if leftover is None:
+                raise
+            if isinstance(exc, OSError | BackupCodecError):
+                # Named in the error itself, first, so the audit row and the alert carry it; a note
+                # would not survive the loop wrapping this into a BackupError.
+                kind = "write" if isinstance(exc, OSError) else "encrypt"
+                raise BackupError(kind, f"{leftover}; the build failed: {safe_exc(exc)}") from exc
+            exc.add_note(leftover)
             raise
         return (*built, work.release())
 
@@ -876,8 +896,11 @@ class BackupRunner:
         for path in sorted(base.rglob("*")):
             if path.is_symlink() or not path.is_file():
                 continue
-            rel_parts = path.relative_to(base).parts
-            if any(_is_staging_dir_name(part) for part in rel_parts[:-1]):
+            if any(
+                _is_staging_dir(base / parent)
+                for parent in path.relative_to(base).parents
+                if parent != Path(".")
+            ):
                 # A data dir inside the config dir puts the backup's own staging there (BACKLOG
                 # #1174): its plaintext snapshot and the tar being written must not ride in the bundle.
                 continue
@@ -1469,8 +1492,10 @@ def _lock_exclusive(fd: int, *, wait: bool) -> bool:
         os.lseek(fd, 0, os.SEEK_SET)
         try:
             msvcrt.locking(fd, msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
-        except OSError:
-            if wait:
+        except OSError as exc:
+            # A held range refuses with EACCES, or EDEADLOCK, the CRT's other contention code (the
+            # same reading as `api/tls.py`). Anything else is a real fault and propagates.
+            if wait or exc.errno not in (errno.EACCES, errno.EDEADLOCK):
                 raise
             return False
         return True
@@ -1478,7 +1503,7 @@ def _lock_exclusive(fd: int, *, wait: bool) -> bool:
 
     try:
         fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         if wait:
             raise
         return False
@@ -1561,6 +1586,14 @@ def _teardown_staging(path: Path) -> str | None:
     return leftover
 
 
+def _release_when_opened(opening: asyncio.Future[_Staging]) -> None:
+    """Done-callback for an open whose awaiter was cancelled: release what it opened, off the loop."""
+    if opening.cancelled() or opening.exception() is not None:
+        return
+    work = opening.result()
+    asyncio.get_running_loop().run_in_executor(None, work.release)
+
+
 def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
     """Create a staging directory under ``root`` and take its lock before anything is written there.
 
@@ -1604,9 +1637,13 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
     return _Staging(path, fd, secure=secure)
 
 
-def _is_staging_dir_name(name: str) -> bool:
-    """Whether a directory name is one this module stages in."""
-    return name.startswith(_SWEPT_PREFIXES) or name == _SERVER_DB_STAGING_DIR
+def _is_staging_dir(path: Path) -> bool:
+    """Whether ``path`` is a directory this module stages in: ``.mefor-staging``, or a prefixed
+    directory holding a lock file. The lock file is what keeps an operator's own directory that
+    happens to share a prefix, such as ``codesets/mefor-verify-maps``, in the config bundle."""
+    if path.name == _SERVER_DB_STAGING_DIR:
+        return True
+    return path.name.startswith(_SWEPT_PREFIXES) and os.path.lexists(path / _LOCK_NAME)
 
 
 def _secure_staged(path: Path, secure: bool) -> None:
@@ -1683,11 +1720,17 @@ def _sweep_abandoned_staging(root: Path) -> int:
         finally:
             _unlock_and_close(fd)
         leftover = _teardown_staging(path)
-        if leftover is None:
+        if leftover is not None:
+            log.error("DR backup: an abandoned staging directory survived the sweep: %s", leftover)
+        elif os.path.lexists(path):
+            log.warning(
+                "DR backup: emptied abandoned staging directory %s but could not remove it; the next "
+                "backup retries it",
+                path,
+            )
+        else:
             swept += 1
             log.info("DR backup: removed abandoned staging directory %s", path)
-        else:
-            log.error("DR backup: an abandoned staging directory survived the sweep: %s", leftover)
     return swept
 
 
@@ -2205,12 +2248,9 @@ def _extract_member(
             return None
         streamed = 0
         with open(out, "wb") as fh:
-            if secure:
-                # Reuse the store's own PHI-at-rest primitive, on the empty file, before any of the
-                # member's bytes reach it.
-                from messagefoundry.store.store import _secure_file
-
-                _secure_file(out)
+            # Reuse the store's own PHI-at-rest primitive, on the empty file, before any of the
+            # member's bytes reach it.
+            _secure_staged(out, secure)
             while True:
                 buf = src.read(1024 * 1024)
                 if not buf:

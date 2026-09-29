@@ -468,6 +468,10 @@ async def test_a_config_dir_holding_the_data_dir_does_not_bundle_the_staging(
     key = generate_key()
     store = await _keyed_store(cfg, key)
     (cfg / "connections.toml").write_text("# synthetic\n", encoding="utf-8")
+    # An operator's own directory that merely shares a prefix, with no lock file, stays in.
+    lookalike = cfg / "codesets" / "mefor-verify-maps"
+    lookalike.mkdir(parents=True)
+    (lookalike / "map.csv").write_text("a,b\n", encoding="utf-8")
     runner = BackupRunner(
         store,
         BackupSettings(enabled=True, destination=str(tmp_path / "dest")),
@@ -486,7 +490,42 @@ async def test_a_config_dir_holding_the_data_dir_does_not_bundle_the_staging(
     with tarfile.open(tar_path, "r:") as tar:
         names = tar.getnames()
     assert "config/connections.toml" in names
-    assert not [n for n in names if "mefor-backup-" in n or "mefor-verify-" in n], names
+    staged = [n for n in names if "mefor-backup-" in n or "mefor-verify-" in n]
+    assert staged == ["config/codesets/mefor-verify-maps/map.csv"], names
+
+
+async def test_a_failed_build_names_its_leftover_in_the_audited_error(
+    tmp_path, monkeypatch
+) -> None:
+    """When the build fails AND its teardown leaves plaintext, the error the audit row records names
+    the directory first, so the 200-character cut of the failure record cannot drop it."""
+    import json
+
+    data_dir = tmp_path / "data"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    real_teardown = dr_backup._teardown_staging
+    leftover = "the plaintext staging directory SYNTHETIC-DIR could not be removed"
+
+    def teardown_fails(path: Path) -> str | None:
+        real_teardown(path)
+        return leftover
+
+    def boom(*_a: object, **_kw: object) -> None:
+        raise OSError("synthetic write failure " + "x" * 300)
+
+    monkeypatch.setattr(dr_backup, "_teardown_staging", teardown_fails)
+    monkeypatch.setattr(dr_backup, "encrypt_stream", boom)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0)
+        rows = [r for r in await store.list_audit(limit=10) if r["action"] == "dr_backup"]
+    finally:
+        await store.close()
+    assert caught.value.kind == "write"
+    assert str(caught.value).startswith(leftover)
+    (row,) = rows
+    assert "SYNTHETIC-DIR" in json.loads(row["detail"])["error"]
 
 
 async def test_a_staging_leftover_after_a_good_build_is_alerted_and_audited(

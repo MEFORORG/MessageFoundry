@@ -6976,6 +6976,8 @@ def _backup(args: argparse.Namespace) -> int:
         "verify": result.verify.status if result.verify is not None else "skipped",
         "pruned": result.pruned,
     }
+    if result.staging_leftover is not None:  # BACKLOG #1174: a good archive, plaintext left behind
+        payload["staging_leftover"] = result.staging_leftover
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -6984,6 +6986,8 @@ def _backup(args: argparse.Namespace) -> int:
             f"  encrypted={result.encrypted} config_only={result.config_only} key_id={result.key_id}"
         )
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
+        if result.staging_leftover is not None:
+            print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
     return 0
 
 

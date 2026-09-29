@@ -243,7 +243,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   is removed by the next backup, which goes by each directory's lock and never by its age, so a
   sibling engine shard's live run survives it; nothing is swept at `serve` start. When a good
   backup's staging cannot be cleared, the run still succeeds, raises a `backup_failed` alert of kind
-  `cleanup`, and names the directory in its audit row. Staging now needs free space on the data
+  `cleanup`, and names the directory in its audit row and in the `backup` command's output. Staging now needs free space on the data
   volume (about twice the store while it runs), and a standalone `restore-verify` needs write access
   to the data directory, or on a server-DB box to the archive's own directory. The archive key is
   now picked by comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and
