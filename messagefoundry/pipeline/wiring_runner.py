@@ -772,11 +772,14 @@ class _ItemOutcome(Enum):
     STOPPED = "stopped"
 
 
-# Which direction's operator hold a STOPPED lane on each pooled stage belongs to. RESPONSE is absent
-# because no operator-required STOP happens there (its only STOP is the missing-inbound exit).
+# Which direction's operator hold a STOPPED lane on each pooled stage belongs to. A RESPONSE lane is
+# a loopback inbound's re-ingress, so it is the inbound's. Its T16 STOP (the missing-inbound exit)
+# needs no operator, but the dispatcher's own T17 and claimer-death bounds do. A #122 log halt turns
+# that STOPPED lane PAUSED, and the window open's start_inbound then resumed it (BACKLOG #2072).
 _HOLD_DIRECTION: dict[Stage, Direction] = {
     Stage.INGRESS: "inbound",
     Stage.ROUTED: "inbound",
+    Stage.RESPONSE: "inbound",
     Stage.OUTBOUND: "outbound",
 }
 
@@ -2955,8 +2958,9 @@ class RegistryRunner:
         bound (``infra_fault_policy="stop"``) and the #2074 claimer-death bound. Unheld, the scheduler
         parked such an outbound at the window close (a pause turns STOPPED into PAUSED) and resumed
         it at the next open, retrying the fault the STOP was bounding; an inbound's listener came
-        back up over a lane nothing drains (BACKLOG #2072). None for a stage with no hold direction
-        (RESPONSE)."""
+        back up over a lane nothing drains (BACKLOG #2072). A RESPONSE lane is held as its loopback
+        inbound, so a window open cannot resume it through that inbound's start. None for a stage
+        with no hold direction."""
         kind = _HOLD_DIRECTION.get(stage)
         if kind is None:
             return None

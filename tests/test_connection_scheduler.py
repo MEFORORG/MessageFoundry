@@ -28,6 +28,7 @@ from messagefoundry.config.models import (
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
+    Loopback,
     Registry,
     Send,
     build_inbound_connection,
@@ -529,6 +530,76 @@ async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
         # re-claims anything.
         runner.notify_work()
         assert ("outbound", "OB_SCHED") not in runner._stop_held
+        await _wait_until(lambda: attempts == 2)
+    finally:
+        await runner.stop()
+
+
+async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_window(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR 1811 review, on BACKLOG #2072. The T17 bound can STOP a pooled RESPONSE lane (a loopback's
+    # re-ingress), and _HOLD_DIRECTION had no entry for RESPONSE, so that STOP was not held. A window
+    # open can re-arm it: a #122 log halt pauses the loopback's internal lanes, which turns STOPPED
+    # into PAUSED, and once another connection's restart clears the halt latch, the window open's
+    # start_inbound resumes every PAUSED lane of that loopback. The fault was then retried.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB_LOOP", Loopback(), router="r", schedule=schedule))
+    reg.add_inbound(build_inbound_connection("IB_TWO", MLLP(port=_free_port()), router="r"))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        claim_mode="pooled",
+        alert_sink=_LogPageSink(),
+        infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
+        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+    )
+    attempts = 0
+
+    async def _infra_fault(name: str, item: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("store handoff fault")
+
+    await runner.start()
+    try:
+        runner._process_response_item = _infra_fault  # type: ignore[method-assign,assignment]
+        # A reply captured on some other hop and owed to the loopback: one RESPONSE-stage row.
+        await store.enqueue_message(channel_id="IB_REAL", raw=RAW, deliveries=[("OB_X", RAW)])
+        item = (await store.claim_ready(destination_name="OB_X"))[0]
+        await store.complete_with_response(
+            item.id, body=RAW, outcome="accepted", reingress_to="IB_LOOP"
+        )
+        runner.notify_work()
+        response = runner._dispatchers[Stage.RESPONSE]
+        await _wait_until(lambda: response.stopped("IB_LOOP"))
+        assert attempts == 1
+
+        guard = _DeadLogGuard()
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        assert response.paused("IB_LOOP")  # the halt overwrote STOPPED
+        guard.writable = True
+        await runner.restart_inbound("IB_TWO")  # clears the process-wide latch
+        assert not runner._delivery_halted
+
+        await runner._reconcile_schedule("IB_LOOP", "inbound", schedule)  # still in window
+        await asyncio.sleep(0.3)  # time for a re-armed lane to claim the re-pended head
+
+        assert attempts == 1  # the lane was not re-armed, so the fault was not retried
+        assert not runner.inbound_running("IB_LOOP")
+
+        # Control: the operator restarts the loopback, a real re-arm. It lifts the hold and the head
+        # is claimed again. Without this arm, "one attempt" could mean a lane that never re-claims.
+        await runner.restart_inbound("IB_LOOP")
+        assert ("inbound", "IB_LOOP") not in runner._stop_held
         await _wait_until(lambda: attempts == 2)
     finally:
         await runner.stop()

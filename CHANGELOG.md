@@ -608,7 +608,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
   pause the stopped lane and the next open resume it, retrying the fault every window. The
   dispatcher now reports the STOPs it decides itself to the runner, which holds the lane until a
-  real re-arm.
+  real re-arm. A loopback's re-ingress lane is held too, as its inbound: after a log-write halt, a
+  window open would have resumed that stopped lane.
   (`BACKLOG #2072`)
 - **The scheduler no longer starts a connection the DR run-profile parked.** A window open called
   the same start an operator uses, which reads as overriding the profile. On a DR box it would have
