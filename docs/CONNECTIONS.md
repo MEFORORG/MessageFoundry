@@ -2463,7 +2463,11 @@ openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old
 
 **A PKCS#12 bundle for `cert import`** must have PBES2 bags at the floor and a **PBMAC1** MAC at
 the floor. A MAC keyed by the PKCS#12 KDF is refused even over SHA-256, and that is what most
-exports carry, OpenSSL's default included. Re-export with OpenSSL 3.4 or later:
+exports carry, OpenSSL's default included. **The MAC rule holds when the bags are not encrypted**
+(`-keypbe NONE -certpbe NONE`): that MAC still runs the passphrase through the PKCS#12 KDF, so it is
+refused too. So is `cryptography`'s `NoEncryption` output, whose MAC uses an empty passphrase. An
+unencrypted bundle with no MAC at all (`-nomac`) passes with no passphrase, since nothing in it
+comes from a password. Re-export with OpenSSL 3.4 or later:
 
 ```
 openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC -iter 600000 -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 -in <cert> -inkey <key> -out <new pfx>

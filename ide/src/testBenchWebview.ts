@@ -22,6 +22,7 @@ export function testBenchScript(token: string): string {
     let sbs = (vscode.getState() || {}).sbs || false; // remembered layout choice
     let traceMode = (vscode.getState() || {}).traceMode || 'coverage'; // 'coverage' | 'profile'
     let lastTrace = null; // the most recent trace detail, so the toggle can re-render it
+    let wantCase = null; // the run case the developer last asked to see, as { run, index }; null: none
 
     // Stringifies first, so a number reaching innerHTML goes through the same escape as a string.
     // Quotes too, matching the host-side esc(): a value must not be able to leave an attribute.
@@ -73,11 +74,11 @@ export function testBenchScript(token: string): string {
         isArrOf(m.dump.lines, (l) => isObj(l) && isCount(l.offset) && isStr(l.ascii) &&
           isArrOf(l.hex, (h) => isStr(h) && HEX_PAIR.test(h)) && l.hex.length <= m.dump.bytesPerRow),
       collections: (m) => isArrOf(m.items, (c) => isObj(c) && isStr(c.name) && isCount(c.cases)),
-      collectionRun: (m) => isStr(m.name) && isCount(m.passed) && isCount(m.total) &&
-        isArrOf(m.results, (r) => isObj(r) && isStr(r.name) && isBool(r.pass) && isStr(r.disposition) &&
-          (r.error === null || isStr(r.error)) &&
-          isArrOf(r.deliveries, (d) => isObj(d) && isStr(d.to) && isStr(d.status) &&
-            isArrOf(d.differences, isFieldDifference))),
+      collectionRun: (m) => isStr(m.name) && isCount(m.run) && isCount(m.passed) && isCount(m.total) &&
+        isArrOf(m.results, (r) => isObj(r) && isStr(r.name) && isBool(r.pass) && isStr(r.disposition)),
+      caseDetail: (m) => isCount(m.run) && isCount(m.index) && (m.error === null || isStr(m.error)) &&
+        isArrOf(m.deliveries, (d) => isObj(d) && isStr(d.to) && isStr(d.status) &&
+          isArrOf(d.differences, isFieldDifference)),
     };
     function shapeOk(m){
       const check = isStr(m.type) && Object.prototype.hasOwnProperty.call(SHAPES, m.type) ? SHAPES[m.type] : null;
@@ -232,23 +233,70 @@ export function testBenchScript(token: string): string {
         '<span class="del">' + (esc(d.before) || '∅') + '</span> &rarr; ' +
         '<span class="ins">' + (esc(d.after) || '∅') + '</span></div>';
     }
+    // RUN VIEW: pass or fail per case, and one case's values at a time on a click (ADR 0121, "Reveal
+    // on click"). The DOM keys cases on their index, never on a name.
     function renderCollectionRun(msg){
-      const cases = msg.results.map((r) => {
+      wantCase = null;
+      const cases = msg.results.map((r, i) => {
         const badge = r.pass ? '<span class="badge pass">PASS</span>' : '<span class="badge fail">FAIL</span>';
-        const failNotes = r.pass ? '' : r.deliveries.map((d) => {
-          if (d.status === 'missing') return '<div class="diffs">Expected delivery to <code>' + esc(d.to) + '</code> was not produced.</div>';
-          if (d.status === 'unexpected') return '<div class="diffs">Unexpected delivery to <code>' + esc(d.to) + '</code>.</div>';
-          if (d.status === 'mismatch') return '<div class="diffs">To <code>' + esc(d.to) + '</code>:' + d.differences.map(diffLine).join('') + '</div>';
-          return '';
-        }).join('');
-        const err = r.error ? '<div class="diffs">' + esc(r.error) + '</div>' : '';
         return '<div class="case"><div class="hd">' + badge + '<span class="cn">' + esc(r.name) +
-          '</span><span class="note">' + esc(r.disposition) + '</span></div>' + err + failNotes + '</div>';
+          '</span><span class="note">' + esc(r.disposition) + '</span>' +
+          '<button id="case-btn-' + i + '" data-case-detail="' + i + '" aria-expanded="false" aria-controls="case-slot-' + i +
+          '" aria-label="Details for ' + esc(r.name) + '">Details</button></div>' +
+          '<div id="case-slot-' + i + '"></div></div>';
       }).join('');
       const allPass = msg.passed === msg.total;
       const summary = '<span class="badge ' + (allPass ? 'pass' : 'fail') + '">' + esc(msg.passed) + ' / ' + esc(msg.total) + ' passed</span>';
-      detail.innerHTML = '<h3>Run — ' + esc(msg.name) + ' &nbsp; ' + summary + '</h3>' + cases;
+      detail.innerHTML = '<div class="run" data-run="' + esc(msg.run) + '"><h3>Run — ' + esc(msg.name) + ' &nbsp; ' + summary + '</h3>' + cases + '</div>';
       showDetailView();
+      const run = msg.run;
+      for (const b of detail.querySelectorAll('button[data-case-detail]')) {
+        const index = Number(b.dataset.caseDetail);
+        b.addEventListener('click', () => {
+          // A click on the case already open closes it. A click on one still waiting asks again.
+          const open = wantCase && wantCase.run === run && wantCase.index === index;
+          const slot = open ? caseSlot(run, index) : null;
+          if (slot && slot.innerHTML) { closeCase(); return; }
+          closeCase();
+          wantCase = { run, index };
+          vscode.postMessage({ command: 'caseDetail', run, index });
+        });
+      }
+    }
+    // Clear the one case on show, if any, and forget the request for it.
+    function closeCase(){
+      if (wantCase) {
+        const slot = caseSlot(wantCase.run, wantCase.index);
+        if (slot) slot.innerHTML = '';
+        const btn = caseButton(wantCase.run, wantCase.index);
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      }
+      wantCase = null;
+    }
+    // The slot or button for one case of one run, or null when the view no longer shows that run.
+    // Looked up by id and compared as numbers, so no key is ever parsed as a selector.
+    function runOnScreen(run){
+      const view = detail.querySelector('.run');
+      return !!view && Number(view.dataset.run) === run;
+    }
+    function caseSlot(run, index){ return runOnScreen(run) ? document.getElementById('case-slot-' + index) : null; }
+    function caseButton(run, index){ return runOnScreen(run) ? document.getElementById('case-btn-' + index) : null; }
+    function renderCaseDetail(m){
+      // Only the reply to the latest request renders: a reply for a case since closed or replaced,
+      // or for a run no longer on screen, is dropped.
+      if (!wantCase || wantCase.run !== m.run || wantCase.index !== m.index) return;
+      const slot = caseSlot(m.run, m.index);
+      if (!slot) return;
+      const notes = m.deliveries.map((d) => {
+        if (d.status === 'missing') return '<div class="diffs">Expected delivery to <code>' + esc(d.to) + '</code> was not produced.</div>';
+        if (d.status === 'unexpected') return '<div class="diffs">Unexpected delivery to <code>' + esc(d.to) + '</code>.</div>';
+        if (d.status === 'mismatch') return '<div class="diffs">To <code>' + esc(d.to) + '</code>:' + d.differences.map(diffLine).join('') + '</div>';
+        return '';
+      }).join('');
+      const err = m.error ? '<div class="diffs">' + esc(m.error) + '</div>' : '';
+      slot.innerHTML = (err + notes) || '<div class="diffs">No differences.</div>';
+      const btn = caseButton(m.run, m.index);
+      if (btn) btn.setAttribute('aria-expanded', 'true');
     }
 
     function saveState(){ vscode.setState({ sbs, traceMode }); }
@@ -257,6 +305,7 @@ export function testBenchScript(token: string): string {
     document.getElementById('collections').addEventListener('click', () => vscode.postMessage({ command: 'listCollections' }));
     document.getElementById('savecoll').addEventListener('click', () => vscode.postMessage({ command: 'saveCollection' }));
     back.addEventListener('click', () => {
+      closeCase(); // a revealed case's values do not stay behind in the hidden view
       detail.style.display='none'; results.style.display=''; lastTrace=null;
       back.hidden=true; layout.hidden=true; tracetoggle.hidden=true;
     });
@@ -282,6 +331,8 @@ export function testBenchScript(token: string): string {
         console.warn('MessageFoundry Test Bench: discarded a malformed "' + String(m.type) + '" message');
         return;
       }
+      // Any other view replaces the run view, so a case request made there is no longer wanted.
+      if (m.type !== 'caseDetail') wantCase = null;
       if (m.type === 'detail') {
         const diff = m.diff;
         detail.innerHTML =
@@ -318,6 +369,8 @@ export function testBenchScript(token: string): string {
         renderCollections(m.items);
       } else if (m.type === 'collectionRun') {
         renderCollectionRun(m);
+      } else if (m.type === 'caseDetail') {
+        renderCaseDetail(m);
       }
     });
   `;

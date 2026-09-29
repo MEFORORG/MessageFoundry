@@ -2,11 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Static-manifest policy guards for the NSSM integrity-verify path (DEPLOY-7).
 
-``install-service.ps1`` auto-downloads a pinned NSSM release when nssm is absent from PATH, then
-verifies it against a hard-coded SHA-256 before trusting the binary. That download + hash + extract
-runs only on Windows when nssm is missing, so it can't execute under pytest here (it's a
-ci-leg-to-add: exercise ``Resolve-Nssm`` on a runner with nssm stripped from PATH — a Pester test or
-the windows-service-smoke job). What IS unit-testable off-Windows is the *static shape* of the
+``install-service.ps1`` auto-downloads a pinned NSSM release when no checked copy is available,
+then verifies it against a hard-coded SHA-256 before trusting the binary. That download + hash +
+extract runs only on Windows, so it can't execute under pytest here (the windows-service-smoke job
+runs it, since the runner's PATH nssm does not match the binary pin). ``Resolve-Nssm``'s choice of
+source is exercised in ``tests/test_nssm_pin.py`` (BACKLOG #2364). What IS unit-testable off-Windows is the *static shape* of the
 integrity policy, which is the load-bearing part: a blanked/malformed pin or a mismatch branch
 downgraded from ``throw`` to ``Write-Warning`` is a silent fail-open of supply-chain verification.
 
@@ -379,41 +379,54 @@ def test_ordinary_nssm_failures_still_name_their_arguments(tmp_path: Path) -> No
     assert "exit 3" in ordinary, "the failure message must carry nssm's exit code"
 
 
-def test_the_password_call_site_passes_the_secret_by_name(tmp_path: Path) -> None:
-    """CALL-SITE guard: a correct Invoke-Nssm is no use if ObjectName still passes the password
-    positionally. Located by AST, so a reordering or a rename of the local does not walk past it."""
+def test_the_password_reaches_the_scm_only_as_a_securestring(tmp_path: Path) -> None:
+    """CALL-SITE guard for the run-as password (BACKLOG #1573, #2364).
+
+    The account is set through Set-ServiceAccount, not `nssm set ObjectName`: NSSM 2.24 refuses a
+    virtual account ("Setting ObjectName requires both a username and password", exit 6, CI run
+    36590581708). The password must reach that function as the -ServiceAccountPassword SecureString,
+    by name, and be turned into plaintext nowhere at the script's top level. Located by AST.
+    """
     assert _SCRIPT is not None
     body = """
   $cmds = @($ast.FindAll({ $args[0] -is
       [System.Management.Automation.Language.CommandAst] }, $true) | Where-Object {
-      $_.GetCommandName() -eq 'Invoke-Nssm' })
-  @($cmds | ForEach-Object {
-    $els = @($_.CommandElements | ForEach-Object { $_.Extent.Text })
-    [pscustomobject]@{ text = $_.Extent.Text; elements = $els }
-  }) | ConvertTo-Json -Depth 4 -Compress
+      $_.GetCommandName() -in @('Invoke-Nssm', 'Set-ServiceAccount') })
+  $fn = $ast.Find({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq 'Set-ServiceAccount' }, $true)
+  $bstr = @($ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+      $args[0].Member.Extent.Text -eq 'PtrToStringBSTR' }, $true))
+  [pscustomobject]@{
+    calls = @($cmds | ForEach-Object {
+      [pscustomobject]@{ name = $_.GetCommandName(); text = $_.Extent.Text
+                         elements = @($_.CommandElements | ForEach-Object { $_.Extent.Text }) } })
+    fnStart = $(if ($fn) { $fn.Extent.StartOffset } else { -1 })
+    fnEnd = $(if ($fn) { $fn.Extent.EndOffset } else { -1 })
+    plaintext = @($bstr | ForEach-Object { $_.Extent.StartOffset })
+  } | ConvertTo-Json -Depth 5 -Compress
 """
-    raw = _ok(_extract(_SCRIPT, [], body), tmp_path)
-    calls = json.loads(raw.strip().splitlines()[-1])
-    if isinstance(calls, dict):
-        calls = [calls]
-    objectname = [c for c in calls if "ObjectName" in c["elements"]]
-    assert objectname, "no Invoke-Nssm call sets ObjectName -- the run-as account is not configured"
-    secret_calls = [c for c in objectname if "-Secret" in c["elements"]]
-    assert len(secret_calls) == 1, (
-        "exactly one ObjectName call passes the password, and it must pass it as -Secret "
-        f"(BACKLOG #1573); found {len(secret_calls)} of {len(objectname)} ObjectName calls:\n"
-        + "\n".join(c["text"] for c in objectname)
+    facts = json.loads(_ok(_extract(_SCRIPT, [], body), tmp_path).strip().splitlines()[-1])
+    calls = facts["calls"]
+    assert not [c for c in calls if c["name"] == "Invoke-Nssm" and "ObjectName" in c["elements"]], (
+        "an Invoke-Nssm call still sets ObjectName, which NSSM 2.24 refuses for a virtual account"
     )
-    # The password local must appear EXACTLY ONCE on that call, and only as -Secret's argument. A
-    # second occurrence would be a positional argument, which lands in $NssmArgs and is joined into
-    # the message -- the leak, restored beside a fix that looks applied.
-    elements = secret_calls[0]["elements"]
-    secret_at = elements.index("-Secret")
-    password_at = [i for i, e in enumerate(elements) if e == "$plain"]
-    assert password_at == [secret_at + 1], (
-        "the password local must appear exactly once on the ObjectName call, as the argument to "
-        f"-Secret; a second (positional) occurrence is joined into the failure message:\n"
-        f"{secret_calls[0]['text']}"
+    with_password = [
+        c for c in calls if c["name"] == "Set-ServiceAccount" and "-Password" in c["elements"]
+    ]
+    assert len(with_password) == 1, (
+        f"exactly one Set-ServiceAccount call passes the password; found {len(with_password)}"
+    )
+    elements = with_password[0]["elements"]
+    assert elements[elements.index("-Password") + 1] == "$ServiceAccountPassword", (
+        "the password must be passed as the SecureString parameter, not a plaintext local: "
+        + with_password[0]["text"]
+    )
+    assert facts["fnStart"] >= 0, "CONTROL FAILED: Set-ServiceAccount is not defined"
+    outside = [o for o in facts["plaintext"] if not (facts["fnStart"] <= o < facts["fnEnd"])]
+    assert facts["plaintext"] and not outside, (
+        "the SecureString is turned into plaintext outside Set-ServiceAccount, where a message or "
+        "an $Error record could carry it"
     )
 
 
@@ -808,7 +821,7 @@ def _sole_call(facts: dict, name: str) -> dict:
 def test_every_path_parameter_is_absolute_before_anything_consumes_it(tmp_path: Path) -> None:
     """Each of -DataDir, -AppExe, -Config, -DbPath is finalised BEFORE the Resolve-Nssm call.
 
-    Resolve-Nssm joins ``bin`` onto -DataDir and caches nssm.exe there; every later consumer
+    Resolve-Nssm is the first consumer of a normalized path (-NssmDir); every later consumer
     (Test-Path, the ACL grants, AppParameters) inherits whatever these hold. A normalization that
     runs after any of them is the #1554 defect in a new position.
     """
@@ -1182,14 +1195,14 @@ _ACL_CALLS = ["Set-SecureDataDirAcl", "Set-SecureConfigAcl", "Set-ConfigReadAcl"
 
 
 def _objectname_calls(facts: dict) -> list[dict]:
-    return [
-        c for c in facts["commands"] if c["name"] == "Invoke-Nssm" and "ObjectName" in c["text"]
-    ]
+    """The calls that set the run-as account. Set-ServiceAccount, through the SCM, since NSSM 2.24
+    refuses `set ObjectName` for a virtual account (BACKLOG #2364)."""
+    return [c for c in facts["commands"] if c["name"] == "Set-ServiceAccount"]
 
 
 def test_objectname_is_written_on_every_run_as_branch(tmp_path: Path) -> None:
     """Three branches set the run-as account -- password, password-less, and the LocalSystem opt-out
-    -- and all three must write ObjectName.
+    -- and all three must set the account (Set-ServiceAccount).
 
     The opt-out used to write nothing, on the reasoning that NSSM defaults to LocalSystem. That is
     true of a FRESH install only; on a rerun it leaves whatever account is already registered.
@@ -1242,7 +1255,7 @@ def test_the_localsystem_optout_writes_objectname_rather_than_leaving_it(tmp_pat
         if optout[0]["elseStart"] <= c["start"] < optout[0]["elseEnd"]
     ]
     assert inside, (
-        "the -AllowLocalSystem branch does not CALL nssm to set ObjectName, so a rerun over a "
+        "the -AllowLocalSystem branch does not CALL Set-ServiceAccount, so a rerun over a "
         "service already registered with another account leaves THAT account configured while the "
         "ACL block below strips its access (BACKLOG #1553)"
     )
