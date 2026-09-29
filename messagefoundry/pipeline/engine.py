@@ -1341,6 +1341,8 @@ class Engine:
                 self._monitored_certs,
                 self._cert_monitor_settings,
                 alert_sink=self._alert_sink,
+                # BACKLOG #299: a CRL a live hop loaded from a path no row names still gets judged.
+                watch_unlisted_held_crls=True,
             )
             self._cert_expiry_runner.start()
         # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and

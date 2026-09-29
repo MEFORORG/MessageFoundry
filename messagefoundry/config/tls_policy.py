@@ -250,7 +250,13 @@ def harden_verify_flags(ctx: ssl.SSLContext) -> None:
     ctx.verify_flags |= strict
 
 
-def harden_crl_check(ctx: ssl.SSLContext, crl_file: str, *, setting: str | None = None) -> None:
+def harden_crl_check(
+    ctx: ssl.SSLContext,
+    crl_file: str,
+    *,
+    setting: str | None = None,
+    record_held_copy: bool = True,
+) -> None:
     """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
@@ -307,8 +313,17 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str, *, setting: str | None 
     LAZILY during verification rather than at load time. So the ``>= 1`` assertion above -- which is
     exactly right for ``cafile=`` -- is not a valid liveness check for ``capath=`` and would reject
     a working configuration. Anyone adding ``capath=`` support needs a different proof that the
-    directory is real, not this one. That is why this loader stays ``cafile=``-only for now."""
+    directory is real, not this one. That is why this loader stays ``cafile=``-only for now.
+
+    **Each successful load is recorded against ``ctx`` (BACKLOG #299),** so the expiry monitor judges
+    the copy this context holds and not only the file, which an operator may replace without a
+    restart. :mod:`messagefoundry.config.loaded_crls` says why. Pass ``record_held_copy=False`` only
+    from a builder that makes a fresh context for every connection, so the file is what its next
+    handshake reads; the Postgres store is at least one such hop. The file is read again after the
+    load, and a file that changed in between refuses, so the record and the load agree."""
     from pathlib import Path
+
+    from messagefoundry.config.loaded_crls import record_crl_load
 
     # Name the setting the operator wrote, and no direction: this runs on listeners and on outbound
     # hops alike (BACKLOG #299). A caller that passes no setting gets the path alone, never a guess.
@@ -327,8 +342,9 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str, *, setting: str | None 
     # skipped: this is the load, so the block would be trusted.
     from messagefoundry.pki import read_every_crl_facts, soonest_crl
 
+    pem = path.read_bytes()
     try:
-        every = read_every_crl_facts(path.read_bytes(), now=time.time())
+        every = read_every_crl_facts(pem, now=time.time())
     except ValueError as exc:
         raise ValueError(f"{label}: {exc}") from exc
     facts = soonest_crl(every)
@@ -351,6 +367,21 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str, *, setting: str | None 
             "its CA setting. Remove the certificates and give this setting a bare CRL "
             "(BACKLOG #1890)"
         )
+    # BACKLOG #299: that load read the file a second time. A file replaced between the two reads
+    # would leave the context holding bytes the checks above never judged, and the held-copy record
+    # below describing the wrong copy. So refuse unless the file still holds the judged bytes. It
+    # runs after the #1890 check so a planted certificate is reported as that, not as a retry.
+    # It runs on every path, record or not: an unjudged expired or delta CRL is unsafe to load
+    # whether anything records it, and a per-connection builder simply fails that one connection.
+    try:
+        unchanged = path.read_bytes() == pem
+    except OSError as exc:
+        raise ValueError(f"{label} could not be read again after loading: {exc}") from exc
+    if not unchanged:
+        raise ValueError(
+            f"{label} changed while it was being loaded, so the CRL checked is not the one "
+            "loaded. Write a new file and rename it into place, then retry"
+        )
     loaded = stats.get("crl", 0)
     if loaded < 1:
         raise ValueError(
@@ -359,6 +390,8 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str, *, setting: str | None 
             "against, which refuses every peer rather than skipping the check"
         )
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    if record_held_copy:
+        record_crl_load(ctx, crl_file, pem, facts, setting=setting)
 
 
 def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
@@ -1345,8 +1378,9 @@ def assert_hvac_tls_suites(
     every connection: it loads requests' CA file onto the context each time and never unloads one, so
     a CA the operator removed from the file would stay trusted until restart. Several threads would
     also be changing one context while others handshake on it. So every TLS handshake with Vault
-    runs on a context narrowed and asserted one step before use. The adapter's
-    ``_narrowed_pool_classes`` names the proxy hops it leaves to urllib3.
+    runs on a context narrowed and asserted one step before use. That includes the TLS leg to an
+    ``https://`` proxy, which the adapter's ``_narrowed_pool_classes`` gives its own context from
+    this factory and checks after the handshake (BACKLOG #300, the proxy limb).
     ``tests/test_tls_cipher_assertion_sites.py`` captures the context at ``ssl_wrap_socket`` and
     requires it to be one the assertion ran on.
 

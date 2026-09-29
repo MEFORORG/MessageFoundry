@@ -272,7 +272,8 @@ jobs:
             tests/test_docs_cite_no_refused_config_keys.py
             tests/test_install_docs_pin_the_current_version.py
             tests/test_operator_docs_no_warning_sign.py
-            tests/test_docs_upstream_hop_ack.py"
+            tests/test_docs_upstream_hop_ack.py
+            tests/test_dangerous_functionality_doc.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
           # the ruling above says removing a guard is a different act from adding one. They were
           # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,
@@ -2376,7 +2377,9 @@ jobs:
           fi
           # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
           # or this workflow (engine-wide regressions are already covered by the `test` job + push-to-main).
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
+          # ci/locks/release-tools.lock is in because the image's builder stage installs from it
+          # (BACKLOG #1193), so a bump to it can break the image build.
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"

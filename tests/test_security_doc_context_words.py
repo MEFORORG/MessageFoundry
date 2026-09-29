@@ -23,9 +23,10 @@ What this module holds, and why each part is here:
 * **The refusal names the list.** The message a user sees used to say "application or vendor terms",
   which mis-described the list: several members are generic credential words. It must now name the
   deny-list by the heading a reader can search for.
-* **No setting adds a term.** Both documents say the list is fixed. Every setting reaches the
-  screen through ``PasswordPolicy``, so its field set is pinned: any new field reds here and sends
-  the author to check that claim.
+* **One setting adds terms, and none removes one.** Both documents say the shipped list is fixed
+  and that ``password_extra_context_words`` is the one way a site adds its own (BACKLOG #1132). Every
+  setting reaches the screen through ``PasswordPolicy``, so its field set is pinned: any new field
+  reds here and sends the author to check that claim.
 
 **What is deliberately NOT pinned.** ``docs/CONFIGURATION.md`` also says "five of the twelve are
 generic credential words". Nothing in code classifies the members, so that five cannot be derived:
@@ -51,7 +52,11 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.auth.policy import CONTEXT_WORDS, PasswordPolicy
+from messagefoundry.auth.policy import (
+    CONTEXT_WORDS,
+    EXTRA_CONTEXT_WORD_MIN_LENGTH,
+    PasswordPolicy,
+)
 from messagefoundry.config.settings import AuthSettings
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +68,8 @@ _HEADING = "**The context-word deny-list, in full.**"
 #: The name a reader searches for. The refusal message must carry it so a refused user can find
 #: the list in the documentation.
 _LIST_NAME = "context-word deny-list"
+#: The one setting through which a site adds its own terms (BACKLOG #1132).
+_SITE_TERMS_SETTING = "password_extra_context_words"
 #: The ``docs/CONFIGURATION.md`` row that republishes the count.
 _CONFIG_ROW_PREFIX = "| `password_check_context` |"
 
@@ -84,6 +91,8 @@ _POLICY_FIELDS = frozenset(
         "lockout_minutes",
         # ADR 0197: the escalating lock's ceiling. A lockout knob; it adds no context-word term.
         "lockout_max_minutes",
+        # BACKLOG #1132: a site's own terms. The ONE field that adds to the screen; it cannot remove.
+        "extra_context_words",
     }
 )
 #: The row's sub-count sentence, "five of the twelve are ...". Anchored on "are" so an unrelated
@@ -274,6 +283,29 @@ def test_configuration_row_spells_the_count() -> None:
     assert "CONTEXT_WORDS" in row, "the row should name CONTEXT_WORDS as where the list lives"
 
 
+def test_the_site_terms_row_states_the_floor_the_code_enforces() -> None:
+    """The ``password_extra_context_words`` row is the one place the docs state the site-term length
+    floor as a number; ``docs/SECURITY.md`` and the CHANGELOG link to it rather than restate it. So
+    the row's number is pinned to ``EXTRA_CONTEXT_WORD_MIN_LENGTH``, which policy.py derives from the
+    shortest shipped term. The row names the shipped list as ``CONTEXT_WORDS`` rather than by count,
+    so no total sits here for the count checks above to miss."""
+    rows = [
+        line
+        for line in _CONFIG_DOC.read_text(encoding="utf-8").splitlines()
+        if line.startswith(f"| `{_SITE_TERMS_SETTING}` |")
+    ]
+    assert len(rows) == 1, rows
+    stated = re.findall(r"at least \*\*(\d+)\*\* characters", rows[0])
+    assert stated == [str(EXTRA_CONTEXT_WORD_MIN_LENGTH)], (
+        f"the row states a floor of {stated}; the code enforces {EXTRA_CONTEXT_WORD_MIN_LENGTH}"
+    )
+    word = _count_word(len(CONTEXT_WORDS))
+    # A whole word only: "ten" must not match "often", and the row already says "one word". Digits
+    # are not checked, since the row's ASVS ids such as 6.2.11 would read as a count.
+    restated = re.search(rf"\b{word}\b", rows[0], re.IGNORECASE)
+    assert restated is None, f"the row restates the shipped count {word!r}; name CONTEXT_WORDS"
+
+
 def test_refusal_message_names_the_deny_list() -> None:
     clause = _refusal_clause()
     assert _LIST_NAME in clause, f"the refusal should name the {_LIST_NAME!r}: {clause!r}"
@@ -282,22 +314,59 @@ def test_refusal_message_names_the_deny_list() -> None:
     assert "vendor" not in clause.lower() and "application" not in clause.lower(), clause
 
 
-def test_no_setting_adds_or_removes_a_term() -> None:
-    """Both documents say the list is fixed in code and only switchable as a whole. A setting that
-    feeds terms in would make that false, so its arrival must red here and send the author to the
-    docs."""
+def test_one_setting_adds_terms_and_none_removes_one() -> None:
+    """Both documents say the shipped list is fixed in code, switchable only as a whole, and that
+    ``password_extra_context_words`` is the one way a site adds terms (BACKLOG #1132). A second
+    setting that feeds terms in, or one that takes them out, would make that false, so its arrival
+    must red here and send the author to the docs."""
     marker = re.compile(r"context|deny|term")
     settings_fields = {f for f in AuthSettings.model_fields if marker.search(f)}
-    assert settings_fields == {"password_check_context"}, settings_fields
+    assert settings_fields == {"password_check_context", _SITE_TERMS_SETTING}, settings_fields
+    # Both documents name the setting, so a reader can find it from either one.
+    assert f"`{_SITE_TERMS_SETTING}`" in _SECURITY_DOC.read_text(encoding="utf-8")
+    assert f"| `{_SITE_TERMS_SETTING}` |" in _CONFIG_DOC.read_text(encoding="utf-8")
+    # Additive by behaviour, not only by name: a site term set, every shipped term still refused.
+    policy = PasswordPolicy.from_settings(
+        AuthSettings(password_check_breached=False, password_extra_context_words=["sitetermq"])
+    )
+    assert policy.context_words == CONTEXT_WORDS | {"sitetermq"}
     # The name filter above misses a setting called, say, `password_blocklist_file`. Every setting
     # reaches the screen through PasswordPolicy.from_settings, so pin that dataclass's fields whole.
     policy_fields = {f.name for f in dataclasses.fields(PasswordPolicy)}
     assert policy_fields == _POLICY_FIELDS, (
         f"PasswordPolicy fields changed: added {sorted(policy_fields - _POLICY_FIELDS)}, removed "
         f"{sorted(_POLICY_FIELDS - policy_fields)}. docs/SECURITY.md and docs/CONFIGURATION.md both "
-        "say no setting adds a term to the context-word screen. If a new field does, change both "
+        "say only password_extra_context_words adds a term to the context-word screen. If a new "
+        "field does, change both "
         "documents; either way, update _POLICY_FIELDS"
     )
+
+
+def test_6_2_11_labels_the_context_words_and_not_the_username_screen() -> None:
+    """ASVS 6.2.11 reads "the documented list of context specific words is used". That is the
+    context-word list. The shipped artifacts once hung 6.2.11 on the username screen instead, and
+    tagged the list itself 6.2.5, the no-mandatory-composition rule (BACKLOG #1135). No ASVS 5.0
+    requirement names the username screen, so its label is gone rather than moved."""
+    source = (_ROOT / "messagefoundry" / "auth" / "policy.py").read_text(encoding="utf-8")
+    lines = source.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("CONTEXT_WORDS:"))
+    comment: list[str] = []
+    for line in reversed(lines[:at]):
+        if not line.startswith("#:"):
+            break
+        comment.append(line)
+    block = " ".join(comment)
+    assert "ASVS 6.2.11" in block, f"the CONTEXT_WORDS comment should cite ASVS 6.2.11: {block!r}"
+    assert "(ASVS 6.2.5)" not in block, block
+    check_username = [line for line in lines if line.strip().startswith("check_username:")]
+    assert len(check_username) == 1 and "6.2.11" not in check_username[0], check_username
+    config_rows = [
+        line
+        for line in _CONFIG_DOC.read_text(encoding="utf-8").splitlines()
+        if line.startswith("| `password_check_username` |")
+    ]
+    assert len(config_rows) == 1 and "(ASVS 6.2.11)" not in config_rows[0], config_rows
+    assert "Two further screens (ASVS 6.2.11" not in _SECURITY_DOC.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------------------------

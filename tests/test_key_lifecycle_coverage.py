@@ -143,6 +143,8 @@ _NO_KEY: dict[str, str] = {
     "client secret it presents is a credential governed by the rotation schedule, not key material",
     "messagefoundry/auth/oidc_http.py": _VERIFY_ONLY,
     "messagefoundry/config/fingerprint.py": _KEYLESS,
+    "messagefoundry/config/loaded_crls.py": "a weak registry of the CRL copies live TLS contexts "
+    "hold, for the expiry monitor (BACKLOG #299); it stores public CRL metadata and holds no key",
     "messagefoundry/config/wiring.py": _KEYLESS,
     "messagefoundry/config/tls_policy.py": "the TLS policy seam itself: it builds verifying contexts, "
     "floors and suite lists for its callers, and never loads, mints or holds a private key; each "

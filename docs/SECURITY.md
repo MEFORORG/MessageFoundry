@@ -157,6 +157,12 @@ directory); resetting your own account is refused (use self-service change-passw
 audited (`auth.password_reset`). For the same reason, **admin-created accounts are flagged
 `must_change_password`** so the operator's initial password is a one-time temp the user must rotate.
 
+The reset can refuse, with a 503 whose detail names `password_extra_context_words`. It does so when
+no generated password clears the policy after repeated tries. That means the site's context words
+refuse nearly every random string, and so nearly every passphrase too. The account keeps its
+password. Remove the site's short or common terms, or replace them with longer ones. Then restart
+the engine and retry, because it reads `[auth]` only at start and a `/config/reload` does not.
+
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per
 actor** (`allow_admin_write`, keyed on the acting user). On the JSON API its only caller is
@@ -1573,7 +1579,8 @@ row written before `sessions.auth_mechanism` existed. An OIDC session never reac
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
 **rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
-opt-out**: when the API is bound **off-loopback** with `require_mfa` *turned off*, `serve` makes the
+opt-out**: when the instance is **exposed** (an off-loopback bind, or a declared TLS-terminating
+proxy, `[api].tls_terminated_upstream`) with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** under `[security].enforcement = enforce`, the
 default in every environment, and **warns** otherwise or where
 `[security].allow_single_factor_admin_when_exposed` is set, mirroring the keyless-store and
@@ -1586,12 +1593,22 @@ holder enrols an engine factor to get past the gate. An earlier revision of this
 Under the shipped `[security] require_mfa_scope = "every_local_account"` it covers **every** account
 — the value's name is narrower than its behaviour — every local administrator, any service account, and every
 directory principal. A non-interactive bearer-token account becomes MFA-pending and cannot enrol
-unattended. **That is a decision a deploying site must make before first start:** either such an
-account moves to the mTLS service-identity plane, or the scope is set to `administrators`. Making it
-an AD principal is **no longer** an escape. An operator who opts out at
-exposure re-enables `[security].require_mfa = true` (or keeps the bind on loopback).
-[CONFIGURATION.md](CONFIGURATION.md) `[security].require_mfa_scope` is the authority on the two
-remedies and on why mTLS is not a third.
+unattended. **That is a decision a deploying site must make before first start**, and two settings
+answer it, each with a limit. Setting the scope to `administrators` frees only a **local** account
+that does not hold the Administrator role. The Administrator role stays in scope under either value
+(`AuthService._mfa_required_for`), and a directory session that proved no factor stays MFA-pending
+under both (`AuthService._unverified_session_owes_factor`). Setting `[security].require_mfa = false`
+frees any account that has not enrolled a factor, whatever its role, at the cost of the exposure
+gate named earlier in this paragraph: on an exposed instance `serve` refuses to start under
+`enforce` unless `allow_single_factor_admin_when_exposed` is set. An account that has enrolled a
+factor still owes it under either setting; an OIDC sign-in meets it while
+`[auth].oidc_require_mfa_claim` is on, the default. Making the account an AD principal is **no
+longer** an escape. Nor is the mTLS service-identity plane: a certificate identity is admitted on one route only,
+`GET /service/identity`, so it cannot carry a working service account (the mTLS row of the pathway
+table below). An operator who opts out at exposure re-enables `[security].require_mfa = true`, or
+keeps the instance unexposed: a loopback bind with no declared TLS-terminating proxy.
+[CONFIGURATION.md](CONFIGURATION.md) `[security].require_mfa_scope` is the authority on both
+remedies and on why neither AD nor mTLS is a third.
 
 ### Administrative-interface defense-in-depth (WP-L3-13, ASVS 8.4.2)
 
@@ -2456,7 +2473,8 @@ MFA step-up is now built (WP-14 native TOTP); a web console banner for the feed 
 Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**, **no mandatory
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
 mandatory composition), plus **offline breached/common-password screening** (a bundled offline
-corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
+corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below, which a
+site may extend with its own terms. Enforced
 identically on create-user and change-password; tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
 
@@ -2472,26 +2490,43 @@ twelve as examples. That description was wrong in a way a reader could act on: f
 `changeme`, `bootstrap`, `admin`, `administrator`, `password` — are generic credential words with no
 connection to this application, to a vendor, or to HL7, so a passphrase chosen on the strength of the
 old sentence could still be refused with no indication of which rule fired. The list above is the
-whole of it, mirrored from `CONTEXT_WORDS` in
+whole of the shipped list, mirrored from `CONTEXT_WORDS` in
 [`auth/policy.py`](../messagefoundry/auth/policy.py).
 `tests/test_security_doc_context_words.py` pins this
 list to `CONTEXT_WORDS`, so a term added to or dropped from either one without the other fails the
 build rather than leaving the two to diverge.
 
 **What a deploying site can and cannot tune here.** `password_check_context` is a whole-list on/off
-switch, on by default. There is **no** setting that adds a site's own terms — its hospital
-abbreviation, a partner or product name, the local domain — and none that removes a member whose
-substring collides with a legitimate local word. A site that wants wider coverage supplies it through
-`password_breach_corpus_file` below, which answers a different question: that corpus is matched
-against the **whole** password, so a term added there is refused only when it *is* the password, never
-when it appears inside a longer passphrase.
+switch, on by default, and it covers the site's terms too. The shipped terms are fixed: no setting
+removes one, even a member whose substring collides with a legitimate local word. A site **can add**
+its own terms with `password_extra_context_words`: its hospital abbreviation, a partner or product
+name, a project codename. Those are the kinds of word ASVS 6.1.2 names, and a vendor list cannot
+know them.
 
-Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline:
+Site terms join the same screen, and it is a plain one. It lower-cases the password and the term,
+then asks whether the term appears anywhere in the password. Nothing else is normalised. A dotted or
+hyphenated term such as `acme.org` or `st-mary` matches only that exact text, and misses `acmeorg`
+or `StMary`. So prefer distinctive bare words, and list each spelling a user might type: `acme` alone
+already catches `acme.org`, `AcmeHealth` and `acme-2026`.
 
-- **Username-in-password rejection** (`password_check_username`) — a password that *contains* the
-  user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected, catching the common
-  `jsmith2026`-style choice that the corpus can't.
-- **Larger operator breach corpus** (`password_breach_corpus_file`) — point this at an offline list to
+A site term's refusal says the word is one of the site's additions, so a user does not search the
+list above for it. Each term must be one word with no whitespace, and short terms are refused at
+load. [CONFIGURATION.md](CONFIGURATION.md) has the length floor and the full rules. The site's added
+terms are the site's to publish, in its own documentation; this page can list only the shipped ones.
+This differs from `password_breach_corpus_file` below. That corpus is matched against the **whole**
+password, so a term added there is refused only when it *is* the password, never inside a longer
+passphrase.
+
+Two further screens, both fully offline. The context-word list above is what ASVS 6.2.11 grades;
+neither of these is part of it:
+
+- **Username-in-password rejection** (`password_check_username`, on by default) — a password that
+  *contains* the user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected,
+  catching the common `jsmith2026`-style choice that the corpus can't. No ASVS 5.0 requirement names
+  this screen. 6.2.11 asks that the *documented list* of context-specific words be used, and a
+  user's own name is not on that list. Earlier revisions labelled this screen 6.2.11.
+- **Larger operator breach corpus** (`password_breach_corpus_file`, ASVS 6.2.12, off until a path is
+  set) — point this at an offline list to
   augment the bundled corpus: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
   (`HASH[:count]` lines, auto-detected), checked locally with no network call. Use a curated subset
   (it's loaded into memory), not the full ~40 GB HIBP set; a configured-but-unreadable path is warned
@@ -2514,7 +2549,7 @@ list, which admits any certificate its CA ever signed.
 
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
-| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled; the second-step lock refuses both, and the second step. Each lock doubles per cycle up to `lockout_max_minutes` where the owner has that way past it + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
+| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled; the second-step lock refuses both, and the second step. The second-step lock doubles per cycle up to `lockout_max_minutes` on every local account, and the sign-in lock does so only on a local account with TOTP enrolled; every other lock keeps `lockout_minutes` + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
 | **AD** (LDAP simple-bind, LDAPS by default) — **step-up re-authentication only; the sign-in was retired** | password, verified by a bind **as the user** against the DC. It no longer mints a session: `POST /auth/login` with `provider=ad` is refused and audited, and the bind survives only at `POST /me/reauth` and the console's `POST /ui/reauth`, where it re-proves a session **Kerberos** minted. An `oidc` session never reaches the bind: `reauth()` refuses it before any verify and it steps up at the IdP (the OIDC row). The one other session it can reach is a row written before `sessions.auth_mechanism` existed, which reads NULL and takes this leg for an AD account. So this row carries no MFA grant of its own — the session's MFA state was decided at its own sign-in. The delegated-directory relaxation it used to carry is **retired** (BACKLOG #1144): no pathway grants MFA satisfaction on a directory assertion the engine cannot read | the **directory's** lockout/complexity policy; engine-side, a **per-actor** step-up budget, **not** the sign-in limiter — the bind is post-session, so an unauthenticated flood cannot reach it — plus the **engine** per-account lockout, which a rejected re-bind feeds (BACKLOG #1138), and a per-session cap: the session whose re-binds reach `lockout_threshold` rejections is revoked, so it sends the DC at most that many. `[auth].login_rate_limit_enabled=false` removes the per-actor budget too, because that flag builds neither limiter. The lockout feed and the per-session cap survive it, so the flag does not strip this pathway bare. The engine lock sets the engine's own row and is enforced at the Kerberos and OIDC sign-ins, not at the re-bind. It never writes a lock to the directory account, but each rejected re-bind still reaches the DC, so the domain's own lockout policy can lock the domain account too | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind, and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
 | **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves the ticket leg with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way). An enrolled engine TOTP or recovery code still feeds the per-account lockout, and a locked account row refuses this sign-in (BACKLOG #1638) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. Both legs (`GET /ui/sso` and the JSON `POST /auth/negotiate`) mint with no step-up window, so a sensitive action forces a step-up unless a TOTP or recovery code proved at the MFA gate has already stamped one. That step-up is the **AD** row's directory re-bind, at `POST /me/reauth` or `POST /ui/reauth` |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess on the federated leg, so that leg feeds no per-account lockout, though a lock another leg set on the account row refuses this sign-in (BACKLOG #1638); both legs (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) charge the sign-in window, and so does `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) (`[auth].login_rate_limit_enabled`, default on — **off leaves the federated leg with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout. The **step-up leg** checks no engine credential either, so a refused IdP step-up feeds no lockout and no per-session re-proof cap, and neither account lock refuses it. Its start, `POST /ui/reauth/oidc`, draws the per-actor ceremony budget, and the IdP's return to `GET /ui/oidc/callback` draws the sign-in window | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184). The session's absolute lifetime is capped at the verified `id_token.exp` and at `auth_time + [auth].oidc_max_age_seconds`; minted with no step-up window. **Its step-up goes back to the IdP and never to a password** (BACKLOG #296, ADR 0142 Amendment B). `POST /ui/reauth/oidc` sends the browser to the IdP with `max_age=0` and `prompt=login`, and `complete_oidc_step_up` elevates the session only when, among other checks, the new `auth_time` is no earlier than the moment the flow was staged, less `oidc_clock_skew_seconds`, and the verified (issuer, sub) pair is still the account's. It then stamps `reauth_at`, rotates the session, and mints the action-bound grant when the action the operator started from takes one and the session is not refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action). Console only: `POST /me/reauth` refuses an `oidc` session, and the JSON plane has no federated step-up |
@@ -2706,14 +2741,26 @@ all mint without one. At sign-in, only a local sign-in that owes no factor, or a
 open it. [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
 is the source of record for what stamps the window later.
 
-**The `acr` the engine asks for is not checked unless it is also required (BACKLOG #2032, open).**
-`[auth].oidc_acr_values` is only a request to the identity provider. The engine compares the returned
-`acr` with `oidc_required_acr_values` alone, and that list is empty by default. So by default the `amr`
-check decides alone. A token with `amr` of `mfa` signs in MFA-verified whether its `acr` is weaker
-than requested or missing. `messagefoundry check` reports a requested `acr` the engine does not
-require as an advisory note. The gate passes on a matching `amr` **or** a matching `acr`. So a
-deploying site that relies on `acr` would need to set `oidc_required_acr_values` and also empty
-`oidc_mfa_amr_values`, whose default is `["mfa"]`.
+**An `acr` request with no required `acr` is refused at load (BACKLOG #2032), but a request that loads can still go unchecked.**
+`[auth].oidc_acr_values` is only a request to the identity provider. The claim gate compares the
+returned `acr` with `oidc_required_acr_values` alone. Settings load checks the pair while
+`oidc_enabled` is on. It refuses a non-blank `oidc_acr_values` if `oidc_required_acr_values` names no
+non-blank value (`AuthSettings._require_oidc_fields` in `config/settings.py`). The gate passes on a
+matching `amr` **or** a matching `acr` (`_check_mfa_gate` in `auth/oidc/claims.py`). So a token whose
+`amr` matches `oidc_mfa_amr_values` (default `["mfa"]`) signs in MFA-verified whatever its `acr`. A
+deploying site that relies on `acr` alone would set `oidc_required_acr_values`, keep
+`oidc_require_mfa_claim` on, and empty `oidc_mfa_amr_values`. At least these requests load and are
+still not checked:
+
+- A requested class that `oidc_required_acr_values` does not list. `messagefoundry check` notes it
+  (`_check_oidc_auth_params` in `checks.py`).
+- Any request while `oidc_require_mfa_claim` is off. The `acr` that comes back is only recorded in the
+  sign-in's success audit row (`AuthService._authenticate_oidc`), and `check` does not flag this case.
+- A whitespace-only `oidc_acr_values`. Load counts it as blank, and the authorization request still
+  carries it.
+
+This paragraph was read against engine commit `df77028b45`. The key's row is in the `[auth]` table of
+[CONFIGURATION.md](CONFIGURATION.md#auth--authentication--rbac).
 
 **What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity
 provider's assertion, not a proof, and the IdP step-up keeps its stated skew residual; both are in
@@ -2752,7 +2799,20 @@ changed is what a campaign costs, and whom:
   escalate, and it does, doubling per cycle to `lockout_max_minutes`: about 35 password guesses on
   the first day and about 5 a day after, while the owner stays out, down from 480. The engine checks
   both factors on every combined sign-in and answers every refusal the same way, in the same padded
-  time, so the caller learns a verdict only when both are right.
+  time, so the caller learns a verdict only when both are right. The `auth.login_failed` row matches:
+  every refused combined sign-in on such an account records the same reason, `bad_credentials`,
+  whichever factor was wrong (BACKLOG #1131). A per-factor slug there was a password oracle to an
+  `audit:read` holder who is not an administrator, since that reader could arm the sign-in lock and
+  read off the trail, one request per candidate, which candidate password was right. The uniform
+  slug removes that per-request oracle; the per-factor failure **count** survives only on the
+  `users:manage` lock-state surface, and the account holder's own out-of-band lock notice still
+  names which factor was right. **A coarser residual remains on the `audit:read` path.** Because the
+  second-step counter is fed only by a right factor, sending one candidate `lockout_threshold` times
+  locks it only when the password was right, and that lock's `auth.account_locked`,
+  `auth.lock_notice` and `auth.login_locked` rows are audit-visible while the live sign-in lock keeps
+  the sign-in counter from emitting any. That is the same oracle at `lockout_threshold` requests per
+  candidate rather than one. Removing it would drop the `auth.account_locked` row AC-10 requires, so
+  it is left as an owner/ADR decision, tracked as the lock-event limb of #1131.
 - **A caller holding one factor** (the password, the TOTP device, or a directory sign-in) feeds the
   second-step counter. That lock refuses every sign-in, and on a local account it doubles per cycle
   too, because one of the owner's two factors is already lost.

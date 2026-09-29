@@ -22,6 +22,7 @@ __all__ = [
     "uploaded_log_detail",
     "uploaded_log_resend_confirm",
     "uploaded_logs",
+    "uploaded_logs_unavailable",
     "uploaded_logs_upload",
 ]
 
@@ -102,6 +103,20 @@ def uploaded_logs(data: UploadedFileList, *, error: str = "") -> Markup:
         ]
     )
     return page("Uploaded logs", *parts, active="uploaded-logs")
+
+
+def uploaded_logs_unavailable(notice: str) -> Markup:
+    """The list page when the engine has no uploads store (BACKLOG #1169, PR 1506 follow-up A).
+
+    There is no listing to render, and no scope either: the engine computes ``scope`` alongside the
+    listing, and re-deriving it here is the drift :data:`_SCOPE_NOTES` warns against. So the page
+    carries the heading and the notice, and nothing else. ``notice`` is fixed route text."""
+    return page(
+        "Uploaded logs",
+        el("h1", "Uploaded logs"),
+        el("p", text(notice), class_="banner"),
+        active="uploaded-logs",
+    )
 
 
 def _list_pager(data: UploadedFileList) -> Markup:

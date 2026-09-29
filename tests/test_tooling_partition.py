@@ -92,6 +92,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # it would be deselected by `-m 'not tooling'` on the engine legs AND unreached by the
         # tooling job's path gate, so the PR that adds the offending import would face nothing.
         "test_conftest_name_collision_guard.py",
+        # NOT engine source, so this entry widens the list's stated rule, as
+        # test_conftest_name_collision_guard.py above does. Its subject is docker/Dockerfile, a
+        # shipped artifact: it holds the base image to a digest and every pip install to a hash
+        # (BACKLOG #1193). A Dockerfile edit sets `code=true` but NOT `tooling=true`, so listed as
+        # tooling it would be deselected on the engine legs and unreached by the tooling path gate.
+        "test_container_build_pins.py",
         "test_cp1252_console_safety.py",
         # Arrived with #421 while this branch was in flight. Same shape as cp1252_console_safety and
         # licence_header_gate above: a repo-wide scanner over TRACKED TEXT, which includes

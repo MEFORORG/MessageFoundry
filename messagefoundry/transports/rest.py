@@ -37,9 +37,9 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any, ClassVar
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import hop_insecure_escape_downgrades
@@ -288,6 +288,18 @@ MAX_OUTBOUND_HEADER_NAME_LEN = 256
 
 # 4xx statuses worth retrying anyway: the server is up but momentarily unwilling, not a hard reject.
 _RETRYABLE_4XX = frozenset({408, 429})
+
+
+class HttpAuthError(ValueError):
+    """A generic outbound-HTTP-auth configuration is invalid (missing secret, a cleartext token endpoint,
+    two mutually-exclusive auth modes on one connection). Raised **loud at connector construction** — like
+    a bad TLS cert — so it fails at ``check`` / dry-run / start, never as a wire-time surprise. The message
+    never contains a secret value.
+
+    ONE wire-time use, because the peer decides it: a Digest challenge (an endpoint's 401 or a web proxy's
+    407) that names any hash but SHA-256, or that cannot be answered at all, is refused with this type
+    when it arrives (BACKLOG #1171). Defined here rather than in ``http_auth``, which re-exports it,
+    because the Digest handlers live beside the opener plumbing and ``http_auth`` imports this module."""
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -1151,19 +1163,160 @@ def _proxy_bypasses(host: str, bypass: tuple[str, ...]) -> bool:
     return False
 
 
+#: The one Digest algorithm this engine answers a challenge with, on the origin 401 path
+#: (``http_auth._ApprovedDigestAuthHandler``) and the proxy 407 path (:class:`_ApprovedProxyDigestAuthHandler`)
+#: alike (BACKLOG #1171, ASVS 11.4.1).
+#:
+#: **The SERVER chooses, not us.** urllib reads ``chal.get('algorithm', 'MD5')``, so a peer that simply
+#: OMITS the parameter, which is the common RFC 2617 case, gets answered with MD5. Appendix C marks MD5
+#: **D**: disallowed for any cryptographic purpose, with no default-off escape. There is no way to
+#: dictate the algorithm to the peer, so the only honest options are refuse or remove.
+#:
+#: **ONE name, because urllib computes only three.** ``AbstractDigestAuthHandler.get_algorithm_impls``
+#: (CPython 3.14.6) implements ``MD5``, ``SHA`` (SHA-1) and ``SHA-256``, matched case-sensitively, and
+#: raises a bare ``ValueError`` for anything else, every ``-sess`` variant included. An approved set
+#: naming ``SHA-512-256`` or a ``-sess`` form admitted a challenge urllib then crashed on, outside the
+#: ``HttpAuthError`` contract. SHA-256 is the only member that is both approved and computable.
+_APPROVED_DIGEST_ALGORITHM = "SHA-256"
+
+
+class _ApprovedDigestMixin(urllib.request.AbstractDigestAuthHandler):
+    """Refuses a Digest challenge naming any algorithm but SHA-256, instead of answering it.
+
+    Shared by the origin handler and the proxy handler so the two cannot drift: before this, the
+    proxy path used urllib's bare ``ProxyDigestAuthHandler``, which runs no such check.
+
+    LOUD, not ``return None``. Returning ``None`` makes urllib skip the auth and the request fails as a
+    bare 401 or 407, which an operator reads as bad credentials. This raises ``HttpAuthError`` with the
+    algorithm named, and it runs BEFORE urllib looks up the credential or computes any hash."""
+
+    #: Who issued the challenge, for the refusal text.
+    _digest_peer = "endpoint"
+    #: Set by the concrete urllib handler: ``Authorization`` or ``Proxy-Authorization``.
+    auth_header: ClassVar[str]
+
+    def get_authorization(self, req: urllib.request.Request, chal: Mapping[str, str]) -> str | None:
+        # RFC 7235 parameter names are case-insensitive, and urllib reads only lowercase keys.
+        params = {k.lower(): v for k, v in chal.items()}
+        # Mirrors urllib's own default EXACTLY: an absent parameter means MD5, which is the case that
+        # makes this reachable without a hostile peer.
+        named = str(params.get("algorithm", "MD5"))
+        if named.strip().upper() != _APPROVED_DIGEST_ALGORITHM:
+            raise HttpAuthError(
+                f"the {self._digest_peer}'s HTTP Digest challenge names algorithm {named[:64]!r}, which "
+                f"is not an approved hash (ASVS 11.4.1; approved here: {_APPROVED_DIGEST_ALGORITHM!r} "
+                "only). urllib defaults to MD5 when the challenge omits the parameter, so a peer that "
+                f"names nothing lands here too. Offer SHA-256 Digest on the {self._digest_peer}, or use "
+                "a different auth mode (BACKLOG #1171)."
+            )
+        # RFC 7616's ABNF literals are case-insensitive but urllib matches the name exactly, so hand it
+        # the canonical spelling rather than let a lowercase ``sha-256`` reach its bare ValueError.
+        params["algorithm"] = _APPROVED_DIGEST_ALGORITHM
+        return super().get_authorization(req, params)
+
+    def http_error_auth_reqed(
+        self,
+        auth_header: str,
+        host: str,
+        req: urllib.request.Request,
+        headers: http.client.HTTPMessage,
+    ) -> Any:
+        # ONE answer per request. urllib otherwise re-answers a rejected credential up to six times in
+        # one send, then raises a 401 whatever the peer sent. Against a proxy that is six failed logins
+        # per message, which can lock the account, and a 407 read as the destination's 401. A request
+        # already carrying urllib's own answer surfaces the peer's real status instead.
+        if self.auth_header.capitalize() in req.unredirected_hdrs:
+            return None
+        self._screen_challenge(headers.get(auth_header))
+        # Typeshed declares urllib's method as returning None; it returns the retried response.
+        reqed: Callable[..., Any] = super().http_error_auth_reqed
+        try:
+            return reqed(auth_header, host, req, headers)
+        finally:
+            # urllib counts retries on the handler and resets the count only when http_error_401/407
+            # RETURNS. A refusal raises instead, so the count stuck, and the handler lives as long as
+            # the connection's opener: after six refusals every later send failed as a bare 401,
+            # even once the peer was fixed.
+            self.reset_retry_count()
+
+    def _screen_challenge(self, authreq: str | None) -> None:
+        """Parse the challenge the way urllib is about to, and refuse what it would crash on.
+
+        urllib raises a bare ValueError for a scheme other than Digest or Basic (a corporate proxy
+        leading with NTLM or Negotiate), and a ValueError or IndexError for a malformed Digest
+        challenge. Neither is this seam's HttpAuthError, and an IndexError escapes every send's
+        ValueError arm. The peer's text is not echoed beyond the first word, capped."""
+        if not authreq:
+            return
+        words = authreq.split()
+        scheme = words[0] if words else ""
+        try:
+            if scheme.lower() == "digest":
+                _token, challenge = authreq.split(" ", 1)
+                # The same parse urllib runs next (retry_http_digest_auth), so it fails here first.
+                urllib.request.parse_keqv_list(
+                    [e for e in urllib.request.parse_http_list(challenge) if e]
+                )
+                return
+            if scheme.lower() == "basic":
+                return  # urllib leaves a Basic challenge unanswered here; the status surfaces.
+        except (ValueError, IndexError):
+            pass
+        # Raised AFTER the handler ends, so the parse error (which can quote the peer's challenge
+        # text) is on neither __cause__ nor __context__. ``from None`` would hide nothing (#1796).
+        raise HttpAuthError(
+            f"the {self._digest_peer}'s authentication challenge (scheme {scheme[:32]!r}) cannot be "
+            "answered: it is malformed, or it leads with a scheme other than Digest. urllib reads "
+            "only the first challenge (BACKLOG #1171)."
+        )
+
+
+class _ApprovedProxyDigestAuthHandler(_ApprovedDigestMixin, urllib.request.ProxyDigestAuthHandler):
+    """urllib's reactive proxy Digest handler, answering the proxy's 407 with SHA-256 or refusing it."""
+
+    _digest_peer = "web proxy"
+
+    def get_authorization(self, req: urllib.request.Request, chal: Mapping[str, str]) -> str | None:
+        # Answer only a 407 on a request that went THROUGH the proxy. ProxyHandler sends a request
+        # direct when urllib's proxy_bypass matches its host (no_proxy, or the Windows registry's
+        # override list), and a 407 on that request came from the destination or the cleartext hop
+        # to it, not from the proxy. The credential lookup matches any URL, so this is the gate.
+        if not req.has_proxy():
+            return None
+        return super().get_authorization(req, chal)
+
+
+class _ProxyPasswordMgr(urllib.request.HTTPPasswordMgrWithDefaultRealm):
+    """Looks the proxy credential up by the PROXY's URL, whatever request raised the 407.
+
+    urllib's Digest code calls ``find_user_password(realm, req.full_url)``, and on a proxied request
+    ``full_url`` is the DESTINATION. A credential stored under the proxy URL therefore never matched,
+    urllib answered nothing, and every proxy Digest send failed as a bare 407. ``ProxyBasicAuthHandler``
+    keys on the proxy (``req.host``), which is the behaviour this restores. It is safe only beside
+    :class:`_ApprovedProxyDigestAuthHandler`, which answers nothing on a request that bypassed the
+    proxy."""
+
+    def __init__(self, proxy_url: str) -> None:
+        super().__init__()
+        self._proxy_url = proxy_url
+
+    def find_user_password(self, realm: str | None, authuri: str) -> tuple[str | None, str | None]:
+        return super().find_user_password(realm, self._proxy_url)
+
+
 @dataclass(frozen=True, slots=True)
 class _ProxyDigestRecipe:
-    """Inputs for a fresh reactive ``ProxyDigestAuthHandler`` (#127, http-destination only). Rebuilt per
+    """Inputs for a fresh reactive proxy Digest handler (#127, http-destination only). Rebuilt per
     opener (a urllib handler binds to its opener, so it is never shared across openers)."""
 
-    proxy_url: str
+    proxy_url: str = field(repr=False)  # may carry user:password@ (#1182)
     user: str
-    password: str
+    password: str = field(repr=False)
 
     def build(self) -> urllib.request.ProxyDigestAuthHandler:
-        pwmgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        pwmgr = _ProxyPasswordMgr(self.proxy_url)
         pwmgr.add_password(None, self.proxy_url, self.user, self.password)
-        return urllib.request.ProxyDigestAuthHandler(pwmgr)
+        return _ApprovedProxyDigestAuthHandler(pwmgr)
 
 
 @dataclass(frozen=True, slots=True)
