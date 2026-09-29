@@ -578,8 +578,8 @@ ignore_missing_imports = true
 # RULES: never ADD a module here -- a new test module must pass. REMOVE one when you fix it, in the
 # same change, and lower the ceiling in tests/test_mypy_tests_scope.py with it. That test fails on a
 # list longer than its ceiling, on a name that no longer resolves to a file (a rename would hand the
-# next file to take the name a free pass), and on an unsorted or duplicated list. Nothing detects a
-# module that has become clean; that removal is by hand.
+# next file to take the name a free pass), and on an unsorted or duplicated list. A listed module that
+# has become clean fails CI too: scripts/ci/mypy_ratchet_check.py re-runs mypy with this exemption off.
 [[tool.mypy.overrides]]
 module = [
     "tests._dicom_sample",

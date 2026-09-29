@@ -496,6 +496,15 @@ jobs:
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy --explicit-package-bases tests
 
+      # BACKLOG #1799: the ratchet's ignore_errors hides every error in a listed module, so the step
+      # above cannot see a listed module that has been fixed. This one re-runs mypy over the listed
+      # modules with the exemption switched off, on linux and win32, and fails on a module clean on
+      # both, so the list cannot hold dead entries. The script's docstring says why it cannot pass
+      # by measuring nothing; tests/test_mypy_tests_scope.py pins this step and plants a control.
+      - name: Type-check (mypy, tests ratchet has no dead entries)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        run: python scripts/ci/mypy_ratchet_check.py
+
       # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
       # path argument) plus every other sys.platform=='win32' branch.
       - name: Type-check (mypy, strict — win32 platform)
