@@ -60,6 +60,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import MessageStatus, Stage
+from messagefoundry.transports.file import FileDestination
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 INBOUND = "IB_TEST"
@@ -474,9 +475,9 @@ def test_settings_refuse_the_legacy_planned_rotation_key_names(tmp_path: Path) -
     # an operator the 50 MB / 5-backup defaults while their file said otherwise — a control that
     # reports success while doing something else. Refuse, naming the real keys.
     with pytest.raises(ValueError, match="file_max_bytes"):
-        LoggingSettings(file=str(tmp_path / "engine.log"), max_bytes=1000)
+        LoggingSettings.model_validate({"file": str(tmp_path / "engine.log"), "max_bytes": 1000})
     with pytest.raises(ValueError, match="file_backup_count"):
-        LoggingSettings(file=str(tmp_path / "engine.log"), backups=2)
+        LoggingSettings.model_validate({"file": str(tmp_path / "engine.log"), "backups": 2})
 
 
 @pytest.mark.parametrize(
@@ -841,7 +842,11 @@ async def _until_processed(store: MessageStore, message_id: str, timeout: float 
     file appears is a race, and it is one this test hit: measured 'routed' where 'processed' was
     expected, three times out of four, on a rig that had passed on the first run."""
     elapsed = 0.0
-    while (await store.get_message(message_id))["status"] != MessageStatus.PROCESSED.value:
+    while True:
+        msg = await store.get_message(message_id)
+        assert msg is not None
+        if msg["status"] == MessageStatus.PROCESSED.value:
+            break
         if elapsed > timeout:
             return False
         await asyncio.sleep(0.02)
@@ -1779,7 +1784,9 @@ async def test_a_reload_that_retargets_a_lane_during_a_halt_still_rebuilds_its_c
     runner = RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
     await runner.start()
     try:
-        assert runner._destinations[OUTBOUND].directory == outdir, "the rig never built the lane"
+        lane = runner._destinations[OUTBOUND]
+        assert isinstance(lane, FileDestination), "the rig never built the lane"
+        assert lane.directory == outdir, "the rig never built the lane"
 
         _kill_every_sink(logdir, monkeypatch)
         logging.getLogger("t").warning("a record this engine cannot write anywhere")
@@ -1798,7 +1805,9 @@ async def test_a_reload_that_retargets_a_lane_during_a_halt_still_rebuilds_its_c
         await runner.reload(_e2e_registry(newdir))
 
         assert runner.registry.outbound[OUTBOUND].spec.settings["directory"] == str(newdir)
-        assert runner._destinations[OUTBOUND].directory == newdir, (
+        lane = runner._destinations[OUTBOUND]
+        assert isinstance(lane, FileDestination)
+        assert lane.directory == newdir, (
             "the halted reload swapped the registry and left the OLD connector live"
         )
 
@@ -1974,7 +1983,8 @@ def _fail_the_next_write(handler: GuardedFileHandler, message: str) -> None:
     # asserts. `_break_the_open_handle` above closes explicitly for the same reason.
     if handler.stream is not None:
         handler.stream.close()
-    handler.stream = _HostileWriteStream(OSError(message))
+    # A stream that raises on write is the fault under test, so it is not a TextIOWrapper.
+    handler.stream = _HostileWriteStream(OSError(message))  # type: ignore[assignment]
 
 
 def test_a_stream_error_cannot_forge_a_line_in_the_notice_it_causes(tmp_path: Path) -> None:

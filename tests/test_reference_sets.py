@@ -24,6 +24,7 @@ from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import (
     DatabaseRef,
     FileRef,
+    Payload,
     Reference,
     ReferenceSpec,
     Registry,
@@ -31,6 +32,7 @@ from messagefoundry.config.wiring import (
     env,
 )
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dryrun import route_message
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
@@ -449,7 +451,7 @@ def test_databaseref_factory_shape() -> None:
 # --- wiring declaration + end-to-end dryrun ---------------------------------
 
 
-class _CapturingAlerts:
+class _CapturingAlerts(LoggingAlertSink):
     """Minimal AlertSink that records connection_stopped details (for the PHI-in-alert check)."""
 
     def __init__(self) -> None:
@@ -567,10 +569,11 @@ def test_dryrun_resolves_file_reference(tmp_path: Path) -> None:
         name="provider_npi", source=FileRef(path=str(csv))
     )
 
-    def route(msg: Message) -> list[str]:
+    def route(msg: Payload) -> list[str]:
         return ["enrich"]
 
-    def enrich(msg: Message) -> Send:
+    def enrich(msg: Payload) -> Send:
+        assert isinstance(msg, Message)  # no accepts= on this handler, so the runner parses
         npi = reference("provider_npi").get(msg["PV1-7.1"] or "")
         if npi:
             msg.set("PV1-7.13", npi)
@@ -1014,7 +1017,7 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
                 await real_execute(sql, params) if params is not None else await real_execute(sql)
             )
 
-        store._db.execute = racing_execute  # type: ignore[method-assign]
+        store._db.execute = racing_execute  # type: ignore[method-assign, assignment]
         try:
             deleted = await store.purge_reference_snapshots(older_than=1000.0, declared={"keep"})
         finally:
