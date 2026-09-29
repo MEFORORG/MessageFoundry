@@ -72,9 +72,11 @@ from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    StoreNotFoundError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
+    warn_stale_schema_read_only,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -743,18 +745,19 @@ def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tu
 
     Two deliberate non-issues: (1) when the group's trailing read is the applock, the rendered batch
     carries TWO ``SET NOCOUNT ON`` (one prepended here, one inside ``_SQL_APPLOCK``) — idempotent and
-    harmless, left as-is rather than string-surgery on a reliability-core constant. (2) ``SET NOCOUNT
-    ON`` is a session setting that persists on the pooled connection. The unbatched path already runs
-    the same ``SET NOCOUNT ON`` (via the finalize applock) on every handoff, so batching adds no new
-    exposure.
+    harmless, left as-is rather than string-surgery on a reliability-core constant. (2) Whether this
+    ``SET NOCOUNT ON`` outlives the call is the question the paragraph below answers. Either way the
+    unbatched path already runs the same ``SET NOCOUNT ON`` (via the finalize applock) on every
+    handoff, so batching adds no new exposure.
 
     **CORRECTED 2026-09-26 (ADR 0157 Inc 3, PR 1576 CI).** This docstring used to say
     ``SQLRowCount`` is still populated under NOCOUNT. With a session-wide ``SET NOCOUNT ON`` (an
     unparameterized batch), a zero-match UPDATE did NOT report 0 on the hosted SQL Server legs. This
     batch runs parameterized, and SQL Server restores NOCOUNT when that call returns, so by reading it
     does not leak; ``test_resend_plain_parity_ss`` backs that by reading rowcount 0 right after the
-    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection, asserts
-    ``>= 1``, and never runs a zero-match statement. Keep this batch parameterized."""
+    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection and
+    never runs a zero-match statement. Whether the restore holds is the ``BACKLOG-2097-NOCOUNT`` probe
+    in ``tests/test_sqlserver_store.py``. Keep this batch parameterized."""
     parts = ["SET NOCOUNT ON;"]
     params: list[Any] = []
     for sql, p in group:
@@ -1911,6 +1914,24 @@ _SCHEMA: list[str] = [
         id NVARCHAR(64) NOT NULL PRIMARY KEY, owner_user_id NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
         criteria NVARCHAR(MAX) NULL, created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
         last_used_at FLOAT NULL)""",
+    # BACKLOG #1909: a 0.3.2 table keys presets on the owner's USERNAME in a column named `owner`. Map
+    # each value to the id of the account that existed at the preset's last save, drop every other
+    # row, then rename; sp_rename carries the unique index. The SQLite
+    # _migrate_preset_owner gives the reasons. The body is EXEC'd because T-SQL compiles a whole batch
+    # first, and a column the table lacks fails that compile even inside a false IF. SET NOCOUNT ON
+    # sits inside the EXEC, so it ends with it: no rows-affected result reaches the driver ahead of an
+    # error, and the pooled session keeps its setting. BIN2 makes the match exact whatever collation
+    # either column carries: 0.3.2 wrote the stored username into `owner` byte for byte.
+    """IF COL_LENGTH('search_presets','owner') IS NOT NULL
+        AND COL_LENGTH('search_presets','owner_user_id') IS NULL
+    EXEC(N'SET NOCOUNT ON;
+        DELETE p FROM search_presets p WHERE NOT EXISTS
+            (SELECT 1 FROM users u WHERE u.username = p.owner COLLATE Latin1_General_100_BIN2
+             AND u.created_at <= p.updated_at);
+        UPDATE p SET p.owner = u.id FROM search_presets p
+            JOIN users u ON u.username = p.owner COLLATE Latin1_General_100_BIN2
+            AND u.created_at <= p.updated_at;
+        EXEC sp_rename ''search_presets.owner'', ''owner_user_id'', ''COLUMN'';')""",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
     # only last-edited. COL_LENGTH-gated ADD for a pre-existing (from #151) search_presets table; a
     # no-op on a fresh DB (the CREATE above has it). NULLable with NO default = metadata-only (no table
@@ -2162,6 +2183,9 @@ class SqlServerStore:
     # (2026-07-16). Flipped only after the T-SQL was proven by the sqlserver-store (2022+2025 matrix)
     # + postgres-store CI legs on PR #1078; the allow-list gate itself stays, for future backends.
     supports_reference_sets = True
+    # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
+    # default so a store built without __init__ (the protocol-level tests do) reads False.
+    _read_only: bool = False
     backend = StoreBackend.SQLSERVER
     # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
     # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
@@ -2837,7 +2861,11 @@ class SqlServerStore:
         audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
         posture: HopPosture | None = None,
+        create: bool = True,
+        read_only: bool = False,
     ) -> SqlServerStore:
+        """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
+        (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
         try:
             import aioodbc  # noqa: F401 - fail on a missing extra before any connect is attempted
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -2845,12 +2873,17 @@ class SqlServerStore:
                 "SQL Server backend requires the 'sqlserver' extra: "
                 "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
             ) from exc
-        if settings.resolved_schema_management() is SchemaManagement.AUTO:
+        if settings.resolved_schema_management() is SchemaManagement.AUTO and not read_only:
+            if not create:
+                # BACKLOG #1780: the ALTER below changes the DATABASE, so a caller that does not
+                # build must find a store here before it runs, not after.
+                await cls._refuse_a_database_with_no_store(settings, posture=posture)
             # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
             # IMMEDIATE takes momentary exclusivity, and with no MEFOR pool session open yet it has
             # nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
             # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
             # the pool; _verify_schema_external reads the two options on a pooled connection instead.
+            # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings, posture=posture)
         pool, executor = await cls._create_pool(
             settings, posture=posture, maxsize=settings.pool_size
@@ -2865,8 +2898,9 @@ class SqlServerStore:
             posture=posture,
         )
         store._pool_executor = executor
+        store._read_only = read_only
         try:
-            await store._ensure_schema()
+            await store._ensure_schema(create=create, read_only=read_only)
             if store._fifo_claim_proc:
                 # ADR 0114 sub-lever A startup gate (AC-7): verify the deployed procs (existence +
                 # body hash + compat) — a miss degrades LOUDLY to the shipped batch, never a failed
@@ -2877,19 +2911,24 @@ class SqlServerStore:
                 # fold, retired-not-stacked under a green proc gate, compat >= 130. Runs AFTER the
                 # proc gate (it reads that outcome). A miss logs and no-ops — never an outage.
                 await store._gate_claim_prepared()
-            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
-            # next and every value sealed after it land under this store's own data sub-key.
-            await bind_store_salt(store._cipher, store._ensure_store_salt)
-            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
-            # block BEFORE anything on this handle encrypts — the at-rest migration below included, since
-            # on a store that is having a key enabled for the first time it is itself a large burst. A
-            # no-op when the cipher carries no bound (keyless / `vault_transit`).
-            await store.checkpoint_cipher_invocations()
-            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
-            await store._encrypt_existing_rows()
+            if not read_only:
+                # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
+                # reserved next and every value sealed after it land under this store's own data
+                # sub-key. A read-only handle seals nothing; every stored value names its own salt.
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
+                # first block BEFORE anything on this handle encrypts — the at-rest migration below
+                # included, since on a store that is having a key enabled for the first time it is
+                # itself a large burst. A no-op when the cipher carries no bound (keyless /
+                # `vault_transit`).
+                await store.checkpoint_cipher_invocations()
+                # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+                await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-            await store._load_state_cache()  # ADR 0005 read-through cache warm-up
-            await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
+            if not read_only:
+                # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
+                await store._load_state_cache()  # ADR 0005 read-through cache warm-up
+                await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
             # in a finally, same as close() above: wait_closed() cannot complete while the pool is
@@ -2924,6 +2963,8 @@ class SqlServerStore:
             self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
             warn_unkeyed_audit_chain(log, rows)
             return
+        if self._read_only:
+            return  # BACKLOG #1780: key nothing from a read-only handle
         active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -3401,11 +3442,9 @@ class SqlServerStore:
         COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either), and
         under ``schema_management = external`` (#305) :meth:`_verify_schema_external` refuses the
         same state without trying the ALTER. So this gate can only fire when RCSI was switched off
-        after this store opened, and ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a
-        store open with RCSI off. Same state query as the open-time check. The
-        runner awaits this at pooled ``start()`` (ADR 0066 §5): under
-        ``[pipeline].require_rcsi_for_pooled`` a raise unwinds the start; false downgrades it to a
-        loud warning + a ``/stats`` degraded gauge. Raises with the exact DBA remediation statement."""
+        after this store opened. Same state query as the open-time check. The runner awaits this at
+        pooled ``start()`` (ADR 0066 §5), and a raise always unwinds that start (ADR 0066 §12).
+        Raises with the exact DBA remediation statement."""
         row = await self._fetchone(
             "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
         )
@@ -3570,14 +3609,26 @@ class SqlServerStore:
             ),
         )
 
-    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
+    async def _ensure_schema(
+        self, *, provisioning: bool = False, create: bool = True, read_only: bool = False
+    ) -> bool:
         """Apply the shipped DDL batch, or skip it entirely when the ``schema_meta`` marker already
         records this exact batch (ADR 0064). Returns ``True`` iff the batch ran.
 
         Under ``[store].schema_management = external`` (#305) an ordinary open only READS the marker and
         raises :class:`SchemaNotProvisionedError` on a mismatch, running no DDL. ``provisioning=True`` is
-        the ``provision-schema`` caller, which applies the batch whatever the mode says."""
+        the ``provision-schema`` caller, which applies the batch whatever the mode says.
+
+        An open that does not build stops before the applock and the DDL (BACKLOG #1780). With
+        ``create=False`` under ``auto``, a database with no ``schema_meta`` table raises
+        :class:`StoreNotFoundError`, and a store that is there is still upgraded. A ``read_only``
+        open, in either mode, raises the same error for a database with no store and otherwise opens
+        a stale marker as it is, with a WARNING, as the SQLite read-only open does. It reads no
+        database options: it runs nothing that RCSI protects."""
         expected = _schema_hash()
+        if read_only and not provisioning:
+            await self._read_schema_read_only(expected)
+            return False
         if (
             not provisioning
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
@@ -3597,6 +3648,9 @@ class SqlServerStore:
                     await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
                     log.debug("sqlserver: schema current (%s…) — DDL batch skipped", expected[:12])
                     return False
+                if not provisioning and not create and not await self._schema_meta_present(cur):
+                    # Raised inside the try, so the except below rolls the probe's read txn back.
+                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
                 # B10/ADR 0060: exempt the schema DDL from the per-statement command timeout. The first-
                 # upgrade FIFO index rebuild (DROP old + CREATE ix_queue_fifo_*_seq) over a large backlog
                 # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
@@ -3758,7 +3812,8 @@ class SqlServerStore:
         """Apply the DDL batch and the two database options as the CURRENT login — the body of
         ``messagefoundry store provision-schema`` (#305).
 
-        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        A one-connection pool and the identity cipher: this reads no sealed cell, so it needs no
+        store key.
         The batch keeps its applock and marker double-check, so two provisioning runs cannot race. The
         options step does NOT share that safety: when RCSI is OFF its ``WITH ROLLBACK IMMEDIATE`` ends
         every other session's open transaction, so run this with the engines stopped.
@@ -3830,13 +3885,57 @@ class SqlServerStore:
             )
         return report
 
+    @classmethod
+    async def _refuse_a_database_with_no_store(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> None:
+        """Raise :class:`StoreNotFoundError` when the database holds no ``schema_meta`` table (#1780).
+
+        Run on a one-connection store, closed before the ``ALTER DATABASE`` step, for an ``auto``
+        open that does not build: that ALTER changes the database, and a check pointed at the wrong
+        one must not change it. ``OBJECT_ID`` hides what the login cannot see, so a login with no
+        SELECT on an existing store is refused here too, and the message says so."""
+        async with (
+            cls._one_connection_store(settings, posture=posture) as probe,
+            probe._acquire() as conn,
+            probe._cursor(conn) as cur,
+        ):
+            try:
+                present = await cls._schema_meta_present(cur)
+                await probe._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        if not present:
+            raise StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, settings.database)
+
+    async def _read_schema_read_only(self, expected: str) -> None:
+        """The whole schema step of a read-only open (#1780): reads only, in either mode."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                current = await self._schema_marker_current(cur, expected)
+                present = current or await self._schema_meta_present(cur)
+                await self._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        if not present:
+            raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+        if not current:
+            warn_stale_schema_read_only(log, self.backend, self._settings.database)
+
     @staticmethod
-    async def _schema_marker_current(cur: Any, expected: str) -> bool:
-        """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
-        ``OBJECT_ID`` (a NULL row, never an exception) so a virgin DB falls through cleanly."""
+    async def _schema_meta_present(cur: Any) -> bool:
+        """Whether ``schema_meta`` exists and this login can see it (``OBJECT_ID``, never raising)."""
         await cur.execute("SELECT OBJECT_ID('schema_meta','U')")
         row = await cur.fetchone()
-        if row is None or row[0] is None:
+        return bool(row is not None and row[0] is not None)
+
+    @classmethod
+    async def _schema_marker_current(cls, cur: Any, expected: str) -> bool:
+        """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
+        ``OBJECT_ID`` (a NULL row, never an exception) so a virgin DB falls through cleanly."""
+        if not await cls._schema_meta_present(cur):
             return False
         await cur.execute("SELECT schema_hash FROM schema_meta WHERE id=1")
         row = await cur.fetchone()
@@ -3848,7 +3947,8 @@ class SqlServerStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            await self.checkpoint_cipher_invocations(settle=True)
+            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+                await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
@@ -8977,12 +9077,17 @@ class SqlServerStore:
         matches no index and full-scanned the queue on every open — with N engines opening against
         one shared (ghost-bloated) store, a measured contributor to the WS-B co-start lock convoy
         (LCK_M_IX/X storms). The ownership filter rides that same seek as a residual chunked ``IN``
-        predicate (no index hints). Iterating the enum keeps a future stage automatically covered."""
+        predicate (no index hints). Iterating the enum keeps a future stage automatically covered.
+
+        The count is the ``OUTPUT inserted.id`` rowset's length, never ``cursor.rowcount`` (BACKLOG
+        #2097). Under a session-wide ``SET NOCOUNT ON`` the driver reports ``-1`` per statement, which
+        summed to ``-4`` on the hosted SQL Server legs. The rowset holds only the re-pended rows, a
+        set bounded by what was claimed, and ADR 0157 Inc 3 reads its fenced resolves the same way."""
         now = time.time() if now is None else now
         stages = [stage] if stage is not None else [s.value for s in Stage]
         sql = (
             "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?, owner=NULL,"
-            " lease_expires_at=NULL WHERE status=? AND stage=?"
+            " lease_expires_at=NULL OUTPUT inserted.id WHERE status=? AND stage=?"
         )
         recovered = 0
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -8993,7 +9098,7 @@ class SqlServerStore:
                             sql,
                             (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
                         )
-                        recovered += cur.rowcount
+                        recovered += len(await cur.fetchall())
                         continue
                     lane_col, names = owned_lane_scope(st, owned)
                     ordered = sorted(names)
@@ -9011,12 +9116,12 @@ class SqlServerStore:
                                 *chunk,
                             ),
                         )
-                        recovered += cur.rowcount
+                        recovered += len(await cur.fetchall())
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return int(recovered)
+        return recovered
 
     # --- streaming attachments (#149, ADR 0105 Phase 4 — SQL Server parity) --------------------------
     # Byte-for-byte behavioral parity with the SQLite reference (store/store.py): content-addressed

@@ -5,7 +5,8 @@
 Every ``CREATE`` in ``_SCHEMA`` is ``IF NOT EXISTS`` and every ``_migrate`` step is an additive guarded
 ``ALTER``, so an object an incompatible version left under an expected name is skipped rather than
 fixed. Before this check, a v0.3.2 store opened cleanly and failed later, at the first preset use, with
-``no such column: owner_user_id``. These tests pin the refusal and the one-sided rule: missing things
+``no such column: owner_user_id``. That table is now migrated in place (BACKLOG #1909), so these tests
+use a stale shape no migration moves. They pin the refusal and the one-sided rule: missing things
 refuse, extra things are tolerated.
 """
 
@@ -25,20 +26,20 @@ from messagefoundry.store.schema_verify import (
 )
 from messagefoundry.store.store import _SCHEMA
 
-# The search_presets DDL as release v0.3.2 shipped it, copied from `git show
-# v0.3.2:messagefoundry/store/store.py` (the table and its index; comments trimmed). Embedded rather than
-# read from the tag at test time: a shallow CI clone carries no tags.
-_V032_SEARCH_PRESETS = """
+# A search_presets table no migration can move: shaped like the v0.3.2 one, but with its owner column
+# named `holder`. The real v0.3.2 table, whose column is `owner`, is now renamed in place (BACKLOG
+# #1909, tests/test_search_presets.py), so it no longer reaches this check.
+_STALE_SEARCH_PRESETS = """
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,
-    owner      TEXT NOT NULL,
+    holder     TEXT NOT NULL,
     name       TEXT NOT NULL,
     criteria   TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     last_used_at REAL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(holder, name);
 """
 
 
@@ -61,15 +62,15 @@ async def test_a_fresh_store_opens_and_reopens(tmp_path: Path) -> None:
     await _fresh(db)
 
 
-async def test_the_v032_search_presets_table_is_refused(tmp_path: Path) -> None:
-    db = tmp_path / "v032.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+async def test_a_stale_search_presets_table_is_refused(tmp_path: Path) -> None:
+    db = tmp_path / "stale.db"
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     text = str(info.value)
     assert "table 'search_presets' is missing column 'owner_user_id'" in text
     assert (
-        "index 'ux_search_presets_owner_name' is on search_presets(owner, name) [unique],"
+        "index 'ux_search_presets_owner_name' is on search_presets(holder, name) [unique],"
         " expected on search_presets(owner_user_id, name) [unique]"
     ) in text
     # The remedy leads, because the paths that print an uncaught error cut it at about 200 chars.
@@ -116,7 +117,7 @@ async def test_a_keyed_refusal_names_a_new_store_key(tmp_path: Path) -> None:
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     db = tmp_path / "keyed.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db, cipher=make_cipher(generate_key()))
     text = str(info.value)
@@ -134,7 +135,7 @@ async def test_a_keyed_store_opened_without_its_key_still_gets_the_new_key_remed
     db = tmp_path / "keyed-then-keyless.db"
     store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
     await store.close()
-    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    _sql(db, "DROP TABLE search_presets;" + _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     assert str(info.value).startswith(f"store {db} {_KEYED_LEAD}")
@@ -147,7 +148,7 @@ async def test_a_cell_bound_store_gets_the_plain_remedy(tmp_path: Path) -> None:
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     db = tmp_path / "cell-bound.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
     assert str(info.value).startswith(
@@ -164,7 +165,7 @@ async def test_a_cell_bound_store_opened_without_its_key_gets_the_plain_remedy(
     db = tmp_path / "cell-bound-then-keyless.db"
     store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
     await store.close()
-    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    _sql(db, "DROP TABLE search_presets;" + _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     assert str(info.value).startswith(
@@ -186,7 +187,7 @@ async def test_a_restored_cell_bound_store_opened_with_its_key_gets_the_plain_re
     store = await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
     await store.close()
     forget_store_salt(db)
-    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    _sql(db, "DROP TABLE search_presets;" + _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
     assert str(info.value).startswith(
@@ -196,7 +197,7 @@ async def test_a_restored_cell_bound_store_opened_with_its_key_gets_the_plain_re
 
 async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:
     db = tmp_path / "plain.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     text = str(info.value)
@@ -206,8 +207,8 @@ async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:
 
 
 async def test_the_refusal_releases_the_file_so_the_remedy_works(tmp_path: Path) -> None:
-    db = tmp_path / "v032.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    db = tmp_path / "stale.db"
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError):
         await MessageStore.open(db)
     for suffix in ("", "-wal", "-shm"):
@@ -225,7 +226,7 @@ async def test_a_refusal_rolls_the_migrations_back(tmp_path: Path) -> None:
     _sql(
         db,
         "DROP TABLE search_presets;"
-        + _V032_SEARCH_PRESETS
+        + _STALE_SEARCH_PRESETS
         + "CREATE INDEX ix_queue_fifo_in ON queue(stage, channel_id, created_at);",
     )
     with pytest.raises(SchemaMismatchError):
@@ -432,3 +433,195 @@ async def test_a_table_whose_name_starts_with_sqlite_is_still_read(tmp_path: Pat
         await db.close()
         await _await_connection_worker_exit(db)
     assert shape.columns == {"sqlitex_meta": frozenset({"a"})}
+
+
+# --- BACKLOG #2101 item 1: a failing schema step gets the same refusal and remedy ------------------
+
+
+async def test_a_schema_script_failure_is_a_schema_mismatch_with_the_remedy(tmp_path: Path) -> None:
+    """``messages`` exists but lacks the columns the script's own indexes name, so a ``CREATE INDEX IF
+    NOT EXISTS`` in the script fails. That used to surface as the driver's bare "no such column"."""
+    db = tmp_path / "script.db"
+    _sql(db, "CREATE TABLE messages (id TEXT PRIMARY KEY);")
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    text = str(info.value)
+    assert text.startswith(f"store {db} is from an incompatible version; recreate it:"), text
+    assert "The schema step failed: no such column" in text, text
+    assert info.value.differences == ()
+    assert info.value.cause is not None and "no such column" in info.value.cause
+    assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+
+
+async def test_a_migration_failure_is_a_schema_mismatch_and_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "migrate.db"
+    await _fresh(db)
+
+    async def _failing_migrate(conn: object) -> None:
+        # One real change first, so the rollback is observable, then a real SQLITE_ERROR.
+        await conn.execute("CREATE TABLE probe_rolled_back (x TEXT)")  # type: ignore[attr-defined]
+        await conn.execute("ALTER TABLE no_such_table ADD COLUMN x TEXT")  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(MessageStore, "_migrate", staticmethod(_failing_migrate))
+    with pytest.raises(SchemaMismatchError, match="The schema step failed: no such table"):
+        await MessageStore.open(db)
+    conn = sqlite3.connect(db)
+    try:
+        left = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'probe_rolled_back'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert left == [], "the failed migration was not rolled back"
+
+
+def test_only_a_schema_shaped_error_is_wrapped(tmp_path: Path) -> None:
+    """A locked, read-only or I/O failure is not fixed by recreating the store, so it must keep its
+    own error. Each exception here is a real one from SQLite, so its error code is SQLite's own."""
+    from messagefoundry.store.schema_verify import is_schema_step_error
+
+    db = tmp_path / "codes.db"
+    _sql(db, "CREATE TABLE t (x TEXT);")
+    conn = sqlite3.connect(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as missing:
+            conn.execute("SELECT nope FROM t")
+    finally:
+        conn.close()
+    assert is_schema_step_error(missing.value)
+
+    ro = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as readonly:
+            ro.execute("INSERT INTO t VALUES ('x')")
+    finally:
+        ro.close()
+    assert not is_schema_step_error(readonly.value)
+
+    holder = sqlite3.connect(db, isolation_level=None)
+    other = sqlite3.connect(db, timeout=0)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(sqlite3.OperationalError) as locked:
+            other.execute("SELECT * FROM t")
+    finally:
+        holder.execute("ROLLBACK")
+        other.close()
+        holder.close()
+    assert not is_schema_step_error(locked.value)
+    assert not is_schema_step_error(RuntimeError("no sqlite code at all"))
+
+    # SQLITE_ERROR too, but this build's fault, not the store's: recreating the store fixes nothing.
+    conn = sqlite3.connect(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as syntax:
+            conn.execute("SELEC x FROM t")
+    finally:
+        conn.close()
+    assert syntax.value.sqlite_errorcode & 0xFF == sqlite3.SQLITE_ERROR
+    assert not is_schema_step_error(syntax.value)
+
+
+async def test_a_counted_store_with_no_salt_table_gets_the_new_key_remedy(tmp_path: Path) -> None:
+    """When the schema script itself fails, an older file may have no ``store_salt`` table. A count
+    with no salt table means the store sealed under the DEK, so the keyed remedy applies."""
+    import aiosqlite
+
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    db = tmp_path / "counted.db"
+    _sql(
+        db,
+        "CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER); INSERT INTO cipher_meta VALUES ('k', 1);",
+    )
+    async with aiosqlite.connect(db) as conn:
+        assert await _counts_under_a_dek(conn) is True
+        await conn.execute("CREATE TABLE store_salt (salt TEXT)")
+        await conn.execute("INSERT INTO store_salt VALUES ('s')")
+        assert await _counts_under_a_dek(conn) is False  # control: a salt row means cell-bound
+
+
+# --- BACKLOG #2101 item 2: the forensic subcommands and a store this build refuses ------------------
+
+
+def _incompatible_store(db: Path) -> None:
+    """A real store with one audit row, then an index given the wrong columns: the open refuses it.
+    Not the v0.3.2 search_presets case, which a later migration may learn to repair."""
+    import asyncio
+
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            await store.record_audit("seed", actor="test")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    _sql(
+        db,
+        "DROP INDEX ix_messages_control; CREATE INDEX ix_messages_control ON messages(control_id);",
+    )
+
+
+@pytest.fixture
+def _no_at_rest_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_audit_keyless_chain_flagged import _AT_REST_ENV
+
+    for name in _AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.usefixtures("_no_at_rest_env")
+@pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
+def test_the_audit_commands_read_a_store_this_build_refuses(
+    tmp_path: Path, command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """They open read-only, so the audit log of an incompatible store can still be verified and
+    anchored, and the store is not touched."""
+    from messagefoundry.__main__ import main
+
+    db = tmp_path / "incompatible.db"
+    _incompatible_store(db)
+    before = db.read_bytes()
+
+    rc = main([command, "--db", str(db)])
+
+    out = capsys.readouterr()
+    assert rc == 0, (out.out, out.err)
+    assert out.out.startswith("OK: verified 1" if command == "audit-verify" else "1:"), out.out
+    assert db.read_bytes() == before, f"{command} wrote to the store it was reading"
+
+
+@pytest.mark.usefixtures("_no_at_rest_env")
+def test_backup_refuses_a_store_this_build_refuses_and_says_why(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``backup`` must open writable (it records a dr_backup audit row), so it refuses, and it names
+    the copy an operator can take instead and the two commands that do open such a store."""
+    from messagefoundry.__main__ import main
+
+    db = tmp_path / "incompatible.db"
+    _incompatible_store(db)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+
+    rc = main(
+        [
+            "backup",
+            "--config",
+            str(cfg),
+            "--db",
+            str(db),
+            "--destination",
+            str(tmp_path / "dest"),
+            "--json",
+        ]
+    )
+
+    assert rc == 2
+    text = capsys.readouterr().out
+    assert "is from an incompatible version" in text, text
+    assert "dr_backup audit row" in text and "`audit-verify`" in text, text
+    assert not (tmp_path / "dest").exists() or not any((tmp_path / "dest").iterdir())

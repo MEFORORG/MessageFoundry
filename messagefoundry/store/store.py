@@ -127,7 +127,13 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
-from messagefoundry.store.schema_verify import verify_live_schema
+from messagefoundry.store.schema_verify import (
+    SchemaMismatchError,
+    is_schema_step_error,
+    live_schema_differences,
+    run_schema_step,
+    verify_live_schema,
+)
 
 log = logging.getLogger(__name__)
 
@@ -4481,6 +4487,11 @@ _LAST_EVENT_COLUMN = (
 # alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
 _MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
 
+# BACKLOG #1909: the account a 0.3.2 preset row belongs to. See MessageStore._migrate_preset_owner.
+_PRESET_OWNER_MATCH = (
+    "users.username = search_presets.owner AND users.created_at <= search_presets.updated_at"
+)
+
 
 @dataclass(frozen=True)
 class SecretRotationMetaRow:
@@ -4605,6 +4616,9 @@ class MessageStore:
         # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
         # may already count for another store, so close() must not settle its reserve here.
         self._cipher_foreign = False
+        # BACKLOG #1780: set by open(read_only=True). The handle is `mode=ro`, so it writes nothing
+        # at open or at close: no salt, no invocation reserve, no audit keying watermark.
+        self._read_only = False
         # HKDF-derived HMAC key for the tamper-evident audit chain (#190). None → the chain stays the
         # keyless SHA-256 chain (byte-identical to a pre-#190 / unencrypted store). Held only in memory;
         # never persisted, never logged.
@@ -4773,13 +4787,35 @@ class MessageStore:
         audit_mac_key: bytes | None = None,
         audit_mac_fn: Callable[[bytes], str] | None = None,
         message_events: str = "all",
+        read_only: bool = False,
     ) -> MessageStore:
+        """Open (and, unless ``read_only``, create, schema-ensure and migrate) the store at ``path``.
+
+        ``read_only`` (BACKLOG #1780) is for a caller that means *inspect this store*. The file is
+        opened through a ``mode=ro`` URI, so SQLite itself refuses to create it or write to it. No
+        schema script, no migration, no permission rewrite, and none of the at-open writes run: no
+        salt bind, no invocation reserve, no at-rest sweep, no audit keying watermark. The schema is
+        still compared with this build's, but a difference is logged as a WARNING rather than
+        refused, because an inspection of an incompatible store is the point. A later read that
+        needs a missing object raises ``sqlite3.OperationalError``, and so does any write. SQLite
+        still creates the ``-wal`` and ``-shm`` files of a WAL store it reads, as any reader does,
+        and leaves them after a read-only close; the store file itself is not written.
+
+        The ``state`` and ``reference`` read caches are NOT loaded on a read-only handle: they serve
+        the pipeline, and loading them decrypts every cell, which refuses a legacy plaintext value
+        the writable open would have sealed first. ``state_get`` and ``reference_view`` therefore
+        read empty there. The audit keying watermark is loaded, because the audit reads need it."""
         sync = synchronous.upper()
         if sync not in ("NORMAL", "FULL"):
             raise ValueError(
                 f"invalid synchronous mode {synchronous!r}; expected 'NORMAL' or 'FULL'"
             )
-        db = await aiosqlite.connect(str(path))
+        if read_only:
+            if str(path) == ":memory:":
+                raise ValueError("a read-only open needs a store file; ':memory:' is always empty")
+            db = await aiosqlite.connect(_sqlite_readonly_uri(str(Path(path).resolve())), uri=True)
+        else:
+            db = await aiosqlite.connect(str(path))
         # Everything past `connect` runs under the cleanup below (#1670). aiosqlite drives each
         # statement on a background thread created WITHOUT `daemon=True`, so a connection nobody
         # closes parks a non-daemon thread forever and interpreter exit then blocks in
@@ -4789,88 +4825,67 @@ class MessageStore:
         store: MessageStore | None = None
         try:
             db.row_factory = aiosqlite.Row
-            await db.execute("PRAGMA journal_mode=WAL")
-            # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power
-            # loss, never corruption) and avoids an fsync per commit — a large write-throughput win
-            # vs FULL. `sync` is validated above, so this f-string can't inject. FULL is available
-            # for the paranoid (every commit fsynced) via [store] synchronous = "full".
-            await db.execute(f"PRAGMA synchronous={sync}")
+            if not read_only:
+                await db.execute("PRAGMA journal_mode=WAL")
+                # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power
+                # loss, never corruption) and avoids an fsync per commit — a large write-throughput
+                # win vs FULL. `sync` is validated above, so this f-string can't inject. FULL is
+                # available for the paranoid (every commit fsynced) via [store] synchronous = "full".
+                await db.execute(f"PRAGMA synchronous={sync}")
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
-            await db.executescript(_SCHEMA)
-            # BACKLOG #1586: the migrations run in ONE transaction, so an interrupted run leaves no
-            # trace. Outside one, each ALTER ... ADD COLUMN commits on its own, and a failure before
-            # its paired backfill leaves the column present -- the next open's column-missing guard
-            # then skips that backfill for good. The transaction opens exactly here and no earlier:
-            # before the PRAGMAs, foreign_keys=ON is a silent no-op and journal_mode=WAL raises;
-            # before executescript, its implicit COMMIT ends the transaction before _migrate runs.
-            # _writer_txn rolls back on BaseException; the lock is a fresh one because nothing else
-            # can reach this connection yet.
-            async with _writer_txn(db, asyncio.Lock()):
-                await cls._migrate(db)
-                # BACKLOG #1720: every CREATE is IF NOT EXISTS and every migration is additive, so an
-                # object an incompatible version left under an expected name was skipped, not fixed.
-                # Checked before the commit, so a refusal rolls the migrations back.
-                await verify_live_schema(
+            if read_only:
+                await cls._report_schema_read_only(db, path)
+            else:
+                await cls._ensure_schema(
                     db,
-                    schema=_SCHEMA,
-                    migrate=cls._migrate,
-                    path=path,
+                    path,
                     # None (no local key) lets the file answer; a keyed process answers itself.
                     counts_under_dek=(
                         counts_under_dek(cipher) if bounded_cipher(cipher) is not None else None
                     ),
                 )
-                await db.commit()
-            # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-            # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
-            # completes before anything is serving, so this one is consistency rather than a fix.
-            if str(path) != ":memory:":
-                main = Path(path)
-                # ADR 0183 Wave 0b: in a HARDENED data directory each trio file gets the same explicit,
-                # protected DACL naming the directory's principals, so the service account and the
-                # provisioning operator can both open it in either order; elsewhere it is rewritten
-                # owner-only as before. See _secure_store_file.
-                grants = await asyncio.to_thread(_store_dir_grants, main.parent)
-                for f in (
-                    main,
-                    main.with_name(main.name + "-wal"),
-                    main.with_name(main.name + "-shm"),
-                ):
-                    if f.exists():
-                        await asyncio.to_thread(_secure_store_file, f, dir_grants=grants)
             store = cls(
                 db,
                 path=path,
                 cipher=cipher,
-                group_commit_window_ms=group_commit_window_ms,
+                # A read-only handle writes nothing, so a grouped write must fail at once on the
+                # read-only file rather than park on a committer this open never starts.
+                group_commit_window_ms=0.0 if read_only else group_commit_window_ms,
                 group_commit_max_batch=group_commit_max_batch,
                 synchronous=sync,
                 audit_mac_key=audit_mac_key,
                 audit_mac_fn=audit_mac_fn,
                 message_events=message_events,
             )
-            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
-            # next and every value sealed after it land under this store's own data sub-key.
-            try:
-                await bind_store_salt(cipher, store._ensure_store_salt)
-            except BaseException:
-                store._cipher_foreign = True
-                raise
-            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
-            # block BEFORE anything on this handle encrypts — the at-rest migration below included,
-            # since on a store that is having a key enabled for the first time it is itself a large
-            # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
-            await store.checkpoint_cipher_invocations()
-            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
-            await store._encrypt_existing_rows()
-            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-            await (
-                store._load_state_cache()
-            )  # populate the in-memory state read-through cache (ADR 0005)
-            await (
-                store._load_reference_cache()
-            )  # populate the reference-snapshot read cache (ADR 0006)
+            store._read_only = read_only
+            if not read_only:
+                # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
+                # reserved next and every value sealed after it land under this store's own data
+                # sub-key. A read-only handle seals nothing; every stored value names its own salt.
+                try:
+                    await bind_store_salt(cipher, store._ensure_store_salt)
+                except BaseException:
+                    store._cipher_foreign = True
+                    raise
+                # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
+                # first block BEFORE anything on this handle encrypts — the at-rest migration below
+                # included, since on a store that is having a key enabled for the first time it is
+                # itself a large burst. A no-op when the cipher carries no bound (keyless /
+                # `vault_transit`).
+                await store.checkpoint_cipher_invocations()
+                # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+                await store._encrypt_existing_rows()
+            if read_only:
+                await store._load_read_only()
+            else:
+                await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+                await (
+                    store._load_state_cache()
+                )  # populate the in-memory state read-through cache (ADR 0005)
+                await (
+                    store._load_reference_cache()
+                )  # populate the reference-snapshot read cache (ADR 0006)
             await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
             if store._group_commit is not None:
                 store._group_commit.start()  # spin the committer coroutine (needs the running loop)
@@ -4897,6 +4912,99 @@ class MessageStore:
                 log.warning("error closing the connection after a failed store open", exc_info=True)
             raise
 
+    @classmethod
+    async def _ensure_schema(
+        cls, db: aiosqlite.Connection, path: str | Path, *, counts_under_dek: bool | None
+    ) -> None:
+        """Run the schema script and the migrations, verify the result, then tighten the file's
+        permissions: the writable half of :meth:`open`.
+
+        A statement in the script or a migration that fails on the live store's shape is raised as
+        :class:`SchemaMismatchError` with the same remedy the verify gives (BACKLOG #2101), rather
+        than as the driver's bare text. Any other failure, such as a locked or read-only file, keeps
+        its own error, because recreating the store would not fix it."""
+        await run_schema_step(
+            db, db.executescript(_SCHEMA), path=path, counts_under_dek=counts_under_dek
+        )
+        # BACKLOG #1586: the migrations run in ONE transaction, so an interrupted run leaves no
+        # trace. Outside one, each ALTER ... ADD COLUMN commits on its own, and a failure before
+        # its paired backfill leaves the column present -- the next open's column-missing guard
+        # then skips that backfill for good. The transaction opens exactly here and no earlier:
+        # before the PRAGMAs, foreign_keys=ON is a silent no-op and journal_mode=WAL raises;
+        # before executescript, its implicit COMMIT ends the transaction before _migrate runs.
+        # _writer_txn rolls back on BaseException; the lock is a fresh one because nothing else
+        # can reach this connection yet.
+        async with _writer_txn(db, asyncio.Lock()):
+            # A refusal raised here is inside the transaction, so the migrations roll back.
+            await run_schema_step(
+                db, cls._migrate(db), path=path, counts_under_dek=counts_under_dek
+            )
+            # BACKLOG #1720: every CREATE is IF NOT EXISTS and every migration is additive, so an
+            # object an incompatible version left under an expected name was skipped, not fixed.
+            # Checked before the commit, so a refusal rolls the migrations back.
+            await verify_live_schema(
+                db,
+                schema=_SCHEMA,
+                migrate=cls._migrate,
+                path=path,
+                counts_under_dek=counts_under_dek,
+            )
+            await db.commit()
+        # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+        # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+        # completes before anything is serving, so this one is consistency rather than a fix.
+        if str(path) != ":memory:":
+            main = Path(path)
+            # ADR 0183 Wave 0b: in a HARDENED data directory each trio file gets the same explicit,
+            # protected DACL naming the directory's principals, so the service account and the
+            # provisioning operator can both open it in either order; elsewhere it is rewritten
+            # owner-only as before. See _secure_store_file.
+            grants = await asyncio.to_thread(_store_dir_grants, main.parent)
+            for f in (
+                main,
+                main.with_name(main.name + "-wal"),
+                main.with_name(main.name + "-shm"),
+            ):
+                if f.exists():
+                    await asyncio.to_thread(_secure_store_file, f, dir_grants=grants)
+
+    @classmethod
+    async def _report_schema_read_only(cls, db: aiosqlite.Connection, path: str | Path) -> None:
+        """The read-only half of :meth:`open`'s schema step (BACKLOG #1780): compare, never change.
+
+        A difference is logged rather than refused. The callers that open read-only are inspecting
+        the store, and an incompatible or not-yet-migrated store is exactly what some of them are
+        there to inspect (BACKLOG #2101). The WARNING names each difference, so a read that later
+        fails on one of them is explained in the same log."""
+        problems = await live_schema_differences(db, schema=_SCHEMA, migrate=cls._migrate)
+        if problems:
+            log.warning(
+                "store %s was opened read-only and its schema differs from this build's, so it was "
+                "neither migrated nor refused; a read that needs a missing object will fail. "
+                "Differences: %s.",
+                path,
+                "; ".join(problems),
+            )
+
+    async def _load_read_only(self) -> None:
+        """The at-open loads of a read-only handle (BACKLOG #1780): the audit keying watermark only.
+
+        A store that lacks what that load reads fails here with a :class:`SchemaMismatchError` that
+        says so, rather than as a bare "no such column": the read-only open never migrates, so an
+        older store that the writable open would have migrated cannot be read by this build."""
+        try:
+            await self._load_audit_chain_meta()
+        except Exception as exc:
+            if not is_schema_step_error(exc):
+                raise
+            cause = str(exc)
+            raise SchemaMismatchError(
+                f"store {self.path} was opened read-only and lacks what this build reads: it is "
+                "from an incompatible version, or it is older and needs the migration an ordinary "
+                f"open of this build runs. The read failed: {cause}.",
+                cause=cause,
+            ) from exc
+
     async def _open_read_pool(self, path: str) -> None:
         """Open the bounded read-only connection pool for a file-backed WAL store (lockfree-reads).
 
@@ -4910,7 +5018,12 @@ class MessageStore:
             return
         pool: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue(maxsize=_READ_POOL_SIZE)
         for _ in range(_READ_POOL_SIZE):
-            conn = await aiosqlite.connect(path)
+            if self._read_only:
+                # BACKLOG #1780: the pool is part of the read-only handle, so it opens `mode=ro` too.
+                uri = _sqlite_readonly_uri(str(Path(path).resolve()))
+                conn = await aiosqlite.connect(uri, uri=True)
+            else:
+                conn = await aiosqlite.connect(path)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA query_only=ON")  # defence in depth: a read conn never writes
             await conn.execute("PRAGMA busy_timeout=5000")
@@ -5102,6 +5215,8 @@ class MessageStore:
         if cnt is None:
             return  # no count read: never key over rows that may exist
         rows = int(cnt["n"])
+        if rows == 0 and self._read_only:
+            return  # BACKLOG #1780: key nothing from a read-only handle; an empty chain has no range
         if rows == 0:
             active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
             async with _writer_guard(self._db, self._lock):
@@ -6013,6 +6128,8 @@ class MessageStore:
         preset_cols = {row["name"] for row in await cur.fetchall()}
         if preset_cols and "last_used_at" not in preset_cols:
             await db.execute("ALTER TABLE search_presets ADD COLUMN last_used_at REAL")
+        if "owner" in preset_cols and "owner_user_id" not in preset_cols:
+            await MessageStore._migrate_preset_owner(db)
         # BACKLOG #1540: a pre-existing pending_approvals table predates requester_user_id — ALTER it
         # in, nullable (an ALTER cannot add NOT NULL without a default, and there is no name-to-id
         # backfill that is CORRECT: after a rename the stored name may belong to somebody else, so
@@ -6023,6 +6140,32 @@ class MessageStore:
         if "requester_user_id" not in approval_cols:
             await db.execute("ALTER TABLE pending_approvals ADD COLUMN requester_user_id TEXT")
         await MessageStore._migrate_outbox_to_queue(db)
+
+    @staticmethod
+    async def _migrate_preset_owner(db: aiosqlite.Connection) -> None:
+        """Move a 0.3.2 ``search_presets.owner`` column to ``owner_user_id`` (BACKLOG #1909).
+
+        0.3.2 keyed a preset on the owner's USERNAME; this version keys it on ``Identity.user_id``
+        (#1225) under the renamed column (#1232). So a bare rename would keep every row and still
+        orphan it: listing by id finds nothing and ``delete_user`` leaves it behind. Each value is
+        mapped to its account's id first, and only when the account existed at the preset's last
+        save. 0.3.2's ``delete_user`` left a user's presets behind, and a later account given the
+        same username would otherwise inherit them, PHI-shaped criteria included: the defect #1225
+        closed. A preset the new holder saved again is theirs, which is why the test reads
+        ``updated_at``. Every other row is dropped, because nobody could list, recall or delete it.
+        That includes rows of ``system``, the no-auth identity: its id equals its username, but so
+        would a deleted account's that was named ``system``, and the two cannot be told apart.
+        ``criteria`` is sealed against the preset ``id``, which does not change, so no cell is
+        re-encrypted. The rename carries the unique index along with the column. Runs in the open's
+        migration transaction, so a refused open rolls all of it back."""
+        await db.execute(
+            "DELETE FROM search_presets"
+            f" WHERE NOT EXISTS (SELECT 1 FROM users WHERE {_PRESET_OWNER_MATCH})"
+        )
+        await db.execute(
+            f"UPDATE search_presets SET owner = users.id FROM users WHERE {_PRESET_OWNER_MATCH}"
+        )
+        await db.execute("ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id")
 
     @staticmethod
     async def _migrate_outbox_to_queue(db: aiosqlite.Connection) -> None:
@@ -6075,7 +6218,8 @@ class MessageStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            if not self._cipher_foreign:
+            # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
+            if not self._cipher_foreign and not self._read_only:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)

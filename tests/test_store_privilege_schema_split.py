@@ -512,6 +512,76 @@ async def test_postgres_auto_on_the_same_stale_marker_reaches_the_ddl_transactio
         await store._ensure_schema()
 
 
+# --- BACKLOG #1780: an auto open that must not build ---------------------------------------------
+
+
+async def test_postgres_auto_without_create_refuses_a_database_with_no_store() -> None:
+    """``create=False`` under auto: no ``schema_meta`` means no store, so nothing is built. The fake
+    refuses a DDL transaction, so reaching one would fail with a different error."""
+    from messagefoundry.store.base import StoreNotFoundError
+
+    conn = _FakePgConn(present=False, schema_hash=None)
+    store = _postgres_store_over(conn, SchemaManagement.AUTO)
+    with pytest.raises(StoreNotFoundError, match="no schema_meta table"):
+        await store._ensure_schema(create=False)
+    assert conn.writes == []
+
+
+async def test_postgres_auto_without_create_still_upgrades_a_store_that_is_there() -> None:
+    """The control: a stale marker is a store, so the same open goes on to the DDL transaction."""
+    conn = _FakePgConn(present=True, schema_hash="an-older-build")
+    store = _postgres_store_over(conn, SchemaManagement.AUTO)
+    with pytest.raises(AssertionError, match="DDL transaction"):
+        await store._ensure_schema(create=False)
+
+
+@pytest.mark.parametrize("mode", [SchemaManagement.AUTO, None], ids=["auto", "external"])
+async def test_postgres_read_only_opens_a_stale_marker_as_it_is_and_says_so(
+    mode: SchemaManagement | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Never an upgrade (the fake refuses a DDL transaction) and never a refusal of the inspection."""
+    conn = _FakePgConn(present=True, schema_hash="an-older-build")
+    store = _postgres_store_over(conn, mode)
+    with caplog.at_level("WARNING"):
+        assert await store._ensure_schema(read_only=True) is False
+    assert conn.writes == []
+    assert "not current for this build; opened read-only" in caplog.text
+
+
+@pytest.mark.parametrize("mode", [SchemaManagement.AUTO, None], ids=["auto", "external"])
+async def test_postgres_read_only_refuses_a_database_with_no_store(
+    mode: SchemaManagement | None,
+) -> None:
+    from messagefoundry.store.base import StoreNotFoundError
+
+    conn = _FakePgConn(present=False, schema_hash=None)
+    store = _postgres_store_over(conn, mode)
+    with pytest.raises(StoreNotFoundError, match="no schema_meta table"):
+        await store._ensure_schema(read_only=True)
+    assert conn.writes == []
+
+
+async def test_postgres_read_only_external_open_needs_no_write_grants() -> None:
+    """An inspecting login should hold SELECT only; the runtime-grants check demands writes, so a
+    read-only open skips it. The control is the ordinary external open refusing the same role."""
+    from messagefoundry.store.base import StoreGrantsMissingError
+    from messagefoundry.store.postgres import _schema_hash
+
+    conn = _FakePgConn(present=True, schema_hash=_schema_hash(), ungranted=("messages",))
+    assert await _postgres_store_over(conn, None)._ensure_schema(read_only=True) is False
+    with pytest.raises(StoreGrantsMissingError):
+        await _postgres_store_over(conn, None)._ensure_schema()
+
+
+async def test_postgres_read_only_opens_a_current_store_under_auto() -> None:
+    from messagefoundry.store.postgres import _schema_hash
+
+    conn = _FakePgConn(present=True, schema_hash=_schema_hash())
+    store = _postgres_store_over(conn, SchemaManagement.AUTO)
+    assert await store._ensure_schema(read_only=True) is False
+    assert conn.writes == []
+
+
 # --- #1927's users.channel_scope_source column is provisioned, never added at runtime ------------
 
 

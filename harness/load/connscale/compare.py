@@ -24,10 +24,9 @@ CPU/FD footprint). This module reads a connscale run's records — which now car
   batch-claimers per stage vs ~one worker per lane). Only asserted where per_lane's idle-poll rate
   clears a noise floor; below it the collapse is negligible-either-way and reported inconclusive.
 
-A **missing pooled arm** (the engine refused to start — e.g. SQL Server ``READ_COMMITTED_SNAPSHOT``
-OFF under the fail-closed ``require_rcsi_for_pooled`` gate) is detected structurally (a baseline
-``(sweep_mode, count)`` with no pooled record) and reported LOUDLY as a failing row — never silently
-compared against nothing.
+A **missing pooled arm** (the engine refused to start, for any reason) is detected structurally (a
+baseline ``(sweep_mode, count)`` with no pooled record) and reported LOUDLY as a failing row — never
+silently compared against nothing.
 
 Metrics + metadata only (no message bodies / control-ids) — pure + deterministic, unit-testable.
 """
@@ -394,8 +393,8 @@ def build_comparison(
     if missing:
         notes.append(
             f"{len(missing)} pooled arm(s) MISSING (engine failed to start): {', '.join(missing)} "
-            "-- on SQL Server this is the RCSI fail-closed gate (READ_COMMITTED_SNAPSHOT OFF); set "
-            "RCSI ON or MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED=false for a smoke."
+            "-- see each arm's recorded reason (on SQL Server one cause is READ_COMMITTED_SNAPSHOT "
+            "OFF; set RCSI ON on the target DB)."
         )
     return ClaimModeComparison(
         baseline_mode=baseline_mode,

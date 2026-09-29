@@ -428,6 +428,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   kept a default-on console on the `/ui` exposure checks, which can refuse start, instead of dropping
   it. `serve` now reads whether `[security].serve_web_console` was provided directly, so that switch
   behaves as before. (`BACKLOG #2000`)
+- **BREAKING: `[pipeline].require_rcsi_for_pooled` is removed and refused at load, in the file and
+  as `MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED`, at either value.** A SQL Server store already
+  refuses to open with `READ_COMMITTED_SNAPSHOT` off (`BACKLOG #1628`). So `false` could only start
+  a pooled runner in the mode that deadlocks. The pooled start gate now always fails closed. The
+  `rcsi_off_degraded` alert event type is removed too, because nothing can raise it. An
+  `[[alerts.rules]]` entry naming it is now refused like any unknown event. Embedders lose the
+  `require_rcsi_for_pooled` parameter of `RegistryRunner`, `Engine` and `create_managed_app`. The
+  `AlertSink` protocol and both shipped sinks lose the `rcsi_off_degraded` method. See ADR 0066 §12.
+  (`BACKLOG #2090`)
 - **BREAKING: an administrator must give a notification address to create an account.**
   `POST /users` now requires `email`, and the web console's create-user form requires it too. The
   address becomes the account's notification address, so its holder is told about changes made
@@ -534,6 +543,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
+  The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
+  It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
+  account existed at the preset's last save, so a new account that reused a deleted user's name does
+  not inherit that user's presets. Every other preset is dropped, because no account could reach it.
+  That includes presets saved under the no-auth `system` identity. On PostgreSQL and SQL Server the
+  step runs in the schema batch, under `provision-schema` and `auto` alike. The 0.4.0 entry's advice
+  to drop the table first no longer applies from this release on. (`BACKLOG #1909`)
 - **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
   whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
   algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal
