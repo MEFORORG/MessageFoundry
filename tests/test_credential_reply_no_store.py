@@ -117,8 +117,16 @@ async def test_every_credential_reply_is_no_store_on_the_wire(
 
     Asserts a 200 on every call first. A directive checked on a refusal proves nothing here: the
     header is set on the success path, and the refusal carries no credential."""
+    # The calls run at machine speed, so the timing floors are off: the shipped 1 s sign-in to MFA
+    # floor would refuse the verify below with a 401 (BACKLOG #2301).
     service = await _service(
-        engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+        engine,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            admin_write_min_interval_seconds=0,
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+        ),
     )
     await _add(service, "adm", Role.ADMINISTRATOR)
     await _add(service, "mfa", Role.VIEWER)

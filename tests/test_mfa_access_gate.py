@@ -47,7 +47,10 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
-    service = AuthService(engine.store, settings or AuthSettings(login_rate_limit_enabled=False))
+    service = AuthService(
+        engine.store,
+        settings or AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False),
+    )
     await service.initialize()
     return service
 

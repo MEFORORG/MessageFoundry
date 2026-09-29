@@ -210,7 +210,9 @@ async def test_password_only_sign_ins_leave_full_sessions_live(
     store = await _store()
     try:
         cap = 2
-        service = AuthService(store, AuthSettings(max_sessions_per_user=cap))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, max_sessions_per_user=cap)
+        )
         full_first, password, codes = await _enrolled_admin(service, monkeypatch)
         full_second = await _full_sign_in(service, password, codes[0])
         assert await _is_full(service, full_first) and await _is_full(service, full_second)
@@ -236,7 +238,9 @@ async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
     siblings; the oldest-completed sibling goes instead."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(max_sessions_per_user=2))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, max_sessions_per_user=2)
+        )
         _first, password, codes = await _enrolled_admin(service, monkeypatch)
         # Signs in now, completes last: the oldest `created_at` among the survivors.
         waiting = (await service.login(ADMIN_USERNAME, password)).token

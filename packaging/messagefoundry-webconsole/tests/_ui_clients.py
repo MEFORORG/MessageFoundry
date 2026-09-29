@@ -39,7 +39,9 @@ async def auth_service(engine: Engine) -> AuthService:
     ``require_mfa=False`` because these suites exercise input validation and their fixtures never
     enroll an authenticator; an MFA gate would refuse before any input was read.
     """
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     return service
 

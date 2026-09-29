@@ -80,6 +80,7 @@ class _Enrolled:
 
 def _settings(**overrides: object) -> AuthSettings:
     return AuthSettings(
+        mfa_verify_min_elapsed_seconds=0,
         ad_enabled=True,
         ad_server="ldaps://dc.test.invalid",
         ad_user_search_base="OU=Staff,DC=test,DC=invalid",
@@ -419,7 +420,7 @@ async def test_a_directory_account_with_no_directory_configured_is_refused(
     """An AD row left behind after the directory is unwired has nothing to confirm it, so it fails
     closed rather than renewing on the engine row alone."""
     e = await _enrolled_directory_session(store, monkeypatch)
-    unwired = AuthService(store, AuthSettings())
+    unwired = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
 
     refused = await unwired.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 

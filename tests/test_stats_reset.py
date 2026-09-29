@@ -155,7 +155,9 @@ async def test_endpoint_destination_target_requires_name(client: httpx.AsyncClie
 
 
 async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     return service
 

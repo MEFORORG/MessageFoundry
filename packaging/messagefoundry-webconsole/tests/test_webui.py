@@ -54,7 +54,16 @@ async def _service(engine: Engine) -> AuthService:
     # an authenticator — so under the new default every unenrolled session diverts to
     # /ui/account?m=enroll_first. Pin require_mfa=False here (the pre-#187 assumption); the handful
     # of tests that DO exercise the require_mfa gate construct their own AuthSettings(require_mfa=True).
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    # The suite also drives writes and second factors at machine speed, so the two human-timing
+    # floors those would trip are off here (BACKLOG #2301).
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            mfa_verify_min_elapsed_seconds=0,
+            require_mfa=False,
+        ),
+    )
     await service.initialize()
     return service
 
@@ -4412,7 +4421,9 @@ async def test_stale_reauth_only_bounces_to_reauth(engine: Engine) -> None:
     # So each lane below is driven TWICE (BACKLOG #1851): an ungranted arm, which bounces under
     # every window and therefore measures the window not at all, and a minted arm, which bounces
     # only because the negative window expired the grant on its way out of the mint.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, step_up_max_age_seconds=-1)
+    )
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -4498,7 +4509,12 @@ async def test_require_mfa_unenrolled_can_enroll_end_to_end(engine: Engine) -> N
     # an attacker's authenticator), so browser enrollment goes login → enroll → reauth (password
     # ONLY, no impossible code demand) → auto-retried enroll → confirm — completing end-to-end.
 
-    service = AuthService(engine.store, AuthSettings(require_mfa=True))
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, mfa_verify_min_elapsed_seconds=0, require_mfa=True
+        ),
+    )
     await service.initialize()
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -4751,7 +4767,10 @@ async def test_required_unenrolled_full_stepup_routes_to_enroll_not_loop(engine:
 async def test_reauth_demands_code_from_enrolled_unverified_session(engine: Engine) -> None:
     # WP-14 positive case: an ENROLLED-but-unverified session must still get the TOTP code demand
     # (the enrolled-aware condition must not have weakened the code requirement).
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(
+        engine.store,
+        AuthSettings(admin_write_min_interval_seconds=0, mfa_verify_min_elapsed_seconds=0),
+    )
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -4768,7 +4787,10 @@ async def test_reauth_demands_code_from_enrolled_unverified_session(engine: Engi
 async def test_disable_mfa_enforces_full_stepup_when_stale(engine: Engine) -> None:
     # Disable is require_ui_step_up (full step-up incl. MFA), matching the JSON DELETE /me/mfa: an
     # enrolled-but-unverified session is bounced to /ui/reauth, and MFA stays on until re-verified.
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(
+        engine.store,
+        AuthSettings(admin_write_min_interval_seconds=0, mfa_verify_min_elapsed_seconds=0),
+    )
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -4792,7 +4814,10 @@ async def test_disabling_the_LAST_factor_renders_the_page_not_raw_json(engine: E
     at exactly the moment it started refusing. The remedy is the operator's to act on (enroll another
     factor first), so it has to reach somewhere they can read it.
     """
-    service = AuthService(engine.store, AuthSettings())  # default posture: require_mfa=True
+    service = AuthService(
+        engine.store,
+        AuthSettings(admin_write_min_interval_seconds=0, mfa_verify_min_elapsed_seconds=0),
+    )  # default posture: require_mfa=True
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -5143,7 +5168,12 @@ async def test_webauthn_enroll_requires_password_reproof(engine: Engine) -> None
     # WP-14 (AC-1): a require_mfa MFA-pending session has NO step-up freshness — the enroll POST
     # walks the password-only reauth continuation before any ceremony starts.
     pytest.importorskip("webauthn")
-    service = AuthService(engine.store, AuthSettings(require_mfa=True))
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, mfa_verify_min_elapsed_seconds=0, require_mfa=True
+        ),
+    )
     await service.initialize()
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -6910,6 +6940,8 @@ def _oidc_settings(**over: object) -> AuthSettings:
         "oidc_token_endpoint": "https://idp.example/token",
         "oidc_jwks_uri": "https://idp.example/jwks",
         "oidc_allowed_endpoints": ["idp.example"],
+        # The start-to-callback floor is off: these callbacks return at machine speed (BACKLOG #2301).
+        "oidc_callback_min_elapsed_seconds": 0,
     }
     base.update(over)
     return AuthSettings(**base)  # type: ignore[arg-type]

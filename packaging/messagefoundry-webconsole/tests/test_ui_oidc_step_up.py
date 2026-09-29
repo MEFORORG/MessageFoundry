@@ -63,6 +63,7 @@ class _FakeLdap:
 
 def _settings(*, require_mfa: bool = False) -> AuthSettings:
     return AuthSettings(
+        oidc_callback_min_elapsed_seconds=0,
         require_mfa=require_mfa,
         ad_enabled=True,
         ad_server="ldaps://x",

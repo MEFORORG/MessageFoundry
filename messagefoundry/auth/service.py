@@ -17,6 +17,7 @@ import http.client
 import ipaddress
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -413,6 +414,11 @@ DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
 STEP_UP_SUBJECT_MISMATCH = "step_up_subject_mismatch"
 FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
+
+#: The audit reason for a second step refused under its ASVS 2.4.2 minimum-elapsed floor (BACKLOG
+#: #2301): an MFA code or passkey too soon after sign-in, or an IdP callback too soon after its flow
+#: started. Audit only. The caller sees its leg's ordinary failure, which says nothing about timing.
+TOO_EARLY = "too_early"
 
 #: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
 #: A slug not listed here reads as the generic line in ``_step_up_refused``.
@@ -1397,6 +1403,8 @@ class AuthService:
                 per_key=settings.admin_write_rate_limit_per_actor,
                 glob=0,
                 window_seconds=settings.admin_write_rate_limit_window_seconds,
+                # BACKLOG #2301: the per-actor gap floor, beside the count.
+                min_interval_seconds=settings.admin_write_min_interval_seconds,
             )
             if settings.admin_write_rate_limit_enabled
             else None
@@ -2772,6 +2780,10 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=FLOW_PURPOSE_MISMATCH
             )
+        # BACKLOG #2301: the callback's age is read as it arrives, so the engine's own round trip to
+        # the token endpoint below never counts as time the person spent. Whether the floor applies
+        # needs the verified auth_time, so the decision waits for the exchange.
+        arrived_too_early = self._oidc_callback_too_early(flow)
         try:
             try:
                 principal_claims = await asyncio.to_thread(
@@ -2828,6 +2840,24 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
+        # BACKLOG #2301 (ASVS 2.4.2): the minimum-elapsed floor, only when the person signed in at
+        # the IdP during THIS flow, which the verified auth_time says. An IdP holding a live single
+        # sign-on session answers with no human step, so there is nothing to floor, and flooring it
+        # would refuse that sign-in on every retry. auth_time is whole seconds, so it is compared
+        # with the flow's start rounded down: a sign-in in the same second as the start is the fast
+        # case this floor exists for. An IdP clock that runs ahead can make an older sign-on look
+        # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
+        signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
+        if signed_in_during_flow and arrived_too_early:
+            # With the client address, as the token_refused arm records it: a run of these is
+            # automation, and the operator needs to see where it comes from.
+            await self._audit(
+                "auth.login_failed",
+                actor="<oidc>",
+                detail=_json({"provider": "ad", "mech": "oidc", "reason": TOO_EARLY}),
+                client=client,
+            )
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason=TOO_EARLY)
 
         # The claimed username selects nothing. It is kept only as a hint in the not-bound refusal.
         username = principal_claims.username
@@ -3072,6 +3102,14 @@ class AuthService:
         )
         return flow_id, url
 
+    def _oidc_callback_too_early(self, flow: PendingFlow) -> bool:
+        """Whether ``flow``'s callback came back sooner than ``[auth].oidc_callback_min_elapsed_seconds``
+        after the flow started, on the flow cache's own clock (BACKLOG #2301). The caller decides
+        whether the floor applies."""
+        floor = self._settings.oidc_callback_min_elapsed_seconds
+        flows = self._oidc_flows
+        return floor > 0 and flows is not None and flows.age(flow) < floor
+
     def oidc_flow_is_step_up(self, flow_id: str) -> bool:
         """Whether the live flow behind this cookie is a step-up flow, WITHOUT consuming it.
 
@@ -3162,6 +3200,13 @@ class AuthService:
         token_hash = flow.step_up_session_hash
         if token_hash is None:
             return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
+        # BACKLOG #2301 (ASVS 2.4.2): max_age=0 and prompt=login make the person authenticate at the
+        # IdP, so a step-up callback faster than a person can do that is refused. Before the code is
+        # redeemed, so the refused flow spends nothing at the token endpoint.
+        if self._oidc_callback_too_early(flow):
+            return await self._step_up_refused(
+                TOO_EARLY, actor=actor, client=client, return_to=return_to
+            )
         try:
             principal_claims = await asyncio.to_thread(
                 self._exchange_and_validate, code, flow, self._oidc_redirect_uri(public_origin)
@@ -6465,8 +6510,12 @@ class AuthService:
 
         A success still rotates the session inside the queue, and the rotation waits for the
         account's re-proof lock, which a directory re-proof holds across its bind. So a slow
-        directory can still hold this queue through a concurrent re-proof, one success at a time."""
+        directory can still hold this queue through a concurrent re-proof, one success at a time.
+
+        **A code that completes an MFA-pending session too soon after sign-in is refused** (BACKLOG
+        #2301): see :meth:`_second_factor_too_early`."""
         arrived = totp.wall_clock()
+        arrived_at = time.time()  # the service's clock, for the floor; `arrived` is the TOTP clock
         if not token:
             return Elevation()
         session = await self._store.get_session(hash_token(token))
@@ -6477,6 +6526,10 @@ class AuthService:
             return Elevation()
         if await self._mfa_lock_refused(user, client=client):
             return Elevation(locked=True)
+        if await self._second_factor_too_early(
+            session, user, arrived_at, event="auth.mfa_failed", client=client
+        ):
+            return Elevation()
         if user.auth_provider == AuthProvider.AD.value:
             # BACKLOG #2023: a good code below renews the step-up window, so a DIRECTORY account must
             # still be in the directory before the code is even checked. Asked first, so a refusal
@@ -6534,6 +6587,42 @@ class AuthService:
                 user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
             )
             return Elevation()
+
+    async def _second_factor_too_early(
+        self,
+        session: SessionRecord,
+        user: UserRecord,
+        now: float,
+        *,
+        event: str,
+        client: str | None,
+    ) -> bool:
+        """Whether a second factor arrived too soon after sign-in, auditing the refusal if so.
+
+        The ASVS 2.4.2 floor on the login-then-MFA pair (BACKLOG #2301). It applies only while the
+        session's factor is PENDING, measured from the session's mint, which is the sign-in. A
+        step-up on a session whose factor is already satisfied is not floored. The caller answers
+        with its leg's ordinary failure, so the refusal says nothing about timing, and nothing is
+        charged: no lockout count, no TOTP step, no recovery code, no passkey challenge. The floor
+        and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
+
+        Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the legs that prove an
+        ENROLLED factor. The two enrollment legs, :meth:`confirm_mfa_enrollment` and
+        :meth:`finish_webauthn_registration`, also satisfy a pending session and are NOT floored:
+        they bind a new factor, a different flow, and flooring them is left open (BACKLOG #2301).
+        A new leg that proves an enrolled factor calls this."""
+        floor = self._settings.mfa_verify_min_elapsed_seconds
+        if floor <= 0 or session.mfa_verified_at is not None:
+            return False
+        if now - session.created_at >= floor:
+            return False
+        await self._audit(
+            event,
+            actor=user.username,
+            detail=_json({"reason": TOO_EARLY}),
+            client=client,
+        )
+        return True
 
     async def _mfa_lock_refused(self, user: UserRecord, *, client: str | None) -> bool:
         """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal if so.
@@ -6991,6 +7080,12 @@ class AuthService:
                 detail=_json({"reason": "locked"}),
                 client=client,
             )
+            return Elevation()
+        # BACKLOG #2301: the login-then-MFA floor, as on verify_mfa. Before the challenge is popped,
+        # so a refusal leaves the ceremony in flight rather than spending it.
+        if await self._second_factor_too_early(
+            session, user, now, event="auth.webauthn_failed", client=client
+        ):
             return Elevation()
         pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
         if pending is None or pending.user_id != user.id:

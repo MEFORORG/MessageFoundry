@@ -270,7 +270,9 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engin
 async def test_cannot_remove_last_administrator(engine: Engine) -> None:
     # Last-admin guard test (step-up admin CRUD), not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the roles/CRUD ops first.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     admin = await create_admin(service)
     async with _client(engine, service) as c:
         h = _auth((await _login(c, admin.username, admin.password)).json()["token"])

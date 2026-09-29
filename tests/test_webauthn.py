@@ -53,6 +53,7 @@ async def _service(
     # the caller set it — otherwise the test admin's mfa_status/last-factor-delete assertions,
     # written for require_mfa off, would flip.
     settings.setdefault("require_mfa", False)
+    settings.setdefault("mfa_verify_min_elapsed_seconds", 0)  # machine-speed factor (BACKLOG #2301)
     service = AuthService(store, AuthSettings(**settings), security_notifier=notifier)
     return service
 
