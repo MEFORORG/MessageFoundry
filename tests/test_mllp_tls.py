@@ -12,6 +12,7 @@ import logging
 import ssl
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -545,14 +546,14 @@ async def test_a_plaintext_destination_still_probes_plaintext(tmp_path: Path) ->
 
 # --- a socket that never handshakes is bounded in time (BACKLOG #1606) ---------------------------
 #
-# `_on_client` runs only once the TLS handshake completes, so until then a connection is in neither
-# `_clients` nor the `max_connections` count. These tests pin the two bounds that now cover that
-# window: the handshake timeout closes a silent socket, and stop() closes one still waiting on it.
+# These tests pin the two TIME bounds on a socket that has not finished its handshake: the handshake
+# timeout closes a silent socket, and stop() closes one still waiting on it. The COUNT bounds on the
+# same socket are pinned in the section at the end of this file.
 # Each waits on an EVENT (the socket closing, or asyncio accepting it) under a generous deadline, and
 # no real client ever has to beat a shortened bound, so a slow runner makes them slower, not red.
 
 
-def _tls_source(tmp_path: Path) -> tuple[MLLPSource, str]:
+def _tls_source(tmp_path: Path, **extra: object) -> tuple[MLLPSource, str]:
     """A TLS listener, and the cert a client pins to reach it."""
     cert, key = _cert(tmp_path)
     source = MLLPSource(
@@ -564,6 +565,7 @@ def _tls_source(tmp_path: Path) -> tuple[MLLPSource, str]:
                 "tls": True,
                 "tls_cert_file": cert,
                 "tls_key_file": key,
+                **extra,
             },
         )
     )
@@ -676,7 +678,6 @@ async def test_stop_closes_a_socket_still_waiting_on_its_handshake(
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
             await _accepted(source, 1)
-            assert source._clients == set()  # outside the listener's own set, as the item says
             started = time.monotonic()
             with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
                 await source.stop()
@@ -693,39 +694,63 @@ async def test_stop_closes_a_socket_still_waiting_on_its_handshake(
 
 
 @pytest.mark.parametrize("tls", [True, False])
-async def test_the_tls_bounds_reach_start_server_only_with_tls(
+async def test_the_tls_bounds_reach_the_upgrade_only_with_tls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls: bool
 ) -> None:
-    """The handshake and close-exchange bounds reach asyncio with TLS, and neither does without it,
-    since asyncio refuses both when there is no `ssl`. The close-exchange bound has no behavioural
-    test of its own: it needs a peer that ignores close_notify, and asyncio's default of 30 s would
-    make the red arm of such a test slow."""
-    seen: dict[str, object] = {}
+    """The listener binds plain TCP either way and, with TLS, upgrades each admitted socket itself
+    (BACKLOG #1606), so the handshake and close-exchange bounds reach ``start_tls`` rather than
+    ``start_server``. The close-exchange bound has no behavioural test of its own: it needs a peer
+    that ignores close_notify, and asyncio's default of 30 s would make the red arm of such a test
+    slow."""
+    served: dict[str, object] = {}
+    upgraded: list[dict[str, object]] = []
     real_start_server = asyncio.start_server
+    real_start_tls = asyncio.StreamWriter.start_tls
 
-    async def spy(*args: object, **kwargs: object) -> asyncio.Server:
-        seen.update(kwargs)
+    async def spy_server(*args: object, **kwargs: object) -> asyncio.Server:
+        served.update(kwargs)
         return await real_start_server(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(asyncio, "start_server", spy)  # mllp calls it through the module
-    if tls:
-        source, _cert_path = _tls_source(tmp_path)
-    else:
-        source = MLLPSource(
-            Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0})
-        )
+    async def spy_tls(self: asyncio.StreamWriter, *args: object, **kwargs: object) -> None:
+        upgraded.append(kwargs)
+        await real_start_tls(self, *args, **kwargs)  # type: ignore[arg-type]
 
-    async def handler(raw: bytes) -> str:
-        return build_ack(raw, code="AA")
-
-    await source.start(handler)
-    await source.stop()
+    monkeypatch.setattr(asyncio, "start_server", spy_server)  # mllp calls it through the module
+    monkeypatch.setattr(asyncio.StreamWriter, "start_tls", spy_tls)
+    cert: str | None = None
     if tls:
-        assert seen["ssl_handshake_timeout"] == mllp_module._TLS_HANDSHAKE_TIMEOUT
-        assert seen["ssl_shutdown_timeout"] == mllp_module._TLS_SHUTDOWN_TIMEOUT
+        source, cert = _tls_source(tmp_path)
     else:
-        assert seen.get("ssl_handshake_timeout") is None
-        assert seen.get("ssl_shutdown_timeout") is None
+        source = _plain_source()
+    await source.start(_ack)
+    try:
+        settings: dict[str, object] = {
+            "host": "127.0.0.1",
+            "port": source.sockport,
+            "timeout_seconds": 5,
+        }
+        if cert is not None:
+            settings.update(tls=True, tls_ca_file=cert, tls_check_hostname=True)
+        dest = MLLPDestination(Destination(name="out", type=ConnectorType.MLLP, settings=settings))
+        try:
+            await dest.send(ADT)
+        finally:
+            await dest.aclose()
+    finally:
+        await source.stop()
+    assert served.get("ssl") is None
+    assert served.get("ssl_handshake_timeout") is None
+    if tls:
+        # The destination's own client-side handshake does not go through StreamWriter.start_tls,
+        # so the one call seen is the listener's.
+        assert upgraded == [
+            {
+                "ssl_handshake_timeout": mllp_module._TLS_HANDSHAKE_TIMEOUT,
+                "ssl_shutdown_timeout": mllp_module._TLS_SHUTDOWN_TIMEOUT,
+            }
+        ]
+    else:
+        assert upgraded == []
 
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------
@@ -850,29 +875,49 @@ def test_stop_and_restart_on_uvloop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls: bool
 ) -> None:
     """The real loop, not a stand-in for it. It skips where uvloop is not installed. With TLS the
-    socket never handshakes, so stop() cannot close it on uvloop; the handshake bound, shortened
-    here, is what closes it."""
+    socket never handshakes; it is tracked from its accept (BACKLOG #1606), so stop() closes it on
+    uvloop too, and the handshake bound is pinned far above the wait so only stop() can. A real TLS
+    client then gets a message through a TLS listener on this loop, which is the check that the
+    listener's own upgrade sees the ClientHello on uvloop rather than losing it to the plaintext
+    reader (see `MLLPSource._on_tls_accept`)."""
     uvloop = pytest.importorskip("uvloop")
-    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 0.5)
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
 
     async def scenario() -> None:
-        source = _tls_source(tmp_path)[0] if tls else _plain_source()
+        source, cert = _tls_source(tmp_path) if tls else (_plain_source(), None)
         await source.start(_ack)
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
-            if tls:
-                # Nothing public counts a socket still in its handshake, so give the loop a moment
-                # to accept it. On a runner too slow for that, the close below is the listening
-                # socket's reset rather than the bound, and the test passes without reaching it.
-                await asyncio.sleep(0.2)
-            else:
-                await _in_handler(source, 1)
+            await _in_handler(source, 1)
             started = time.monotonic()
             await source.stop()
             assert time.monotonic() - started < mllp_module._CLIENT_SHUTDOWN_GRACE
-            await _closed_by_listener(reader, within=5.0)
+            await _closed_by_listener(reader, within=mllp_module._CLIENT_SHUTDOWN_GRACE)
         finally:
             await _close_raw(writer)
+        if cert is not None:
+            await source.start(_ack)
+            try:
+                dest = MLLPDestination(
+                    Destination(
+                        name="out",
+                        type=ConnectorType.MLLP,
+                        settings={
+                            "host": "127.0.0.1",
+                            "port": source.sockport,
+                            "timeout_seconds": 5,
+                            "tls": True,
+                            "tls_ca_file": cert,
+                            "tls_check_hostname": True,
+                        },
+                    )
+                )
+                try:
+                    await dest.send(ADT)
+                finally:
+                    await dest.aclose()
+            finally:
+                await source.stop()
         plain = _plain_source()
         await plain.start(_ack)
         try:
@@ -881,3 +926,197 @@ def test_stop_and_restart_on_uvloop(
             await plain.stop()
 
     asyncio.run(scenario(), loop_factory=uvloop.new_event_loop)
+
+
+# --- the caps and the allowlist reach a socket before its handshake (BACKLOG #1606) --------------
+#
+# The handshake bound above limits how LONG an unhandshaken socket lives. These pin how MANY: the
+# listener accepts plain TCP, applies `source_ip_allowlist`, `max_connections` and
+# `max_connections_per_host` exactly as the plain-TCP path does, and only then starts TLS on the
+# admitted socket. So a peer holding sockets that never send a ClientHello spends real slots, and a
+# peer the allowlist excludes never gets a handshake at all. The handshake bound is pinned far above
+# every wait here, so only the cap or the allowlist can close the socket in time. Each wait polls a
+# condition under a bounded deadline, so a slow runner makes these slower, not red.
+
+
+class _Events:
+    """A connection-event sink that records ``(kind, peer_host, reason)``."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, str | None, str | None]] = []
+
+    async def __call__(self, kind: str, peer_host: str | None, reason: str | None) -> None:
+        self.seen.append((kind, peer_host, reason))
+
+    def kinds(self) -> list[str]:
+        return [kind for kind, _host, _reason in self.seen]
+
+
+async def _until(predicate: Callable[[], bool], what: str, *, within: float = 5.0) -> None:
+    """Poll ``predicate`` under a bounded deadline, failing with ``what`` if it never holds."""
+    deadline = time.monotonic() + within
+    while not predicate():
+        if time.monotonic() > deadline:
+            pytest.fail(what)
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize(
+    ("caps", "reason"),
+    [
+        ({"max_connections": 1, "max_connections_per_host": 0}, None),
+        ({"max_connections": 0, "max_connections_per_host": 1}, "max_connections_per_host"),
+    ],
+    ids=["max_connections", "max_connections_per_host"],
+)
+async def test_an_unhandshaken_socket_spends_a_connection_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caps: dict[str, int], reason: str | None
+) -> None:
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+    source, _cert_path = _tls_source(tmp_path, **caps)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        w2: asyncio.StreamWriter | None = None
+        try:
+            # Before the fix a socket that sent no ClientHello was outside the count entirely.
+            await _until(
+                lambda: source._active == 1,
+                "a socket still in its TLS handshake was not counted against the caps",
+            )
+            r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
+            await _closed_by_listener(r2, within=5.0)
+            await _until(lambda: "at_capacity" in events.kinds(), "no at_capacity event")
+            assert events.seen == [("at_capacity", "127.0.0.1", reason)]
+        finally:
+            await _close_raw(w1)
+            if w2 is not None:
+                await _close_raw(w2)
+        # The slot comes back when the unhandshaken socket goes, and no `established` or `closed`
+        # was emitted for it: it never became a session.
+        await _until(lambda: source._active == 0, "the slot was not released")
+        assert source._per_host == {}
+        assert events.kinds() == ["at_capacity"]
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_peer_outside_the_allowlist_is_refused_before_its_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+    source, _cert_path = _tls_source(tmp_path, source_ip_allowlist=["10.0.0.1"])
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            # Before the fix the allowlist was checked only after the handshake, so this socket sat
+            # open, unchecked, until the handshake bound.
+            await _closed_by_listener(reader, within=5.0)
+        finally:
+            await _close_raw(writer)
+        await _until(
+            lambda: "peer_not_allowlisted" in events.kinds(), "no peer_not_allowlisted event"
+        )
+        assert events.kinds() == ["peer_not_allowlisted"]
+        assert source._active == 0
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_failed_handshake_gives_its_slot_back_and_emits_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A socket admitted before its handshake and then aborted at the handshake bound must free both
+    counters, or a handful of silent sockets would lock a peer out for good. It emits no event: it
+    was never a session, and before this change a failed handshake emitted nothing either."""
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 0.3)
+    source, _cert_path = _tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            await _closed_by_listener(reader, within=5.0)
+        finally:
+            await _close_raw(writer)
+        await _until(lambda: source._active == 0, "the slot was not released")
+        assert source._per_host == {}
+        assert events.kinds() == []
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_peer_dropping_as_its_handshake_completes_is_closed_quietly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """CPython's ``StreamWriter.start_tls`` stores ``None`` as the transport, then raises
+    ``AttributeError``, when the connection is closed cleanly during the handshake. The stop tests
+    above reach that for real; this stand-in upgrade leaves the writer exactly that way on demand, so
+    the guard is pinned without a timing race. Unguarded, the listener's own close then raised
+    ``AttributeError`` again and the task logged a failure."""
+
+    async def upgrade_then_lose(
+        self: asyncio.StreamWriter, *args: object, **kwargs: object
+    ) -> None:
+        self.transport.close()
+        self._transport = None  # type: ignore[attr-defined]  # what start_tls leaves behind
+        raise AttributeError("'NoneType' object has no attribute 'get_extra_info'")
+
+    monkeypatch.setattr(asyncio.StreamWriter, "start_tls", upgrade_then_lose)
+    source, _cert_path = _tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.mllp"):
+            reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+            try:
+                await _closed_by_listener(reader, within=5.0)
+            finally:
+                await _close_raw(writer)
+            await _until(lambda: source._active == 0, "the slot was not released")
+            await _until(lambda: not source._client_tasks, "the client task did not finish")
+        assert "task failed" not in caplog.text
+        assert events.kinds() == []
+        assert source._per_host == {}
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_stop_closes_an_unhandshaken_socket_without_close_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uvloop's Server has no close_clients(), so before the fix stop() could not reach a socket
+    still in its handshake there and left it to the handshake bound. Such a socket is tracked with
+    every other client now, so stop() closes it on any loop."""
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+    source, _cert_path = _tls_source(tmp_path)
+    await source.start(_ack)
+    stopped = False
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            # Before the fix this never held: the listener's own set saw a socket only once its
+            # handshake was done.
+            await _until(
+                lambda: len(source._clients) == 1,
+                "a socket still in its TLS handshake is not tracked by the listener",
+            )
+            assert source._server is not None
+            source._server = _ServerWithoutCloseClients(source._server)  # type: ignore[assignment]
+            started = time.monotonic()
+            await source.stop()
+            stopped = True
+            assert time.monotonic() - started < mllp_module._CLIENT_SHUTDOWN_GRACE
+            await _closed_by_listener(reader, within=mllp_module._CLIENT_SHUTDOWN_GRACE)
+        finally:
+            await _close_raw(writer)
+    finally:
+        if not stopped:
+            await source.stop()
