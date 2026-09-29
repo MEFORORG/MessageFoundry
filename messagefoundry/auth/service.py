@@ -385,8 +385,8 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: account carries no ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5). Written into the
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`. Also the
 #: reason a federated login refuses an already-bound id-less row, and a reconciliation pass skips one
-#: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id and an AD step-up
-#: re-bind on a row with none. Deliberately absent from the browser layer's code map, so it shows as
+#: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id, and an AD step-up
+#: re-bind or ``verify_mfa`` directory check on a row with none. Deliberately absent from the browser layer's code map, so it shows as
 #: generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
@@ -824,11 +824,12 @@ class DirectoryObjectIdMissing(ValueError):
     writes sits on a row carrying an id, and the id is written at the row's creation and never
     cleared, so both re-resolves above ask by the id for it. It does not reach at least these: a
     direct ``set_user_federated_subject`` call, which checks no id, and whose one caller is the
-    bind; and ``verify_mfa``'s directory check, which asks about an id-less UNBOUND row by its name.
-    The step-up re-proof and a Windows SSO sign-in no longer reach an id-less row at all: both refuse
-    it with this reason (BACKLOG #2027). For a binding already on an id-less row, written before this refusal existed or planted through that setter, the two re-resolves
-    above no longer ask by name (BACKLOG #2027): the federated login refuses it with this same
-    reason, and the reconciler skips it (``_holds_unkeyed_federated_binding``).
+    bind. The step-up re-proof, ``verify_mfa``'s directory check and a Windows SSO sign-in no
+    longer reach an id-less row at all: each refuses it with this reason (BACKLOG #2027). For a
+    binding already on an id-less row, written before this refusal existed or planted through that
+    setter, the two re-resolves above no longer ask by name (BACKLOG #2027): the federated login
+    refuses it with this same reason, and the reconciler skips it
+    (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
 
     :meth:`AuthService.create_directory_account` raises it too, before any write, when the directory
@@ -6659,16 +6660,15 @@ class AuthService:
         nothing, so the next attempt asks again. An AD row on an engine with no directory
         configured is refused as ``not_configured``, because nothing can confirm it.
 
-        A row with a federated binding and no ``directory_object_id`` is refused unasked. ADR 0184
-        AC-5 forbids asking the directory about a bound row by its name, and it has no other key.
-        An id-less row with no binding is still asked by name, as the reconciler asks it; the Windows
-        SSO sign-in and the password step-up refuse such a row instead (BACKLOG #2027). A name is
-        the weaker key (BACKLOG #1532), but it is a stronger check than the no lookup this path made
-        before.
+        **A row with no ``directory_object_id`` is refused unasked, whether or not it holds a
+        federated binding** (ADR 0184 AC-5, BACKLOG #2027). Its only other key is its name, and a
+        directory may reissue a freed name to someone else, whose account would then vouch for this
+        row. The Windows SSO sign-in and the password step-up refuse the same row the same way.
+        This leg used to ask an id-less row with no binding by its name.
         """
         if self._ldap is None:
             return "not_configured"
-        if _holds_unkeyed_federated_binding(user):
+        if not user.directory_object_id:
             return DIRECTORY_OBJECT_ID_MISSING
         # The reconciler's own probe, so both ask the same question by the same key, off the loop.
         probe = await self._probe_principal(user)
