@@ -950,7 +950,7 @@ async def test_a_cancelled_refusal_still_writes_its_rows(monkeypatch: pytest.Mon
 # --- Round 3 (Manager decisions 2026-09-28): the status meter and three rarer log lines ------------
 
 
-async def test_the_status_log_size_is_withheld_from_a_reader_without_users_manage(
+async def test_the_status_log_size_and_audit_count_are_withheld_from_a_reader_without_users_manage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``GET /status`` reports the log directory's byte total to ``monitoring:read``, which the
@@ -968,10 +968,12 @@ async def test_the_status_log_size_is_withheld_from_a_reader_without_users_manag
             transport=httpx.ASGITransport(app=app, client=_PEER), base_url="http://t"
         ) as c:
             logs: dict[str, dict[str, Any]] = {}
+            audit_count: dict[str, Any] = {}
             for reader in (_AUDITOR, "test-operator", _SECOND_ADMIN):
                 r = await c.get("/status", headers=await _bearer(c, reader))
                 assert r.status_code == 200, r.text
                 logs[reader] = r.json()["logs"]
+                audit_count[reader] = r.json()["db"]["audit"]
         assert logs[_AUDITOR]["size_bytes"] is None, logs[_AUDITOR]
         assert logs["test-operator"]["size_bytes"] is None, logs["test-operator"]
         assert (
@@ -979,6 +981,10 @@ async def test_the_status_log_size_is_withheld_from_a_reader_without_users_manag
         )
         for reader in logs:
             assert logs[reader]["disk_free_bytes"] is not None, (reader, logs[reader])
+        # The audit_log row count includes the hidden rows too, so it minus the rows GET /audit
+        # returns was their exact number (review round 3).
+        assert audit_count[_AUDITOR] is None and audit_count["test-operator"] is None, audit_count
+        assert isinstance(audit_count[_SECOND_ADMIN], int) and audit_count[_SECOND_ADMIN] > 0
     finally:
         await world.engine.stop()
 
@@ -1076,3 +1082,45 @@ def test_smtp_verification_off_is_logged_once_and_before_the_first_notice(
             )
     lines = [r for r in caplog.records if "DISABLED" in r.getMessage()]
     assert len(lines) == 1, [r.getMessage() for r in lines]
+
+
+def test_a_failed_key_exchange_pin_is_logged_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A TLS context is built per SMTP send, so a failed key-exchange pin logged once per mail, lock
+    notices included. It is logged once per process. The control is that one line."""
+    from types import SimpleNamespace
+    from typing import cast
+
+    from messagefoundry.config import tls_policy
+
+    monkeypatch.setattr(tls_policy, "_KEX_PIN_WARNED", False, raising=False)
+
+    def refuse(_groups: Any) -> None:
+        raise ValueError("no such group")
+
+    ctx = cast("Any", SimpleNamespace(set_groups=refuse))
+    with caplog.at_level(logging.WARNING, logger=tls_policy.logger.name):
+        for _ in range(3):
+            assert tls_policy.harden_kex_groups(ctx) is None
+    lines = [r for r in caplog.records if "key-exchange groups" in r.getMessage()]
+    assert len(lines) == 1, [r.getMessage() for r in lines]
+
+
+async def test_a_cancel_as_the_writes_finish_is_not_swallowed() -> None:
+    """``_write_through_cancellation`` re-raises a cancel even when it lands in the turn the writes
+    finish, so a caller's timeout still fires."""
+    from messagefoundry.auth.service import _write_through_cancellation
+
+    written: list[str] = []
+
+    async def write() -> None:
+        await asyncio.sleep(0.05)
+        written.append("row")
+
+    task = asyncio.ensure_future(_write_through_cancellation([write]))
+    await asyncio.sleep(0.05)  # about when the write finishes
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert written == ["row"], "the write was abandoned"

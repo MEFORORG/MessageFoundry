@@ -936,10 +936,16 @@ async def _write_through_cancellation(writes: Sequence[Callable[[], Awaitable[No
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            if task.done():
-                break
+            # Recorded before anything else, so a cancel that lands in the turn the writes finish
+            # is still re-raised rather than swallowed.
             cancelled = True
     if cancelled:
+        if not task.cancelled() and task.exception() is not None:
+            # Nobody else will read it: the caller is leaving with the cancel.
+            _log.error(
+                "a refused sign-in's audit write failed while the request was cancelled",
+                exc_info=task.exception(),
+            )
         raise asyncio.CancelledError
     task.result()
 

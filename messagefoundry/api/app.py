@@ -5954,7 +5954,9 @@ def create_app(
                 journal_mode=db.journal_mode,
                 messages=db.messages,
                 events=db.events,
-                audit=db.audit,
+                # BACKLOG #1131: the whole-table count includes the hidden lock rows, so it goes only
+                # to a caller who may read them (see the log size above).
+                audit=db.audit if reads_audit_copies_in_the_log(_user) else None,
                 synchronous=db.synchronous,
             ),
             logs=logs,

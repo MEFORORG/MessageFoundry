@@ -204,7 +204,16 @@ def harden_kex_groups(ctx: ssl.SSLContext) -> str | None:
         # None, not the list: a pin that RAISED must never read back as a pin that took. (The former
         # `# pragma: no cover` here is gone — this branch is now driven by a stand-in context in
         # tests/test_tls_policy.py rather than left to an unusual OpenSSL build to exercise.)
-        logger.warning("Could not pin TLS key-exchange groups %r: %s", APPROVED_KEX_GROUPS, exc)
+        # Once per process (BACKLOG #1131): a context is built per SMTP send, and a line per send
+        # is a line per mail, lock notices included. The build's OpenSSL does not change at runtime.
+        global _KEX_PIN_WARNED
+        if not _KEX_PIN_WARNED:
+            _KEX_PIN_WARNED = True
+            logger.warning(
+                "Could not pin TLS key-exchange groups %r: %s (logged once per process)",
+                APPROVED_KEX_GROUPS,
+                exc,
+            )
         return None
     return APPROVED_KEX_GROUPS
 
@@ -2386,6 +2395,9 @@ def vault_client_verify_kwargs(
     verify = requests_verify_from_anchor(anchor, cell=cell)
     return {} if verify is None else {"verify": verify}
 
+
+#: Whether this process has logged that it could not pin the key-exchange groups.
+_KEX_PIN_WARNED = False
 
 #: The ``(cell, host)`` pairs whose ``tls_verify=false`` warning this process has logged.
 _SMTP_VERIFY_OFF_WARNED: set[tuple[str, str]] = set()

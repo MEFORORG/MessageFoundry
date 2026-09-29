@@ -3120,7 +3120,7 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
 are written at a fixed point inside the failure pad, half a budget after the attempt's turn in the
 queue, so a refusal by a lock and a verified refusal land at the same offset from the request, and
 the answer still goes out on its padded slot. This holds while a branch's work fits in half a
-budget, the same condition the answer's slot already rests on. The failure is still counted before
+budget and its writes fit in the other half; the second condition is an open channel, below. The failure is still counted before
 that point, and a caller who drops the request before it does not drop the rows.
 
 **What the ruling does not reach.** At least these channels still differ between a right and a
@@ -3129,16 +3129,30 @@ wrong candidate, and are open:
 - **The owner's own later activity.** A live second-step lock refuses the owner's own sign-in, which
   then shows as a refusal where it would have shown as `auth.login_success`. That follows from the
   lock refusing the owner at all.
-- **Coarser byte counts.** `GET /status` still reports the database's `size_bytes` and the
-  log volume's `disk_free_bytes` to `monitoring:read`. Both move when a hidden row is written, but in
-  whole pages or clusters, and with every other write on the same file or volume.
+- **Store write counters.** Every audit row is one committed transaction, and the attempt that
+  arms a lock writes more rows than any other. `GET /stats` (`committed_txns`) and `GET /metrics`
+  (`messagefoundry_store_committed_txns`) report that count to `monitoring:read`, which the Viewer,
+  the Auditor and the Operator hold. On an idle instance the count separates the lock-arming attempt
+  exactly; message traffic only adds noise to it.
+- **The database's size.** `GET /status` reports `db.size_bytes` (the file plus its write-ahead
+  log) to `monitoring:read`. On SQLite each commit appends to the write-ahead log, so between
+  checkpoints the size is close to a commit counter and moves like the one above. The log volume's
+  `disk_free_bytes` moves too, in whole clusters and with every other write on the volume.
+- **The answer's time, when the store is slow.** The refusal rows are written at a fixed point half
+  a budget in, and the answer goes out on its slot. That holds while a branch's work fits in the
+  first half of the budget and its writes fit in the second. The lock-arming attempt writes the
+  most rows, so under heavy store contention it alone can spill into the next slot, and the answer
+  shows it.
 
 **Closed on the same channel (Manager decisions 2026-09-28).** `GET /status` returns the log
-directory's `size_bytes` as null to a caller without `users:manage`, since it counted the tee's
-copies of the hidden rows. Three rarer log lines no longer carry the bit: a failed lock-notice
-throttle read names neither the account nor the notice, a broken tee sink is logged once per
-process without the row's action, and SMTP with `tls_verify = false` is logged once per process for
-each relay, by the security notifier when it is built rather than at its first send.
+directory's `size_bytes` and the database's `audit` row count as null to a caller without
+`users:manage`: the first counted the tee's copies of the hidden rows, and the second minus the
+rows `GET /audit` returns was their exact number. Four rarer log lines no longer carry the bit: a
+failed lock-notice throttle read names neither the account nor the notice; a broken tee sink is
+logged once per process without the row's action; SMTP with `tls_verify = false` is logged once per
+process for each relay, by the security notifier when it is built rather than at its first send; and
+a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
+stays broken, or recovers and breaks again, is reported only by that first line.
 
 **Residual: a lost lock notice leaves no record** (BACKLOG #1139 deliverability, not the oracle).
 The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So

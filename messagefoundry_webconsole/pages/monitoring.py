@@ -526,7 +526,7 @@ def status(
             ["Journal mode", db.journal_mode],
             ["Messages", db.messages],
             ["Events", db.events],
-            ["Audit rows", db.audit],
+            ["Audit rows", _opt(db.audit)],
             *claim_proc_rows,
         ],
         adjustable=False,
