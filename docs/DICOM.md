@@ -63,17 +63,20 @@ among them, retry it. **Cannot Understand** (`0xCxxx`) says the SCP will not tak
 treat it as final. So the SCP answers the final class for a refusal that would repeat on a re-send, and
 Out of Resources only for a failure that may clear.
 
+The SCP answers at least these statuses:
+
 | Status | Class | When the SCP answers it |
 |---|---|---|
 | `0x0000` | Success | the object is durably committed to the ingress stage |
-| `0xC001` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, or a deflated object inflates past the SCP's inflate bound (the lesser of `max_object_bytes` and 16 MiB, BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
-| `0xC000` | Cannot Understand, final | the object would not decode or re-encode, or the engine's ingress refused it and recorded `ERROR` |
-| `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down, or did not finish within `timeout_seconds`, or the SCP is stopping |
+| `0xC010` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, checked on the Data Set as received and again, with the codec's own guard, on the re-encoded bytes the store would hold (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
+| `0xC000` | Cannot Understand, final | the object would not decode or re-encode, the engine's ingress refused it and recorded `ERROR`, or the SCP hit an error it did not expect |
+| `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down; the commit did not finish within `timeout_seconds`; the engine's loop is not running; or the host ran out of memory decoding the object |
 | `0x0124` | Refused: Not Authorized | the peer IP is not in `source_ip_allowlist` |
 
-The low byte of `0xC001` is the SCP's own choice, which PS3.4 allows inside `0xCxxx`. It separates an
-over-cap refusal from a decode failure in the sender's log, and stays clear of `0xC211`, which
-`pynetdicom` answers when a C-STORE handler raises.
+The low byte of `0xC010` is the SCP's own choice, which PS3.4 allows inside `0xCxxx`. It separates an
+over-cap refusal from a decode failure in the sender's log. It stays clear of the codes `pynetdicom`
+answers on its own for C-STORE: `0xC001` and `0xC002` for a malformed handler status, and `0xC211`
+when the handler raises.
 
 ### Outbound — C-STORE SCU + C-ECHO (`DICOM()` outbound)
 Forward an object to a downstream PACS over a C-STORE association (full Mirth-sender parity). The blocking

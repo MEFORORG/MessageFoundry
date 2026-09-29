@@ -828,8 +828,9 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 X12 interchange cap = 16 MiB", DEFAULT_MAX_INTERCHANGE_BYTES, 16 * mib),
         ("15.1.3 DICOM object cap = 128 MiB", dicom.DEFAULT_MAX_OBJECT_BYTES, 128 * mib),
         # BACKLOG #1961: the SCP clamps to min(max_object_bytes, this ceiling), so the 128 MiB default
-        # above still bounds the SCU and the pre-decode inflate but never what the SCP accepts. The
-        # clamp's behaviour is tested in tests/test_dicom_scp_disposition.py; this pins the number.
+        # above still bounds the SCU but never what the SCP accepts; BACKLOG #2104 clamps the SCP's
+        # pre-decode inflate to the codec's 16 MiB too. The clamp's behaviour is tested in
+        # tests/test_dicom_scp_disposition.py; this pins the number.
         ("15.1.3 DICOM SCP effective cap = 16 MiB", dicom._ENGINE_INGRESS_CEILING_BYTES, 16 * mib),
         ("15.1.3 MLLP frame cap = 16 MiB", mllp.DEFAULT_MAX_FRAME_BYTES, 16 * mib),
         ("15.1.3 MLLP connection cap = 256", mllp.DEFAULT_MAX_CONNECTIONS, 256),

@@ -135,7 +135,7 @@ async def test_scp_rejects_oversized_object() -> None:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert established is True
         # Cannot Understand, over-cap: refused before commit, and a re-send is refused again.
-        assert status == 0xC001
+        assert status == 0xC010
         assert captured == []
     finally:
         await scp.stop()
@@ -164,7 +164,7 @@ class _FakeStoreEvent:
     """A minimal EVT_C_STORE stand-in exposing only what ``_on_c_store`` reads before decode. Touching
     ``dataset`` / ``file_meta`` raises — the pre-decode guards (the ASVS 5.2.3 deflate ceiling and the
     BACKLOG #1727 raw-length charge) MUST refuse an over-cap object BEFORE pynetdicom decodes it. The
-    raise surfaces through ``_on_c_store``'s last-resort handler as ``0xC000``, so a ``0xC001`` from a
+    raise surfaces through ``_on_c_store``'s last-resort handler as ``0xC000``, so a ``0xC010`` from a
     test using this event IS the evidence that the decode never ran."""
 
     def __init__(self, *, transfer_syntax: str, data_set: bytes) -> None:
@@ -194,7 +194,7 @@ def test_scp_rejects_deflated_decompression_bomb_before_decode() -> None:
     status = scp._on_c_store(event)
     # Cannot Understand, over-cap (BACKLOG #2103): over the inflate cap, before any decode/commit. The
     # object would inflate as far on a re-send, so the status must not invite one.
-    assert status == 0xC001
+    assert status == 0xC010
     assert captured == []  # never committed
 
 
@@ -203,14 +203,14 @@ def test_scp_rejects_oversized_raw_data_set_before_decode() -> None:
     # the received object and save_as had re-encoded it, so an over-cap object was held several times over
     # before the cap refused it. It is now charged against the RAW event.request.DataSet length first, on
     # EVERY transfer syntax — not just the deflated one. _FakeStoreEvent raises when the decode is
-    # touched, and that raise returns 0xC000, so 0xC001 here is the proof the decode never ran.
+    # touched, and that raise returns 0xC000, so 0xC010 here is the proof the decode never ran.
     captured: list[bytes] = []
     scp = _build_scp(captured, max_object_bytes=64)
     uncompressed = (
         "1.2.840.10008.1.2.1"  # Explicit VR Little Endian — no inflate, so no deflate guard
     )
     over_cap = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * 128)
-    assert scp._on_c_store(over_cap) == 0xC001  # the over-cap refusal, before any decode/commit
+    assert scp._on_c_store(over_cap) == 0xC010  # the over-cap refusal, before any decode/commit
     assert captured == []  # never committed
     # Positive control: the SAME event under the cap DOES reach event.dataset, whose raise surfaces as
     # 0xC000. Without this, an inert decode trap would produce the assertion above for the wrong reason.
@@ -228,7 +228,7 @@ def test_scp_shipped_default_refuses_above_the_engine_ingress_ceiling_before_dec
     scp = _build_scp([])  # no max_object_bytes: the shipped default
     uncompressed = "1.2.840.10008.1.2.1"
     over = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * (INGRESS_MAX_BYTES + 1))
-    assert scp._on_c_store(over) == 0xC001
+    assert scp._on_c_store(over) == 0xC010
     at = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * INGRESS_MAX_BYTES)
     assert scp._on_c_store(at) == 0xC000, "exactly the ceiling must reach the decode trap"
 
@@ -247,7 +247,7 @@ def test_scp_inflate_bound_is_clamped_to_the_codec_inflate_ceiling() -> None:
         transfer_syntax=deflated, data_set=make_deflated_bomb_stream(inflated_bytes=8 * 1024 * 1024)
     )
     for scp in (_build_scp([]), _build_scp([], max_object_bytes=0)):
-        assert scp._deflated_over_cap(over, peer_ip="127.0.0.1", calling_ae="M") == 0xC001
+        assert scp._deflated_over_cap(over, peer_ip="127.0.0.1", calling_ae="M") == 0xC010
         assert scp._deflated_over_cap(under, peer_ip="127.0.0.1", calling_ae="M") is None
 
 
@@ -267,6 +267,37 @@ async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
         assert status == 0xA700
     finally:
         await scp.stop()
+
+
+def test_scp_commit_on_a_closed_loop_answers_out_of_resources() -> None:
+    # BACKLOG #2103: when the engine's loop has closed under a live association, scheduling the commit
+    # raises. Nothing was committed and a re-send after a restart would be, so the answer is Out of
+    # Resources. It used to escape _commit and reach the last-resort handler's final 0xC000.
+    async def handler(data: bytes) -> str | None:
+        return "mid"
+
+    scp = _build_scp([])
+    closed = asyncio.new_event_loop()
+    closed.close()
+    scp._loop, scp._handler = closed, handler
+    status = scp._commit(b"x", peer_ip="127.0.0.1", sop_instance="1.2", sop_class="1.2")
+    assert status == 0xA700
+
+
+class _OutOfMemoryStoreEvent(_FakeStoreEvent):
+    """Passes both pre-decode guards, then runs out of memory decoding."""
+
+    @property
+    def dataset(self) -> object:
+        raise MemoryError
+
+
+def test_scp_out_of_memory_decoding_answers_out_of_resources() -> None:
+    # BACKLOG #2103: a MemoryError is the host running short, not a fault in the object, so a re-send
+    # may succeed. It must not get the final Cannot Understand a decode failure gets.
+    scp = _build_scp([])
+    event = _OutOfMemoryStoreEvent(transfer_syntax="1.2.840.10008.1.2.1", data_set=b"\x00" * 32)
+    assert scp._on_c_store(event) == 0xA700
 
 
 async def test_scp_handler_refusal_returns_dimse_failure_not_success() -> None:
@@ -462,12 +493,14 @@ def test_scp_tls_ca_file_requires_client_cert(tmp_path: Path) -> None:
     assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
 
 
-async def test_scp_commit_timeout_returns_out_of_resources_not_success() -> None:
+async def test_scp_commit_timeout_returns_out_of_resources_not_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # A commit that does not land within the per-commit timeout must surface as a DIMSE failure
     # (Out of Resources, 0xA700 — the SCU re-sends), never a false Success and never the
-    # decode-failure status (0xC000). This pins the FutureTimeoutError branch of _commit, which is
-    # distinct from the commit-*exception* branch covered by
-    # test_scp_commit_failure_returns_dimse_failure_not_success above.
+    # decode-failure status (0xC000). This pins the FutureTimeoutError branch of _commit. Since
+    # BACKLOG #2103 the commit-*exception* branch answers 0xA700 too, so the status alone cannot tell
+    # the two apart; the log line below does.
     #
     # Build with the default timeout so the AE's acse/dimse/network timeouts stay long (they are set
     # once at _start_server and would otherwise abort the association before the C-STORE reply),
@@ -487,6 +520,9 @@ async def test_scp_commit_timeout_returns_out_of_resources_not_success() -> None
         )  # Out of Resources — the commit-timeout branch (re-send), not Success
         assert status not in (0x0000, 0xC000), (
             "a commit timeout must be Out of Resources, not Success or Cannot Understand"
+        )
+        assert any("commit timed out" in r.getMessage() for r in caplog.records), (
+            "the timeout must be reported by the FutureTimeoutError branch, not the exception branch"
         )
     finally:
         await scp.stop()

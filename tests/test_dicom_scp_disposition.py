@@ -45,7 +45,7 @@ _SUCCESS = 0x0000
 _CANNOT_UNDERSTAND = 0xC000
 #: BACKLOG #2103: a deterministic over-cap refusal, in the Cannot Understand class so no sender reads
 #: it as transient and re-sends an object that would be refused again.
-_REFUSED_OVER_CAP = 0xC001
+_REFUSED_OVER_CAP = 0xC010
 
 
 @pytest.fixture
@@ -191,6 +191,27 @@ async def test_a_small_deflated_object_that_inflates_past_the_parse_ceiling_is_r
     status = await _send_through_runner(store, data)
 
     assert status != _SUCCESS
+    assert status == _REFUSED_OVER_CAP
+    assert await _rows(store) == [], "a refused object must not also be recorded as received"
+
+
+async def test_the_scp_refuses_what_the_codec_would_refuse_on_the_re_encoded_bytes(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2104: the pre-decode guard bounds the Data Set as it arrived, at a value read at build.
+    The codec bounds the re-encoded bytes the store holds, at a value read when it runs. The SCP runs
+    the codec's own guard on the re-encoded bytes before commit, so the two cannot disagree.
+
+    Lowering the codec's ceiling after the SCP module has read it isolates that second check: the
+    pre-decode guard still allows 16 MiB, so only the re-encode check can refuse this 2 MiB inflate.
+    Without it the object is answered Success and then refused by the router's parse."""
+    from messagefoundry.parsing.dicom import _inflate
+
+    monkeypatch.setattr(_inflate, "DEFAULT_MAX_INFLATED_BYTES", _MIB)
+    data = _deflated_big_sr(2 * _MIB)
+
+    status = await _send_through_runner(store, data)
+
     assert status == _REFUSED_OVER_CAP
     assert await _rows(store) == [], "a refused object must not also be recorded as received"
 
