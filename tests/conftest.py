@@ -387,6 +387,34 @@ def _quiesce_targets() -> None:
             logger.addHandler(_QuiesceNullHandler())
 
 
+@pytest.fixture(autouse=True)
+def _drop_engine_log_handlers_a_test_installed() -> Iterator[None]:
+    """Remove, after each test, the root log handlers the ENGINE installed during it.
+
+    ``configure_logging`` (reached through ``main(["serve", ...])`` and several direct calls) puts a
+    stdout handler on the root logger, bound to whatever ``sys.stdout`` was then: that test's capture
+    stream. Nothing took it off again. A later test on the same worker that logged through the root
+    then wrote to a closed stream, the write guard rolled the sink onto the NEW test's stdout, and the
+    guard's own warning plus the record landed in that test's captured output. Measured 2026-09-29:
+    ``tests/test_forwarding_gate.py`` then the two ``audit-verify``/``audit-anchor`` stdout tests in
+    ``tests/test_store_schema.py`` fail on ``origin/main`` alone, and pass alone.
+
+    Only handlers whose class is the engine's own are touched, and only ones that were not there
+    before the test. pytest's capture handlers, and anything a test attached itself, are left alone,
+    the same line ``configure_logging`` draws. A forwarder owns a thread and a socket, so it is
+    closed as well as removed; a stream handler is only removed, because its stream is not ours.
+    """
+    root = logging.getLogger()
+    before = set(root.handlers)
+    yield
+    for handler in [h for h in root.handlers if h not in before]:
+        if not type(handler).__module__.startswith("messagefoundry."):
+            continue
+        root.removeHandler(handler)
+        if type(handler).__name__ == "_ForwardQueueHandler":
+            handler.close()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
     """SECONDARY backstop for the #17 teardown race — fast-and-silent, not the primary fix.
