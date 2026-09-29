@@ -41,7 +41,7 @@ on its own.
 | 4 | Starting processes | 11 modules | Varies, see below |
 | 5 | Calling native libraries | 16 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
-| 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives | On -- this is the product |
+| 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
 | 9 | Processes, terminals and webview scripts | VS Code extension | Runs the CLI on open and on save, once you trust the workspace |
 | 10 | Writing server-built HTML into the page | Web console | On |
@@ -298,8 +298,8 @@ these:
 
 1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml`, `xml`,
    `xmlschema`, `signxml`, `pydicom`, `pynetdicom`, `pyx12`, `fhir.resources`, `fhirpathpy`,
-   `cbor2`, `webauthn`, `csv`, `email.parser`, `email.feedparser`, `pickle`, `marshal` or
-   `shelve`.
+   `cbor2`, `webauthn`, `spnego` (the module the pyspnego package installs), `csv`,
+   `email.parser`, `email.feedparser`, `pickle`, `marshal` or `shelve`.
 2. A JSON decode: a call to `json.loads`, `json.load` or the engine's `json_loads_or_refusal`, or
    any `.json()` method call.
 3. A form, header or mail decode: a call to `parse_qs`, `parse_qsl`, `parse_http_list`,
@@ -308,6 +308,8 @@ these:
    `index` or `rindex` called with a bytes literal first, or any `unpack`, `unpack_from` or
    `iter_unpack` call.
 5. An inbound connector: a call to `register_source`.
+6. A certificate or key decode: a call to any function whose name starts `load_pem_`,
+   `load_der_` or `load_ssh_`, or to `load_key_and_certificates` or `load_pkcs12`.
 
 A hit inside a codec package under `parsing/`, such as `parsing/xml/`, counts for the whole package.
 Every parse site the scan finds sits in exactly one of the first two tables below. The first holds
@@ -324,7 +326,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 - Libraries parse their own wire: uvicorn's HTTP server, the HTTP clients, TLS and `ldap3`. FastAPI
   decodes every other API request body as JSON, and checks it against a model before a route sees
   it. [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) covers those libraries. The engine's own HTTP
-  inbound listener is hand-written, and it is in the first table.
+  inbound listener is hand-written, and it is in the first table. When `ssl` loads a certificate
+  itself, from a file path or from text in memory, `ssl` parses it, so pattern 6 does not see that
+  load.
 - A hand-written parser that makes none of these calls is missed by the scan. The third table holds
   the ones found by reading, and there may be more. A parser passed as a value rather than called,
   as in `asyncio.to_thread(json.loads, raw)`, is missed too. Parsing inside your own Routers and
@@ -354,6 +358,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Replies from an engine address | Whatever answers at the address a client is given. It is meant to be the engine, but nothing proves that before the parse. | `apiclient/client.py`, `tray/probe.py`, `verify/smoke.py` |
 | Identity provider replies | The OpenID Connect token response and key set, and an ID token's header and claims | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
 | A passkey response | A browser sends JSON with CBOR (Concise Binary Object Representation) inside. The `webauthn` library, from the optional `[webauthn]` extra, decodes the CBOR. | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py` |
+| A Kerberos sign-in token | The token a browser sends for Windows single sign-on, in its `Authorization: Negotiate` header. The API route decodes its base64, as the web console's `routes/sso.py` does, and pyspnego decodes the token. Kerberos sign-in is off unless configured. | `api/auth_routes.py`, `auth/ldap.py` |
+| A TLS client's certificate | The certificate a TLS client presents, read again to find its issuer | `pki.py` |
+| A partner's certificate | The recipient certificate a Direct outbound encrypts to. An operator names the file, but the partner issued what is in it, so the module checks it against the operator's trust anchor before using it. The module also reads the operator's own signing key. | `transports/direct.py` |
 | Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
@@ -362,9 +369,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `api/approvals.py`, `api/auth_routes.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
+| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
-| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata and a restore token file | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py` |
+| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py` |
 
@@ -377,10 +384,64 @@ The scan leaves some parsing out on purpose, and it has limits:
 | The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
-| The certificate a TLS client presents, read again to find its issuer | `pki.py` |
 
 The first two tables rest on a judgement about where each input comes from, and the test cannot
 check that judgement. Re-read a row when its module changes what it reads.
+
+**How the extension's parser list is found.** The VS Code extension's TypeScript gets a scan of its
+own, over `ide/src` without its `test` folder, as in section 9. It reads by pattern rather than by
+syntax tree, and skips whole-line comments. A file is a parse site when a line of it holds at least
+one of these:
+
+1. A JSON decode: a call to `JSON.parse`, or any `.json()` call.
+2. A line split: a `split` call whose first argument is a string or regular-expression literal that
+   holds `\r` or `\n`.
+3. A character read: a call to `charAt`, `charCodeAt` or `codePointAt`.
+4. A network read: an import of Node's `http`, `https`, `http2`, `net`, `tls` or `dgram` module,
+   with or without the `node:` prefix, or a call to the global `fetch` or `WebSocket`.
+
+Every file this scan finds sits in exactly one of the first two tables below. The third lists files
+the patterns cannot see, found by reading the code. The scan's limits include at least these:
+
+- VS Code decodes a webview's messages before the extension sees them, and Node parses its own
+  HTTP, TLS and URL formats. Those are left out, as the Python libraries are. What a webview page
+  may ask the extension to do is section 9's subject.
+- A regular expression is not a pattern, just as `re` is not one for Python. So the scan misses a
+  file that parses text only with a regular expression, or that splits it on a named constant.
+- A call is read one line at a time. A `split` whose argument starts on the next line is missed.
+  A line inside a block comment that does not start with `*` counts as code, as it does for the section 9 counts.
+- A type-only import of a network module counts as a network read, though it reads nothing.
+- Scripts outside `ide/src` are not scanned, such as the webview script in `ide/media/`.
+- The web console's browser scripts, in `messagefoundry_webconsole/static/`, are not scanned. They
+  parse what the console's own origin sends them (section 10), and what the browser keeps for that
+  origin.
+
+**Extension parsers that read input from outside.**
+
+| Input | Where it comes from | Files |
+|---|---|---|
+| Replies from an engine address | Whatever answers at the engine URL setting. The file's own comment says that is not necessarily the engine, and a plain `http` URL gets no TLS. The Python clients' replies sit in the first table above for the same reason. | `engineClient.ts` |
+| An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` is the extension's twin of `anon/surrogates.py` in the hand-read table. | `hl7diff.ts`, `hl7scope.ts` |
+
+**Extension parse sites left out, and why.**
+
+| Why it is left out | Files |
+|---|---|
+| It reads the JSON the MessageFoundry command line prints. The extension runs that command itself, and section 9 says when. Message content inside that JSON goes on to `hl7diff.ts`, in the table above. `connectionSchemaModel.ts` matches pattern 4 only because its caller passes it that command's result under the name `fetch`. | `cli.ts`, `connectionSchemaModel.ts`, `engineControlModel.ts`, `stepsModel.ts` |
+| It reads your config source line by line, from the open editor or the config folder. That code runs when the engine loads it (sections 1 and 2), so reading its text trusts it no further. | `completionScope.ts`, `editorToolbar.ts`, `liveDebug.ts`, `stepsModel.ts`, `symbolIndex.ts`, `traceView.ts` |
+| It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
+| It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |
+| It reads a value you typed into the extension's connection form | `connectionForm.ts` |
+| It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
+
+**Extension files that parse text the patterns cannot see.**
+
+| What it reads | Files |
+|---|---|
+| The code you are typing, matched with regular expressions to offer completions | `completion.ts` |
+| Its own page's menu values, matched with a regular expression | `wiringMapWebview.ts` |
+
+Neither reads input from outside, and there may be more files like them.
 
 **Archives and compressed streams are parsed too.** A small input can expand into a huge one, and
 an archive names its own members, so each reader below bounds both. These modules import an archive
@@ -605,9 +666,10 @@ reads the code and fails when one of these no longer matches it:
   `shell=True`;
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
-- the section 7 parser tables: a parse site the five patterns find that the first two tables omit,
+- the section 7 parser tables: a parse site the six patterns find that the first two tables omit,
   a site in both, or a name there the scan does not find. A hand-read parser must exist, and the
-  scan must not find it. The five patterns the page states must be the ones the test uses;
+  scan must not find it. The six patterns the page states must be the ones the test uses. The
+  extension's three tables are held to its four patterns the same way;
 - the section 7 archive list: a new module that imports an archive or compression library;
 - the section 8 table: a script added to or removed from `scripts/service/`, or one with no
   administrator check;
@@ -619,5 +681,5 @@ reads the code and fails when one of these no longer matches it:
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
 Some things no test checks. They include what a script grants, what holds a site, and sections 1,
-2, 3 and 6. In section 7, no test checks which table a parse site belongs in, or whether the
+2, 3 and 6. In section 7, no test checks which table a parse site belongs in, or whether either
 hand-read table is complete. Keep that prose true by hand.

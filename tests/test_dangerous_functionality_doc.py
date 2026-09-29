@@ -27,12 +27,14 @@ and the section 10 count of HTML writes in the web console's scripts, plus the c
 the console's Python holds none of the engine's classes. The TypeScript and JavaScript checks read
 by pattern, not by parser, and skip whole-line comments only.
 
-Section 7's parser tables are held to a scan too (BACKLOG #1190): every parse site the five patterns
+Section 7's parser tables are held to a scan too (BACKLOG #1190): every parse site the six patterns
 the page names find, over the engine and the web console's Python, must sit in exactly one of the
 first two tables, and neither may name a site the scan does not find. The third table names parsers
 found by reading the code; each must exist and must not be a site the scan finds, and nothing here
-says it is complete. The patterns the page states must be the ones the detector uses. Which table a
-site belongs in is a judgement about where its input comes from, and no check here reads that.
+says it is complete. The VS Code extension's TypeScript under ``ide/src`` has a four-pattern scan
+and three tables of its own, held the same way. The patterns the page states must
+be the ones each detector uses. Which table a site belongs in is a judgement about where its input
+comes from, and no check here reads that.
 Section 9's claim about which extension file builds markup with ``innerHTML`` is pinned to a file
 that exists and does.
 
@@ -53,7 +55,7 @@ from __future__ import annotations
 import ast
 import functools
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -1014,6 +1016,7 @@ _PARSER_LIBS = (
     "fhirpathpy",
     "cbor2",
     "webauthn",
+    "spnego",
     "csv",
     "email.parser",
     "email.feedparser",
@@ -1051,20 +1054,33 @@ _UNPACKS = frozenset({"unpack", "unpack_from", "iter_unpack"})
 #: Pattern 5: an inbound connector, which reads whatever a sender chooses.
 _SOURCE_REGISTRAR = "register_source"
 
-#: Patterns 2, 3, 4 and 5 matched by the called name alone, bare or as an attribute.
-_CALLS_BY_NAME = frozenset({_JSON_HELPER, *_FORM_DECODES, *_UNPACKS, _SOURCE_REGISTRAR})
+#: Pattern 6: a certificate or key decode. ``cryptography`` names most decoders by encoding, so a
+#: name prefix reaches every ``load_pem_*``, ``load_der_*`` and ``load_ssh_*`` loader. Its two
+#: PKCS #12 decoders are named by format instead.
+_KEY_DECODE_PREFIXES = ("load_pem_", "load_der_", "load_ssh_")
+_PKCS12_DECODES = frozenset({"load_key_and_certificates", "load_pkcs12"})
+
+#: Patterns 2, 3, 4, 5 and 6 matched by the called name alone, bare or as an attribute.
+_CALLS_BY_NAME = frozenset(
+    {_JSON_HELPER, *_FORM_DECODES, *_UNPACKS, _SOURCE_REGISTRAR, *_PKCS12_DECODES}
+)
 
 _CONSOLE_PREFIX = "messagefoundry_webconsole/"
 _OUTSIDE_HEADER = "| Input | Where it comes from | Modules |"
 _LEFT_OUT_HEADER = "| Why it is left out | Modules |"
 _BY_HAND_HEADER = "| What it parses | Modules |"
-_UNIT_RE = re.compile(r"`([\w/]+(?:\.py|/))`")
+#: Every backticked name in a table's last cell, which holds only file and package names. A name
+#: the scan cannot produce, such as a misspelling or a file of another type, is then reported rather
+#: than silently read as no name at all.
+_UNIT_RE = re.compile(r"`([^`]+)`")
 
 
 def _is_parse_call(node: ast.Call, aliases: Mapping[str, str]) -> bool:
-    """Whether one call matches pattern 2, 3, 4 or 5."""
+    """Whether one call matches pattern 2, 3, 4, 5 or 6."""
     name = _called_name(node)
     if name in _CALLS_BY_NAME or _dotted(node.func, aliases) in _JSON_DECODES:
+        return True
+    if name is not None and name.startswith(_KEY_DECODE_PREFIXES):
         return True
     if not isinstance(node.func, ast.Attribute):
         return False
@@ -1080,7 +1096,7 @@ def _is_parse_call(node: ast.Call, aliases: Mapping[str, str]) -> bool:
 
 @functools.cache
 def _is_parse_site(source: str) -> bool:
-    """Whether a module matches any of the five patterns section 7 names. One parse feeds both the
+    """Whether a module matches any of the six patterns section 7 names. One parse feeds both the
     import check and the call walk."""
     tree = _parse(source)
     if _tree_imports_any(tree, _PARSER_LIBS):
@@ -1109,7 +1125,7 @@ def _parser_scan_sources() -> dict[str, str]:
 
 
 def _table_units(section: str, header: str) -> set[str]:
-    """Every module or package the table under ``header`` names in its last cell."""
+    """Every module, package or file the table under ``header`` names in its last cell."""
     lines = section.splitlines()
     assert header in lines, f"section 7 has no table headed {header!r}"
     units: set[str] = set()
@@ -1126,40 +1142,61 @@ def _unit_exists(unit: str) -> bool:
     return (_PKG / unit).exists()
 
 
-def _parser_drift(text: str, live: set[str]) -> list[str]:
-    """The first two tables together must name exactly the sites the scan finds, and no site may be
-    in both. A site may sit in several rows of one table. The third names parsers found by reading
-    the code: each must exist, and none may be a site the scan finds, or it belongs in the first
-    two."""
+def _three_table_drift(
+    text: str,
+    where: str,
+    headers: tuple[str, str, str],
+    live: set[str],
+    unit_of: Callable[[str], str],
+    exists: Callable[[str], bool],
+) -> list[str]:
+    """``headers`` name an outside-input table, a left-out table and a hand-read table. The first
+    two together must name exactly the sites the scan finds, and no site may be in both; a site may
+    sit in several rows of one table. The third names parsers found by reading the code: each must
+    exist, and none may be a site the scan finds, or it belongs in the first two."""
     section = _section(text, 7)
-    outside = _table_units(section, _OUTSIDE_HEADER)
-    left_out = _table_units(section, _LEFT_OUT_HEADER)
-    by_hand = _table_units(section, _BY_HAND_HEADER)
+    outside, left_out, by_hand = (_table_units(section, header) for header in headers)
     problems: list[str] = []
     if unfound := sorted((outside | left_out) - live):
         problems.append(
-            f"section 7's first two parser tables name {unfound}, which the scan does not find; "
-            "a real parser it cannot see belongs in the hand-read table"
+            f"{where} name {unfound}, which the scan does not find; a real parser it cannot see "
+            "belongs in the hand-read table"
         )
     if unlisted := sorted(live - outside - left_out):
-        problems.append(f"the scan finds {unlisted}, which section 7's first two tables omit")
-    if both := outside & left_out:
-        problems.append(f"section 7 puts {sorted(both)} in both of its first two parser tables")
-    if found := sorted(unit for unit in by_hand if _parse_unit(unit) in live):
-        problems.append(f"section 7's hand-read table names {found}, which the scan finds")
-    if missing := sorted(unit for unit in by_hand if not _unit_exists(unit)):
-        problems.append(f"section 7's hand-read table names {missing}, which do not exist")
+        problems.append(f"the scan finds {unlisted}, which {where} omit")
+    if both := sorted(outside & left_out):
+        problems.append(f"{where} name {both} both as outside input and as left out")
+    if found := sorted(unit for unit in by_hand if unit_of(unit) in live):
+        problems.append(f"{where} list {found} as hand-read, but the scan finds them")
+    if missing := sorted(unit for unit in by_hand if not exists(unit)):
+        problems.append(f"{where} list {missing} as hand-read, and they do not exist")
     return problems
 
 
+def _parser_drift(text: str, live: set[str]) -> list[str]:
+    return _three_table_drift(
+        text,
+        "section 7's engine parser tables",
+        (_OUTSIDE_HEADER, _LEFT_OUT_HEADER, _BY_HAND_HEADER),
+        live,
+        _parse_unit,
+        _unit_exists,
+    )
+
+
 _PATTERNS_LEAD = "**How the parser list is found.**"
+_PATTERNS_END = "A hit inside"
+_TS_PATTERNS_LEAD = "**How the extension's parser list is found.**"
+_TS_PATTERNS_END = "Every file this scan finds"
 _PATTERN_ITEM_RE = re.compile(r"^(\d+)\. ")
 
 
-def _page_patterns(text: str) -> list[set[str]]:
-    """The backticked names in each numbered pattern section 7 states, in order."""
-    region = _section(text, 7).partition(_PATTERNS_LEAD)[2].partition("A hit inside")[0]
-    assert region, f"section 7 has no {_PATTERNS_LEAD!r} paragraph"
+def _page_patterns(
+    text: str, lead: str = _PATTERNS_LEAD, end: str = _PATTERNS_END
+) -> list[set[str]]:
+    """The backticked names in each numbered pattern section 7 states after ``lead``, in order."""
+    region = _section(text, 7).partition(lead)[2].partition(end)[0]
+    assert region, f"section 7 has no {lead!r} paragraph"
     items: list[list[str]] = []
     for line in region.splitlines():
         if _PATTERN_ITEM_RE.match(line):
@@ -1176,6 +1213,7 @@ _DETECTOR_PATTERNS = [
     set(_FORM_DECODES),
     {*_BYTE_TOKENIZERS, *_UNPACKS},
     {_SOURCE_REGISTRAR},
+    {*_KEY_DECODE_PREFIXES, *_PKCS12_DECODES},
 ]
 
 
@@ -1251,6 +1289,13 @@ _PARSE_SITE_CONTROLS = [
     "import email\nemail.message_from_bytes(raw)\n",
     "body = response.json(strict=True)\n",
     "register_source(ConnectorType.TCP, TcpSource)\n",
+    "def f(token):\n    import spnego\n",
+    "from cryptography import x509\nx509.load_pem_x509_certificate(data)\n",
+    "from cryptography.hazmat.primitives.serialization import load_der_private_key\n"
+    "load_der_private_key(data, None)\n",
+    "pkcs12.load_key_and_certificates(pfx, password)\n",
+    "pkcs12.load_pkcs12(pfx, password)\n",
+    "serialization.load_ssh_public_key(data)\n",
 ]
 
 
@@ -1269,6 +1314,8 @@ def test_the_parse_site_detector_ignores_mentions_and_non_parses() -> None:
         "ok = data.startswith(b'MSH') and data.endswith(b'\\r')\n"
         "parts = text.split(',')\n"
         "def register_source(kind, cls): ...\n"
+        "ctx.load_verify_locations(cafile=path)\n"
+        "pem = cert.public_bytes(encoding)\n"
     )
     assert not _is_parse_site(quiet)
     assert _parse_sites(
@@ -1337,3 +1384,168 @@ def test_innerhtml_file_drift_is_reported() -> None:
     # A file that writes HTML another way no longer backs the sentence's innerHTML claim.
     other_sink = {**sources, "testBenchWebview.ts": "el.insertAdjacentHTML('beforeend', x);\n"}
     assert _innerhtml_file_problems(text, other_sink)
+
+
+# --- section 7: the extension's parser tables (BACKLOG #1190) -------------------------------------
+
+#: Extension pattern 1: a JSON decode. A ``.json()`` call shares the Python scan's method name.
+_TS_JSON_PARSE = "JSON.parse"
+#: Extension pattern 2: a ``split`` on a string or regular-expression literal holding a line break.
+_TS_SPLIT = "split"
+_TS_LINE_BREAKS = (r"\r", r"\n")
+#: Extension pattern 3: a character read.
+_TS_CHAR_READS = ("charAt", "charCodeAt", "codePointAt")
+#: Extension pattern 4: an import of a Node network module, with or without the ``node:`` prefix,
+#: or a call to a global that reads the network with no import.
+_TS_NET_MODULES = ("http", "https", "http2", "net", "tls", "dgram")
+_TS_NODE_PREFIX = "node:"
+_TS_NET_GLOBALS = ("fetch", "WebSocket")
+
+# A literal body is escapes and other characters up to the closing quote. The part before the first
+# break escape may not hold one, so the match is linear rather than trying every break in turn.
+_TS_BREAK = "|".join(re.escape(escape) for escape in _TS_LINE_BREAKS)
+_TS_PARSE_RE = re.compile(
+    "|".join(
+        (
+            rf"\b{re.escape(_TS_JSON_PARSE)}\(|\.{_JSON_METHOD}\(",
+            rf"\.{_TS_SPLIT}\(\s*(?P<q>[/\"'`])(?:(?!(?P=q))[^\\\n]|\\[^rn])*(?:{_TS_BREAK})"
+            r"(?:(?!(?P=q))[^\\\n]|\\.)*(?P=q)",
+            rf"\.(?:{'|'.join(_TS_CHAR_READS)})\(",
+            rf"""\b(?:from|import|require)\s*\(?\s*["'](?:{_TS_NODE_PREFIX})?"""
+            rf"""(?:{"|".join(_TS_NET_MODULES)})["']""",
+            rf"(?<![\w.$])(?:{'|'.join(_TS_NET_GLOBALS)})\(",
+        )
+    )
+)
+
+#: What the extension detector matches, pattern by pattern, as the page must state it.
+_TS_DETECTOR_PATTERNS = [
+    {_TS_JSON_PARSE, f".{_JSON_METHOD}()"},
+    {_TS_SPLIT, *_TS_LINE_BREAKS},
+    set(_TS_CHAR_READS),
+    {*_TS_NET_MODULES, _TS_NODE_PREFIX, *_TS_NET_GLOBALS},
+]
+
+_TS_OUTSIDE_HEADER = "| Input | Where it comes from | Files |"
+_TS_LEFT_OUT_HEADER = "| Why it is left out | Files |"
+_TS_BY_HAND_HEADER = "| What it reads | Files |"
+
+
+def _ts_page_patterns(text: str) -> list[set[str]]:
+    return _page_patterns(text, _TS_PATTERNS_LEAD, _TS_PATTERNS_END)
+
+
+@functools.cache
+def _is_ts_parse_site(source: str) -> bool:
+    """Whether a code line of one extension file matches any of the four patterns section 7 names
+    for the extension. Whole-line comments are skipped by the rule section 9's counts use."""
+    return any(_TS_PARSE_RE.search(line) for line in _script_code_lines(source))
+
+
+def _ts_parse_sites(sources: Mapping[str, str]) -> set[str]:
+    return {rel for rel, source in sources.items() if _is_ts_parse_site(source)}
+
+
+def _ts_parser_drift(text: str, live: set[str], sources: Mapping[str, str]) -> list[str]:
+    """The extension's tables, held as the engine's are. A hand-read file must be in ``sources``."""
+    return _three_table_drift(
+        text,
+        "section 7's extension parser tables",
+        (_TS_OUTSIDE_HEADER, _TS_LEFT_OUT_HEADER, _TS_BY_HAND_HEADER),
+        live,
+        str,
+        sources.__contains__,
+    )
+
+
+def test_the_extension_parser_tables_match_the_code() -> None:
+    sources = _ide_sources()
+    _assert_no_drift(7, _ts_parser_drift(_doc_text(), _ts_parse_sites(sources), sources))
+
+
+def test_the_page_states_the_extension_patterns_the_detector_uses() -> None:
+    assert _ts_page_patterns(_doc_text()) == _TS_DETECTOR_PATTERNS
+
+
+def test_the_extension_scan_reaches_the_sites_it_must() -> None:
+    # The engine client parses whatever answers at the engine URL, and hl7diff.ts is a hand-written
+    # HL7 parser that only the character-read pattern reaches: it splits on a named constant.
+    must = {"engineClient.ts", "hl7diff.ts"}
+    assert must <= _ts_parse_sites(_ide_sources()), (
+        "the extension parse-site scan no longer finds a site it must: it is dead or a pattern broke"
+    )
+
+
+_TS_PARSE_SITE_CONTROLS = [
+    "const parsed: unknown = JSON.parse(text);",
+    "const body = await response.json();",
+    r"for (const line of text.split(/\r?\n/)) {}",
+    r"const segments = raw.split(/\r\n|\r|\n/);",
+    r'const head = (markdown.split("\n")[0] ?? "");',
+    r"const rows = text.split('\r\n');",
+    r"const rows = text.split(`\n`);",
+    "const field = line.charAt(3);",
+    "const code = text.charCodeAt(0);",
+    "const point = text.codePointAt(0);",
+    'import * as http from "node:http";',
+    "import { Socket } from 'net';",
+    'const tls = require("node:tls");',
+    'const dgram = await import("dgram");',
+    "const response = await fetch(url);",
+    "const socket = new WebSocket(url);",
+]
+
+
+@pytest.mark.parametrize("source", _TS_PARSE_SITE_CONTROLS)
+def test_the_extension_detector_fires_on_each_pattern(source: str) -> None:
+    assert _is_ts_parse_site(source)
+
+
+def test_the_extension_detector_ignores_mentions_and_non_parses() -> None:
+    quiet = "\n".join(
+        (
+            "// const parsed = JSON.parse(text);",
+            " * const field = line.charAt(3);",
+            "/* import * as http from 'node:http'; */",
+            "const text = JSON.stringify(value);",
+            'const parts = name.split("_");',
+            r"const base = fsPath.split(/[\\/]/).pop();",
+            "const lines = text.split(SEG_SEP);",
+            'import * as path from "node:path";',
+            'import { getJson } from "./http";',
+            'const url = "https://127.0.0.1:8765";',
+            r'const escaped = text.split("\\n");',
+            "await repo.fetch(remote);",
+            "const prefetched = prefetch(url);",
+        )
+    )
+    assert not _is_ts_parse_site(quiet)
+
+
+def test_extension_parser_table_drift_is_reported() -> None:
+    """Break the page and the tree in memory, one way at a time, and each break must be reported."""
+    text = _doc_text()
+    sources = _ide_sources()
+    live = _ts_parse_sites(sources)
+    assert not _ts_parser_drift(text, live, sources)
+    # A planted JSON decode in a file the page does not name.
+    grown = {**sources, "newPanel.ts": "const reply = JSON.parse(text);\n"}
+    assert _ts_parser_drift(text, _ts_parse_sites(grown), grown)
+    # An omitted site, an orphaned listing, one site in both tables, a hand-read file the scan
+    # finds, and a hand-read file that does not exist.
+    for old, new in (
+        ("| `hl7diff.ts`, `hl7scope.ts` |", "| `hl7diff.ts` |"),
+        ("| `connectionForm.ts` |", "| `connectionForm.ts`, `nope.ts` |"),
+        ("| `engineClient.ts` |", "| `engineClient.ts`, `cli.ts` |"),
+        ("| `completion.ts` |", "| `completion.ts`, `cli.ts` |"),
+        ("| `completion.ts` |", "| `completion.ts`, `nope.ts` |"),
+    ):
+        assert _ts_parser_drift(_replace_once(text, old, new), live, sources), new
+    # A table the reader can no longer find is an error, not an empty set.
+    with pytest.raises(AssertionError):
+        _ts_parser_drift(
+            _replace_once(text, _TS_OUTSIDE_HEADER, "| Input | Files |"), live, sources
+        )
+    # A pattern the page states that the detector does not use, or one it drops.
+    for old, new in (("`tls` or `dgram`", "`tls`"), ("`charAt`, ", "`charAt`, `at`, ")):
+        assert _ts_page_patterns(_replace_once(text, old, new)) != _TS_DETECTOR_PATTERNS, new
