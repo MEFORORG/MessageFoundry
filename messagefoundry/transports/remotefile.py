@@ -446,22 +446,30 @@ _FTP_AUTH_TLS = "AUTH TLS"
 _FTP_LOGIN = "the login"
 _FTP_PROT_P = "PBSZ/PROT P"
 
-#: A server's reply text that names a connection limit: ProFTPD's "530 Sorry, the maximum number of
-#: clients (5) for this user are already connected.", Serv-U's "530 Sorry, no more than 10 users
-#: allowed", and "Too many connections" or "too many users" from several others. The nouns are
+#: A reply line that names a connection limit as a whole phrase: ProFTPD's "530 Sorry, the maximum
+#: number of clients (5) for this user are already connected.", Serv-U's "530 Sorry, no more than 10
+#: users allowed", "Too many connections" or "too many users" from several others, and "Connection
+#: limit reached". A "maximum ... clients" must go on to say they are already connected, or that the
+#: limit is reached or exceeded; the word "maximum" and a noun alone are not enough. The nouns are
 #: clients, connections, users and sessions only. "Login" is left out on purpose: "530 Maximum login
 #: attempts exceeded" is a credential refusal, not a limit.
 _FTP_CONNECTION_LIMIT = re.compile(
-    r"max(?:imum)?\b[^.]{0,60}?\b(?:clients?|connections?|users?|sessions?)\b"
-    r"|too\s+many\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
-    r"|no\s+more\s+than\s+\d+\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
-    r"|(?:client|connection|user|session)\s+limit",
+    r"\bmax(?:imum)?\b[^.]{0,60}?\b(?:clients?|connections?|users?|sessions?)\b"
+    r"[^.]{0,40}?\b(?:already\s+(?:connected|logged\s+in)|reached|exceeded)\b"
+    r"|\btoo\s+many\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
+    r"|\bno\s+more\s+than\s+\d+\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
+    r"|\b(?:client|connection|user|session)s?\s+limit\s+(?:reached|exceeded)\b",
     re.IGNORECASE,
 )
 
-#: Words that mark a reply as being about the credential even when it also names a limit. A reply
-#: carrying one is not read as a connection limit, so it keeps the credential-fault class.
-_FTP_CREDENTIAL_WORDS = re.compile(r"attempt|fail|password|incorrect|invalid|lock", re.IGNORECASE)
+#: Words that mark a reply as being about the credential or the account, even when it also names a
+#: limit. A reply carrying one anywhere is not read as a connection limit, so it keeps the
+#: credential-fault class.
+_FTP_CREDENTIAL_WORDS = re.compile(
+    r"attempt|fail|passw|incorrect|invalid|lock|tries|retr(?:y|ies)|denied|reject|disabl|auth"
+    r"|permit|expir",
+    re.IGNORECASE,
+)
 
 
 def _names_connection_limit(reply: str) -> bool:
@@ -474,8 +482,14 @@ def _names_connection_limit(reply: str) -> bool:
     same. Reading a busy server as a bad password stops one lane on this engine, with every message
     kept, until an operator resumes it. Reading a bad password as a busy server retries the login on
     every delivery, and a partner that locks an account after a few failures would lock it. That
-    lockout is on the partner's system, where no operator here can undo it."""
-    return bool(_FTP_CONNECTION_LIMIT.search(reply)) and not _FTP_CREDENTIAL_WORDS.search(reply)
+    lockout is on the partner's system, where no operator here can undo it.
+
+    So the test is narrow on purpose. The limit phrase must be on the reply's last line, the one
+    that carries the final code, since the earlier lines of a multi-line reply are often a banner.
+    And no word about the credential or the account may appear anywhere in the reply."""
+    lines = [line for line in reply.strip().splitlines() if line.strip()]
+    last = lines[-1] if lines else ""
+    return bool(_FTP_CONNECTION_LIMIT.search(last)) and not _FTP_CREDENTIAL_WORDS.search(reply)
 
 
 def _ftp_connect_refusal(step: str, exc: ftplib.error_perm) -> _RemoteError:
@@ -825,7 +839,7 @@ SFTP_WRITE_CHUNK_BYTES = 32768
 
 
 class _WriteWatchdog:
-    """Closes the SSH client when an upload stops making progress (BACKLOG #2082, ASVS 15.4.4).
+    """Closes the SSH transport when an upload stops making progress (BACKLOG #2082, ASVS 15.4.4).
 
     THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACT BELOW IS STATED. Read against paramiko 5.0.0.
 
@@ -835,7 +849,7 @@ class _WriteWatchdog:
     stops reading, and keeps its TCP window shut, would park the worker thread for good.
 
     The upload writes in :data:`SFTP_WRITE_CHUNK_BYTES` steps and calls :meth:`progress` after each.
-    A helper thread closes the client once :data:`SFTP_WRITE_STALL_SECONDS` pass with no progress.
+    A helper thread closes the transport once :data:`SFTP_WRITE_STALL_SECONDS` pass with no progress.
     ``Transport.close`` closes the packetizer, so ``write_all`` raises ``EOFError`` on its next turn,
     and ``_op`` reports the upload as stalled, which is transient. A slow upload that keeps moving
     resets the bound at every step, so only a stall is cut off."""
@@ -869,7 +883,12 @@ class _WriteWatchdog:
         if self._done.is_set():
             return
         self.fired = True
-        client.close()
+        # The transport, not the client: ``SSHClient.close`` reads and then clears its transport
+        # with no lock, and ``_session`` closes the client in its own ``finally``, so two threads
+        # closing it could race. ``Transport.close`` is safe to call twice.
+        transport = client.get_transport()
+        if transport is not None:
+            transport.close()
 
 
 def _open_sftp_within(client: Any, seconds: float) -> Any:
@@ -1605,17 +1624,35 @@ class RemoteFileDestination(DestinationConnector):
         # Write to a unique temp name then rename, so a poller on the far side never sees a partial
         # file. The temp suffix is unguessable so two concurrent uploads never collide on it.
         tmp = posixpath.join(self._remote_dir, f".{name}.{uuid.uuid4().hex}.part")
-        self._client.store(tmp, data)
+        try:
+            self._client.store(tmp, data)
+        except _RemoteError as exc:
+            # A store cut off part-way, by the stall bound (#2082) or a dropped connection, can leave
+            # a partial temp behind, one more on every retry. Not after a credential fault: another
+            # login would be one more refused attempt against the partner account.
+            if not exc.credential_fault:
+                self._remove_temp(tmp, name, "store")
+            raise
         try:
             self._client.rename(tmp, final)
         except _RemoteError:
             # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so the
             # delivery is classified (retry/dead-letter) by send().
-            try:
-                self._client.remove(tmp)
-            except _RemoteError:
-                logger.warning("REMOTEFILE could not remove temp %s after a failed rename", tmp)
+            self._remove_temp(tmp, name, "rename")
             raise
+
+    def _remove_temp(self, tmp: str, name: str, after: str) -> None:
+        """Best-effort removal of an upload's temp file after a failed ``after`` step. The temp name
+        carries the rendered filename, which can hold an identifier, so it is logged only through
+        ``safe_name`` (BACKLOG #2082; this line logged it raw before)."""
+        try:
+            self._client.remove(tmp)
+        except _RemoteError:
+            logger.warning(
+                "REMOTEFILE could not remove the temp for %s after a failed %s",
+                safe_name(name),
+                after,
+            )
 
     def _unique(self, final: str) -> str:
         """Return ``final`` or, if anything already exists there, ``name-1.ext``, ``name-2.ext``, …

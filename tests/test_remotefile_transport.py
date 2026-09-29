@@ -353,6 +353,31 @@ async def test_destination_credential_fault_flag_threads_through(
     assert ei.value.credential_fault is True
 
 
+async def test_destination_cleans_temp_on_failed_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #2082: a store cut off part-way (the SFTP stall bound, a dropped connection) can leave a partial
+    # temp on the partner's server, one more on every retry. It is removed before the retry.
+    client = _FakeClient(store_exc=_RemoteError("SFTP upload stalled", permanent=False))
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    with pytest.raises(DeliveryError):
+        await dest.send("x")
+    (stored,) = [p for op, p in client.ops if op == "store"]
+    assert ("remove", stored) in client.ops
+
+
+async def test_destination_keeps_temp_after_a_credential_fault_on_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CONTROL: after a refused credential, removing the temp would be one more login attempt against
+    # the partner account, and nothing was written anyway.
+    client = _FakeClient(
+        store_exc=_RemoteError("auth failed", permanent=True, credential_fault=True)
+    )
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    with pytest.raises(NegativeAckError):
+        await dest.send("x")
+    assert not any(op == "remove" for op, _ in client.ops)
+
+
 async def test_destination_cleans_temp_on_failed_rename(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _FakeClient(rename_exc=_RemoteError("rename failed", permanent=False))
     dest = _dest(monkeypatch, client, filename="msg.hl7")
@@ -2248,6 +2273,13 @@ def test_a_tls_refusal_is_a_configuration_fault_not_a_credential_fault(
         "530 Maximum login attempts exceeded for this user",
         # Names a limit and the password: the credential words win.
         "530 Too many users failed the password check",
+        # Read as busy servers by a first, looser pattern. Each is about the credential or the
+        # account, so each must stop the lane rather than retry into a lockout.
+        "530 Maximum retries exceeded for this user",
+        "530 Max auth tries reached for user jdoe",
+        "530-This server allows a maximum of 50 users.\n530 Authentication rejected.",
+        "530 User account disabled: maximum sessions policy",
+        "530 Access denied: user jmax, user not permitted",
     ],
 )
 def test_a_refused_credential_is_still_a_credential_fault(
