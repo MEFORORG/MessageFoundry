@@ -942,16 +942,15 @@ def _import_aioodbc() -> Any:
 
 def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | None:
     """The login timeout, in seconds, for a DATABASE connection's pool: its ``connect_timeout``
-    setting, or ``None`` for the ``generic`` dialect (BACKLOG #2089). Every pool site calls this.
+    setting, or ``None`` for the ``generic`` dialect (BACKLOG #2089). Pool sites take it from here.
 
     ``dialect`` is the one the caller built its DSN with, passed explicitly rather than read from
     ``s``: ``db_lookup`` and reference sync always build the SQL Server DSN, whatever the mapping says.
 
-    **Why it is not in the DSN.** The SQL Server preset used to emit ``Connection Timeout=<n>``. That
-    is an ADO.NET keyword, and ODBC Driver 18 ignores it, so it bounded nothing (the store's #1626
-    measured this: a DSN with ``Connection Timeout=2`` still waited 15.1 s). The driver's login
-    timeout is ``SQL_ATTR_LOGIN_TIMEOUT``, which pyodbc sets from its ``timeout=`` argument, and
-    :func:`_make_pool` passes the value there. The connector states that reason here only.
+    **Why it is not in the DSN.** ODBC Driver 18 ignores a login-timeout keyword in the connection
+    string; the comment in ``store/sqlserver.py::connection_string`` records the #1626
+    measurement. The driver reads pyodbc's ``timeout=`` argument instead, and :func:`_make_pool`
+    passes the value there.
 
     The ``generic`` dialect gets ``None``, as before: its DSN never carried a login timeout, and
     whether an arbitrary operator-named driver accepts the attribute has not been measured.
@@ -959,7 +958,8 @@ def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | N
     ``connect_timeout`` is checked by :func:`check_db_connect_timeout` whatever the dialect, and
     ``label`` names the declaration in its refusal. The destination, poll source and lookup executor
     call this at construction, so ``serve`` and ``messagefoundry check`` refuse a bad value at start.
-    ``DatabaseRef`` checks its own value when it is declared."""
+    ``DatabaseRef`` checks a literal value when it is declared; an ``env()`` value is checked here,
+    at each sync, once resolved."""
     value = check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
     return None if dialect == "generic" else value
 
@@ -1415,7 +1415,7 @@ class DatabaseSource(SourceConnector):
         self._encoding: str = s.get("encoding", "utf-8")
         self._login_timeout = _login_timeout(
             s,
-            f"DATABASE connection {inbound_record_name(config.name or '')!r}",
+            f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
             dialect=self._dialect,
         )
         self._pool_max = int(s.get("pool_max", 5))

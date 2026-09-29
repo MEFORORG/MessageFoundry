@@ -3,19 +3,16 @@
 """BACKLOG #2089: a DATABASE connection's ``connect_timeout`` must reach ODBC Driver 18 as the LOGIN
 timeout, as ``[store].connect_timeout`` does since #1626.
 
-The SQL Server preset used to put ``Connection Timeout=<n>`` in the DSN. That is an ADO.NET keyword,
-and ODBC Driver 18 ignores it (the store's measurement under #1626: a DSN with ``Connection
-Timeout=2`` still waited 15.1 s, while ``pyodbc.connect(..., timeout=2)`` gave up in 2.1 s). pyodbc
-maps its ``timeout=`` argument to ``SQL_ATTR_LOGIN_TIMEOUT``, and aioodbc forwards the pool's
-``timeout=`` to every ``pyodbc.connect`` it makes. So the fix is to pass ``timeout=`` to the pool.
+Why the DSN keyword did nothing is stated in ``transports.database._login_timeout``; the fix is to
+pass ``timeout=`` to the pool, which aioodbc forwards to every ``pyodbc.connect`` it makes.
 
 **Why the fakes.** ``aioodbc``/``pyodbc`` are the optional ``sqlserver`` extra, not installed on every
 CI leg. A recording ``aioodbc`` stands in through ``sys.modules``, which the connector's lazy import
 resolves, and ``pyodbc`` is hidden so the #2049 pooling guard is a no-op. What is pinned is the
 argument each pool site hands the driver, which is the whole of the defect.
 
-The pool sites: the destination, the poll source, the ``db_lookup`` executor and the reference-set
-sync. All four go through ``transports.database._make_pool``. Each SQL Server test here fails on the
+The pool sites pinned here are at least the destination, the poll source, the ``db_lookup`` executor
+and the reference-set sync, each through ``transports.database._make_pool``. Each SQL Server test here fails on the
 pre-fix code, where no site passed ``timeout=``.
 
 The value is also checked: ``connect_timeout`` must be a whole number of seconds, at least 1, and a
@@ -183,6 +180,10 @@ def test_a_bad_connect_timeout_is_refused_at_construction(bad: object) -> None:
     with pytest.raises(ValueError, match="'OB_DB' connect_timeout") as info:
         _dest({**_SQLSERVER, "connect_timeout": bad})
     assert "value withheld" in str(info.value)
+    if isinstance(bad, str):  # #1183/#1796: the value stays out of the message and the chain
+        assert bad not in str(info.value).replace("'OB_DB'", "")
+    assert info.value.__cause__ is None
+    assert info.value.__context__ is None
 
 
 async def test_an_env_resolved_string_connect_timeout_is_accepted(
@@ -244,3 +245,31 @@ async def test_lookup_pool_keeps_its_login_timeout_whatever_the_mapping_dialect(
     with pytest.raises(_StopPool):
         await executor._get_pool("clarity")
     assert pool_calls[0].get("timeout") == _LOGIN_TIMEOUT
+
+
+def test_a_poll_source_refusal_names_the_inbound_record() -> None:
+    with pytest.raises(ValueError, match="DATABASE connection 'inbound:IB_DB' connect_timeout"):
+        DatabaseSource(
+            Source(
+                name="IB_DB",
+                type=ConnectorType.DATABASE,
+                settings={**_SQLSERVER, "poll_statement": "SELECT 1", "connect_timeout": 0},
+            )
+        )
+
+
+async def test_reference_sync_refuses_a_bad_resolved_connect_timeout(
+    pool_calls: list[dict[str, Any]],
+) -> None:
+    """The env() case DatabaseRef defers: the resolved value is checked at sync, before any dial."""
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    settings = {
+        **_SQLSERVER,
+        "statement": "SELECT code FROM t",
+        "key_column": "code",
+        "connect_timeout": "0",
+    }
+    with pytest.raises(ValueError, match="reference source connect_timeout"):
+        await _load_database_source(settings, None)
+    assert pool_calls == []
