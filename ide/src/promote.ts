@@ -11,9 +11,10 @@ import { configDir, engineUrl, environments, runJson, workspaceDir, type Environ
 import { HttpError, type Approvable } from "./engineClient";
 import { assertTargetAllowed, isLocalEngine } from "./engineTarget";
 import {
-  PREFLIGHT_HELD_MESSAGE,
+  preflightOutcome,
   promoteOutcomeMessage,
   reloadConfig,
+  type PromoteMessage,
   type ReloadResult,
 } from "./promoteOutcome";
 import { planTargetResolution, resolveTargetUrl, type ResolvedTarget } from "./promoteTarget";
@@ -158,16 +159,18 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   if (preflight === undefined) {
     return; // sign-in cancelled
   }
-  if (preflight.kind === "held") {
-    void vscode.window.showErrorMessage(PREFLIGHT_HELD_MESSAGE);
+  const pre = preflightOutcome(preflight);
+  if (!pre.ok) {
+    showPromoteMessage(pre.message);
     return;
   }
-  const check = preflight.body;
+  const check = pre.result;
 
   // 4. Confirm — a live swap is production-affecting, so require an explicit OK.
   const ok = await vscode.window.showWarningMessage(
     `Promote "${cfg}" to ${target.name} (${target.url})?\n\nPre-flight passed: ` +
-      `${check.inbound} inbound, ${check.outbound} outbound. This atomically swaps the live graph.`,
+      `${check.inbound} inbound, ${check.outbound} outbound. This atomically swaps the live graph, ` +
+      "or, where dual control applies, asks a second approver to.",
     { modal: true },
     "Promote",
   );
@@ -187,10 +190,19 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   if (result === undefined) {
     return; // sign-in cancelled
   }
-  const message = promoteOutcomeMessage(target.name, result);
-  if (message.level === "warning") {
-    void vscode.window.showWarningMessage(message.text);
-  } else {
-    void vscode.window.showInformationMessage(message.text);
+  showPromoteMessage(promoteOutcomeMessage(target.name, result));
+}
+
+function showPromoteMessage(message: PromoteMessage): void {
+  switch (message.level) {
+    case "error":
+      void vscode.window.showErrorMessage(message.text);
+      return;
+    case "warning":
+      void vscode.window.showWarningMessage(message.text);
+      return;
+    case "info":
+      void vscode.window.showInformationMessage(message.text);
+      return;
   }
 }

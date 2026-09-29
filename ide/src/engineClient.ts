@@ -199,8 +199,9 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
  * `{"detail": ...}` when present — and a plain Error when the engine is unreachable, so a caller's
  * try/catch shows a useful message and can special-case 401/403.
  *
- * Every 2xx decodes as `T`. A route dual control can hold answers 202 with a different body, so
- * call such a route through {@link postApprovable} instead.
+ * A route dual control can hold answers 202 with a pending-approval body instead of a result, so
+ * call such a route through {@link postApprovable}. Here that reply rejects rather than decoding as
+ * `T`: a caller that does not handle a hold must not read one as success (BACKLOG #1981).
  */
 export function postJson<T>(
   baseUrl: string,
@@ -208,7 +209,15 @@ export function postJson<T>(
   body: unknown,
   token?: string,
 ): Promise<T> {
-  return postReply(baseUrl, route, body, token).then((reply) => reply.body as T);
+  return postReply(baseUrl, route, body, token).then((reply) => {
+    if (reply.status === HTTP_PENDING_APPROVAL && isPendingApproval(reply.body)) {
+      throw new Error(
+        `engine held this action for a second approver (approval ${reply.body.approval_id}); ` +
+          "it has not run",
+      );
+    }
+    return reply.body as T;
+  });
 }
 
 /**
@@ -237,8 +246,10 @@ export type Approvable<T> = { kind: "done"; body: T } | { kind: "held"; pending:
  *
  * The status is the discriminator, as it is in the Python client, because it is what the engine
  * varies. A 202 must also carry the pending-approval body: a 202 without one is neither a result nor
- * a hold the user can act on, so it throws rather than being read as success. The body's strings
- * are server text headed for a notification, so they are bounded like an error detail.
+ * a hold the user can act on, so it throws rather than being read as success. The body's free text
+ * is server text headed for a notification, so it is bounded like an error detail. The id is not
+ * bounded by cutting it, because a cut id matches nothing in the approvals queue: an id that is not
+ * a short token is refused instead (the engine issues a uuid4 hex).
  */
 export function classifyApprovable<T>(status: number, body: unknown): Approvable<T> {
   if (status !== HTTP_PENDING_APPROVAL) {
@@ -246,19 +257,23 @@ export function classifyApprovable<T>(status: number, body: unknown): Approvable
   }
   if (!isPendingApproval(body)) {
     throw new Error(
-      `engine answered HTTP ${status} without a pending-approval body, so the outcome is unknown`,
+      `engine answered HTTP ${status} without a pending-approval body, so it is unknown whether ` +
+        "the action was held or ran; check the engine before retrying",
     );
   }
   return {
     kind: "held",
     pending: {
-      approval_id: clamp(body.approval_id),
+      approval_id: body.approval_id,
       operation: clamp(body.operation),
       status: body.status,
       detail: clamp(body.detail),
     },
   };
 }
+
+/** An approval id as the engine issues it: a short token with no spaces or punctuation to hide in. */
+const APPROVAL_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 function isPendingApproval(body: unknown): body is PendingApproval {
   if (body === null || typeof body !== "object") {
@@ -268,7 +283,7 @@ function isPendingApproval(body: unknown): body is PendingApproval {
   return (
     b.status === "pending_approval" &&
     typeof b.approval_id === "string" &&
-    b.approval_id.length > 0 &&
+    APPROVAL_ID_RE.test(b.approval_id) &&
     typeof b.operation === "string" &&
     typeof b.detail === "string"
   );

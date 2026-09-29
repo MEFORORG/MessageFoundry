@@ -5,7 +5,7 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import {
-  PREFLIGHT_HELD_MESSAGE,
+  preflightOutcome,
   promoteOutcomeMessage,
   reloadConfig,
   type ReloadResult,
@@ -89,20 +89,30 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     assert.strictEqual(
       msg.text,
       "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
-        "4 handlers • running.",
+        "4 handlers, running.",
     );
   });
 
-  test("the dry-run pre-flight still decodes as a normal result", async () => {
+  test("the dry-run pre-flight still decodes as a normal result the promote confirms", async () => {
     replyStatus = 200;
     replyBody = { ...live, dry_run: true };
     const outcome = await reloadConfig(url, "/cfg", true, "tok");
     assert.deepStrictEqual(sent, { config_dir: "/cfg", dry_run: true });
     assert.deepStrictEqual(outcome, { kind: "done", body: { ...live, dry_run: true } });
+    assert.deepStrictEqual(preflightOutcome(outcome), {
+      ok: true,
+      result: { ...live, dry_run: true },
+    });
   });
 
-  test("a held pre-flight has its own error text, which promotes nothing", () => {
-    assert.ok(PREFLIGHT_HELD_MESSAGE.includes("pre-flight failed"));
-    assert.ok(PREFLIGHT_HELD_MESSAGE.includes("Nothing was promoted"));
+  test("a held pre-flight stops the promote with an ERROR naming the approval to reject", async () => {
+    replyStatus = 202;
+    replyBody = pendingBody;
+    const pre = preflightOutcome(await reloadConfig(url, "/cfg", true, "tok"));
+    assert.ok(!pre.ok, "a held dry run must not reach the confirm step");
+    assert.strictEqual(pre.message.level, "error");
+    assert.ok(pre.message.text.includes("pre-flight failed"), pre.message.text);
+    assert.ok(pre.message.text.includes(pendingBody.approval_id), pre.message.text);
+    assert.ok(pre.message.text.includes("reject"), pre.message.text);
   });
 });

@@ -210,16 +210,32 @@ suite("engineClient — postApprovable tells a hold from a result (BACKLOG #1981
     );
   });
 
-  test("postJson's contract is unchanged: every 2xx still decodes as the body", async () => {
+  test("postJson REJECTS a real hold rather than reading it as the expected result", async () => {
     replyStatus = 202;
     replyBody = pendingBody;
-    assert.deepStrictEqual(await postJson(url, "/auth/logout", {}, "tok"), pendingBody);
+    await assert.rejects(
+      () => postJson(url, "/dead-letters/replay", {}, "tok"),
+      (e: unknown) =>
+        e instanceof Error &&
+        !(e instanceof HttpError) &&
+        e.message.includes("held this action for a second approver") &&
+        e.message.includes(pendingBody.approval_id),
+    );
   });
 
-  test("classifyApprovable refuses a 202 body with the wrong status or a missing field", () => {
+  test("control: postJson still decodes an ordinary 2xx body as before", async () => {
+    replyStatus = 200;
+    replyBody = { ok: true };
+    assert.deepStrictEqual(await postJson(url, "/auth/logout", {}, "tok"), { ok: true });
+  });
+
+  test("classifyApprovable refuses a 202 body with a wrong status, a bad id or a missing field", () => {
     for (const body of [
       { ...pendingBody, status: "approved" },
       { ...pendingBody, approval_id: "" },
+      { ...pendingBody, approval_id: "   " },
+      { ...pendingBody, approval_id: "a".repeat(129) },
+      { ...pendingBody, approval_id: "id with spaces" },
       { ...pendingBody, detail: undefined },
       null,
       "pending_approval",
