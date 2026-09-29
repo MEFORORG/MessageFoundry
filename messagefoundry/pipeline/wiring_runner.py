@@ -955,7 +955,6 @@ class RegistryRunner:
         pooled_sweep_interval: float = 0.25,
         pooled_claim_lane_chunk: int = 256,
         pooled_max_processing_lanes: int = 256,
-        require_rcsi_for_pooled: bool = True,
         infra_fault_policy: str = "stop",
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
@@ -1271,7 +1270,6 @@ class RegistryRunner:
         self._pooled_sweep_interval = pooled_sweep_interval
         self._pooled_claim_lane_chunk = pooled_claim_lane_chunk
         self._pooled_max_processing_lanes = pooled_max_processing_lanes
-        self._require_rcsi_for_pooled = require_rcsi_for_pooled
         # Pooled T17 infra-fault bound (ADR 0070). Threaded into each StageDispatcher; read once here.
         self._infra_fault_policy = infra_fault_policy
         self._infra_fault_stop_after = infra_fault_stop_after
@@ -1322,9 +1320,6 @@ class RegistryRunner:
         self._fusion_pool_open_failed = False
         # One StageDispatcher per stage in pooled mode (empty in per_lane mode — nothing pooled built).
         self._dispatchers: dict[Stage, StageDispatcher] = {}
-        # Set True when pooled mode started on SQL Server with RCSI OFF and
-        # require_rcsi_for_pooled=False downgraded the fail-closed gate to a warning (a /stats gauge).
-        self._rcsi_off_degraded = False
         # Pooled INGRESS/ROUTED buildup-alert rate limiter (D1): the per_lane buildup check lives in the
         # worker loops (dropped in pooled mode), so the pooled adapter re-adds it, throttled per
         # (stage, lane) to _BUILDUP_CHECK_INTERVAL so it never runs a COUNT+MIN per claimed item.
@@ -4198,7 +4193,6 @@ class RegistryRunner:
         # start() re-arms every lane from scratch, so no STOP outlives a full teardown.
         self._stop_held.clear()
         self._stop_hold_logged.clear()
-        self._rcsi_off_degraded = False
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
         self._fusion_pool_open_failed = False
@@ -4468,25 +4462,11 @@ class RegistryRunner:
         """Build + start the pooled StageDispatchers (ADR 0066 §5) — called once from ``start()`` under
         the pooled branch. (1) fail-closed RCSI verify; (2) one dispatcher per stage (RESPONSE only when
         a loopback inbound exists); (3) start each (seed-all-READY + one immediate sweep); (4) note that
-        ``per_lane_wake`` is subsumed. A RuntimeError from step 1 propagates — ``start()``'s except tears
-        down the partial start — UNLESS ``require_rcsi_for_pooled`` is false, which downgrades it to a
-        loud warning + a persistent degraded gauge + an AlertSink event."""
+        ``per_lane_wake`` is subsumed. A RuntimeError from step 1 always propagates — ``start()``'s
+        except tears down the partial start. There is no override: running with RCSI off is the mode
+        that deadlocks (ADR 0066 §12)."""
         # (1) RCSI fail-closed gate (SQL Server; a no-op on SQLite / Postgres).
-        try:
-            await self.store.require_rcsi_for_pooled()
-        except RuntimeError as exc:
-            if self._require_rcsi_for_pooled:
-                raise  # fail closed — start()'s except unwinds the partial start
-            log.warning(
-                "pooled claim mode starting DEGRADED: %s (require_rcsi_for_pooled=false); the ADR 0066 "
-                "§3.2 correctness proofs assume READ_COMMITTED_SNAPSHOT on",
-                safe_exc(exc),
-            )
-            self._rcsi_off_degraded = True
-            try:
-                self._alert_sink.rcsi_off_degraded("pipeline", detail=safe_exc(exc))
-            except Exception:
-                log.warning("alert sink raised on rcsi_off_degraded")
+        await self.store.require_rcsi_for_pooled()
         # (1.5) ADR 0071 B5: decide EFFECTIVE thread-hop fusion — BEFORE the _make_dispatcher loop so the
         # slot-budget clamp reaches the fused INGRESS/ROUTED dispatchers. Fail-closed: a pool-open failure
         # leaves it inactive and the engine runs the async path (never a lane outage).

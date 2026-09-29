@@ -19,11 +19,13 @@ No hashlib/hmac/secrets/ssl here (crypto-inventory gate)."""
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from pathlib import Path
 
 import pytest
 
+from messagefoundry.api.app import create_managed_app
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     ConnectorType,
@@ -32,6 +34,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
+from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 
@@ -148,6 +151,33 @@ async def test_explicit_per_lane_constructs_zero_pooled_objects(
     finally:
         await runner.stop()
     assert runner._dispatchers == {}  # and still empty after teardown
+
+
+async def test_pooled_start_fails_closed_on_the_rcsi_gate_with_no_override(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2090 (ADR 0066 section 12): the RCSI gate is unconditional. There is no
+    # require_rcsi_for_pooled knob left to downgrade a raise to a warning, so a raising gate always
+    # unwinds the pooled start and leaves no dispatcher behind. SQLite's gate is a no-op, so the
+    # SQL Server raise is stood in for here.
+    async def _rcsi_off() -> None:
+        raise RuntimeError("pooled claim mode requires READ_COMMITTED_SNAPSHOT (test stand-in)")
+
+    # The retirement itself: no layer takes the override any more. The start check below would
+    # also pass on the old code, whose default was True, so this is what fails there.
+    for layer in (RegistryRunner, Engine, create_managed_app):
+        assert "require_rcsi_for_pooled" not in inspect.signature(layer).parameters, layer
+    monkeypatch.setattr(store, "require_rcsi_for_pooled", _rcsi_off)
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    runner = RegistryRunner(_reg(inbox, tmp_path / "out"), store, poll_interval=0.02)
+    with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT"):
+        await runner.start()
+    # The partial start was unwound: the listener and destination built before the gate are gone.
+    assert runner._dispatchers == {}
+    assert runner._sources == {}
+    assert runner._destinations == {}
+    assert runner.running is False
 
 
 async def test_pooled_sqlite_end_to_end_smoke(store: MessageStore, tmp_path: Path) -> None:

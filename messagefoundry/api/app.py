@@ -7156,7 +7156,6 @@ def create_managed_app(
     pooled_sweep_interval: float = 0.25,
     pooled_claim_lane_chunk: int = 256,
     pooled_max_processing_lanes: int = 256,
-    require_rcsi_for_pooled: bool = True,
     infra_fault_policy: str = "stop",  # ADR 0070: "stop" (default) | "retry_forever"
     infra_fault_stop_after: int = 10,
     infra_fault_backoff_cap: float = 60.0,
@@ -7456,7 +7455,6 @@ def create_managed_app(
             pooled_sweep_interval=pooled_sweep_interval,
             pooled_claim_lane_chunk=pooled_claim_lane_chunk,
             pooled_max_processing_lanes=pooled_max_processing_lanes,
-            require_rcsi_for_pooled=require_rcsi_for_pooled,
             infra_fault_policy=infra_fault_policy,
             infra_fault_stop_after=infra_fault_stop_after,
             infra_fault_backoff_cap=infra_fault_backoff_cap,

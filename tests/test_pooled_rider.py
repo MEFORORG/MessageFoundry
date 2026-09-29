@@ -8,10 +8,10 @@ stage interleavings pooled mode introduces (many lanes multiplexed onto one clai
 clock-driven sweep/park-timer + ephemeral per-lane serializers). So every test here runs under the
 SHARED backend-parametrized ``store`` fixture (sqlite always; sqlserver / postgres gated on
 ``MEFOR_TEST_*``) — the CI SS + PG legs are where these actually bite. Each drives a real
-``RegistryRunner`` built with ``claim_mode="pooled"`` (``require_rcsi_for_pooled=False`` so the SS
-leg exercises functional correctness even where the CI DB lacks RCSI — the RCSI fail-closed gate is
-tested elsewhere), so the pooled StageDispatchers, the pooled finalizer, and the per-lane serializer
-carry the whole path — no ``StageDispatcher`` unit stubs.
+``RegistryRunner`` built with ``claim_mode="pooled"``, so the pooled StageDispatchers, the pooled
+finalizer, and the per-lane serializer carry the whole path — no ``StageDispatcher`` unit stubs. On
+SQL Server a pooled ``start()`` that returns has passed the RCSI gate, which fails closed with no
+override (BACKLOG #2090), so every server-DB proof here runs under snapshot reads by construction.
 
 Rows covered (ADR 0066 §8):
 
@@ -266,8 +266,7 @@ async def _ready(event: asyncio.Event) -> bool:
 def _make_runner(
     reg: Registry, store: Any, *, mode: str, sweep: float = 0.05, **extra: Any
 ) -> RegistryRunner:
-    """Construct a RegistryRunner in ``per_lane`` or ``pooled`` mode. Pooled passes
-    ``require_rcsi_for_pooled=False`` (functional correctness, not the RCSI gate). ``sweep`` is small
+    """Construct a RegistryRunner in ``per_lane`` or ``pooled`` mode. ``sweep`` is small
     (the pooled dispatchers still need the sweep to drive a STATIC backlog / retry backstop and to
     keep forward progress snappy). The SQL Server teardown safety does NOT rest on the sweep interval
     — it rests on QUIESCING before ``stop()`` (so no worker is cancelled mid-write-transaction: at a
@@ -279,7 +278,6 @@ def _make_runner(
             store,
             claim_mode="pooled",
             pooled_sweep_interval=sweep,
-            require_rcsi_for_pooled=False,
             **extra,
         )
     return RegistryRunner(reg, store, claim_mode="per_lane", **extra)
@@ -302,30 +300,6 @@ async def _stop_quiesced(runner: RegistryRunner, store: Any) -> None:
     await runner.stop()
     if getattr(store, "_test_backend", None) == "sqlserver":
         await asyncio.sleep(0.2)
-
-
-def _assert_rcsi_not_degraded(runner: RegistryRunner, store: Any) -> None:
-    """Guard the merge oracle on a SERVER DB: the pooled path must run under the concurrent
-    snapshot-read semantics it exists to prove — SQL Server's ``READ_COMMITTED_SNAPSHOT`` — NOT
-    silently degraded to ``READ_COMMITTED``.
-
-    The runner is built with ``require_rcsi_for_pooled=False`` so the SS leg does not fail-close on a
-    CI DB that lacks RCSI. But if the DB actually had RCSI OFF, the pooled dispatchers would run under
-    ``READ_COMMITTED``, whose blocking read serializes away the concurrent stage interleavings the
-    rider asserts (much like SQLite's write lock) — and the whole suite would still report GREEN
-    without ever exercising them. ``RegistryRunner._rcsi_off_degraded`` is set True exactly in that
-    downgrade (see :meth:`RegistryRunner._start_pooled_dispatchers`); assert it stayed False so a
-    future RCSI-off server box can never silently hollow out these proofs.
-
-    A no-op on SQLite (RCSI is not a concept; the fail-closed gate never runs). On Postgres it is
-    trivially satisfied (plain MVCC snapshots, the gate is a no-op) but kept as a cheap regression
-    guard."""
-    if getattr(store, "_test_backend", None) == "sqlite":
-        return
-    assert runner._rcsi_off_degraded is False, (
-        "pooled mode fell back to RCSI-off-degraded: the merge oracle would run under READ_COMMITTED "
-        "and serialize away the concurrent interleavings it exists to prove"
-    )
 
 
 # =================================================================================================
@@ -408,8 +382,6 @@ async def test_row8_fanout_finalize_both_modes(store: Any, tmp_path: Path, mode:
         assert set(runner._dispatchers) == {Stage.INGRESS, Stage.ROUTED, Stage.OUTBOUND}
     else:
         assert runner._dispatchers == {}
-    # Server DB: the oracle must run under RCSI, not silently degraded to READ_COMMITTED.
-    _assert_rcsi_not_degraded(runner, store)
     col_a = _Recorder()  # out_a = fast recorder (delivers immediately)
     gate = _GateConnector()  # out_b = gate (delivery parks INFLIGHT until released)
     runner._destinations["out_a"] = col_a  # swap in before any traffic
@@ -540,8 +512,6 @@ async def test_row2_pooled_crash_replay_no_loss_no_fifo_overtake(
             Stage.ROUTED,
             Stage.OUTBOUND,
         }  # pooled engaged
-        # Server DB: the crash-replay proof must run under RCSI, not degraded.
-        _assert_rcsi_not_degraded(runner1, store)
         gate = _GateConnector()
         runner1._destinations["out_a"] = gate  # blocks the head's delivery
         ic = runner1.registry.inbound["file_in"]
@@ -587,7 +557,6 @@ async def test_row2_pooled_crash_replay_no_loss_no_fifo_overtake(
     runner2 = _make_runner(_single_out_registry(inbox, out_dir), store, mode="pooled")
     await runner2.start()
     try:
-        _assert_rcsi_not_degraded(runner2, store)  # server DB: the replay proof must run under RCSI
 
         async def _all_processed() -> bool:
             msgs = await store.list_messages(status=MessageStatus.PROCESSED.value)
@@ -651,8 +620,6 @@ async def test_row3_pooled_retry_schedule_real_clock(store: Any, tmp_path: Path)
         Stage.ROUTED,
         Stage.OUTBOUND,
     }  # pooled engaged
-    # Server DB: the retry-schedule proof must run under RCSI, not degraded.
-    _assert_rcsi_not_degraded(runner, store)
     flaky = _FlakyConnector(fail_times=2)
     runner._destinations["out_a"] = flaky
     try:

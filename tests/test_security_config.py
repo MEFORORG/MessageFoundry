@@ -22,6 +22,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    PipelineSettings,
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
@@ -211,6 +212,30 @@ def test_serve_ui_explicit_is_refused_as_operator_input(
     assert "MEFOR_API_SERVE_UI_EXPLICIT" in message
     assert "[security].serve_web_console" in message
     assert "serve_ui_explicit" not in ApiSettings.model_fields
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+@pytest.mark.parametrize("surface", ["file", "env"])
+def test_require_rcsi_for_pooled_is_refused_at_load(
+    tmp_path: Path, surface: str, value: str
+) -> None:
+    """BACKLOG #2090 (ADR 0066 section 12): ``[pipeline].require_rcsi_for_pooled`` is retired.
+
+    ``false`` once let a pooled start run with RCSI off. The SQL Server store now refuses to open
+    that way and the pooled gate always fails closed, so a key that loaded cleanly would read as a
+    control that is not there. Both surfaces are refused at either value, and the message says why
+    and what to do instead. The env arm needs the named refusal: the generic unknown-key check reads
+    the file only, so without it the variable would be ignored."""
+    toml, environ = _as_input(surface, "pipeline", "require_rcsi_for_pooled", value)
+    with pytest.raises(
+        ValueError, match=r"\[pipeline\]\.require_rcsi_for_pooled was REMOVED"
+    ) as excinfo:
+        _load(tmp_path, toml, environ)
+    message = str(excinfo.value)
+    assert "MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED" in message
+    assert "READ_COMMITTED_SNAPSHOT" in message
+    assert "ADR 0066 section 12" in message
+    assert "require_rcsi_for_pooled" not in PipelineSettings.model_fields
 
 
 @pytest.mark.parametrize("value", ["true", "false"])
