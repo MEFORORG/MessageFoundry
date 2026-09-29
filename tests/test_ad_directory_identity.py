@@ -740,6 +740,7 @@ async def test_a_reissued_name_cannot_reach_an_id_less_row() -> None:
             auth_provider=AuthProvider.AD.value,
             display_name="J Smith",
             email="jsmith@example.org",
+            password_generated=False,
         )
         roles_before = set(await store.get_user_role_ids("legacy-row"))
         out = await service._complete_ad_login(_principal("jsmith", None), None, mfa_verified=True)
