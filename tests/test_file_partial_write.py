@@ -38,6 +38,7 @@ from messagefoundry.transports import remotefile
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.remotefile import _FtpClient, _SftpClient
 from tests.test_remotefile_transport import _FakeClient, _src
+from tests.test_remotefile_transport import _settle as _settle_remote
 
 _FILE_LOGGER = "messagefoundry.transports.file"
 _REMOTE_LOGGER = "messagefoundry.transports.remotefile"
@@ -425,6 +426,7 @@ async def test_a_remote_file_that_grows_after_the_read_is_neither_archived_nor_d
 
     handler = _Recorder(on_first=partner_finishes)
     src._handler = handler
+    await _settle_remote(src)
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
     assert handler.got == [_HEAD]
@@ -433,6 +435,9 @@ async def test_a_remote_file_that_grows_after_the_read_is_neither_archived_nor_d
     assert not any(p.startswith("/in/.processed/") for p in client.files)
     assert "changed after it was read" in sink.text
     _assert_no_name(sink, caplog, name)
+    # The admitted file left the settle map, so its new size settles again first (#2071).
+    await _settle_remote(src)
+    assert handler.got == [_HEAD]
     await src._poll_once()
     assert handler.got == [_HEAD, _WHOLE]
     assert path not in client.files
@@ -459,12 +464,14 @@ async def test_a_remote_file_that_changed_during_the_retrieve_is_not_emitted(
     src = _src(monkeypatch, client)
     handler = _Recorder()
     src._handler = handler
+    await _settle_remote(src)
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
     assert handler.got == []
     assert client.files[path] == _WHOLE  # left in place, not quarantined
     assert "changed while it was retrieved" in sink.text
     _assert_no_name(sink, caplog, name)
+    # No second settle poll: the refusal re-recorded the file at its size after the read (#2071).
     await src._poll_once()
     assert handler.got == [_WHOLE]
     assert client.files[f"/in/.processed/{name}"] == _WHOLE
@@ -477,6 +484,7 @@ async def test_a_stable_remote_file_is_processed_exactly_as_before(
     src = _src(monkeypatch, client)
     handler = _Recorder()
     src._handler = handler
+    await _settle_remote(src)
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
     assert handler.got == [_WHOLE]
