@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 import pytest
+from _ui_clients import create_local_user_with_password
 from fastapi import Request, WebSocket
 
 import messagefoundry_webconsole._auth as ui_auth
@@ -65,7 +66,8 @@ def _client(
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,

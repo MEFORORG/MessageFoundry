@@ -105,7 +105,6 @@ async def test_an_administrator_with_an_address_is_notifiable(engine: Engine) ->
             headers=h,
             json={
                 "username": "root2",
-                "password": PW,
                 "roles": ["administrator"],
                 "email": "ops@example.org",
             },
@@ -128,7 +127,6 @@ async def test_a_non_administrator_with_an_address_is_not_enough(engine: Engine)
             headers=h,
             json={
                 "username": "viewer1",
-                "password": PW,
                 "roles": ["viewer"],
                 "email": "viewer@example.org",
             },

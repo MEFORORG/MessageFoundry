@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _ui_clients import create_local_user_with_password
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -36,7 +37,8 @@ async def _op(engine: Engine, *, per_actor: int = 120) -> AuthService:
         engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=per_actor)
     )
     await service.initialize()
-    uid = await service.create_local_user(
+    uid = await create_local_user_with_password(
+        service,
         username="op",
         password=PW,
         display_name=None,

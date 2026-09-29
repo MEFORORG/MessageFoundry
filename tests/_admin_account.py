@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 from uuid import uuid4
 
 from messagefoundry.auth.identity import AuthProvider, Identity
@@ -31,7 +32,14 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
 
-__all__ = ["ADMIN_PASSWORD", "ADMIN_USERNAME", "AdminAccount", "create_admin", "login_admin"]
+__all__ = [
+    "ADMIN_PASSWORD",
+    "ADMIN_USERNAME",
+    "AdminAccount",
+    "create_admin",
+    "create_local_user_with_password",
+    "login_admin",
+]
 
 # Not "admin": a distinct name cannot collide with a test that makes an account named "admin" on
 # purpose, and keeps a failure message unambiguous about which account it means.
@@ -85,3 +93,24 @@ async def login_admin(service: AuthService) -> tuple[Identity, str, str]:
     # every local account, so without this they would pass even if the role never landed.
     assert Role.ADMINISTRATOR in out.identity.roles
     return out.identity, out.token, admin.password
+
+
+async def create_local_user_with_password(
+    service: AuthService, *, password: str, **kwargs: Any
+) -> str:
+    """Create a local account through ``create_local_user``, then give it ``password``.
+
+    ADR 0197 Amendment A made the engine generate every created account's credential, so
+    ``create_local_user`` takes no password. Tests written before it need an account whose password
+    they know, in the state they were written against: must-change, holder-chosen
+    (``password_generated`` unset, so lockable), unclaimed. This writes that state over the
+    generated one. The amendment's own tests call ``create_local_user`` directly. Returns the id.
+    """
+    created = await service.create_local_user(**kwargs)
+    await service.store.set_password(
+        created.user_id,
+        password_hash=await asyncio.to_thread(hash_password, password),
+        must_change_password=True,
+        password_generated=False,
+    )
+    return created.user_id

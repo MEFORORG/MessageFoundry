@@ -17,7 +17,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._admin_account import ADMIN_USERNAME, create_local_user_with_password, login_admin
 from tests._totp_clock import pin_totp_clock
 
 PW = "Sup3rSecret!!"
@@ -28,8 +28,14 @@ async def _store() -> MessageStore:
 
 
 async def _local_user(service: AuthService, username: str) -> None:
-    await service.create_local_user(
-        username=username, password=PW, display_name=None, email=None, roles=[], actor="test"
+    await create_local_user_with_password(
+        service,
+        username=username,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[],
+        actor="test",
     )
 
 

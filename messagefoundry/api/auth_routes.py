@@ -46,6 +46,7 @@ from messagefoundry.api.auth_models import (
     MfaConfirmRequest,
     MfaConfirmResponse,
     MfaEnrollResponse,
+    MfaResetResponse,
     MfaStatusResponse,
     MfaVerifyRequest,
     NotifyEmailRequest,
@@ -60,6 +61,7 @@ from messagefoundry.api.auth_models import (
     SessionInfo,
     SessionList,
     SimpleMessage,
+    UserCreatedResponse,
     UserCreateRequest,
     UserLockState,
     UserPermissions,
@@ -97,6 +99,7 @@ from messagefoundry.auth import (
 from messagefoundry.auth.ldap import LdapError
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
+    ENROL_AUTHENTICATOR_FIRST,
     STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
@@ -112,6 +115,7 @@ from messagefoundry.auth.service import (
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
+    FactorEnrolmentRequired,
     FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
@@ -469,6 +473,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD passwords are managed in AD, not by this engine"
             )
+        # ADR 0197 Amendment A, AC-A3: asked BEFORE the current password, so a holder who must enrol
+        # first is not asked for a password the service would then refuse. The service refuses on
+        # its own as well (below); this is the courtesy, that is the control.
+        if await service.must_enrol_before_rotating(identity):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, ENROL_AUTHENTICATOR_FIRST)
         # Counts toward the account lockout and against this session's re-proof budget; the failure
         # that exhausts the budget revokes the session (BACKLOG #1138).
         check = await service.verify_current_password(
@@ -494,9 +503,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "new password must differ from the current password"
             )
-        violations = await service.change_password(
-            identity, body.new_password, client=_client(request)
-        )
+        try:
+            violations = await service.change_password(
+                identity, body.new_password, client=_client(request)
+            )
+        except FactorEnrolmentRequired as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, ENROL_AUTHENTICATOR_FIRST) from exc
         if violations:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
@@ -908,25 +920,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             permissions=sorted(p.value for p in resolved.permissions),
         )
 
-    @app.post("/users", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
+    @app.post("/users", response_model=UserCreatedResponse, status_code=status.HTTP_201_CREATED)
     async def create_user(
         body: UserCreateRequest,
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
-    ) -> UserSummary:
+    ) -> UserCreatedResponse:
         await _validate_roles(service, body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, USERNAME_TAKEN)
-        violations = service.password_violations(body.password, username=body.username)
-        if violations:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
-            )
         try:
-            user_id = await service.create_local_user(
+            # ADR 0197 Amendment A, AC-A2: the engine generates the credential; nobody chooses it.
+            created = await service.create_local_user(
                 username=body.username,
-                password=body.password,
                 display_name=body.display_name,
                 email=body.email,
                 roles=body.roles,
@@ -944,16 +951,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             _alert_administrator_granted(
                 app, f"user:{body.username}", via="account_created", granted_by=identity.username
             )
-        user = await service.store.get_user(user_id)
+        user = await service.store.get_user(created.user_id)
         assert user is not None
         # BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
         # expires, so the one response the issuing administrator reads states when. Read back off the
         # stored stamp create_local_user just wrote, never a fresh clock.
-        return _user_summary(
+        summary = _user_summary(
             user,
             sorted(body.roles),
             credential_expires_at=pending_credential_deadline(service, user),
             lock_state_at=time.time(),
+        )
+        return UserCreatedResponse(
+            **summary.model_dump(), temp_password=created.credential.password
         )
 
     @app.post("/users/directory", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
@@ -1150,7 +1160,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(code, detail) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
-    @app.post("/users/{user_id}/reset-mfa", response_model=SimpleMessage)
+    @app.post("/users/{user_id}/reset-mfa", response_model=MfaResetResponse)
     async def reset_user_mfa(
         user_id: ResourceId,
         service: AuthService = Depends(_service),
@@ -1159,7 +1169,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_MFA, Permission.USERS_MANAGE)
         ),
-    ) -> SimpleMessage:
+    ) -> MfaResetResponse:
         """Admin MFA reset (lost authenticator + no recovery codes): clear the user's TOTP enrollment
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
         # SELF-EXCLUSION, AND IT BELONGS HERE RATHER THAN IN THE SERVICE (BACKLOG #1022).
@@ -1189,7 +1199,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 "use the self-service MFA settings for your own account",
             )
         try:
-            await service.admin_reset_mfa(user_id, actor=identity.username)
+            issued = await service.admin_reset_mfa(user_id, actor=identity.username)
         except ValueError as exc:
             detail = str(exc)
             code = (
@@ -1198,7 +1208,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 else status.HTTP_400_BAD_REQUEST
             )
             raise HTTPException(code, detail) from exc
-        return SimpleMessage(detail="MFA reset")
+        # ADR 0197 Amendment A, AC-A4: a local account's reset also issued a generated credential,
+        # returned ONCE here for the administrator to convey out-of-band.
+        return MfaResetResponse(
+            detail="MFA reset",
+            temp_password=None if issued is None else issued.password,
+            expires_at=None if issued is None else issued.expires_at,
+        )
 
     # --- federated identity binding (BACKLOG #1143 / #295, ADR 0184) ---------------------------------
     #

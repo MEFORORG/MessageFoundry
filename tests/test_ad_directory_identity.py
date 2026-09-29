@@ -39,6 +39,7 @@ from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_with_password
 
 # One account object, two spellings of the SAME identity: the 16 bytes as they arrive on the wire,
 # and the braced upper-case string ldap3's own formatter produces. Microsoft's GUID layout is
@@ -731,7 +732,8 @@ async def test_a_like_named_local_account_is_still_refused_before_the_identity_c
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        await service.create_local_user(
+        await create_local_user_with_password(
+            service,
             username="jsmith",
             password="Sup3rSecret!!",
             display_name=None,

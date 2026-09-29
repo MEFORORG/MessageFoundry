@@ -37,6 +37,7 @@ from messagefoundry.store.base import (
     ResendSourceNotFound,
 )
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_with_password
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 # A transformed outbound body, distinct from the raw, so a test can prove resend ships the TRANSFORMED
@@ -399,7 +400,8 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_with_password(
+            service,
             username="op",
             password=PW,
             display_name=None,
@@ -451,7 +453,8 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_with_password(
+            service,
             username="v",
             password=PW,
             display_name=None,
@@ -505,7 +508,8 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_with_password(
+            service,
             username="op",
             password=PW,
             display_name=None,

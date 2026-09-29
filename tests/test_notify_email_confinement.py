@@ -39,6 +39,7 @@ from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyE
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
+from tests._admin_account import create_local_user_with_password
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -60,7 +61,8 @@ def _no_mfa(**overrides: Any) -> AuthSettings:
 
 async def _add_local(service: AuthService, username: str, *, email: str | None = None) -> str:
     """An onboarded local Administrator: the create path, with the forced rotation cleared."""
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -504,7 +506,7 @@ async def test_the_api_create_seeds_the_address_and_tells_it(engine: Engine) -> 
         r = await c.post(
             "/users",
             headers=_auth(tok),
-            json={"username": "newbie", "password": PW, "email": "newbie@example.org"},
+            json={"username": "newbie", "email": "newbie@example.org"},
         )
         assert r.status_code == 201, r.text
     user = await engine.store.get_user_by_username("newbie")
@@ -521,13 +523,13 @@ async def test_the_api_create_refuses_a_missing_blank_or_malformed_address(engin
     before = len(await engine.store.list_audit(action="user.created", limit=100_000))
     async with _client(engine, service) as c:
         tok = (await _login(c, "root"))["token"]
-        missing = await c.post("/users", headers=_auth(tok), json={"username": "a", "password": PW})
+        missing = await c.post("/users", headers=_auth(tok), json={"username": "a"})
         assert missing.status_code == 422, missing.text
         for i, bad in enumerate((" ", "x", "a@b.org, c@d.org", "Name <a@b.org>")):
             r = await c.post(
                 "/users",
                 headers=_auth(tok),
-                json={"username": f"bad{i}", "password": PW, "email": bad},
+                json={"username": f"bad{i}", "email": bad},
             )
             assert r.status_code == 400, (bad, r.text)
             if "@" in bad:  # the refusal never echoes the value
@@ -547,7 +549,8 @@ async def test_the_service_refuses_a_malformed_address_before_any_write() -> Non
         await service.initialize()
         for bad in ("", "  ", "a@b.org; c@d.org"):
             with pytest.raises(InvalidNotifyEmail):
-                await service.create_local_user(
+                await create_local_user_with_password(
+                    service,
                     username="bad",
                     password=PW,
                     display_name=None,

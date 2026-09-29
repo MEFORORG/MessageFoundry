@@ -37,6 +37,7 @@ from messagefoundry.auth.service import AuthService, IssuedCredential
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_with_password
 
 _HOUR = 3600.0
 
@@ -65,7 +66,8 @@ async def _service(hours: int = 72) -> tuple[MessageStore, AuthService]:
 
 async def _issue(service: AuthService, username: str = "alice") -> tuple[str, IssuedCredential]:
     """Create a user, then admin-reset it: an unclaimed must-change credential off a stored stamp."""
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password="a-long-enough-original-passphrase",
         display_name=None,
@@ -262,7 +264,8 @@ async def _notified_service() -> tuple[MessageStore, AuthService, _RecordingNoti
 async def _account(
     service: AuthService, username: str, *, email: str | None, actor: str, admin: bool = False
 ) -> str:
-    return await service.create_local_user(
+    return await create_local_user_with_password(
+        service,
         username=username,
         password="a-long-enough-original-passphrase",
         display_name=None,

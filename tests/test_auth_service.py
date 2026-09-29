@@ -33,7 +33,7 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.auth.service import AuthService, IssuedCredential, UsernameTaken
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import ADMIN_USERNAME, create_admin
+from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_with_password
 
 GOOD_PASSWORD = "Sup3rSecret!!"
 NEW_PASSWORD = "An0ther-Str0ng-Pass!!"
@@ -107,7 +107,9 @@ async def test_the_claim_stamp_is_write_once_across_a_second_rotation() -> None:
     # it would satisfy every not-None assertion in this file while destroying that fact.
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        # require_mfa off: under the shipped default a rotation waits for TOTP (ADR 0197 Amendment A),
+        # and this test is about the rotation's own effects.
+        service = AuthService(store, AuthSettings(require_mfa=False))
         admin = await create_admin(service)  # unclaimed until the holder rotates it below
         await _claim(service, admin.username, admin.password)
 
@@ -160,7 +162,9 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
     db = tmp_path / "mefor.db"
     store = await MessageStore.open(str(db))
     try:
-        service = AuthService(store, AuthSettings())
+        # require_mfa off: under the shipped default a rotation waits for TOTP (ADR 0197 Amendment A),
+        # and this test is about the rotation's own effects.
+        service = AuthService(store, AuthSettings(require_mfa=False))
         admin = await create_admin(service)  # unclaimed until the holder rotates it below
         await _claim(service, admin.username, admin.password)
         claimed = await store.get_user_by_username(ADMIN_USERNAME)
@@ -227,7 +231,8 @@ async def _make_reset_temp(store, service, *, username: str = "alice") -> Issued
     can assert what the ISSUING SURFACE said as well as what the gate does.
     """
     await store.upsert_role(role_id="viewer", display_name="Viewer")
-    await service.create_local_user(
+    await create_local_user_with_password(
+        service,
         username=username,
         password="a-long-enough-original-passphrase",
         display_name=None,
@@ -487,7 +492,9 @@ async def test_notifier_fires_on_password_change() -> None:
     store = await _store()
     try:
         notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        # require_mfa off: under the shipped default a rotation waits for TOTP (ADR 0197 Amendment A),
+        # and this test is about the rotation's own effects.
+        service = AuthService(store, AuthSettings(require_mfa=False), security_notifier=notifier)
         await _local_user(store)
         out = await service.login("bob", GOOD_PASSWORD)
         assert out.identity is not None
@@ -594,7 +601,11 @@ async def test_notifier_failure_is_isolated_from_the_auth_op() -> None:
     # service-side try/except, distinct from the notifier's own background-loop error handling.
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(), security_notifier=_BoomNotifier())  # type: ignore[arg-type]
+        # require_mfa off: under the shipped default a rotation waits for TOTP (ADR 0197 Amendment A),
+        # and this test is about the rotation's own effects.
+        service = AuthService(
+            store, AuthSettings(require_mfa=False), security_notifier=_BoomNotifier()
+        )  # type: ignore[arg-type]
         await _local_user(store)
         out = await service.login("bob", GOOD_PASSWORD)
         assert out.ok and out.identity is not None
@@ -1347,7 +1358,8 @@ async def test_the_reset_notice_to_a_disabled_account_carries_no_deadline() -> N
         )
         await service.initialize()
         await store.upsert_role(role_id="viewer", display_name="Viewer")
-        user_id = await service.create_local_user(
+        user_id = await create_local_user_with_password(
+            service,
             username="alice",
             password="a-long-enough-original-passphrase",
             display_name=None,
@@ -1393,7 +1405,8 @@ async def test_a_lost_username_race_raises_username_taken(
         await service.initialize()
         _race_for_the_name(store, monkeypatch)
         with pytest.raises(UsernameTaken, match="username already exists") as raised:
-            await service.create_local_user(
+            await create_local_user_with_password(
+                service,
                 username="carol",
                 password="a-long-enough-original-passphrase",
                 display_name=None,
@@ -1423,7 +1436,8 @@ async def test_an_integrity_refusal_with_no_holder_is_not_called_a_username_conf
 
         monkeypatch.setattr(store, "create_user", refused)
         with pytest.raises(sqlite3.IntegrityError, match="some other constraint"):
-            await service.create_local_user(
+            await create_local_user_with_password(
+                service,
                 username="dave",
                 password="a-long-enough-original-passphrase",
                 display_name=None,

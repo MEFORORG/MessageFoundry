@@ -28,6 +28,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_with_password
 
 PW = "a-strong-test-passphrase"  # ≥15, satisfies the ASVS policy
 
@@ -71,8 +72,14 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 async def _add_user(
     service: AuthService, username: str, roles: list[str], *, scope: list[str] | None = None
 ) -> str:
-    user_id = await service.create_local_user(
-        username=username, password=PW, display_name=None, email=None, roles=roles, actor="test"
+    user_id = await create_local_user_with_password(
+        service,
+        username=username,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=roles,
+        actor="test",
     )
     # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
     # fixture still stands for an operator who has been provisioned; the channel axis itself

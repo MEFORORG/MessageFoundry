@@ -29,6 +29,7 @@ All data here is synthetic.
 from __future__ import annotations
 
 import httpx
+from _ui_clients import create_local_user_with_password
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -61,7 +62,8 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,

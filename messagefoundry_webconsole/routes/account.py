@@ -32,6 +32,7 @@ from messagefoundry.auth.tokens import hash_token
 
 from .. import pages
 from .._auth import (
+    ENROL_FIRST_PAGE,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
     allow_reauth_attempt,
@@ -192,6 +193,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         The JSON handler this page delegates to is reached in-process, past its ``Depends`` gate, so
         the check has to live on this plane too. ``require_ui`` runs it as its ``pending_refusal``,
         so the refusal is audited there and comes before the admin-write charge (BACKLOG #1973)."""
+        # ADR 0197 Amendment A, AC-A3: an account the requirement covers that holds no factor with a
+        # way past the sign-in lock enrols one BEFORE it may rotate. The service refuses the
+        # rotation itself; this sends the holder to enrolment instead of to that error.
+        if await service.must_enrol_before_rotating(_identity):
+            return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": ENROL_FIRST_PAGE})
         if not await service.password_change_owes_factor(session_token(request)):
             return None
         return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/mfa"})

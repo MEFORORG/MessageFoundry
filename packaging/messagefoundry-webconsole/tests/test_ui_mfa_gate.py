@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from _ui_clients import SAME_ORIGIN
+from _ui_clients import SAME_ORIGIN, create_local_user_with_password
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
@@ -97,7 +97,8 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -221,7 +222,10 @@ async def test_the_account_page_and_password_page_stay_reachable_while_pending(
     async with _client(engine, service) as c:
         await _login(c)
         assert (await c.get("/ui/account")).status_code == 200
-        assert (await c.get("/ui/account/password")).status_code == 200
+        # Reachable, and under require_mfa with no TOTP it sends the holder to enrol first (ADR 0197
+        # Amendment A, AC-A3) rather than to the factor page or back to itself.
+        r = await c.get("/ui/account/password")
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
 
 
 async def test_the_watchdog_heartbeat_survives_confinement(engine: Engine) -> None:
@@ -338,18 +342,19 @@ def test_a_passkey_only_account_gets_a_completing_assertion_not_a_dead_end() -> 
 async def test_must_change_outranks_the_second_factor_on_the_gate_page(
     engine: Engine,
 ) -> None:
-    """RED when: GET /ui/mfa checks mfa before must_change.
+    """RED when: GET /ui/mfa parks a must-change account with no factor on a page it cannot answer.
 
-    A first Administrator on a temporary password is BOTH. Leading with MFA parks it on a page it
-    cannot answer until it has rotated — the cookie-plane twin of the JSON ordering rule.
+    A first Administrator on a temporary password is BOTH must-change and pending, with nothing to
+    prove. Under require_mfa it goes to enrol first (ADR 0197 Amendment A), from the sign-in and from
+    the gate page alike -- never to the code prompt. The cookie-plane twin of the JSON order.
     """
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
     admin = await _must_change_admin(service)
     async with _client(engine, service) as c:
         r = await c.post("/ui/login", data={"username": admin, "password": _ADMIN_PW})
-        assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
         r = await c.get("/ui/mfa")
-        assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
 
 
 # --- ASVS 7.2.4: the cookie plane of session rotation on re-authentication ---
@@ -528,6 +533,8 @@ async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_sess
 
 PW2 = "another-strong-test-passphrase"  # the rotated password; satisfies the same policy
 _PASSWORD = "/ui/account/password"
+#: Where a covered account with no TOTP is sent first (ADR 0197 Amendment A).
+_ENROL_FIRST = "/ui/account?m=enroll_first"
 
 
 async def _change_password(c: httpx.AsyncClient, *, current: str = PW) -> httpx.Response:
@@ -645,17 +652,21 @@ async def test_ui_reauth_webauthn_lets_a_reset_passkey_account_prove_it_and_rota
 
     service = await _service(engine)
     user_id = await _add(service, "op", Role.OPERATOR)
-    identity = await service.identity_for_user_id(user_id)
+    # The passkey is registered with the requirement OFF: under it, a passkey cannot be a covered
+    # account's first factor in wave 1 (ADR 0197 Amendment A). This builds the passkey-only state
+    # an account can still reach from before the requirement covered it.
+    setup_service = await _service(engine, require_mfa=False)
+    identity = await setup_service.identity_for_user_id(user_id)
     assert identity is not None
-    setup = await service.login("op", PW)
+    setup = await setup_service.login("op", PW)
     assert setup.ok and setup.token is not None
     options = json.loads(
-        await service.begin_webauthn_registration(
+        await setup_service.begin_webauthn_registration(
             identity, token=setup.token, rp_id="t", rp_name="t"
         )
     )
     key = SoftAuthenticator(rp_id="t", origin="http://t")
-    registered = await service.finish_webauthn_registration(
+    registered = await setup_service.finish_webauthn_registration(
         identity,
         key.create_response(base64url_to_bytes(options["challenge"])),
         label="key",
@@ -680,23 +691,76 @@ async def test_ui_reauth_webauthn_lets_a_reset_passkey_account_prove_it_and_rota
         # Proven, so the route confines it again: the other half of the old blanket refusal.
         r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
         assert r.status_code == 403 and r.json()["error"] == "password change required"
-        assert (await c.get(_PASSWORD)).status_code == 200
+        # A passkey is not a way past the sign-in lock in wave 1 (ADR 0197 Amendment A), so the
+        # rotation still waits for TOTP: the password page sends it to enrol, and a POST changes
+        # nothing. The account is not stranded; the enrolment is open to it.
+        r = await c.get(_PASSWORD)
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
         r = await _change_password(c, current=temp)
-        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=pwchanged"
-    assert (await service.login("op", PW2)).ok
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
+        assert (await c.get("/ui/account")).status_code == 200
+    assert not (await service.login("op", PW2)).ok
 
 
-async def test_a_must_change_account_with_no_factor_still_rotates_first(engine: Engine) -> None:
-    """RED when: the refusal or the new sign-in order reaches an account with no factor.
+async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0197 Amendment A, AC-A3, console plane. REWRITTEN: this was
+    ``test_a_must_change_account_with_no_factor_still_rotates_first``, which pinned rotate-first.
 
-    A first Administrator on a temporary password and an administrator-created user are must-change
-    with nothing to prove. Sending either to the factor page would bounce it to enroll, which the
-    must-change confinement refuses: the brick. Both must still land on the password page and rotate
-    there.
-    """
+    Under the default require_mfa, a must-change account with no TOTP is sent to enrol from the
+    sign-in, the gate page and the password page, and ``POST /ui/account/password`` -- which calls
+    the JSON handler in-process, past its ``Depends`` gate -- changes nothing. Once TOTP is on, the
+    holder proves it and rotates. RED against the old order: the first POST rotated."""
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    await service.initialize()
+    await create_local_user_with_password(
+        service,
+        username="newbie",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "newbie", "password": PW})
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
+        for path in ("/ui/mfa", _PASSWORD):
+            r = await c.get(path)
+            assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST, path
+        r = await _change_password(c, current=PW)
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
+        assert (await c.get("/ui/account")).status_code == 200  # the enrolment page is open
+    assert not (await service.login("newbie", PW2)).ok  # the rotation never landed
+
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service, "newbie")
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "newbie", "password": PW})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        t1 = t0 + totp.DEFAULT_PERIOD
+        _pin_totp_clock(monkeypatch, t1)
+        r = await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)}, headers=SAME_ORIGIN)
+        assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        r = await _change_password(c, current=PW)
+        assert r.headers.get("location") == "/ui/login?e=pwchanged"
+    assert (await service.login("newbie", PW2)).ok
+
+
+async def test_with_the_requirement_off_a_must_change_account_still_rotates_first(
+    engine: Engine,
+) -> None:
+    """The positive control for the rewrite above: with require_mfa off nothing covers the account,
+    so the order stays as it was. A first Administrator on a temporary password and an
+    administrator-created user both land on the password page and rotate there."""
+    service = AuthService(
+        engine.store, AuthSettings(login_rate_limit_enabled=False, require_mfa=False)
+    )
     admin = await _must_change_admin(service)
-    await service.create_local_user(
+    await create_local_user_with_password(
+        service,
         username="newbie",
         password=PW,
         display_name=None,
@@ -708,11 +772,6 @@ async def test_a_must_change_account_with_no_factor_still_rotates_first(engine: 
         async with _client(engine, service) as c:
             r = await c.post("/ui/login", data={"username": username, "password": password})
             assert r.status_code == 303 and r.headers["location"] == _PASSWORD, username
-            r = await c.get("/ui/mfa")
-            assert r.status_code == 303 and r.headers["location"] == _PASSWORD, username
-            # Nothing to prove, so the passkey leg stays shut to it too.
-            r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
-            assert r.status_code == 403 and r.json()["error"] == "password change required"
             r = await _change_password(c, current=password)
             assert r.headers.get("location") == "/ui/login?e=pwchanged", username
 
@@ -736,9 +795,14 @@ async def test_a_row_that_vanishes_mid_request_does_not_lift_the_confinement(
     nothing to deny. ``user`` hides only the user row: ``delete_user`` would take the sessions with
     it, and this case would then test a missing session twice.
     """
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    # require_mfa off (ADR 0197 Amendment A): with it on, a no-factor account now enrols first, and
+    # the rotate-first confinement this guards exists only on the uncovered path.
+    service = AuthService(
+        engine.store, AuthSettings(login_rate_limit_enabled=False, require_mfa=False)
+    )
     await service.initialize()
-    await service.create_local_user(
+    await create_local_user_with_password(
+        service,
         username="newbie",
         password=PW,
         display_name=None,
@@ -937,7 +1001,13 @@ async def test_a_satisfied_session_is_still_charged_on_the_same_posts(
     assert await _denials_for(engine, path) == 0
 
 
-@pytest.mark.parametrize(("path", "refused_to"), _PENDING_REFUSED_POSTS)
+#: The password page is not among them any more: under require_mfa an account with no TOTP is sent
+#: to enrol before it may rotate (ADR 0197 Amendment A), which
+#: ``test_a_must_change_account_with_no_factor_enrols_before_it_rotates`` pins.
+_NO_FACTOR_PASSING_POSTS = tuple(p for p in _PENDING_REFUSED_POSTS if p.id != "password")
+
+
+@pytest.mark.parametrize(("path", "refused_to"), _NO_FACTOR_PASSING_POSTS)
 async def test_a_pending_session_with_no_factor_is_charged_and_not_refused(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str, refused_to: str
 ) -> None:

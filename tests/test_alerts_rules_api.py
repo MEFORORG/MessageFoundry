@@ -32,6 +32,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
 )
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_with_password
 
 # Sentinels planted in the two secret fields. If either ever appears in the response the endpoint
 # has leaked a credential — the one thing #22b forbids.
@@ -182,7 +183,8 @@ async def _auth_service(engine: Engine) -> AuthService:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,

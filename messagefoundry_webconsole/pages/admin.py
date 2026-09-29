@@ -325,15 +325,20 @@ def user_new_page(
 ) -> Markup:
     """The create-user form (an ``unlock`` page: it always opens inside a fresh step-up window).
 
-    On a rejected submit the form is re-rendered with the non-secret fields preserved — the password
-    field is always empty (a password is never echoed back into markup).
+    On a rejected submit the form is re-rendered with the fields preserved. There is NO password
+    field (ADR 0197 Amendment A, N-B2 part 1): the engine generates the new account's credential and
+    the next page shows it once, so nothing an administrator types, and nothing a caller could guess,
+    is the credential.
 
     BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
     expires. This form renders before the account exists, so it can state only the WINDOW, from
-    ``[auth].initial_password_expiry_hours``. The instant itself is on the user's page the submit
-    lands on. ``None`` means the setting is 0 and the credential never expires.
+    ``[auth].initial_password_expiry_hours``. The instant itself is on the page the submit lands on.
+    ``None`` means the setting is 0 and the credential never expires.
     """
-    hint = "Convey the initial password out-of-band; the user must change it at first sign-in."
+    hint = (
+        "The engine generates the initial password and shows it once on the next page. Convey it "
+        "out-of-band. At first sign-in the user sets up an authenticator app, then chooses a password."
+    )
     if credential_window_hours is not None:
         hint += (
             f" It stops working {_hours_text(credential_window_hours)} after you create the "
@@ -342,11 +347,6 @@ def user_new_page(
     form = el(
         "form",
         el("label", "Username", el("input", name="username", value=username, autofocus=True)),
-        el(
-            "label",
-            "Initial password",
-            el("input", name="password", type="password", autocomplete="new-password"),
-        ),
         el("p", hint, class_="muted"),
         el("label", "Display name", el("input", name="display_name", value=display_name)),
         # BACKLOG #2018 (ASVS 6.3.7): required. It becomes the account's notification address, so
@@ -819,7 +819,11 @@ def _pending_credential(user: UserSummary) -> list[object]:
 
 
 def temp_password_page(
-    username: str, temp_password: str, expires_at: float | None = None
+    username: str,
+    temp_password: str,
+    expires_at: float | None = None,
+    *,
+    heading: str = "Temporary password issued",
 ) -> Markup:
     """The one-time result of an admin password reset — shown once, never stored or logged.
 
@@ -845,11 +849,11 @@ def temp_password_page(
         ]
     body = el(
         "div",
-        el("h1", "Temporary password issued"),
+        el("h1", heading),
         el(
             "p",
-            f"Convey this to {username} out-of-band. It is shown once and must be changed at "
-            "first sign-in.",
+            f"Convey this to {username} out-of-band. It is shown once. At first sign-in they set "
+            "up an authenticator app, then choose a new password.",
             class_="muted",
         ),
         el("p", el("code", temp_password)),

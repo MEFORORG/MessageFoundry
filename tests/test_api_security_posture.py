@@ -24,6 +24,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_with_password
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy
 
@@ -42,7 +43,8 @@ async def _service(engine: Engine) -> AuthService:
 
 
 async def _add_viewer(service: AuthService, username: str) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,

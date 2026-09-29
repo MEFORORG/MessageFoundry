@@ -44,6 +44,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.netaddr import client_network_allowed, peer_ip_allowed
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_with_password
 
 
 def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
@@ -87,7 +88,8 @@ async def _service(engine: Engine) -> AuthService:
 
 
 async def _add_viewer(service: AuthService, username: str) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,

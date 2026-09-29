@@ -32,6 +32,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_with_password
 from tests._ast_sites import call_sites
 
 PW = "a-strong-test-passphrase"
@@ -250,7 +251,8 @@ async def test_the_local_password_leg_still_counts_login_as_the_first_verificati
     test: the same route and the same settings admit a local session, so its refusal there is the
     directory seeding and not the fixture."""
     service = await _service(engine)
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username="loc",
         password=PW,
         display_name=None,

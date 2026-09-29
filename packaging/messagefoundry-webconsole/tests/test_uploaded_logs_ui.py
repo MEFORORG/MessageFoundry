@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 import httpx
 import pytest
+from _ui_clients import create_local_user_with_password
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, hash_token
@@ -46,8 +47,14 @@ async def _add_user(
     BACKLOG #1152 that was what saying nothing already did; an unset scope now denies, and leaving
     these fixtures unscoped would answer 403 on the resend target inbound for a reason this file --
     which is about the uploads OWNER axis (ASVS 8.2.2) -- never asserts."""
-    uid = await service.create_local_user(
-        username=name, password=PW, display_name=None, email=None, roles=[role.value], actor="t"
+    uid = await create_local_user_with_password(
+        service,
+        username=name,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[role.value],
+        actor="t",
     )
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None

@@ -750,6 +750,32 @@ class ChannelScopeSourceConflict(RuntimeError):
     between this write's read and its compare-and-set."""
 
 
+#: The ONE detail every refusal of ADR 0197 Amendment A's first-sign-in order carries (N-B2 part 4):
+#: a password change, a passkey registration and a TOTP removal refused because the account would
+#: hold no factor with a way past the sign-in lock. Fixed, so it tells a caller nothing it did not
+#: already know from holding the session.
+ENROL_AUTHENTICATOR_FIRST = "enrol an authenticator app first"
+
+
+#: The detail ``disable_mfa`` refuses with while ``[security].require_mfa`` covers the account (ADR
+#: 0197 Amendment A, AC-A3a). In wave 1 TOTP is the only way past the sign-in lock, so a covered
+#: account keeps it; an administrator's factor reset remains the recovery.
+TOTP_REMOVAL_REFUSED = (
+    "your authenticator app is the last second factor that gets you past a sign-in lock, and MFA "
+    "is required for your account, so it cannot be removed -- an administrator can reset it"
+)
+
+
+class FactorEnrolmentRequired(ValueError):
+    """The account ``[security].require_mfa`` covers holds no factor with a way past the sign-in lock,
+    so this step must wait until it enrols one (ADR 0197 Amendment A, N-B2 part 4). In wave 1 only
+    TOTP is such a factor. A ``ValueError`` so every route that already renders a flow refusal renders
+    this one too; the password routes map it to 403 with :data:`ENROL_AUTHENTICATOR_FIRST`."""
+
+    def __init__(self) -> None:
+        super().__init__(ENROL_AUTHENTICATOR_FIRST)
+
+
 class UsernameTaken(RuntimeError):
     """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
     (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
@@ -1065,6 +1091,35 @@ class IssuedCredential:
 
     password: str
     expires_at: float | None = None
+
+
+@dataclass(frozen=True)
+class CreatedLocalAccount:
+    """What :meth:`AuthService.create_local_user` returns: the new row's id and its engine-generated
+    birth credential, handed to the creating administrator **once** (ADR 0197 Amendment A, N-B2
+    part 1). The administrator never chooses the password, so nothing a caller guesses can be the
+    credential, and wrong passwords arm no lock while it stands."""
+
+    user_id: str
+    credential: IssuedCredential
+
+
+@dataclass(frozen=True)
+class LockableAccountCensus:
+    """What :meth:`AuthService.lockable_account_census` found (ADR 0197 Amendment A, N-B2 part 6).
+
+    ``no_way_past`` names every local account ``[security].require_mfa`` covers that holds a chosen
+    credential (``password_generated`` unset) and no factor with a way past the sign-in lock -- TOTP,
+    in wave 1. ``undecryptable_totp`` names every account whose ENABLED TOTP secret the engine cannot
+    decrypt, which turns the owner's combined sign-in into "right password, wrong code". Both are
+    usernames only, sorted; neither carries a secret."""
+
+    no_way_past: tuple[str, ...] = ()
+    undecryptable_totp: tuple[str, ...] = ()
+
+    @property
+    def clean(self) -> bool:
+        return not self.no_way_past and not self.undecryptable_totp
 
 
 @dataclass(frozen=True)
@@ -6051,16 +6106,33 @@ class AuthService:
 
         Returns policy violations (empty list = changed). No-op-safe for AD identities at the API
         layer, which rejects password changes for AD users before calling this.
+
+        **Raises :class:`FactorEnrolmentRequired` while ``[security].require_mfa`` covers the account
+        and it holds no factor with a way past the sign-in lock** (ADR 0197 Amendment A, N-B2 part 4).
+        The rotation ends every session, the holder's own included, so without this a holder who does
+        everything right passes through "a password they chose, no factor, no session", and anyone
+        who knows the username can lock them out at that moment. The refusal is HERE and not only in
+        the route gate, because the web console's password form calls the JSON handler in-process,
+        past its ``Depends`` gate. And the write carries the condition itself (``require_totp``), so
+        an ``admin_reset_mfa`` that clears TOTP between this read and the write makes the write match
+        no row, and the change is refused rather than landing on an account with no way past.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
-        await self._store.set_password(
+        user = await self._store.get_user(identity.user_id)
+        covered = user is not None and self._covered_by_requirement(user, identity.roles)
+        if covered and user is not None and not self._has_way_past(user):
+            raise FactorEnrolmentRequired()
+        written = await self._store.set_password(
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
             password_generated=False,
+            require_totp=covered,
         )
+        if not written:
+            raise FactorEnrolmentRequired()
         await self._store.revoke_user_sessions(identity.user_id)
         await self._audit("auth.password_changed", actor=identity.username, client=client)
         user = await self._store.get_user(identity.user_id)
@@ -6073,6 +6145,38 @@ class AuthService:
         return []
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
+
+    def _covered_by_requirement(self, user: UserRecord, roles: frozenset[Role]) -> bool:
+        """Whether ``user`` is a LOCAL account that ``[security].require_mfa`` covers, enrolled or not
+        (ADR 0197 Amendment A). The gates of N-B2 part 4 key on this and on
+        :meth:`_has_way_past`, never on ``must_change_password``: a site that ran with the requirement
+        off and then turned it on holds accounts with a chosen password, no factor and no must-change
+        flag, and the gates must reach those too."""
+        return user.auth_provider == AuthProvider.LOCAL.value and self._mfa_required_for(
+            user, roles, second_factor_enrolled=False
+        )
+
+    @staticmethod
+    def _has_way_past(user: UserRecord) -> bool:
+        """Whether ``user`` holds a factor with a way past the SIGN-IN lock (ADR 0197 Amendment A).
+
+        WAVE 1: TOTP ONLY, because only TOTP has a combined sign-in (option E). A passkey counts as a
+        second factor everywhere else, but the engine cannot use it to get past the lock, and a
+        passkey registered without a discoverable-credential request may never get a way past at all
+        (the amendment's fact 11). Wave 2 adds a passkey recorded as discoverable."""
+        return user.totp_enabled
+
+    async def must_enrol_before_rotating(self, identity: Identity) -> bool:
+        """Whether a password change by ``identity`` would be refused with
+        :class:`FactorEnrolmentRequired` right now. The route and the console ask it FIRST, so they
+        send the holder to enrolment before asking for a password the service would then refuse.
+        The service still refuses on its own; this is a courtesy, not the control."""
+        user = await self._store.get_user(identity.user_id)
+        return (
+            user is not None
+            and self._covered_by_requirement(user, identity.roles)
+            and not self._has_way_past(user)
+        )
 
     async def _second_factor_enrolled(self, user: UserRecord) -> bool:
         """Any second factor enrolled — TOTP **or** ≥1 WebAuthn passkey (ADR 0068 decision 5). The
@@ -6508,6 +6612,14 @@ class AuthService:
         every passkey and is deliberately unguarded. Nothing here narrows it.
         """
         user = await self._store.get_user(identity.user_id)
+        # ADR 0197 Amendment A, AC-A3a: removing TOTP removes the account's way past the sign-in lock
+        # (wave 1: nothing else is one), so a covered account may not remove it, passkeys or not.
+        if (
+            user is not None
+            and user.totp_enabled
+            and self._covered_by_requirement(user, identity.roles)
+        ):
+            raise ValueError(TOTP_REMOVAL_REFUSED)
         if user is not None and user.totp_enabled:
             creds = await self._store.list_webauthn_credentials(identity.user_id)
             # Dropping to zero factors while MFA is required is not a lockout — it lands the user in
@@ -6534,7 +6646,7 @@ class AuthService:
             client=client,
         )
 
-    async def admin_reset_mfa(self, user_id: str, *, actor: str) -> None:
+    async def admin_reset_mfa(self, user_id: str, *, actor: str) -> IssuedCredential | None:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
         recovery path; ADR 0068 extends this to credentials) — and revoke their sessions so they
         re-enroll. The always-available recovery for a locked-out passkey user. Raises
@@ -6544,10 +6656,34 @@ class AuthService:
         true while no directory account could hold an engine factor. Once one can, keeping it would
         make enrollment a one-way door: a directory user who lost the authenticator would have no
         recovery at all, because every route that could help stands behind the factor they lost. This
-        is the widest of the refusals the item names, and it is included for that reason."""
+        is the widest of the refusals the item names, and it is included for that reason.
+
+        **ON A LOCAL ACCOUNT IT ALSO ISSUES A GENERATED CREDENTIAL, AND RETURNS IT ONCE** (ADR 0197
+        Amendment A, N-B2 part 5, AC-A4). Without it the lost-authenticator recovery would leave a
+        chosen password, no factor and no session, which anyone who knows the username can lock
+        before the holder signs in to enrol again. **The credential is written FIRST**, before TOTP
+        and the passkeys are cleared, so a crash between the writes leaves a generated credential
+        with factors, never a chosen password without them. A directory account has no engine
+        password and gets ``None``."""
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
+        issued: IssuedCredential | None = None
+        if user.auth_provider == AuthProvider.LOCAL.value:
+            temp = self._generate_policy_password()
+            await self._store.set_password(
+                user_id,
+                password_hash=await self._argon2(hash_password, temp),
+                must_change_password=True,
+                password_generated=True,
+            )
+            stamped = await self._store.get_user(user_id)
+            issued = IssuedCredential(
+                password=temp,
+                expires_at=self.initial_credential_deadline(
+                    None if stamped is None else stamped.password_changed_at
+                ),
+            )
         await self._store.disable_totp(user_id)
         removed = await self._store.delete_all_webauthn_credentials(user_id)
         await self._store.revoke_user_sessions(user_id)
@@ -6559,12 +6695,14 @@ class AuthService:
                     "user_id": user_id,
                     "username": user.username,
                     "webauthn_credentials_removed": removed,
+                    "credential_issued": issued is not None,
                 }
             ),
         )
         await self._notify_security(
             MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
+        return issued
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
         """The caller's current MFA posture for ``GET /me/mfa``."""
@@ -6626,6 +6764,10 @@ class AuthService:
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
+        # ADR 0197 Amendment A, AC-A3: a covered account's FIRST factor must be one with a way past
+        # the sign-in lock, and in wave 1 a passkey is not, so registration waits for TOTP.
+        if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
+            raise FactorEnrolmentRequired()
         existing = await self._store.list_webauthn_credentials(identity.user_id)
         challenge = webauthn.new_challenge()
         options = webauthn.registration_options(
@@ -6918,6 +7060,11 @@ class AuthService:
         target = next((c for c in creds if c.credential_id_hash == credential_id_hash), None)
         if target is None:
             return False
+        # ADR 0197 Amendment A, AC-A3a: a covered account may not end a removal holding no factor
+        # with a way past the sign-in lock. In wave 1 a passkey is never one, so this refuses only
+        # where TOTP is already absent, and there the removal cannot restore a way past either.
+        if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
+            raise FactorEnrolmentRequired()
         last_second_factor = len(creds) == 1 and not user.totp_enabled
         if last_second_factor and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=False
@@ -6997,14 +7144,21 @@ class AuthService:
         self,
         *,
         username: str,
-        password: str,
         display_name: str | None,
         email: str | None,
         roles: Sequence[str],
         actor: str,
         client: str | None = None,
-    ) -> str:
-        """Create a local account with an admin-set, must-change initial password.
+    ) -> CreatedLocalAccount:
+        """Create a local account with an ENGINE-GENERATED, must-change initial credential, returned
+        once (ADR 0197 Amendment A, N-B2 part 1, AC-A2).
+
+        The administrator no longer chooses it. The credential is the 192-bit
+        :meth:`_generate_policy_password` the password reset already issues, written with
+        ``password_generated`` set, so wrong passwords arm no sign-in lock until the holder replaces
+        it. That is what stops anyone who knows the username locking the account before its first
+        sign-in. The returned :class:`CreatedLocalAccount` carries the deadline the login gate will
+        refuse on, as :meth:`admin_reset_password` does.
 
         ``client`` is the creating administrator's address. It lands on the ``user.created`` row
         (ADR 0150, BACKLOG #315), so the step that can mint a second dual-control approver is
@@ -7026,8 +7180,9 @@ class AuthService:
                 )
             email = _require_single_mailbox(email)
         user_id = uuid4().hex
+        temp = self._generate_policy_password()
         # Hashed before the insert so the handler below covers the store call alone.
-        password_hash = await self._argon2(hash_password, password)
+        password_hash = await self._argon2(hash_password, temp)
         try:
             await self._store.create_user(
                 user_id=user_id,
@@ -7039,7 +7194,7 @@ class AuthService:
                 # Admin-set the credential is a one-time temp: force rotation on first login so the
                 # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
                 must_change_password=True,
-                password_generated=False,
+                password_generated=True,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -7069,7 +7224,16 @@ class AuthService:
                 # notice sends the administrator's address to the account's mailbox.
                 detail={"roles": list(roles)},
             )
-        return user_id
+        stamped = await self._store.get_user(user_id)
+        return CreatedLocalAccount(
+            user_id=user_id,
+            credential=IssuedCredential(
+                password=temp,
+                expires_at=self.initial_credential_deadline(
+                    None if stamped is None else stamped.password_changed_at
+                ),
+            ),
+        )
 
     async def update_user(
         self,

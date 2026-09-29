@@ -36,6 +36,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink, _subject
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
+from tests._admin_account import create_local_user_with_password
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _client_with_sink, _hold_replay
 from tests.test_approval_requester_recheck import _Sink as _RecheckSink
@@ -254,7 +255,7 @@ async def _create(c: httpx.AsyncClient, headers: dict[str, str], name: str, role
     r = await c.post(
         "/users",
         headers=headers,
-        json={"username": name, "password": PW, "roles": [role.value], "email": f"{name}@x.org"},
+        json={"username": name, "roles": [role.value], "email": f"{name}@x.org"},
     )
     assert r.status_code == 201, r.text
     return str(r.json()["id"])
@@ -310,7 +311,6 @@ async def test_an_administrator_create_that_loses_the_username_race_pages_nobody
             headers=headers,
             json={
                 "username": "contested",
-                "password": PW,
                 "roles": [Role.ADMINISTRATOR.value],
                 "email": "contested@x.org",
             },
@@ -344,7 +344,8 @@ async def test_account_created_notice_goes_to_the_new_accounts_address(engine: E
     notifier = _FakeNotifier()
     service = AuthService(engine.store, AuthSettings(require_mfa=False), security_notifier=notifier)
     await service.initialize()
-    await service.create_local_user(
+    await create_local_user_with_password(
+        service,
         username="newbie",
         password=PW,
         display_name=None,

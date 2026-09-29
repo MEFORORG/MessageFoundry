@@ -20,6 +20,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, ServiceStatusSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_with_password
 
 PW = "a-strong-test-passphrase"
 
@@ -38,7 +39,8 @@ async def _service(engine: Engine) -> AuthService:
 
 
 async def _token(engine: Engine, svc: AuthService, *roles: Role) -> str:
-    await svc.create_local_user(
+    await create_local_user_with_password(
+        svc,
         username="u",
         password=PW,
         display_name=None,

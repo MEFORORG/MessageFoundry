@@ -47,6 +47,7 @@ from messagefoundry.pipeline.cluster import (
     StepdownReleaseUnconfirmed,
 )
 from messagefoundry.store import MessageStore
+from tests._admin_account import create_local_user_with_password
 
 PW = "a-strong-test-passphrase"  # >=15 chars, no vendor terms — satisfies the ASVS password policy
 
@@ -163,7 +164,8 @@ def _client(engine: Engine | None, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_with_password(
+        service,
         username=username,
         password=PW,
         display_name=None,

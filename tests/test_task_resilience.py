@@ -28,6 +28,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, Stage
 from messagefoundry.store.store import MessageStatus, OutboxItem
 from messagefoundry.transports.file import FileSource
+from tests._admin_account import create_local_user_with_password
 
 
 async def _until(predicate: Any, timeout: float = 2.0) -> None:
@@ -793,7 +794,8 @@ async def test_status_names_a_pooled_stage_whose_claimer_is_down(
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         pw = "Viewer-pw-1609-long-enough"
-        uid = await service.create_local_user(
+        uid = await create_local_user_with_password(
+            service,
             username="vw",
             password=pw,
             display_name=None,

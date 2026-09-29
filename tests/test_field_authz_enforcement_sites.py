@@ -39,6 +39,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from tests._admin_account import create_local_user_with_password
 
 PW = "a-strong-test-passphrase"  # >= 15 chars, satisfies the ASVS password policy
 
@@ -139,7 +140,8 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             ("rawonly", [custom.id]),
             ("boss", [Role.ADMINISTRATOR.value]),
         ):
-            uid = await service.create_local_user(
+            uid = await create_local_user_with_password(
+                service,
                 username=username,
                 password=PW,
                 display_name=None,

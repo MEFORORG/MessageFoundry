@@ -62,6 +62,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.signing import CompactJwtSigner
+from tests._admin_account import create_local_user_with_password
 
 CLIENT_SECRET = "s3cr3t-client-value"
 #: The ``sub`` the default ``_claims`` carry, and the one ``_service`` binds ``jdoe`` to by default.
@@ -675,7 +676,8 @@ async def test_ac3_a_binding_on_a_local_row_is_refused(
     try:
         ldap = _FakeLdap()
         service = await _service(store, rsa_key, ldap=ldap, bind=None)
-        local_id = await service.create_local_user(
+        local_id = await create_local_user_with_password(
+            service,
             username="jlocal",
             password="Sup3rSecret!!-long-enough",
             display_name=None,
@@ -1281,7 +1283,8 @@ async def test_unreachable_idp_does_not_affect_local_or_ad_login(
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
-        await service.create_local_user(
+        await create_local_user_with_password(
+            service,
             username="alice",
             password="Sup3rSecret!!",
             display_name=None,
@@ -1316,7 +1319,8 @@ async def test_construction_succeeds_with_an_unreachable_idp() -> None:
         service = AuthService(store, _settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
         assert service.oidc_enabled is True
         await service.initialize()
-        await service.create_local_user(
+        await create_local_user_with_password(
+            service,
             username="alice",
             password="Sup3rSecret!!",
             display_name=None,

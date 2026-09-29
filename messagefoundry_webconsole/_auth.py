@@ -42,7 +42,9 @@ __all__ = [
     "authorize_ui_ws",
     "browser_hardening_enabled",
     "clear_oidc_flow_cookie",
+    "ENROL_FIRST_PAGE",
     "clear_session_cookie",
+    "confined_before_its_factor",
     "effective_https",
     "is_safe_ui_action",
     "is_unlock_action",
@@ -257,7 +259,30 @@ async def rotation_comes_first(auth: AuthService, must_change: bool, token: str 
     :func:`must_change_target` asks the same question.
 
     Fails closed on an unknown state (BACKLOG #1974): see :func:`_owes_known_factor`."""
+    return (
+        must_change
+        and not await _owes_known_factor(auth, token)
+        and not await _enrols_first(auth, token)
+    )
+
+
+async def confined_before_its_factor(
+    auth: AuthService, must_change: bool, token: str | None
+) -> bool:
+    """Whether a must-change session owes no factor it has enrolled. That is the old
+    :func:`rotation_comes_first` question, before ADR 0197 Amendment A added the enrol-first case,
+    and it is still the right one for a ceremony that proves an EXISTING factor: such a session has
+    none to prove, whether it rotates next or enrols next."""
     return must_change and not await _owes_known_factor(auth, token)
+
+
+async def _enrols_first(auth: AuthService, token: str | None) -> bool:
+    """Whether the session's account must enrol a factor with a way past the sign-in lock before it
+    may rotate (ADR 0197 Amendment A, AC-A3). The JSON plane's ``_ENROL_FIRST_PATHS`` twin. False for
+    a token that no longer resolves, so an unknown state stays confined to the password page, where
+    the service refuses the rotation anyway. ``activity=False``: this probe is not user activity."""
+    identity = await auth.identity_for_token(token, activity=False)
+    return identity is not None and await auth.must_enrol_before_rotating(identity)
 
 
 async def _owes_known_factor(auth: AuthService, token: str | None) -> bool:
@@ -277,7 +302,16 @@ async def must_change_target(auth: AuthService, token: str | None) -> str:
     """Where a must-change session is sent: the factor page while it owes an enrolled factor,
     otherwise the password page. It asks what :func:`rotation_comes_first` asks, so an unknown
     state is confined on both paths and never audited as an MFA refusal."""
-    return "/ui/mfa" if await _owes_known_factor(auth, token) else "/ui/account/password"
+    if await _owes_known_factor(auth, token):
+        return "/ui/mfa"
+    if await _enrols_first(auth, token):
+        return ENROL_FIRST_PAGE
+    return "/ui/account/password"
+
+
+#: Where a session that must enrol before it rotates is sent (ADR 0197 Amendment A): the account
+#: page, which offers the TOTP enrolment, with the notice that says why.
+ENROL_FIRST_PAGE = "/ui/account?m=enroll_first"
 
 
 #: A route's own refusal of an MFA-pending session, for a route that passes ``allow_mfa_pending``.
@@ -355,11 +389,18 @@ def require_ui(
             # instead of appearing as an unexplained form, and its render carries Clear-Site-Data
             # too (14.3.1). A visitor with NO cookie never had a session — plain form, no code.
             raise _login_redirect("expired" if token else "")
-        if identity.must_change_password and not allow_must_change:
+        # ADR 0197 Amendment A: a must-change session that must enrol first may reach the routes a
+        # pending session may (the enrolment, confinement and account pages), and nothing else.
+        if (
+            identity.must_change_password
+            and not allow_must_change
+            and not (allow_mfa_pending and await auth.must_enrol_before_rotating(identity))
+        ):
             # A flagged account can go nowhere but the change-password page (L4b) until it rotates,
-            # or the factor page first when it still owes an enrolled factor (BACKLOG #1954).
+            # the factor page first when it still owes an enrolled factor (BACKLOG #1954), or the
+            # enrolment page first when it must enrol before rotating (ADR 0197 Amendment A).
             target = await must_change_target(auth, token)
-            if target == "/ui/mfa":
+            if target != "/ui/account/password":
                 # The MFA refusal in all but name, so it is audited like the one below (#1197), with
                 # the client read through the same extractor (BACKLOG #2088).
                 await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
