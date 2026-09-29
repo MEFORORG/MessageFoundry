@@ -1411,6 +1411,14 @@ nothing. It is audited as `auth.mfa_failed` with `reason=directory_unconfirmed` 
 outcome. `POST /auth/mfa-verify` answers **403** saying the directory could not confirm the account,
 and `/ui/mfa` and `/ui/reauth` say the same. A local account is never looked up.
 
+**The password re-bind says the same when the directory could not judge the password (BACKLOG
+#2027).** That covers a row with no directory object id, an entry that is not provably the row's
+own, no entry for the row's id, and an unreachable directory. None of these checks the password or
+counts toward the lockout. `POST /me/reauth` answers **403** saying the directory could not confirm
+the account, rather than `re-verification failed`, and the `/ui/reauth` password leg says it rather
+than "Incorrect password." A password the directory refused still reads as wrong. The precise
+reason is on the `auth.reauth` audit row only, so the words name no directory internals.
+
 Without this, an account disabled in the directory would keep renewing its window with a code
 until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as
 fresh as that pass, which runs every `[auth].ad_session_recheck_seconds` (300 s by default) and

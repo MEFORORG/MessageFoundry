@@ -21,16 +21,20 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
+from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth import ldap as ldap_module
 from messagefoundry.auth.identity import AuthProvider, Identity
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     LdapAuthenticator,
+    LdapError,
     _object_guid,
     normalise_object_guid,
     object_guid_filter_value,
@@ -38,6 +42,7 @@ from messagefoundry.auth.ldap import (
 from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
 from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 
 # One account object, two spellings of the SAME identity: the 16 bytes as they arrive on the wire,
@@ -1378,6 +1383,8 @@ async def test_a_re_bind_on_a_row_with_no_directory_id_is_refused_unasked() -> N
         service, identity, token = await _reauth_session(store, directory, keep_id=False)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
+        # Carried so a caller says the directory could not confirm the account, not "wrong password".
+        assert elevation.directory_unconfirmed is True
         assert directory.binds == 0, "the password was sent to the directory for an id-less row"
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1400,6 +1407,7 @@ async def test_a_re_bind_that_binds_another_directory_object_is_refused(
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
+        assert elevation.directory_unconfirmed is True
         assert directory.binds == 1
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1419,6 +1427,7 @@ async def test_a_refused_re_bind_keyed_on_the_rows_id_is_counted() -> None:
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-wrong", token=token)
         assert not elevation.ok
+        assert elevation.directory_unconfirmed is False  # judged and wrong, so "wrong" is true
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 1
         assert directory.keys == [GUID_A_TEXT, GUID_A_TEXT]
@@ -1450,7 +1459,7 @@ async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts(
         directory = _RebindDirectory(own, own)
         service, identity, token = await _reauth_session(store, directory)
         wrong = await service.reauth(identity, "synthetic-wrong", token=token)
-        assert not wrong.ok
+        assert not wrong.ok and wrong.directory_unconfirmed is False
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 1
         good = await service.reauth(identity, "synthetic-good", token=token)
@@ -1460,3 +1469,58 @@ async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts(
         assert directory.keys == [GUID_A_TEXT, GUID_A_TEXT, GUID_A_TEXT]
     finally:
         await store.close()
+
+
+class _UnreachableRebindDirectory(_RebindDirectory):
+    """A directory that cannot be asked at all: the bind raises the connectivity signal."""
+
+    def authenticate(
+        self, username: str, password: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
+        self.binds += 1
+        raise LdapError("synthetic: LDAP socket closed")
+
+
+async def test_an_unreachable_directory_re_bind_is_unconfirmed_and_uncounted() -> None:
+    """The directory could not judge the password, so the caller must not be told it was wrong, and
+    nothing counts (BACKLOG #1138's outage rule)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        directory = _UnreachableRebindDirectory(None, None)
+        service, identity, token = await _reauth_session(store, directory)
+        elevation = await service.reauth(identity, "synthetic-good", token=token)
+        assert not elevation.ok and elevation.directory_unconfirmed is True
+        assert directory.binds == 1
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.failed_attempts == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("keep_id", [False, True], ids=["id-less-row", "wrong-password"])
+async def test_the_reauth_route_says_the_directory_could_not_confirm_the_account(
+    tmp_path: Path, keep_id: bool
+) -> None:
+    """``POST /me/reauth`` names the directory when the re-bind judged no password (a row with no
+    id, here), and keeps "re-verification failed" for a password the directory refused (the
+    control). Both are 403, so neither sends the client back to sign-in."""
+    engine = await Engine.create(tmp_path / "reauth_directory.db", poll_interval=0.02)
+    try:
+        assert isinstance(engine.store, MessageStore)
+        own = _principal("jsmith", GUID_A_TEXT)
+        directory = _RebindDirectory(own, own)
+        service, _identity, token = await _reauth_session(engine.store, directory, keep_id=keep_id)
+        transport = httpx.ASGITransport(
+            app=create_app(engine, auth=service), client=("127.0.0.1", 123)
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post(
+                "/me/reauth",
+                json={"password": "synthetic-wrong" if keep_id else "synthetic-good"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert r.status_code == 403
+        said = "directory could not confirm this account" in r.json()["detail"]
+        assert said is (not keep_id)
+    finally:
+        await engine.stop()

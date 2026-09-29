@@ -525,11 +525,15 @@ class Elevation:
     #: checked and nothing was charged. It qualifies the wrong-proof state: the token still
     #: authenticates, and the caller must send the operator to the IdP leg rather than re-prompt.
     idp_step_up_required: bool = False
-    #: Set only by :meth:`AuthService.verify_mfa`, on a directory account the directory did not
-    #: confirm as present and enabled, including when it could not be reached (BACKLOG #2023). The
-    #: code was never checked and nothing was charged. It qualifies the wrong-proof state: the token
-    #: still authenticates, and the caller must say the directory could not confirm the account
-    #: rather than call the code wrong.
+    #: Set by :meth:`AuthService.verify_mfa`, on a directory account the directory did not confirm
+    #: as present and enabled, including when it could not be reached (BACKLOG #2023), or a row with
+    #: no directory id (BACKLOG #2027). Set by :meth:`AuthService.reauth` when the directory re-bind
+    #: could not judge the password: no directory, no entry for the row's id, an unreachable one,
+    #: a row with no id, or an entry that is not provably the row's own (BACKLOG #2027). Either way
+    #: the proof was never checked and nothing was charged. It qualifies the wrong-proof state: the
+    #: token still authenticates, and the caller must say the directory could not confirm the
+    #: account rather than call the code or the password wrong. The reason is on the audit row
+    #: only, so the caller learns nothing about the directory's internals.
     directory_unconfirmed: bool = False
 
     @property
@@ -1016,6 +1020,10 @@ class _Reproof:
     #: the row has no id, or the directory answered about an entry that is not the row's own. Written
     #: onto the ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
     reason: str | None = None
+    #: A directory re-proof the directory could not decide, so no password was judged and nothing
+    #: was charged: no directory, no such entry, an unreachable one, or any ``reason`` above. Carried
+    #: to ``Elevation.directory_unconfirmed`` so a caller does not report the password as wrong.
+    directory_unconfirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -5651,7 +5659,12 @@ class AuthService:
                 # else whose password would then step this session up. Refused before the directory
                 # is asked, so no password leaves the engine and nothing is charged -- the caller
                 # did not guess wrong.
-                return _Reproof(ok=False, user=user, reason=DIRECTORY_OBJECT_ID_MISSING)
+                return _Reproof(
+                    ok=False,
+                    user=user,
+                    reason=DIRECTORY_OBJECT_ID_MISSING,
+                    directory_unconfirmed=True,
+                )
             rebind = await self._reauth_ad(
                 user.username, password, object_id=user.directory_object_id
             )
@@ -5661,7 +5674,8 @@ class AuthService:
                 verify_password, user.password_hash, password
             )
         if verdict is None:
-            return _Reproof(ok=False, user=user, reason=reason)
+            # Only the directory leg answers None: it could not judge the password at all.
+            return _Reproof(ok=False, user=user, reason=reason, directory_unconfirmed=True)
         charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
@@ -5786,7 +5800,10 @@ class AuthService:
             token=token,
         )
         ok = proof.ok
-        elevation = Elevation(session_lost=proof.session_revoked or proof.session_gone)
+        elevation = Elevation(
+            session_lost=proof.session_revoked or proof.session_gone,
+            directory_unconfirmed=proof.directory_unconfirmed,
+        )
         grant_refused = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these

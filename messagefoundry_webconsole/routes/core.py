@@ -76,8 +76,9 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa`` refused a directory account the
-#: directory did not confirm (BACKLOG #2023). The code was never checked, so "invalid code" is false.
+#: What the MFA gate and the re-auth form say when ``verify_mfa`` or ``reauth`` refused a directory
+#: account the directory did not confirm (BACKLOG #2023, #2027). The code or password was never
+#: checked, so "invalid code" or "incorrect password" would be false.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )
@@ -1343,7 +1344,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             wa_options, wa_notice = await _reauth_webauthn_state(
                 request, auth, token, mfa, not still_unsatisfied
             )
-            # The wrong-password exit AFTER a successful code leg — the stranded-cookie case.
+            # The wrong-password exit AFTER a successful code leg — the stranded-cookie case. A
+            # directory that could not judge the password never called it wrong (BACKLOG #2027).
             return _keep_session(
                 HTMLResponse(
                     pages.reauth(
@@ -1351,7 +1353,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=mfa_enrolled and still_unsatisfied,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error="Incorrect password.",
+                        error=(
+                            _DIRECTORY_UNCONFIRMED_ERROR
+                            if _directory_unconfirmed(pw_elevation)
+                            else "Incorrect password."
+                        ),
                     )
                 ),
                 token,
