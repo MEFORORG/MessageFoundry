@@ -349,13 +349,14 @@ def _sso_service(engine: Engine, *, conflicting_local: bool = False) -> AuthServ
         email="j@x",
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-admins,dc=x"}),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             # A resolvable principal costs a directory search; an unresolvable one does not. That
             # difference is the branch the pad has to hide on this seam.
             time.sleep(0.002)

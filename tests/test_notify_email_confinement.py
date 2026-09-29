@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,7 @@ async def test_a_directory_account_whose_directory_returns_no_mail_is_confined()
                 email=mail,
                 dn=f"CN={name},DC=x",
                 groups=frozenset(),
+                directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, name)),
             )
             # The shared completion tail that simple bind, Kerberos and OIDC all reach; its create
             # branch is `_upsert_ad_user` meeting a principal it has not seen.
@@ -176,7 +178,12 @@ def _ad_service(store: MessageStore, notifier: _FakeNotifier | None = None) -> A
 
 def _directory_principal(name: str, mail: str | None) -> AdPrincipal:
     return AdPrincipal(
-        username=name, display_name=name, email=mail, dn=f"CN={name},DC=x", groups=frozenset()
+        username=name,
+        display_name=name,
+        email=mail,
+        dn=f"CN={name},DC=x",
+        groups=frozenset(),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, name)),
     )
 
 

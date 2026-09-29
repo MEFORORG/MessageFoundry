@@ -1152,6 +1152,27 @@ All notable changes to MessageFoundry are documented here. The format follows
   floored protocols and the same bannerless `Server` setting `serve` does. Steps on a single
   response still degrade to uvicorn's own response and log a WARNING, and uvicorn's
   `100 Continue` still carries no header. (`BACKLOG #1120`)
+- **BREAKING: a directory account with no directory id no longer signs in or steps up by its
+  username.** The engine now refuses a Windows SSO sign-in whose directory entry has no readable
+  `objectGUID`. It refuses whether or not an account already exists for that name, and it creates
+  no account. The web console shows the generic SSO failure, and the `auth.login_failed` audit row
+  carries `directory_object_id_missing`. The AD step-up re-bind (`POST /me/reauth`,
+  `POST /ui/reauth`) refuses an account with no directory id for the same reason. It refuses before
+  it sends the password anywhere. It also refuses an answer about a different directory object
+  (`directory_identity_conflict`) or one with no readable id. None of these refusals counts toward
+  the account lockout. The web console still shows these step-up refusals as a wrong password.
+  - **Why.** A username is the only key such an account has, and a directory can give a freed
+    username to a new person. That person's sign-in would then reach the old account and give it
+    their groups, and their password would step up the old account's session (ADR 0184 AC-5).
+  - **The cost.** A directory that does not return `objectGUID` to the service account signs nobody
+    in through Windows SSO. The engine logs a warning naming the cause once. The fix is to make the
+    attribute readable to the service account. For an account left with no directory id, an
+    administrator deletes it, and the person signs in again to create it with one.
+  - **The step-up re-bind now finds the account by its `objectGUID`, not its username.** The typed
+    password goes only to the account's own directory entry, and a renamed account can still step
+    up. This adds no directory read: each lookup is keyed on the id instead of the name.
+
+  (`BACKLOG #2027`, ADR 0184)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -1265,8 +1286,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer asks about such an account by its username either. It skips it and writes one
   `auth.ad_reconcile_binding_unkeyed` row with the same reason, once per account per process. That
   is a new audit action, separate from the outage's `auth.ad_reconcile_skipped`, because it is not
-  benign. On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds
-  such an account by its username, as it finds any account with no directory id there.
+  benign. A Windows SSO sign-in to such an account is refused as well, by the directory-id
+  entry at the top of this section; before it, that sign-in found the account by its username.
   - **Why.** The username is the only key such an account has. A directory can give a freed
     username to a new person, and the linked account would then take that person's groups (ADR
     0184 AC-5).
@@ -1494,7 +1515,7 @@ All notable changes to MessageFoundry are documented here. The format follows
     `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
   - **A link made before this change on such an account is left in place.** It can still be
     removed, and it cannot be moved to another `sub`. This change added no sign-in refusal for it;
-    the `BACKLOG #2027` entry at the top of this section does. On a directory that now
+    the `BACKLOG #2027` federated-link entry in this section does. On a directory that now
     returns `objectGUID`, its Windows SSO sign-in is refused as `directory_identity_conflict`, as
     it was before this change. Its federated sign-in is now refused as
     `directory_object_id_missing`, which that entry checks first.

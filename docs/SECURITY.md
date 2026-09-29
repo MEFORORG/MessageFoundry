@@ -729,10 +729,15 @@ tuple: they act only on the caller's own account.
 > principal whose identifier disagrees with the row holding its username is refused rather than handed
 > that row. A recycled name gets a new account with a new `user_id`.
 >
-> **One residual, and it is the honest limit of the control.** A directory that returns no immutable
-> identifier at all still resolves by username; the engine cannot key on an identifier it is never
-> given. The engine warns once per distinct cause -- the attribute absent, or present in a shape it
-> cannot read -- so a site on that path is told rather than left to assume the control is running.
+> **A directory that returns no immutable identifier signs nobody in (BACKLOG #2027).** It used to
+> resolve by username, which left the recycle open on that path. A Windows SSO sign-in whose
+> principal carries no `objectGUID` is now refused as `directory_object_id_missing`, and so is an AD
+> step-up re-bind on a row with none; neither refusal counts toward the lockout. The re-bind binds
+> the entry its search finds by the row's `objectGUID`, never by the name. The engine warns once per
+> distinct cause -- the attribute absent, or present in a shape it cannot read -- so a site on that
+> path learns why its sign-ins fail. **At least two readers still ask about an id-less row by its
+> name:** the session reconciler, and `verify_mfa`'s directory check on a row with no federated
+> binding. A directory that reissued the name answers for its new holder there.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
@@ -1348,8 +1353,9 @@ Without this, an account disabled in the directory would keep renewing its windo
 until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as
 fresh as that pass, which runs every `[auth].ad_session_recheck_seconds` (300 s by default) and
 revokes after `[auth].ad_session_recheck_strikes` refusals in a row (2 by default). An id-less row
-with no binding is still looked up by name, as the reconciler and the Windows SSO sign-in look it
-up; a name is the weaker key, since a directory can reissue it.
+with no binding is still looked up by name, as the reconciler looks it up; a name is the weaker key,
+since a directory can reissue it. The Windows SSO sign-in and the password step-up refuse such a row
+instead (BACKLOG #2027).
 
 **This check fails closed, which is the opposite of the reconciler, and the cost is availability.**
 The reconciler revokes, so it fails open on an unreachable directory and waits for repeated answers

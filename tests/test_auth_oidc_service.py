@@ -198,7 +198,7 @@ class _FakeLdap:
         self._by_username = by_username
         self.resolved: list[str] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return self._principal
 
     def resolve_principal(

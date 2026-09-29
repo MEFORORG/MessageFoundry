@@ -244,10 +244,10 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engin
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == ADMIN_USERNAME and password == "pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == ADMIN_USERNAME else None
 
     settings = AuthSettings(
