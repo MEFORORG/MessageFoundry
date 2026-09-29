@@ -657,6 +657,24 @@ def _service_rows(text: str) -> set[str]:
     return set(re.findall(r"^\|\s*`([\w.-]+\.ps1)`\s*\|", _section(text, 8), re.M))
 
 
+_ADMIN_CHECK_RE = re.compile(
+    r"\.IsInRole\(\s*\[Security\.Principal\.WindowsBuiltInRole\]::Administrator\s*\)"
+)
+
+
+def _unchecked_scripts(scripts: Mapping[str, str]) -> list[str]:
+    """Section 8 says every script stops at once without administrator rights."""
+    return [
+        f"{name} has no administrator check"
+        for name, source in sorted(scripts.items())
+        if not _ADMIN_CHECK_RE.search(source)
+    ]
+
+
+def _service_sources() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8") for path in _SERVICE_DIR.glob("*.ps1")}
+
+
 def _service_drift(text: str, live: set[str]) -> list[str]:
     return _set_drift("section 8's table", _service_rows(text), live)
 
@@ -665,8 +683,17 @@ def _script_code_lines(source: str) -> list[str]:
     """Lines of a TypeScript or JavaScript file that are not whole-line comments, by the rule
     ``_is_comment_only`` in ``scripts/security/crypto_inventory_check.py`` uses. A trailing comment
     stays on its line, so a call named inside one counts, and so does a line inside a block comment
-    that does not start with ``*``. The page says so."""
-    return [line for line in source.splitlines() if not line.lstrip().startswith(("//", "*", "/*"))]
+    that does not start with ``*``. The page says so. Code after a closing ``*/`` on a comment line
+    is kept, so ``/* reviewed */ execFile(...)`` still counts."""
+    kept: list[str] = []
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("//"):
+            continue
+        if stripped.startswith(("*", "/*")):
+            line = line.partition("*/")[2]
+        kept.append(line)
+    return kept
 
 
 @functools.cache
@@ -683,6 +710,7 @@ def _ide_sources() -> dict[str, str]:
 _IDE_CALLS: dict[str, re.Pattern[str]] = {
     "execFile": re.compile(r"\bexecFile\("),
     "createTerminal": re.compile(r"\.createTerminal\("),
+    "sendText": re.compile(r"\.sendText\("),
     "startDebugging": re.compile(r"\.startDebugging\("),
     "openExternal": re.compile(r"\.openExternal\("),
     "enableScripts: true": re.compile(r"\benableScripts:\s*true\b"),
@@ -728,14 +756,18 @@ _CHILD_PROCESS_IMPORT_RE = re.compile(
 )
 
 
-#: VS Code task runners. Section 9 has no row for them, so any use must fail until it gets one.
-_VSCODE_TASK_RE = re.compile(r"\b(?:ShellExecution|ProcessExecution|executeTask)\b")
+#: Other ways to start or load code that section 9 has no row for: VS Code tasks, Node's
+#: ``cluster`` and ``worker_threads``, and ``process.dlopen``. Any use must fail until it gets one.
+_UNLISTED_START_RE = re.compile(
+    r"\b(?:ShellExecution|ProcessExecution|executeTask|worker_threads)\b"
+    r"""|["'](?:node:)?cluster["']|\bprocess\.dlopen\("""
+)
 
 
 def _other_start_problems(sources: Mapping[str, str]) -> list[str]:
     """Starts section 9's table has no row for. Every code line naming ``child_process`` must be a
     named import of ``execFile`` alone, so a ``spawn``, an ``exec``, a namespace import or a
-    ``require`` fails here; so does any VS Code task."""
+    ``require`` fails here; so does anything ``_UNLISTED_START_RE`` matches."""
     problems: list[str] = []
     for rel, source in sources.items():
         for line in _script_code_lines(source):
@@ -744,7 +776,7 @@ def _other_start_problems(sources: Mapping[str, str]) -> list[str]:
                 names = {name.strip() for name in match.group(1).split(",")} if match else set()
                 if names != {"execFile"}:
                     problems.append(f"{rel}: {line.strip()}")
-            if _VSCODE_TASK_RE.search(line):
+            if _UNLISTED_START_RE.search(line):
                 problems.append(f"{rel}: {line.strip()}")
     return problems
 
@@ -765,10 +797,13 @@ def _console_python() -> dict[str, str]:
     }
 
 
-#: Writes of an HTML string into the page: an assignment or ``+=`` to ``innerHTML`` or
-#: ``outerHTML``, ``insertAdjacentHTML`` and ``document.write``.
+#: Ways to turn an HTML string into page content, at least: assignment (plain, ``+=`` or logical) to
+#: ``innerHTML`` or ``outerHTML`` by dot or by bracket, ``insertAdjacentHTML``, ``document.write``,
+#: ``DOMParser.parseFromString``, ``createContextualFragment``, ``srcdoc`` and ``setHTML``.
 _HTML_SINK_RE = re.compile(
-    r"\.(?:inner|outer)HTML\s*\+?=(?!=)|\.insertAdjacentHTML\(|\bdocument\.write(?:ln)?\("
+    r"""(?:\.|\[\s*["'])(?:inner|outer)HTML(?:["']\s*\])?\s*(?:\+|\|\||&&|\?\?)?=(?!=)"""
+    r"|\.insertAdjacentHTML\(|\bdocument\.write(?:ln)?\(|\.parseFromString\("
+    r"|\.createContextualFragment\(|\.srcdoc\s*=(?!=)|\.setHTML(?:Unsafe)?\("
 )
 
 
@@ -835,7 +870,8 @@ def test_the_archive_readers_match_the_code() -> None:
 
 
 def test_every_service_script_has_a_row() -> None:
-    _assert_no_drift(8, _service_drift(_doc_text(), _service_scripts()))
+    problems = _service_drift(_doc_text(), _service_scripts())
+    _assert_no_drift(8, problems + _unchecked_scripts(_service_sources()))
 
 
 def test_the_extension_counts_match_the_code() -> None:
@@ -856,6 +892,10 @@ def test_the_later_section_detectors_fire() -> None:
     assert _imports_archive_lib("from shutil import unpack_archive\nunpack_archive(p, d)\n")
     assert not _imports_archive_lib('"""import tarfile"""\nNOTE = "zipfile"\n')
     assert "install-service.ps1" in _service_scripts()
+    elevated = "if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {}"
+    assert not _unchecked_scripts({"a.ps1": elevated})
+    assert _unchecked_scripts({"a.ps1": "# needs IsInRole Administrator\n"})
+    assert _script_code_lines("/* reviewed */ execFile(bin, args)\n") == [" execFile(bin, args)"]
     live = _ide_counts(_ide_sources())
     assert all(sites and files for sites, files in live.values()), (
         f"an IDE scan found nothing: {live}"
@@ -872,6 +912,12 @@ def test_the_later_section_detectors_fire() -> None:
         "el.outerHTML = x;",
         "el.insertAdjacentHTML('beforeend', x);",
         "document.write(x);",
+        "el['innerHTML'] = x;",
+        "el.innerHTML ||= x;",
+        "new DOMParser().parseFromString(x, 'text/html');",
+        "range.createContextualFragment(x);",
+        "frame.srcdoc = x;",
+        "el.setHTMLUnsafe(x);",
     ):
         assert _console_sink_count({"a.js": sink}) == 1, sink
     assert not _other_start_problems({"a.ts": 'import { execFile } from "node:child_process";'})
@@ -882,6 +928,9 @@ def test_the_later_section_detectors_fire() -> None:
         'const cp = require("child_process");',
         "await vscode.tasks.executeTask(task);",
         "const run = new vscode.ShellExecution(cmd);",
+        'import cluster from "node:cluster";',
+        'import { Worker } from "worker_threads";',
+        "process.dlopen(module, path);",
     ):
         assert _other_start_problems({"a.ts": planted}), planted
     assert _console_python(), "no console Python found: the scan is dead"

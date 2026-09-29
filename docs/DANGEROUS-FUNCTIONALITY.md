@@ -42,7 +42,7 @@ withholding is policy, not oversight. This page is the in-tree highlight and sta
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | HL7, X12, DICOM, XML, archives | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
-| 9 | Processes, terminals and webview scripts | VS Code extension | On when you use it; the CLI waits for workspace trust |
+| 9 | Processes, terminals and webview scripts | VS Code extension | Runs the CLI on open and on save, once you trust the workspace |
 | 10 | Writing server-built HTML into the page | Web console | On |
 
 ---
@@ -330,7 +330,7 @@ administrator rights. What each one grants or changes:
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
 | `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
-| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. |
+| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
 least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
@@ -347,14 +347,20 @@ Other switches on `install-service.ps1` change more than the service:
   keyed by program name. So they affect every process with that name on the machine, not only the
   engine.
 
-**Both installers run programs they did not check.** `install-service.ps1` looks for NSSM in three
-places: `-NssmPath`, then `PATH`, then a copy cached in the data directory's `bin` folder. Only when
-all three miss does it download NSSM. It checks that download against a fixed SHA-256 hash, and
-stops on a mismatch. A copy found on `PATH` or in the cache runs without that check.
-`install-net-helper.ps1` downloads nothing. It copies the `nssm.exe` from `-NssmPath` or `PATH`
-into the helper's folder without a hash check. It also runs the engine's `messagefoundry.exe`,
-from the repository's `.venv` unless `-AppExe` names another, to read the address settings. Both
-run elevated, so a planted program on those paths would run as administrator.
+**Three scripts run programs they did not check.** `install-service.ps1` and
+`uninstall-service.ps1` look for NSSM in three places: `-NssmPath`, then `PATH`, then a copy cached
+in the data directory's `bin` folder. Only when all three miss does the installer download NSSM. It
+checks that download against a fixed SHA-256 hash, and stops on a mismatch. A copy found on `PATH`
+or in the cache runs without that check. The cache sits in the data directory, where the engine's
+service account can modify files. So code running as the engine could replace that `nssm.exe`, and
+the next install or uninstall would run it as administrator.
+
+`install-net-helper.ps1` downloads nothing. It copies `mefor-net-helper.exe` from `-HelperSource`,
+and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. It checks no hash, and it
+prints the helper's signature status without requiring one. It then starts the helper as
+LocalSystem. It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless
+`-AppExe` names another, to read the address settings. All three scripts run elevated. So a
+planted program on any of those paths would run as administrator, or as LocalSystem.
 
 **What holds the helper.** It refuses any request that names a different address, interface or
 mask from the ones in its configuration file. It hands Windows only the values from that file. Its
@@ -367,9 +373,11 @@ engine calls the helper yet.
 
 **What holds the certificate import.** Every program on the machine trusts the machine store, not
 only the engine. So a CA added there can vouch for any server. The script shows the certificate's
-subject and thumbprint before it imports, and supports `-WhatIf`. SQL Server's ODBC Driver 18
-reads only the machine store, so a SQL Server behind a private CA needs this step. PostgreSQL can
-instead pin a CA file with `[store].ssl_root_cert`, which changes nothing machine-wide.
+subject and thumbprint before it imports, and supports `-WhatIf`. It also accepts a `.p7b` bundle,
+which it shows as one certificate but imports whole. So check every certificate in a bundle first.
+SQL Server's ODBC Driver 18 reads only the machine store, so a SQL Server behind a private CA needs
+this step. PostgreSQL can instead pin a CA file with `[store].ssl_root_cert`, which changes nothing
+machine-wide.
 
 The uninstall scripts leave most changes in place by default, and print a list of what is left
 with the command that clears each item. "Log on as a service" stays by default because a shared
@@ -386,16 +394,21 @@ leaving out its `test` folder:
 |---|---|---|---|
 | Process starts | `execFile` | 5 | 3 |
 | Terminals | `createTerminal` | 4 | 2 |
+| Text typed into a terminal | `sendText` | 2 | 2 |
 | Debug sessions | `startDebugging` | 1 | 1 |
 | Links opened outside VS Code | `openExternal` | 3 | 3 |
 | Webviews that run scripts | `enableScripts: true` | 14 | 13 |
 
 **Process starts.** Node's `execFile` runs one program with an argument list and no shell.
-`cli.ts` runs the MessageFoundry command line through a Python interpreter. Before it starts the
-engine, `statusBar.ts` runs that interpreter to check it, and to ask whether an administrator
-account exists. What holds them: in a workspace you have not marked as trusted, `cli.ts` refuses
-to run any interpreter. The extension never picks up a workspace `.venv` there, and the engine
-start refuses there too. The interpreter setting, `messagefoundry.pythonPath`, is machine-scoped.
+`cli.ts` runs the MessageFoundry command line through a Python interpreter. It does so on its own,
+not only when you ask. In a trusted workspace it runs `validate` and the graph and code-set reads
+when the extension starts. It runs them again after you save a Python file or the config changes. Each of
+those loads your config modules, so their top-level code runs each time (section 2).
+
+Before it starts the engine, `statusBar.ts` runs that interpreter to check it, and to ask whether
+an administrator account exists. What holds them: in a workspace you have not marked as trusted,
+`cli.ts` refuses to run any interpreter. The extension never picks up a workspace `.venv` there,
+and the engine start refuses there too. The interpreter setting, `messagefoundry.pythonPath`, is machine-scoped.
 So a settings file checked into a repository cannot set it.
 
 `git.ts` runs `git` for the source-control commands, and those do not check workspace trust. It
@@ -406,8 +419,8 @@ in the workspace folder before the one on `PATH`, as section 4 says of `checks.p
 **Terminals.** Two terminals run one program as the terminal's own process, with no shell reading
 a command line: the engine's `serve`, and `provision-admin`. The other two type text into a shell:
 
-- **MessageFoundry Setup** types each step of a generated setup plan and runs it. It needs a
-  trusted workspace and a yes in a dialog that lists every step first.
+- **MessageFoundry Setup** types each step of a generated setup plan with `sendText`, and runs it.
+  It needs a trusted workspace and a yes in a dialog that lists every step first.
 - **Install Git** types `winget install --id Git.Git -e` and does not press Enter. You run it
   yourself or close the terminal.
 
@@ -426,18 +439,25 @@ and a fresh nonce on `script-src`. So only the scripts the extension rendered in
 scripts build markup with `innerHTML`, at least in `testBench.ts`. The policy blocks inline event
 handlers, so markup injected that way cannot run script of its own.
 
+A page script can also ask the extension to act. The Home view runs any VS Code command whose id
+its page sends, with no list of allowed ids. The engine setup page, by contrast, runs only the
+command behind a button it knows. So the Home view's policy is the only thing between its page and
+every command VS Code has, including other extensions' commands.
+
 **The extension also writes files that run later.** One is the new-route module in section 2.
 Another is the git `pre-commit` hook that source-control setup writes to `.mefor-hooks/pre-commit`
 and stages for commit. Setup then points git's `core.hooksPath` there, so git runs the hook on
 every commit. It skips that step when git already has another hooks folder, or a `pre-commit` hook
-in `.git/hooks`. In a linked worktree, where `.git` is a file, that second check finds nothing.
-So the setting can switch off a `pre-commit` hook the repository already had.
+in `.git/hooks`. Otherwise the new setting turns off every other hook in `.git/hooks`, such as a
+`pre-push` or `commit-msg` hook, without a warning. In a linked worktree, where `.git` is a file,
+the `pre-commit` check finds nothing, so even that hook can be turned off.
 
-The hook runs the workspace's own `.venv` interpreter when one exists, and no workspace-trust check
-applies at commit time. So a repository that ships a `.venv`, or a pulled change to the hook, runs
-its own code on your next commit. The hook names your config and message folders, which a
-checked-in `.vscode/settings.json` can set. Each is single-quoted for the shell, so a crafted value
-cannot break out of its argument.
+The hook runs `messagefoundry check`, which loads and dry-runs your config modules. So your config
+code runs on every commit, and no workspace-trust check applies then. The hook prefers the
+workspace's own `.venv` interpreter when one exists. So a repository that ships a `.venv`, or a
+pulled change to the hook or the config, runs its own code on your next commit. The hook names
+your config and message folders, which a checked-in `.vscode/settings.json` can set. Each is
+single-quoted for the shell, so a crafted value cannot break out of its argument.
 
 ---
 
@@ -456,9 +476,10 @@ origin. It adds no markup of its own.
 **What holds it.** The server builds its pages and fragments with
 `messagefoundry_webconsole/_html.py`, which escapes every value unless the code wraps it in
 `Markup` on purpose. So a message field is escaped unless some code chose to mark it safe. The
-`/ui` Content Security Policy has no `unsafe-inline` or `unsafe-eval`. Over https it runs only
-scripts that carry that response's nonce, and scripts those load. Otherwise it runs only scripts
-from the console's own origin. Either way, an event handler in injected markup would not run.
+`/ui` Content Security Policy has no `unsafe-inline` or `unsafe-eval`. It comes in two forms. The
+stricter one runs only scripts that carry that response's nonce, and scripts those load. The other
+runs only scripts from the console's own origin. Under either, an event handler in injected markup
+would not run.
 
 The console's own Python starts no process, calls no native library, reads no archive and imports
 nothing by name. It can ask the engine to reload its configuration, though. That runs section 2's
@@ -492,9 +513,10 @@ reads the code and fails when one of these no longer matches it:
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
 - the section 7 archive list: a new module that imports an archive or compression library;
-- the section 8 table: a script added to or removed from `scripts/service/`;
-- the section 9 table: each count in it, and any `child_process` call other than `execFile`, or
-  any VS Code task;
+- the section 8 table: a script added to or removed from `scripts/service/`, or one with no
+  administrator check;
+- the section 9 table: each count in it. It also fails on any `child_process` call other than
+  `execFile`, any VS Code task, and any use of `cluster`, `worker_threads` or `process.dlopen`;
 - section 10: the count of HTML writes. It also checks that the console's Python starts no
   process, imports no `ctypes` or archive library, and imports nothing by name.
 
