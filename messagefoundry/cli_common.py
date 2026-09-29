@@ -23,7 +23,7 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from messagefoundry.console_streams import harden_console_streams
@@ -39,7 +39,7 @@ def run_cli(
     argv: list[str] | None,
     build_parser: Callable[[], tuple[argparse.ArgumentParser, Dispatch]],
     *,
-    configures_own_logging: Collection[str] = frozenset(),
+    configures_own_logging: frozenset[str] = frozenset(),
 ) -> int:
     """Run one command line: harden, install the hooks, parse, dispatch, and return the exit code.
 

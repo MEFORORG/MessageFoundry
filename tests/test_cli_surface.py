@@ -148,23 +148,39 @@ def test_main_parses_with_the_builder(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ran == ["only-in-the-plant"]
 
 
-def test_building_the_parser_installs_nothing() -> None:
-    """Reading the surface must not change the process: the hooks, the root log handlers and the
-    console streams are what ``main()`` sets, and the builder must leave all of them alone."""
+def test_building_the_parser_installs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reading the surface must not change the process. The hooks, the stream hardening and the log
+    sink are what ``main()`` sets, and the builder must call none of them.
 
-    def state() -> tuple[object, ...]:
-        streams = (sys.stdout, sys.stderr)
-        return (
-            sys.excepthook,
-            threading.excepthook,
-            list(logging.getLogger().handlers),
-            *streams,
-            *(getattr(s, "errors", None) for s in streams),
-        )
+    Recorders, not before-and-after state. Under pytest's capture the streams already use
+    ``errors="replace"``, and an earlier ``main()`` call in the same worker has already installed
+    the hooks, so a state comparison would stay green on exactly the regression it is for."""
+    called: list[str] = []
 
-    before = state()
+    def recorder(name: str) -> object:
+        return lambda *_a, **_kw: called.append(name)
+
+    import messagefoundry.console_streams as console_streams
+    import messagefoundry.last_resort as last_resort
+    import messagefoundry.logging_setup as logging_setup
+
+    for module, name in (
+        (console_streams, "harden_console_streams"),
+        (cli_module, "harden_console_streams"),
+        (cli_common, "harden_console_streams"),
+        (last_resort, "install_excepthook"),
+        (last_resort, "install_thread_excepthook"),
+        (logging_setup, "configure_stderr_logging"),
+        (cli_common, "configure_stderr_logging"),
+    ):
+        monkeypatch.setattr(module, name, recorder(f"{module.__name__}.{name}"))
+    handlers = list(logging.getLogger().handlers)
     cli_module._build_parser()
-    assert state() == before
+    assert called == []
+    assert list(logging.getLogger().handlers) == handlers
+    # Control: the recorders are live, so an empty list above means nothing was called.
+    console_streams.harden_console_streams()
+    assert called == ["messagefoundry.console_streams.harden_console_streams"]
 
 
 # --- Planted breaks. Each must be named by the same function the real test uses. ----------------
