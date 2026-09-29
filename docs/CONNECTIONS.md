@@ -1180,9 +1180,10 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   its connection limit is retried. A TLS refusal and a refused greeting are configuration faults. An
   unclear login refusal is a credential fault. Either one stops the lane and keeps the queue under
   the default `credential_fault_policy` (ADR 0095), since every queued message would meet the same
-  refusal, and the alert names which fault it was. The rules are stated once, in
-  `remotefile._ftp_connect_refusal`. Why an unclear login refusal is read as a credential fault is
-  in `remotefile._names_connection_limit`.
+  refusal, and the alert names which fault it was. The 5xx rules are stated once, in
+  `remotefile._ftp_connect_refusal`, and the 4xx rule in `remotefile._FtpClient._connect`. Why an
+  unclear login refusal is read as a credential fault is in `remotefile._names_connection_limit`.
+  A busy reply that also carries a credential word stops the lane too.
 - **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
   `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
   nothing else. A server missing either fails the handshake with a permanent `SFTP connection

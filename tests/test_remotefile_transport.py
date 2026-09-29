@@ -390,17 +390,17 @@ async def test_destination_cleans_temp_on_failed_rename(monkeypatch: pytest.Monk
 @pytest.mark.parametrize(
     "marker", [{"credential_fault": True}, {"config_fault": True}], ids=["credential", "config"]
 )
-async def test_destination_keeps_temp_after_a_connection_fault_on_rename(
+async def test_destination_cleans_temp_after_a_connection_fault_on_rename(
     monkeypatch: pytest.MonkeyPatch, marker: dict[str, bool]
 ) -> None:
-    # BACKLOG #2083 fix round 4 review: the rename opens its own session, so a connection fault can
-    # meet it there. Removing the temp would open one more session: another refused login against
-    # the partner account, or the same refusal again. The store branch already skipped it.
+    # BACKLOG #2083 fix round 4: unlike the store branch, the rename branch still removes the temp
+    # after a connection fault. The store succeeded, so the temp holds a whole message; the lane
+    # stops right after, so the cleanup costs one more login at most.
     client = _FakeClient(rename_exc=_RemoteError("refused", permanent=True, **marker))
     dest = _dest(monkeypatch, client, filename="msg.hl7")
     with pytest.raises(NegativeAckError):
         await dest.send("x")
-    assert not any(op == "remove" for op, _ in client.ops)
+    assert any(op == "remove" for op, _ in client.ops)
 
 
 # === source ==================================================================
@@ -2419,6 +2419,7 @@ def test_a_tls_demand_at_the_login_is_a_configuration_fault(
         _plain_client().list_dir("/in")
     assert caught.value.permanent is True, "no retry makes the connection use TLS"
     assert caught.value.credential_fault is False, "no credential was at fault"
+    assert caught.value.config_fault is True, "every row meets it alike, so it stops the lane"
     assert "TLS configuration fault" in str(caught.value)
     (ftp,) = _ScriptedFtp.instances
     assert ftp.closed, "the refused connection must be closed"
@@ -2534,22 +2535,27 @@ async def _e2e_runner(
 
     class _Sink(LoggingAlertSink):
         def __init__(self) -> None:
+            super().__init__()
             self.stopped: list[tuple[str, str]] = []
 
         def connection_stopped(self, name: str, *, detail: str) -> None:
             self.stopped.append((name, detail))
 
     store = await MessageStore.open(tmp_path / "config_fault.db")
-    mids = []
-    for n in range(3):
-        body = f"MSH|^~\\&|A|B|C|D|20260810||ADT^A01|MSG{n}|P|2.5\r"
-        mids.append(
-            await store.enqueue_message(
-                channel_id="IB", raw=body, deliveries=[(_E2E_DEST, body)], now=100.0 + n
+    try:
+        mids = []
+        for n in range(3):
+            body = f"MSH|^~\\&|A|B|C|D|20260810||ADT^A01|MSG{n}|P|2.5\r"
+            mids.append(
+                await store.enqueue_message(
+                    channel_id="IB", raw=body, deliveries=[(_E2E_DEST, body)], now=100.0 + n
+                )
             )
-        )
-    sink = _Sink()
-    runner = RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=sink)
+        sink = _Sink()
+        runner = RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=sink)
+    except BaseException:
+        await store.close()  # the callers' finally closes it only once this returns
+        raise
     runner._destinations[_E2E_DEST] = connector
     runner._retry[_E2E_DEST] = RetryPolicy()
     runner._simulate[_E2E_DEST] = False
@@ -2630,12 +2636,13 @@ async def test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row(
     [
         ("430 Invalid username or password", True),
         ("421 Too many connections (8) from this IP", False),  # CONTROL: a busy server
-        # Fix round 4 review: a 4xx naming a connection limit stays transient beside a credential
-        # word ("blocked", "refused"), as every 4xx was before #2083.
-        ("421 Too many users - blocked for 60 s", False),
-        ("421 Too many connections; connection refused", False),
+        # Fix round 4 review 2: a credential word wins over a limit phrase at a 4xx, as at a 5xx.
+        # Retried, the first would log in again into a locked account. The second is a busy
+        # server that stops the lane anyway, the cheaper error; the same word list decides both.
+        ("421 Too many connections; account locked", True),
+        ("421 Too many users - blocked for 60 s", True),
     ],
-    ids=["430-credential", "421-busy-control", "421-busy-blocked", "421-busy-refused"],
+    ids=["430-credential", "421-busy-control", "421-limit-and-lock", "421-busy-blocked"],
 )
 def test_a_4xx_login_refusal_naming_the_credential_is_a_credential_fault(
     monkeypatch: pytest.MonkeyPatch, reply: str, credential_fault: bool

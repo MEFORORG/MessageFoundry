@@ -205,12 +205,13 @@ from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
 __all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
 type Direction = Literal["inbound", "outbound"]
-#: A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083).
-type _LaneFault = Literal["credential", "configuration"]
 """Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
 enforces uniqueness per table, and the API's ``_dual_role_control`` carries a ``role=`` to
 disambiguate the pair), so every per-connection map that can hold an entry for either direction
 is keyed by ``(Direction, name)`` rather than by the bare name."""
+
+type _LaneFault = Literal["credential", "configuration"]
+"""A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
 
 
 log = logging.getLogger(__name__)

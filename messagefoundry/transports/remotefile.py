@@ -568,9 +568,10 @@ def _names_connection_limit(reply: str, *, at_login: bool) -> bool:
 
     **An unclear login refusal is a credential fault (BACKLOG #2083).** RFC 959 gives 530 for "not
     logged in", whatever the reason. So only the text can tell a busy server from a wrong password,
-    and servers word it freely. This function is the narrow test that lets a login refusal be read
-    as a busy server. :func:`_demands_tls` is the only other one. A login refusal that passes
-    neither is a credential fault, which stops the lane under the default policy (ADR 0095).
+    and servers word it freely. This function is the narrow test that lets a 5xx login refusal be
+    read as a busy server. :func:`_demands_tls` is another, and there may be more: a 4xx is
+    classified in :meth:`_FtpClient._connect`. A 5xx login refusal that passes neither is a
+    credential fault, which stops the lane under the default policy (ADR 0095).
 
     The two errors do not cost the same. Reading a busy server as a bad password stops one lane on
     this engine, with every message kept, until an operator resumes it. Reading a bad password as a
@@ -614,8 +615,7 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _Re
       worker stops the lane rather than retrying into an account lockout.
 
     These are the 5xx rules. A 4xx is transient, except a 4xx at the login that names the credential
-    ("430 Invalid username or password") and no connection limit: :meth:`_FtpClient._connect` makes
-    that a credential fault.
+    ("430 Invalid username or password"): :meth:`_FtpClient._connect` makes that a credential fault.
 
     The configuration faults carry ``config_fault`` (fix round 4). Every queued row would meet the
     same refusal, so on the delivery path the worker stops the lane and keeps the queue, as it does
@@ -706,17 +706,13 @@ class _FtpClient(_RemoteClient):
             raise _ftp_connect_refusal(step, exc, tls=self._tls) from exc
         except ftplib.error_temp as exc:
             ftp.close()
-            reply = str(exc)
-            if (
-                step == _FTP_LOGIN
-                and _names_credential(reply)
-                and not _FTP_CONNECTION_LIMIT.search(_last_reply_line(reply))
-            ):
+            if step == _FTP_LOGIN and _names_credential(str(exc)):
                 # A 4xx that names the credential ("430 Invalid username or password") is a refused
                 # login too: retried, it would lock the partner account (BACKLOG #2083, fix round 3).
-                # A 4xx naming a connection limit stays transient even beside such a word ("421 Too
-                # many users - blocked for 60 s"): RFC 959 makes a 4xx transient, and every 4xx was
-                # retried before #2083 (fix round 4 review).
+                # A credential word wins over a limit phrase here as it does at a 5xx, so "421 Too
+                # many connections; account locked" stops the lane. The word list is broad, so some
+                # busy or closing 4xx replies ("blocked", "terminated") stop it too: the cheaper
+                # error, as :func:`_names_connection_limit` explains (fix round 4 review 2).
                 raise _RemoteError(
                     f"FTP login refused: {exc}", permanent=True, credential_fault=True
                 ) from exc
@@ -1782,13 +1778,12 @@ class RemoteFileDestination(DestinationConnector):
             raise
         try:
             self._client.rename(tmp, final)
-        except _RemoteError as exc:
+        except _RemoteError:
             # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so the
-            # delivery is classified (retry/dead-letter) by send(). The rename opens its own session,
-            # so a connection fault there skips the cleanup for the store branch's reason: another
-            # session would be one more refused login, or the same refusal again.
-            if not exc.connection_fault:
-                self._remove_temp(tmp, name, "rename")
+            # delivery is classified (retry/dead-letter) by send(). Unlike the store branch, this
+            # tries even after a connection fault: the store succeeded, so a whole message sits in
+            # the temp, and the lane stops right after, so it costs one more login at most.
+            self._remove_temp(tmp, name, "rename")
             raise
 
     def _remove_temp(self, tmp: str, name: str, after: str) -> None:
