@@ -276,7 +276,9 @@ def _is_private(staging: Path) -> bool:
     probe = staging.parent / "owner-probe"
     probe.mkdir()
     try:
-        return dacl.owner == dr_backup._owner_of(probe)
+        probe_sddl = _read_dacl_sddl(probe, owner=True)
+        probe_dacl = _parse_sddl_dacl(probe_sddl) if probe_sddl else None
+        return probe_dacl is not None and dacl.owner == probe_dacl.owner
     finally:
         probe.rmdir()
 
