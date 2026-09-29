@@ -2843,7 +2843,10 @@ def _serve(args: argparse.Namespace) -> int:
     # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
     # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
-    # never trips this.
+    # never trips this. The hop here is NOT cleartext: the non-loopback gate above has already
+    # refused every arm but the warn path, so this fires only with no operator certificate and no
+    # declared proxy, where the engine would serve https on the minted placeholder (ADR 0172). The
+    # message says that, rather than "without TLS" (BACKLOG #1672).
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
     # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
     #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
@@ -2870,11 +2873,13 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
-            f"non-loopback host {settings.api.host!r} without TLS. The /ui surface requires "
-            "in-process TLS ([api].tls_cert_file) or a declared TLS-terminating proxy "
-            "([api].tls_terminated_upstream + trusted_proxies); --allow-insecure-bind does not cover "
-            "it. Set [security].listen_address to a loopback address (127.0.0.1) for local-only "
-            "access, or configure TLS.",
+            f"non-loopback host {settings.api.host!r} without an operator certificate or a "
+            "declared TLS-terminating proxy. The only certificate available is the engine's "
+            "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
+            "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
+            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies); "
+            "--allow-insecure-bind does not cover it. Set [security].listen_address to a loopback "
+            "address (127.0.0.1) for local-only access, or configure one of those two.",
             file=sys.stderr,
         )
         return 2
