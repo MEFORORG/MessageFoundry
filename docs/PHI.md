@@ -726,11 +726,13 @@ the platform's concern, not covered by the [§7](#7-logging--phi-redaction) inve
 
 PHI is exposed for the **minimum window and surface** needed to route and transform it:
 
-- **Peek at ingress; the strict model only on request.** Before the ACK, the listener reads only
-  the control id, message type and summary through the tolerant `Peek`
-  ([parsing/peek.py](../messagefoundry/parsing/peek.py)). The version-aware strict object model
-  (hl7apy) is built only on a connection's opt-in strict path. **This does not narrow what a Router
-  or Handler sees:** each receives the whole decrypted message, parsed, because routing and
+- **A tolerant parse at ingress; the strict model only on request.** Before the ACK, the listener
+  parses an HL7 body with the tolerant `Peek` ([parsing/peek.py](../messagefoundry/parsing/peek.py)),
+  which is a whole-message parse. The ingress row records only the control id, the message type
+  and a summary, and the summary is PHI: the MRN and name, plus order numbers for ORM/ORU. The ACK
+  echoes MSH header fields. The version-aware strict object model (hl7apy) is built only on a
+  connection's opt-in strict path. **None of this narrows what a Router or Handler sees:** each
+  receives the whole decrypted message, parsed (HL7) or verbatim (`RawMessage`), because routing and
   transformation are the site's own Python ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
   An earlier version of this bullet said routing reads only the fields a Router asks for; that was
   not what the code does (BACKLOG #1174).
