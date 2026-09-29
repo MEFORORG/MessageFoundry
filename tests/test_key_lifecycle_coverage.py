@@ -28,10 +28,10 @@ label :data:`_DEK` counts as governed only while that heading AND each of its fi
 
 **The SP 800-57 mapping is held to the same floor.** Every lifecycle label except the DEK must also
 have a row in the ``NIST SP 800-57 mapping for the other keys`` table, and every row there must name a
-lifecycle label. That table sits before ``### Rotation schedule``, inside the window
-:func:`lifecycle_labels` scans, so its rows lead with a PLAIN label: a bold one would be read as a
-second lifecycle row for the same key and hide a deleted one. This checks that each key HAS a mapping
-row, not that the row maps it correctly; that is the reviewer's job.
+lifecycle label. Each table is read only up to the next ``### `` heading, so a mapping row can never
+stand in for a deleted lifecycle row. This checks that each key HAS a mapping row, not that the row
+maps it correctly, and not that the key's lifecycle follows the standard: the mapping itself records
+where it departs. Judging the rows is the reviewer's job.
 """
 
 from __future__ import annotations
@@ -54,9 +54,7 @@ _DEK_BULLETS = (
     "- **Destruction**",
 )
 _LIFECYCLE_HEADING = "### Key management for the other keys the engine loads or mints"
-_NEXT_HEADING = "### Rotation schedule"
-#: The NIST SP 800-57 mapping for the non-DEK keys. It sits inside the lifecycle scan window, so its
-#: rows lead with a PLAIN label: a bold one would count as a lifecycle row and mask a deleted one.
+#: The NIST SP 800-57 mapping for the non-DEK keys. Its rows lead with a PLAIN label.
 _MAPPING_HEADING = "### NIST SP 800-57 mapping for the other keys"
 
 #: A cell or bullet counts as written only if it holds a letter or digit, not just a dash.
@@ -221,12 +219,41 @@ def _inventory() -> dict[str, frozenset[str]]:
     return inventory
 
 
+def _first_cells(lines: list[str], heading: str) -> list[str]:
+    """The first cell of each WRITTEN table body row under ``heading``, up to the next ``### ``.
+
+    A row counts as written only if it has at least four cells and every one holds text, so a row
+    emptied down to its label does not count. Header rows (the ones a separator follows) and
+    separators are skipped. An absent heading yields nothing.
+    """
+    start = next((i for i, line in enumerate(lines) if line.startswith(heading)), None)
+    if start is None:
+        return []
+    end = next(
+        (i for i, line in enumerate(lines[start + 1 :], start + 1) if line.startswith("### ")),
+        len(lines),
+    )
+    separator = re.compile(r"^\|\s*-")
+    firsts: list[str] = []
+    for i in range(start + 1, end):
+        line = lines[i]
+        if not line.startswith("| ") or separator.match(line):
+            continue
+        if i + 1 < end and separator.match(lines[i + 1]):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) >= 4 and all(_WORD.search(cell) for cell in cells):
+            firsts.append(cells[0])
+    return firsts
+
+
 def lifecycle_labels(doc: str) -> set[str]:
     """The key labels the document gives a lifecycle to.
 
-    Every table row in the lifecycle subsection whose first cell leads with a bold label, plus
-    :data:`_DEK` when the store-key policy heading is present. A row counts only if every one of its
-    cells has text, so a row emptied down to its label does not count as governed.
+    Every written table row in the lifecycle subsection whose first cell leads with a bold label,
+    plus :data:`_DEK` when the store-key policy heading and all its bullets are present. The
+    subsection ends at the next ``### `` heading, so a table in a later subsection (the SP 800-57
+    mapping) can never stand in for a deleted lifecycle row.
     """
     lines = doc.splitlines()
     labels: set[str] = set()
@@ -239,22 +266,9 @@ def lifecycle_labels(doc: str) -> set[str]:
             for lead in _DEK_BULLETS
         ):
             labels.add(_DEK)
-    if start is None:
-        return labels
-    end = next(
-        (
-            i
-            for i, line in enumerate(lines[start + 1 :], start + 1)
-            if line.startswith(_NEXT_HEADING)
-        ),
-        len(lines),
-    )
-    for line in lines[start:end]:
-        match = re.match(r"^\| \*\*(.+?)\*\*", line)
-        if not match:
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) >= 4 and all(_WORD.search(cell) for cell in cells):
+    for first in _first_cells(lines, _LIFECYCLE_HEADING):
+        match = re.match(r"\*\*(.+?)\*\*", first)
+        if match:
             labels.add(match.group(1))
     return labels
 
@@ -271,31 +285,17 @@ def uncovered(doc: str) -> list[str]:
 
 
 def mapping_labels(doc: str) -> set[str]:
-    """The key labels the SP 800-57 mapping table gives a row to.
+    """The key labels the SP 800-57 mapping table gives a written row to.
 
-    Every table row under :data:`_MAPPING_HEADING`, up to the next ``### `` heading, whose first
-    cell is a plain (not bold) label, skipping the header row. A row counts only if it has at least
-    four cells and every cell has text, so a row emptied down to its label does not count as mapped.
+    The first cell of each written row under :data:`_MAPPING_HEADING` is the label, spelled exactly
+    as the lifecycle label it maps. A bold first cell is not counted, because bold labels belong to
+    the lifecycle tables, so a key whose mapping row is bold reads as unmapped.
     """
-    lines = doc.splitlines()
-    start = next((i for i, line in enumerate(lines) if line.startswith(_MAPPING_HEADING)), None)
-    if start is None:
-        return set()
-    end = next(
-        (i for i, line in enumerate(lines[start + 1 :], start + 1) if line.startswith("### ")),
-        len(lines),
-    )
-    labels: set[str] = set()
-    for i in range(start + 1, end):
-        line = lines[i]
-        if not line.startswith("| ") or line.startswith("| **") or re.match(r"^\|\s*-", line):
-            continue
-        if i + 1 < end and re.match(r"^\|\s*-", lines[i + 1]):
-            continue  # the header row: the separator follows it
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) >= 4 and all(_WORD.search(cell) for cell in cells):
-            labels.add(cells[0])
-    return labels
+    return {
+        first
+        for first in _first_cells(doc.splitlines(), _MAPPING_HEADING)
+        if not first.startswith("**")
+    }
 
 
 def unmapped(doc: str) -> list[str]:
@@ -395,11 +395,11 @@ def test_a_no_key_reason_is_a_sentence() -> None:
 
 
 def test_every_lifecycle_key_has_an_sp800_57_mapping_row() -> None:
-    """ASVS 11.1.1's "follows a key management standard" limb, at the floor the lifecycle rows set.
+    """Every key with a lifecycle row, except the store DEK, has a row in the SP 800-57 mapping.
 
-    Every key with a lifecycle row, except the store DEK (whose policy carries its own heading
-    claim), must have a row in the NIST SP 800-57 mapping. Mutation: delete the SFTP client key's
-    mapping row. Red: ``SFTP client key``.
+    This is row PRESENCE only. It says nothing about whether a key's lifecycle follows the standard,
+    and the mapping records several places where it does not; do not score ASVS 11.1.1 off a green
+    here. Mutation: delete the SFTP client key's mapping row. Red: ``SFTP client key``.
     """
     doc = _DOC.read_text(encoding="utf-8")
     assert {_SFTP, _TOTP, _ANON_SALT} <= mapping_labels(doc), (
@@ -442,6 +442,13 @@ def test_deleting_a_mapping_row_turns_the_guard_red() -> None:
         line.replace(row, f"| **{_SFTP}** |", 1) if line.startswith(row) else line for line in lines
     ]
     assert _SFTP in unmapped("\n".join(bolded)), "a bold-labelled mapping row counted as mapped"
+    # A bold mapping row must not stand in for the lifecycle row either: delete the lifecycle row.
+    kept = [line for line in bolded if not line.startswith(f"| **{_SFTP}** —")]
+    assert len(kept) == len(bolded) - 1, "expected one SFTP lifecycle row to delete; its lead moved"
+    masked = "\n".join(kept)
+    assert f"messagefoundry/transports/remotefile.py -> {_SFTP}" in uncovered(masked), (
+        "a bold mapping row hid a deleted lifecycle row"
+    )
 
 
 def test_the_totp_mapping_row_takes_no_cryptoperiod() -> None:

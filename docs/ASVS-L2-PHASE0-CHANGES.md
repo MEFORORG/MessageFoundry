@@ -395,69 +395,89 @@ standard in whole.
 **Source.** NIST SP 800-57 Part 1 Rev. 5, *Recommendation for Key Management: Part 1 - General*
 (May 2020, <https://doi.org/10.6028/NIST.SP.800-57pt1r5>). It was read on 2026-09-28 from the PDF
 NIST publishes. The sections cited here are the ones that read covered: 5.1.1, 5.1.2, 5.2, 5.3.4,
-5.3.6 and 5.3.7; section 7 through 7.6; 8.1.4, 8.1.5 and 8.1.5.2.2; Table 7 (backup of keys, in 8.2.2); 8.3.1 with
-Table 9; 8.3.3, 8.3.4 and 8.3.5; and Appendix B.3.2, B.3.3.2 and B.3.4. No statement here rests on a
-section outside that list.
+5.3.6 and 5.3.7; section 7 through 7.6; 8.1.4, 8.1.5 and 8.1.5.2.2; Table 7 (backup of keys, in
+8.2.2); 8.3.1 with Table 9; 8.3.3, 8.3.4 and 8.3.5; and Appendix B.3.2, B.3.3.2 and B.3.4. No
+statement here rests on a section outside that list.
 
-**How to read the table.** Each row names the key type from section 5.1.1, then splits the lifecycle
-at the custody line. The third column is a claim about the engine, cited by code symbol. The fourth
-is a deployment precondition: what the standard asks of the key's owner that the engine cannot do or
-see. This document makes **no** claim that any site meets the fourth column. The cryptoperiods it
-quotes are the standard's suggestions, which section 5.3.6 calls rough order-of-magnitude
-guidelines. Like the tables above, this one covers at least the keys it lists, and
-`tests/test_key_lifecycle_coverage.py` fails when a key in those tables has no row here.
+**How to read the table.** Each row names the key type from section 5.1.1. Then it splits the
+lifecycle at the custody line. The third column is a claim about the engine, cited by code symbol.
+The fourth is a deployment precondition: what the standard asks of the key's owner that the engine
+cannot do or see. This document makes **no** claim that any site meets the fourth column.
 
-**Five points hold for every key below, so the rows do not repeat them.**
+Where a row says to set the cryptoperiod, the rotation schedule below gives the project's suggested
+cadence. The 5.3.6 figure quoted beside it is the standard's own guide, which 5.3.6 calls rough
+order of magnitude. A site that goes past it should record why, because 5.3.6 asks for serious
+thought about the risks of a longer period.
+
+Like the tables above, this one covers at least the keys it lists. `tests/test_key_lifecycle_coverage.py`
+fails when a key in those tables has no row here. It checks that each row exists, not that the row
+is right.
+
+**Six points hold for every key below, so the rows do not repeat them.**
 
 1. **Generation module.** Section 8.1.5 says all keys shall be generated within a FIPS 140-validated
    cryptographic module. The engine claims that for no key it mints. It mints with Python's
-   `secrets` and with `cryptography`, and [ADR 0120](adr/0120-fips-provider-mode-attestation-report-only-on-security-posture.md)
+   `secrets` and with `cryptography`. [ADR 0120](adr/0120-fips-provider-mode-attestation-report-only-on-security-posture.md)
    reports FIPS mode only for the OpenSSL behind `ssl` and `_hashlib`, never as a certification. A
-   site can mint its own keys in a validated module, except the TOTP secret, which only the engine
-   mints.
+   site can mint its own keys in a validated module. Two keys are the exception, because only the
+   engine mints them: the TOTP secret, and the API TLS placeholder key. Supplying a chain replaces
+   the placeholder with a different key, the API TLS server key.
 2. **No suspended state.** Section 7 lets a system leave out states it does not need. The engine has
    no suspended state (7.3) for any key. A key is in use or it is not.
-3. **No destruction to the 8.3.4 standard.** Section 8.3.4 asks that secret and private keys be
-   destroyed so that no trace can be recovered. The engine claims that for no key. When it discards
-   a key it deletes or replaces a file, sets a column to NULL, or drops a reference in memory. It
-   does nothing further to erase the old bytes.
-4. **State changes are recorded only for keys the engine mints.** Section 7 says each state
-   transition shall be recorded. The engine writes audit rows for the placeholder key and the TOTP
-   secret, named in their rows. For an operator-supplied key it records no state change, because it sees
-   only the setting that names the key, so recording those transitions is the site's job.
-5. **One purpose per key.** Section 5.2 says a key shall be used for only one purpose. Each key's row
-   in the inventory table above states that one use under **Usage scope**, and
-   `tests/test_key_usage_scope_inventory.py` fails when a row loses it.
+3. **No destruction to the 8.3.4 bar.** Section 8.3.4 asks that secret and private keys be destroyed
+   so that no trace can be recovered. The engine claims that for no key. When it discards a key it
+   deletes or replaces a file, sets a column to NULL, or drops a reference in memory. It does nothing
+   further to erase the old bytes.
+4. **Copies the engine can make.** The engine keeps no copy of an operator-supplied key of its own.
+   Two engine actions can still make one, as the holder-bounds bullet above says: `cert import`, and
+   the DR backup, which copies every file in the config directory into each archive. So "keep no
+   backup" in a row below includes keeping the key file outside the config directory.
+5. **State changes are recorded only in part.** Section 7 says each state transition shall be
+   recorded. The engine audits some changes to the two keys it mints, and the rows name which. It
+   does not audit the placeholder key's first mint, or the non-production key at all. For an
+   operator-supplied key it records no state change. It sees only the setting that names the key,
+   so recording those changes is the site's job.
+6. **One purpose per key.** Section 5.2 says a key shall be used for only one purpose. Each setting
+   in the inventory table above has one use, stated under **Usage scope**, and
+   `tests/test_key_usage_scope_inventory.py` fails when a row loses it. The engine does not stop a
+   site from pointing two settings at one key file. Using one key per setting is the site's job.
 
 | Key | SP 800-57 type (5.1.1) | What the engine does (claim) | What a deploying site must do (precondition) |
 |---|---|---|---|
-| Per-message JWS signing key | 1, private signature key. It signs outbound message bodies for source and integrity authentication | Loads the key once, at connector construction (`_load_private_key` in [`transports/signing.py`](../messagefoundry/transports/signing.py)), and uses it only to sign, which section 7.2 calls protect-only use. It makes no backup or archive copy | Choose the cryptoperiod. Section 5.3.6 item 1 suggests at most about one to three years, and says the key shall be destroyed when it ends. Keep no backup and no archive copy: Table 7 answers "No (in general)" to backup, and Table 9 answers No to archive. At retirement, withdraw the public key from each partner (8.3.5) and destroy every copy (8.3.4) |
-| SMART Backend Services client-assertion key | 4, private authentication key. It signs a short-lived assertion that proves the engine's identity to one authorization server. Read as a private authorization key (type 18) instead, the answers in this row are the same in substance | Loads it through the same signer (`CompactJwtSigner` in [`transports/signing.py`](../messagefoundry/transports/signing.py)) and signs assertions that live 240 seconds. It makes no copy | Choose the cryptoperiod. Section 5.3.6 item 4 suggests no more than one or two years. Back it up only if a new pair cannot be registered in time, and never archive it (B.3.3.2). At retirement, de-register the public key at the FHIR server (8.3.3) and destroy every copy |
-| DIRECT S/MIME sender signing key | 1, private signature key. It signs the S/MIME body; encryption uses the partner's public certificate, not this key | Reads the key file at construction, refuses a key that does not match `signing_cert` (`_verify_signing_key_matches_cert` in [`transports/direct.py`](../messagefoundry/transports/direct.py)), and uses it only to sign | As for the JWS signing key. Section 5.3.4 also says a public key's certificates shall not run past the private key's cryptoperiod, so a renewed `signing_cert` must not carry the key past it |
-| SFTP client key | 4, private authentication key. It signs the SSH user-authentication exchange | Parses the inline PEM with `paramiko.RSAKey.from_private_key` in `_SftpClient` ([`transports/remotefile.py`](../messagefoundry/transports/remotefile.py)) and uses it only to authenticate. It makes no copy | Choose the cryptoperiod under section 5.3.6 item 4. Keep no archive copy (B.3.3.2). At retirement, remove the public key from the peer (8.3.3) and destroy every copy |
-| API TLS server key | 4, private authentication key, while the handshake uses forward-secret key exchange (see *TLS key-exchange & cipher posture* below). A static-RSA suite would also make it a private key-transport key (type 10); this mapping relies on that subsection and does not re-measure it | Reads the key when it builds the listener context (`build_api_ssl_context` in [`api/tls.py`](../messagefoundry/api/tls.py)) and refuses to start on a bad key or passphrase. It makes no copy | Choose the cryptoperiod under section 5.3.6 item 4, and keep every certificate for the key inside it (5.3.4). Keep no archive copy (B.3.3.2). At retirement or compromise, have the CA revoke the certificate (8.3.5) and destroy every copy |
-| API TLS placeholder key | 4, private authentication key | Mints an EC P-256 key (`make_self_signed` in [`pki.py`](../messagefoundry/pki.py)) on the first `serve` with no chain, writes it once through `_write_private_key`, and serves it at once, so it moves straight from pre-activation to active (7.1, transition 4). **Here the engine sets the key's period.** Every renewal mints a new key (`_renew_generated_pair` in [`api/tls.py`](../messagefoundry/api/tls.py)), at the first start with under a third of the 365-day certificate left, so an old key is never re-certified. Each replacement is audited as `api.tls_generated_pair_replaced`. The new key file replaces the old one by rename | Restart the engine often enough for renewal to run, because the engine renews only at startup. Better, supply a chain, then delete both placeholder files, which the engine leaves in place |
-| Per-connection TLS server key | 4, on the same condition as the API TLS server key | Reads the key when the connection builds its server context (`_mllp_ssl_context` in [`transports/mllp.py`](../messagefoundry/transports/mllp.py), which the HTTP listener reuses, and `_server_ssl_context` in [`transports/dicom.py`](../messagefoundry/transports/dicom.py)). It makes no copy | As for the API TLS server key |
-| Outbound mTLS client key | 4, on the same condition as the API TLS server key | Reads the key when the connection builds its client context (`_mllp_ssl_context`, `_client_ssl_context` in `transports/dicom.py`, `_client_cert_opener` in `transports/soap.py`, `_ftps_ssl_context` in `transports/remotefile.py`). It makes no copy | As for the API TLS server key. Where the partner pins the certificate instead of trusting a CA, retiring the key also means removing it from the partner's enrolment |
+| Per-message JWS signing key | 1, private signature key. It signs outbound message bodies for source and integrity authentication | Loads the key once, at connector construction (`_load_private_key` in [`transports/signing.py`](../messagefoundry/transports/signing.py)). It uses the key only to sign, which section 7.2 calls protect-only use. It keeps no copy of its own | Set the cryptoperiod. Section 5.3.6 item 1 suggests at most about one to three years, and says the key shall be destroyed when it ends. Keep no backup and no archive copy: Table 7 answers "No (in general)" to backup, and Table 9 answers No to archive. At retirement, withdraw the public key from each partner (8.3.5) and destroy every copy (8.3.4) |
+| SMART Backend Services client-assertion key | 4, private authentication key. It signs a short-lived assertion that proves the engine's identity to one authorization server. Read as a private authorization key (type 18) instead, the answers in this row are the same in substance | Loads it through the same signer (`CompactJwtSigner` in [`transports/signing.py`](../messagefoundry/transports/signing.py)) and signs assertions that live 240 seconds. It keeps no copy of its own | Set the cryptoperiod. Section 5.3.6 item 4 suggests no more than one or two years. Back it up only if a new pair cannot be registered in time, and never archive it (B.3.3.2). At retirement, de-register the public key at the FHIR server (8.3.3) and destroy every copy |
+| DIRECT S/MIME sender signing key | 1, private signature key. It signs the S/MIME body; encryption uses the partner's public certificate, not this key | Reads the key file at construction. It refuses a key that does not match `signing_cert` (`_verify_signing_key_matches_cert` in [`transports/direct.py`](../messagefoundry/transports/direct.py)) and uses the key only to sign | As for the JWS signing key. Section 5.3.4 also says a public key's certificates shall not run past the private key's cryptoperiod, so a renewed `signing_cert` must not carry the key past it |
+| SFTP client key | 4, private authentication key. It signs the SSH user-authentication exchange | Parses the inline PEM with `paramiko.RSAKey.from_private_key` in `_SftpClient` ([`transports/remotefile.py`](../messagefoundry/transports/remotefile.py)) and uses it only to authenticate. It keeps no copy of its own | Set the cryptoperiod under section 5.3.6 item 4. Keep no archive copy (B.3.3.2). At retirement, remove the public key from the peer (8.3.3) and destroy every copy |
+| API TLS server key | 4, private authentication key, while the handshake uses forward-secret key exchange (see *TLS key-exchange & cipher posture* below). A static-RSA suite would also make it a private key-transport key (type 10). This mapping relies on that subsection and does not re-measure it | Reads the key when it builds the listener context (`build_api_ssl_context` in [`api/tls.py`](../messagefoundry/api/tls.py)). It refuses to start on a bad key or passphrase, and keeps no copy of its own | Set the cryptoperiod under section 5.3.6 item 4, and keep every certificate for the key inside it (5.3.4). Keep no archive copy (B.3.3.2). At retirement or compromise, have the CA revoke the certificate (8.3.5) and destroy every copy |
+| API TLS placeholder key | 4, private authentication key | Mints an EC P-256 key (`make_self_signed` in [`pki.py`](../messagefoundry/pki.py)) and serves it at once, so the key moves straight from pre-activation to active (7.1, transition 4). **Here the engine sets the key's period.** Every renewal mints a new key (`_renew_generated_pair` in [`api/tls.py`](../messagefoundry/api/tls.py)), so an old key is never re-certified, which fits 5.3.4. The lifecycle row above gives the renewal cadence and the audit row each replacement writes. The first mint writes a log warning, not an audit row | Restart the engine often enough for renewal to run, because the engine renews only at startup. Better, supply a chain. Then delete both placeholder files, which the engine leaves in place |
+| Per-connection TLS server key | 4, on the same condition as the API TLS server key | Reads the key when the connection builds its server context (`_mllp_ssl_context` in [`transports/mllp.py`](../messagefoundry/transports/mllp.py), which the HTTP listener reuses, and `_server_ssl_context` in [`transports/dicom.py`](../messagefoundry/transports/dicom.py)). It keeps no copy of its own | As for the API TLS server key |
+| Outbound mTLS client key | 4, on the same condition as the API TLS server key | Reads the key when the connection builds its client context (`_mllp_ssl_context`, `_client_ssl_context` in `transports/dicom.py`, `_client_cert_opener` in `transports/soap.py`, `_ftps_ssl_context` in `transports/remotefile.py`). It keeps no copy of its own | As for the API TLS server key. Where the partner pins the certificate instead of trusting a CA, retiring the key also means removing it from the partner's enrolment |
 | Off-box log-forward client key | 4, on the same condition as the API TLS server key | Loads the combined PEM in `_build_tls_context` ([`logging_setup.py`](../messagefoundry/logging_setup.py)). There is no passphrase setting | As for the API TLS server key. The file's permissions are the key's only protection, so setting them is the site's job |
 | Native API client key | 4, on the same condition as the API TLS server key | Holds no copy. The client process loads it (`_build_verify_context` in [`apiclient/client.py`](../messagefoundry/apiclient/client.py)) | Every function in this row belongs to the operator of the client machine |
-| Non-production self-signed key | Test keying material under section 8.1.4; as a key, type 4 | Mints it on request (`make_self_signed` in [`pki.py`](../messagefoundry/pki.py)). The CLI writes it through `_write_private_key`, which refuses to overwrite an existing file | Never use it operationally. Section 8.1.4 says test keying material shall not be used operationally, and the engine does not stop that |
-| TOTP shared secret | 3, symmetric authentication key: an HMAC key shared by exactly two parties | **Pre-activation (7.1):** `begin_mfa_enrollment` in [`auth/service.py`](../messagefoundry/auth/service.py) stages a fresh secret from `generate_secret` ([`auth/totp.py`](../messagefoundry/auth/totp.py)); calling it again before confirmation replaces the staged one. **Key confirmation, then active (7.1, transition 4):** `confirm_mfa_enrollment` turns MFA on only after a live code proves the user's copy. **Destroyed:** `disable_totp` sets the column to NULL on a disable or an administrator reset. The audit rows `auth.mfa_enroll_started`, `auth.mfa_enrolled`, `auth.mfa_disabled` and `auth.mfa_reset` record those changes. **Distribution:** the engine shows it once, to its second holder (the table above). **Backup:** each DR archive holds a copy sealed under the DEK. Table 7 allows backup of this key type, and B.3.2 (its case 3) says a key that can be re-established need not be backed up; re-enrolment re-establishes this one. **Cryptoperiod: none.** The secret is exempt from a calendar lifetime (owner ruling 2026-09-27, BACKLOG #1931). Section 5.3.6 item 3 suggests an originator-usage period of no more than two years, so this is a recorded departure from that suggestion, not an alignment with it | Keep the user's copy in one authenticator. After an administrator reset, tell the user to delete the old entry: section 8.3.5 says the party revoking a key shared by two shall inform the other. Older copies stay in DR archives and in the database file until the site discards the DEK that sealed them |
+| Non-production self-signed key | Test keying material under section 8.1.4; as a key, type 4 | Mints it on request (`make_self_signed` in [`pki.py`](../messagefoundry/pki.py)). The CLI writes it through `_write_private_key`, which refuses to overwrite an existing file. Nothing is audited | Never use it operationally. Section 8.1.4 says test keying material shall not be used operationally, and the engine does not stop that |
+| TOTP shared secret | 3, symmetric authentication key: an HMAC key shared by exactly two parties | **Pre-activation (7.1):** `begin_mfa_enrollment` in [`auth/service.py`](../messagefoundry/auth/service.py) stores a fresh staged secret and audits `auth.mfa_enroll_started`. A later call replaces it. A staged secret nobody confirms stays in the column until then, or until a disable or reset; nothing moves it on by time. **Key confirmation, then active (7.1, transition 4):** `confirm_mfa_enrollment` turns MFA on only after a live code proves the user's copy, and audits `auth.mfa_enrolled`. **Out of use:** `disable_totp` sets the live column to NULL on a disable or an administrator reset, audited as `auth.mfa_disabled` or `auth.mfa_reset`. That removes the live copy. It is not destruction to the 8.3.4 bar (point 3), because older copies can survive. **Backup:** where a DR archive carries the store, it carries the secret; the lifecycle row above says when discarding the DEK erases those copies. Table 7 allows backup of this key type, and B.3.2 (its case 3) says a key that can be re-established need not be backed up. Re-enrolment re-establishes this one. **Cryptoperiod: none.** The secret is exempt from a calendar lifetime (owner ruling 2026-09-27, BACKLOG #1931). Section 5.3.6 item 3 suggests an originator-usage period of no more than two years. So this is a recorded departure from that suggestion, not an alignment with it | Keep the user's copy in one authenticator. After an administrator reset, tell the user to delete the old entry. Section 8.3.5 says the party revoking a key shared by two shall inform the other |
 | Anonymizer re-identification salt | None of the 19 types in 5.1.1 fits. It keys a hash that pseudonymizes one dataset. The nearest fit is 5.1.2's *other secret information*, so this row borrows 5.3.7's rule for that and takes no cryptoperiod from 5.3.6 | Never mints or stores it. `Keyer` in [`anon/keying.py`](../messagefoundry/anon/keying.py) refuses a visibly weak salt, and the export reads it from the environment for one run | Mint it with a CSPRNG, one per dataset, and hold it with one person. Section 5.3.7 says other secret information shall not be kept longer than necessary, so its period is one dataset. Keep no backup unless the dataset must be regenerated, and destroy it when that need ends |
 
-**What the standard says about escrow, which BACKLOG #1162 asked.** In SP 800-57 the one-holder bound
-for private keys and the DEK's escrow do not pull against each other, because the standard decides
-backup by key type. The DEK is a symmetric data-encryption key (type 6). Table 7 allows its backup,
-B.3.4 says it should be backed up while data encrypted under it may need decrypting, and 8.1.5.2.2
-says a key used only for storage shall not be distributed except for backup or to other authorized
-entities that need the stored data. So one escrow copy is what the standard expects, and any copy
-beyond it needs a reason of its own. For the private keys in the first table the answer runs the
-other way. Table 7 answers "No (in general)" for signature keys and says a backed-up one shall be
-stored under the owner's control. B.3.3.2 says an authentication key need not be backed up when a
-new pair can be issued in time, which is what losing one of those keys costs (the Distribution
-paragraph above). Section 8.3.4 adds the bookkeeping: when copies are made, plan for their
-destruction, for example by recording who shares the key. The engine keeps no such record for any
-key, so the site must.
+**What the standard says about escrow, which BACKLOG #1162 asked.** In SP 800-57, the one-holder
+bound for private keys and the DEK's escrow do not pull against each other. The standard decides
+backup by key type. The DEK is a symmetric data-encryption key (type 6). It is also a key-derivation
+key (type 9), because `store/crypto.py` derives the v4 data sub-key and the audit-chain MAC key from
+it with HKDF. Table 7 allows backup of both types. B.3.4 says a data-encryption key should be backed
+up while data encrypted under it may need decrypting. And 8.1.5.2.2 says a key used only for storage
+shall not be distributed, except for backup or to other authorized entities that need the data. So
+one escrow copy is what the standard expects. Any copy beyond it needs a reason of its own. (This
+read did not assess the DEK's two roles against the one-purpose rule in 5.2.)
+
+For the private keys in the first table, the answer runs the other way. Table 7 answers "No (in
+general)" to backing up a signature key. It adds that a key which is backed up shall be stored under
+the owner's control. B.3.3.2 says an authentication key need not be backed up when a new pair can be
+issued in time. A re-issue is exactly what losing one of those keys costs, as the Distribution
+paragraph above says.
+
+Section 8.3.4 adds the bookkeeping. When copies are made, plan for their destruction, for example by
+recording who shares the key. For the TOTP secret, the audit rows in its mapping row name the account
+that holds the second copy. For every operator-supplied key the engine keeps no such record, so the
+site must.
 
 ### Rotation schedule (ASVS 13.1.4 / 13.3.4)
 
