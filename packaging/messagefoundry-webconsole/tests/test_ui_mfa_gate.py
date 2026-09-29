@@ -732,7 +732,13 @@ async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
         r = await _change_password(c, current=PW)
         assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
         assert (await c.get("/ui/account")).status_code == 200  # the enrolment page is open
+        # Session termination is not on the enrol-first path, matching the JSON plane.
+        r = await c.get("/ui/account/sessions")
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
     assert not (await service.login("newbie", PW2)).ok  # the rotation never landed
+    # Sending an account to enrol refuses no factor it holds, so it is not an MFA denial.
+    for path in ("/ui/mfa", _PASSWORD, "/ui/account/sessions", "/ui"):
+        assert await _denials_for(engine, path) == 0, path
 
     t0 = 1_000_000.0
     _pin_totp_clock(monkeypatch, t0)

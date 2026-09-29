@@ -313,7 +313,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/oidc_http.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     "messagefoundry/auth/passwords.py": frozenset({"argon2"}),
     "messagefoundry/auth/policy.py": frozenset({"hashlib"}),
-    "messagefoundry/auth/service.py": frozenset({"messagefoundry.config.tls_policy", "secrets"}),
+    # ADR 0197 Amendment A (AC-A9): store.crypto for CipherError alone, so the lockable-account census
+    # can tell a TOTP cell the store key does not open apart from any other store error.
+    "messagefoundry/auth/service.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
+    ),
     "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
     # WP #285 (ASVS 6.7.1): SHA-256 fingerprint of an operator-supplied auth-path trust anchor
@@ -1402,6 +1406,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/verify/runner.py": frozenset({"tls_context:via messagefoundry.verify.smoke"}),
+    # ADR 0197 Amendment A (AC-A9): the lockable-account census computes one TOTP code per enabled
+    # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is
+    # discarded and never compared.
+    "messagefoundry/verify/checks.py": frozenset({"mac:via messagefoundry.auth.service"}),
     "messagefoundry_webconsole/routes/account.py": frozenset(
         {"hash:via messagefoundry.auth.tokens"}
     ),

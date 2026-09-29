@@ -122,7 +122,9 @@ Four properties are load-bearing rather than incidental:
 **The first Administrator enrols an authenticator app at the terminal** ([ADR
 0197](adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
 Amendment A, N-A). After the password, the command generates a TOTP key in memory and shows it, as a
-key and an `otpauth://` URI. You add it to the app and type the code the app shows. The command
+key and an `otpauth://` URI. You add it to the app and type the code the app shows. The codes use
+SHA-256, so add the account by its URI, which names the algorithm; an app that takes only the key
+must be set to SHA-256. The command
 checks that code before it writes anything, so a wrong code writes nothing; after five wrong codes it
 stops. It then writes the account, the password, the TOTP key and recovery codes, and the role last.
 It prints the recovery codes once. The account starts with a way past a sign-in lock: the combined
@@ -181,8 +183,11 @@ create form has no password field and shows the credential once.
 
 **The factor reset issues one too.** `POST /users/{user_id}/reset-mfa` on a local account writes a
 generated credential **first**, then clears the TOTP key, the recovery codes and every passkey and
-revokes the sessions. It returns the credential once. The order means a crash between the writes
-leaves a generated credential with factors, never a chosen password without them. A directory account
+revokes the sessions, then writes the same credential again. It returns the credential once, and
+the holder gets a password-reset notice with its deadline. The first write means a crash between the
+writes leaves a generated credential with factors, never a chosen password without them. The second
+means a holder's password change that lands between the writes cannot leave a chosen password with no
+factor either. A directory account
 has no engine password and gets none.
 
 **While a generated credential stands, wrong passwords arm no sign-in lock.** Each is still counted

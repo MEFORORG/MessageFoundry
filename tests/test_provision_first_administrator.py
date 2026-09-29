@@ -1471,3 +1471,36 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         assert "h1" not in await store.get_recovery_code_hashes("earlier")
     finally:
         await store.close()
+
+
+async def test_a_code_the_row_already_spent_is_refused_before_any_password_is_written() -> None:
+    """Review round 1: the step is consumed before the credential is written, so a re-run inside
+    the same 30 seconds on a row that already spent that step writes no password."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.create_user(
+            user_id="half",
+            username="site-admin",
+            auth_provider="local",
+            password_hash=None,
+            must_change_password=True,
+            password_generated=False,
+        )
+        kw = provision_totp()
+        from messagefoundry.auth import totp
+
+        spent = totp.verify_totp_step(
+            kw["totp_secret"], kw["totp_code"], now=kw["totp_code_read_at"]
+        )
+        assert spent is not None and await store.consume_totp_step("half", spent)
+        with pytest.raises(FirstAdministratorRefused, match="no password was set"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test", **kw
+            )
+        row = await store.get_user("half")
+        assert row is not None and row.password_hash is None and not row.totp_enabled
+        assert await store.get_user_role_ids("half") == []
+    finally:
+        await store.close()

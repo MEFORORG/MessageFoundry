@@ -2535,3 +2535,119 @@ async def test_the_mfa_enabled_notice_to_a_must_change_account_says_who_to_tell(
         assert "have not signed in" in body and "administrator" in body
     finally:
         await store.close()
+
+
+# --- review round 1 (ADR 0197 Amendment A) -------------------------------------------------------
+
+
+async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chosen_password_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other ordering of the reset/rotation race. The reset writes its credential, then a
+    holder's rotation -- which read TOTP on -- lands its conditional write before the reset clears
+    TOTP. The reset writes its credential again once the factors are gone, so the account ends with
+    the generated credential, never a chosen password with no factor. And the holder hears of the
+    password change as a PASSWORD_RESET, with its deadline."""
+    from messagefoundry.auth.notifications import PASSWORD_RESET
+
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        identity = await _enrol_totp(service, monkeypatch)
+        real_disable = store.disable_totp
+
+        async def rotation_lands_first(user_id: str, **k: Any) -> None:
+            assert await store.set_password(
+                user_id,
+                password_hash=await asyncio.to_thread(hash_password_for_test, "a-chosen-one-99x"),
+                password_generated=False,
+                must_change_password=False,
+                require_totp=True,
+            ), "the holder's conditional write must match here, TOTP is still on"
+            await real_disable(user_id, **k)
+
+        monkeypatch.setattr(store, "disable_totp", rotation_lands_first)
+        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        assert issued is not None
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.password_generated and not row.totp_enabled
+        assert (await service.login(ADMIN_USERNAME, issued.password)).ok
+        assert not (await service.login(ADMIN_USERNAME, "a-chosen-one-99x")).ok
+        assert any(e.event_type == PASSWORD_RESET for e in notifier.events)
+    finally:
+        await store.close()
+
+
+async def test_the_census_reads_every_account_it_should_and_nothing_it_should_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory account's unusable TOTP secret is named. A local row with no hash is not: nobody
+    can sign into it. A keyless read that hands ciphertext through counts as unusable. Any other
+    store error is not a finding, so it propagates rather than sending an operator to reset a
+    healthy account."""
+    from messagefoundry.auth.service import lockable_account_census
+
+    store = await _store()
+    try:
+        await store.create_user(
+            user_id="dir-totp", username="directory", auth_provider="ad", password_generated=False
+        )
+        await store.set_totp_secret("dir-totp", secret="JBSWY3DPEHPK3PXP")
+        await store.enable_totp("dir-totp", recovery_code_hashes=[])
+        await store.create_user(
+            user_id="hashless",
+            username="half-built",
+            auth_provider="local",
+            password_generated=False,
+        )
+        real = store.get_totp_secret
+
+        async def ciphertext_through(user_id: str) -> str | None:
+            if user_id == "dir-totp":
+                return "mfenc:v2:not-a-base32-key"
+            return await real(user_id)
+
+        monkeypatch.setattr(store, "get_totp_secret", ciphertext_through)
+        census = await lockable_account_census(store, AuthSettings())
+        assert census.undecryptable_totp == ("directory",)
+        assert census.no_way_past == ()
+
+        async def unreachable(user_id: str) -> str | None:
+            raise ConnectionError("synthetic: the store went away")
+
+        monkeypatch.setattr(store, "get_totp_secret", unreachable)
+        with pytest.raises(ConnectionError):
+            await lockable_account_census(store, AuthSettings())
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_can_still_be_revoked_by_a_covered_account_with_no_totp() -> None:
+    """Review round 1: removing a passkey cannot take away a way past in wave 1, so a covered
+    account holding two passkeys and no TOTP may still remove a lost one."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, _token, _pw = await login_admin(service)
+        for n in (1, 2):
+            await store.add_webauthn_credential(
+                WebAuthnCredential(
+                    credential_id_hash=f"pk-{n}-hash",
+                    credential_id=f"pk-{n}-id",
+                    user_id=identity.user_id,
+                    rp_id="t",
+                    public_key="cose-public-key-b64url",
+                    sign_count=0,
+                    transports=None,
+                    device_type="multi_device",
+                    backed_up=True,
+                    label=f"key {n}",
+                    aaguid=None,
+                    created_at=1000.0,
+                )
+            )
+        assert await service.delete_webauthn_credential(identity, "pk-1-hash")
+        assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
+    finally:
+        await store.close()

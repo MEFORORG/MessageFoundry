@@ -43,6 +43,7 @@ __all__ = [
     "browser_hardening_enabled",
     "clear_oidc_flow_cookie",
     "ENROL_FIRST_PAGE",
+    "ENROL_FIRST_UI_PATHS",
     "clear_session_cookie",
     "confined_before_its_factor",
     "effective_https",
@@ -314,6 +315,18 @@ async def must_change_target(auth: AuthService, token: str | None) -> str:
 #: page, which offers the TOTP enrolment, with the notice that says why.
 ENROL_FIRST_PAGE = "/ui/account?m=enroll_first"
 
+#: The /ui routes a must-change session that must enrol first may reach (ADR 0197 Amendment A):
+#: the account page and the TOTP enrolment ceremony. ``/ui/reauth`` makes the same decision by hand.
+#: Session termination and passkey registration are NOT here, matching the JSON plane.
+ENROL_FIRST_UI_PATHS = frozenset(
+    {
+        "/ui/account",
+        "/ui/account/mfa/enroll",
+        "/ui/account/mfa/confirm",
+        "/ui/account/mfa/verify",
+    }
+)
+
 
 #: A route's own refusal of an MFA-pending session, for a route that passes ``allow_mfa_pending``.
 #: Returns the exception to raise, or None to let the session through. See :func:`require_ui`.
@@ -390,18 +403,24 @@ def require_ui(
             # instead of appearing as an unexplained form, and its render carries Clear-Site-Data
             # too (14.3.1). A visitor with NO cookie never had a session — plain form, no code.
             raise _login_redirect("expired" if token else "")
-        # ADR 0197 Amendment A: a must-change session that must enrol first may reach the routes a
-        # pending session may (the enrolment, confinement and account pages), and nothing else.
+        # ADR 0197 Amendment A: a must-change session that must enrol first may reach the TOTP
+        # enrolment path (ENROL_FIRST_UI_PATHS), the console twin of the JSON plane's
+        # _ENROL_FIRST_ROUTES, and nothing else.
         if (
             identity.must_change_password
             and not allow_must_change
-            and not (allow_mfa_pending and await auth.must_enrol_before_rotating(identity))
+            and not (
+                request.url.path in ENROL_FIRST_UI_PATHS
+                and await auth.must_enrol_before_rotating(identity)
+            )
         ):
             # A flagged account can go nowhere but the change-password page (L4b) until it rotates,
             # the factor page first when it still owes an enrolled factor (BACKLOG #1954), or the
-            # enrolment page first when it must enrol before rotating (ADR 0197 Amendment A).
+            # enrolment page first when it must enrol before rotating (ADR 0197 Amendment A). Only
+            # the factor-page redirect is audited as an MFA refusal: an account that must enrol owes
+            # no factor it has, so sending it to enrol refuses nothing it could prove.
             target = await must_change_target(auth, token)
-            if target != "/ui/account/password":
+            if target == "/ui/mfa":
                 # The MFA refusal in all but name, so it is audited like the one below (#1197), with
                 # the client read through the same extractor (BACKLOG #2088).
                 await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))

@@ -197,7 +197,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # way past the sign-in lock enrols one BEFORE it may rotate. The service refuses the
         # rotation itself; this sends the holder to enrolment instead of to that error.
         if await service.must_enrol_before_rotating(_identity):
-            return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": ENROL_FIRST_PAGE})
+            # RAISED, not returned: require_ui audits a returned refusal as ``auth.mfa_denied``, and
+            # an account that must enrol owes no factor it has, so this refuses nothing it could
+            # prove. It is a redirect to the next step, not an MFA denial.
+            raise HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": ENROL_FIRST_PAGE})
         if not await service.password_change_owes_factor(session_token(request)):
             return None
         return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/mfa"})

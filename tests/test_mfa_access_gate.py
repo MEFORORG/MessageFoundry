@@ -766,6 +766,10 @@ async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
             refused = await _change_password(c, tok, current=password)
             assert refused.status_code == 403, f"{username}: {refused.text}"
             assert refused.json()["detail"] == "enrol an authenticator app first"
+            # The enrol-first path is (METHOD, path): GET /me/mfa is on it, DELETE /me/mfa is not.
+            assert (await c.get("/me/mfa", headers=_auth(tok))).status_code == 200
+            deleted = await c.delete("/me/mfa", headers=_auth(tok))
+            assert deleted.status_code == 403 and "password change required" in deleted.text
             # Every other route still says rotate, and now says what comes first.
             blocked = await c.get("/users", headers=_auth(tok))
             assert blocked.status_code == 403

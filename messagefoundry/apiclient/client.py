@@ -36,12 +36,14 @@ from messagefoundry.api.auth_models import (
     LoginResponse,
     MfaConfirmResponse,
     MfaEnrollResponse,
+    MfaResetResponse,
     MfaStatusResponse,
     ProvidersInfo,
     RoleInfo,
     SessionInfo,
     SessionList,
     SimpleMessage,
+    UserCreatedResponse,
     UserSummary,
 )
 from messagefoundry.api.models import (
@@ -1034,9 +1036,11 @@ class EngineClient:
         """Turn off the signed-in user's TOTP MFA (step-up gated)."""
         self._request("DELETE", "/me/mfa")
 
-    def reset_user_mfa(self, user_id: str) -> None:
-        """Admin: clear a user's MFA enrollment and revoke their sessions (step-up gated)."""
-        self._request("POST", f"/users/{_seg(user_id)}/reset-mfa")
+    def reset_user_mfa(self, user_id: str) -> MfaResetResponse:
+        """Admin: clear a user's MFA enrollment and revoke their sessions (step-up gated). On a local
+        account the engine also issues a generated credential, returned ONCE in ``temp_password``
+        (ADR 0197 Amendment A); convey it out-of-band, since the old password no longer works."""
+        return _decode(self._request("POST", f"/users/{_seg(user_id)}/reset-mfa"), MfaResetResponse)
 
     # --- endpoints -----------------------------------------------------------
 
@@ -1568,21 +1572,22 @@ class EngineClient:
     def create_user(
         self,
         username: str,
-        password: str,
         *,
         email: str,
         display_name: str | None = None,
         roles: list[str] | None = None,
-    ) -> UserSummary:
-        """``email`` is required: it becomes the account's notification address (BACKLOG #2018)."""
+    ) -> UserCreatedResponse:
+        """``email`` is required: it becomes the account's notification address (BACKLOG #2018).
+
+        There is no password argument (ADR 0197 Amendment A): the engine generates the credential
+        and returns it ONCE, in ``temp_password``, for the caller to convey out-of-band."""
         body = {
             "username": username,
-            "password": password,
             "display_name": display_name,
             "email": email,
             "roles": roles or [],
         }
-        return _decode(self._request("POST", "/users", json=body), UserSummary)
+        return _decode(self._request("POST", "/users", json=body), UserCreatedResponse)
 
     def set_user_roles(self, user_id: str, roles: list[str]) -> None:
         self._request("PUT", f"/users/{_seg(user_id)}/roles", json={"roles": roles})

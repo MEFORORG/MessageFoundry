@@ -5538,7 +5538,9 @@ def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str
     secret = totp.generate_secret()
     print(
         "\nEnrol an authenticator app for this Administrator now (ADR 0197). Add this account to "
-        "the app by its key or its URI, then type the 6-digit code it shows.\n"
+        "the app by its URI, which names the algorithm, then type the 6-digit code it shows. The "
+        "codes use SHA-256: an app that takes only the key must be set to SHA-256, or its codes "
+        "will never match.\n"
         f"  key: {secret}\n"
         f"  URI: {totp.otpauth_uri(secret, username)}\n",
         file=sys.stderr,
@@ -5553,8 +5555,9 @@ def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str
             return secret, code, read_at
         print("That code did not match. Try the current one.", file=sys.stderr)
     raise _PasswordEntryRefused(
-        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match; nothing was written. Check the device's "
-        "clock and run the command again."
+        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match; nothing was written. Check that the app "
+        "uses SHA-256 (add the account by its URI) and that the device's clock is right, then run "
+        "the command again."
     )
 
 

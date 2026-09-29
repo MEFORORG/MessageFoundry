@@ -852,8 +852,9 @@ def temp_password_page(
         el("h1", heading),
         el(
             "p",
-            f"Convey this to {username} out-of-band. It is shown once. At first sign-in they set "
-            "up an authenticator app, then choose a new password.",
+            f"Convey this to {username} out-of-band. It is shown once and must be replaced at first "
+            "sign-in. Where MFA is required and the account has no authenticator app, they set one "
+            "up first.",
             class_="muted",
         ),
         el("p", el("code", temp_password)),

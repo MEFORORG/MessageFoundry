@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import http.client
 import ipaddress
 import json
@@ -91,6 +92,7 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.store.base import AdminStore
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -1180,6 +1182,79 @@ def _roles_from_ids(ids: Iterable[str]) -> frozenset[Role]:
     return frozenset(out)
 
 
+def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozenset[Role]) -> bool:
+    """Whether ``[security].require_mfa`` covers ``user`` as a LOCAL account, enrolled or not (ADR
+    0197 Amendment A). The one statement of the rule, shared by the service's gates and by
+    :func:`lockable_account_census`, which runs without a service. It is
+    ``AuthService._mfa_required_for`` with no factor enrolled, restricted to local accounts."""
+    if user.auth_provider != AuthProvider.LOCAL.value or not settings.require_mfa:
+        return False
+    return settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
+
+
+async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
+    """Whether ``user``'s enabled TOTP secret decrypts to a key the engine can compute codes with.
+
+    Two ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
+    the account and never the value. Or a keyless open hands the stored ciphertext through unchanged,
+    which is not base32, so computing a code from it fails. Any other store error propagates: it
+    says nothing about this secret, and filing it as "undecryptable" would send an operator to reset
+    a healthy account."""
+    try:
+        secret = await store.get_totp_secret(user.id)
+    except CipherError:
+        _log.warning(
+            "the TOTP secret of account %r does not decrypt under this store key", user.username
+        )
+        return False
+    if not secret:
+        return False
+    try:
+        totp.totp(secret)
+    except (ValueError, binascii.Error):
+        return False
+    return True
+
+
+async def lockable_account_census(
+    store: AdminStore, settings: AuthSettings
+) -> LockableAccountCensus:
+    """Name every account that is still lockable with no way past the sign-in lock (ADR 0197
+    Amendment A, N-B2 part 6, AC-A9).
+
+    Two populations. **A covered local account holding a chosen credential and no TOTP**: the gates
+    of part 4 never let a holder reach that state under the shipped defaults, so one that exists got
+    there another way -- for instance while the site ran with ``require_mfa`` off, or from before
+    this change. **An enabled TOTP secret the engine cannot use**, on any account, directory accounts
+    included: the owner's combined sign-in then reads as "right password, wrong code", which feeds
+    the second-step lock, so the owner's way past has become a way to lock themselves out.
+
+    Read-only, and it needs no :class:`AuthService`, so ``messagefoundry verify`` runs it without the
+    trust-anchor preflights or a directory client. Disabled accounts are skipped: they cannot sign
+    in. A local row with no password hash is skipped too: nobody can sign into it, so there is
+    nothing to lock (an interrupted ``provision-admin`` leaves one). Usernames only; each secret is
+    dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
+    ``verify`` reports. Neither refuses to start, since refusing would hand an account-level fact a
+    site-wide veto."""
+    no_way_past: list[str] = []
+    undecryptable: list[str] = []
+    for user in await store.list_users():
+        if user.disabled:
+            continue
+        if user.totp_enabled:
+            if not await _totp_secret_usable(store, user):
+                undecryptable.append(user.username)
+            continue
+        if user.password_generated or user.password_hash is None:
+            continue
+        roles = _roles_from_ids(await store.get_user_role_ids(user.id))
+        if _requirement_covers(settings, user, roles):
+            no_way_past.append(user.username)
+    return LockableAccountCensus(
+        no_way_past=tuple(sorted(no_way_past)), undecryptable_totp=tuple(sorted(undecryptable))
+    )
+
+
 def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
 
@@ -1899,6 +1974,16 @@ class AuthService:
                 password_generated=False,
             )
         await self._seed_roles()
+        # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
+        # secret is written, so a code this row already spent (an interrupted earlier run in the
+        # same 30 seconds) is refused with no password written. The row itself stays roleless.
+        if matched_step is not None and not await self._store.consume_totp_step(
+            user_id, matched_step
+        ):
+            raise FirstAdministratorRefused(
+                "that authenticator code was already used on this account; no password was set. "
+                "Wait for the next code and run the command again"
+            )
         await self._store.set_password(
             user_id,
             password_hash=await self._argon2(hash_password, password),
@@ -1907,14 +1992,10 @@ class AuthService:
         )
         plain_codes: tuple[str, ...] = ()
         if totp_secret is not None and matched_step is not None:
-            # ADR 0197 Amendment A (N-A): enrolled BEFORE the role, which stays last, so every
-            # interruption still leaves a roleless row a re-run completes -- and the repair branch
-            # above clears a half-enrolled one before this runs again.
+            # Enrolled BEFORE the role, which stays last, so every interruption still leaves a
+            # roleless row a re-run completes -- and the repair branch above clears a half-enrolled
+            # one before this runs again.
             await self._store.set_totp_secret(user_id, secret=totp_secret)
-            if not await self._store.consume_totp_step(user_id, matched_step):
-                raise FirstAdministratorRefused(
-                    "the authenticator code was already used; run the command again"
-                )
             plain_codes = tuple(
                 totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
             )
@@ -6231,7 +6312,7 @@ class AuthService:
             password_generated=False,
             require_totp=covered,
         )
-        if not written:
+        if not written and covered:
             raise FactorEnrolmentRequired()
         await self._store.revoke_user_sessions(identity.user_id)
         await self._audit("auth.password_changed", actor=identity.username, client=client)
@@ -6252,9 +6333,7 @@ class AuthService:
         :meth:`_has_way_past`, never on ``must_change_password``: a site that ran with the requirement
         off and then turned it on holds accounts with a chosen password, no factor and no must-change
         flag, and the gates must reach those too."""
-        return user.auth_provider == AuthProvider.LOCAL.value and self._mfa_required_for(
-            user, roles, second_factor_enrolled=False
-        )
+        return _requirement_covers(self._settings, user, roles)
 
     @staticmethod
     def _has_way_past(user: UserRecord) -> bool:
@@ -6279,42 +6358,8 @@ class AuthService:
         )
 
     async def lockable_account_census(self) -> LockableAccountCensus:
-        """Name every account that is still lockable with no way past the sign-in lock (ADR 0197
-        Amendment A, N-B2 part 6, AC-A9).
-
-        Two populations. **A covered local account holding a chosen credential and no TOTP**: the
-        gates of part 4 never let a holder reach that state under the shipped defaults, so one that
-        exists got there another way -- for instance while the site ran with ``require_mfa`` off,
-        or from before this change. **An enabled TOTP secret the engine cannot decrypt**: the owner's
-        combined sign-in then reads as "right password, wrong code", which feeds the second-step
-        lock, so the owner's way past has become a way to lock themselves out.
-
-        Read-only. Disabled accounts are skipped: they cannot sign in, so they cannot be locked out
-        of anything. Each TOTP secret is decrypted and dropped at once; the census returns usernames
-        only. The caller decides what to do with the answer: :meth:`report_lockable_account_census`
-        warns and audits, and ``messagefoundry verify`` reports it. Neither refuses to start, since
-        refusing would hand an account-level fact a site-wide veto."""
-        no_way_past: list[str] = []
-        undecryptable: list[str] = []
-        for user in await self._store.list_users():
-            if user.disabled or user.auth_provider != AuthProvider.LOCAL.value:
-                continue
-            if user.totp_enabled:
-                try:
-                    secret = await self._store.get_totp_secret(user.id)
-                except Exception:  # noqa: BLE001 -- any decrypt failure is exactly the finding
-                    secret = None
-                if not secret:
-                    undecryptable.append(user.username)
-                continue
-            if user.password_generated:
-                continue
-            roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
-            if self._covered_by_requirement(user, roles):
-                no_way_past.append(user.username)
-        return LockableAccountCensus(
-            no_way_past=tuple(sorted(no_way_past)), undecryptable_totp=tuple(sorted(undecryptable))
-        )
+        """:func:`lockable_account_census` over this service's store and settings."""
+        return await lockable_account_census(self._store, self._settings)
 
     async def report_lockable_account_census(self) -> LockableAccountCensus:
         """Run :meth:`lockable_account_census` at startup: WARN and write one audit row when it
@@ -6849,11 +6894,27 @@ class AuthService:
         if user is None:
             raise ValueError("no such user")
         issued: IssuedCredential | None = None
+        temp_hash: str | None = None
         if user.auth_provider == AuthProvider.LOCAL.value:
             temp = self._generate_policy_password()
+            temp_hash = await self._argon2(hash_password, temp)
             await self._store.set_password(
                 user_id,
-                password_hash=await self._argon2(hash_password, temp),
+                password_hash=temp_hash,
+                must_change_password=True,
+                password_generated=True,
+            )
+        await self._store.disable_totp(user_id)
+        removed = await self._store.delete_all_webauthn_credentials(user_id)
+        if temp_hash is not None:
+            # WRITTEN AGAIN, now that the factors are gone. A holder's rotation whose conditional
+            # write ran between the first write and ``disable_totp`` matched ``totp_enabled = 1`` and
+            # replaced the generated credential with a chosen one; the factor clear then left that
+            # chosen password with no factor -- the lockable state. This second, unconditional write
+            # restores the generated credential, so the reset always ends where it says it does.
+            await self._store.set_password(
+                user_id,
+                password_hash=temp_hash,
                 must_change_password=True,
                 password_generated=True,
             )
@@ -6864,8 +6925,6 @@ class AuthService:
                     None if stamped is None else stamped.password_changed_at
                 ),
             )
-        await self._store.disable_totp(user_id)
-        removed = await self._store.delete_all_webauthn_credentials(user_id)
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "auth.mfa_reset",
@@ -6882,6 +6941,19 @@ class AuthService:
         await self._notify_security(
             MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
+        if issued is not None:
+            # The password changed too, so the holder is told as for an administrator's password
+            # reset, with the new credential's deadline (BACKLOG #1141).
+            await self._notify_security(
+                PASSWORD_RESET,
+                username=user.username,
+                email=user.notify_email,
+                detail=(
+                    None
+                    if issued.expires_at is None or user.disabled
+                    else {"expires_at": issued.expires_at}
+                ),
+            )
         return issued
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
@@ -7240,11 +7312,11 @@ class AuthService:
         target = next((c for c in creds if c.credential_id_hash == credential_id_hash), None)
         if target is None:
             return False
-        # ADR 0197 Amendment A, AC-A3a: a covered account may not end a removal holding no factor
-        # with a way past the sign-in lock. In wave 1 a passkey is never one, so this refuses only
-        # where TOTP is already absent, and there the removal cannot restore a way past either.
-        if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
-            raise FactorEnrolmentRequired()
+        # ADR 0197 Amendment A, AC-A3a asks whether a removal would take the account's last way
+        # past the sign-in lock. In wave 1 a passkey is never one (``_has_way_past``), so removing
+        # one cannot, and this path adds no refusal: a holder must stay able to revoke a lost or
+        # stolen passkey. From wave 2 a discoverable passkey is a way past, and the check belongs
+        # here.
         last_second_factor = len(creds) == 1 and not user.totp_enabled
         if last_second_factor and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=False

@@ -320,7 +320,7 @@ def check_console_no_window() -> CheckResult:
 def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckResult:
     """ADR 0197 Amendment A, AC-A9: name every account that is still lockable with no way past.
 
-    Runs ``AuthService.lockable_account_census`` against the configured store: every local account
+    Runs ``auth.service.lockable_account_census`` against the configured store: every local account
     ``[security].require_mfa`` covers that holds a chosen password and no authenticator app, and every
     enabled TOTP secret the engine cannot decrypt. A finding FAILS this check, so an operator sees
     it, and it never stops ``serve`` -- the engine only warns and audits at startup. Usernames only;
@@ -335,13 +335,15 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
     if absent is not None:
         return CheckResult(rid, title, Status.SKIP, f"no SQLite store at {absent} yet")
 
-    from messagefoundry.auth.service import AuthService, LockableAccountCensus
+    # The service-free census: no AuthService, so no trust-anchor preflight and no directory client
+    # is built for a read-only question, and the [security].enforcement dial does not matter here.
+    from messagefoundry.auth.service import LockableAccountCensus, lockable_account_census
     from messagefoundry.store.base import open_store
 
     async def _census() -> LockableAccountCensus:
         handle = await open_store(store, keyless_chain_refusal=None)  # read-only
         try:
-            return await AuthService(handle, auth).lockable_account_census()
+            return await lockable_account_census(handle, auth)
         finally:
             await handle.close()
 
