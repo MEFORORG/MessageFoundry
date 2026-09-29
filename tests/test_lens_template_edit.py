@@ -717,3 +717,112 @@ def test_a_template_edit_changes_only_its_own_argument(
         edited = next(r for r in after_rows if r["line_start"] == line)
         assert edited["param_parts"][param] == _normalize_parts(parts)
     assert written > 20, f"only {written} of {len(sample)} sampled templates were written"
+
+
+# =============================================================================
+# Machine-readable refusal codes -- what the IDE branches on instead of message text
+# =============================================================================
+
+
+def test_the_refusal_code_strings_are_pinned() -> None:
+    """The IDE classifier keys on these exact strings (steps 2 and 3 of BACKLOG #237). Changing one
+    is a contract change, so it must fail a test rather than pass silently."""
+    assert lens.REFUSAL_DYNAMIC_MODE == "dynamic-mode"
+    assert lens.REFUSAL_TEMPLATE_SHAPE == "template-shape"
+    assert lens.REFUSAL_LITERAL_ONLY == "literal-only"
+    assert lens.REFUSAL_COLUMN_LIMIT == "column-limit"
+    assert lens.REFUSAL_GENERIC == "refused"
+
+
+_STATIC = 'set_field(msg, "PID-5.1", "old")'
+
+#: (row, params, expected code) -- at least one case per member of every coded family.
+CODED_REFUSALS = [
+    pytest.param(
+        'set_field(msg, "PID-5.1", msg["PID-3"])', {"value": "X"}, "dynamic-mode", id="dyn-arg"
+    ),
+    pytest.param(_STATIC, {"value": {"expr": 'msg["PID-3"]'}}, "dynamic-mode", id="dyn-expr"),
+    pytest.param(_STATIC, {"value": {"parts": "PID-3"}}, "template-shape", id="not-a-list"),
+    pytest.param(
+        _STATIC, {"value": {"parts": [{"path": "A", "text": "b"}]}}, "template-shape", id="two-keys"
+    ),
+    pytest.param(_STATIC, {"value": {"parts": [{"field": "A"}]}}, "template-shape", id="bad-key"),
+    pytest.param(_STATIC, {"value": {"parts": [{"text": "x"}]}}, "template-shape", id="no-path"),
+    pytest.param(_STATIC, {"value": {"parts": [{"path": ""}]}}, "template-shape", id="empty-path"),
+    pytest.param(_STATIC, {"value": {"parts": [{"path": "A'B"}]}}, "template-shape", id="bad-path"),
+    pytest.param(
+        _STATIC,
+        {"value": {"expr": "f\"{msg['PID-3'] or ''}\""}},
+        "template-shape",
+        id="template-as-expr",
+    ),
+    pytest.param(_STATIC, {"value": {"parts": [], "x": 1}}, "template-shape", id="bad-object"),
+    pytest.param(_STATIC, {"path": {"parts": [{"path": "A"}]}}, "literal-only", id="action-path"),
+    pytest.param(
+        'row = db_lookup("MPI", "select 1", {})',
+        {"statement": {"parts": [{"path": "A"}]}},
+        "literal-only",
+        id="lookup",
+    ),
+    pytest.param(
+        'log_note("n {}", "x")', {"template": {"parts": [{"path": "A"}]}}, "literal-only", id="log"
+    ),
+    pytest.param(
+        _STATIC,
+        {"value": {"parts": [{"text": "x" * 80}, {"path": "PID-3"}]}},
+        "column-limit",
+        id="column-limit",
+    ),
+    pytest.param(_STATIC, {"value": float("inf")}, "refused", id="generic-non-finite"),
+    pytest.param(_STATIC, {"nope": "x"}, "refused", id="generic-unknown-param"),
+]
+
+
+@pytest.mark.parametrize(("line", "params", "code"), CODED_REFUSALS)
+def test_every_refusal_carries_its_family_code(
+    line: str, params: dict[str, Any], code: str
+) -> None:
+    with pytest.raises(LensRewriteError) as info:
+        _set(_one_row(line), params)
+    assert info.value.code == code, str(info.value)
+
+
+@pytest.mark.parametrize(("line", "params", "code"), CODED_REFUSALS)
+def test_lens_rewrite_emits_the_code_beside_the_error(
+    line: str,
+    params: dict[str, Any],
+    code: str,
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    """The CLI contract: ``{"error": <message>, "code": <slug>}`` on stdout and exit 1. ``error`` stays
+    exactly the exception's message, so a consumer reading only it sees no change."""
+    import json
+
+    from messagefoundry.__main__ import main
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(line).encode("utf-8"))
+    edit = {"line_start": 6, "line_end": 6, "op": "set_params", "params": params}
+    rc = main(["lens", "rewrite", str(module), "--edit", json.dumps(edit), "--contract", "2"])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert set(payload) == {"error", "code"}
+    assert payload["code"] == code
+    with pytest.raises(LensRewriteError) as info:
+        _set(_one_row(line), params)
+    assert payload["error"] == str(info.value)
+
+
+def test_an_unreadable_module_carries_the_generic_code(
+    tmp_path: Path, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    import json
+
+    from messagefoundry.__main__ import main
+
+    missing = tmp_path / "absent.py"
+    rc = main(["lens", "rewrite", str(missing), "--edit", '{"line_start": 1, "line_end": 1}'])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"

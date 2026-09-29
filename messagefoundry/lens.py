@@ -118,7 +118,30 @@ class LensRewriteError(ValueError):
     outside the v1 param-edit scope. A subclass of :class:`ValueError`; the CLI turns it into a clean
     ``{"error": …}`` + non-zero exit, exactly like :class:`LensParseError`, so the caller never applies a
     partial or lossy rewrite. Byte-preservation is the contract: an editable row is regenerated **only**
-    within its own line range, every other byte untouched (gate 2)."""
+    within its own line range, every other byte untouched (gate 2).
+
+    ``code`` is a stable machine-readable slug for the refusal FAMILY, which ``lens rewrite`` emits
+    beside the message as ``{"error": ..., "code": ...}``. The IDE keys on it, so a message can be
+    reworded without breaking a consumer. The families with their own code are the ``REFUSAL_*``
+    constants below; any other refusal carries :data:`REFUSAL_GENERIC`. Changing a code's string is a
+    contract change for the IDE."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code if code is not None else REFUSAL_GENERIC
+
+
+#: A dynamic-mode argument: editing one (AC-M5), or an ``expr`` that would write one (E.6.4).
+REFUSAL_DYNAMIC_MODE = "dynamic-mode"
+#: A malformed templated value: ``parts`` not a list, a part without exactly one key, no path part,
+#: an empty or unusable path, an unencodable character, or a template sent as an ``expr``.
+REFUSAL_TEMPLATE_SHAPE = "template-shape"
+#: A template sent to a param outside the row's ``template_params`` (a literal-only param).
+REFUSAL_LITERAL_ONLY = "literal-only"
+#: A template write that pushes a line past the column limit.
+REFUSAL_COLUMN_LIMIT = "column-limit"
+#: Every other ``lens rewrite`` refusal.
+REFUSAL_GENERIC = "refused"
 
 
 # --- vocabulary registries ---------------------------------------------------
@@ -1678,37 +1701,45 @@ def _check_parts_spec(parts: Any, pname: str) -> list[dict[str, str]]:
     a template with no read is plain text, which ``static`` mode writes as a literal, and an f-string with
     no placeholder is dead weight a linter flags."""
     if not isinstance(parts, list):
-        raise LensRewriteError(f"parameter {pname!r}: 'parts' must be a list of part objects")
+        raise LensRewriteError(
+            f"parameter {pname!r}: 'parts' must be a list of part objects",
+            code=REFUSAL_TEMPLATE_SHAPE,
+        )
     checked: list[dict[str, str]] = []
     for i, part in enumerate(parts):
         if not isinstance(part, dict) or len(part) != 1:
             raise LensRewriteError(
                 f"parameter {pname!r}: part {i} must be an object with exactly one key, "
-                f"{PART_TEXT!r} or {PART_PATH!r}"
+                f"{PART_TEXT!r} or {PART_PATH!r}",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         ((key, value),) = part.items()
         if key not in (PART_TEXT, PART_PATH) or not isinstance(value, str):
             raise LensRewriteError(
                 f"parameter {pname!r}: part {i} must be {{{PART_TEXT!r}: <string>}} or "
-                f"{{{PART_PATH!r}: <string>}}"
+                f"{{{PART_PATH!r}: <string>}}",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         if not _is_encodable(value):
             raise LensRewriteError(
-                f"parameter {pname!r}: part {i} carries a character that cannot be encoded as UTF-8"
+                f"parameter {pname!r}: part {i} carries a character that cannot be encoded as UTF-8",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         if key == PART_PATH and (
             not value or not value.isprintable() or any(c in _PATH_FORBIDDEN for c in value)
         ):
             raise LensRewriteError(
                 f"parameter {pname!r}: part {i} path {value!r} must be non-empty, with no quote, "
-                "backslash, brace or non-printable character"
+                "backslash, brace or non-printable character",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         checked.append({key: value})
     normalized = _normalize_parts(checked)
     if not any(PART_PATH in part for part in normalized):
         raise LensRewriteError(
             f"parameter {pname!r}: a template needs at least one {PART_PATH!r} part - plain text is "
-            "static mode, so send it as a literal value instead"
+            "static mode, so send it as a literal value instead",
+            code=REFUSAL_TEMPLATE_SHAPE,
         )
     return normalized
 
@@ -1720,8 +1751,8 @@ def _render_parts(parts: Any, pname: str) -> str:
     with its empty-string fallback, so an absent field writes empty text rather than ``None`` (E.11).
     When the text carries more double quotes than single ones the two swap
     (``f'...{msg["PATH"] or ""}...'``), which is the choice ``ruff format`` makes, so the spliced line
-    stays format-clean. Before it is returned, the
-    EXISTING classifier must call it ``templated`` and read back exactly the parts that were sent.
+    stays format-clean. Before it is returned, the EXISTING classifier must call it ``templated`` and
+    read back exactly the parts that were sent.
     That is round-trip totality (E.6.3) checked on every write rather than trusted, so a renderer
     defect refuses an edit instead of splicing a shape the lens cannot read back."""
     normalized = _check_parts_spec(parts, pname)
@@ -1741,7 +1772,8 @@ def _render_parts(parts: Any, pname: str) -> str:
     if node is None or _param_mode(node) != MODE_TEMPLATED or _template_parts(node) != normalized:
         raise LensRewriteError(
             f"parameter {pname!r}: the template did not render to a bounded interpolation that reads "
-            "back to the same parts - refused (no change made)"
+            "back to the same parts - refused (no change made)",
+            code=REFUSAL_TEMPLATE_SHAPE,
         )
     return rendered
 
@@ -2560,7 +2592,8 @@ def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line
         if new > _MAX_LINE_LENGTH and new > old:
             raise LensRewriteError(
                 f"this edit would make line {i + 1} {new} columns wide, past the "
-                f"{_MAX_LINE_LENGTH}-column limit - shorten the template, or edit it as text"
+                f"{_MAX_LINE_LENGTH}-column limit - shorten the template, or edit it as text",
+                code=REFUSAL_COLUMN_LIMIT,
             )
 
 
@@ -2974,7 +3007,8 @@ def _render_moded_value(
     if _param_mode(node) == MODE_DYNAMIC:
         raise LensRewriteError(
             f"parameter {pname!r} is in dynamic mode (an expression the lens cannot write back "
-            "faithfully) - it is read-only here; edit it as text (ADR 0076 E.6.4)"
+            "faithfully) - it is read-only here; edit it as text (ADR 0076 E.6.4)",
+            code=REFUSAL_DYNAMIC_MODE,
         )
     if isinstance(value, dict):
         if set(value) == {"parts"}:
@@ -2989,7 +3023,8 @@ def _render_moded_value(
         if set(value) != {"expr"}:
             raise LensRewriteError(
                 f"parameter {pname!r}: an object value must be {{'parts': [...]}} or "
-                "{'expr': <source>}"
+                "{'expr': <source>}",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
     rendered = _render_new_value(value, True, pname)
     if isinstance(value, dict):
@@ -3002,12 +3037,14 @@ def _render_moded_value(
         if new_mode == MODE_DYNAMIC:
             raise LensRewriteError(
                 f"parameter {pname!r}: the expression would write a dynamic-mode argument, which is "
-                "read-only - only a literal or a template may be written here (ADR 0076 E.6.4)"
+                "read-only - only a literal or a template may be written here (ADR 0076 E.6.4)",
+                code=REFUSAL_DYNAMIC_MODE,
             )
         if new_mode == MODE_TEMPLATED:
             raise LensRewriteError(
                 f"parameter {pname!r}: write a template as {{'parts': [...]}}, not as an expression, "
-                "so the engine renders it and checks it reads back"
+                "so the engine renders it and checks it reads back",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
     return rendered
 
@@ -3041,7 +3078,9 @@ def _refuse_templated_write(kind: str, pname: str) -> NoReturn:
             "append_to_field suffix, replace_literal new); a path, segment id, index or setting "
             "chosen by message content is refused"
         )
-    raise LensRewriteError(f"parameter {pname!r} takes a literal only: {reason}")
+    raise LensRewriteError(
+        f"parameter {pname!r} takes a literal only: {reason}", code=REFUSAL_LITERAL_ONLY
+    )
 
 
 def _render_literal(value: Any, pname: str) -> str:
