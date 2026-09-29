@@ -693,15 +693,20 @@ async def test_stop_closes_a_socket_still_waiting_on_its_handshake(
             await source.stop()
 
 
-@pytest.mark.parametrize("tls", [True, False])
-async def test_the_tls_bounds_reach_the_upgrade_only_with_tls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls: bool
+@pytest.mark.parametrize("mode", ["plain", "listener_tls", "loop_tls"])
+async def test_the_tls_bounds_reach_whichever_side_runs_the_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    """The listener binds plain TCP either way and, with TLS, upgrades each admitted socket itself
-    (BACKLOG #1606), so the handshake and close-exchange bounds reach ``start_tls`` rather than
-    ``start_server``. The close-exchange bound has no behavioural test of its own: it needs a peer
-    that ignores close_notify, and asyncio's default of 30 s would make the red arm of such a test
-    slow."""
+    """On the stdlib loop the listener binds plain TCP and upgrades each admitted socket itself
+    (BACKLOG #1606), so the handshake and close-exchange bounds reach ``start_tls``. On any other
+    loop (``loop_tls``, forced here, which is what uvloop gets) the loop runs the handshake and the
+    bounds reach ``start_server``. Without TLS neither sees them. A real TLS client gets a message
+    through in both TLS modes. The close-exchange bound has no behavioural test of its own: it needs
+    a peer that ignores close_notify, and asyncio's default of 30 s would make the red arm of such a
+    test slow."""
+    tls = mode != "plain"
+    if mode == "loop_tls":
+        monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: False)
     served: dict[str, object] = {}
     upgraded: list[dict[str, object]] = []
     real_start_server = asyncio.start_server
@@ -738,19 +743,35 @@ async def test_the_tls_bounds_reach_the_upgrade_only_with_tls(
             await dest.aclose()
     finally:
         await source.stop()
+    bounds = {
+        "ssl_handshake_timeout": mllp_module._TLS_HANDSHAKE_TIMEOUT,
+        "ssl_shutdown_timeout": mllp_module._TLS_SHUTDOWN_TIMEOUT,
+    }
+    if mode == "loop_tls":
+        assert served["ssl"] is not None
+        assert {k: served[k] for k in bounds} == bounds
+        assert upgraded == []
+        return
     assert served.get("ssl") is None
     assert served.get("ssl_handshake_timeout") is None
-    if tls:
-        # The destination's own client-side handshake does not go through StreamWriter.start_tls,
-        # so the one call seen is the listener's.
-        assert upgraded == [
-            {
-                "ssl_handshake_timeout": mllp_module._TLS_HANDSHAKE_TIMEOUT,
-                "ssl_shutdown_timeout": mllp_module._TLS_SHUTDOWN_TIMEOUT,
-            }
-        ]
-    else:
-        assert upgraded == []
+    # The destination's own client-side handshake does not go through StreamWriter.start_tls, so
+    # the one call seen is the listener's.
+    assert upgraded == ([bounds] if tls else [])
+
+
+def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
+    """uvloop's Loop is an AbstractEventLoop and not a BaseEventLoop, so this is what sends it to the
+    loop-level handshake; see `_upgrades_tls_itself` for why."""
+
+    class _OtherLoop(asyncio.AbstractEventLoop):
+        pass
+
+    stdlib = asyncio.new_event_loop()
+    try:
+        assert mllp_module._upgrades_tls_itself(stdlib) is True
+    finally:
+        stdlib.close()
+    assert mllp_module._upgrades_tls_itself(_OtherLoop()) is False
 
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------
@@ -874,21 +895,27 @@ async def test_a_connection_reaching_the_handler_after_stop_is_refused_unread() 
 def test_stop_and_restart_on_uvloop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls: bool
 ) -> None:
-    """The real loop, not a stand-in for it. It skips where uvloop is not installed. With TLS the
-    socket never handshakes; it is tracked from its accept (BACKLOG #1606), so stop() closes it on
-    uvloop too, and the handshake bound is pinned far above the wait so only stop() can. A real TLS
-    client then gets a message through a TLS listener on this loop, which is the check that the
-    listener's own upgrade sees the ClientHello on uvloop rather than losing it to the plaintext
-    reader (see `MLLPSource._on_tls_accept`)."""
+    """The real loop, not a stand-in for it. It skips where uvloop is not installed. uvloop keeps the
+    loop-level TLS handshake (`_upgrades_tls_itself`), so with TLS a socket that never handshakes is
+    outside the listener's own set and stop() cannot close it there; the handshake bound, shortened
+    here, is what closes it. A real TLS client then gets a message through a TLS listener on this
+    loop, which is the check that the loop-level path still serves."""
     uvloop = pytest.importorskip("uvloop")
-    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 0.5)
 
     async def scenario() -> None:
         source, cert = _tls_source(tmp_path) if tls else (_plain_source(), None)
         await source.start(_ack)
+        assert source._upgrade_tls is False
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
-            await _in_handler(source, 1)
+            if tls:
+                # Nothing public counts a socket still in its handshake, so give the loop a moment
+                # to accept it. On a runner too slow for that, the close below is the listening
+                # socket's reset rather than the bound, and the test passes without reaching it.
+                await asyncio.sleep(0.2)
+            else:
+                await _in_handler(source, 1)
             started = time.monotonic()
             await source.stop()
             assert time.monotonic() - started < mllp_module._CLIENT_SHUTDOWN_GRACE
@@ -896,6 +923,8 @@ def test_stop_and_restart_on_uvloop(
         finally:
             await _close_raw(writer)
         if cert is not None:
+            # Restored first, so the real client never races the shortened bound.
+            monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
             await source.start(_ack)
             try:
                 dest = MLLPDestination(

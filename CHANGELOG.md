@@ -289,10 +289,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   complete frames of one listener are in the inbound handler (decode, parse, validate, ingress
   commit) at once. The row measured about 64 MiB of handling cost per 16 MiB message, so the peak
   was `max_connections` times that, 10 to 16 GiB across 256 frames; it is now a setting of its own.
-  A frame over the limit waits for a slot, first come first served, and is never refused, dropped
-  or NAK'd. It still holds the bytes it arrived in, so the raw buffer bound is unchanged. On stop a
-  frame still waiting is not handled and gets no ACK, so the sender retries it. `None`/`0` turns it
-  off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
+  A frame over the limit waits for a slot, first come first served, and is never refused or NAK'd.
+  It still holds the bytes it arrived in, so the raw buffer bound is unchanged. A frame still
+  waiting when the listener stops, or when its own connection closes, is not handled and gets no
+  ACK, so the sender resends it; a WARNING names the peer. `None`/`0` turns it off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
   ([BACKLOG #1725](docs/BACKLOG.md), act 3)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
@@ -1233,16 +1233,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
-- **An MLLP TLS listener now applies `source_ip_allowlist`, `max_connections` and
-  `max_connections_per_host` before the TLS handshake, not after it.** The listener accepts plain
-  TCP, runs those checks exactly as a plaintext listener does, and only then starts TLS on the
-  admitted socket. Before, a socket that never sent a ClientHello sat outside all three for up to
-  the 10 s handshake bound, so a peer could hold as many as its connect rate allowed. Now each one
-  holds a real slot, is refused with the same `at_capacity` or `peer_not_allowlisted` event as a
-  plaintext connection, and is closed by stop() on every event loop, uvloop included. A socket
-  refused this way never starts a handshake. A handshake that fails or times out gives its slot
-  back and, as before, emits no connection event and logs at DEBUG only. `established` is emitted
-  once the handshake completes. ([BACKLOG #1606](docs/BACKLOG.md))
+- **On the stdlib event loop, an MLLP TLS listener now applies `source_ip_allowlist`,
+  `max_connections` and `max_connections_per_host` before the TLS handshake, not after it.** The
+  listener accepts plain TCP, runs those checks exactly as a plaintext listener does, and only then
+  starts TLS on the admitted socket. Before, a socket that never sent a ClientHello sat outside all
+  three for up to the 10 s handshake bound, so a peer could hold as many as its connect rate
+  allowed. Now each one holds a real slot, is refused with the same `at_capacity` or
+  `peer_not_allowlisted` event as a plaintext connection, and is closed by stop(). A socket refused
+  this way never starts a handshake. A handshake that fails or times out gives its slot back and,
+  as before, emits no connection event and logs at DEBUG only. `established` is emitted once the
+  handshake completes. **Under uvloop, which `uvicorn[standard]` installs outside Windows, nothing
+  changes**: the loop still runs the handshake and the three checks apply after it, because the
+  listener's own upgrade could not be verified safe on uvloop. ([BACKLOG #1606](docs/BACKLOG.md))
 - **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
   reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
   account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was

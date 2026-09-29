@@ -81,6 +81,7 @@ from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.transports.base import (
+    INTAKE_PAUSE_POLL_SECONDS,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -199,10 +200,12 @@ DEFAULT_MAX_CONNECTIONS_PER_HOST = 32
 #: Complete frames ONE listener hands to its inbound handler at the same time (BACKLOG #1725, act 3).
 #:
 #: The handler is the pre-ACK path: decode, parse, validate and the ingress commit. The row measured
-#: about 64 MiB traced per 16 MiB message on it, so the aggregate handling peak was the product of
-#: :data:`DEFAULT_MAX_CONNECTIONS` and ``max_frame_bytes``: 10 to 16 GiB across 256 frames in flight
-#: at once. This makes that peak a setting of its own. At 32 it is about 2 GiB at the default frame
-#: cap, on the row's own multiplier; that figure is the row's measurement, not one taken here.
+#: about 64 MiB traced per 16 MiB message on it, so the aggregate handling peak was
+#: :data:`DEFAULT_MAX_CONNECTIONS` times that per-frame cost: 10 to 16 GiB across 256 frames in
+#: flight at once. That is on top of the RAW peak of 256 times ``max_frame_bytes`` (4 GiB), which
+#: this does not change. This makes the handling peak a setting of its own: at 32 it is about 2 GiB
+#: at the default frame cap, on the row's own multiplier, which is the row's measurement and not
+#: one taken here.
 #:
 #: 32 is an eighth of :data:`DEFAULT_MAX_CONNECTIONS`, the ratio :data:`DEFAULT_MAX_CONNECTIONS_PER_HOST`
 #: uses. Handling one ordinary message takes milliseconds, so 32 at once is far above what a
@@ -213,10 +216,17 @@ DEFAULT_MAX_CONNECTIONS_PER_HOST = 32
 #: is the handling multiplier on top of it. The bound is per LISTENER, so a site with many inbound
 #: listeners has one budget per listener, not one for the engine.
 #:
-#: Waiting is FIFO and never refuses: a frame gets a slot as soon as one frees, and nothing is
-#: dropped or NAK'd for waiting. On stop() a frame still waiting is not handled and gets no ACK, so
-#: the sender retries it against the restarted listener, exactly as for a frame still arriving.
-#: ``None``/``0`` disables it, like every cap here.
+#: Waiting is first come, first served (see ``MLLPSource._take_inflight_slot`` for how strictly)
+#: and never refuses: a frame gets a slot as soon as one frees, and nothing is NAK'd for waiting.
+#: A frame still WAITING is given up, unhandled and unacknowledged, in two cases: stop() began, or
+#: its own connection closed. Either way the sender has no ACK and resends it, so handling the
+#: stale copy would only commit a duplicate. Each case logs a WARNING. A frame that finds a slot
+#: free is handled exactly as with the bound off. ``None``/``0`` disables it, like every cap here.
+#:
+#: **Per listener, below the store's group-commit batch.** With ``[store].group_commit_window_ms``
+#: above zero (it ships at 0), a batch flushes early at ``group_commit_max_batch`` rows (64). One
+#: listener alone can then never fill a batch, so its commits wait out the window. Raise this with
+#: that window if one listener carries most of the traffic.
 DEFAULT_MAX_INFLIGHT_FRAMES = 32
 
 #: Message-rate pacing ships OFF, and that is a DELIBERATE DEVIATION from this module's
@@ -260,12 +270,14 @@ _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 # A constant rather than a per-connection setting, for the reason `_ACK_DRAIN_GRACE` gives: there is
 # no feed-shaped traffic to size it against, and a setting would carry the `None`/`0` = "off" spelling
 # every cap here accepts, which would restore the unbounded window through a supported value.
-# **This bounds how LONG an unhandshaken socket lives; the caps bound how MANY.** The listener
-# accepts plain TCP and upgrades an admitted socket itself (see `_on_tls_accept`), so
-# `source_ip_allowlist`, `max_connections` and `max_connections_per_host` all act BEFORE the
-# handshake, and a socket in its handshake holds a real slot. When the bound fires, the handshake is
-# aborted, the slot is given back, and the line is logged at DEBUG only, so a flood of silent sockets
-# cannot fill the log.
+# **This bounds how LONG an unhandshaken socket lives; on the stdlib loop the caps bound how MANY.**
+# There the listener accepts plain TCP and upgrades an admitted socket itself (see
+# `_on_tls_accept`), so `source_ip_allowlist`, `max_connections` and `max_connections_per_host` all
+# act BEFORE the handshake, and a socket in its handshake holds a real slot. When the bound fires,
+# the handshake is aborted, the slot is given back, and the line is logged at DEBUG only, so a flood
+# of silent sockets cannot fill the log. **On any other loop, uvloop included, the loop runs the
+# handshake and all three act only after it** (see `_upgrades_tls_itself`), so there this bounds
+# how long such a socket lives, not how many a peer can open.
 _TLS_HANDSHAKE_TIMEOUT = 10.0
 
 # Seconds a closed TLS connection waits for the peer's close_notify before the socket is dropped
@@ -275,6 +287,11 @@ _TLS_HANDSHAKE_TIMEOUT = 10.0
 # teardown in a test must not silently shorten this too. On the stdlib loop stop() does not wait
 # for it, and on uvloop it can; see stop().
 _TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
+
+# Seconds between checks, while a frame waits for an in-flight slot, that its own connection is
+# still open (BACKLOG #1725 act 3). The stream API offers no event for a peer's EOF, so it is polled;
+# stop() does not wait for this, it wakes the wait at once. The intake pause polls at the same rate.
+_INFLIGHT_POLL_SECONDS = INTAKE_PAUSE_POLL_SECONDS
 
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
@@ -1488,6 +1505,25 @@ def _peer_host(writer: asyncio.StreamWriter) -> str | None:
     return None
 
 
+def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether a TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself, so its
+    caps and allowlist run before the handshake (BACKLOG #1606). True on the stdlib loops only.
+
+    The upgrade is safe only where pausing reading inside ``connection_made`` is known to keep the
+    ClientHello out of the plaintext reader. On the stdlib loops it is, read in their source: the
+    selector transport arms its reader only if not paused, and the Proactor issues no receive while
+    paused. uvloop is a different implementation. Review of this change read its ``pause_reading``
+    as a no-op before reading starts, and its reading as starting after ``connection_made``
+    returns, and uvloop's ``start_tls`` has no counterpart to gh-142352. That reading was not
+    checked against uvloop's source here, and uvloop does not run on Windows, where this was built.
+    A wrong guess there would stall every TLS connection, so any other loop keeps the loop-level
+    handshake, and with it the documented limit: the caps and allowlist apply after the handshake.
+    uvicorn runs the engine on uvloop wherever it is installed, which ``uvicorn[standard]`` does
+    for CPython outside Windows, so on Linux that limit is the one in force.
+    """
+    return isinstance(loop, asyncio.BaseEventLoop)
+
+
 def _lost_its_transport(writer: asyncio.StreamWriter) -> bool:
     """Whether ``StreamWriter.start_tls`` left ``writer`` with no transport (BACKLOG #1606).
     Typeshed declares the attribute non-optional, which is exactly the invariant CPython breaks
@@ -1693,13 +1729,13 @@ class MLLPSource(SourceConnector):
     peer can sit inside all of them but one.** ``max_connections`` counts sockets on this listener
     and ``max_connections_per_host`` counts sockets from one peer address; ``receive_timeout`` bounds
     SILENCE between reads and ``max_frame_seconds`` bounds one frame's life; ``max_frame_bytes``
-    bounds that frame's size. Each takes ``None``/``0`` to disable it.
+    bounds that frame's size; ``max_inflight_frames`` bounds how many complete frames are in the
+    handler at once. Each takes ``None``/``0`` to disable it.
 
-    The two caps BACKLOG #1725 added are documented once, on :data:`DEFAULT_MAX_CONNECTIONS_PER_HOST`
-    and :data:`DEFAULT_MAX_FRAME_SECONDS` above — what each bounds, why the default is the number it
-    is, and what it does NOT cover. Read those rather than a summary here; this docstring deliberately
-    does not restate them, and does not count the caps either, because a closed count is a claim that
-    goes stale the next time a cap is added.
+    The caps BACKLOG #1725 added are documented once, on :data:`DEFAULT_MAX_CONNECTIONS_PER_HOST`,
+    :data:`DEFAULT_MAX_FRAME_SECONDS` and :data:`DEFAULT_MAX_INFLIGHT_FRAMES` above — what each
+    bounds, why the default is the number it is, and what it does NOT cover. Read those rather than a
+    summary here; this docstring deliberately does not restate them.
     """
 
     def __init__(self, config: Source) -> None:
@@ -1784,8 +1820,8 @@ class MLLPSource(SourceConnector):
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused when its connection reaches `_on_client` -- with TLS on, that is
-        # BEFORE the handshake (BACKLOG #1606; see _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no
-        # restriction.
+        # before the handshake on the stdlib loop and after it on uvloop (BACKLOG #1606; see
+        # _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
@@ -1818,6 +1854,9 @@ class MLLPSource(SourceConnector):
         # a connection that arrives while it is set, and a TLS connection whose handshake finishes
         # while it is set, so a stopped listener never reads one.
         self._stopping = False
+        # True while this listener runs TLS handshakes itself, after its own checks (BACKLOG #1606);
+        # set at start() from the running loop, see `_upgrades_tls_itself`.
+        self._upgrade_tls = False
         # Set with `_stopping`, so a frame waiting for an in-flight slot wakes at stop() rather than
         # when a slot frees (BACKLOG #1725 act 3). Replaced at every start().
         self._stop_event = asyncio.Event()
@@ -1839,26 +1878,42 @@ class MLLPSource(SourceConnector):
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
         )
-        # A TLS listener accepts PLAIN TCP and upgrades each admitted socket itself (BACKLOG #1606),
-        # so the allowlist and both connection caps run before the handshake rather than after it.
-        # `_on_tls_accept` says why the accept callback is synchronous.
+        # A TLS listener on the stdlib loop accepts PLAIN TCP and upgrades each admitted socket
+        # itself (BACKLOG #1606), so the allowlist and both connection caps run before the
+        # handshake rather than after it. `_upgrades_tls_itself` says why other loops do not.
+        self._upgrade_tls = self._ssl is not None and _upgrades_tls_itself(
+            asyncio.get_running_loop()
+        )
+        if self._ssl is None or self._upgrade_tls:
+            self._server = await asyncio.start_server(
+                self._on_tls_accept if self._upgrade_tls else self._on_client, self.host, self.port
+            )
+            return
+        # The loop runs the handshake, and `_on_client` sees the socket only after it. Both ends of
+        # the TLS socket's life are bounded here instead: the handshake, and the close_notify
+        # exchange after writer.close(). Read at start() so a test can shorten them.
         self._server = await asyncio.start_server(
-            self._on_client if self._ssl is None else self._on_tls_accept, self.host, self.port
+            self._on_client,
+            self.host,
+            self.port,
+            ssl=self._ssl,
+            ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT,
+            ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT,
         )
 
     def _on_tls_accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Take a new TLS-listener socket in plain TCP, then hand it to `_on_client` (BACKLOG #1606).
 
-        Deliberately NOT a coroutine. asyncio calls this inside the transport's ``connection_made``,
-        before the first read is armed, and pausing reading here keeps every byte the peer sends,
-        its ClientHello included, in the kernel until ``start_tls`` resumes reading under the TLS
-        protocol. A coroutine callback first runs a loop turn later, and on a loop that has already
-        read by then the ClientHello would land in the plaintext reader where the TLS layer never
-        sees it. CPython 3.14's ``start_tls`` moves such bytes across (gh-142352); uvloop's is not
-        known to, and this does not depend on either.
+        Deliberately NOT a coroutine. The stdlib loop calls this inside the transport's
+        ``connection_made``, before the first read is armed, and pausing reading here keeps every
+        byte the peer sends, its ClientHello included, in the kernel until ``start_tls`` resumes
+        reading under the TLS protocol. A coroutine callback first runs a loop turn later, and on a
+        loop that has already read by then the ClientHello would land in the plaintext reader where
+        the TLS layer never sees it. CPython 3.14's ``start_tls`` also moves such bytes across
+        (gh-142352), so on the stdlib loop there are two guards.
 
         The task and writer are registered here too, so stop() finds a socket from its first moment,
-        on every loop, whether or not the loop's server offers ``close_clients()``.
+        whether or not the loop's server offers ``close_clients()``.
         """
         # A stream's transport reads as well as writes; typeshed types the attribute write-only.
         cast(asyncio.Transport, writer.transport).pause_reading()
@@ -1928,33 +1983,53 @@ class MLLPSource(SourceConnector):
             return False
         return True
 
-    async def _take_inflight_slot(self, slots: asyncio.Semaphore) -> bool:
-        """Wait for an in-flight frame slot (BACKLOG #1725 act 3); ``False`` if stop() came first.
+    async def _take_inflight_slot(
+        self,
+        slots: asyncio.Semaphore,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> str | None:
+        """Wait for an in-flight frame slot (BACKLOG #1725 act 3).
 
-        The wait is FIFO, since ``asyncio.Semaphore`` wakes waiters in order, so a frame is never
-        starved by later ones. It ends on whichever comes first, a slot or stop(), so a stopping
-        listener does not sit behind a slow handler for its whole shutdown grace. A cancellation
-        of this task, which stop() delivers to stragglers, is cancellable here too: a slot granted
-        in the same turn is handed straight back, so none is lost.
+        Returns ``None`` once the slot is held, or why the frame was given up instead: ``stopping``
+        or ``connection closed``. A frame that finds a slot free takes it at once, with no other
+        check, so it is handled exactly as it would be with the bound off.
+
+        A frame that must wait queues on ``asyncio.Semaphore``, which wakes waiters in order. The
+        order is not strict: the request joins the queue one loop turn after the frame found no
+        slot, and a slot freed in that turn can go to a frame that arrived later. So a frame can be
+        overtaken by at most the frames of that one turn; it is never starved.
+
+        The wait ends early on stop(), at once, or when this frame's own connection closes, seen
+        within :data:`_INFLIGHT_POLL_SECONDS`. In both cases the sender has no ACK and resends,
+        so handling this copy would only commit a duplicate. A cancellation, which stop() delivers
+        to stragglers, is safe here too: a slot granted in the same turn is handed straight back.
         """
-        if self._stopping:
-            return False
         if not slots.locked():
             await slots.acquire()  # a free slot: acquire() returns without suspending
-            return True
+            return None
         acquire = asyncio.ensure_future(slots.acquire())
         stopping = asyncio.ensure_future(self._stop_event.wait())
+        reason: str | None = None
         try:
-            await asyncio.wait((acquire, stopping), return_when=asyncio.FIRST_COMPLETED)
+            while reason is None and not acquire.done():
+                await asyncio.wait(
+                    (acquire, stopping),
+                    timeout=_INFLIGHT_POLL_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if self._stopping:
+                    reason = "stopping"
+                elif writer.is_closing() or reader.at_eof():
+                    reason = "connection closed"
         except BaseException:
             stopping.cancel()
             self._give_up_slot(acquire, slots)
             raise
         stopping.cancel()
-        if acquire.done() and not self._stopping:
-            return True
-        self._give_up_slot(acquire, slots)  # a slot granted as stop() began is not used either
-        return False
+        if reason is not None:
+            self._give_up_slot(acquire, slots)  # a slot granted in the same turn is not used
+        return reason
 
     @staticmethod
     def _give_up_slot(acquire: asyncio.Future[Any], slots: asyncio.Semaphore) -> None:
@@ -2002,16 +2077,19 @@ class MLLPSource(SourceConnector):
         # await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
         for writer in list(self._clients):
             writer.close()
-        # A TLS socket still in its handshake is in `_clients` from its accept on (BACKLOG #1606;
-        # `_on_tls_accept`), so the loop above closes it on every event loop, and its handshake
-        # fails rather than completing mid-stop.
+        # Where this listener upgrades TLS itself, a socket still in its handshake is in `_clients`
+        # from its accept on (BACKLOG #1606; `_on_tls_accept`), so the loop above closes it and its
+        # handshake fails rather than completing mid-stop.
         #
         # Then close every transport the SERVER tracks, a wider set than `_clients`: a plain-TCP
-        # socket accepted in the same turn stop() began, before `_on_client` first ran. For an
-        # established TLS client this closes the raw socket under the writer just closed; its
-        # close_notify is already queued, and close() sends what is queued before it closes, so
-        # stop() does not wait out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is untouched, as
-        # with writer.close(). It awaits nothing, so it cannot wedge on the Proactor (#55).
+        # socket accepted in the same turn stop() began, before `_on_client` first ran, and where
+        # the LOOP runs the handshake (`_upgrades_tls_itself`), a socket still in it, which never
+        # reached `_on_client`. That comes BEFORE the task wait below, or such a socket could finish
+        # its handshake during it and have a message handled mid-stop. For an established TLS client
+        # this closes the raw socket under the writer just closed; its close_notify is already
+        # queued, and close() sends what is queued before it closes, so stop() does not wait out
+        # `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is untouched, as with writer.close(). It
+        # awaits nothing, so it cannot wedge on the Proactor (#55).
         #
         # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
         # uvicorn runs the engine on uvloop wherever it is installed, which `uvicorn[standard]` does
@@ -2020,6 +2098,9 @@ class MLLPSource(SourceConnector):
         # What uvloop loses, and what still holds there:
         # * the same-turn plain-TCP socket above. The one-turn yield below lets it reach
         #   `_on_client`, which refuses it unread on `_stopping`.
+        # * a TLS socket still in its handshake, since uvloop keeps the loop-level handshake.
+        #   `_TLS_HANDSHAKE_TIMEOUT` still bounds it, and `_stopping` refuses it unread if it
+        #   finishes.
         # * stop() can wait, inside the grace below, for an established TLS peer's close_notify, up
         #   to `_TLS_SHUTDOWN_TIMEOUT`: `_on_client`'s finally waits for the close exchange.
         # * uvloop's wait_closed() returns once the listening socket is closed, so the wait this
@@ -2263,6 +2344,22 @@ class MLLPSource(SourceConnector):
             self.max_frame_seconds,
         )
 
+    def _log_inflight_gave_up(self, writer: asyncio.StreamWriter, why: str) -> None:
+        """Record a complete frame given up while it waited for an in-flight slot (BACKLOG #1725).
+
+        The count-and-log rule says nothing is silently dropped, and the `closed` event for the
+        connection reads as a plain end, so this line is the record. It is not a lost message: no
+        ACK was sent, so the sender still holds it and resends. Socket metadata only, never frame
+        bytes. One line per connection, since the connection closes after it, which is the rate
+        the frame-deadline warning beside it already accepts."""
+        logger.warning(
+            "MLLP frame from %s was not handled: it was waiting for one of max_inflight_frames "
+            "(%d) slots when the %s. It was not acknowledged, so the sender resends it.",
+            writer.get_extra_info("peername"),
+            self.max_inflight_frames,
+            "listener began stopping" if why == "stopping" else "connection closed",
+        )
+
     def _frame_seconds_left(self, frame_opened_at: float | None) -> float | None:
         """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
 
@@ -2298,9 +2395,11 @@ class MLLPSource(SourceConnector):
         assert self._handler is not None
         if self._stopping:
             # Reached after stop() began, so nothing will wait for this task: refuse the connection
-            # before it is registered, admitted or read (see `_stopping`). The close is not awaited,
-            # and on TLS it is bounded by `_TLS_SHUTDOWN_TIMEOUT`. No message was read, so the
-            # sender retries against the restarted listener.
+            # before it is registered, admitted or read (see `_stopping`). The close is not awaited.
+            # A socket this listener upgrades itself is still plain TCP here; one the loop upgraded
+            # (see `_upgrades_tls_itself`) is in TLS, and its close is bounded by
+            # `_TLS_SHUTDOWN_TIMEOUT`. No message was read, so the sender retries against the
+            # restarted listener.
             logger.debug("MLLP connection refused: the listener is stopping")
             self._clients.discard(writer)  # `_on_tls_accept` may have registered it
             writer.close()
@@ -2355,7 +2454,7 @@ class MLLPSource(SourceConnector):
             # handshake sits inside it for the same reason (BACKLOG #1606): the slot is held while
             # the handshake runs, and given back however the handshake ends.
             try:
-                if self._ssl is not None:
+                if self._upgrade_tls:
                     handshaking = True
                     if not await self._start_tls(writer):
                         return  # never a session: no `established`, so no `closed` either
@@ -2435,16 +2534,19 @@ class MLLPSource(SourceConnector):
                     try:
                         decoded = 0
                         handler_dropped = False
-                        stopped_waiting = False
+                        gave_up = False
                         for message in decoder.feed(chunk):
                             decoded += 1
                             # BACKLOG #1725 act 3: at most `max_inflight_frames` frames of this
                             # listener are in the handler at once. The same object is released as
                             # was taken, even if a restart has replaced `_inflight` meanwhile.
                             slots = self._inflight
-                            if slots is not None and not await self._take_inflight_slot(slots):
-                                stopped_waiting = True  # stop() began: not handled, no ACK
-                                break
+                            if slots is not None:
+                                why = await self._take_inflight_slot(slots, reader, writer)
+                                if why is not None:
+                                    self._log_inflight_gave_up(writer, why)
+                                    gave_up = True
+                                    break
                             try:
                                 reply = await self._handle_in_slot(message, slots)
                             except Exception as exc:  # noqa: BLE001 -- see _answer_handler_failure
@@ -2467,8 +2569,8 @@ class MLLPSource(SourceConnector):
                         if handler_dropped:
                             failed = True  # handler_error already names why this closes
                             break
-                        if stopped_waiting:
-                            break  # stopping: close as on EOF, as the intake pause does
+                        if gave_up:
+                            break  # close as on EOF, as the intake pause does; logged above
                         # Charge AFTER the messages in this chunk are fully handled and ACKed.
                         if pacer is not None:
                             pacer.settle(decoded)

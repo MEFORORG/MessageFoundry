@@ -1576,9 +1576,9 @@ def MLLP(
     only) bounds how many complete frames the listener hands to its handler at once; a frame over
     it waits for a slot and is never refused. Each is disabled by ``None``/``0``.
 
-    What the two #1725 caps do NOT cover, and when to change one, is stated **once** on
-    ``DEFAULT_MAX_CONNECTIONS_PER_HOST`` and ``DEFAULT_MAX_FRAME_SECONDS`` in
-    ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
+    What the #1725 caps do NOT cover, and when to change one, is stated **once** on
+    ``DEFAULT_MAX_CONNECTIONS_PER_HOST``, ``DEFAULT_MAX_FRAME_SECONDS`` and
+    ``DEFAULT_MAX_INFLIGHT_FRAMES`` in ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
     a listener behind a source-NAT proxy, and a feed carrying large embedded documents. Read those rather than a summary here; ``docs/CONNECTIONS.md`` carries the same two in
     operator form.
 

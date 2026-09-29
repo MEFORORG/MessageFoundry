@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import Callable
 
@@ -117,9 +118,10 @@ async def test_a_second_frame_waits_for_the_only_slot() -> None:
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-async def test_stop_while_a_frame_waits_exits_cleanly() -> None:
+async def test_stop_while_a_frame_waits_exits_cleanly(caplog: pytest.LogCaptureFixture) -> None:
     """A frame waiting for a slot gives up as soon as stop() begins. It is not handled and gets no
-    ACK, so the sender retries it; stop() does not sit behind the slow handler to get there."""
+    ACK, so the sender retries it; stop() does not sit behind the slow handler to get there. The
+    give-up is logged, since the connection's own `closed` event reads as a plain end."""
     handler = _GatedHandler()
     source = _mllp(max_inflight_frames=1)
     await source.start(handler)
@@ -132,21 +134,86 @@ async def test_stop_while_a_frame_waits_exits_cleanly() -> None:
         r2, w2 = await _send(source.sockport, 2)
         writers.append(w2)
         await _until(lambda: _waiters(source) == 1, "the second frame never queued for the slot")
-        stopper = asyncio.create_task(source.stop())
-        # The waiter leaves at once, while the first frame still holds the only slot.
-        await _until(lambda: _waiters(source) == 0, "the waiting frame did not give up at stop()")
-        assert await asyncio.wait_for(r2.read(4096), 5.0) == b""  # closed, and no ACK
-        assert len(handler.entered) == 1
-        handler.release_first.set()
-        await asyncio.wait_for(stopper, timeout=10.0)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+            stopper = asyncio.create_task(source.stop())
+            # The waiter leaves at once, while the first frame still holds the only slot.
+            await _until(lambda: _waiters(source) == 0, "the waiting frame did not give up")
+            assert await asyncio.wait_for(r2.read(4096), 5.0) == b""  # closed, and no ACK
+            assert len(handler.entered) == 1
+            handler.release_first.set()
+            await asyncio.wait_for(stopper, timeout=10.0)
         assert not source._client_tasks
         assert len(handler.entered) == 1  # the waiting frame was never handled
+        assert "listener began stopping" in caplog.text
+        assert "MSH" not in caplog.text  # socket metadata only, never frame bytes
     finally:
         handler.release_first.set()
         for w in writers:
             await _close(w)
         if stopper is None:
             await asyncio.wait_for(source.stop(), timeout=10.0)
+        elif not stopper.done():
+            await asyncio.wait_for(stopper, timeout=10.0)
+
+
+async def test_a_waiting_frame_whose_sender_hung_up_is_not_handled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sender that gives up waiting for its ACK resends on a new connection. Handling the copy that
+    was still queued would commit a duplicate, so a waiter whose own connection closed leaves the
+    queue instead, and the slot goes to the next frame."""
+    monkeypatch.setattr(mllp_mod, "_INFLIGHT_POLL_SECONDS", 0.05)
+    handler = _GatedHandler()
+    source = _mllp(max_inflight_frames=1)
+    await source.start(handler)
+    writers: list[asyncio.StreamWriter] = []
+    try:
+        r1, w1 = await _send(source.sockport, 1)
+        writers.append(w1)
+        await _until(lambda: len(handler.entered) == 1, "the first frame never reached the handler")
+        _r2, w2 = await _send(source.sockport, 2)
+        await _until(lambda: _waiters(source) == 1, "the second frame never queued for the slot")
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+            await _close(w2)  # the sender hangs up while its frame waits
+            await _until(lambda: _waiters(source) == 0, "the hung-up frame kept its place")
+        assert "connection closed" in caplog.text
+        handler.release_first.set()
+        assert b"MSA|AA" in await asyncio.wait_for(r1.read(4096), 5.0)
+        # The next frame gets the slot; the hung-up one was never handled.
+        r3, w3 = await _send(source.sockport, 3)
+        writers.append(w3)
+        assert b"MSA|AA" in await asyncio.wait_for(r3.read(4096), 5.0)
+        assert [m.split(b"|")[9] for m in handler.entered] == [b"MSG1", b"MSG3"]
+        assert source._inflight is not None and not source._inflight.locked()
+    finally:
+        handler.release_first.set()
+        for w in writers:
+            await _close(w)
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_frame_that_finds_a_slot_free_is_handled_as_with_the_bound_off() -> None:
+    """Only a frame that must WAIT gives up at stop(). One that finds a slot free takes it with no
+    stop check, exactly as the listener behaves with the bound off, so stop semantics do not change
+    with a memory setting."""
+    source = _mllp(max_inflight_frames=4)
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> str:
+        received.append(raw)
+        return build_ack(raw, code="AA")
+
+    await source.start(handler)
+    try:
+        slots = source._inflight
+        assert slots is not None
+        source._stopping = True  # as stop() leaves it, without closing anything yet
+        reader = asyncio.StreamReader()
+        assert await source._take_inflight_slot(slots, reader, None) is None  # type: ignore[arg-type]
+        slots.release()
+    finally:
+        source._stopping = False
+        await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
 async def test_a_handler_fault_gives_its_slot_back() -> None:
