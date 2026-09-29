@@ -397,11 +397,11 @@ suite("Steps modes: parts on the wire and into a set_params payload", () => {
     assert.deepStrictEqual(readTemplateParts(wire.params.value.parts), parts);
   });
 
-  test("a posted template is re-copied part by part, so a stray key never reaches the engine", () => {
+  test("a malformed posted template reaches the engine unchanged, so the engine refuses it", () => {
+    // Repairing it here (dropping the second key) would write a template the user never built.
     const posted = {
-      parts: [{ text: "A ", extra: 1 } as unknown as TemplatePart, { path: "PID-3" }],
-      also: "ignored",
-    } as unknown as { parts: TemplatePart[] };
+      parts: [{ text: "a", path: "PID-3" } as unknown as TemplatePart],
+    };
     const req = buildEditRequest({
       command: "edit",
       handler: "H",
@@ -410,8 +410,38 @@ suite("Steps modes: parts on the wire and into a set_params payload", () => {
       name: "value",
       value: posted,
     });
-    assert.deepStrictEqual(req.params.value, { parts: [{ text: "A " }, { path: "PID-3" }] });
+    assert.deepStrictEqual(req.params.value, { parts: [{ text: "a", path: "PID-3" }] });
+    assert.strictEqual(isTemplateValue(posted), false);
     assert.strictEqual(req.expect_src, undefined);
+  });
+
+  test("the model's parts are copies, so editing them never edits the projected row", () => {
+    const parts = paramModeViews(TEMPLATED_VALUE)?.value.parts;
+    assert.ok(parts);
+    parts.push({ path: "PID-8" });
+    const again = paramModeViews(TEMPLATED_VALUE)?.value.parts;
+    assert.strictEqual(again?.length, 4);
+    const edited = templateValue(parts);
+    edited.parts.pop();
+    assert.strictEqual(parts.length, 5);
+  });
+
+  test("a param named like an Object member is an own key, never an inherited one", () => {
+    // Built from JSON, as the wire delivers it: an object literal's `__proto__` key sets the prototype.
+    const row: LensRow = {
+      ...STATIC_LITERAL,
+      params: JSON.parse('{"__proto__": "X", "constructor": "Y"}') as Record<string, unknown>,
+      literal_params: [],
+      param_modes: JSON.parse('{"__proto__": "static", "constructor": "computed"}') as Record<string, string>,
+      template_params: [],
+    };
+    const vm = vmOf(row);
+    assert.deepStrictEqual(Object.keys(vm.paramModes ?? {}), ["__proto__"]);
+    assert.strictEqual(paramModeOf(vm, "__proto__"), "static");
+    assert.strictEqual(paramModeOf(vm, "constructor"), undefined);
+    assert.strictEqual(paramModeOf(vm, "toString"), undefined);
+    assert.deepStrictEqual(paramWritableModes(vm, "constructor"), []);
+    assert.deepStrictEqual(paramWritableModes(vm, "toString"), []);
   });
 
   test("switching a templated argument to static sends a plain scalar, as before", () => {
@@ -512,7 +542,24 @@ suite("Steps modes: the engine's set_params refusals are classified by kind", ()
         "edit it as text",
       "column-limit",
     ],
-    // Not mode refusals: a route row's list refusal and a stale coordinate.
+    ["parameter 'value': an object value must be {'parts': [...]} or {'expr': <source>}", "template-shape"],
+    [
+      "parameter 'value': part 0 carries a character that cannot be encoded as UTF-8",
+      "template-shape",
+    ],
+    [
+      "parameter 'value': the template did not render to a bounded interpolation that reads back to the " +
+        "same parts - refused (no change made)",
+      "template-shape",
+    ],
+    // A refused path is quoted verbatim, so a path spelling another family's needle stays template-shape.
+    [
+      "parameter 'value': part 0 path 'a\"is in dynamic mode' must be non-empty, with no quote, " +
+        "backslash, brace or non-printable character",
+      "template-shape",
+    ],
+    // Not mode refusals: a note's over-long comment, a route row's list refusal, a stale coordinate.
+    ["the edited comment would be 95 columns — over the 88-column limit; shorten it", undefined],
     ["a route row's 'handlers' must be a list of handler-name strings", undefined],
     [
       "the row's source no longer matches the editor buffer (stale coordinates) - re-project the Steps " +

@@ -643,10 +643,11 @@ function isTemplatePartList(value: unknown): value is TemplatePart[] {
  * engine's call, and a bad one comes back as a refusal.
  */
 export function readTemplateParts(value: unknown): TemplatePart[] | null {
-  return isTemplatePartList(value) ? value : null;
+  // A copy, so an editor that changes the returned list never changes the projected row it came from.
+  return isTemplatePartList(value) ? value.map(copyTemplatePart) : null;
 }
 
-/** A fresh one-key copy of a part, so no stray property rides into a rewrite payload. */
+/** A fresh copy of a well-formed part. */
 function copyTemplatePart(part: TemplatePart): TemplatePart {
   return "text" in part ? { text: part.text } : { path: part.path };
 }
@@ -659,7 +660,7 @@ export function isTemplateValue(value: unknown): value is TemplateValue {
   return isRecord(value) && Object.keys(value).length === 1 && isTemplatePartList(value.parts);
 }
 
-/** The `set_params` value that writes `parts` as a template: `{parts}`, each part copied to one key. */
+/** The `set_params` value that writes `parts` as a template: `{parts}`, the list copied. */
 export function templateValue(parts: readonly TemplatePart[]): TemplateValue {
   return { parts: parts.map(copyTemplatePart) };
 }
@@ -688,13 +689,13 @@ export function templateValue(parts: readonly TemplatePart[]): TemplateValue {
  */
 export function paramModeViews(
   row: LensRow,
-  editableNames: readonly string[] = editableParamNames(row),
+  editableNames?: readonly string[],
 ): Record<string, ParamModeView> | undefined {
   const modes: unknown = row.param_modes;
   if (!hasTypedParams(row.kind) || !isRecord(modes)) {
     return undefined;
   }
-  const editable = new Set(editableNames);
+  const editable = new Set(editableNames ?? editableParamNames(row));
   const templateOk = new Set(Array.isArray(row.template_params) ? row.template_params : []);
   const partsMap: unknown = row.param_parts;
   const views: Record<string, ParamModeView> = {};
@@ -716,9 +717,16 @@ export function paramModeViews(
     if (mode === "templated" && isRecord(partsMap) && Object.hasOwn(partsMap, name)) {
       view.parts = readTemplateParts(partsMap[name]);
     }
-    views[name] = view;
+    // defineProperty, not assignment: a kwarg named `__proto__` must become an own key, not a prototype.
+    Object.defineProperty(views, name, { value: view, enumerable: true, writable: true, configurable: true });
   }
   return views;
+}
+
+/** The mode view of one argument, read as an OWN key so `toString` or `constructor` never resolves. */
+function ownModeView(vm: RowViewModel, name: string): ParamModeView | undefined {
+  const views = vm.paramModes;
+  return views !== undefined && Object.hasOwn(views, name) ? views[name] : undefined;
 }
 
 /**
@@ -726,7 +734,7 @@ export function paramModeViews(
  * mode selector for `undefined`: the row predates modes, and its argument is not known to be dynamic.
  */
 export function paramModeOf(vm: RowViewModel, name: string): ParamMode | undefined {
-  return vm.paramModes?.[name]?.mode;
+  return ownModeView(vm, name)?.mode;
 }
 
 /**
@@ -736,7 +744,7 @@ export function paramModeOf(vm: RowViewModel, name: string): ParamMode | undefin
  * `[]`.
  */
 export function paramWritableModes(vm: RowViewModel, name: string): readonly ParamMode[] {
-  const view = vm.paramModes?.[name];
+  const view = ownModeView(vm, name);
   if (view !== undefined) {
     return view.writable;
   }
@@ -747,31 +755,38 @@ export function paramWritableModes(vm: RowViewModel, name: string): readonly Par
 export type RewriteRefusalKind = "dynamic" | "literal-only" | "template-shape" | "column-limit";
 
 // Keyed on substrings of the engine's own refusal text (messagefoundry/lens.py, `_render_moded_value`,
-// `_refuse_templated_write`, `_check_parts_spec`, `_refuse_overlong_template_lines`). Checked in this
-// order, so the most specific reason wins when one message could match two.
+// `_refuse_templated_write`, `_check_parts_spec`, `_render_parts`, `_refuse_overlong_template_lines`).
+// Template-shape is checked FIRST because it is the only family whose messages quote user text (a
+// refused path, verbatim), so a path spelling another family's needle must not be filed under it. The
+// other families quote only a Python parameter name, which cannot contain a space and so cannot spell
+// any needle here.
 const REWRITE_REFUSALS: ReadonlyArray<[RewriteRefusalKind, readonly string[]]> = [
-  ["dynamic", ["is in dynamic mode", "would write a dynamic-mode argument"]],
-  ["literal-only", ["takes a literal only"]],
   [
     "template-shape",
     [
       "write a template as {'parts'",
+      "an object value must be {'parts'",
       // Narrower than "must be a list": a route row's refusal "'handlers' must be a list" is not this.
       "'parts' must be a list",
       "exactly one key",
       "must be {'text'",
-      "at least one 'path'",
+      "cannot be encoded as UTF-8",
       "must be non-empty",
+      "at least one 'path'",
+      "did not render to a bounded interpolation",
     ],
   ],
-  ["column-limit", ["column limit"]],
+  ["dynamic", ["is in dynamic mode", "would write a dynamic-mode argument"]],
+  ["literal-only", ["takes a literal only"]],
+  // Narrower than "column limit": a note row's over-long comment names the column limit too.
+  ["column-limit", ["column limit - shorten the template"]],
 ];
 
 /**
  * Classify a `set_params` refusal from `lens rewrite` ({@link RewriteOutcome.error}) as one of the mode
  * refusals, or `undefined` for any other error. The message itself is still the thing to show; this only
- * says which field state it belongs to. Meant for a param edit's outcome: a structural op's refusal can
- * also name the column limit.
+ * says which field state it belongs to. A rewording in lens.py turns a match into `undefined`, which
+ * degrades to the plain error message rather than to a wrong kind.
  */
 export function classifyRewriteRefusal(error: string | undefined): RewriteRefusalKind | undefined {
   if (!error) {
@@ -1183,12 +1198,9 @@ export function buildEditRequest(msg: EditMessage, expectSrc?: string): EditRequ
     line_start: msg.lineStart,
     line_end: msg.lineEnd,
     op: "set_params",
-    // A template is re-copied part by part, so the payload carries exactly `{"parts": [{text}|{path}]}`
-    // whatever else rode along on the posted object.
-    params: {
-      [msg.name]:
-        typeof msg.value === "object" ? templateValue(msg.value.parts) : msg.value,
-    },
+    // A template passes through as posted. It is not reshaped here: a malformed one must reach the
+    // engine intact, so the engine's own shape check refuses it rather than a repaired template landing.
+    params: { [msg.name]: msg.value },
   };
   const src = expectSrc ?? msg.expectSrc;
   if (src !== undefined) {
