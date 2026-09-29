@@ -1160,7 +1160,7 @@ def _three_table_drift(
     if unfound := sorted((outside | left_out) - live):
         problems.append(
             f"{where} name {unfound}, which the scan does not find; a real parser it cannot see "
-            "belongs in the hand-read table"
+            "belongs in their hand-read table"
         )
     if unlisted := sorted(live - outside - left_out):
         problems.append(f"the scan finds {unlisted}, which {where} omit")
@@ -1411,9 +1411,9 @@ _TS_PARSE_RE = re.compile(
             rf"\.{_TS_SPLIT}\(\s*(?P<q>[/\"'`])(?:(?!(?P=q))[^\\\n]|\\[^rn])*(?:{_TS_BREAK})"
             r"(?:(?!(?P=q))[^\\\n]|\\.)*(?P=q)",
             rf"\.(?:{'|'.join(_TS_CHAR_READS)})\(",
-            rf"""\b(?:from|import|require)\s*\(?\s*["'](?:{_TS_NODE_PREFIX})?"""
+            rf"""(?<![\w.$])(?:from|import|require)\s*\(?\s*["'](?:{_TS_NODE_PREFIX})?"""
             rf"""(?:{"|".join(_TS_NET_MODULES)})["']""",
-            rf"(?<![\w.$])(?:{'|'.join(_TS_NET_GLOBALS)})\(",
+            rf"(?:(?<![\w.$])|\bglobalThis\.)(?:{'|'.join(_TS_NET_GLOBALS)})\s*(?:\?\.)?\(",
         )
     )
 )
@@ -1493,6 +1493,8 @@ _TS_PARSE_SITE_CONTROLS = [
     'const dgram = await import("dgram");',
     "const response = await fetch(url);",
     "const socket = new WebSocket(url);",
+    "const response = await globalThis.fetch(url);",
+    "const response = await fetch?.(url);",
 ]
 
 
@@ -1517,6 +1519,8 @@ def test_the_extension_detector_ignores_mentions_and_non_parses() -> None:
             r'const escaped = text.split("\\n");',
             "await repo.fetch(remote);",
             "const prefetched = prefetch(url);",
+            'const bytes = Buffer.from("http");',
+            "const chars = Array.from('net');",
         )
     )
     assert not _is_ts_parse_site(quiet)
