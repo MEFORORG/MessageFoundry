@@ -624,11 +624,17 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _provision_admin_enrols_a_synthetic_authenticator(monkeypatch: pytest.MonkeyPatch) -> None:
+def _provision_admin_enrols_a_synthetic_authenticator() -> Iterator[None]:
     """``provision-admin`` enrols TOTP at the terminal (ADR 0197 Amendment A, N-A), which reads a
     code from a real terminal. Every test that drives the command about something else gets a
     synthetic, VALID enrolment here, so it keeps testing what it was written for. The tests of the
-    enrolment itself replace this stub in their own body."""
+    enrolment itself replace this stub in their own body.
+
+    ITS OWN ``MonkeyPatch``, NOT THE ``monkeypatch`` FIXTURE. An autouse fixture that requests
+    ``monkeypatch`` instantiates it before every other fixture of the test, so it is torn down AFTER
+    them. A test that stubs an attribute a fixture's teardown uses (``tests/test_api.py`` swaps the
+    engine's registry runner, relying on the undo running before ``engine.stop()``) then fails in
+    teardown. A private instance leaves the shared fixture's order exactly as it was."""
     import messagefoundry.__main__ as cli
     from tests._admin_account import provision_totp
 
@@ -638,7 +644,6 @@ def _provision_admin_enrols_a_synthetic_authenticator(monkeypatch: pytest.Monkey
 
     # The real prompt, for the tests that drive it: ``cli._enrol_totp_at_terminal.__wrapped__``.
     _stub.__wrapped__ = cli._enrol_totp_at_terminal  # type: ignore[attr-defined]
-    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", _stub)
 
     # The recovery codes go to the console DEVICE (CodeQL alert 228), which pytest cannot capture: on
     # a developer's machine the real one would print them onto the screen running the suite. Dropped
@@ -647,4 +652,7 @@ def _provision_admin_enrols_a_synthetic_authenticator(monkeypatch: pytest.Monkey
         return None
 
     _drop.__wrapped__ = cli._show_on_terminal  # type: ignore[attr-defined]
-    monkeypatch.setattr(cli, "_show_on_terminal", _drop)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cli, "_enrol_totp_at_terminal", _stub)
+        patch.setattr(cli, "_show_on_terminal", _drop)
+        yield
