@@ -228,7 +228,7 @@ def test_lookup_executor_flag_without_reason_fails_loud() -> None:
 def _fail_at_dial(monkeypatch: pytest.MonkeyPatch, seen: list[str]) -> None:
     """Capture the DSN the reference source builds and stop before any socket is opened."""
 
-    async def _fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> object:
+    async def _fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool, **_: object) -> object:
         seen.append(dsn)
         raise _StopBeforeDial
 
