@@ -1673,7 +1673,8 @@ class AuthService:
         )
         raise TemporaryPasswordUnavailable(
             "could not generate a temporary password that clears the password policy; check "
-            "[auth].password_extra_context_words for short or very common terms"
+            "[auth].password_extra_context_words for short or very common terms, then restart the "
+            "engine, which reads [auth] only at start"
         )
 
     async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:

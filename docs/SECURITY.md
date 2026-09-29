@@ -160,7 +160,8 @@ audited (`auth.password_reset`). For the same reason, **admin-created accounts a
 The reset can refuse, with a 503 whose detail names `password_extra_context_words`. It does so when
 no generated password clears the policy after repeated tries. That means the site's context words
 refuse nearly every random string, and so nearly every passphrase too. The account keeps its
-password. Remove the site's short or common terms, or replace them with longer ones, then retry.
+password. Remove the site's short or common terms, or replace them with longer ones. Then restart
+the engine and retry, because it reads `[auth]` only at start and a `/config/reload` does not.
 
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per
