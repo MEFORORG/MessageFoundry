@@ -38,6 +38,14 @@ describe a session and not an account lock), and ``auth.temp_password_expired`` 
 password-right signal on an account whose temporary credential has already expired, outside this
 ruling).
 
+**Left open, because the ruling covers the audit trail only:** the general log's per-notice WARNING
+when a lock notice cannot be mailed (``AuthService._notify_security`` and
+``pipeline/security_notify.py``), served to ``logs:view``; the owner's own later sign-in, which a
+live lock refuses; and the visible row's ``ts``, written after less work on a lock refusal than on a
+verified one. ``docs/SECURITY.md`` (Audit) states them. The factor and directory lock refusals get
+no visible stand-in row: only a holder of the account's session or ticket causes one, and that
+holder's unrefused attempt would differ anyway (``auth.mfa_verified``, ``auth.login_success``).
+
 ``/me/security-events`` is not filtered. It selects rows by the caller's own username, so it shows
 the holder their own lock and never another account's.
 """

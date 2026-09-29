@@ -57,6 +57,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.audit_exclusion import AuditExclusion
+from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._phi_gate_provisions import setenv_at_rest_opt_out
@@ -105,7 +106,7 @@ async def _totp_admin(
     return identity, password, steps
 
 
-async def _set_sign_in_lock(store: MessageStore, user_id: str) -> None:
+async def _set_sign_in_lock(store: Store, user_id: str) -> None:
     await store.record_login_failure(user_id, failed_attempts=3, locked_until=time.time() + 900)
 
 
@@ -672,3 +673,21 @@ def test_an_empty_excluded_detail_is_refused() -> None:
     """An empty detail would also match every NULL-detail row of that action."""
     with pytest.raises(ValueError):
         AuditExclusion(rows=frozenset({("auth.mfa_failed", "")}))
+
+
+def test_the_exclusion_binds_every_value_in_placeholder_order() -> None:
+    """The Postgres backend numbers its placeholders by position (``$N``), so the clause text and
+    the parameter list must be built in one order. This drives ``clauses`` with that backend's own
+    ``bind`` shape, which the SQLite suite cannot exercise."""
+    params: list[object] = ["actor-first"]
+
+    def bind(value: str) -> str:
+        params.append(value)
+        return f"${len(params)}"
+
+    clauses = HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.clauses(bind)
+    text = " AND ".join(clauses)
+    for n, value in enumerate(params[1:], start=2):
+        assert f"${n}" in text, (n, value, text)
+    assert "locked" not in text and "auth." not in text, "a value reached the SQL text"
+    assert params[1:5] == sorted(HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions)
