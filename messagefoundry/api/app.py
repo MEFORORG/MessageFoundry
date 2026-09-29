@@ -8031,6 +8031,19 @@ def create_managed_app(
             if credential_reminder is not None:
                 credential_reminder.cancel()
                 await asyncio.gather(credential_reminder, return_exceptions=True)
+            # BACKLOG #2087: let approval outcome writes still running land before the store closes.
+            # A write whose caller was cancelled, such as by a request timeout, finishes on its own,
+            # and would otherwise meet a closed store. drain() is bounded, and it is guarded like the
+            # flush below, so neither a failure nor the deadline skips engine.stop(). The gate is
+            # read through getattr because a startup that failed early may not have built one.
+            approval_gate = getattr(app.state, "approval_gate", None)
+            if approval_gate is not None:
+                try:
+                    await approval_gate.drain()
+                except Exception:
+                    _log.exception(
+                        "approval gate: the shutdown drain failed; continuing the teardown"
+                    )
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
             # called it, so every clean restart dropped the open hour's PHI-summary access audit --
