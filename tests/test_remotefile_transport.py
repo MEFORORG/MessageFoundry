@@ -213,6 +213,13 @@ class _FakeLedger:
         self.pruned += 1
 
 
+async def _settle(src: RemoteFileSource) -> None:
+    """Take the settle poll (BACKLOG #2071): a first sighting of a file only records its listed size,
+    so a test that expects a file to be read takes this poll first. It reads, moves and emits
+    nothing."""
+    await src._poll_once()
+
+
 # === destination =============================================================
 
 
@@ -346,6 +353,31 @@ async def test_destination_credential_fault_flag_threads_through(
     assert ei.value.credential_fault is True
 
 
+async def test_destination_cleans_temp_on_failed_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #2082: a store cut off part-way (the SFTP stall bound, a dropped connection) can leave a partial
+    # temp on the partner's server, one more on every retry. It is removed before the retry.
+    client = _FakeClient(store_exc=_RemoteError("SFTP upload stalled", permanent=False))
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    with pytest.raises(DeliveryError):
+        await dest.send("x")
+    (stored,) = [p for op, p in client.ops if op == "store"]
+    assert ("remove", stored) in client.ops
+
+
+async def test_destination_keeps_temp_after_a_credential_fault_on_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CONTROL: after a refused credential, removing the temp would be one more login attempt against
+    # the partner account, and nothing was written anyway.
+    client = _FakeClient(
+        store_exc=_RemoteError("auth failed", permanent=True, credential_fault=True)
+    )
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    with pytest.raises(NegativeAckError):
+        await dest.send("x")
+    assert not any(op == "remove" for op, _ in client.ops)
+
+
 async def test_destination_cleans_temp_on_failed_rename(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _FakeClient(rename_exc=_RemoteError("rename failed", permanent=False))
     dest = _dest(monkeypatch, client, filename="msg.hl7")
@@ -367,6 +399,7 @@ async def test_source_polls_retrieves_and_moves_to_processed(
     src = _src(monkeypatch, client)
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [b"MSH|^~\\&|A", b"MSH|^~\\&|B"]  # both delivered, in sorted order
     # Moved to the processed dir (only after the handler returned), not left in /in.
@@ -380,6 +413,7 @@ async def test_source_pattern_filters_non_matching(monkeypatch: pytest.MonkeyPat
     src = _src(monkeypatch, client, pattern="*.hl7")
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [b"MSH|^~\\&|A"]  # the .txt is ignored (pattern), the .hl7 sniffs as HL7
 
@@ -389,6 +423,7 @@ async def test_source_after_read_delete(monkeypatch: pytest.MonkeyPatch) -> None
     src = _src(monkeypatch, client, after_read="delete")
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [b"MSH|^~\\&|A"]
     assert "/in/a.hl7" not in client.files  # deleted, not moved
@@ -400,6 +435,7 @@ async def test_source_handler_failure_leaves_file(monkeypatch: pytest.MonkeyPatc
     src = _src(monkeypatch, client)
     h = _RecordingHandler(exc=RuntimeError("store write failed"))
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [b"MSH|^~\\&|A"]  # handler attempted
     assert "/in/a.hl7" in client.files  # left in place → re-emits next poll (at-least-once)
@@ -416,6 +452,7 @@ async def test_source_after_read_leave_keeps_file_and_dedups(
     src.processed_ledger = ledger
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [b"MSH|^~\\&|A"]  # ingested once
     assert "/in/a.hl7" in client.files  # left in place
@@ -468,6 +505,7 @@ async def test_source_oversize_moves_to_error_without_retrieving(
     src = _src(monkeypatch, client, max_file_bytes=5)
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == []  # never delivered
     assert not any(op == "retrieve" for op, _ in client.ops)  # never retrieved
@@ -566,6 +604,7 @@ async def test_source_refuses_a_body_bigger_than_the_size_the_server_listed(
     src = _src(monkeypatch, client, max_file_bytes=10)
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert any(op == "retrieve" for op, _ in client.ops)  # it DID pass the listing gate
     assert h.bodies == []  # nothing partial reached the pipeline
@@ -581,6 +620,7 @@ async def test_source_logs_the_lying_size_refusal(
     client = _FakeClient(files={"/in/lie.hl7": b"M" * 100}, sizes={"/in/lie.hl7": 4})
     src = _src(monkeypatch, client, max_file_bytes=10)
     src._handler = _RecordingHandler()
+    await _settle(src)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
         await src._poll_once()
     assert any("delivered more than max_file_bytes" in r.getMessage() for r in caplog.records)
@@ -593,6 +633,7 @@ async def test_source_zero_max_file_bytes_keeps_the_retrieve_unbounded(
     src = _src(monkeypatch, client, max_file_bytes=0)
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert len(h.bodies) == 1  # delivered whole — the operator disabled the cap
 
@@ -647,6 +688,7 @@ async def test_source_retrieve_failure_leaves_file(monkeypatch: pytest.MonkeyPat
     src = _src(monkeypatch, client)
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == []  # nothing delivered
     assert "/in/a.hl7" in client.files  # left in place to retry
@@ -781,6 +823,7 @@ async def test_source_quarantines_content_rejected_by_scan_hook(
         src = _src(monkeypatch, client)
         h = _RecordingHandler()
         src._handler = h
+        await _settle(src)
         await src._poll_once()
     finally:
         set_scan_hook(None)  # restore the default no-op
@@ -802,6 +845,7 @@ async def test_source_content_sniff_quarantines_non_hl7_when_hl7v2(
     src.content_type = ContentType.HL7V2  # runner injects this; set it directly here
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [b"MSH|^~\\&|A|B"]  # only the real HL7 message was delivered
     assert "/in/.error/bad.hl7" in client.files  # the non-HL7 file was quarantined
@@ -823,6 +867,7 @@ async def test_source_content_sniff_active_for_x12_quarantines_non_isa(
     src.content_type = ContentType.X12  # x12 inbound → ISA sniff stays ON
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [x12_body]  # only the conformant ISA body delivered
     assert "/in/.error/claim.hl7" not in client.files  # NOT quarantined
@@ -841,6 +886,7 @@ async def test_source_content_sniff_quarantines_non_fhir_when_fhir(
     src.content_type = ContentType.FHIR  # fhir inbound → JSON {/[ sniff ON
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [resource]  # only the JSON-shaped FHIR resource delivered
     assert "/in/.error/bad.fhir" in client.files  # the PDF was quarantined
@@ -858,6 +904,7 @@ async def test_source_content_sniff_active_when_content_type_unset(
     assert src.content_type is None  # default: unset
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [b"MSH|^~\\&|A|B"]  # only the HL7 body delivered
     assert (
@@ -1114,6 +1161,7 @@ class _FakeParamiko:
     AutoAddPolicy = _AutoAddPolicy
     SSHException = _SSHException
     AuthenticationException = _AuthException
+    SFTPError = type("SFTPError", (Exception,), {})
 
     class RSAKey:
         @staticmethod
@@ -1913,6 +1961,7 @@ async def test_a_safe_entry_beside_a_hostile_one_still_flows(
     src = _src(monkeypatch, client)
     h = _RecordingHandler()
     src._handler = h
+    await _settle(src)
     await src._poll_once()
     assert h.bodies == [rb"MSH|^~\&|A"]
 
@@ -1992,6 +2041,7 @@ async def test_remote_source_oversize_reject_never_logs_the_partner_chosen_name(
     client = _FakeClient(files={f"/in/{name}": b"M" * 100})
     src = _src(monkeypatch, client, max_file_bytes=10)
     src._handler = _RecordingHandler()
+    await _settle(src)
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
     assert f"/in/.error/{name}" in client.files  # the arm really ran (not a vacuous pass)
@@ -2026,6 +2076,7 @@ async def test_remote_source_retrieve_failure_logs_neither_the_name_nor_a_raw_ex
     )
     src = _src(monkeypatch, client)
     src._handler = _RecordingHandler()
+    await _settle(src)
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
     assert "could not retrieve" in sink.text  # the arm ran
@@ -2045,6 +2096,7 @@ async def test_remote_source_move_failure_logs_neither_the_name_nor_a_raw_except
     )
     src = _src(monkeypatch, client)
     src._handler = _RecordingHandler()
+    await _settle(src)
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
     assert "could not move" in sink.text  # the arm ran
@@ -2085,3 +2137,233 @@ def test_sftp_real_handshake_still_needs_an_etm_mac_beside_gcm(
     assert _stock_handshake(paramiko, ciphers, tmp_path / "control", encrypt_and_mac) == ciphers[0]
     with pytest.raises(paramiko.SSHException, match="(?i)macs"):
         _connector_handshake(paramiko, ciphers, tmp_path, monkeypatch, encrypt_and_mac)
+
+
+# --- BACKLOG #2071: the settle gate on the remote source -------------------------------------------
+
+_SETTLE_HEAD = b"MSH|^~\\&|A|B|C|D|20260929||ADT^A01|SETTLE1|P|2.5\rPID|1||SYNTH"
+_SETTLE_WHOLE = _SETTLE_HEAD + b"0001\r"
+
+
+async def test_a_file_that_grows_between_polls_is_read_only_once_it_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partner that writes, pauses and writes again leaves a file that is still for the length of
+    one retrieve, so #116's before-and-after check passes the head as a whole message. The gate
+    compares the listed size across polls instead.
+
+    Red mutation: make ``_settled`` return True. The first poll then emits the head, which is a
+    truncated message that nothing downstream can tell from a whole one."""
+    client = _FakeClient(files={"/in/a.hl7": _SETTLE_HEAD})
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+
+    await src._poll_once()  # first sighting: recorded, nothing read
+    assert h.bodies == []
+    assert not any(op == "retrieve" for op, _ in client.ops)
+
+    client.files["/in/a.hl7"] = _SETTLE_WHOLE  # the partner writes the rest between polls
+    await src._poll_once()  # the listed size moved, so it waits again
+    assert h.bodies == []
+    assert "/in/a.hl7" in client.files
+
+    await src._poll_once()  # unchanged since the last poll: read whole
+    assert h.bodies == [_SETTLE_WHOLE]
+    assert client.files["/in/.processed/a.hl7"] == _SETTLE_WHOLE
+    assert src._settle_seen == {}  # an admitted file leaves the map
+
+
+async def test_a_file_the_listing_drops_is_forgotten_after_the_miss_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The map is bounded by the poll directory, not by every name it ever held.
+
+    Red mutation: delete the ``_prune_settle`` call. The removed file's entry is never forgotten."""
+    from messagefoundry.transports.file import SETTLE_MISS_LIMIT
+
+    client = _FakeClient(files={"/in/a.hl7": _SETTLE_HEAD, "/in/b.hl7": _SETTLE_HEAD})
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    await src._poll_once()
+    assert sorted(src._settle_seen) == ["a.hl7", "b.hl7"]
+
+    del client.files["/in/b.hl7"]  # renamed away by the partner before it settled
+    for _ in range(SETTLE_MISS_LIMIT - 1):
+        await src._poll_once()
+        assert "b.hl7" in src._settle_seen, "one missed listing must not restart the wait"
+    await src._poll_once()
+    assert "b.hl7" not in src._settle_seen
+
+
+async def test_at_the_settle_cap_a_new_file_waits_and_every_file_still_settles(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At the cap a new file is not recorded, and every file still settles in turn.
+
+    Red mutation: evict the oldest entry to make room instead. With a cap of one and two files, each
+    first sighting pushes the other out and nothing is ever emitted."""
+    monkeypatch.setattr(remotefile, "SETTLE_SEEN_MAX", 1)
+    client = _FakeClient(files={"/in/a.hl7": _SETTLE_WHOLE, "/in/b.hl7": _SETTLE_WHOLE})
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.remotefile"):
+        await src._poll_once()
+    assert list(src._settle_seen) == ["a.hl7"]  # b waits for room
+    assert "settle memory is full" in caplog.text
+    await src._poll_once()  # a is admitted, which makes room for b's first sighting
+    assert h.bodies == [_SETTLE_WHOLE]
+    await src._poll_once()
+    assert h.bodies == [_SETTLE_WHOLE, _SETTLE_WHOLE]
+    assert src._settle_seen == {}
+
+
+async def test_an_unsettled_file_does_not_charge_the_poll_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file still being written stays in place, so it must not spend the per-tick budget.
+
+    Red mutation: charge ``disposed`` on the not-yet-settled arm. The growing file, which sorts first,
+    then eats a ceiling of one on every poll and the settled file behind it is never read."""
+    client = _FakeClient(files={"/in/a.hl7": _SETTLE_HEAD, "/in/b.hl7": _SETTLE_WHOLE})
+    src = _src(monkeypatch, client, poll_max_files=1)
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    client.files["/in/a.hl7"] += b"X"  # a keeps growing on every poll
+    await src._poll_once()
+    assert h.bodies == [_SETTLE_WHOLE]  # b was read although a sorts ahead of it
+    assert "/in/a.hl7" in client.files
+
+
+# --- BACKLOG #2082: every entry is a collision, and the probe uses one connection -------------------
+
+
+class _DropBoxFtp:
+    """An ``ftplib.FTP_TLS`` stand-in over an in-memory drop directory whose ``MLSD`` listing is
+    ``entries``. Records every connection and every command that changes the directory."""
+
+    connections: list[_DropBoxFtp] = []
+    entries: list[tuple[str, dict[str, str]]] = []
+
+    def __init__(self, *, context: Any = None, timeout: float | None = None) -> None:
+        self.stored: list[str] = []
+        self.renamed: list[tuple[str, str]] = []
+        self.made: list[str] = []
+        self.listed = 0
+        _DropBoxFtp.connections.append(self)
+
+    def connect(self, host: str, port: int) -> None:
+        pass
+
+    def auth(self) -> None:
+        pass
+
+    def login(self, *, user: str, passwd: str) -> None:
+        pass
+
+    def prot_p(self) -> None:
+        pass
+
+    def mkd(self, path: str) -> str:
+        self.made.append(path)
+        return path
+
+    def mlsd(self, path: str) -> list[tuple[str, dict[str, str]]]:
+        self.listed += 1
+        return list(_DropBoxFtp.entries)
+
+    def storbinary(self, cmd: str, fp: Any) -> None:
+        self.stored.append(cmd.removeprefix("STOR "))
+
+    def rename(self, src: str, dst: str) -> None:
+        self.renamed.append((src, dst))
+
+    def quit(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _drop_box(
+    monkeypatch: pytest.MonkeyPatch, entries: list[tuple[str, dict[str, str]]]
+) -> type[_DropBoxFtp]:
+    import ftplib as _ftplib
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _DropBoxFtp.connections = []
+    _DropBoxFtp.entries = entries
+    monkeypatch.setattr(_ftplib, "FTP_TLS", _DropBoxFtp)
+    return _DropBoxFtp
+
+
+def _ftps_client() -> _FtpClient:
+    return _FtpClient(
+        {"host": "ftp.example.com", "remote_dir": "/in", "username": "u", "password": "p"}, tls=True
+    )
+
+
+_MLSD_DOTS = [(".", {"type": "cdir"}), ("..", {"type": "pdir"})]
+
+
+@pytest.mark.parametrize(
+    "entry_type",
+    ["OS.unix=symlink", "dir", "OS.unix=slink:/elsewhere/a.hl7"],
+    ids=["symlink", "directory", "symlink-with-target"],
+)
+async def test_a_same_named_entry_that_is_not_a_file_is_a_collision(
+    monkeypatch: pytest.MonkeyPatch, entry_type: str
+) -> None:
+    """The regular-file listing the source reads leaves these out, so before #2082 the collision
+    check did not see them, and the rename would have replaced a partner's symlink.
+
+    Driven through the shipped ``_FtpClient``, so the MLSD parsing under test is the real one."""
+    box = _drop_box(monkeypatch, [*_MLSD_DOTS, ("msg.hl7", {"type": entry_type})])
+    dest = build_destination(
+        _ftp_dest(tls=True, username="u", password="p", filename="msg.hl7", overwrite=False)
+    )
+    await dest.send(_UPLOAD_BODY)
+    (rename,) = [r for c in box.connections for r in c.renamed]
+    assert rename[1] == "/in/msg-1.hl7", f"the upload was published over the {entry_type} entry"
+
+
+def test_the_source_listing_still_takes_regular_files_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CONTROL: the widening is the collision check's alone. The source's ``list_dir`` must not
+    start offering a symlink or directory for retrieval."""
+    _drop_box(
+        monkeypatch,
+        [
+            *_MLSD_DOTS,
+            ("link.hl7", {"type": "OS.unix=symlink"}),
+            ("sub", {"type": "dir"}),
+            ("a.hl7", {"type": "file", "size": "5"}),
+        ],
+    )
+    client = _ftps_client()
+    assert client.list_dir("/in") == [("a.hl7", 5)]
+    assert client.list_names("/in") == {"link.hl7", "sub", "a.hl7"}
+
+
+def test_sftp_list_names_takes_every_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SFTPClient.listdir`` names every entry; ``listdir_attr`` with ``S_ISREG``, which the source
+    reads, would drop a symlink (``listdir_attr`` reports the link itself, not its target)."""
+
+    class _Listing:
+        def listdir(self, path: str) -> list[str]:
+            return ["link.hl7", "sub", "a.hl7"]
+
+    monkeypatch.setattr(_SftpClient, "_op", lambda self, fn: fn(_Listing()))
+    client = _SftpClient({"host": "sftp.example.com"})
+    assert client.list_names("/in") == {"link.hl7", "sub", "a.hl7"}
+
+
+async def test_the_overwrite_off_probe_uses_one_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe ensures the directory and lists it. On two connections, two connect bounds in a
+    row can outlast the API's cap on the probe; on one, they cannot."""
+    box = _drop_box(monkeypatch, list(_MLSD_DOTS))
+    dest = build_destination(_ftp_dest(tls=True, username="u", password="p", overwrite=False))
+    await dest.test_connection()
+    (conn,) = box.connections
+    assert conn.made == ["/in"] and conn.listed == 1, "the probe must still ensure AND list"

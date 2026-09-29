@@ -636,6 +636,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   tick closed it. A committed reload now replaces every scheduler task from the new config, and
   leaves a scheduled inbound unbound outside its window. An outbound whose schedule is removed is
   resumed if the calendar had parked it, since nothing else would. (`BACKLOG #2069`)
+- **The SFTP and FTP source now waits for a file to stop growing before it reads it.** A file is
+  read only once it lists at the same size on two polls in a row, as the local File source has done
+  since `BACKLOG #1811`, so a partner that pauses between writes for less than `poll_seconds` is
+  waited out. Every file now waits at least one poll. The gate is always on and reads the listed
+  size alone, since a remote listing has no reliable modification time; it cannot see a same-size
+  rewrite, nor anything on a server that lists every file at size 0. (`BACKLOG #2071`)
+- **An SFTP upload to a server that stops reading is now cut off, and a few SFTP errors that escaped
+  raw are now classified.** paramiko retries a stalled socket write without limit, so such an upload
+  would have held its worker thread for good. The connector now closes the connection once an upload
+  makes no progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per 32 KiB step), and the delivery is
+  retried, after the partial temp file is removed where it can be; a failed store now removes its temp, except
+  after a refused credential. An `EOFError` and a helper thread that cannot start are now transient, and a
+  `paramiko.SFTPError` is permanent. With `overwrite = false`, a same-named symlink, directory or
+  other non-file entry now counts as a collision, and `POST /connections/{name}/test` ensures and
+  lists the upload directory on one connection. (`BACKLOG #2082`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
