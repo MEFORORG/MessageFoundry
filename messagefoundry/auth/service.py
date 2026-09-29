@@ -101,6 +101,7 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
@@ -6814,7 +6815,8 @@ class AuthService:
         arrived: float | None = None,
     ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
-        match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
+        match). TOTP is checked first, and a TOTP success does no argon2 work; a refused TOTP
+        replay still pays the recovery-code walk (ADR 0170). Recovery codes are argon2id-hashed and
         single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
 
         ``client`` is the caller's address, carried onto the recovery-code audit row and notice
@@ -6822,6 +6824,7 @@ class AuthService:
         code = code.strip()
         if not code:
             return False
+        totp_refused = False
         secret = await self._store.get_totp_secret(user.id)
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
@@ -6841,7 +6844,15 @@ class AuthService:
                 # tolerated future (fast-clock) code to the CURRENT step (SEC-014), so consuming it
                 # can't advance the high-water mark past now and lock the user out of their own next
                 # legitimate code.
-                return await self._store.consume_totp_step(user.id, matched_step)
+                if await self._store.consume_totp_step(user.id, matched_step):
+                    return True
+                # ASVS 11.2.4 (BACKLOG #1167, ADR 0170 amendment). The step was already consumed:
+                # a replay, or a second use inside the same step. Returning here cost no argon2
+                # work, while a WRONG code falls through to the recovery-code walk below. Both answer
+                # False, so the wall clock was the only thing telling them apart. So fall through
+                # to the SAME walk (same store read, same hashes, same slot count) and refuse after
+                # it. A success stays fast: it already reveals its outcome.
+                totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
         real = list(await self._store.get_recovery_code_hashes(user.id))
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
@@ -6864,7 +6875,8 @@ class AuthService:
             ok = await self._argon2(verify_password, h, normalized)
             if ok and i < len(real) and matched < 0:
                 matched = i  # recorded, NOT returned -- returning here restores the leak
-        if matched < 0:
+        if matched < 0 or totp_refused:
+            # A refused TOTP code never spends a recovery code, even one it somehow matched.
             return False
         # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
         # concurrent verify of the same single-use code can't double-spend it (WP-14).
@@ -7328,7 +7340,14 @@ class AuthService:
         if user is None:
             return False
         creds = await self._store.list_webauthn_credentials(identity.user_id)
-        target = next((c for c in creds if c.credential_id_hash == credential_id_hash), None)
+        # ASVS 11.2.4 (BACKLOG #1167). Every credential is compared, and each compare is constant-time:
+        # a `next(... == ...)` search stopped at the matching slot and its `==` stopped at the first
+        # differing character. The store delete below still matches the row by SQL equality.
+        target: WebAuthnCredential | None = None
+        for cred in creds:
+            same = constant_time_equal(cred.credential_id_hash, credential_id_hash)
+            if same and target is None:
+                target = cred  # recorded, NOT returned -- the walk runs to the end
         if target is None:
             return False
         last_second_factor = len(creds) == 1 and not user.totp_enabled

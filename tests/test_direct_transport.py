@@ -340,6 +340,33 @@ def test_key_cert_mismatch_refused(pki: dict[str, Any], tmp_path: Path) -> None:
         DirectDestination(_dest(pki, signing_key=str(other_key_p)))
 
 
+def test_key_cert_match_is_compared_in_constant_time(
+    pki: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 11.2.4 (BACKLOG #1167): the key/cert public-key compare uses ``hmac.compare_digest``.
+
+    Red while the compare is a bare ``!=``, which never reaches the spy. The operands must be the
+    DER SubjectPublicKeyInfo bytes, the same encoding the bare compare used.
+    """
+    import hmac
+
+    seen: list[tuple[object, object]] = []
+    real = hmac.compare_digest
+
+    def spy(a: bytes, b: bytes) -> bool:
+        seen.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+    DirectDestination(_dest(pki))
+    spki = (
+        pki["signer_cert"]
+        .public_key()
+        .public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    )
+    assert (spki, spki) in seen, "the key/cert compare never reached compare_digest"
+
+
 def test_untrusted_recipient_refused(pki: dict[str, Any], tmp_path: Path) -> None:
     # A recipient cert issued by a DIFFERENT CA — must not chain to the supplied trust anchor.
     rogue_ca_key, rogue_ca_cert = _mint_ca()

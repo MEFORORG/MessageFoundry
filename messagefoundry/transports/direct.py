@@ -46,6 +46,7 @@ and connector-success — documented and accepted (a duplicate beats a drop), ex
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import smtplib
 import ssl
@@ -441,7 +442,10 @@ class DirectDestination(DestinationConnector):
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        if key_pub != cert_pub:
+        # Constant-time over the DER bytes (ASVS 11.2.4, BACKLOG #1167): `!=` stops at the first
+        # differing byte. Both operands are public keys, so this closes a bare compare on key
+        # material rather than a secret leak; the requirement's verb asks for no short-circuit.
+        if not hmac.compare_digest(key_pub, cert_pub):
             raise ValueError(
                 "Direct destination 'signing_key' does not match 'signing_cert' (public keys differ)"
             )

@@ -4,7 +4,9 @@ This page designates which of the engine's third-party dependencies are **risky 
 what "risky" means here, and names the ones that were assessed and deliberately not designated.
 
 It exists so a deploying operator knows where to look first when a dependency advisory lands, without
-reading the source or guessing from a package name.
+reading the source or guessing from a package name. A later section reads every component on the
+examples of a risky component that ASVS, the Application Security Verification Standard, gives. It
+uses dated public data.
 
 > **MessageFoundry is a not-deployed beta. There are zero running instances.** Nothing below reports
 > a live exposure. It describes what a first deployment would carry.
@@ -173,9 +175,129 @@ regression in an 18.6 release of ODBC Driver 18, not in `pyodbc`. It says Micros
 So the defect to track is the driver's, which is one more reason to keep the driver current.
 `pyodbc` 5.3.0 was still its newest release on that date.
 
+## Risky by ASVS's own examples, read from public data
+
+The tiers above ask where a flaw would hurt most. ASVS asks something else. Its V15.1 chapter calls
+a third-party library a risky component when it has "missing or poorly implemented security
+controls around its development processes or functionality". Its examples are components that are
+"poorly maintained, unsupported, at the end-of-life stage, or have a history of significant
+vulnerabilities". This section reads every component on those examples.
+
+<!-- BEGIN component-readings: rendered by scripts/security/component_readings.py from security/risky-component-readings.json. Do not edit by hand. -->
+
+> **Snapshot date: 2026-09-29. Re-read by: 2026-12-28.** Every reading below comes from public data
+> on the snapshot date: PyPI, the Python Package Index, and OSV, the Open Source Vulnerabilities
+> database. It covers the versions the closure files pinned that day. Support status and advisory
+> history go stale. After the re-read date, treat this section as out of date until
+> [`scripts/security/component_readings.py`](../scripts/security/component_readings.py) runs again.
+
+The readings, their sources and their windows are recorded in
+[`security/risky-component-readings.json`](../security/risky-component-readings.json).
+
+### What is read, and the test for each example
+
+All 43 distributions in the `sqlserver` closure are read: the 41 in the core closure and the 2 the
+extra adds. That is the whole assessed set, not only the designated part. A library can be risky on
+these examples even where the tiers did not designate it.
+
+| Example | A component is risky on it when | Source |
+|---|---|---|
+| Poorly maintained | it has uploaded no release to PyPI in the 730 days before the snapshot. A pre-release counts; a release whose every file is yanked does not | PyPI JSON API |
+| Unsupported or end of life | its PyPI project status, the marker Python standard PEP 792 defines, is `archived`, `deprecated` or `quarantined`, or its latest release is classified `Development Status :: 7 - Inactive`, or the pinned version is yanked or no longer listed | PyPI JSON and Simple APIs |
+| A history of significant vulnerabilities | at least one advisory rated `HIGH` or `CRITICAL` was first published in the 1825 days (about 5 years) before the snapshot | OSV API |
+
+OSV often records one flaw twice, once from the GitHub advisory database and once from the Python
+advisory database. Records that name each other count once. A record does not count when every
+GitHub advisory it names about that package has been withdrawn.
+
+The severity is the GitHub advisory database's rating. Where it gives none, the script scores the
+record's CVSS 3 vector and rates it on that system's scale. CVSS is the Common Vulnerability Scoring
+System. An advisory with neither does not count. The ones in the window are named below so a reader
+can judge them.
+
+These tests are mechanical. A small library that is finished can trip the first one without being
+neglected. The reading says where to look; it does not say the library is broken.
+
+**Risky on at least one example: 13 of 43. On maintenance: 5. On support: 0. On vulnerability
+history: 8. Not risky on any: 30. 13 plus 30 is 43.**
+
+### Poorly maintained
+
+| Component | Newest release | Designated above |
+|---|---|---|
+| `aioodbc` | 2023-10-28 | yes, the `sqlserver` extra |
+| `colorama` | 2022-10-25 | no |
+| `defusedxml` | 2023-09-29 | yes, tier 1 |
+| `hl7` | 2022-03-31 | yes, tier 1 |
+| `hl7apy` | 2024-03-13 | yes, tier 1 |
+
+### Unsupported or end of life
+
+None on the snapshot date.
+
+### A history of significant vulnerabilities
+
+| Component | Significant in the window | Newest of those | Designated above |
+|---|---|---|---|
+| `anyio` | 2 | 2026-09-18 | no |
+| `certifi` | 1 | 2023-07-25 | yes, tier 2 |
+| `click` | 1 | 2026-04-30 | no |
+| `cryptography` | 8 | 2026-08-03 | yes, tier 2 |
+| `h11` | 1 | 2025-04-24 | yes, tier 3 |
+| `httpx` | 1 | 2022-04-28 | yes, tier 3 |
+| `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
+| `starlette` | 5 | 2026-06-15 | yes, tier 3 |
+
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 43. The table
+above counts past advisories only.
+
+Every advisory in the window carries a rating from one of the two sources.
+
+1 record was left out because every GitHub advisory about the package it names is withdrawn:
+`PYSEC-2024-38` against `fastapi`, twin of `GHSA-qf9m-vfgh-m389`.
+
+1 record names a GitHub advisory that OSV does not have, so its status is unknown. It still counts:
+`PYSEC-2026-2132` against `click`, naming `GHSA-47fr-3ffg-hgmw`.
+
+### Not risky on any of the three
+
+| Components | Designated above |
+|---|---|
+| `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyspnego`, `pyyaml`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
+| `aiosqlite`, `annotated-doc`, `annotated-types`, `prometheus-client`, `psutil`, `python-dotenv`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop`, `watchfiles` | no |
+
+### How this reading and the tiers fit together
+
+The tiers stay the designation. This reading does not move a component into or out of them. Where
+the two agree is where to look first.
+
+10 designated components are also risky on an ASVS example:
+
+| Component | Designated above | Risky on |
+|---|---|---|
+| `aioodbc` | the `sqlserver` extra | maintenance |
+| `certifi` | tier 2 | vulnerability history |
+| `cryptography` | tier 2 | vulnerability history |
+| `defusedxml` | tier 1 | maintenance |
+| `h11` | tier 3 | vulnerability history |
+| `hl7` | tier 1 | maintenance |
+| `hl7apy` | tier 1 | maintenance |
+| `httpx` | tier 3 | vulnerability history |
+| `pyasn1` | tier 2 | vulnerability history |
+| `starlette` | tier 3 | vulnerability history |
+
+3 components are risky here and not designated above: `anyio` (vulnerability history), `click`
+(vulnerability history), `colorama` (maintenance). The tiers did not designate them under the
+exposure criterion. The reading names them so that choice stays visible, and a reviewer can revisit
+it.
+
+<!-- END component-readings -->
+
 ## What this page is not
 
-**It is not a vulnerability list.** It says where to look, not what is currently wrong. Advisories
+**It is not a vulnerability list.** It says where to look, not what is currently wrong. The
+vulnerability-history reading above counts past advisories on a dated snapshot; it does not track
+what is open today. Advisories
 against these components are handled through the process in
 [`.github/SECURITY.md`](../.github/SECURITY.md), and the machine-readable exception record is
 [`security/vex/messagefoundry.openvex.json`](../security/vex/messagefoundry.openvex.json).
@@ -203,3 +325,15 @@ Dependabot pull request, the lock-resync workflow runs the command for you.
 
 Adding a dependency therefore means classifying it. Designating it is a judgement call; leaving it
 out of both tables is not available.
+
+The same test holds the ASVS reading to its snapshot,
+[`security/risky-component-readings.json`](../security/risky-component-readings.json), with no
+network. Every name in the `sqlserver` closure must have exactly one reading, and no reading may
+name anything else. Each verdict must follow from its recorded readings under the recorded
+criteria. The section between the markers must be exactly what the snapshot and the tiers above
+render, so a tier change needs `python scripts/security/component_readings.py --render-only`.
+
+The test does not go red when the re-read date passes, because a date alone would then fail every
+unrelated pull request. Keeping the re-read date is a maintainer task. Run
+`python scripts/security/component_readings.py` and commit what it writes. It reads the public data
+again and rewrites both the snapshot and the section.
