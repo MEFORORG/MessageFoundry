@@ -660,9 +660,12 @@ export function isTemplateValue(value: unknown): value is TemplateValue {
   return isRecord(value) && Object.keys(value).length === 1 && isTemplatePartList(value.parts);
 }
 
-/** The `set_params` value that writes `parts` as a template: `{parts}`, the list copied. */
+/**
+ * The `set_params` value that writes `parts` as a template: `{parts}`, the list copied but each part left
+ * as given. It never repairs a part: a malformed one must reach the engine, which refuses it.
+ */
 export function templateValue(parts: readonly TemplatePart[]): TemplateValue {
-  return { parts: parts.map(copyTemplatePart) };
+  return { parts: [...parts] };
 }
 
 /**
@@ -678,24 +681,24 @@ export function templateValue(parts: readonly TemplatePart[]): TemplateValue {
  * - An argument's mode is the engine's. A name with no mode, or a mode string this IDE does not know (a
  *   newer engine), is left out, so {@link paramWritableModes} falls back to the old split for it alone.
  * - `dynamic` is read-only, always.
- * - `static` is writable exactly where it was before modes existed ({@link editableParamNames}), and also
- *   on an argument in `template_params`, because the engine accepts a literal wherever it accepts a
- *   template. That is how a templated argument switches back to a literal.
+ * - `static` is writable on an argument in `literal_params` (as before modes existed), and also on one in
+ *   `template_params`, because the engine accepts a literal wherever it accepts a template. That is how
+ *   a templated argument switches back to a literal. An absent `literal_params` beside a present
+ *   `param_modes` grants nothing: the old "absent means all editable" reading is for engines without
+ *   modes, and applying it here would offer a display keyword a write the engine refuses.
  * - `templated` is writable only on an argument in `template_params`. An absent `template_params` (an
  *   engine that sends modes but predates template writes) offers no template write at all.
- * - A templated argument outside `template_params` (a lookup's statement, a diagnostic's template) is
- *   read-only here. The engine would take a literal into some of those, but it issues no list saying
- *   which, and this model offers only writes an engine list names.
+ * - A templated argument outside `template_params` (a lookup's statement, a diagnostic's template, a
+ *   locator) is read-only here. Measured on the engine piece at 5d7a274ca, the engine does accept a
+ *   literal into those, but it issues no list saying so, and this model offers only writes an engine
+ *   list names.
  */
-export function paramModeViews(
-  row: LensRow,
-  editableNames?: readonly string[],
-): Record<string, ParamModeView> | undefined {
+export function paramModeViews(row: LensRow): Record<string, ParamModeView> | undefined {
   const modes: unknown = row.param_modes;
   if (!hasTypedParams(row.kind) || !isRecord(modes)) {
     return undefined;
   }
-  const editable = new Set(editableNames ?? editableParamNames(row));
+  const editable = new Set(Array.isArray(row.literal_params) ? row.literal_params : []);
   const templateOk = new Set(Array.isArray(row.template_params) ? row.template_params : []);
   const partsMap: unknown = row.param_parts;
   const views: Record<string, ParamModeView> = {};
@@ -756,10 +759,10 @@ export type RewriteRefusalKind = "dynamic" | "literal-only" | "template-shape" |
 
 // Keyed on substrings of the engine's own refusal text (messagefoundry/lens.py, `_render_moded_value`,
 // `_refuse_templated_write`, `_check_parts_spec`, `_render_parts`, `_refuse_overlong_template_lines`).
-// Template-shape is checked FIRST because it is the only family whose messages quote user text (a
+// Template-shape is checked FIRST because it is the only mode family whose messages quote user text (a
 // refused path, verbatim), so a path spelling another family's needle must not be filed under it. The
-// other families quote only a Python parameter name, which cannot contain a space and so cannot spell
-// any needle here.
+// other mode families quote only a Python parameter name, which cannot contain a space and so cannot
+// spell any needle here.
 const REWRITE_REFUSALS: ReadonlyArray<[RewriteRefusalKind, readonly string[]]> = [
   [
     "template-shape",
@@ -792,7 +795,13 @@ export function classifyRewriteRefusal(error: string | undefined): RewriteRefusa
   if (!error) {
     return undefined;
   }
+  // Every mode refusal but the column limit opens with "parameter '<name>'". Requiring that prefix keeps
+  // an unrelated error that quotes user text (a handler name, an unknown param name) from matching.
+  const aboutParameter = error.startsWith("parameter '");
   for (const [kind, needles] of REWRITE_REFUSALS) {
+    if (kind !== "column-limit" && !aboutParameter) {
+      continue;
+    }
     if (needles.some((needle) => error.includes(needle))) {
       return kind;
     }
@@ -802,7 +811,6 @@ export function classifyRewriteRefusal(error: string | undefined): RewriteRefusa
 
 /** Fold one contract row + the module lines into its view-model. */
 export function buildRowViewModel(row: LensRow, index: number, lines: string[]): RowViewModel {
-  const editable = editableParamNames(row);
   const vm: RowViewModel = {
     index,
     kind: row.kind,
@@ -813,7 +821,7 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
     isReturn: isReturnRow(row),
     title: rowTitle(row),
     params: rowParams(row),
-    editableParams: editable,
+    editableParams: editableParamNames(row),
     action: row.action ?? row.call, // ADR 0104 §2.3: recognized name (action OR lookup call, e.g. code_lookup)
 
     // The row's projected source — sliced from the SAME (engine-newline) lines the projection parsed, so
@@ -854,7 +862,7 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
     vm.code = row.raw ?? sliceSource(lines, row.line_start, row.line_end);
     vm.pragma = row.pragma === true;
   }
-  const modes = paramModeViews(row, editable);
+  const modes = paramModeViews(row);
   if (modes !== undefined) {
     vm.paramModes = modes;
   }

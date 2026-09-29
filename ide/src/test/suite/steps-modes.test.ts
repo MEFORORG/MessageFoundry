@@ -344,6 +344,16 @@ suite("Steps modes: an absent map falls back to the literal split (ADR 0076 E.8)
     assert.deepStrictEqual(views?.path, { mode: "static", writable: ["static"] });
   });
 
+  test("modes without literal_params grant no literal write (the all-editable reading is pre-modes)", () => {
+    const row: LensRow = { ...NATIVE_DISPLAY };
+    delete row.literal_params;
+    const views = paramModeViews(row);
+    assert.deepStrictEqual(views?.occurrence, { mode: "static", writable: [] });
+    assert.deepStrictEqual(views?.path, { mode: "static", writable: [] });
+    // template_params still grants its own writes, the literal switch included.
+    assert.deepStrictEqual(views?.value, { mode: "static", writable: ["static", "templated"] });
+  });
+
   test("an unknown mode string or a missing key falls back for that argument alone", () => {
     const skewed: LensRow = {
       ...TEMPLATED_VALUE,
@@ -424,6 +434,11 @@ suite("Steps modes: parts on the wire and into a set_params payload", () => {
     const edited = templateValue(parts);
     edited.parts.pop();
     assert.strictEqual(parts.length, 5);
+  });
+
+  test("templateValue copies the list but never repairs a part", () => {
+    const bad = [{ text: "a", path: "PID-3" } as unknown as TemplatePart];
+    assert.deepStrictEqual(templateValue(bad), { parts: [{ text: "a", path: "PID-3" }] });
   });
 
   test("a param named like an Object member is an own key, never an inherited one", () => {
@@ -561,6 +576,9 @@ suite("Steps modes: the engine's set_params refusals are classified by kind", ()
     // Not mode refusals: a note's over-long comment, a route row's list refusal, a stale coordinate.
     ["the edited comment would be 95 columns — over the 88-column limit; shorten it", undefined],
     ["a route row's 'handlers' must be a list of handler-name strings", undefined],
+    // A user-chosen handler name quoted in an unrelated error must not spell a mode refusal.
+    ["no recognized row at lines 3-3 in handler 'exactly one key'", undefined],
+    ["unknown or absent parameter(s) ['is in dynamic mode'] for this call", undefined],
     [
       "the row's source no longer matches the editor buffer (stale coordinates) - re-project the Steps " +
         "view and retry",
