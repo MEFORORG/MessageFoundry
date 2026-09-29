@@ -246,6 +246,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   `oidc_acr_values` still loads. With both keys set, a token whose `amr` matches
   `oidc_mfa_amr_values` still passes the gate whatever its `acr`. The `oidc-auth-params` advisory in
   `messagefoundry check` now reports this case as a settings load failure. (`BACKLOG #2032`)
+- **The Vault clients now narrow and verify the TLS leg to an `https://` proxy, and refuse an
+  `http://` Vault behind one.** Both Vault clients (the `vault` secret provider and the store's
+  Vault key provider and Transit cipher) honour `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and, on
+  Windows, the system proxy. Through an `https://` proxy, the leg to the proxy used urllib3's own
+  context, which offered CBC suites off the approved list. It now gets a fresh engine context per
+  connection, narrowed to the approved suites. The engine checks that the leg ran on that context
+  before it sends `CONNECT`, and refuses otherwise. So a proxy that offers only a non-approved suite
+  would now refuse. Verification of that leg is unchanged: it was, and is, checked against the
+  Vault hop's anchor and the proxy's host name. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
+  proxy is refused when the client is built, and again before each send. requests does not verify
+  that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
+  nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
+- **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
+  `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
+  site proxy would have taken the loopback probe off the host and read a running engine as down.
+  The leg to an `https://` proxy also ran on httpcore's own context, not the narrowed one. The probe
+  now ignores proxy settings. (`BACKLOG #300`, ASVS 12.1.2)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
