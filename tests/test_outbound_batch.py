@@ -25,6 +25,7 @@ from messagefoundry.config.models import BatchConfig, RetryPolicy
 from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
@@ -304,6 +305,67 @@ async def test_permanent_reject_deadletters_all(store: Any) -> None:
     assert await _states(store, mids) == [DEAD_LETTERED] * 3
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0
+
+
+# --- BACKLOG #2073: a credential fault on a batch STOPs the lane instead ---------------------------
+
+
+class _StopRecorder(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.stopped: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append(name)
+
+
+def _credential_fault() -> NegativeAckError:
+    return NegativeAckError(
+        "bad password", code="remotefile", permanent=True, credential_fault=True
+    )
+
+
+async def test_a_credential_fault_on_a_batch_stops_the_lane_and_keeps_every_row(store: Any) -> None:
+    # The single-row path STOPs on a permanent credential fault (#109) and keeps the row. The batch
+    # path had no such branch, so the fault took the ordinary permanent-reject arm and dead-lettered
+    # the whole batch: a bad password emptied the lane's queue into the DLQ.
+    mids = await _enqueue(store, 3)
+    sink = _StopRecorder()
+    runner = RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=sink)
+    _wire_batch(
+        runner, _Recorder(fail=_credential_fault()), BatchConfig(max_count=5, max_wait_ms=1)
+    )
+    head = await store.claim_next_fifo(DEST)
+    outcome, retry_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert retry_until is None
+    assert await store.count_dead() == 0  # nothing dead-lettered
+    assert await _states(store, mids) == [QUEUED] * 3  # every member back PENDING, in place
+    rows = [r for mid in mids for r in await store.outbox_for(mid)]
+    assert [r["attempts"] for r in rows] == [0, 0, 0]  # the claim's attempt was given back
+    assert sink.stopped == [DEST]  # the operator is told the lane stopped
+    assert ("outbound", DEST) in runner._stop_held  # and the scheduler will not re-arm it
+
+
+async def test_the_dead_letter_policy_still_dead_letters_a_credential_faulted_batch(
+    store: Any,
+) -> None:
+    # The control: credential_fault_policy="dead_letter" opts back into the fail-fast reject, for a
+    # batch exactly as for a single row. Without this arm the test above would also pass against a
+    # batch path that never dead-letters anything.
+    mids = await _enqueue(store, 3)
+    runner = RegistryRunner(
+        Registry(), store, poll_interval=0.02, credential_fault_policy="dead_letter"
+    )
+    _wire_batch(
+        runner, _Recorder(fail=_credential_fault()), BatchConfig(max_count=5, max_wait_ms=1)
+    )
+    head = await store.claim_next_fifo(DEST)
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED
+    assert await _states(store, mids) == [DEAD_LETTERED] * 3
+    assert ("outbound", DEST) not in runner._stop_held
 
 
 # --- AC4b: a graceful stop flushes the partial batch (decision #4) --------------------------------

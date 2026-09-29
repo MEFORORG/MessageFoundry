@@ -582,6 +582,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
+  The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
+  dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
+  pause the stopped lane and the next open resume it, retrying the fault every window. The
+  dispatcher now reports the STOPs it decides itself to the runner, which holds the lane until a
+  real re-arm.
+  (`BACKLOG #2072`)
+- **The scheduler no longer starts a connection the DR run-profile parked.** A window open called
+  the same start an operator uses, which reads as overriding the profile. On a DR box it would have
+  bound a below-threshold listener and cleared its `filtered` status. The scheduler now leaves a
+  filtered connection alone in both directions. An operator start still overrides the profile, and
+  the calendar owns the connection from then on. (`BACKLOG #2067`)
+- **A log-write halt no longer makes the scheduler restart and re-page every tick.** A halted
+  scheduled connection reads as not running, so each in-window tick called start. On a first
+  deployment an inbound would have bound its partner port, probed the dead log sinks, paged and
+  unbound, every tick; an outbound would have probed and paged. The scheduler now treats the halt
+  as a held stop while the halt is latched, so the halt's own page is the only one. Once a restart
+  proves the log writable, the calendar may bring the other halted connections back.
+  The probe stays on the event loop; moving it to a thread opened a window at two recovery doors.
+  (`BACKLOG #2066`)
+- **A credential fault on a batching outbound now stops the lane and keeps the batch.** The
+  single-message path already stopped on a permanent credential fault (#109). The HL7 batch path
+  had no such branch, so a bad password would have dead-lettered every message in the batch. Under
+  the default `credential_fault_policy = "stop"` the batch path now stops the lane, pages, and
+  returns every member to pending with its attempt given back. `"dead_letter"` still dead-letters
+  the batch. (`BACKLOG #2073`)
+- **A reload now keeps each connection's schedule in step with the new config.** A scheduler task
+  kept the calendar it started with, and only engine start created one. A reload that added a
+  schedule never ran it, an edited schedule kept its old hours, and a removed connection logged a
+  traceback every tick. The reload also opened a schedule-parked listener's port until the next
+  tick closed it. A committed reload now replaces every scheduler task from the new config, and
+  leaves a scheduled inbound unbound outside its window. An outbound whose schedule is removed is
+  resumed if the calendar had parked it, since nothing else would. (`BACKLOG #2069`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
