@@ -268,14 +268,50 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 # and the per-driver spellings for "verified" vs "encrypted only" are not consistent enough to classify
 # without guessing. The generic path delegates TLS to the operator by design (ADR 0092); this detector
 # exists to make the PLAINTEXT case impossible to miss, not to grade the operator's cipher policy.
-_ODBC_NO_TLS_VALUE_RE = re.compile(
-    r"^(?:disabled?|allow|prefer(?:red)?|no|off|false|0)$", re.IGNORECASE
+_ODBC_NO_TLS_VALUES: tuple[str, ...] = (
+    "disable",
+    "disabled",
+    "allow",
+    "prefer",
+    "preferred",
+    "no",
+    "off",
+    "false",
+    "0",
 )
+
+
+def _no_tls_label(value: object) -> str | None:
+    """The word from :data:`_ODBC_NO_TLS_VALUES` that ``value`` spells, matched case-insensitively
+    as the earlier regex did, or ``None``. Returns the table's own string, never the caller's."""
+    spelled = str(value).strip()
+    return next((w for w in _ODBC_NO_TLS_VALUES if re.fullmatch(w, spelled, re.IGNORECASE)), None)
+
+
+# A keyword that carries a SECRET, never a TLS mode, although `ssl` in its name matches the hint
+# (libpq `sslpassword`, BACKLOG #1352). It is not a TLS keyword for either question below: its
+# value is never classified or rendered, and its presence is not TLS ownership. Before this, a
+# passphrase spelled `off` or `0` was rendered as `sslpassword=off` into the warning, the refusal
+# text and every posture report that quotes the classifier's reason.
+# Same words as config.wiring._SECRET_ODBC_SUBSTRINGS, which masks these keywords in /metadata.
+_ODBC_SECRET_KEY_RE = re.compile(
+    r"password|passwd|passphrase|pwd|secret|token|credential", re.IGNORECASE
+)
+
+
+def _is_tls_mode_keyword(name: str) -> bool:
+    """True for an ``odbc_params`` keyword that may set the hop's TLS mode: it matches the TLS hint
+    and is not a secret-bearing keyword."""
+    return bool(_ODBC_TLS_HINT_RE.search(name)) and not _ODBC_SECRET_KEY_RE.search(name)
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     """Every ``odbc_params`` TLS keyword that is set to a value meaning "TLS not required", as
-    ``["KEY=VALUE", ...]`` (#333). Empty when the operator set no such value.
+    ``["KEY=value", ...]`` (#333). Empty when the operator set no such value. The value is rendered
+    as the lower-case constant from :data:`_ODBC_NO_TLS_VALUES` it matched, never as supplied, and a
+    keyword :data:`_ODBC_SECRET_KEY_RE` names is skipped. What a report can carry is therefore a
+    keyword name and one of those nine words; a secret keyword that regex does not name could still
+    be reported as ``KEY=<word>`` when its value is one of them.
 
     The SINGLE classifier for the generic-ODBC cleartext-risk question, shared by this module's
     construction-time reminder (:func:`_warn_generic_tls_unenforced`) and by the posture readers that
@@ -284,11 +320,15 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     surface can never report a hop as clean that the log warns about, or the reverse.
 
     Pure — it reads a mapping and touches nothing else."""
-    return [
-        f"{key}={str(value).strip()}"
-        for key, value in params.items()
-        if _ODBC_TLS_HINT_RE.search(str(key)) and _ODBC_NO_TLS_VALUE_RE.match(str(value).strip())
-    ]
+    found: list[str] = []
+    for key, value in params.items():
+        name = str(key)
+        if not _is_tls_mode_keyword(name):
+            continue
+        label = _no_tls_label(value)
+        if label is not None:
+            found.append(f"{name}={label}")
+    return found
 
 
 def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
@@ -308,7 +348,7 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    if any(_ODBC_TLS_HINT_RE.search(str(k)) for k in params):
+    if any(_is_tls_mode_keyword(str(k)) for k in params):
         return None
     return "no TLS keyword is set in odbc_params"
 

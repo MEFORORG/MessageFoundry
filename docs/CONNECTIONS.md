@@ -1377,7 +1377,9 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
 > when `odbc_params` carries **no** ssl/tls/encrypt keyword **or** carries one set to a no-TLS value
 > (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
-> dropped to DEBUG only once a keyword is set to something outside that deny-list. It is also reported
+> dropped to DEBUG only once a keyword is set to something outside that deny-list. A passphrase keyword
+> such as `sslpassword` is not a TLS keyword here: it sets no TLS mode, and its value is never read or
+> reported (BACKLOG #1352). It is also reported
 > by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
 > line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
