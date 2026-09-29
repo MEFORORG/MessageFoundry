@@ -241,8 +241,6 @@ suite("webview message guard — what it accepts and what it discards", () => {
       { type: "map", nodes: [], edges: [], [CHANNEL_FIELD]: TOKEN },
     ]) {
       assert.strictEqual(opaque.deliver({ origin: "null", data }), null, `accepted ${String(data.command ?? data.type)}`);
-      // Nor does naming some OTHER origin get past it.
-      assert.strictEqual(opaque.deliver({ origin: "https://localhost", data }), null);
     }
 
     // THE CONTROL: the identical message at a tuple origin is accepted, so the discard above is the

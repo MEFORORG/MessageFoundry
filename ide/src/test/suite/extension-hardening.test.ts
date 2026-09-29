@@ -446,8 +446,10 @@ suite("webview message receivers check origin, source and the channel token", ()
     // ask for; this is the check that its required fields are there with the right types. Test Bench
     // runs its own shapeOk(); the other seven share mfShapeOk() from webviewMessaging.ts. What each
     // one accepts and discards is pinned behaviourally in webview-receivers.test.ts.
+    // Matched as the guard of an early return, `if (!d || !mfShapeOk(` or `if (!shapeOk(`, so a
+    // bare mention of the name does not satisfy it. Still text: the behavioural suite is the proof.
     const offenders = receivers()
-      .filter(({ body }) => !/\b(mfShapeOk|shapeOk)\(/.test(body))
+      .filter(({ body }) => !/\bif \(!(?:\w+ \|\| !)?(?:mfShapeOk|shapeOk)\(/.test(body))
       .map(({ rel, n }) => `${rel}:${n}`);
     assert.deepStrictEqual(offenders, [], "a receiver acted on a payload without a shape check");
   });

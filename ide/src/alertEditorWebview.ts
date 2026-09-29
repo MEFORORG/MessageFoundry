@@ -96,13 +96,16 @@ export function alertEditorScript(
     });
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
-    // One entry per message the host posts (alertEditor.ts). A rule is one "alert list" row: the
-    // ordinal is always there, and every AlertRule field is optional but typed when present.
+    // One entry per message the host posts (at least alertEditor.ts). A rule is one "alert list" row: the
+    // ordinal is always there, and every AlertRule field is optional but typed when present. The row
+    // is the raw TOML table, and the engine's lax model loads a quoted number for the three numeric
+    // fields, so a string passes there too: the engine accepts that file, and this table only shows it.
+    function mfNumeric(x) { return mfNum(x) || mfStr(x); }
     const SHAPES = {
       rules: (d) => mfArrOf(d.rules, (r) => mfObj(r) && mfInt(r.index) &&
         mfOpt(r.event_type, mfStr) && mfOpt(r.connection, mfStr) && mfOpt(r.severity, mfStr) &&
-        mfOpt(r.min_depth, mfNum) && mfOpt(r.min_oldest_seconds, mfNum) && mfOpt(r.cooldown_seconds, mfNum) &&
-        mfOpt(r.transports, (t) => mfArrOf(t, mfStr))),
+        mfOpt(r.min_depth, mfNumeric) && mfOpt(r.min_oldest_seconds, mfNumeric) &&
+        mfOpt(r.cooldown_seconds, mfNumeric) && mfOpt(r.transports, (t) => mfArrOf(t, mfStr))),
       error: (d) => mfStr(d.message),
     };
     ${WEBVIEW_GUARD_NOTE}

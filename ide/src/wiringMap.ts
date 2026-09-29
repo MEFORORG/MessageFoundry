@@ -88,8 +88,7 @@ export class WiringMapPanel {
       return;
     }
     // Built by a pure function so the webview's shape check is tested against exactly this message.
-    const payload = wiringMapPayload(this.graph.getGraph(), this.focus);
-    void postToWebview(this.panel.webview, { ...payload });
+    void postToWebview(this.panel.webview, wiringMapPayload(this.graph.getGraph(), this.focus));
   }
 
   private html(webview: vscode.Webview): string {

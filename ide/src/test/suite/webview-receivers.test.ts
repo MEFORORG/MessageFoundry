@@ -22,8 +22,9 @@ import { wiringMapScript } from "../../wiringMapWebview";
 // nothing throws. Value ranges are a different requirement and are not tested here.
 //
 // Each panel's REAL script is evaluated in a jsdom page, so what runs here is what ships. Each
-// well-formed fixture is what the host posts: built by the host's own pure function where there is
-// one (buildForm, wiringMapPayload), and otherwise recorded from the CLI command the host runs.
+// well-formed fixture is built by the host's own pure function where there is one (buildForm,
+// wiringMapPayload), and is otherwise output recorded once from the CLI command the host runs. A
+// recorded fixture does NOT follow later changes to that CLI's output; nothing here would notice one.
 // Each must be accepted, and accepted means the page visibly changed. That is the control: a
 // receiver that discarded everything would pass every malformed case and prove nothing.
 //
@@ -162,6 +163,10 @@ const ALERT_RULES = [
   { event_type: "cert_expiry", transports: [], index: 2 },
 ];
 
+/** Recorded the same day from `alert list --json` over a HAND-EDITED file with `min_depth = "500"`.
+ *  The row is the raw TOML table, and the engine's lax model loads that quoted number. */
+const ALERT_RULES_QUOTED = [{ event_type: "queue_buildup", min_depth: "500", index: 0 }];
+
 /** alertEditor.ts posts `String(e)` for a thrown CLI error; this is a recorded CLI refusal. */
 const CLI_ERROR = String(
   new Error(
@@ -196,7 +201,10 @@ const alertRules: Receiver = {
        <select id="severity"></select><select id="transports"></select>
        <div id="error">${SENTINEL}</div><button id="add"></button><button id="close"></button>`,
     ),
-  wellFormed: { rules: [ALERT_OK, { command: "rules", rules: [] }], error: [ERROR_OK] },
+  wellFormed: {
+    rules: [ALERT_OK, { command: "rules", rules: ALERT_RULES_QUOTED }, { command: "rules", rules: [] }],
+    error: [ERROR_OK],
+  },
   malformed: {
     rules: [
       ["no rules", variant(ALERT_OK, (c) => delete c.rules)],
@@ -206,7 +214,8 @@ const alertRules: Receiver = {
       ["index is a string", variant(ALERT_OK, (c) => (c.rules[0].index = "0"))],
       ["transports is a string", variant(ALERT_OK, (c) => (c.rules[0].transports = "webhook"))],
       ["a transport is a number", variant(ALERT_OK, (c) => (c.rules[0].transports = [1]))],
-      ["min_depth is a string", variant(ALERT_OK, (c) => (c.rules[0].min_depth = "500"))],
+      ["min_depth is an array", variant(ALERT_OK, (c) => (c.rules[0].min_depth = [500]))],
+      ["cooldown_seconds is a boolean", variant(ALERT_OK, (c) => (c.rules[1].cooldown_seconds = true))],
       ["connection is a number", variant(ALERT_OK, (c) => (c.rules[0].connection = 7))],
       ["severity is an array", variant(ALERT_OK, (c) => (c.rules[0].severity = ["critical"]))],
     ],
@@ -455,7 +464,7 @@ const security: Receiver = {
       ["defaults is a string", variant(STATE_OK, (c) => (c.state.defaults = "secure"))],
       ["set is a string", variant(STATE_OK, (c) => (c.state.set = "require_mfa"))],
       ["a loosening has no risk", variant(STATE_OK, (c) => delete c.state.loosenings[0].risk)],
-      ["loosenings is missing", variant(STATE_OK, (c) => delete c.state.loosenings)],
+      ["loosenings is an object", variant(STATE_OK, (c) => (c.state.loosenings = c.state.loosenings[0]))],
     ],
     error: badMessages(ERROR_OK),
   },
@@ -632,6 +641,10 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       p.deliver({ [r.key]: "notAType", message: "x", text: "x" });
       assert.deepStrictEqual(p.errors.map(String), []);
       assert.strictEqual(p.snapshot(), before);
+      assert.ok(
+        p.warnings.some((w) => w.includes(`MessageFoundry ${r.panel}: discarded a malformed "notAType"`)),
+        `${r.panel}: an unhandled type was not named in the console`,
+      );
     });
   }
 });

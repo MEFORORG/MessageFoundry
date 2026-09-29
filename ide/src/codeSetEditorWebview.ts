@@ -218,7 +218,7 @@ export function codeSetEditorScript(
     $('delete').addEventListener('click', () => { if (originalName) vscode.postMessage({ command: 'delete', name: originalName }); });
 
     // CLI/validation errors arrive here and stay inline so the grid is still editable (file unchanged).
-    // The one message the host posts (codeSetEditor.ts).
+    // The one message its hosts post: at least codeSetEditor.ts and configEditors.ts use this page.
     const SHAPES = { error: (d) => mfStr(d.message) };
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {

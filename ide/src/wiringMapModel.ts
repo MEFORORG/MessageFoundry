@@ -292,14 +292,15 @@ export function buildWiringMap(g: Graph, focus: MapFocus | null, hops: number = 
 }
 
 /** The one message the Wiring Map host posts to its webview: the focused map plus every element name. */
-export interface WiringMapPayload {
+// A type alias rather than an interface, so it passes straight to postToWebview's Record parameter.
+export type WiringMapPayload = {
   type: "map";
   /** Null when no graph is loaded yet; the webview says so rather than drawing nothing. */
   map: WiringMap | null;
   focus: MapFocus | null;
   /** Every element, in pipeline order, for the jump-to search box. */
   names: MapFocus[];
-}
+};
 
 /**
  * Build the `map` message from the provider's current graph. Pure, so the webview's shape check can

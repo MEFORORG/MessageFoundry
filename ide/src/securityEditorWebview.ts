@@ -175,12 +175,14 @@ export function securityEditorScript(token: string, fields: unknown): string {
     $('save').addEventListener('click', () => vscode.postMessage({ command: 'save', updates: collectUpdates() }));
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
-    // One entry per message the host posts (securityEditor.ts). The state is ShowResult, which is
-    // the JSON "security show" prints.
+    // One entry per message the host posts (at least securityEditor.ts). The state is ShowResult,
+    // the JSON "security show" prints. That comes from the INSTALLED engine, which can be older or
+    // newer than this extension, so the two fields the form renders from are required and the two
+    // it does not read are typed only when present.
     const SHAPES = {
       state: (d) => mfObj(d.state) && mfObj(d.state.values) && mfObj(d.state.defaults) &&
-        mfArrOf(d.state.set, mfStr) &&
-        mfArrOf(d.state.loosenings, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk)),
+        mfOpt(d.state.set, (s) => mfArrOf(s, mfStr)) &&
+        mfOpt(d.state.loosenings, (ls) => mfArrOf(ls, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk))),
       error: (d) => mfStr(d.message),
     };
     ${WEBVIEW_GUARD_NOTE}
