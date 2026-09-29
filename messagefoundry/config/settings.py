@@ -1672,9 +1672,7 @@ class PipelineSettings(_Section):
     pooled_claim_lane_chunk: int = Field(default=256, ge=1, le=500)
     # Max concurrently-PROCESSING lanes per stage (the decrypted-body / crash-exposure bound).
     pooled_max_processing_lanes: int = Field(default=256, ge=1)
-    # SQL Server pooled mode fails closed at startup if READ_COMMITTED_SNAPSHOT is OFF; False downgrades
-    # to a loud warning + a /stats rcsi_off_degraded gauge (the §3.2 correctness proofs assume RCSI on).
-    require_rcsi_for_pooled: bool = Field(default=True)
+    # `require_rcsi_for_pooled` USED TO SIT HERE; it is refused at load (see `_REMOVED_KEYS`).
 
     # Pooled T17 (infra/machinery-fault) handling (ADR 0070). A store/handoff error, or any raise from
     # OUTSIDE the per-item body, is caught by the dispatcher's T17 handler; fix A always re-pends the
@@ -3691,7 +3689,6 @@ _ALERT_EVENT_TYPES = frozenset(
         "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
         "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
-        "rcsi_off_degraded",  # ADR 0066: pooled claim running with READ_COMMITTED_SNAPSHOT OFF (correctness-degraded)
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
@@ -5811,6 +5808,14 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "it was an internal marker the loader set, never an operator setting (BACKLOG #2000). "
         "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
         "sets it. To request the web console explicitly, set [security].serve_web_console"
+    ),
+    # BACKLOG #2090 (ADR 0066 §12): `false` could only start the mode that deadlocks.
+    ("pipeline", "require_rcsi_for_pooled"): (
+        "a SQL Server store no longer opens with READ_COMMITTED_SNAPSHOT off. The pooled start "
+        "check also always fails closed, so this key has nothing left to relax (BACKLOG #2090, "
+        "ADR 0066 section 12). Remove it from the config file, or unset "
+        "MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED if the environment sets it. To run pooled on SQL "
+        "Server, turn READ_COMMITTED_SNAPSHOT on for the database"
     ),
 }
 

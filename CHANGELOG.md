@@ -421,6 +421,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   kept a default-on console on the `/ui` exposure checks, which can refuse start, instead of dropping
   it. `serve` now reads whether `[security].serve_web_console` was provided directly, so that switch
   behaves as before. (`BACKLOG #2000`)
+- **BREAKING: `[pipeline].require_rcsi_for_pooled` is removed and refused at load, in the file and
+  as `MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED`, at either value.** A SQL Server store already
+  refuses to open with `READ_COMMITTED_SNAPSHOT` off (`BACKLOG #1628`). So `false` could only start
+  a pooled runner in the mode that deadlocks. The pooled start gate now always fails closed. The
+  `rcsi_off_degraded` alert event type is removed too, because nothing can raise it. An
+  `[[alerts.rules]]` entry naming it is now refused like any unknown event. Embedders lose the
+  `require_rcsi_for_pooled` parameter of `RegistryRunner`, `Engine` and `create_managed_app`. The
+  `AlertSink` protocol and both shipped sinks lose the `rcsi_off_degraded` method. See ADR 0066 §12.
+  (`BACKLOG #2090`)
 - **BREAKING: an administrator must give a notification address to create an account.**
   `POST /users` now requires `email`, and the web console's create-user form requires it too. The
   address becomes the account's notification address, so its holder is told about changes made

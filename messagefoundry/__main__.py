@@ -4075,7 +4075,6 @@ def _serve(args: argparse.Namespace) -> int:
         pooled_sweep_interval=settings.pipeline.pooled_sweep_interval,
         pooled_claim_lane_chunk=settings.pipeline.pooled_claim_lane_chunk,
         pooled_max_processing_lanes=settings.pipeline.pooled_max_processing_lanes,
-        require_rcsi_for_pooled=settings.pipeline.require_rcsi_for_pooled,
         infra_fault_policy=settings.pipeline.infra_fault_policy,
         infra_fault_stop_after=settings.pipeline.infra_fault_stop_after,
         infra_fault_backoff_cap=settings.pipeline.infra_fault_backoff_cap,

@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -285,8 +286,8 @@ async def run_connscale(
                                 )
                             except (ConnScaleError, FailoverError) as exc:
                                 # The per_lane BASELINE must start — a failure there is a real setup
-                                # fault, so it propagates (exit 2). A POOLED arm can legitimately refuse
-                                # to start (the SQL Server RCSI fail-closed gate); record the miss LOUDLY
+                                # fault, so it propagates (exit 2). A POOLED arm can still fail to
+                                # start (the SQL Server RCSI gate, for one); record the miss LOUDLY
                                 # and keep the sweep going so the A/B never silently compares per_lane
                                 # against nothing. FailoverError is caught too: the port preflight
                                 # (`_await_port`) raises it, and it must NOT escape to crash the whole
@@ -970,9 +971,7 @@ def _pooled_miss_reason(detail: str) -> str:
     if _is_rcsi_gate(detail):
         return (
             "engine refused to start under claim_mode=pooled -- READ_COMMITTED_SNAPSHOT is OFF on the "
-            "target SQL Server DB (require_rcsi_for_pooled=true fail-closed gate); set RCSI ON on the "
-            "target DB or MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED=false for a smoke (production wants "
-            "RCSI on)"
+            "target SQL Server DB (the engine fails closed on it); set RCSI ON on the target DB"
         )
     return (
         "engine failed to start under claim_mode=pooled -- NOT the RCSI gate; real startup failure "
@@ -980,13 +979,21 @@ def _pooled_miss_reason(detail: str) -> str:
     )
 
 
+#: One line naming READ_COMMITTED_SNAPSHOT that is also the store refusing: the open (every schema
+#: mode), the pooled start gate, or the probe that could not connect to check it.
+_RCSI_REFUSAL = re.compile(
+    r"READ_COMMITTED_SNAPSHOT[^\n]*refusing to (?:open the store|start pooled claimers)"
+    r"|could not connect to verify READ_COMMITTED_SNAPSHOT"
+)
+
+
 def _is_rcsi_gate(detail: str) -> bool:
-    """True iff a startup-failure detail carries the ``require_rcsi_for_pooled`` RuntimeError signature
-    (the pooled-mode RCSI-off fail-closed gate), not some other crash. Matches the store's raised
-    message + the traceback frame name, both of which land in the captured log tail."""
-    if "READ_COMMITTED_SNAPSHOT" not in detail:
-        return False
-    return "require_rcsi_for_pooled" in detail or "pooled claim mode requires" in detail
+    """True iff a startup-failure detail carries one of the SQL Server store's RCSI refusals, not some
+    other crash: the pooled start gate's or the store open's (BACKLOG #1628). Each names
+    READ_COMMITTED_SNAPSHOT and says it is refusing ON THE SAME LINE, which a WARNING about RCSI in the
+    log tail does not. Keyed on the messages, never on the ``require_rcsi_for_pooled`` name: that
+    also appears in the load-time refusal of the retired key (BACKLOG #2090), a config error."""
+    return _RCSI_REFUSAL.search(detail) is not None
 
 
 async def _await_node_healthy(node: EngineNode, *, timeout: float) -> None:

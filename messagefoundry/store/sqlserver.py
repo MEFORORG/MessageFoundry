@@ -3399,11 +3399,9 @@ class SqlServerStore:
         COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either), and
         under ``schema_management = external`` (#305) :meth:`_verify_schema_external` refuses the
         same state without trying the ALTER. So this gate can only fire when RCSI was switched off
-        after this store opened, and ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a
-        store open with RCSI off. Same state query as the open-time check. The
-        runner awaits this at pooled ``start()`` (ADR 0066 §5): under
-        ``[pipeline].require_rcsi_for_pooled`` a raise unwinds the start; false downgrades it to a
-        loud warning + a ``/stats`` degraded gauge. Raises with the exact DBA remediation statement."""
+        after this store opened. Same state query as the open-time check. The runner awaits this at
+        pooled ``start()`` (ADR 0066 §5), and a raise always unwinds that start (ADR 0066 §12).
+        Raises with the exact DBA remediation statement."""
         row = await self._fetchone(
             "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
         )

@@ -694,7 +694,7 @@ class QueueStore(StoreLifecycle, Protocol):
         verify. Only the SQL Server backend overrides it to hard-verify ``READ_COMMITTED_SNAPSHOT`` is
         ON and raise a :class:`RuntimeError` (with the DBA remediation statement) when it is OFF. The
         runner ``await``s this unconditionally at pooled ``start()`` so no ``isinstance`` reach is
-        needed; ``[pipeline].require_rcsi_for_pooled=false`` downgrades a raise to a warning."""
+        needed, and a raise always fails that start closed."""
         return None
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
