@@ -73,11 +73,11 @@ export function testBenchScript(token: string): string {
         isArrOf(m.dump.lines, (l) => isObj(l) && isCount(l.offset) && isStr(l.ascii) &&
           isArrOf(l.hex, (h) => isStr(h) && HEX_PAIR.test(h)) && l.hex.length <= m.dump.bytesPerRow),
       collections: (m) => isArrOf(m.items, (c) => isObj(c) && isStr(c.name) && isCount(c.cases)),
-      collectionRun: (m) => isStr(m.name) && isCount(m.passed) && isCount(m.total) &&
-        isArrOf(m.results, (r) => isObj(r) && isStr(r.name) && isBool(r.pass) && isStr(r.disposition) &&
-          (r.error === null || isStr(r.error)) &&
-          isArrOf(r.deliveries, (d) => isObj(d) && isStr(d.to) && isStr(d.status) &&
-            isArrOf(d.differences, isFieldDifference))),
+      collectionRun: (m) => isStr(m.name) && isCount(m.run) && isCount(m.passed) && isCount(m.total) &&
+        isArrOf(m.results, (r) => isObj(r) && isStr(r.name) && isBool(r.pass) && isStr(r.disposition)),
+      caseDetail: (m) => isCount(m.run) && isCount(m.index) && (m.error === null || isStr(m.error)) &&
+        isArrOf(m.deliveries, (d) => isObj(d) && isStr(d.to) && isStr(d.status) &&
+          isArrOf(d.differences, isFieldDifference)),
     };
     function shapeOk(m){
       const check = isStr(m.type) && Object.prototype.hasOwnProperty.call(SHAPES, m.type) ? SHAPES[m.type] : null;
@@ -232,23 +232,50 @@ export function testBenchScript(token: string): string {
         '<span class="del">' + (esc(d.before) || '∅') + '</span> &rarr; ' +
         '<span class="ins">' + (esc(d.after) || '∅') + '</span></div>';
     }
+    // RUN VIEW (ASVS 14.2.6, BACKLOG #2437). A run shows each case's name, PASS or FAIL, and
+    // disposition, and no field value. A case's differences and error arrive from the host only when
+    // that case's Details button is clicked, and showing one case clears any other, so this page holds
+    // at most one case's values at a time. The DOM keys cases on their index, never on a name.
     function renderCollectionRun(msg){
-      const cases = msg.results.map((r) => {
+      const cases = msg.results.map((r, i) => {
         const badge = r.pass ? '<span class="badge pass">PASS</span>' : '<span class="badge fail">FAIL</span>';
-        const failNotes = r.pass ? '' : r.deliveries.map((d) => {
-          if (d.status === 'missing') return '<div class="diffs">Expected delivery to <code>' + esc(d.to) + '</code> was not produced.</div>';
-          if (d.status === 'unexpected') return '<div class="diffs">Unexpected delivery to <code>' + esc(d.to) + '</code>.</div>';
-          if (d.status === 'mismatch') return '<div class="diffs">To <code>' + esc(d.to) + '</code>:' + d.differences.map(diffLine).join('') + '</div>';
-          return '';
-        }).join('');
-        const err = r.error ? '<div class="diffs">' + esc(r.error) + '</div>' : '';
         return '<div class="case"><div class="hd">' + badge + '<span class="cn">' + esc(r.name) +
-          '</span><span class="note">' + esc(r.disposition) + '</span></div>' + err + failNotes + '</div>';
+          '</span><span class="note">' + esc(r.disposition) + '</span>' +
+          '<button data-case-detail="' + i + '">Details</button></div>' +
+          '<div data-case-slot="' + i + '"></div></div>';
       }).join('');
       const allPass = msg.passed === msg.total;
       const summary = '<span class="badge ' + (allPass ? 'pass' : 'fail') + '">' + esc(msg.passed) + ' / ' + esc(msg.total) + ' passed</span>';
-      detail.innerHTML = '<h3>Run — ' + esc(msg.name) + ' &nbsp; ' + summary + '</h3>' + cases;
+      detail.innerHTML = '<div class="run" data-run="' + esc(msg.run) + '"><h3>Run — ' + esc(msg.name) + ' &nbsp; ' + summary + '</h3>' + cases + '</div>';
       showDetailView();
+      const run = msg.run;
+      for (const b of detail.querySelectorAll('button[data-case-detail]')) {
+        const index = Number(b.dataset.caseDetail);
+        b.addEventListener('click', () => {
+          const slot = caseSlot(run, index);
+          // A second click on an open case closes it, without asking the host again.
+          if (slot && slot.innerHTML) { slot.innerHTML = ''; return; }
+          vscode.postMessage({ command: 'caseDetail', run, index });
+        });
+      }
+    }
+    // The slot for one case of one run, or null when the view no longer shows that run.
+    function caseSlot(run, index){
+      const view = detail.querySelector('.run[data-run="' + esc(run) + '"]');
+      return view ? view.querySelector('[data-case-slot="' + esc(index) + '"]') : null;
+    }
+    function renderCaseDetail(m){
+      const slot = caseSlot(m.run, m.index);
+      if (!slot) return; // a stale reply: the run it belongs to is no longer on screen
+      for (const other of detail.querySelectorAll('[data-case-slot]')) other.innerHTML = '';
+      const notes = m.deliveries.map((d) => {
+        if (d.status === 'missing') return '<div class="diffs">Expected delivery to <code>' + esc(d.to) + '</code> was not produced.</div>';
+        if (d.status === 'unexpected') return '<div class="diffs">Unexpected delivery to <code>' + esc(d.to) + '</code>.</div>';
+        if (d.status === 'mismatch') return '<div class="diffs">To <code>' + esc(d.to) + '</code>:' + d.differences.map(diffLine).join('') + '</div>';
+        return '';
+      }).join('');
+      const err = m.error ? '<div class="diffs">' + esc(m.error) + '</div>' : '';
+      slot.innerHTML = (err + notes) || '<div class="diffs">No differences.</div>';
     }
 
     function saveState(){ vscode.setState({ sbs, traceMode }); }
@@ -318,6 +345,8 @@ export function testBenchScript(token: string): string {
         renderCollections(m.items);
       } else if (m.type === 'collectionRun') {
         renderCollectionRun(m);
+      } else if (m.type === 'caseDetail') {
+        renderCaseDetail(m);
       }
     });
   `;

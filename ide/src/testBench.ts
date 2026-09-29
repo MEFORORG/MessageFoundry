@@ -17,8 +17,9 @@ import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView
 import { testBenchScript } from "./testBenchWebview";
 import { openChannel, postToWebview } from "./webviewMessaging";
 import {
-  compareCase,
-  type DeliveryComparison,
+  judgeCollectionRun,
+  type CaseRerun,
+  type CaseRunDetail,
   type TestCase,
   type TestCollection,
 } from "./testCollections";
@@ -55,6 +56,7 @@ type Incoming =
   | { command: "listCollections" }
   | { command: "saveCollection" }
   | { command: "runCollection"; name: string }
+  | { command: "caseDetail"; run: number; index: number }
   | { command: "deleteCollection"; name: string };
 
 function esc(s: string): string {
@@ -83,6 +85,11 @@ export class TestBench {
   private rows: DryRunRow[] = [];
   private pickPaths: string[] = []; // the files last loaded — re-run under --trace on demand
   private traces: TraceEntry[] | null = null; // lazily fetched, aligned 1:1 with `rows` by index
+  // The last collection run's per-case differences and errors. They stay here, in the host, and one
+  // case's go to the webview only when that case is clicked (ASVS 14.2.6, BACKLOG #2437). `id` names
+  // the run, so a click on a run the view no longer shows reveals nothing.
+  private lastRun: { id: number; details: CaseRunDetail[] } | null = null;
+  private runSeq = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -97,7 +104,14 @@ export class TestBench {
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true },
     );
-    this.panel.onDidDispose(() => (this.panel = undefined), null, this.context.subscriptions);
+    this.panel.onDidDispose(
+      () => {
+        this.panel = undefined;
+        this.lastRun = null;
+      },
+      null,
+      this.context.subscriptions,
+    );
     this.panel.webview.onDidReceiveMessage((m: Incoming) => void this.onMessage(m));
     this.render();
   }
@@ -119,6 +133,8 @@ export class TestBench {
       await this.saveCollection();
     } else if (m.command === "runCollection") {
       await this.runCollection(m.name);
+    } else if (m.command === "caseDetail") {
+      await this.showCaseDetail(m.run, m.index);
     } else if (m.command === "deleteCollection") {
       await this.deleteCollection(m.name);
     }
@@ -241,25 +257,28 @@ export class TestBench {
           byBase.set(path.basename(row.path), row);
         }
       }
-      const results = coll.cases.map((c, i) => {
+      const reruns = coll.cases.map((_c, i): CaseRerun | undefined => {
         const row = byBase.get(`case_${String(i).padStart(4, "0")}.hl7`);
-        const actual = row ? row.deliveries.map((d) => ({ to: d.to, payload: d.payload })) : [];
-        const cmp = compareCase(c.expected, actual);
-        return {
-          name: c.name,
-          pass: row ? cmp.pass : false,
-          disposition: row?.disposition ?? "NO RESULT",
-          error: row?.error ?? (row ? null : "no dry-run row produced for this case"),
-          deliveries: cmp.deliveries as DeliveryComparison[],
-        };
+        return row
+          ? {
+              disposition: row.disposition,
+              error: row.error ?? null,
+              deliveries: row.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
+            }
+          : undefined;
       });
-      const passed = results.filter((r) => r.pass).length;
+      const run = judgeCollectionRun(coll.cases, reruns);
+      const id = ++this.runSeq;
+      this.lastRun = { id, details: run.details };
+      // Pass or fail per case, and nothing else: each case's field values and error text stay in
+      // `lastRun` until that one case is clicked (showCaseDetail).
       await postToWebview(this.panel.webview, {
         type: "collectionRun",
         name,
-        passed,
-        total: results.length,
-        results,
+        run: id,
+        passed: run.passed,
+        total: run.summaries.length,
+        results: run.summaries,
       });
     } catch (e) {
       void vscode.window.showErrorMessage(`MessageFoundry: collection run failed — ${String(e)}`);
@@ -273,6 +292,29 @@ export class TestBench {
         }
       }
     }
+  }
+
+  /**
+   * Post ONE case's differences and error, for the case the developer clicked in the run view. The
+   * webview never holds another case's values, because the host never sends them (ASVS 14.2.6,
+   * BACKLOG #2437). A click naming a run other than the last one, or no case in it, posts nothing.
+   */
+  private async showCaseDetail(run: unknown, index: unknown): Promise<void> {
+    const last = this.lastRun;
+    if (!this.panel || !last || run !== last.id || !Number.isSafeInteger(index)) {
+      return;
+    }
+    const detail = last.details[index as number];
+    if (!detail) {
+      return;
+    }
+    await postToWebview(this.panel.webview, {
+      type: "caseDetail",
+      run: last.id,
+      index,
+      error: detail.error,
+      deliveries: detail.deliveries,
+    });
   }
 
   /**
@@ -564,6 +606,7 @@ export class TestBench {
     .case { padding: 6px 0; border-bottom: 1px solid var(--vscode-panel-border); }
     .case .hd { display: flex; align-items: baseline; gap: 8px; }
     .case .hd .cn { font-size: 13px; }
+    .case .hd button { margin-left: auto; padding: 1px 8px; }
     .case .diffs { margin: 4px 0 0 12px; font-size: 12px; color: var(--vscode-descriptionForeground); }
     .case .diffs code { font-family: var(--vscode-editor-font-family, monospace); }
     .case .diffs .del { color: var(--vscode-testing-iconFailed, #f85149); }
