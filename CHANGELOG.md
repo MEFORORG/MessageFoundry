@@ -593,6 +593,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   bound a below-threshold listener and cleared its `filtered` status. The scheduler now leaves a
   filtered connection alone in both directions. An operator start still overrides the profile, and
   the calendar owns the connection from then on. (`BACKLOG #2067`)
+- **A log-write halt no longer makes the scheduler restart and re-page every tick.** A halted
+  scheduled connection reads as not running, so each in-window tick called start. On a first
+  deployment an inbound would have bound its partner port, probed the dead log sinks, paged and
+  unbound, every tick; an outbound would have probed and paged. The scheduler now treats the halt
+  as a held stop, so the halt's own page is the only one and only an operator restart lifts it.
+  The probe stays on the event loop; moving it to a thread opened a window at two recovery doors.
+  (`BACKLOG #2066`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

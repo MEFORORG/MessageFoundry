@@ -14,6 +14,7 @@ import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, time
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -32,6 +33,8 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     build_outbound_connection,
 )
+from messagefoundry.logging_guard import LogSinkEvent, LogSinkStatus
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -566,6 +569,117 @@ async def test_a_dr_filtered_inbound_is_not_started_by_its_window(store: Message
         clock.set(_utc(2026, 7, 14, 18))
         await runner._reconcile_schedule("IB_LOW", "inbound", schedule)
         assert not runner.inbound_running("IB_LOW")
+    finally:
+        await runner.stop()
+
+
+class _DeadLogGuard:
+    """A stand-in for the #122 log-write guard whose sinks stay dead until ``writable`` is set. It counts the
+    re-validation probes, which WRITE to the sinks."""
+
+    def __init__(self) -> None:
+        self.writable = False
+        self.probes = 0
+
+    def revalidate(self) -> bool:
+        self.probes += 1
+        return self.writable
+
+    def can_log(self) -> bool:
+        return self.writable
+
+    def status(self) -> list[LogSinkStatus]:
+        state: Literal["healthy", "unwritable"] = "healthy" if self.writable else "unwritable"
+        return [LogSinkStatus(sink="file", state=state, rollovers=0)]
+
+    def set_escalation(self, callback: object) -> None:
+        pass
+
+    def clear_escalation(self, callback: object) -> None:
+        pass
+
+
+class _LogPageSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.pages: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        pass
+
+    def log_write_failed(
+        self, name: str, *, stage: str, reason: str, stopped: int | None = None
+    ) -> None:
+        self.pages.append(reason)
+
+
+async def test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2066. After a #122 log-write halt, a scheduled connection reads as not running, so
+    # every in-window tick called start. An inbound bound its listener, probed the dead sinks, paged
+    # and unbound again; an outbound probed and paged. Each tick, for as long as the disk stayed
+    # broken. The halt already paged once, and only an operator restart may lift it.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection("IB_SCHED", MLLP(port=_free_port()), router="r", schedule=schedule)
+    )
+    reg.add_router("r", lambda m: [])
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SCHED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+            schedule=schedule,
+        )
+    )
+    guard = _DeadLogGuard()
+    sink = _LogPageSink()
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, schedule_clock=clock.now, alert_sink=sink
+    )
+    await runner.start()
+    try:
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        assert len(sink.pages) == 1  # the halt's own page
+        assert not runner.inbound_running("IB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
+
+        binds = 0
+        real_start = runner._start_inbound_unsafe
+
+        async def _counting_start(name: str) -> None:
+            nonlocal binds
+            binds += 1
+            await real_start(name)
+
+        monkeypatch.setattr(runner, "_start_inbound_unsafe", _counting_start)
+        for _ in range(3):  # three in-window ticks
+            await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+            await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+
+        assert binds == 0  # no bind-and-unbind of the partner port per tick
+        assert guard.probes == 0  # no sink write per tick
+        assert len(sink.pages) == 1  # and no page per tick
+        assert not runner.inbound_running("IB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
+
+        # Control: the operator repairs the disk and restarts. One probe lifts the halt, and the
+        # calendar owns both connections again: the next close parks both.
+        guard.writable = True
+        await runner.restart_inbound("IB_SCHED")
+        await runner.start_outbound("OB_SCHED")
+        assert guard.probes == 1  # one probe lifted the process-wide latch
+        assert runner.inbound_running("IB_SCHED")
+        assert runner.outbound_running("OB_SCHED")
+        clock.set(_OUT_OF_WINDOW)
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        assert not runner.inbound_running("IB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
     finally:
         await runner.stop()
 

@@ -2788,6 +2788,14 @@ class RegistryRunner:
         would_park_outbound = kind == "outbound" and not active and running
         if (would_start or would_park_outbound) and self._schedule_holds(name, kind):
             return
+        # A #122 log-write halt (ADR 0162/0189) is a held stop too, and for the same reason: only an
+        # operator restart may lift it. A halted connection reads as not running, so every in-window
+        # tick used to call start. An inbound bound its listener, probed the dead sinks, paged and
+        # unbound again; an outbound probed and paged. That repeated every tick for as long as the
+        # disk stayed broken (BACKLOG #2066). The halt has already paged once. Only the start branch
+        # is gated: an inbound park just unbinds, and a halted outbound never reads as running.
+        if would_start and self._log_halt_holds(name, kind):
+            return
         if active and not running:
             # Per-connection auto-start (#115): ``auto_start=False`` means the ENGINE never brings this
             # connection up on its own — only an explicit operator start does. A scheduler tick IS the
@@ -2829,6 +2837,18 @@ class RegistryRunner:
             return
         self._stop_held.add(key)
         self._stop_hold_logged.discard(key)
+
+    def _log_halt_holds(self, name: str, kind: Direction) -> bool:
+        """Whether a #122 log-write halt holds ``name``'s ``kind`` lane down against the scheduler.
+
+        By the record each tier's recovery clears. An inbound is held while it is in
+        :attr:`_log_halted`, which only its own restart clears (:meth:`_resume_inbound_processing`),
+        so restarting inbound A never lets the calendar bring B back. The delivery tier has no
+        per-lane record: the halt is process-wide, so an outbound is held while
+        :attr:`_delivery_halted` holds, and the first successful restart lifts it for all."""
+        if kind == "inbound":
+            return name in self._log_halted
+        return self._delivery_halted
 
     def _pooled_stop_hold(self, stage: Stage) -> Callable[[str], None] | None:
         """The ``on_lane_stopped`` hook for ``stage``'s dispatcher: hold every lane it STOPs.
@@ -3334,7 +3354,16 @@ class RegistryRunner:
         The re-validation write is SYNCHRONOUS on the calling (event-loop) thread. That is the same
         posture as every other log write in this engine — stdlib logging is synchronous throughout,
         including the syslog forwarder — and this one runs at most once per operator recovery action,
-        never on the hot path, so it is not the blocking-the-loop hazard the async rules are about."""
+        never on the hot path, so it is not the blocking-the-loop hazard the async rules are about.
+
+        **The scheduler used to break "once per operator action"**, calling it every in-window tick
+        on a halted connection; :meth:`_log_halt_holds` now keeps it out (BACKLOG #2066). **Moving the
+        probe to a thread was measured and refused.** Two doors rely on it having no await point.
+        :meth:`_start_inbound_unsafe` probes AFTER it binds, so an await would let a sender be ACKed
+        into halted lanes before the refusal unbinds it. :meth:`_reconcile_outbounds` probes after the
+        reload's broadcast has armed an ADDED lane, so an await let that lane claim its head before
+        the refusal paused it: ``test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused``
+        went red, pooled, on ``halted_claim_gate_hits == 1``."""
         if not self._log_write_stopped:
             return True
         guard = active_log_guard()
