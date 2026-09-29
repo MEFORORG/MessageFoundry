@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import adr0075_batch_harness as h
 import pytest
 
 from messagefoundry.config.settings import PipelineSettings
@@ -23,6 +22,7 @@ from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
+from tests import adr0075_batch_harness as h
 
 
 @pytest.fixture(autouse=True)

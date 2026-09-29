@@ -58,13 +58,22 @@ def ratchet_modules(pyproject_text: str) -> list[str]:
 def flipped_config(pyproject_text: str) -> str:
     """pyproject text with the ratchet's ``ignore_errors = true`` turned to ``false``.
 
-    Refuses anything but exactly one such line, so the flip cannot land on the wrong override.
+    Only lines inside a ``[[tool.mypy.overrides]]`` table count, so another tool's key of the same
+    spelling (coverage.py has one) is left alone. Refuses anything but exactly one such line there,
+    so the flip cannot land on the wrong override.
     """
     lines = pyproject_text.splitlines(keepends=True)
-    hits = [i for i, line in enumerate(lines) if line.strip() == _IGNORE_TRUE]
+    hits = []
+    table = ""
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            table = stripped
+        elif stripped == _IGNORE_TRUE and table == "[[tool.mypy.overrides]]":
+            hits.append(i)
     if len(hits) != 1:
         raise SystemExit(
-            f"expected exactly one `{_IGNORE_TRUE}` line in pyproject.toml, found {len(hits)}"
+            f"expected exactly one `{_IGNORE_TRUE}` line in a mypy override, found {len(hits)}"
         )
     lines[hits[0]] = lines[hits[0]].replace("true", "false")
     flipped = "".join(lines)

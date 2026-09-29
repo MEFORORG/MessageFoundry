@@ -18,8 +18,9 @@ throughput GO/NO-GO needs the live-rig A/B — this gate proves the round-trip A
 
 from __future__ import annotations
 
-import adr0075_batch_harness as h
 import pytest
+
+from tests import adr0075_batch_harness as h
 
 # Round-trips = executes + the one commit. UNBATCHED baseline (hot path, N=1 handler / 1 delivery).
 ROUTE_RT_UNBATCHED = 6  # DELETE, INSERT_ROUTED, APPLOCK, UPDATE, EVENT (5) + commit

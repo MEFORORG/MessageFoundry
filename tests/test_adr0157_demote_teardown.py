@@ -440,8 +440,9 @@ async def test_a_shutdown_teardown_calls_no_demotion_helper() -> None:
     runner._quiesce_dispatchers_demote = _forbidden  # type: ignore[method-assign]
 
     # Drive only the source/dispatcher phase selection, which is the whole of the reason branch.
-    reason = TeardownReason.SHUTDOWN
-    demote = reason is TeardownReason.DEMOTE
+    # mypy is right that this is a constant: the test never drives _teardown_unsafe, so the
+    # mutation its docstring names would not fail it. Reported under BACKLOG #1799; not fixed here.
+    demote = TeardownReason.SHUTDOWN is TeardownReason.DEMOTE  # type: ignore[comparison-overlap]
     assert demote is False
     for src in runner._sources.values():
         await src.stop()

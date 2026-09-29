@@ -574,7 +574,11 @@ ignore_missing_imports = true
 # 1,464 errors across these 177 modules (arg-type 503, index 281, unused-ignore 227, attr-defined 200,
 # the rest under 70 each). The list is the UNION of the linux and win32 passes, so it does not depend
 # on which platform ran it. The dominant shapes: indexing an Optional fetch result with no
-# `is not None` check, and a fake passed where a Protocol is expected.
+# `is not None` check, and a fake passed where a Protocol is expected. Re-measured 2026-09-29 with
+# the exemption switched off, scripts/ci/mypy_ratchet_check.py's method: the 177 gave 1,559 errors
+# on linux and 1,551 on native win32 before any fix, and the 28 still listed give 568 and 569. The
+# two linux counts for the same 177 differ (1,464 against 1,559): main moved in between, and the two
+# runs need not share a method, so compare only numbers one method produced.
 # RULES: never ADD a module here -- a new test module must pass. REMOVE one when you fix it, in the
 # same change, and lower the ceiling in tests/test_mypy_tests_scope.py with it. That test fails on a
 # list longer than its ceiling, on a name that no longer resolves to a file (a rename would hand the

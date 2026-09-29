@@ -180,3 +180,15 @@ def test_the_dead_entry_check_flips_exactly_the_ratchet() -> None:
         (a, b) for a, b in zip(text.splitlines(), flipped.splitlines(), strict=True) if a != b
     ]
     assert len(changed) == 1, f"the flip must change one line only: {changed}"
+
+
+def test_the_flip_leaves_another_tools_same_named_key_alone() -> None:
+    # coverage.py's [tool.coverage.report] has its own `ignore_errors = true`. Planted beside a
+    # mypy ratchet, it must neither be flipped nor make the flip refuse.
+    text = (
+        '[tool.mypy]\nstrict = true\n\n[[tool.mypy.overrides]]\nmodule = ["tests.test_x"]\n'
+        "ignore_errors = true\n\n[tool.coverage.report]\nignore_errors = true\n"
+    )
+    flipped = ratchet_check.flipped_config(text)
+    assert ratchet_check.ratchet_modules(flipped) == []
+    assert flipped.endswith("[tool.coverage.report]\nignore_errors = true\n")
