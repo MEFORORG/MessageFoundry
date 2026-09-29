@@ -600,6 +600,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   as a held stop, so the halt's own page is the only one and only an operator restart lifts it.
   The probe stays on the event loop; moving it to a thread opened a window at two recovery doors.
   (`BACKLOG #2066`)
+- **A credential fault on a batching outbound now stops the lane and keeps the batch.** The
+  single-message path already stopped on a permanent credential fault (#109). The HL7 batch path
+  had no such branch, so a bad password would have dead-lettered every message in the batch. Under
+  the default `credential_fault_policy = "stop"` the batch path now stops the lane, pages, and
+  returns every member to pending with its attempt given back. `"dead_letter"` still dead-letters
+  the batch. (`BACKLOG #2073`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

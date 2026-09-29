@@ -6761,6 +6761,32 @@ class RegistryRunner:
             else:
                 await connector.send(envelope)
         except NegativeAckError as exc:
+            if (
+                exc.permanent
+                and getattr(exc, "credential_fault", False)
+                and self._credential_fault_policy == "stop"
+            ):
+                # #109 (ADR 0095), the batch twin of the single-row branch in
+                # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is
+                # not a bad batch: dead-lettering all N here would empty the lane's queue into the
+                # DLQ, and a retry would re-authenticate toward a partner lockout. So STOP the lane
+                # and release every member un-errored (BACKLOG #2073). "dead_letter" falls through
+                # to the ordinary permanent reject below, exactly as the single row does.
+                await self.store.release_claimed(ids)
+                log.error(
+                    "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
+                    "and retaining %d queued row(s) un-errored to protect the partner account "
+                    "(operator must fix the credential + reload/restart to resume)",
+                    name,
+                    exc.code,
+                    len(ids),
+                )
+                self._alert_sink.connection_stopped(
+                    name,
+                    detail=f"credential fault ({exc.code}); lane stopped, queue retained (#109)",
+                )
+                self._hold_for_operator(name, "outbound")
+                return _ItemOutcome.STOPPED, None
             if exc.permanent:
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
             else:
