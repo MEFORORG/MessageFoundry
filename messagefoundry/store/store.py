@@ -8678,9 +8678,9 @@ class MessageStore:
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
         """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns the
-        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT to
-        re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry wake on a
-        float — WS-C; see the base contract)."""
+        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT or
+        PENDING to re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry
+        wake on a float — WS-C; see the base contract)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         rescheduled_at: float | None = None
@@ -8692,31 +8692,40 @@ class MessageStore:
                 raise _AbortMember(None)
             attempts = row["attempts"]
             # max_attempts None = retry forever (never dead-letter here); a finite cap dead-letters
-            # once exhausted. attempts is post-increment (the claim bumped it before this send).
+            # once exhausted. attempts is post-increment (the claim bumped it before this send). It is
+            # 0 only on a row a replay or release reset under a late worker, which the widened retry
+            # term now lands on; the exponent floors at 0 so that case takes the base backoff and a
+            # backoff_multiplier of 0 cannot raise ZeroDivisionError (ADR 0157 Amendment A).
             if retry.max_attempts is not None and attempts >= retry.max_attempts:
                 status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
             else:
                 backoff = min(
                     retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
+                    retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
                 )
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-            # ADR 0157 Amendment A (BACKLOG #2078, #2348): the retry branch re-pends only a row that
-            # is still INFLIGHT, so a late worker cannot put a DONE, DEAD or CANCELLED row back in the
-            # queue. A miss writes nothing, not even the 'failed' event, and still returns the retry
-            # time so a row something else left PENDING gets its wake. It cannot strand a row, because
-            # a row it declines is not INFLIGHT. The DEAD branch carries no status term (C2).
+            # ADR 0157 Amendment A (BACKLOG #2078, #2348), widened by owner ruling 2026-09-29: the
+            # retry branch re-pends a row that is INFLIGHT or PENDING, so a late worker cannot put a
+            # DONE, DEAD or CANCELLED row back in the queue, and a row something else already re-pended
+            # still takes this attempt's backoff, event and last_error. A miss is a terminal (or
+            # vanished) row; it writes nothing, not even the 'failed' event, and still returns the
+            # retry time. It cannot strand a row, because it declines no INFLIGHT row. The DEAD branch
+            # carries no status term (C2).
             retrying = status == OutboxStatus.PENDING.value
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                " WHERE id=?" + (" AND status=?" if retrying else ""),
+                " WHERE id=?" + (" AND status IN (?, ?)" if retrying else ""),
                 (
                     status,
                     next_at,
                     self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
-                    *((OutboxStatus.INFLIGHT.value,) if retrying else ()),
+                    *(
+                        (OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value)
+                        if retrying
+                        else ()
+                    ),
                 ),
             )
             if retrying:
@@ -8751,7 +8760,8 @@ class MessageStore:
         preserved), or all dead-letter together — never a split batch that fractures the prefix. Returns
         the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered (the
         runner arms the lane retry wake on a float). A vanished member is skipped, and on the retry
-        branch so is a member no longer INFLIGHT (ADR 0157 Amendment A); it keeps its own state."""
+        branch so is a member that is neither INFLIGHT nor PENDING (ADR 0157 Amendment A, widened
+        2026-09-29), which is a terminal member; it keeps its own state."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         rescheduled_at: float | None = None
@@ -8769,26 +8779,31 @@ class MessageStore:
             else:
                 backoff = min(
                     retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                    retry.backoff_seconds * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
                 )
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 rescheduled_at = next_at
-            # ADR 0157 Amendment A, as mark_failed: on the retry branch a member that is no longer
-            # INFLIGHT is skipped, event and all. The members still INFLIGHT re-pend together.
+            # ADR 0157 Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a
+            # terminal member is skipped, event and all. The INFLIGHT and PENDING members re-pend
+            # together to the one shared deadline.
             retrying = status == OutboxStatus.PENDING.value
             changed = 0
             finalize: dict[str, None] = {}
             for outbox_id, row in present:
                 cur = await self._db.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                    " WHERE id=?" + (" AND status=?" if retrying else ""),
+                    " WHERE id=?" + (" AND status IN (?, ?)" if retrying else ""),
                     (
                         status,
                         next_at,
                         self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
-                        *((OutboxStatus.INFLIGHT.value,) if retrying else ()),
+                        *(
+                            (OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value)
+                            if retrying
+                            else ()
+                        ),
                     ),
                 )
                 if retrying and cur.rowcount == 0:

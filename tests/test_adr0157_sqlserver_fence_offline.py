@@ -379,8 +379,11 @@ async def test_unfenced_terminal_sql_is_character_identical_and_reads_no_result(
 _RETRY_SQL = (
     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
     + _RESOLVE_OUTPUT
-    + " WHERE id=? AND status=?"
+    + " WHERE id=? AND status IN (?, ?)"
 )
+
+#: The retry branch's status term (ADR 0157 Amendment A, widened by owner ruling 2026-09-29).
+_OPEN = (OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value)
 
 
 def _counting_events(store: SqlServerStore) -> list[str]:
@@ -411,14 +414,15 @@ async def test_mark_failed_fences_the_dead_branch_and_status_filters_the_retry_b
     (sql, params), *_ = _updates(cur2)
     assert sql == _RETRY_SQL
     assert "leader_lease" not in sql and _LEASE_KEY not in params
-    assert params[-2:] == ("row-2", OutboxStatus.INFLIGHT.value)
+    assert params[-3:] == ("row-2", *_OPEN)
     assert events == ["failed"]
     assert released2 == [] and store2.fenced_writes == 0 and conn2.commits == 1
 
 
-async def test_a_retry_that_matches_no_inflight_row_is_a_quiet_no_op() -> None:
+async def test_a_retry_that_matches_no_open_row_is_a_quiet_no_op() -> None:
     """ADR 0157 Amendment A (BACKLOG #2078, #2348). A late worker's retry finds the row already DONE,
-    DEAD, CANCELLED or PENDING, so the status term matches nothing. The fake cursor's ``rowcount`` is
+    DEAD or CANCELLED, so the status term matches nothing. (A PENDING row matches since the owner's
+    widening of 2026-09-29.) The fake cursor's ``rowcount`` is
     ``-1``, so only the OUTPUT rowset can tell. It must write no event, raise no fence, re-pend nothing
     through D1, commit, and still return the retry time for the wake. Mutations that break it: read
     ``cur.rowcount``, route the retry through ``_exec_terminal(checked=True)``, or write the event
@@ -435,7 +439,7 @@ async def test_a_retry_that_matches_no_inflight_row_is_a_quiet_no_op() -> None:
         assert [s for s, _p in _updates(cur)] == [_RETRY_SQL], epoch
 
 
-async def test_a_batch_retry_skips_the_members_no_longer_inflight() -> None:
+async def test_a_batch_retry_skips_the_terminal_members() -> None:
     """The batch twin. Every member misses here, so no event is written and no fence fires, and the
     shared retry time still comes back. Each member's UPDATE carries the status term."""
     cur, conn = _Cursor(matched=0), _Conn()
@@ -446,9 +450,7 @@ async def test_a_batch_retry_skips_the_members_no_longer_inflight() -> None:
     )
     assert isinstance(next_at, float)
     assert events == [] and released == [] and store.fenced_writes == 0
-    assert [p[-2:] for _s, p in _updates(cur)] == [
-        (oid, OutboxStatus.INFLIGHT.value) for oid in ("a", "b", "c")
-    ]
+    assert [p[-3:] for _s, p in _updates(cur)] == [(oid, *_OPEN) for oid in ("a", "b", "c")]
     assert conn.commits == 1
 
     cur2, conn2 = _Cursor(matched=1), _Conn()

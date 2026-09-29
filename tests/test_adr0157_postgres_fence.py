@@ -321,6 +321,31 @@ async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(s
     assert (await _events(store, mid2)).count("failed") == 1
 
 
+async def test_a_retry_after_the_lease_sweep_keeps_its_backoff_event_and_error(store) -> None:
+    """ADR 0157 Amendment A, widened by owner ruling 2026-09-29: the interleaving the widening exists
+    for. The send outlasts ``lease_ttl_seconds``, so ``reclaim_expired_leases`` re-pends the row due
+    at once. The send then fails. The retry must still land on the PENDING row: its backoff, its
+    ``failed`` event and its ``last_error``. Mutation: narrow the term back to INFLIGHT only, and the
+    row keeps the sweep's deadline with no event."""
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    claimed = await _claim_one(store)
+    swept_at = 10_000_000_000.0  # far past any lease the claim stamped
+    assert await store.reclaim_expired_leases(now=swept_at, stage=Stage.OUTBOUND.value) == 1
+    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.PENDING.value  # premise
+
+    retry = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=1)
+    next_at = await store.mark_failed(claimed.id, "late", retry, now=swept_at + 1)
+
+    row = (await store.outbox_for(mid))[0]
+    assert row["status"] == OutboxStatus.PENDING.value
+    assert next_at == row["next_attempt_at"] == swept_at + 6
+    assert row["last_error"] == "late"
+    assert (await _events(store, mid)).count("failed") == 1
+    assert store.fenced_writes == 0
+
+
 async def test_repend_writes_land_under_a_bumped_epoch(store) -> None:
     """C1's other direction, as a test, so nobody "completes" the fence by guarding these.
 
