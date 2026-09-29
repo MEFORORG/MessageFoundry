@@ -127,3 +127,125 @@ action.
 - [x] Scheduler polarity model — availability windows with an `invert` maintenance flag (chosen; single
   clear model, documented on `Schedule`).
 - [x] Retain-un-errored primitive — `store.release_claimed` (undoes the claim, no backoff, FIFO-neutral).
+
+## Amendment A (2026-09-29): configuration-fault STOP and scheduler holds (BACKLOG #2083, batch 178)
+
+> **Status of this amendment: recorded 2026-09-29 by the Manager seat for batch 178.** It lands with
+> the code it describes: PR 1821 (BACKLOG #2083) for A.1 to A.3, and PR 1811 for A.4. The Decision,
+> AC-1 to AC-5 and the Consequences above stay as first written. Where they differ from this
+> amendment, this amendment governs.
+
+### A.1 A third fault class: the configuration fault
+
+The Decision names two permanent-fault classes. A credential fault stops the lane and keeps the
+queue. A content-permanent reject dead-letters one row. This amendment adds a third, the
+**configuration fault**.
+
+A configuration fault is a permanent refusal of the connection's own settings. It is not a fault of
+one message or of the credential. `_RemoteError.config_fault` marks it, and
+`NegativeAckError.config_fault` carries it to the delivery worker. `remotefile._ftp_connect_refusal`
+sets it on these refusals while an FTP session opens:
+
+- a 5xx refusal of `AUTH TLS`, or of `PBSZ`/`PROT P`;
+- a 5xx login refusal on a plain FTP session that demands TLS as one phrase, with no credential word
+  in the reply (`_demands_tls`);
+- a 5xx refusal of the greeting, before any credential is sent.
+
+A configuration fault takes the same STOP as a credential fault. Every queued row would meet the same
+refusal, so dead-lettering one row would only be the first of the whole queue. Under
+`credential_fault_policy="stop"`, the default, the worker would stop the lane. It would release the
+claimed rows to PENDING un-errored through `store.release_claimed`. Under `"dead_letter"` it
+dead-letters the row.
+
+One policy governs both classes, and no new setting was added. Before #2083 these refusals were read
+as credential faults. So neither policy's handling of them changes; only the log line and the alert do.
+
+The routing lives in `messagefoundry/pipeline/wiring_runner.py`. `_lane_stopping_fault` names the
+class, and `_stop_lane_retaining` stops the lane and releases the rows. The single-row path
+(`_process_delivery_item`) and the batch path (`_deliver_coalesced_batch`) both call them. The batch
+path releases every member of the batch.
+
+The alert detail names the class. A configuration stop reads
+`configuration fault (<code>); lane stopped, queue retained (#2083)`. A credential stop still reads
+`credential fault (<code>); lane stopped, queue retained (#109)`. So the "Legible stop reasons"
+paragraph now covers four reasons, not three.
+
+With `validate_directory` on, `_list_or_retry` passes a configuration fault through unchanged, as it
+does a credential fault. It still makes every other listing fault transient.
+
+### A.2 The credential fault narrows to a refused login
+
+Before #2083, `_FtpClient._op` read every 5xx while an FTP session opened as a credential fault. Now
+`_ftp_connect_refusal` classifies a 5xx by the step it answers. The steps are the greeting,
+`AUTH TLS`, the login, and `PBSZ`/`PROT P`.
+
+- A 5xx whose last line names a connection limit is transient, at any step
+  (`_names_connection_limit`). At the login, the reply must also carry no credential word anywhere.
+  A busy server would then be retried rather than stop the lane.
+- Any other 5xx at the login is still a credential fault. That includes an ambiguous 530. The
+  rationale is stated once, in the docstring of `remotefile._names_connection_limit`; read it there.
+- A 4xx is transient, as before, with one change. A 4xx at the login that names the credential, such
+  as `430 Invalid username or password`, is now a credential fault too.
+
+The SFTP auth-failed site is unchanged. The credential words are broad on purpose. So a busy reply
+that also carries one, such as "blocked", still stops the lane. That is the cheaper of the two errors:
+a stopped lane keeps every message, while a retried bad password could lock the partner account.
+
+### A.3 AC-5 is narrowed, and AC-6 is added
+
+AC-5 now reads: IF the failure is a CONTENT-permanent reject (neither a credential nor a
+configuration fault), THEN THE SYSTEM SHALL dead-letter just that one message (unchanged). Its test
+is unchanged.
+
+- **AC-6**: WHEN an outbound sender hits a PERMANENT configuration fault under the `stop` policy, THE
+  SYSTEM SHALL stop the lane and retain the queued rows un-errored. Its alert SHALL name a
+  configuration fault, not a credential. Under `dead_letter`, THE SYSTEM SHALL dead-letter just that
+  one message.
+  Tests: `tests/test_credential_fault_stop.py::test_configuration_fault_stops_and_retains`,
+  `tests/test_credential_fault_stop.py::test_dead_letter_policy_dead_letters_the_configuration_fault`,
+  `tests/test_remotefile_transport.py::test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row`
+
+The Consequences line on a credential-STOPped lane applies to a configuration STOP as well. The lane
+would stay down until an operator fixes the connection's configuration and reloads or restarts.
+
+### A.4 Scheduler holds and reload (batch 178, PR 1811)
+
+The Decision says the scheduler reconciles each connection on every tick through the ordinary
+start/stop path. Batch 178 added these limits to `_reconcile_schedule` and to reload.
+
+1. **An operator-required STOP outranks the calendar.** `_schedule_holds` reads the record that
+   `_hold_for_operator` writes. A window open never starts a held lane. A window close does not park
+   a held outbound either: a park is a pause, and a window open resumes a pause. A held inbound's park
+   still runs, since it only unbinds the listener.
+2. **The holds are at least these.** A #109 credential fault, a #2083 configuration fault, and the
+   internal-error STOP policy. Also a pooled dispatcher's own STOP: the ADR 0070 T17 infra-fault bound
+   or the #2074 claimer-death bound. `_pooled_stop_hold` holds those on all four pooled stages
+   (BACKLOG #2072). An INGRESS, ROUTED or RESPONSE lane is held as its inbound. The record is cleared
+   only where a lane is re-armed or torn down; the `_schedule_holds` docstring names those places.
+3. **A DR-filtered connection is left alone (BACKLOG #2067).** A connection the ADR 0048 run-profile
+   parked this run is skipped by both the start and the park branch, in both directions. An operator
+   start of an inbound clears its marker, and from then its calendar owns it again.
+4. **A latched #122 log-write halt counts as a held stop (BACKLOG #2066).** While the process-wide
+   latch holds, a window open does not start a halted connection. Before, every in-window tick
+   probed the dead sinks and paged again. Only the start branch is gated. An inbound is held only if
+   the halt took it down.
+5. **A committed reload replaces every scheduler task (BACKLOG #2069).** `_reconcile_schedulers`
+   cancels each task and spawns one per schedule in the new graph. So an added schedule runs, an
+   edited one takes its new calendar, and a removed connection's task ends. A kept outbound whose
+   schedule the reload removed is resumed, when the calendar parked it and nothing else holds it.
+6. **A window open that cannot start an inbound is recorded failed and alerted once (#2069
+   follow-up).** `_record_window_open_failure` records it through `_record_failed`, as an engine start
+   does (ADR 0031). Later ticks retry and log at DEBUG. A reload clears the record, so the next failed
+   window open alerts afresh. An outbound start that fails has no such record; the scheduler worker
+   logs it and retries next tick.
+
+The Consequences line says a manual start or stop out of phase is re-reconciled on the next tick. That
+now has exceptions: items 1, 3 and 4 name the cases where the scheduler leaves a lane as it is.
+
+Tests: `tests/test_connection_scheduler.py`, at least
+`test_credential_fault_stop_is_not_resumed_by_the_next_window`,
+`test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_window`,
+`test_a_dr_filtered_inbound_is_not_started_by_its_window`,
+`test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick`,
+`test_a_reload_that_edits_a_schedule_replaces_its_calendar` and
+`test_a_window_open_that_cannot_bind_is_recorded_and_alerted_once`.
