@@ -866,9 +866,9 @@ class EngineClient:
         **kw: object,
     ) -> httpx.Response:
         # ``_bearer`` sends a token OTHER than the held one, for the one call that must: ending the
-        # session a new sign-in replaced (:meth:`_end_replaced_session`). It rides through here
-        # rather than a side request so it keeps every bound below, the cleartext refusal, and the
-        # renewed-certificate follow. It disarms the MFA and step-up retries: their handlers elevate
+        # session a sign-in or set_token replaced (:meth:`_end_replaced_session`). It rides through
+        # here rather than a side request so it keeps every bound below, the cleartext refusal, and
+        # the renewed-certificate follow. It disarms the MFA and step-up retries: their handlers elevate
         # the HELD session, not the one sent here. The certificate retry stays armed and carries
         # ``_bearer`` through, so a revoke after a renewal still ends the REPLACED token rather than
         # falling back to the held one.
@@ -1561,12 +1561,12 @@ class EngineClient:
         Only that one token is ended, never the user's other sessions: a bearer caller may run
         several at once, one per tool. :meth:`login` and :meth:`set_token` call this only for a
         token the engine issued to this client, so a token shared with another process through
-        :meth:`set_token` is never ended here. The call installs no MFA or step-up retry, so it can never prompt the user;
-        ``/auth/logout`` is exempt from both gates anyway.
+        :meth:`set_token` is never ended here. The call installs no MFA or step-up retry, so it
+        can never prompt the user; ``/auth/logout`` is exempt from both gates anyway.
 
-        A failure is logged and swallowed, because the sign-in it follows has already succeeded. A
-        401 is the common case (usually the old token had already expired or been revoked), so it
-        logs at INFO. The engine refuses with 401 for other reasons too, so the line says the
+        A failure is logged and swallowed, because the sign-in or adoption it follows has already
+        replaced the token. A 401 is the common case (usually the old token had already expired or
+        been revoked), so it logs at INFO. The engine refuses with 401 for other reasons too, so the line says the
         engine refused rather than that the session had ended. Anything else may leave a live
         session behind, so it logs a WARNING with the error, which tells a certificate failure from
         a timeout from a local refusal.
@@ -1585,14 +1585,14 @@ class EngineClient:
         except (RuntimeError, ValueError, httpx.HTTPError) as exc:
             if isinstance(exc, ApiError) and exc.status == 401:
                 _log.info(
-                    "%s refused to end the session this sign-in replaced (401); it has most likely "
+                    "%s refused to end the session this client replaced (401); it has most likely "
                     "already ended",
                     self.base_url,
                 )
             else:
                 _log.warning(
-                    "signed in to %s, but could not end the session this sign-in replaced, so it "
-                    "may stay valid until it expires: %r",
+                    "could not end the session this client replaced at %s, so it may stay valid "
+                    "until it expires: %r",
                     self.base_url,
                     str(exc).replace(prior, "[token]")[:_REVOKE_LOG_CHARS],
                 )

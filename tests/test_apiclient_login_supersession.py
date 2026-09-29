@@ -136,6 +136,40 @@ async def test_a_second_login_ends_only_the_session_it_replaced(engine: Engine) 
         assert await _me(elsewhere) == 200, "a session this client never held was ended"
 
 
+async def test_a_must_change_session_can_log_itself_out(engine: Engine) -> None:
+    """RED when: ``/auth/logout`` leaves the engine's must-change exemption, or the client's
+    ``logout`` stops ending the session.
+
+    The harness monitor ends a must-change session it refuses to use with ``logout`` (BACKLOG
+    #2091). Its own test stubs the client, so this is the link to a real engine: the confined
+    session reaches ``/auth/logout``, and its token is refused afterwards."""
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    await create_local_user_chosen(
+        service,
+        username="op",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )  # admin-created, so it still owes the first-login change
+    app = create_app(engine, auth=service)
+    client = EngineClient(_BASE)
+    client._http.close()
+    client._http = httpx.Client(
+        base_url=_BASE, transport=_LoopBridge(app, asyncio.get_running_loop())
+    )
+    try:
+        result = await asyncio.to_thread(client.login, "op", PW)
+        assert result.must_change_password is True
+        await asyncio.to_thread(client.logout)
+    finally:
+        client.close()
+    assert client.token is None
+    assert await service.identity_for_token(result.token) is None, "the session is still live"
+
+
 # --- stubbed transport: the edges an end-to-end run cannot force --------------------------------
 
 
