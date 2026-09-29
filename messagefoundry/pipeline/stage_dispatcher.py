@@ -352,6 +352,7 @@ class StageDispatcher:
         stop_event: asyncio.Event | None = None,
         alert_sink: AlertSink | None = None,
         on_lane_paused: Callable[[str], None] | None = None,
+        on_lane_stopped: Callable[[str], None] | None = None,
         empty_counter: _EmptyClaimObserver | None = None,
         clock: Callable[[], float] | None = None,
         call_later: _CallLater | None = None,
@@ -386,6 +387,11 @@ class StageDispatcher:
         # this to set its per-outbound quiescence Event, so 'stopped' means zero in-flight (not merely
         # pause-requested). None keeps PR3/tests self-contained.
         self._on_lane_paused = on_lane_paused
+        # Fired (if set) when THIS dispatcher decides to STOP a lane: the ADR 0070 T17 infra-fault
+        # bound or the #2074 claimer-death bound. No runner code sees those happen, so the runner wires
+        # this to its operator hold and an active-window scheduler never re-arms them (BACKLOG #2072).
+        # A T16 content STOP is not reported: its runner STOP site holds it, or not, itself.
+        self._on_lane_stopped = on_lane_stopped
         self._clock: Callable[[], float] = clock or time.time
         self._call_later = call_later  # resolved to loop.call_later at start() when None
         # Pooled T17 (infra/machinery-fault) bound (ADR 0070 fix B). Policy "stop" STOPs a persistently
@@ -965,6 +971,7 @@ class StageDispatcher:
                 f"raised while dispatching it"
             ),
         )
+        self._report_own_stop(lane)
 
     def _mark_task_healthy(self, name: str) -> None:
         """The task named ``name`` is iterating: stamp when its current incarnation was first seen
@@ -1389,6 +1396,7 @@ class StageDispatcher:
                     f"{self._stage.value} lane stopped after {st.infra_error_streak} consecutive "
                     f"infra faults (ADR 0070 T17)",
                 )
+                self._report_own_stop(lane)
                 return
             if self._infra_fault_policy == "retry_forever":
                 self._maybe_lane_stuck_alert(lane, st)
@@ -1523,6 +1531,25 @@ class StageDispatcher:
                 lane,
                 exc_info=True,
             )
+
+    def _report_own_stop(self, lane: str) -> None:
+        """Tell the runner (``on_lane_stopped``) about a STOP this dispatcher decided on its own: the
+        T17 infra-fault bound or the #2074 claimer-death bound. Called after :meth:`_to_stopped`, so
+        after the alert and whether or not it raised: a raising sink does not undo the STOP here.
+
+        NOT for the T16 content STOP. Its body is a runner STOP site, and each such site decides for
+        itself whether its STOP needs an operator: a credential fault does, a leadership loss or a
+        removed inbound does not. Reporting those here would hold lanes nothing needs to clear."""
+        if self._on_lane_stopped is not None:
+            try:
+                self._on_lane_stopped(lane)
+            except Exception:  # noqa: BLE001 — a hook failure must not undo or escalate the stop
+                log.warning(
+                    "StageDispatcher %s on_lane_stopped raised for lane %s",
+                    self._stage.value,
+                    lane,
+                    exc_info=True,
+                )
 
     def _end_claim(
         self,

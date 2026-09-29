@@ -128,6 +128,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         "passkey_added": "Passkey added.",
         "passkey_removed": "Passkey removed.",
     }
+    # ADR 0197 Amendment A: an account the requirement covers that has no TOTP may not register a
+    # passkey as its first factor (``begin_webauthn_registration`` refuses it), so its notice offers
+    # the authenticator app alone. ``must_enrol_before_rotating`` is that refusal's own predicate.
+    _ENROL_TOTP_FIRST_NOTICE = (
+        "That action requires MFA: enroll an authenticator app (TOTP) to continue. "
+        "You can add a passkey after that."
+    )
+
+    async def _account_notice(
+        service: AuthService, identity: Identity, m: str | None
+    ) -> str | None:
+        if m == "enroll_first" and await service.must_enrol_before_rotating(identity):
+            return _ENROL_TOTP_FIRST_NOTICE
+        return _ACCOUNT_NOTICES.get(m or "")
 
     async def _account_response(
         service: AuthService,
@@ -180,7 +194,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         m: str | None = Query(None, max_length=32),
     ) -> HTMLResponse:
         return await _account_response(
-            service, identity, request, notice=_ACCOUNT_NOTICES.get(m or "")
+            service, identity, request, notice=await _account_notice(service, identity, m)
         )
 
     async def _factor_first(
@@ -188,8 +202,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> HTTPException | None:
         """The /ui twin of the JSON gate's refusal on ``POST /me/password`` (BACKLOG #1954).
 
-        ``allow_mfa_pending`` on these two routes serves an account with NO factor, which must be
-        able to rotate. A pending session on an account that HAS one goes to the factor page first.
+        ``allow_mfa_pending`` on these two routes lets a pending session on an account with NO
+        factor reach this check. A local one is pending only because the requirement covers it, so
+        it is sent on to enrolment first (below) rather than rotating. A pending session on an
+        account that HAS one goes to the factor page first.
         The JSON handler this page delegates to is reached in-process, past its ``Depends`` gate, so
         the check has to live on this plane too. ``require_ui`` runs it as its ``pending_refusal``,
         so the refusal is audited there and comes before the admin-write charge (BACKLOG #1973)."""

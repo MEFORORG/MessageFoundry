@@ -372,7 +372,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 |---|---|
 | It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches, and the dry-run's copy of a state write or reference value in the form the live engine returns | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/dryrun.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
-| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
+| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py` |
 
@@ -438,6 +438,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |
 | It reads a value you typed into the extension's connection form | `connectionForm.ts` |
+| It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 
 **Extension files that parse text the patterns cannot see.**
