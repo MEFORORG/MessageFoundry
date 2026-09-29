@@ -57,8 +57,8 @@ def _pin_totp_clock(monkeypatch: pytest.MonkeyPatch, instant: float) -> None:
 async def _service(engine: Engine, **kw: object) -> AuthService:
     service = AuthService(
         engine.store,
-        AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False, **kw),
-    )  # type: ignore[arg-type]
+        AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False, **kw),  # type: ignore[arg-type]
+    )
     await service.initialize()
     return service
 

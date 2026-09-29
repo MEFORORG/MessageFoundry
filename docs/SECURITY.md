@@ -205,9 +205,14 @@ to back. `[auth].admin_write_min_interval_seconds` refuses a write that lands le
 after the same actor's last admitted write, with the same `429` as the count. That default is
 **provisional** too, from the same research. The fastest console write the model allows, with the
 decision made and the hand in place, is one click (0.2 s) or Tab then Enter (0.16 s). The default
-sits just under the faster. A refused write is not recorded, so the gap runs from the last write
-that was served. `0` turns the gap off, and a gap as long as the window is refused at load. The
-derivation is the comment on the setting.
+sits just under the faster. The gap runs from the last write the limiter admitted. A write the
+limiter refused does not count, but one it admitted counts even if a later check refused it, such as
+a `403` for a stale step-up. `0` turns the gap off, and a gap as long as the window is refused at
+load. The derivation is the comment on the setting.
+
+**A double click can meet the gap.** The console has no guard against a second submit. If an
+operator double-clicks a write button, the first request is served and the second gets `429`, and
+the browser shows the second answer. The action still happened once. Reload the page to see it.
 
 **This refuses scripted bulk administration.** An `apiclient` or IDE loop that makes more than twelve
 admin writes in 15 s, or two within 0.15 s, gets `429`. Such a loop has to pace itself. Otherwise the site raises the budget
@@ -278,8 +283,21 @@ one submit, M + K = 1.43 s, even when a password manager fills the code. The def
 below that, at 1 s, because M is an average and some people are faster. The comment on
 `mfa_verify_min_elapsed_seconds` in `config/settings.py` carries the derivation.
 
-**What these floors do not do.** A script that waits out the floor is not refused. Each floor sets a
-lower bound on one pair's timing; it does not detect automation.
+**What these floors do not do.** At least these gaps remain:
+
+- A script that waits out a floor is not refused. Each floor sets a lower bound on one pair's
+  timing. It does not detect automation.
+- A combined sign-in, with the password and the code in one request, has no second step, so it has
+  nothing to floor. A script holding both goes straight through.
+- The two enrollment legs, `POST /me/mfa/confirm` and a passkey registration, can also satisfy a
+  pending session. They bind a new factor and are not floored.
+- An IdP that re-authenticates with no human step, such as integrated Windows sign-in, answers a
+  step-up faster than the floor on every try. The step-up is then refused each time. At such a site,
+  set `oidc_callback_min_elapsed_seconds` to `0`.
+- The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
+  refuses a good code until the clocks agree again. A step forward lets a code through early.
+- The response hides the reason, but the audit row names it. The account holder's own security
+  events feed shows the `too_early` row.
 
 **Authorization-decision audit (ASVS 16.3.2).** **Every** authorization grant on the engine's own
 gates is audited (`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG
@@ -1916,7 +1934,7 @@ slack.
 | Live directory group membership vs. the session's channel scope | the AD groups returned by that same reconciliation probe, mapped through the AD-group→channel-scope map, decided by `decide_ad_channel_scope` (the function login applies) | on a **successful (PRESENT)** probe, the directory would withdraw the stored scope or drop a channel from it — a **single** pass, **no** strike accrual. A widened scope, an administrator's scope with no mapped group, and an Administrator do not fire. A group ADD can fire: a matching group replaces an administrator's scope, so it narrows one the group does not cover | **DENY** by revocation of every session for that account, `auth.ad_session_revoked` with `reason = scope_changed`. The pass never writes the scope; the next login does (ADR 0198). A principal whose roles also changed is revoked once, under the row above, so it is one count against the mass-revoke breaker | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
 | Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the three rows above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
-| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last served one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
+| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`) or a passkey assertion that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied is not floored | **DENY** with the leg's ordinary failure, so nothing tells the caller about timing (`401 invalid code` on `POST /auth/mfa-verify`, the gate's own error on `POST /ui/mfa`); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`; no lockout count, no code or challenge spent | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
 | Time from a federated start to its callback | the flow cache's monotonic clock when the flow was staged vs at the callback | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off) |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |

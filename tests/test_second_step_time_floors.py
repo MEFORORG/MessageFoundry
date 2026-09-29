@@ -108,6 +108,13 @@ def test_a_federated_floor_as_long_as_the_flow_ttl_is_refused_at_load() -> None:
     AuthSettings(oidc_flow_ttl_seconds=30, oidc_callback_min_elapsed_seconds=29.0)
 
 
+def test_an_mfa_floor_as_long_as_the_idle_timeout_is_refused_at_load() -> None:
+    # Every pending session would idle out before its code could be accepted.
+    with pytest.raises(ValidationError, match="shorter than session_idle_timeout_minutes"):
+        AuthSettings(session_idle_timeout_minutes=1, mfa_verify_min_elapsed_seconds=60.0)
+    AuthSettings(session_idle_timeout_minutes=1, mfa_verify_min_elapsed_seconds=59.0)
+
+
 # --- sign-in then the TOTP second factor ----------------------------------------------------------
 
 
@@ -118,19 +125,24 @@ async def _pending_totp_session(
 
     Returns ``(store, service, pending token, the code for the next step, the session's mint)``."""
     store = await MessageStore.open(":memory:")
-    service = AuthService(store, AuthSettings(**settings))
-    identity, token, password = await login_admin(service)
-    enroll = await service.begin_mfa_enrollment(identity)
-    # Enrollment consumes the activating step, so the sign-in's code sits in the NEXT step.
-    t0 = 1_000_000.0
-    pin_totp_clock(monkeypatch, t0)
-    await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret, now=t0), token=token)
-    t1 = t0 + totp.DEFAULT_PERIOD
-    pin_totp_clock(monkeypatch, t1)
-    out = await service.login(ADMIN_USERNAME, password)
-    assert out.ok and out.mfa_required and out.token is not None
-    session = await store.get_session(hash_token(out.token))
-    assert session is not None and session.mfa_verified_at is None
+    try:
+        service = AuthService(store, AuthSettings(**settings))
+        identity, token, password = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        # Enrollment consumes the activating step, so the sign-in's code sits in the NEXT step.
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        activating = totp.totp(enroll.secret, now=t0)
+        await service.confirm_mfa_enrollment(identity, activating, token=token)
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.ok and out.mfa_required and out.token is not None
+        session = await store.get_session(hash_token(out.token))
+        assert session is not None and session.mfa_verified_at is None
+    except BaseException:
+        await store.close()  # the caller's try/finally has not started yet
+        raise
     return store, service, out.token, totp.totp(enroll.secret, now=t1), session.created_at
 
 
@@ -304,13 +316,41 @@ async def test_a_sign_in_callback_just_inside_the_floor_is_refused(
         assert not early.ok and early.token is None
         assert early.error == "federated sign-in failed"
         assert early.reason == TOO_EARLY
-        assert TOO_EARLY in _reasons(await _audit_rows(store, "auth.login_failed"))
+        rows = [r for r in await _audit_rows(store, "auth.login_failed") if r["detail"]]
+        refused = [r for r in rows if json.loads(str(r["detail"])).get("reason") == TOO_EARLY]
+        assert len(refused) == 1 and refused[0]["client"] == "127.0.0.1", "no client on the row"
 
         # CONTROL: just past the floor, the same answer signs the person in.
         served = await _sign_in_callback_after(
             service, clock, OIDC_FLOOR + 0.001, auth_time_offset=0.5
         )
         assert served.ok and served.token is not None, served
+    finally:
+        await store.close()
+
+
+async def test_the_engines_own_token_round_trip_does_not_count_as_the_persons_time(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The callback arrives inside the floor, then the token endpoint takes longer than the floor.
+    # The age is read on arrival, so the slow exchange cannot carry the callback past the floor.
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock = await _floored_federated_service(store, rsa_key, monkeypatch)
+        flow_id, url = await service.begin_oidc_login(client="127.0.0.1", public_origin=ORIGIN)
+        state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
+        issued_at = _staged(service, flow_id).issued_at
+
+        def slow_exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            clock[0] += 2 * OIDC_FLOOR
+            return _verified(auth_time=issued_at + 0.5)
+
+        service._exchange_and_validate = slow_exchange  # type: ignore[method-assign]
+        clock[0] += OIDC_FLOOR / 2
+        early = await service.complete_oidc_login(
+            flow_id=flow_id, state=state, code=AUTH_CODE, client="127.0.0.1", public_origin=ORIGIN
+        )
+        assert not early.ok and early.reason == TOO_EARLY, early
     finally:
         await store.close()
 

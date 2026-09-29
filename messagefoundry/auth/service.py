@@ -2746,6 +2746,10 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=FLOW_PURPOSE_MISMATCH
             )
+        # BACKLOG #2301: the callback's age is read as it arrives, so the engine's own round trip to
+        # the token endpoint below never counts as time the person spent. Whether the floor applies
+        # needs the verified auth_time, so the decision waits for the exchange.
+        arrived_too_early = self._oidc_callback_too_early(flow)
         try:
             try:
                 principal_claims = await asyncio.to_thread(
@@ -2810,8 +2814,15 @@ class AuthService:
         # case this floor exists for. An IdP clock that runs ahead can make an older sign-on look
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
-        if signed_in_during_flow and self._oidc_callback_too_early(flow):
-            await self._directory_reject_audit("<oidc>", "oidc", TOO_EARLY)
+        if signed_in_during_flow and arrived_too_early:
+            # With the client address, as the token_refused arm records it: a run of these is
+            # automation, and the operator needs to see where it comes from.
+            await self._audit(
+                "auth.login_failed",
+                actor="<oidc>",
+                detail=_json({"provider": "ad", "mech": "oidc", "reason": TOO_EARLY}),
+                client=client,
+            )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=TOO_EARLY)
 
         # The claimed username selects nothing. It is kept only as a hint in the not-bound refusal.
@@ -6489,9 +6500,11 @@ class AuthService:
         charged: no lockout count, no TOTP step, no recovery code, no passkey challenge. The floor
         and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
 
-        Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the two legs that
-        complete a pending factor. :meth:`confirm_mfa_enrollment` also satisfies a pending session
-        and is not floored: a QR scan and a first code sit between. A new completing leg calls this."""
+        Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the legs that prove an
+        ENROLLED factor. The two enrollment legs, :meth:`confirm_mfa_enrollment` and
+        :meth:`finish_webauthn_registration`, also satisfy a pending session and are NOT floored:
+        they bind a new factor, a different flow, and flooring them is left open (BACKLOG #2301).
+        A new leg that proves an enrolled factor calls this."""
         floor = self._settings.mfa_verify_min_elapsed_seconds
         if floor <= 0 or session.mfa_verified_at is not None:
             return False
