@@ -9,11 +9,13 @@ The replay endpoint stands in for a gated high-value action (it needs no configu
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import gc
 import json
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -805,9 +807,15 @@ def _held_store(engine: Engine, action: str, *, approver_changed: bool = False) 
     return _Held(engine.store)
 
 
-async def _cancel_inside(store: Any, execute: Any) -> tuple[str, list[str]]:
+async def _cancel_inside(
+    store: Any,
+    execute: Any,
+    *,
+    while_held: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[str]]:
     """Run approve() over ``store``, cancel it once the held write is entered, release the write,
-    and return the approval id plus whether the executor started."""
+    and return the approval id plus whether the executor started. ``while_held`` runs with the
+    approval id while the write is held, before the cancel."""
     from tests._pending_approval_store_contract import _resolve
 
     ran: list[str] = []
@@ -826,7 +834,9 @@ async def _cancel_inside(store: Any, execute: Any) -> tuple[str, list[str]]:
         gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     )
     await asyncio.wait_for(store.entered.wait(), _WAIT_S)
-    # cancel() cancels the shield the task is parked on at once, so releasing the held write straight
+    if while_held is not None:
+        await while_held(approval_id)
+    # cancel() cancels the wait the task is parked on at once, so releasing the held write straight
     # after still lands the cancellation inside it. Released BEFORE awaiting the task, because a
     # cancel during the claim makes approve() wait for the claim to land before it re-raises.
     task.cancel()
@@ -1453,3 +1463,325 @@ async def test_a_cancel_during_the_status_write_still_records_the_resolution(
 
     await _eventually(_recorded)
     assert await _status_of(engine, approval_id) == "resolved_applied"
+
+
+# --- BACKLOG #2087: a shielded outcome write logs once, is per gate, and is drained at shutdown ---
+# asyncio.shield reported a write that raised after its caller was cancelled through the loop's
+# exception handler, and the gate logged the same failure again. So these count the gate's log
+# records AND every call to the loop's exception handler.
+#
+# Which handler is installed depends on test order. The tests share one session loop, and any
+# create_managed_app lifespan earlier on it installs the engine's last-resort handler
+# (install_loop_exception_handler) and never removes it. That handler logs to its own logger, not
+# 'asyncio'. So each test installs a capturing handler of its own rather than trusting a logger name.
+
+_REPORTING_LOGGERS = ("messagefoundry.api.approvals", "asyncio")
+
+
+def _reports(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records if r.name in _REPORTING_LOGGERS and r.levelno >= logging.WARNING
+    ]
+
+
+@contextlib.contextmanager
+def _loop_reports() -> Iterator[list[dict[str, Any]]]:
+    """Capture every call to the running loop's exception handler, then restore the previous one."""
+    loop = asyncio.get_running_loop()
+    # Collect first, so garbage left by EARLIER tests on the shared loop reports to the previous
+    # handler and is not counted against this one.
+    gc.collect()
+    previous = loop.get_exception_handler()
+    seen: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: seen.append(context))
+    try:
+        yield seen
+    finally:
+        loop.set_exception_handler(previous)
+
+
+def _described(loop_reports: list[dict[str, Any]]) -> list[str]:
+    """Each captured loop report as its message plus the exception, so a failure names the cause."""
+    return [f"{c.get('message')}: {c.get('exception')!r}" for c in loop_reports]
+
+
+async def _reported_after(caplog: pytest.LogCaptureFixture, text: str) -> list[logging.LogRecord]:
+    """Wait for the gate's own line naming ``text``, then a little longer, so a SECOND report of the
+    same failure would have had time to arrive before the caller counts them. Run it inside
+    :func:`_loop_reports`, so a report through the loop's exception handler is captured too."""
+    deadline = time.monotonic() + _WAIT_S
+    while not any(text in r.getMessage() for r in _reports(caplog)):
+        assert time.monotonic() < deadline, f"no report naming {text!r}"
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    # "Task exception was never retrieved" is reported only when the task is collected, so collect
+    # before counting, or an error nobody read would still count as one report.
+    gc.collect()
+    await asyncio.sleep(0)
+    return _reports(caplog)
+
+
+async def test_a_cancelled_claim_that_fails_is_logged_once(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelled while claiming, and the claim then raises. The settle logs the failure; asyncio
+    must not report it a second time as an exception in a shielded future."""
+    from tests._pending_approval_store_contract import _StandingStore
+
+    class _ClaimFails(_StandingStore):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw["status"] == "executing":
+                self.entered.set()
+                await self.release.wait()
+                raise OSError("store unreachable")
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
+        approval_id, ran = await _cancel_inside(_ClaimFails(engine.store), _runs)
+        reports = await _reported_after(caplog, "its claim failed")
+    assert _described(loop_reports) == []
+    assert len(reports) == 1, [f"{r.name}: {r.getMessage()}" for r in reports]
+    assert reports[0].levelno == logging.ERROR and approval_id in reports[0].getMessage()
+    assert ran == []
+    assert await _status_of(engine, approval_id) == "pending"
+
+
+async def test_a_cancelled_resolve_that_loses_the_race_logs_one_warning(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PR 1636's item 5. A resolve whose caller was cancelled, and whose status write then loses to
+    another operator, raises the gate's own 409. That is an expected refusal: one WARNING, no ERROR,
+    and no second report from asyncio."""
+    from tests._pending_approval_store_contract import _resolve
+
+    approval_id = await _interrupted_row(engine, "maker", "maker-id")
+    store = _held_store(engine, "decide:resolved_applied")
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
+        task = asyncio.create_task(
+            gate.resolve_interrupted(
+                approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
+            )
+        )
+        await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+        # Another operator resolves it while this status write is held, so the write then loses.
+        assert await engine.store.decide_pending_approval(
+            approval_id,
+            status="resolved_not_applied",
+            approver="releaser",
+            decided_at=time.time(),
+            from_status="interrupted",
+        )
+        task.cancel()
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, _WAIT_S)
+        reports = await _reported_after(caplog, "another operator resolved it first")
+    assert _described(loop_reports) == []
+    assert len(reports) == 1, [f"{r.name}: {r.getMessage()}" for r in reports]
+    assert reports[0].levelno == logging.WARNING and approval_id in reports[0].getMessage()
+    assert reports[0].exc_info is None
+    assert await _status_of(engine, approval_id) == "resolved_not_applied"
+
+
+async def test_a_cancelled_claim_that_loses_the_race_settles_nothing(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelled while claiming, and a reject lands first, so the claim returns False. Nothing ran and
+    nothing was claimed: the row stays 'rejected', no approval.failed is written, nothing is logged."""
+    store = _held_store(engine, "decide:executing")
+
+    async def _reject(approval_id: str) -> None:
+        assert await engine.store.decide_pending_approval(
+            approval_id, status="rejected", approver="other", decided_at=time.time()
+        )
+
+    with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
+        # approve() waits for the settle before it re-raises, so the settle is done on return.
+        approval_id, ran = await _cancel_inside(store, _runs, while_held=_reject)
+        await asyncio.sleep(0.1)
+        gc.collect()
+        await asyncio.sleep(0)
+    assert ran == []
+    assert await _status_of(engine, approval_id) == "rejected"
+    assert await engine.store.list_audit(action="approval.failed") == []
+    assert _reports(caplog) == []
+    assert _described(loop_reports) == []
+
+
+async def _orphan_a_held_approved_write(engine: Engine) -> tuple[ApprovalGate, Any, str]:
+    """Cancel an approve while its 'approved' status write is held, and leave the write held."""
+    from tests._pending_approval_store_contract import _resolve
+
+    store = _held_store(engine, "decide:approved")
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+    return gate, store, approval_id
+
+
+async def test_drain_waits_for_a_write_whose_caller_was_cancelled(engine: Engine) -> None:
+    gate, store, approval_id = await _orphan_a_held_approved_write(engine)
+    drain = asyncio.create_task(gate.drain(timeout=_WAIT_S))
+    await asyncio.sleep(0.05)
+    assert not drain.done(), "the drain returned while the write was still held"
+    store.release.set()
+    assert await asyncio.wait_for(drain, _WAIT_S) == []
+    # No polling: the drain returned only once the whole outcome write had finished.
+    assert await _status_of(engine, approval_id) == "approved"
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+
+
+async def test_drain_is_bounded_and_scoped_to_its_own_gate(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The deadline returns the approval ids still running and logs them. A second gate holds none
+    of the first gate's writes, which a module-wide set could not tell apart."""
+    from tests._pending_approval_store_contract import _resolve
+
+    gate, store, approval_id = await _orphan_a_held_approved_write(engine)
+    other = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    assert await asyncio.wait_for(other.drain(timeout=_WAIT_S), 1.0) == []
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        assert await gate.drain(timeout=0.05) == [approval_id]
+    assert any(
+        r.levelno == logging.ERROR
+        and approval_id in r.getMessage()
+        and "still running" in r.getMessage()
+        for r in caplog.records
+    )
+    store.release.set()
+    assert await gate.drain(timeout=_WAIT_S) == []
+    assert await _status_of(engine, approval_id) == "approved"
+
+
+async def test_drain_also_waits_for_a_write_started_while_it_waits(engine: Engine) -> None:
+    gate = ApprovalGate(engine.store, ON)
+    first_go, second_go = asyncio.Event(), asyncio.Event()
+    finished: list[str] = []
+
+    async def _write(name: str, go: asyncio.Event) -> None:
+        await go.wait()
+        finished.append(name)
+
+    first = asyncio.create_task(gate._shielded(_write("first", first_go), "a1"))
+    await asyncio.sleep(0)
+    drain = asyncio.create_task(gate.drain(timeout=_WAIT_S))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(gate._shielded(_write("second", second_go), "a2"))
+    await asyncio.sleep(0)
+    first_go.set()
+    await asyncio.sleep(0.05)
+    assert not drain.done(), "the drain returned while a write started during it was running"
+    second_go.set()
+    assert await asyncio.wait_for(drain, _WAIT_S) == []
+    assert finished == ["first", "second"]
+    await asyncio.gather(first, second)
+
+
+async def _probe_rows(db_path: Path) -> list[Any]:
+    """Read the audit through a second store, after the app's own store has closed."""
+    from messagefoundry.store import open_store, sqlite_settings
+
+    store = await open_store(sqlite_settings(db_path), keyless_chain_refusal=None)
+    try:
+        return list(await store.list_audit(action="approval.drain_probe"))
+    finally:
+        await store.close()
+
+
+async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: bool) -> None:
+    """Start a slow shielded write inside the managed lifespan, cancel its caller, then shut down."""
+    from messagefoundry.api import create_managed_app
+
+    app = create_managed_app(db_path=db_path)
+    finished = asyncio.Event()
+    # Undrained, the write is held until the lifespan has exited, so the control cannot pass by a
+    # slow teardown. Drained, it sleeps briefly, and the drain has to wait for it.
+    after_exit = asyncio.Event()
+    async with app.router.lifespan_context(app):
+        gate: ApprovalGate = app.state.approval_gate
+        store = app.state.engine.store
+        if not drained:
+
+            async def _no_drain(timeout: float = 0.0) -> list[str]:
+                return []
+
+            gate.drain = _no_drain  # type: ignore[method-assign]
+
+        async def _slow_write() -> None:
+            try:
+                if drained:
+                    await asyncio.sleep(0.3)
+                else:
+                    await after_exit.wait()
+                await store.record_audit("approval.drain_probe", actor="checker")
+            finally:
+                finished.set()
+
+        caller = asyncio.create_task(gate._shielded(_slow_write(), "probe-id"))
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+    # Undrained, the write is still running here; let it meet the closed store and finish.
+    after_exit.set()
+    await asyncio.wait_for(finished.wait(), _WAIT_S)
+    await asyncio.sleep(0.05)
+
+
+async def test_shutdown_drains_an_orphaned_write_before_the_store_closes(tmp_path: Path) -> None:
+    db_path = tmp_path / "drained.db"
+    await _run_an_orphaned_write_through_shutdown(db_path, drained=True)
+    assert len(await _probe_rows(db_path)) == 1, "the write did not land before the store closed"
+
+
+async def test_the_drain_assertion_can_fail(tmp_path: Path) -> None:
+    """Control: with the drain neutralised the same write misses the store, so the test above is
+    measuring the drain and not a write that was always fast enough."""
+    db_path = tmp_path / "undrained.db"
+    await _run_an_orphaned_write_through_shutdown(db_path, drained=False)
+    assert await _probe_rows(db_path) == []
+
+
+async def test_a_drain_failure_does_not_skip_engine_stop(tmp_path: Path) -> None:
+    """The drain runs BEFORE engine.stop(), and a drain that raises must not skip the stop, or the
+    store's non-daemon worker keeps the process alive."""
+    from messagefoundry.api import create_managed_app
+
+    app = create_managed_app(db_path=tmp_path / "boom.db")
+    calls: list[str] = []
+    real_stop: list[Any] = []
+    try:
+        async with app.router.lifespan_context(app):
+            engine = app.state.engine
+            real_stop.append(engine.stop)
+            gate: ApprovalGate = app.state.approval_gate
+
+            async def _boom(timeout: float = 0.0) -> list[str]:
+                calls.append("drain")
+                raise RuntimeError("PROBE: deliberate drain failure")
+
+            async def _spy_stop() -> None:
+                calls.append("stop")
+                await real_stop[0]()
+
+            gate.drain = _boom  # type: ignore[method-assign]
+            engine.stop = _spy_stop
+    finally:
+        if real_stop and "stop" not in calls:
+            await real_stop[0]()
+    assert calls == ["drain", "stop"]

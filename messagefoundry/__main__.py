@@ -34,13 +34,21 @@ from pathlib import (
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from messagefoundry import __version__
+from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR 0201 slice 1)
+    Dispatch,
+    _emit_error,
+    _load_operator_json,
+    _OperatorJsonError,
+    _print_json,
+    _safe_print,
+    run_cli,
+)
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
     LogFile,
     SyslogForward,
     configure_logging,
-    configure_stderr_logging,
     query_sntp_offset,
 )
 from messagefoundry.odbc_env import disable_driver_manager_pooling
@@ -91,37 +99,28 @@ def main(argv: list[str] | None = None) -> int:
     # UnicodeEncodeError. errors="replace" is lossy for such chars, but the machine-read JSON
     # subcommands stay ASCII (json.dumps ensure_ascii=True), so this keeps the stream's codec. The
     # shared helper is the one chokepoint every console entry point calls (BACKLOG #1875).
+    #
+    # `run_cli` below hardens again, which is a no-op the second time. This call stays the FIRST
+    # statement of main() anyway, because tests/test_cp1252_console_safety.py reads it here.
     harden_console_streams()
     # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
     # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
     disable_driver_manager_pooling()
+    # Everything else around dispatch is shared with the planned toolkit command (ADR 0201 slice 1):
+    # the last-resort hooks, parsing, the redacting stderr log sink and the JSON error floor.
+    return run_cli(argv, _build_parser, configures_own_logging=_CONFIGURES_OWN_LOGGING)
 
-    # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
-    # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
-    # error can never escape as a raw traceback quoting a PHI-bearing value; until this call site they
-    # were installed inside `_serve` only, leaving the other 33 subcommands unguarded. `dryrun`,
-    # `audit-verify` and `backup` open the store, so an uncaught exception from one of them is the
-    # case that could carry a field value.
-    #
-    # INSTALLING THE HOOK CHANGES NO EXIT CODE: the interpreter still exits 1 after calling
-    # `sys.excepthook`. That is why this shape was taken over the alternative of wrapping the dispatch
-    # and exiting 2, which would have made every CLI exit-code assertion in the suite a fresh question.
-    # The dispatch IS now wrapped (BACKLOG #1863, at the foot of this function), but it returns 1,
-    # so that reasoning still holds. The hooks stay: they cover everything outside that `try`.
-    #
-    # LATE IMPORT, DELIBERATELY. Two `tests/test_config_anchoring.py` monkeypatches target the module
-    # attribute `messagefoundry.last_resort.install_excepthook`; importing the name at module scope
-    # here would bind it before they can patch it, and they would silently stop applying.
-    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
 
-    install_excepthook()
-    # The sibling hook for every OTHER thread (BACKLOG #1055), which had the identical serve-only gap.
-    # sys.excepthook does not cover them, and the engine runs non-asyncio threads whose except clauses
-    # are deliberately narrow -- the sandbox session's raw stdout reader catches only OSError -- so
-    # anything else would otherwise reach the stdlib default and print an unredacted traceback to the
-    # NSSM-captured stderr.
-    install_thread_excepthook()
+def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
+    """Build the engine's argument parser, and return it with the dispatch map (ADR 0201 slice 1).
 
+    Building has no side effect: it installs no hook, touches no stream and dispatches nothing. So a
+    test or a release smoke can read the real command surface without running ``main()``.
+    ``run_cli`` calls this after it installs the last-resort hooks, the order ``main()`` always had.
+
+    The map returned is :data:`_DISPATCH` itself, not a copy, so a test that patches an entry in it
+    still reaches ``main()``.
+    """
     parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
     parser.add_argument(
         "--version",
@@ -1132,76 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
         "install-service.ps1 as -Environment, i.e. serve --env)",
     )
 
-    args = parser.parse_args(argv)
-    # A `--json` subcommand's stdout is a machine-parsed document, so NOTHING else may write there
-    # (BACKLOG #1489). The engine's default log sink is stdout too, and one log line ahead of the
-    # payload makes `json.loads` raise `Extra data: line 1 column 5`, because the text format opens
-    # with the ISO timestamp: `2026` parses as a number and the payload becomes trailing garbage.
-    # It cost real CI time before it was fixed; the census lives on the ledger item, with its
-    # provenance, rather than being restated here.
-    #
-    # DECIDED HERE, and not in `logging_guard`, which is where the symptom shows up. That module
-    # writes its rollover notice to the ROLLED SINK on purpose: the notice landing is the proof that
-    # the replacement stream accepted a write, which is precisely what separates stage 1 (healed)
-    # from stage 2 (unwritable). Move the notice and the fail-closed halt loses its trigger. The
-    # collision is two contracts on one file descriptor, and the CLI is what owns that choice.
-    #
-    # `configure_stderr_logging` is the shipped answer to "this process's stdout is not a log
-    # channel" (the ADR 0087 sandbox worker, whose stdout carries IPC frames), and it carries the
-    # PHI-redaction + control-char-scrub filter chain. `serve` and `supervise` take no `--json`,
-    # print no payload and are untouched: they still log to the stdout NSSM captures.
-    #
-    # EVERY OTHER SUBCOMMAND GETS THE SAME STDERR SINK, `--json` OR NOT (BACKLOG #1441). Before this,
-    # a subcommand without `--json` ran with NO root handler, so a WARNING or above went to the
-    # standard library's `logging.lastResort`: no filters and no formatter. A traceback quoting a PHI
-    # segment printed as written. Redaction is a property of the HANDLER, so a process that installs
-    # none has no chain at all. Stderr keeps stdout for data. The root stays at WARNING, the level
-    # `lastResort` used. At least these visible changes follow:
-    #   * Every such record now carries the timestamp/level/logger prefix and is redacted.
-    #   * The handler is at NOTSET, so a logger given its OWN level below WARNING (an operator's
-    #     `log.setLevel(logging.INFO)`, or the audit tee's) now prints those records. `lastResort`
-    #     dropped them. They pass the same chain as under `serve`, which prints them too; the chain
-    #     does not catch a lone identifier, so "never put PHI in a log message" still applies.
-    #   * A library that puts a NullHandler on its own logger (urllib3, pynetdicom and others) had
-    #     its WARNINGs DROPPED, because a NullHandler counts as "a handler found" and so skips
-    #     `lastResort`. They now print, through the chain, exactly as they already do under `serve`.
-    #   * A stdlib `basicConfig(...)` call in an operator's config module becomes a no-op under
-    #     `dryrun`/`check`/`validate`, because basicConfig does nothing once the root has a handler.
-    #     `serve` already behaves this way. The fix for an operator is a named logger, not basicConfig.
-    # The audit tee's INFO records reached stderr through `ensure_logger_sink` (#1199) before this;
-    # that now finds this handler and adds no second one. The exempt subcommands, and the one
-    # residual the exemption leaves, are stated once at `_CONFIGURES_OWN_LOGGING`.
-    #
-    # Only when the root has NO handler yet, which is the state a `python -m messagefoundry` process
-    # starts in. A caller that configured logging before calling main() owns its own handlers, and
-    # main() does not take them away: an embedding host, or pytest, whose `caplog` capture lives on
-    # the root (replacing it would empty `caplog`, as the ledger row measured). That host's handler
-    # is then the host's to filter. `--json` still replaces unconditionally, because a handler left
-    # in place could write to stdout and corrupt the document (#1489).
-    as_json = bool(getattr(args, "json", False))
-    needs_sink = args.command not in _CONFIGURES_OWN_LOGGING and not logging.getLogger().handlers
-    if as_json or needs_sink:
-        configure_stderr_logging()
-    # THE FLOOR UNDER `_emit_error`'s --json CONTRACT (BACKLOG #1863). Without this `try`, an exception
-    # no subcommand arm names went to `sys.excepthook`: one redacted CRITICAL line on stderr, exit 1,
-    # and stdout EMPTY. A machine consumer could not tell that from a command with no output. Now it
-    # gets `{"error": ...}` on stdout under --json. Text mode prints nothing new, as before; only the
-    # log line appears, on whatever sink logging uses (stdout for `serve`/`supervise`, per NSSM).
-    #
-    # The exit code stays 1, the same 1 the hook path gave, so #1674's reasoning above still holds.
-    # `report_uncaught` is the hook's own rendering, so the stderr line is unchanged and the stdout
-    # text is the same PHI-redacted string. Never format `exc` here.
-    #
-    # `Exception`, not `BaseException`: Ctrl-C and `SystemExit` keep their own meaning. A command that
-    # printed part of its JSON before raising still leaves two documents on stdout; this catch cannot
-    # take back what was already written.
-    try:
-        return _DISPATCH[args.command](args)
-    except Exception as exc:
-        from messagefoundry.last_resort import report_uncaught
-
-        text = report_uncaught(exc)
-        return _emit_error(text, as_json=True) if as_json else 1
+    return parser, _DISPATCH
 
 
 def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
@@ -2843,7 +2773,10 @@ def _serve(args: argparse.Namespace) -> int:
     # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
     # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
-    # never trips this.
+    # never trips this. The hop here is NOT cleartext: the non-loopback gate above has already
+    # refused every arm but the warn path, so this fires only with no operator certificate and no
+    # declared proxy, where the engine would serve https on the minted placeholder (ADR 0172). The
+    # message says that, rather than "without TLS" (BACKLOG #1672).
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
     # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
     #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
@@ -2870,11 +2803,14 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
-            f"non-loopback host {settings.api.host!r} without TLS. The /ui surface requires "
-            "in-process TLS ([api].tls_cert_file) or a declared TLS-terminating proxy "
-            "([api].tls_terminated_upstream + trusted_proxies); --allow-insecure-bind does not cover "
-            "it. Set [security].listen_address to a loopback address (127.0.0.1) for local-only "
-            "access, or configure TLS.",
+            f"non-loopback host {settings.api.host!r} without an operator certificate or a "
+            "declared TLS-terminating proxy. The only certificate available is the engine's "
+            "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
+            "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
+            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies); "
+            "--allow-insecure-bind does not cover it, and neither does "
+            "[security].require_encryption_for_remote=false. Set [security].listen_address to a loopback "
+            "address (127.0.0.1) for local-only access, or configure one of those two.",
             file=sys.stderr,
         )
         return 2
@@ -3009,12 +2945,28 @@ def _serve(args: argparse.Namespace) -> int:
     # 2026-08-17: a warning earns nothing by itself). It reports an operator's explicit choice; it does
     # not gate, refuse, or re-enable anything. Imported from the console package root rather than its
     # private `_auth` module, and reached only when serve_ui survived the find_spec gate above, so the
-    # wheel is present by construction.
+    # wheel is PRESENT by construction. Present is not importable (BACKLOG #1907): an older console
+    # lacks these names, or its own import chain fails against this engine. This is the FIRST import
+    # of the console on the serve path, after the provenance gate above and before create_app's
+    # assert_engine_seam. Uncaught, a failure here would reach main()'s last-resort catch (BACKLOG
+    # #1863): exit 1 and one generic redacted log line that never names the console or the seam.
+    # Refuse here instead, exit 2, naming the seam and the installed version. The exception text is
+    # rendered through safe_exc, as that catch would render it. A console that imports cleanly but
+    # speaks another seam still fails at create_app's assert_engine_seam; that path is unchanged.
     if settings.api.serve_ui:
-        from messagefoundry_webconsole import (
-            BROWSER_HARDENING_OPT_OUT_ENV,
-            browser_hardening_enabled,
-        )
+        try:
+            from messagefoundry_webconsole import (
+                BROWSER_HARDENING_OPT_OUT_ENV,
+                browser_hardening_enabled,
+            )
+        except ImportError as exc:
+            from messagefoundry.api._webconsole_import import console_import_failure
+
+            print(
+                f"error: refusing to mount the web console: {console_import_failure(exc)}",
+                file=sys.stderr,
+            )
+            return 2
 
         if not browser_hardening_enabled():
             print(
@@ -4986,8 +4938,9 @@ def _cert(args: argparse.Namespace) -> int:
 def _cert_import(args: argparse.Namespace) -> int:
     """`cert import` — import a PKCS#12/.pfx bundle into the PEM files the TLS loaders read.
 
-    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD`` (absent/empty ⇒ an unencrypted bundle,
-    ``password=None``); it is never a CLI arg and never echoed. A bad password / malformed bundle is
+    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD`` (absent or empty means ``password=None``,
+    which only an unencrypted bundle with no MAC can use, BACKLOG #1352); it is never a CLI arg and
+    never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
     public; key.pem is written ``O_EXCL`` + ``0o600`` + ``_secure_file`` and refuses to overwrite."""
     import os
@@ -8219,19 +8172,6 @@ def _security(args: argparse.Namespace) -> int:
     return 0
 
 
-def _safe_print(line: str) -> None:
-    """Print a line, re-encoding to stdout's codec with replacement so a non-cp1252 character (an
-    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console.
-
-    STDOUT ONLY, AND DO NOT EXTEND IT TO STDERR. ``sys.stdout`` carries ``surrogateescape``, which
-    still raises on an unencodable codepoint; ``sys.stderr`` carries ``backslashreplace`` and never
-    raises. So stderr needs no protection, and routing an error line through this would be a
-    downgrade: it would blank a character stderr prints as a readable escape, handing an operator a
-    path they cannot paste back. ``tests/test_cp1252_console_safety.py`` measures that asymmetry."""
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    sys.stdout.write(line.encode(enc, "replace").decode(enc) + "\n")
-
-
 #: ASCII characters that mean something inside double quotes to cmd.exe, PowerShell or a POSIX
 #: shell: ``%`` (cmd), ``$`` and backtick (PowerShell, POSIX), ``!`` (history, delayed expansion),
 #: and the double quote itself.
@@ -8259,10 +8199,6 @@ def _paste_safe_option(option: str, value: str) -> str | None:
         or value.startswith("/")
     )
     return None if unsafe else f'{option}="{value}"'
-
-
-def _print_json(data: object, *, compact: bool) -> None:
-    print(json.dumps(data) if compact else json.dumps(data, indent=2))
 
 
 def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool = False) -> int:
@@ -8300,86 +8236,18 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
     )
 
 
-class _OperatorJsonError(Exception):
-    """Operator-supplied JSON that ``json`` would not decode -- malformed, or nested too deep.
-
-    A private CLI signal raised ONLY by :func:`_load_operator_json`, never by engine code. The TYPE
-    is the scope: a subcommand can catch it on a ``try`` that also wraps its edit/validate calls
-    without that catch ever attributing a downstream fault to the operator's input."""
-
-
-def _load_operator_json(raw: str, what: str) -> Any:
-    """Decode operator-supplied JSON (an argument or stdin), reporting either failure as
-    :class:`_OperatorJsonError` with ``what`` naming which input was at fault.
-
-    ``json`` guards its own decode depth and raises ``RecursionError`` -- a ``RuntimeError``, and
-    neither a ``JSONDecodeError`` nor a ``ValueError`` -- so before this helper existed, deeply
-    nested input escaped every subcommand that reads operator JSON. The cost is not a traceback:
-    ``main`` installs the last-resort excepthook (BACKLOG #1674), so the escape was redacted to one
-    CRITICAL line and exit 1 with **stdout empty**. That breaks :func:`_emit_error`'s contract that
-    under ``--json`` the error object IS the command's machine-readable output -- measured on a real
-    subprocess, a consumer piping to ``jq`` got a parse failure, and the CRITICAL line named only
-    the exception type, never which input was at fault.
-
-    BOTH conversions happen HERE, around ``json.loads`` alone, and that is what scopes them. Four of
-    the five callers wrap the decode AND their edit/validate calls in ONE ``try``; raising a
-    dedicated type from a function that wraps only the decode means a ``RecursionError`` (or a
-    ``JSONDecodeError``) from ``upsert_connection`` or ``load_settings`` is NOT an
-    ``_OperatorJsonError`` and still falls through -- so no caller's arm can blame an input nothing
-    has established is at fault. The stack has already unwound to this shallow frame before either
-    clause runs, so raising cannot re-trip the limit.
-
-    Each caller keeps its OWN arm even though ``main`` now has a dispatch-level catch (BACKLOG #1863).
-    That catch is only a floor: it reports the exception type and redacted message, and cannot say
-    WHICH operator input was at fault. The arm here can, so it is the better report where it applies.
-
-    DO NOT DRIVE A TEST OF THE RECURSION ARM WITH REAL DEEPLY-NESTED INPUT -- manufacture the
-    exception. The depth where ``json``'s C accelerator gives out is a property of the runner, not
-    of this code; ``tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`` is the
-    canonical write-up of why, with the measurements (BACKLOG #1222).
-
-    Both refusals are raised after the handler, so neither chains the decode error: a
-    ``JSONDecodeError`` holds the whole input on ``.doc``, and operator JSON can carry a connection's
-    credentials (BACKLOG #2085). Its TEXT is json's fixed reason and a position, never the input, so
-    the message keeps it: that is the diagnosis an operator fixing hand-written JSON needs."""
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        refused = f"invalid {what}: {exc}"
-    except RecursionError:
-        refused = f"{what} is nested too deeply to parse"
-    raise _OperatorJsonError(refused)
-
-
-def _emit_error(message: str, *, as_json: bool) -> int:
-    """Report a command failure on the right stream and return its exit code.
-
-    Text goes to **stderr**. A shell redirect of a command's output --
-    ``messagefoundry validate --config x > report.txt`` -- must not swallow the reason the command
-    failed into the file it was writing, and ``2>/dev/null`` must be able to silence diagnostics
-    without silencing results (BACKLOG #1673).
-
-    JSON stays on **stdout**, deliberately. Under ``--json`` the error object IS the command's
-    machine-readable output: a consumer piping to ``jq`` reads it there, and the non-zero exit code
-    is what tells it apart from a success payload."""
-    if as_json:
-        print(json.dumps({"error": message}))
-    else:
-        print(f"error: {message}", file=sys.stderr)
-    return 1
-
-
-#: The subcommands main() does NOT give a stderr log sink, because each installs its own root handler
-#: with the PHI filter chain (`configure_logging`). Every other entry in `_DISPATCH` gets the sink by
-#: default, so a new subcommand is covered without anyone remembering to add it (BACKLOG #1441).
+#: The subcommands the CLI shell (`run_cli`, which main() calls) does NOT give a stderr log sink,
+#: because each installs its own root handler with the PHI filter chain (`configure_logging`). Every
+#: other entry in `_DISPATCH` gets the sink by default, so a new subcommand is covered without anyone
+#: remembering to add it (BACKLOG #1441).
 #: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
 #: checks that each member really calls `configure_logging`.
 #:
 #: KNOWN RESIDUAL, NOT FIXED HERE: `serve` calls `configure_logging` only after its settings, key
 #: and egress gates run, and its WARNINGs in that window still go through the unfiltered
 #: `logging.lastResort`. The comments inside `_serve` rely on that path by name. `supervise` calls it
-#: on its first line, so it has no such window. Whether `serve` should take main()'s sink for that
-#: window is an open question, deliberately not decided by the change that added this set.
+#: on its first line, so it has no such window. Whether `serve` should take run_cli()'s sink for
+#: that window is an open question, deliberately not decided by the change that added this set.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 _DISPATCH = {

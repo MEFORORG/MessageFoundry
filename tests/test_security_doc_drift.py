@@ -1304,6 +1304,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "absence of a retired mTLS remedy in two docs and a settings.py comment (BACKLOG #1133); "
         "its code claims are pinned by AST and by calling the functions"
     ),
+    ("test_docs_security_pathways.py", "_config_row"): "slices a CONFIGURATION.md table row",
+    (
+        "test_docs_security_pathways.py",
+        "test_the_ninth_sweep_states_the_local_pathway_after_amendment_a",
+    ): (
+        "absence of eight retired SECURITY.md and CONFIGURATION.md sentences (BACKLOG #1133); the "
+        "code they describe is pinned by calling it in the ninth-sweep probe test"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
     ),

@@ -254,7 +254,8 @@ def _mfa_redirect() -> HTTPException:
 async def rotation_comes_first(auth: AuthService, must_change: bool, token: str | None) -> bool:
     """Whether a session is confined to the password page (L4b) right now.
 
-    A must-change session with no factor, or with its factor proven, can only rotate. One that still
+    A must-change session with no factor, or with its factor proven, can only rotate, unless its
+    account must enrol TOTP first (ADR 0197 Amendment A, :func:`_enrols_first`). One that still
     owes a factor it has enrolled proves it first, since the password page refuses it until then
     (``AuthService.password_change_owes_factor``, BACKLOG #1954); an administrator reset is at least
     one shipped way in, because it keeps factors. Where the routing is a redirect,
@@ -280,7 +281,7 @@ async def confined_before_its_factor(
 
 async def _enrols_first(auth: AuthService, token: str | None) -> bool:
     """Whether the session's account must enrol a factor with a way past the sign-in lock before it
-    may rotate (ADR 0197 Amendment A, AC-A3). The JSON plane's ``_ENROL_FIRST_PATHS`` twin. False for
+    may rotate (ADR 0197 Amendment A, AC-A3). The JSON plane's ``_ENROL_FIRST_ROUTES`` twin. False for
     a token that no longer resolves, so an unknown state stays confined to the password page, where
     the service refuses the rotation anyway. ``activity=False``: this probe is not user activity."""
     identity = await auth.identity_for_token(token, activity=False)
@@ -301,8 +302,9 @@ async def _owes_known_factor(auth: AuthService, token: str | None) -> bool:
 
 
 async def must_change_target(auth: AuthService, token: str | None) -> str:
-    """Where a must-change session is sent: the factor page while it owes an enrolled factor,
-    otherwise the password page. It asks what :func:`rotation_comes_first` asks, so an unknown
+    """Where a must-change session is sent: the factor page while it owes an enrolled factor, then
+    the enrolment page while its account must enrol TOTP first (ADR 0197 Amendment A), otherwise
+    the password page. It asks what :func:`rotation_comes_first` asks, so an unknown
     state is confined on both paths and never audited as an MFA refusal."""
     if await _owes_known_factor(auth, token):
         return "/ui/mfa"
