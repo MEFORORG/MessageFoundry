@@ -187,6 +187,11 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 # rolls back first, so a transaction-owned lock does not. Each round now checks the server side
 # directly: once the close lands, the abandoned statement's session holds no lock and no open
 # transaction. A close that never ran fails by name.
+#
+# That check then failed on both legs: the session itself outlived the close, with one open
+# transaction. It was the pooling, and it was a product defect, not a test artefact. The engine now
+# turns ODBC driver-manager pooling off (messagefoundry/odbc_env.py, ADR 0159 amendment 2026-09-29).
+# Keep the check exactly this strict.
 _CANCEL_CHILD = r"""
 import asyncio, os, sys
 from messagefoundry.config.settings import load_settings
@@ -338,8 +343,12 @@ async def test_a_pooled_connection_runs_its_calls_through_the_call_gate(store) -
     """Pins the aioodbc shape the BACKLOG #2049 gate relies on. The gate wraps
     ``Connection._execute`` and silently stands aside when that is not a bound method, so an aioodbc
     that renamed it would bring the crash back with every offline test still green."""
+    import pyodbc
+
     from messagefoundry.store.sqlserver import _call_gate
 
+    # BACKLOG #2049, ADR 0159 amendment 2026-09-29: the store turned driver-manager pooling off.
+    assert pyodbc.pooling is False, "a closed connection's server session would outlive the close"
     async with store._acquire() as conn:
         gate = _call_gate(conn)
         assert gate is not None, "a real pooled connection did not get the call gate"

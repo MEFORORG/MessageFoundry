@@ -66,6 +66,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -2773,6 +2774,7 @@ class SqlServerStore:
         transaction exactly as on the pooled path."""
         import aioodbc
 
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         return await aioodbc.connect(
             dsn=connection_string(self._settings, posture=self._posture),
             autocommit=False,
@@ -3399,6 +3401,7 @@ class SqlServerStore:
         partial result (exit 3) rather than trusting what happened here."""
         import aioodbc
 
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         db = settings.database
         remedy = _rcsi_remedy(db)
         dsn = connection_string(settings, posture=posture)
@@ -3852,6 +3855,7 @@ class SqlServerStore:
                 "SQL Server backend requires the 'sqlserver' extra: "
                 "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
             ) from exc
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         executor = _build_pool_executor(settings, maxsize)
         try:
             pool = await aioodbc.create_pool(
@@ -4015,6 +4019,7 @@ class SqlServerStore:
             raise ValueError(f"sync handoff pool size must be >= 1 (got {size})")
         import pyodbc
 
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         dsn = connection_string(self._settings, posture=self._posture)
         login_timeout = self._settings.connect_timeout
 

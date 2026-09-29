@@ -70,6 +70,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -869,6 +870,9 @@ async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> Any:
     execute+commit itself (``autocommit=False``); the source marks each row in its own auto-committed
     statement (``autocommit=True``)."""
     aioodbc = _import_aioodbc()
+    # BACKLOG #2049: with ODBC driver-manager pooling on, a closed connection's server session stays
+    # alive in the driver's pool. aioodbc already pools, so the engine turns the second layer off.
+    disable_driver_manager_pooling()
     return await aioodbc.create_pool(
         dsn=dsn, minsize=1, maxsize=max(1, pool_max), autocommit=autocommit
     )
