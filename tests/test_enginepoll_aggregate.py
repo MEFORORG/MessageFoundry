@@ -49,6 +49,7 @@ def _shard(
     synchronous: str | None = "normal",
     committed_txns: int = 0,
     claim_lock_timeouts: int = 0,
+    claim_head_skips: int = 0,
 ) -> _ShardSample:
     return _ShardSample(
         pending=pending,
@@ -66,6 +67,7 @@ def _shard(
         synchronous=synchronous,
         committed_txns=committed_txns,
         claim_lock_timeouts=claim_lock_timeouts,
+        claim_head_skips=claim_head_skips,
     )
 
 
@@ -156,18 +158,25 @@ def test_claim_lock_timeouts_sums_across_shards(monkeypatch: pytest.MonkeyPatch)
     """
     poller = _poller_over(
         [
-            [_shard(read=100, claim_lock_timeouts=7)],
-            [_shard(read=50, claim_lock_timeouts=2)],
-            [_shard(read=10, claim_lock_timeouts=0)],
+            [_shard(read=100, claim_lock_timeouts=7, claim_head_skips=4)],
+            [_shard(read=50, claim_lock_timeouts=2, claim_head_skips=0)],
+            [_shard(read=10, claim_lock_timeouts=0, claim_head_skips=11)],
         ],
         monkeypatch,
     )
     sample = asyncio.run(poller.sample_once())
     assert sample is not None
     assert sample.claim_lock_timeouts == 9  # 7 + 2 + 0
+    assert sample.claim_head_skips == 15  # 4 + 0 + 11 (lanes; the #1270 head-of-line skip)
 
 
-def _stats(*, claim_lock_timeouts: int, in_pipeline: int, committed_txns: int) -> StatsResponse:
+def _stats(
+    *,
+    claim_lock_timeouts: int,
+    in_pipeline: int,
+    committed_txns: int,
+    claim_head_skips: int = 0,
+) -> StatsResponse:
     """A real ``/stats`` body. The REAL model, not a stand-in: the reader under test is a
     ``getattr(stats, "<name>", 0)``, so the field NAME is the contract, and only the real model can
     fail this test when that name moves. Named parameters rather than a ``**kwargs`` splat for the
@@ -175,6 +184,7 @@ def _stats(*, claim_lock_timeouts: int, in_pipeline: int, committed_txns: int) -
     return StatsResponse(
         outbox_by_status={"pending": 3, "inflight": 2, "done": 40, "dead": 1},
         claim_lock_timeouts=claim_lock_timeouts,
+        claim_head_skips=claim_head_skips,
         in_pipeline=in_pipeline,
         committed_txns=committed_txns,
     )
@@ -241,7 +251,9 @@ def test_sample_shard_reads_claim_lock_timeouts_off_the_stats_body() -> None:
     THE OTHER FIELDS ARE ASSERTED TOO, as a non-vacuousness control: if the read were failing wholesale
     the lock-timeout zero would be indistinguishable from a correctly-read zero."""
     poller = EnginePoller(["http://shard-a"], None, origin=time.perf_counter())
-    client = _StatsClient(_stats(claim_lock_timeouts=7, in_pipeline=5, committed_txns=88))
+    client = _StatsClient(
+        _stats(claim_lock_timeouts=7, in_pipeline=5, committed_txns=88, claim_head_skips=6)
+    )
     poller._clients = [client]  # type: ignore[list-item]
 
     sample = asyncio.run(poller.sample_once())
@@ -251,6 +263,7 @@ def test_sample_shard_reads_claim_lock_timeouts_off_the_stats_body() -> None:
         "the /stats lock-timeout field did not reach the sample — the harness's only reader of it"
         " looked up a name the engine does not publish, and the getattr default made that silent"
     )
+    assert sample.claim_head_skips == 6, "the /stats head-skip field did not reach the sample"
     assert (sample.in_pipeline, sample.committed_txns) == (5, 88), (
         "control: the shard read is working generally, so the assertion above is about THIS field"
     )

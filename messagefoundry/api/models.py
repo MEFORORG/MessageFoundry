@@ -661,6 +661,10 @@ class StatsResponse(BaseModel):
     # therefore means NOT ESTABLISHED; do not render it as "no contention" — that is the empty-scan-
     # versus-clean-scan conflation this repo keeps meeting.
     claim_lock_timeouts: int = 0
+    # BACKLOG #1270, the OTHER empty route: LANE claims that came back EMPTY because the store skipped
+    # a due head it could not lock, so the lane waits for its next claim. Counts LANES,
+    # like empty_claims_*. Zero is NOT ESTABLISHED either; see ClaimedHeads.head_skipped for why.
+    claim_head_skips: int = 0
     # B11 wall #1 (executor saturation): the default ThreadPoolExecutor's submit-queue depth + in-flight
     # ("busy") count — observable ONLY when the connection-scale harness installs its default-sized boot
     # shim (loop.set_default_executor); ``None`` on a normal engine (no shim), so production /stats is
