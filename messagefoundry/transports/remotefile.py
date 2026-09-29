@@ -89,7 +89,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
-from messagefoundry.keywrap import load_connection_cert_chain
+from messagefoundry.keywrap import load_connection_cert_chain, ssh_key_encrypted
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -820,6 +820,32 @@ def _sftp_slow_peer(
     return None, late
 
 
+#: Smallest RSA modulus the SFTP connector authenticates with (BACKLOG #1352). 2048, matching owner
+#: rulings R2 and R6 for keys that face a counterparty; not the 3072 the JWS signer uses.
+_SFTP_MIN_RSA_BITS = 2048
+
+
+def _refuse_sftp_key_wrap(private_key: object, key_password: object) -> None:
+    """Refuse a passphrase, or an encrypted key, for the SFTP client key (BACKLOG #1352, #1171).
+
+    paramiko opens an encrypted key only through MD5 (legacy PEM) or bcrypt_pbkdf (OpenSSH format),
+    and neither is an approved key derivation (ASVS 11.4.4, the 11.4.4 cell's SFTP clause). So the
+    SFTP key must be unencrypted, protected by where its ``env()`` value is kept. Refused at
+    construction, so ``check`` reports it. The message names the setting, never the key."""
+    if key_password:
+        raise ValueError(
+            "REMOTEFILE sftp key_password is refused: paramiko can open an encrypted key only "
+            "through MD5 or bcrypt_pbkdf, neither an approved key derivation (ASVS 11.4.4). Supply "
+            "private_key unencrypted through env(), for example: ssh-keygen -p -N '' -f <key>"
+        )
+    if private_key and ssh_key_encrypted(str(private_key).encode("utf-8", "replace")):
+        raise ValueError(
+            "REMOTEFILE sftp private_key is encrypted, which is refused: paramiko can open it only "
+            "through MD5 or bcrypt_pbkdf (ASVS 11.4.4). Supply it unencrypted through env(), for "
+            "example: ssh-keygen -p -N '' -f <key>"
+        )
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
@@ -832,6 +858,7 @@ class _SftpClient(_RemoteClient):
         self._password = settings.get("password")
         self._private_key = settings.get("private_key")
         self._key_password = settings.get("key_password")
+        _refuse_sftp_key_wrap(self._private_key, self._key_password)
         self._known_hosts = settings.get("known_hosts")
         self._timeout = float(settings.get("connect_timeout", 30.0))
         # Fail fast at construction (build_check time): an unknown-host-key posture without the escape
@@ -955,10 +982,17 @@ class _SftpClient(_RemoteClient):
     def _load_key(self, paramiko: Any) -> Any:
         if not self._private_key:
             return None
-        passphrase = str(self._key_password) if self._key_password else None
-        return paramiko.RSAKey.from_private_key(
-            io.StringIO(str(self._private_key)), password=passphrase
-        )
+        # Construction already refused a passphrase and an encrypted key (_refuse_sftp_key_wrap), so
+        # this loads an unencrypted key and never derives one from a password.
+        key = paramiko.RSAKey.from_private_key(io.StringIO(str(self._private_key)), password=None)
+        bits = int(key.get_bits())
+        if bits < _SFTP_MIN_RSA_BITS:
+            raise _RemoteError(
+                f"SFTP private_key is RSA-{bits}, below the {_SFTP_MIN_RSA_BITS}-bit floor; generate "
+                f"a key of at least {_SFTP_MIN_RSA_BITS} bits (BACKLOG #1352)",
+                permanent=True,
+            )
+        return key
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
         import stat as _stat

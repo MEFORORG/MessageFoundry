@@ -4968,8 +4968,14 @@ def _cert_import(args: argparse.Namespace) -> int:
 
     pw_env = os.environ.get("MEFOR_PFX_PASSWORD")
     password = pw_env.encode() if pw_env else None
+    from messagefoundry.keywrap import KeyWrapRefused
+
     try:
         key, cert, cas = pki.load_pkcs12(pfx_bytes, password)
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: a weak or unreadable wrap. Checked before any decryption, and the
+        # text names the setting and the re-export command, never the passphrase or the bundle.
+        return _cert_fail(str(exc), as_json=args.json)
     except Exception:
         # NEVER surface the underlying exception text — a bad-password/decrypt error must not leak the
         # passphrase into stderr/logs/CI. The failure cause is intentionally generic.
