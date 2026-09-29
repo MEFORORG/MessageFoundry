@@ -2393,6 +2393,7 @@ def _serve(args: argparse.Namespace) -> int:
         unverified_db_hops=(),
         attested_hops=(),
         revocation_attested_hops=(),
+        api=settings.api,
         store_privilege=None,
         audit_chain_unkeyed=None,
     )
@@ -2632,15 +2633,8 @@ def _serve(args: argparse.Namespace) -> int:
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
         # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
         # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
-        from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
+        from messagefoundry.api.tls import plaintext_upstream_hop_unacknowledged
 
-        serves_plaintext = (
-            api_tls_source(
-                cert_file=settings.api.tls_cert_file,
-                tls_terminated_upstream=settings.api.tls_terminated_upstream,
-            )
-            == "upstream"
-        )
         if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
@@ -2656,12 +2650,21 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if serves_plaintext:
+        if settings.api.serves_plaintext_upstream_hop:
             # The acknowledgement is the only record that someone took this hop on, so name it at
-            # every start rather than leaving it in the TOML alone.
-            logging.getLogger(__name__).info(
-                "[api].plaintext_upstream_hop_acknowledged: the proxy-to-engine hop is plaintext and "
-                "the operator has acknowledged that securing it is the deploying site's job."
+            # every start rather than leaving it in the TOML alone. WARNING with an AUDIT prefix, in
+            # the shape of the BACKLOG #1967 retention acknowledgements: owner ruling 2026-09-27
+            # (#2006 question (a)) holds that a silent weakening keeps ASVS 12.3.3 at partial, and an
+            # INFO line is filtered out by any WARNING-level log config. security_loosenings() names
+            # it too, so the serve warning above and GET /security/posture carry it. Worded as what
+            # the acknowledgement permits, not as a start: gates below this one can still refuse.
+            logging.getLogger(__name__).warning(
+                "AUDIT: [api].plaintext_upstream_hop_acknowledged=true permits a PLAINTEXT "
+                "proxy-to-engine hop behind the upstream TLS terminator on a %sPHI instance "
+                "(environment %r) -- the engine does nothing to protect that hop, and the operator "
+                "has acknowledged that securing it is the deploying site's job (ASVS 12.3.3).",
+                "production " if production else "",
+                env_name,
             )
         posture_b_missing = []
         if not settings.api.proxy_intra_service_declared:
@@ -7827,6 +7830,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
         AlertsSettings,
+        ApiSettings,
         AuthSettings,
         SecretRotationSettings,
         SecuritySettings,
@@ -7837,8 +7841,9 @@ def _security(args: argparse.Namespace) -> int:
 
     path = args.service_config
 
-    # This subcommand edits [security], but security_loosenings() also reports [store]/[auth] deviations
-    # (ADR 0148: one posture). Resolve those from the whole file so the list is complete. If the file will
+    # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
+    # [secret_rotation]/[api] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
@@ -7847,6 +7852,9 @@ def _security(args: argparse.Namespace) -> int:
     # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
     # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
     _rotation = SecretRotationSettings()
+    # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
+    # degradation marker.
+    _api = ApiSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -7855,6 +7863,7 @@ def _security(args: argparse.Namespace) -> int:
             _full = load_settings(config_path=path)
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
             _rotation = _full.secret_rotation
+            _api = _full.api
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -7883,14 +7892,15 @@ def _security(args: argparse.Namespace) -> int:
                 unverified_db_hops=(),
                 attested_hops=(),
                 revocation_attested_hops=(),
+                api=_api,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
             )
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
-    #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
-    #: read at all (the file did not load); the scope string is the standing limitation above. It names
+    #: degraded or settings-only report for a complete one. `partial` means the sections outside
+    #: [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
     #: ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
     #: scope itself incomplete, which is the same defect one level up.
     #:
@@ -7903,7 +7913,7 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
+            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]); the per-connection "
             "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "

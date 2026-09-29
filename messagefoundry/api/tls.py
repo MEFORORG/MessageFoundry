@@ -258,10 +258,7 @@ def plaintext_upstream_hop_unacknowledged(api: ApiSettings) -> bool:
     One predicate for both callers, ``serve`` and the ``upstream-hop-ack`` leg of
     ``messagefoundry check``, so the refusal and the gate agree by construction.
     """
-    source = api_tls_source(
-        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
-    )
-    return source == "upstream" and not api.plaintext_upstream_hop_acknowledged
+    return api.serves_plaintext_upstream_hop and not api.plaintext_upstream_hop_acknowledged
 
 
 @dataclass(frozen=True)
@@ -290,9 +287,11 @@ class ApiTlsPlan:
     def scheme(self) -> Literal["http", "https"]:
         """The scheme the engine's OWN bind serves.
 
-        ``http`` only for a DECLARED upstream terminator, which is not a weaker posture: the proxy
-        holds the protected hop and the engine speaks plaintext behind it. A client that hardcodes
-        https breaks exactly that topology, which is why this is reported rather than assumed.
+        ``http`` only for a DECLARED upstream terminator: the proxy holds the protected hop and the
+        engine speaks plaintext behind it. That hop is the deploying site's to secure, so ``serve``
+        requires ``[api].plaintext_upstream_hop_acknowledged`` for it and ``security_loosenings()``
+        lists it (BACKLOG #1179). A client that hardcodes https breaks exactly that topology, which
+        is why this is reported rather than assumed.
         """
         return "http" if self.source == "upstream" else "https"
 
