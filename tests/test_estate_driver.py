@@ -55,7 +55,7 @@ def _driver_with_fakes(
             sent_per_conn[self._idx] += 1
             return True
 
-    driver._conns = [_FakeConn(i) for i in range(count)]  # type: ignore[assignment]
+    driver._conns = [_FakeConn(i) for i in range(count)]  # type: ignore[misc]  # a duck-typed fake
     return driver, sent_per_conn, flags
 
 

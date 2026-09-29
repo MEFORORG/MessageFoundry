@@ -119,7 +119,7 @@ async def test_source_mark_closes_its_cursor_before_release() -> None:
     src._get_pool = lambda: _pool_coro(pool)  # type: ignore[method-assign]
     src._acquire_timeout = 5.0
     src._mark_sql = "UPDATE t SET done=1 WHERE id=?"
-    src._mark_names = ("id",)  # type: ignore[attr-defined]
+    src._mark_names = ["id"]
 
     await src._mark({"id": 1})
     assert "close:mark" in log, f"the mark cursor was never closed; log={log}"

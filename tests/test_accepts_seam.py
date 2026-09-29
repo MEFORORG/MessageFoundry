@@ -32,12 +32,12 @@ import pytest
 
 from messagefoundry.config.db_lookup import DbLookupError, db_lookup
 from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.response import response_get
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.state import state_get
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,

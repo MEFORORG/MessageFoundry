@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "webconsole_seam_snapshot.py"
@@ -181,7 +182,8 @@ def test_the_digest_does_not_depend_on_the_seam_it_produces() -> None:
 
     spec = importlib.util.spec_from_file_location("_seam_gen_circ", _SCRIPT)
     assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
+    # Any: a script loaded from a path, whose attributes mypy cannot know.
+    module: Any = importlib.util.module_from_spec(spec)
     sys.modules["_seam_gen_circ"] = module
     spec.loader.exec_module(module)
 

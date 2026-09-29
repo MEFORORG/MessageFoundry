@@ -61,8 +61,8 @@ class _FakeTokenResp:
     def __enter__(self) -> _FakeTokenResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _RecordingOpener:
@@ -438,8 +438,8 @@ def test_rest_oauth2_bearer_on_the_wire() -> None:
         def __enter__(self) -> _Resp:
             return self
 
-        def __exit__(self, *a: object) -> bool:
-            return False
+        def __exit__(self, *a: object) -> None:
+            return None
 
     seen: dict[str, str] = {}
 

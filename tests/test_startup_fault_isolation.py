@@ -30,6 +30,7 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     env,
 )
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 from tests._admin_account import create_local_user_chosen
@@ -53,7 +54,7 @@ async def store(tmp_path: Path):
     await s.close()
 
 
-class _RecordingAlertSink:
+class _RecordingAlertSink(LoggingAlertSink):
     def __init__(self) -> None:
         self.stopped: list[tuple[str, str]] = []
         self.buildups: list[tuple[str, int, float]] = []

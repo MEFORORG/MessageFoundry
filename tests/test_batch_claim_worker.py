@@ -18,9 +18,9 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,

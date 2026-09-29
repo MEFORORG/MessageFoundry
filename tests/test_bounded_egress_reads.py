@@ -112,8 +112,8 @@ class _UnboundedResp:
     def __enter__(self) -> _UnboundedResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _ExactResp:
@@ -130,8 +130,8 @@ class _ExactResp:
     def __enter__(self) -> _ExactResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _FakeOpener:

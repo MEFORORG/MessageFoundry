@@ -19,6 +19,7 @@ from messagefoundry.generators import (
     _hl7data,
     all_types,  # noqa: F401  (registers message types)
 )
+from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import leak as tee_leak
 
@@ -182,10 +183,10 @@ def _structural_fields(report: object) -> tuple[object, ...]:
 def test_leak_check_and_report_engine_equals_tee() -> None:
     for msg in _LEAK_PARITY_INPUTS:
         eng_hits = engine_leak.leak_check(msg, rules=DEFAULT_RULES)
-        tee_hits = tee_leak.leak_check(msg, rules=DEFAULT_RULES)
+        tee_hits = tee_leak.leak_check(msg, rules=TEE_DEFAULT_RULES)
         assert eng_hits == tee_hits, f"leak_check diverged on {msg!r}: {eng_hits!r} != {tee_hits!r}"
         eng_report = _structural_fields(engine_leak.leak_report(msg, rules=DEFAULT_RULES))
-        tee_report = _structural_fields(tee_leak.leak_report(msg, rules=DEFAULT_RULES))
+        tee_report = _structural_fields(tee_leak.leak_report(msg, rules=TEE_DEFAULT_RULES))
         assert eng_report == tee_report, (
             f"leak_report structural fields diverged on {msg!r}:"
             f"\n  ENG {eng_report!r}\n  TEE {tee_report!r}"

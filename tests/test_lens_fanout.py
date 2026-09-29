@@ -67,6 +67,7 @@ def _assert_partition(source: str) -> None:
                     else node.name
                 )
                 assert node.end_lineno is not None
+                assert isinstance(name, str)
                 ranges[name] = (node.body[0].lineno, node.end_lineno)
     for contract in parse_source(source):
         rows = contract["rows"]
@@ -686,7 +687,7 @@ def test_empty_accumulator_delivers_nothing() -> None:
     the honest FILTERED disposition, no coupled name-scrub needed."""
 
     def _empty(msg):
-        sends = []
+        sends: list[Send] = []
         return sends
 
     deliveries, _, _, _ = transform_one(_two_ob_registry(_empty), "H", _ADT, "hl7v2")

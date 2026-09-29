@@ -20,10 +20,9 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import AckAfter
+from messagefoundry.config.models import AckAfter, ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     Registry,
     WiringError,
     inbound,

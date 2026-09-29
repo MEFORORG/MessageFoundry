@@ -19,8 +19,8 @@ from uuid import uuid4
 
 import pytest
 
-from messagefoundry.config.models import ContentType, RetryPolicy, Validation
-from messagefoundry.config.wiring import ConnectionSpec, ConnectorType, InboundConnection, Registry
+from messagefoundry.config.models import ConnectorType, ContentType, RetryPolicy, Validation
+from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing.binary import chunk_b64, is_doc_ref, parse_doc_ref
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek

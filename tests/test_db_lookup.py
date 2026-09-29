@@ -459,7 +459,7 @@ def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
     ],
 )
 def test_read_only_statements_still_admitted(stmt: str) -> None:
-    assert database._require_read_only(stmt) is None
+    database._require_read_only(stmt)  # admitted: returns rather than raising
 
 
 def test_lookup_dsn_is_read_only() -> None:

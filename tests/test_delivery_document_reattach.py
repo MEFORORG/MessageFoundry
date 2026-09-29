@@ -32,10 +32,9 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import BatchConfig, ContentType, RetryPolicy
+from messagefoundry.config.models import BatchConfig, ConnectorType, ContentType, RetryPolicy
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,

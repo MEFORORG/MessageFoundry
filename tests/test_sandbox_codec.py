@@ -558,9 +558,12 @@ def test_value_grammar_round_trips_exactly() -> None:
 def test_a_setstate_tuple_value_stays_a_tuple() -> None:
     """A JSON-text shortcut would flatten it to a list — a silent value-shape change mode=off does not
     make."""
-    restored = _rt_transform(SetState("ns", "k", (1, 2)))
-    assert isinstance(restored, SetState) and restored.value == (1, 2)
-    assert isinstance(restored.value, tuple)
+    # A tuple is outside SetState's declared value type; the shape it keeps IS the subject.
+    restored = _rt_transform(SetState("ns", "k", (1, 2)))  # type: ignore[arg-type]
+    assert isinstance(restored, SetState)
+    value: object = restored.value
+    assert value == (1, 2)
+    assert isinstance(value, tuple)
 
 
 def test_adr0028_binary_body_is_not_double_encoded() -> None:
