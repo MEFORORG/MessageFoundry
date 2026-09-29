@@ -3783,8 +3783,8 @@ async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> 
 
         result = await PostgresStore.provision_schema(store._settings)
         assert result.applied is True
-        assert {"owner_user_id"} <= await _preset_columns()
-        assert "owner" not in await _preset_columns()
+        cols = await _preset_columns()
+        assert "owner_user_id" in cols and "owner" not in cols
 
         assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
         assert [p["id"] for p in await store.list_search_presets("u-bob")] == ["pb"]

@@ -175,7 +175,7 @@ async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
     finally:
         conn.close()
 
-    for _ in range(2):  # the second open finds nothing to move
+    for reopened in (False, True):  # the second open finds nothing to move
         s = await MessageStore.open(db, cipher=cipher)
         try:
             listed = await s.list_search_presets("u-alice")
@@ -186,13 +186,9 @@ async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
             async with s._read() as rdb:
                 cur = await rdb.execute("SELECT id FROM search_presets ORDER BY id")
                 assert [r["id"] for r in await cur.fetchall()] == ["pa", "pb"]
+            if reopened:
+                await s.delete_user("u-bob")
+                assert await s.list_search_presets("u-bob") == []
+                assert [p["id"] for p in await s.list_search_presets("u-alice")] == ["pa"]
         finally:
             await s.close()
-
-    s = await MessageStore.open(db, cipher=cipher)
-    try:
-        await s.delete_user("u-bob")
-        assert await s.list_search_presets("u-bob") == []
-        assert [p["id"] for p in await s.list_search_presets("u-alice")] == ["pa"]
-    finally:
-        await s.close()

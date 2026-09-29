@@ -19,8 +19,8 @@ The rule is deliberately one-sided. The open refuses a missing table or column, 
 KEY`` that is no longer the table's row id, a missing index, or an index whose name matches but whose
 table, key columns (with their order, collation and direction), uniqueness or partial flag differ. An
 EXTRA column or index is tolerated: a newer build or an operator's own index does not make the store
-unusable. This check renames and repairs nothing (engine ``CLAUDE.md`` section 0: there is nothing
-deployed to migrate), so the remedy the refusal names is to recreate the store.
+unusable. This check renames and repairs nothing, so the remedy the refusal names is to recreate the
+store. The v0.3.2 preset move is the one in-place exception; the backlog chose it (BACKLOG #1909).
 """
 
 from __future__ import annotations
