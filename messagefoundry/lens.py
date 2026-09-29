@@ -50,6 +50,7 @@ import ast
 import json
 import math
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -1330,10 +1331,14 @@ def _attach_param_modes(
         row["param_parts"] = {
             name: _template_parts(node) for name, node in nodes if modes[name] == MODE_TEMPLATED
         }
+        # A multi-line argument is left out: every set_params splice refuses one (it would change the
+        # line count), so listing it would offer an edit certain to fail.
         row["template_params"] = [
             name
-            for name, _node in nodes
-            if modes[name] != MODE_DYNAMIC and _template_ok(row["kind"], row.get("action"), name)
+            for name, node in nodes
+            if modes[name] != MODE_DYNAMIC
+            and (node.end_lineno or node.lineno) == node.lineno
+            and _template_ok(row["kind"], row.get("action"), name)
         ]
     return row
 
@@ -1498,6 +1503,7 @@ PART_PATH = "path"
 _TEMPLATE_PARAMS = frozenset(
     {
         ("set_field", "value"),
+        ("add_repetition", "value"),
         ("append_to_field", "suffix"),
         ("replace_literal", "new"),
     }
@@ -1680,8 +1686,9 @@ def _render_parts(parts: Any, pname: str) -> str:
     The output is ``f"...{msg['PATH']}..."``: double quotes outside, the subscript read inside. When the
     text carries more double quotes than single ones the two swap (``f'...{msg["PATH"]}...'``), which is
     the choice ``ruff format`` makes, so the spliced line stays format-clean. Before it is returned, the
-    EXISTING classifier must call it ``templated`` and read back exactly the parts that were sent. That is round-trip totality (E.6.3) checked on every write rather than trusted, so a
-    renderer defect refuses an edit instead of splicing a shape the lens cannot read back."""
+    EXISTING classifier must call it ``templated`` and read back exactly the parts that were sent.
+    That is round-trip totality (E.6.3) checked on every write rather than trusted, so a renderer
+    defect refuses an edit instead of splicing a shape the lens cannot read back."""
     normalized = _check_parts_spec(parts, pname)
     text = "".join(part.get(PART_TEXT, "") for part in normalized)
     outer, inner = ("'", '"') if text.count('"') > text.count("'") else ('"', "'")
@@ -2509,16 +2516,32 @@ def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line
     A template is usually longer than the literal it replaces, and ``ruff format`` would re-wrap an
     over-long call across lines -- output the lens did not write. The lens never wraps a line itself, so
     it refuses, as :func:`_apply_insert_row` does. A line that was already over the limit and did not
-    grow is left alone: the refusal is about what this edit did."""
+    grow is left alone: the refusal is about what this edit did. Width is measured as ruff measures it,
+    in display columns (:func:`_display_width`), so wide CJK text cannot slip under the limit."""
     old_lines = _physical_lines(src)
     new_lines = _physical_lines(result)
     for i in range(line_start - 1, line_end):
-        old, new = old_lines[i], new_lines[i]
-        if len(new) > _MAX_LINE_LENGTH and len(new) > len(old):
+        old, new = _display_width(old_lines[i]), _display_width(new_lines[i])
+        if new > _MAX_LINE_LENGTH and new > old:
             raise LensRewriteError(
-                f"the template would make line {i + 1} {len(new)} columns wide, past the "
-                f"{_MAX_LINE_LENGTH}-column limit - shorten it, or edit it as text"
+                f"this edit would make line {i + 1} {new} columns wide, past the "
+                f"{_MAX_LINE_LENGTH}-column limit - shorten the template, or edit it as text"
             )
+
+
+def _display_width(line: str) -> int:
+    """``line``'s width in terminal columns, the unit ruff's ``line-length`` counts.
+
+    An East Asian wide or fullwidth character takes two columns and a combining mark none. Everything
+    else takes one. This approximates ruff's width table rather than copying it. Where the two are
+    known to differ (a zero-width joiner, for one) it over-counts, which errs toward a refusal near the
+    limit rather than a line ruff re-wraps."""
+    width = 0
+    for ch in line:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
 
 
 # --- note rows (ADR 0076 Amendment A) ----------------------------------------
@@ -2828,6 +2851,8 @@ def _splice_slots(
         if pname not in params:
             continue
         _refuse_multiline_arg(node, pname)
+        consumed.add(pname)
+        rendered: str | None
         if moded is not None:
             kind, action = moded
             rendered = _render_moded_value(
@@ -2835,11 +2860,12 @@ def _splice_slots(
             )
         else:
             rendered = _render_new_value(params[pname], isinstance(node, ast.Constant), pname)
+        if rendered is None:
+            continue  # unchanged template: leave the argument's bytes exactly as they are
         start, end = _byte_span(
             node
         )  # for a keyword slot this is the value node, never the ``name=``
         edits.append((start, end, rendered.encode("utf-8")))
-        consumed.add(pname)
 
     unknown = set(params) - consumed
     if unknown:
@@ -2889,8 +2915,11 @@ def _render_new_value(value: Any, original_is_literal: bool, pname: str) -> str:
 
 def _render_moded_value(
     value: Any, node: ast.expr, pname: str, kind: str, template_ok: bool
-) -> str:
+) -> str | None:
     """Render a ``set_params`` value for a moded argument (ADR 0076 Amendment E), or refuse.
+
+    Returns None when the value is the parts the argument already has, so the caller leaves its bytes
+    alone.
 
     The CURRENT argument's mode decides what may happen to it:
 
@@ -2916,7 +2945,12 @@ def _render_moded_value(
         if set(value) == {"parts"}:
             if not template_ok:
                 _refuse_templated_write(kind, pname)
-            return _render_parts(value["parts"], pname)
+            rendered_parts = _render_parts(value["parts"], pname)
+            if _template_parts(node) == _normalize_parts(value["parts"]):
+                # The parts the argument already has: an edit that changes nothing changes nothing, so
+                # a msg.field("X") read or an F-prefix is not respelled by a resubmitted template.
+                return None
+            return rendered_parts
         if set(value) != {"expr"}:
             raise LensRewriteError(
                 f"parameter {pname!r}: an object value must be {{'parts': [...]}} or "
@@ -2924,7 +2958,12 @@ def _render_moded_value(
             )
     rendered = _render_new_value(value, True, pname)
     if isinstance(value, dict):
-        new_mode = _param_mode(ast.parse(rendered, mode="eval").body)
+        new_node = ast.parse(rendered, mode="eval").body
+        if isinstance(new_node, ast.Constant):
+            # Re-render through the literal renderer: that canonicalizes the spelling (gate 3) and
+            # refuses a constant JSON cannot carry (bytes, ``...``, a complex number).
+            return _render_literal(new_node.value, pname)
+        new_mode = _param_mode(new_node)
         if new_mode == MODE_DYNAMIC:
             raise LensRewriteError(
                 f"parameter {pname!r}: the expression would write a dynamic-mode argument, which is "
@@ -2957,12 +2996,15 @@ def _refuse_templated_write(kind: str, pname: str) -> NoReturn:
             "(an injection path)"
         )
     elif kind == "diagnostic":
-        reason = "a template would log message field values unredacted (log_note redacts only its operands)"
+        reason = (
+            "a template would log message field values unredacted (log_note redacts only its "
+            "operands)"
+        )
     else:
         reason = (
-            "only a value parameter takes a template (set_field value, append_to_field suffix, "
-            "replace_literal new); a path, segment id, index or setting chosen by message content is "
-            "refused"
+            "only a value parameter takes a template (set_field or add_repetition value, "
+            "append_to_field suffix, replace_literal new); a path, segment id, index or setting "
+            "chosen by message content is refused"
         )
     raise LensRewriteError(f"parameter {pname!r} takes a literal only: {reason}")
 

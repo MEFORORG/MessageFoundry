@@ -38,6 +38,7 @@ from messagefoundry.lens import (
     MODE_STATIC,
     MODE_TEMPLATED,
     LensRewriteError,
+    _display_width,
     _normalize_parts,
     _param_mode,
     _render_parts,
@@ -127,6 +128,7 @@ def test_param_parts_is_total_over_the_templated_params_and_only_those() -> None
         pytest.param('copy_field(msg, "PID-3", "PID-4")', [], id="copy-field-paths"),
         pytest.param('pad_field(msg, "PID-3", 10)', [], id="int-width"),
         pytest.param('msg.set("OBX-5", "V", occurrence=2)', ["value"], id="display-kwarg-excluded"),
+        pytest.param('msg.add_repetition("PID-3", "X")', ["value"], id="native-add-repetition"),
         pytest.param('row = db_lookup("MPI", "select 1", {})', [], id="lookup"),
         pytest.param('log_note("note {}", "x")', [], id="diagnostic"),
     ],
@@ -141,10 +143,56 @@ def test_template_params_names_exactly_the_writable_value_params(
     for pname in row["params"]:
         edit = {pname: {"parts": [{"path": "PID-3"}]}}
         if pname in expected:
-            _set(_one_row(line), edit)
+            written = _row(_set(_one_row(line), edit))
+            assert written["param_modes"][pname] == MODE_TEMPLATED
+            assert written["param_parts"][pname] == [{"path": "PID-3"}]
         elif row["param_modes"][pname] != MODE_DYNAMIC and pname in row["literal_params"]:
             with pytest.raises(LensRewriteError, match="takes a literal only"):
                 _set(_one_row(line), edit)
+
+
+def test_template_params_leaves_out_a_multi_line_argument() -> None:
+    """Every set_params splice refuses an argument spanning several lines, so listing one would offer
+    an edit certain to fail."""
+    src = (
+        PREAMBLE + '@handler("h")\ndef h(msg):\n    set_field(\n        msg,\n        "PID-5.1",\n'
+        '        (\n            "a"\n            "b"\n        ),\n    )\n    return Send("OB", msg)\n'
+    )
+    row = _row(src)
+    assert row["param_modes"]["value"] == MODE_STATIC
+    assert row["template_params"] == []
+
+
+def test_resubmitting_the_current_parts_changes_no_byte() -> None:
+    """An edit that changes nothing changes nothing: a ``msg.field("X")`` read, an ``F`` prefix or a
+    triple-quoted spelling is not respelled when the IDE sends the parts back unchanged."""
+    for arg in ("f\"{msg.field('PID-3')}\"", "F\"{msg['PID-3']}\"", "f'''{msg['PID-3']}'''"):
+        src = _one_row(f'set_field(msg, "PID-5.1", {arg})')
+        parts = _row(src)["param_parts"]["value"]
+        assert parts == [{"path": "PID-3"}], arg
+        assert _set(src, {"value": {"parts": parts}}) == src, arg
+
+
+def test_a_literal_expr_is_written_in_its_canonical_spelling() -> None:
+    """A static ``expr`` is re-rendered as the literal renderer would write it, so the line stays
+    ``ruff format``-clean, and a constant JSON cannot carry is refused."""
+    src = _one_row('set_field(msg, "PID-5.1", "old")')
+    assert _set(src, {"value": {"expr": "'x'"}}).splitlines()[5] == (
+        '    set_field(msg, "PID-5.1", "x")'
+    )
+    assert _set(src, {"value": {"expr": '"a" "b"'}}).splitlines()[5] == (
+        '    set_field(msg, "PID-5.1", "ab")'
+    )
+    for expr in ("b'x'", "...", "1j"):
+        with pytest.raises(LensRewriteError, match="cannot render value"):
+            _set(src, {"value": {"expr": expr}})
+
+
+def test_a_send_row_still_refuses_a_scalar_for_an_expression_destination() -> None:
+    """The unmoded path keeps its own refusal, pinned by its own message."""
+    src = PREAMBLE + '@handler("h")\ndef h(msg):\n    return Send(dest, msg)\n'
+    with pytest.raises(LensRewriteError, match="currently an expression"):
+        _set(src, {"to": "OB"})
 
 
 @pytest.mark.parametrize(
@@ -216,6 +264,10 @@ def test_a_template_that_overruns_the_column_limit_is_refused() -> None:
         _set(src, {"value": {"parts": long_parts}})
     # A short template on the same row is fine.
     _set(src, {"value": {"parts": [{"text": "x" * 10}, {"path": "PID-3"}]}})
+    # Width is counted as ruff counts it: 40 wide CJK characters are 80 columns, not 40.
+    wide = [{"text": "\u4e2d" * 40}, {"path": "PID-3"}]
+    with pytest.raises(LensRewriteError, match="column limit"):
+        _set(src, {"value": {"parts": wide}})
 
 
 @pytest.mark.parametrize(
@@ -331,6 +383,7 @@ TEXT_ALPHABET = [
     "\u200d",
     "\u00e9",
     "\U0001f6f0",
+    "\u4e2d\u6587",
     "%s",
 ]
 PATH_ALPHABET = ["PID-3", "PID-5.1", "OBX-5.1.2", "MSH-9", "ZX1-1", "PID-3(2)"]
@@ -421,7 +474,7 @@ def test_rendered_templates_are_ruff_format_clean() -> None:
         rendered = _round_trip(parts)
         if rendered is not None:
             line = f'    set_field(msg, "PID-5.1", {rendered})'
-            if len(line) <= 100:
+            if _display_width(line) <= 100:
                 lines.append(line + "\n")
     assert len(lines) > 500, len(lines)
     module = (
@@ -436,6 +489,7 @@ def test_rendered_templates_are_ruff_format_clean() -> None:
         input=module.encode("utf-8"),
         capture_output=True,
         cwd=Path(__file__).resolve().parents[1],
+        timeout=120,
     )
     assert proc.returncode == 0, proc.stdout.decode("utf-8", "replace")[:3000]
 

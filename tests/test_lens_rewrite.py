@@ -676,7 +676,7 @@ def test_scalar_edit_of_an_expression_slot_is_refused() -> None:
         '    split_field(msg, "PID-5", "^", ["PID-5.1", "PID-5.2"])\n'
         '    return Send("OB", msg)\n'
     )
-    with pytest.raises(LensRewriteError, match="expression"):
+    with pytest.raises(LensRewriteError, match="dynamic mode"):
         rewrite_source(
             src, {"line_start": 6, "line_end": 6, "op": "set_params", "params": {"dests": "X"}}
         )
