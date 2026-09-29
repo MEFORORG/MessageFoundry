@@ -64,7 +64,12 @@ async def test_webauthn_public_key_plaintext_under_cipher(tmp_path: Path) -> Non
     store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", password_hash="h", now=1.0
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            password_hash="h",
+            now=1.0,
+            password_generated=False,
         )
         await store.add_webauthn_credential(_cred("u1", "key", id_hash="h1", created_at=2.0))
         async with store._read() as conn:  # noqa: SLF001 - white-box: raw column, no decrypt

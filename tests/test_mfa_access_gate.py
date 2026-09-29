@@ -34,7 +34,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import WebAuthnCredential
-from tests._admin_account import create_admin
+from tests._admin_account import create_admin, create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -79,7 +79,8 @@ def _client(
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -96,7 +97,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> str:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     return user_id
 
@@ -733,35 +737,126 @@ async def test_a_reset_account_with_a_factor_proves_it_and_then_rotates(
     assert (await service.login("vic", PW2)).ok
 
 
-async def test_a_must_change_account_with_no_factor_still_rotates_from_a_pending_session(
+async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
     engine: Engine,
 ) -> None:
-    """RED when: the refusal over-reaches and blocks an account with no factor.
+    """ADR 0197 Amendment A, AC-A3, JSON plane. REWRITTEN: this test used to be
+    ``test_a_must_change_account_with_no_factor_still_rotates_from_a_pending_session`` and pinned the
+    opposite order, rotate first. That order passed every holder through "a chosen password, no
+    factor, no session", because the rotation ends every session, and anyone who knows the username
+    could lock the account at that moment.
 
-    A must-change account with no factor, as an Administrator and as a Viewer. The first-run
-    bootstrap administrator was the Administrator arm until ADR 0183 retired it; ``create_admin``
-    writes an Administrator in the same state. Each is pending under the default ``require_mfa``
-    and has nothing to prove at ``/auth/mfa-verify``, so rotating first is the only way forward.
-    This is also why must-change stays ahead of the MFA gate in ``require()``.
-    """
+    Under the default ``require_mfa``, a must-change account with no TOTP -- an Administrator whose
+    password was typed for it, and a Viewer created through the real, generated-credential path --
+    is refused ``POST /me/password`` with the fixed detail, may reach the TOTP enrolment from its
+    pending session, and rotates once TOTP is on. RED against the old gate: the first rotation
+    returned 200 and the enrolment returned "password change required"."""
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
     admin = await create_admin(service)
-    await service.create_local_user(
+    created = await service.create_local_user(
         username="newbie",
-        password=PW,
         display_name=None,
         email=None,
         roles=[Role.VIEWER.value],
         actor="test",
     )
+    arms = ((admin.username, admin.password), ("newbie", created.credential.password))
     async with _client(engine, service) as c:
-        for username, password in ((admin.username, admin.password), ("newbie", PW)):
+        for username, password in arms:
             r = await c.post("/auth/login", json={"username": username, "password": password})
             assert r.status_code == 200 and r.json()["must_change_password"] is True
             tok = str(r.json()["token"])
             assert await service.mfa_satisfied(tok) is False  # pending, with nothing to prove
-            r = await _change_password(c, tok, current=password)
+
+            refused = await _change_password(c, tok, current=password)
+            assert refused.status_code == 403, f"{username}: {refused.text}"
+            assert refused.json()["detail"] == "enrol an authenticator app first"
+            # The enrol-first path is (METHOD, path): GET /me/mfa is on it, DELETE /me/mfa is not.
+            assert (await c.get("/me/mfa", headers=_auth(tok))).status_code == 200
+            deleted = await c.delete("/me/mfa", headers=_auth(tok))
+            assert deleted.status_code == 403 and "password change required" in deleted.text
+            # Every other route still says rotate, and now says what comes first.
+            blocked = await c.get("/users", headers=_auth(tok))
+            assert blocked.status_code == 403
+            assert "password change required" in blocked.text
+            assert "enrol an authenticator app first" in blocked.text
+
+            r = await c.post(
+                "/me/reauth",
+                json={"password": password, "purpose": "mfa_enroll"},
+                headers=_auth(tok),
+            )
             assert r.status_code == 200, f"{username}: {r.text}"
+            tok = str(r.json()["token"])
+            enrolled = await c.post("/me/mfa/enroll", headers=_auth(tok))
+            assert enrolled.status_code == 200, f"{username}: {enrolled.text}"
+            secret = str(enrolled.json()["secret"])
+            r = await c.post(
+                "/me/reauth",
+                json={"password": password, "purpose": "mfa_confirm"},
+                headers=_auth(tok),
+            )
+            assert r.status_code == 200
+            tok = str(r.json()["token"])
+            confirmed = await c.post(
+                "/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok)
+            )
+            assert confirmed.status_code == 200, f"{username}: {confirmed.text}"
+            tok = str(confirmed.json()["token"])
+
+            rotated = await _change_password(c, tok, current=password)
+            assert rotated.status_code == 200, f"{username}: {rotated.text}"
+            row = await service.store.get_user_by_username(username)
+            assert row is not None and row.totp_enabled and not row.password_generated
+
+
+async def test_a_passkey_does_not_open_the_rotation_gate_and_cannot_be_the_first_factor(
+    engine: Engine,
+) -> None:
+    """ADR 0197 Amendment A, AC-A3, wave 1: a passkey is a second factor but not a way past the
+    sign-in lock, so an account holding only a passkey is still refused the rotation, and a covered
+    account with no TOTP is refused a passkey registration."""
+    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    await _add(service, "pk")
+    await _add_passkey(service, "pk")
+    user = await service.store.get_user_by_username("pk")
+    assert user is not None
+    identity = await service.identity_for_user_id(user.id)
+    assert identity is not None
+    assert await service.must_enrol_before_rotating(identity)
+    out = await service.login("pk", PW)
+    assert out.ok and out.identity is not None and out.token is not None
+    from messagefoundry.auth.service import FactorEnrolmentRequired
+
+    with pytest.raises(FactorEnrolmentRequired):
+        await service.change_password(out.identity, PW2)
+    with pytest.raises(FactorEnrolmentRequired):
+        await service.begin_webauthn_registration(
+            out.identity, token=out.token, rp_id="t", rp_name="t"
+        )
+
+
+async def test_an_account_with_no_must_change_flag_is_gated_on_the_json_plane(
+    engine: Engine,
+) -> None:
+    """AC-A3, "with or without the must-change flag": a claimed account with no TOTP (its factor
+    went while the requirement was off) is refused ``POST /me/password`` once the requirement is on
+    again. With the requirement off it rotates as today."""
+    service_off = await _service(
+        engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+    )
+    await _add(service_off, "claimed")
+    user = await service_off.store.get_user_by_username("claimed")
+    assert user is not None and not user.must_change_password and not user.totp_enabled
+    service_on = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    async with _client(engine, service_on) as c:
+        tok = await _login(c, "claimed")
+        refused = await _change_password(c, tok)
+        assert refused.status_code == 403
+        assert refused.json()["detail"] == "enrol an authenticator app first"
+    async with _client(engine, service_off) as c:
+        tok = await _login(c, "claimed")
+        assert (await _change_password(c, tok)).status_code == 200
 
 
 async def test_a_satisfied_session_changes_the_password_as_before(

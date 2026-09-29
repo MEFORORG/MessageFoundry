@@ -38,6 +38,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 from tests.test_api_auth import (
     ABSENT_USER_ID,
     _add,
@@ -92,6 +93,7 @@ async def _ad_account(engine: Engine, username: str = "jdoe", *, object_id: bool
         username=username,
         auth_provider="ad",
         directory_object_id=f"guid-{username}" if object_id else None,
+        password_generated=False,
     )
     return user_id
 
@@ -308,7 +310,8 @@ async def test_bind_refusals(
     if case == "unknown user":
         target = ABSENT_USER_ID
     elif case == "local account":
-        target = await service.create_local_user(
+        target = await create_local_user_chosen(
+            service,
             username="jlocal",
             password="a-strong-test-passphrase",
             display_name=None,
@@ -377,7 +380,11 @@ async def test_the_service_refuses_a_row_with_no_directory_object_id(
     # Written directly, so the empty string reaches the store as it is.
     target = uuid4().hex
     await engine.store.create_user(
-        user_id=target, username="jdoe", auth_provider="ad", directory_object_id=object_id
+        user_id=target,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id=object_id,
+        password_generated=False,
     )
     await engine.store.create_session(
         token_hash="t-target", user_id=target, expires_at=9e9, now=1.0

@@ -43,6 +43,7 @@ from messagefoundry.api.protocol_headers import (
     floored_http_protocol_class,
     floored_ws_protocol_class,
 )
+from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -146,19 +147,24 @@ async def _provision(service: AuthService, username: str, role: Role, password: 
     answer 403 "password change required" instead of exercising the gate under test. Re-set the SAME
     hash with the flag cleared — the tests/test_api_auth.py pattern — rather than weakening the policy.
     """
-    user_id = await service.create_local_user(
+    # ADR 0197 Amendment A: the engine generates the created account's credential, so the probe's
+    # own password is written over it here, in the claimed state the probes need.
+    created = await service.create_local_user(
         username=username,
-        password=password,
         display_name=None,
         email=None,
         roles=[role.value],
         actor="dast",
     )
+    user_id = created.user_id
     user = await service.store.get_user(user_id)
     if user is None or user.password_hash is None:
         raise DastTargetUnusable(f"provisioning {username} produced no usable credential")
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=await asyncio.to_thread(hash_password, password),
+        must_change_password=False,
+        password_generated=False,
     )
 
 

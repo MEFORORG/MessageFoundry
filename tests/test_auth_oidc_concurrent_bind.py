@@ -67,10 +67,18 @@ async def _two_accounts(store: MessageStore) -> tuple[str, str]:
     would leave them: unbound, each carrying its immutable id (BACKLOG #1143 slice C)."""
     first, second = uuid4().hex, uuid4().hex
     await store.create_user(
-        user_id=first, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+        user_id=first,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id="guid-jdoe",
+        password_generated=False,
     )
     await store.create_user(
-        user_id=second, username="bsmith", auth_provider="ad", directory_object_id="guid-bsmith"
+        user_id=second,
+        username="bsmith",
+        auth_provider="ad",
+        directory_object_id="guid-bsmith",
+        password_generated=False,
     )
     return first, second
 

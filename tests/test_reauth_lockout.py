@@ -49,7 +49,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import AuthStore
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_admin
+from tests._admin_account import create_admin, create_local_user_chosen
 
 GOOD = "Synth3tic-Pass-Phrase!!"
 WRONG = "not-the-password"
@@ -87,6 +87,7 @@ async def _local_user(store: MessageStore, username: str = "bob") -> None:
         auth_provider="local",
         email=None,
         password_hash=hash_password(GOOD),
+        password_generated=False,
     )
 
 
@@ -184,7 +185,8 @@ async def test_a_sign_in_lock_does_not_block_step_up_on_a_live_session() -> None
 
 
 async def _api_user(service: AuthService, username: str = "carol") -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=GOOD,
         display_name=None,
@@ -195,7 +197,10 @@ async def _api_user(service: AuthService, username: str = "carol") -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 

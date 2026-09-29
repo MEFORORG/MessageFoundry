@@ -59,6 +59,7 @@ async def _user(store: Any, user_id: str, now: float) -> None:
         email=None,
         password_hash="h",
         now=now,
+        password_generated=False,
     )
 
 

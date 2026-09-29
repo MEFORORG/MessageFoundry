@@ -7,6 +7,27 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
+  before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
+  off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and
+  an account from before this change keeps it until it enrols. The engine now generates the credential of every account an
+  administrator creates, and the one an administrator's factor reset issues; `POST /users` takes no
+  password and returns the credential once as `temp_password`, and `POST /users/{id}/reset-mfa`
+  returns one for a local account. While a generated credential stands, wrong passwords are counted
+  and audited but arm no sign-in lock. Under the shipped `[security].require_mfa`, the holder must
+  enrol an authenticator app before choosing a password: `POST /me/password` and the console's
+  password form refuse with `enrol an authenticator app first` until TOTP is on, and a passkey
+  cannot be the first factor or replace TOTP yet. `provision-admin` now enrols TOTP at the terminal
+  and prints recovery codes once; `--no-totp` is refused while MFA is required. Its repair of a
+  roleless account now clears that account's factors and ends its sessions first. At startup the
+  engine warns about, and audits, every covered account that still has a chosen password and no
+  TOTP, and every TOTP key it cannot decrypt; `messagefoundry verify` reports the same as
+  `auth.lockable_accounts`. The `users.password_generated` column is added on all three backends.
+  If `[auth].password_extra_context_words` is so broad that no generated credential clears the
+  policy, creating an account and both resets answer 503 and change nothing, and a spent step-up
+  grant is given back; the engine logs an ERROR at start and `verify` fails
+  `auth.credential_generation`. `provision-admin` shows the TOTP key and recovery codes on the
+  controlling terminal only, never on stdout or stderr. (`BACKLOG #1131`, ASVS 6.1.1)
 - **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
   lists terms such as an organization, product, project or department name. They join the shipped
   `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`

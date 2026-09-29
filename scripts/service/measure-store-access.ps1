@@ -748,11 +748,25 @@ try {
         "MEFOR_LOGGING_FORWARD_PROTOCOL=tls" `
         "MEFOR_LOGGING_FORWARD_TLS_CA_FILE=$syslogCa" `
         "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=$syslogCa" `
-        "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" | Out-Host
+        "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" `
+        "MEFOR_SECURITY_REQUIRE_MFA=false" | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "nssm set AppEnvironmentExtra failed (exit $LASTEXITCODE)" }
 
-    $provisionArgs = @("provision", "--username", $Username, "--email", $Email, "--db", $DbPath, "--json")
-    $cliSecrets = @{ MEFOR_STORE_ENCRYPTION_KEY = $StoreKey; MEFOR_W0_ADMIN_PASSWORD = $Password }
+    # ADR 0197 Amendment A: under [security].require_mfa, provision-admin enrols an authenticator app
+    # at an interactive console, which this unattended smoke does not have, and the product offers no
+    # non-interactive TOTP input on purpose. So the smoke runs with require_mfa OFF, on the operator
+    # CLI and on the service alike (above), and passes --no-totp, which provision-admin allows only
+    # in that posture. The bind is loopback, so the single-factor refusal for an exposed PHI bind does
+    # not apply. What this arm measures is store access, which the factor does not touch.
+    $provisionArgs = @(
+        "provision", "--username", $Username, "--email", $Email, "--db", $DbPath, "--json", "--no-totp"
+    )
+    $cliSecrets = @{
+        MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
+        MEFOR_W0_ADMIN_PASSWORD = $Password
+        # Not a secret; it rides the same inherited-environment channel so it is cleared after.
+        MEFOR_SECURITY_REQUIRE_MFA = "false"
+    }
 
     if ($Order -eq "ProvisionFirst") {
         # 1. The operator provisions the fresh store.

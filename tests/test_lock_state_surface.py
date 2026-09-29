@@ -34,6 +34,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15 characters, no app or vendor terms (WP-3)
 
@@ -70,7 +71,8 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, roles: list[str]) -> str:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -81,7 +83,10 @@ async def _add(service: AuthService, username: str, roles: list[str]) -> str:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     return user_id
@@ -213,7 +218,7 @@ async def test_the_create_user_response_carries_lock_state(engine: Engine) -> No
         created = await c.post(
             "/users",
             headers=await _bearer(c, "root"),
-            json={"username": "newbie", "password": PW, "roles": ["viewer"], "email": "n@x.org"},
+            json={"username": "newbie", "roles": ["viewer"], "email": "n@x.org"},
         )
     assert created.status_code == 201, created.text
     assert created.json()["lock_state"] == {

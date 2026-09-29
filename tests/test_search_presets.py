@@ -147,7 +147,13 @@ async def _seed_v032_store(db: Path, cipher: Cipher) -> None:
     s = await MessageStore.open(db, cipher=cipher)
     try:
         for uid, name in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
-            await s.create_user(user_id=uid, username=name, auth_provider="local", now=1.0)
+            await s.create_user(
+                user_id=uid,
+                username=name,
+                auth_provider="local",
+                now=1.0,
+                password_generated=False,
+            )
         for pid, owner, name, now in (
             ("pa", "alice", "ACME ADT", None),
             ("pb", "bob", "ACME ADT", None),

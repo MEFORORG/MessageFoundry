@@ -287,10 +287,16 @@ async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() 
     have left a cell reading "rotates on re-authentication" while the whole passkey path still
     elevated in place. That is the trap #1146 names against the owner-specified two-route subset, and
     this arm is what would have caught it.
+
+    TOTP first, then a fresh sign-in: under the shipped require_mfa a passkey cannot be a covered
+    account's FIRST factor in wave 1 (ADR 0197 Amendment A, AC-A3). The fresh sign-in is the
+    not-yet-satisfied token this arm registers from, and the rotation it measures is unchanged.
     """
     store, service = await _service()
     try:
-        identity, enrolling, _ = await login_admin(service)
+        identity, first, password = await login_admin(service)
+        await _enroll_totp(service, identity, first)
+        enrolling = await _login(service, password)
         assert await service.mfa_satisfied(enrolling) is False
 
         _, fresh = await _enroll_passkey(service, identity, enrolling)
@@ -318,7 +324,10 @@ async def test_the_passkey_assertion_elevates_the_pre_mfa_token_in_place() -> No
     store, service = await _service()
     try:
         identity, enrolling, password = await login_admin(service)
-        soft, _ = await _enroll_passkey(service, identity, enrolling)
+        # TOTP first: under the shipped require_mfa a passkey registration waits for a factor with
+        # a way past the sign-in lock (ADR 0197 Amendment A, AC-A3).
+        _, enrolled = await _enroll_totp(service, identity, enrolling)
+        soft, _ = await _enroll_passkey(service, identity, enrolled)
 
         pre_mfa = await _login(service, password)
         assert await service.mfa_satisfied(pre_mfa) is False
@@ -349,7 +358,11 @@ async def test_a_password_change_terminates_the_callers_own_token() -> None:
     """
     store, service = await _service()
     try:
-        identity, token, _ = await login_admin(service)
+        identity, first, _ = await login_admin(service)
+        # TOTP first: under the shipped require_mfa the rotation waits for a factor with a way past
+        # the sign-in lock (ADR 0197 Amendment A, N-B2 part 4). Enrolment re-keys the session, so the
+        # token that asks for the change is the rotated one.
+        _, token = await _enroll_totp(service, identity, first)
         assert await service.identity_for_token(token) is not None
 
         assert await service.change_password(identity, "another-strong-test-passphrase") == []

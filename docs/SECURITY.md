@@ -120,6 +120,24 @@ Four properties are load-bearing rather than incidental:
   active password policy, so the account is not flagged `must_change_password` and is an ordinary
   administrator from birth.
 
+**The first Administrator enrols an authenticator app at the terminal** ([ADR
+0197](adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
+Amendment A, N-A). After the password, the command generates a TOTP key in memory and shows it, as a
+key and an `otpauth://` URI. You add it to the app and type the code the app shows. The codes use
+SHA-256, so add the account by its URI, which names the algorithm; an app that takes only the key
+must be set to SHA-256. The command
+checks that code before it writes anything, so a wrong code writes nothing; after five wrong codes it
+stops. It then writes the account, the password, the TOTP key and recovery codes, and the role last.
+It prints the recovery codes once. The account starts with a way past a sign-in lock: the combined
+sign-in, password and code in one request.
+
+- The key and the codes go to the terminal only. They are never in `--json` output, argv, a file or
+  a log. Save the codes, then clear the terminal's scrollback. The key is shown before anything is
+  written, so a run that fails later shows it too. The IDE's Start flow clears and closes its
+  terminal after every run, once you press Enter.
+- `--no-totp` skips the enrolment. It is refused while `[security].require_mfa` is on, because the
+  requirement always covers an Administrator.
+
 Re-running with the same username completes a provision an earlier run left half-written. The same
 repair takes over any enabled local account with that name that holds no roles, such as one an
 administrator created with none. The command says it completed an existing roleless account. It
@@ -143,7 +161,12 @@ notification address the account held **before** the repair (BACKLOG #2019).
   new Administrator goes there. The command warns. Change it from the web console if it is not
   yours.
 
-The repair does not end the account's sessions or remove its second factors.
+The repair first ends every session on the account and removes its TOTP key, its recovery codes
+and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role
+is written (ADR 0197 Amendment A). The second pass catches a sign-in made with the earlier password
+while the repair ran. Before that change
+it did neither. A session the earlier holder kept then became an Administrator session when the role
+was written, because every request re-reads the account's roles.
 
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
@@ -155,8 +178,45 @@ emailed a reset notice (the same security-event channel as [Security-event notif
 The administrator therefore never sets a *lasting* password the user keeps (ASVS 6.4.6) — the one-time
 credential must be rotated on first login. AD users are refused (they authenticate against the
 directory); resetting your own account is refused (use self-service change-password). The action is
-audited (`auth.password_reset`). For the same reason, **admin-created accounts are flagged
-`must_change_password`** so the operator's initial password is a one-time temp the user must rotate.
+audited (`auth.password_reset`).
+
+**Account creation issues a generated credential the same way** (ADR 0197 Amendment A). `POST /users`
+takes no password; a request that sends one is refused (422). The engine generates the new account's
+credential, returns it once as `temp_password`, and flags it `must_change_password`. The web console's
+create form has no password field and shows the credential once.
+
+**If no credential can be generated, nothing changes.** A site context-word list
+(`[auth].password_extra_context_words`) broad enough that no generated credential clears the policy
+makes account creation and both resets answer 503. Each generates the credential before it writes
+anything, so the account, its factors and its sessions are untouched, and the single-use step-up
+grant the route spent is given back. The engine tries the generator once at start and logs an ERROR
+if it fails, and `messagefoundry verify` reports the same as `auth.credential_generation`. Neither
+refuses to start.
+
+**The factor reset issues one too.** `POST /users/{user_id}/reset-mfa` on a local account writes a
+generated credential **first**, then clears the TOTP key, the recovery codes and every passkey and
+revokes the sessions, then writes the same credential again. It returns the credential once, and
+the holder gets a password-reset notice with its deadline. The first write means a crash between the
+writes leaves a generated credential with factors, never a chosen password without them. The second
+means a holder's password change that lands between the writes cannot leave a chosen password with no
+factor either. A directory account
+has no engine password and gets none.
+
+**While a generated credential stands, wrong passwords arm no sign-in lock.** Each is still counted
+and audited. The credential has 192 bits, so a lock on it bounds no guessing; it would only let
+anyone who knows the username shut the holder out before they sign in once. The second-step lock
+arms as before.
+
+**Under `[security].require_mfa`, the holder enrols an authenticator app before choosing a
+password.** Changing the password ends every session, so rotating first would pass through a chosen
+password with no factor and no session, which anyone who knows the username can lock. So
+`POST /me/password` and the console's password form refuse with the fixed detail `enrol an
+authenticator app first` until TOTP is on, whether or not the account is flagged
+`must_change_password`. The session may reach `POST /me/reauth` and the TOTP enrolment meanwhile. In
+this release only TOTP opens that gate; a passkey is not yet a way past the lock, so a passkey cannot
+be the first factor, and TOTP cannot be removed while the requirement covers the account. The
+password write carries the TOTP check itself, so a factor reset racing it makes it refuse. With the
+requirement off the order is as before: rotate, then enrol if you choose.
 
 The reset can refuse, with a 503 whose detail names `password_extra_context_words`. It does so when
 no generated password clears the policy after repeated tries. That means the site's context words
@@ -2637,7 +2697,7 @@ list, which admits any certificate its CA ever signed.
 
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
-| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled; the second-step lock refuses both, and the second step. The second-step lock doubles per cycle up to `lockout_max_minutes` on every local account, and the sign-in lock does so only on a local account with TOTP enrolled; every other lock keeps `lockout_minutes` + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
+| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled; the second-step lock refuses both, and the second step. The second-step lock doubles per cycle up to `lockout_max_minutes` on every local account, and the sign-in lock does so only on a local account with TOTP enrolled; every other lock keeps `lockout_minutes`. While the credential in force is engine-generated, sign-in failures arm no lock, and under `require_mfa` the holder enrols TOTP before replacing it (ADR 0197 Amendment A) + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
 | **AD** (LDAP simple-bind, LDAPS by default) — **step-up re-authentication only; the sign-in was retired** | password, verified by a bind **as the user** against the DC. It no longer mints a session: `POST /auth/login` with `provider=ad` is refused and audited, and the bind survives only at `POST /me/reauth` and the console's `POST /ui/reauth`, where it re-proves a session **Kerberos** minted. An `oidc` session never reaches the bind: `reauth()` refuses it before any verify and it steps up at the IdP (the OIDC row). The one other session it can reach is a row written before `sessions.auth_mechanism` existed, which reads NULL and takes this leg for an AD account. So this row carries no MFA grant of its own — the session's MFA state was decided at its own sign-in. The delegated-directory relaxation it used to carry is **retired** (BACKLOG #1144): no pathway grants MFA satisfaction on a directory assertion the engine cannot read | the **directory's** lockout/complexity policy; engine-side, a **per-actor** step-up budget, **not** the sign-in limiter — the bind is post-session, so an unauthenticated flood cannot reach it — plus the **engine** per-account lockout, which a rejected re-bind feeds (BACKLOG #1138), and a per-session cap: the session whose re-binds reach `lockout_threshold` rejections is revoked, so it sends the DC at most that many. `[auth].login_rate_limit_enabled=false` removes the per-actor budget too, because that flag builds neither limiter. The lockout feed and the per-session cap survive it, so the flag does not strip this pathway bare. The engine lock sets the engine's own row and is enforced at the Kerberos and OIDC sign-ins, not at the re-bind. It never writes a lock to the directory account, but each rejected re-bind still reaches the DC, so the domain's own lockout policy can lock the domain account too | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind, and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
 | **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves the ticket leg with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way). An enrolled engine TOTP or recovery code still feeds the per-account lockout, and a locked account row refuses this sign-in (BACKLOG #1638) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. Both legs (`GET /ui/sso` and the JSON `POST /auth/negotiate`) mint with no step-up window, so a sensitive action forces a step-up unless a TOTP or recovery code proved at the MFA gate has already stamped one. That step-up is the **AD** row's directory re-bind, at `POST /me/reauth` or `POST /ui/reauth` |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess on the federated leg, so that leg feeds no per-account lockout, though a lock another leg set on the account row refuses this sign-in (BACKLOG #1638); both legs (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) charge the sign-in window, and so does `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) (`[auth].login_rate_limit_enabled`, default on — **off leaves the federated leg with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout. The **step-up leg** checks no engine credential either, so a refused IdP step-up feeds no lockout and no per-session re-proof cap, and neither account lock refuses it. Its start, `POST /ui/reauth/oidc`, draws the per-actor ceremony budget, and the IdP's return to `GET /ui/oidc/callback` draws the sign-in window | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184). The session's absolute lifetime is capped at the verified `id_token.exp` and at `auth_time + [auth].oidc_max_age_seconds`; minted with no step-up window. **Its step-up goes back to the IdP and never to a password** (BACKLOG #296, ADR 0142 Amendment B). `POST /ui/reauth/oidc` sends the browser to the IdP with `max_age=0` and `prompt=login`, and `complete_oidc_step_up` elevates the session only when, among other checks, the new `auth_time` is no earlier than the moment the flow was staged, less `oidc_clock_skew_seconds`, and the verified (issuer, sub) pair is still the account's. It then stamps `reauth_at`, rotates the session, and mints the action-bound grant when the action the operator started from takes one and the session is not refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action). Console only: `POST /me/reauth` refuses an `oidc` session, and the JSON plane has no federated step-up |
@@ -2867,7 +2927,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 
 | # | Control | Protects | Threshold / window | Disable switch | What remains when off |
 |---|---|---|---|---|---|
-| 1 | **Per-account lockout**, on two counters (ADR 0197) | one account's credential-guessing, on the password **and** TOTP/recovery legs of sign-in and the **combined sign-in** (password and TOTP code in one request). The **sign-in** lock refuses a password-only sign-in and a Kerberos or OIDC sign-in, but **not** a combined one on a local account with TOTP enrolled, and **no** second-factor leg; the **second-step** lock refuses every sign-in and both second-factor legs. The step-up re-auth and password-change re-proofs feed the sign-in counter but are not refused by it; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session (the note after the 6.1.3 paragraph above) | 5 consecutive failures on one counter → 15 min. The **sign-in** counter takes wrong passwords from a caller who has proved nothing, plus the re-proofs; the **second-step** counter takes failures from a caller who has proved one factor. Each count is applied by a single atomic store call, so parallel failures that reach the counter each land and a burst locks the account exactly as a serial run does. Within one API process, the sign-in and second-step checks on one account also run one at a time, and each failed sign-in holds that queue until its padded answer. So a burst of password-only sign-ins or second-step codes gets at most `lockout_threshold` guesses verified before the lock refuses the rest (BACKLOG #1943). Two cases fall outside that bound: engine shards serving their own API ports can each add one more, and the sign-in lock does not refuse a combined sign-in with both factors wrong. A lapsed window restarts the counter, so each lock expires on its own, and a live lock is never extended. **Each lock doubles per cycle, up to `lockout_max_minutes` (24 h), where the owner has a way past it**: the second-step lock on a local account, and the sign-in lock on a local account with TOTP enrolled. On every other lock **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_max_minutes = lockout_minutes` keeps every lock at the base length; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure, and a session is revoked on its first failed re-proof | limiters 2 + 3 only |
+| 1 | **Per-account lockout**, on two counters (ADR 0197) | one account's credential-guessing, on the password **and** TOTP/recovery legs of sign-in and the **combined sign-in** (password and TOTP code in one request). The **sign-in** lock refuses a password-only sign-in and a Kerberos or OIDC sign-in, but **not** a combined one on a local account with TOTP enrolled, and **no** second-factor leg; the **second-step** lock refuses every sign-in and both second-factor legs. The step-up re-auth and password-change re-proofs feed the sign-in counter but are not refused by it; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session (the note after the 6.1.3 paragraph above) | 5 consecutive failures on one counter → 15 min. The **sign-in** counter takes wrong passwords from a caller who has proved nothing, plus the re-proofs; the **second-step** counter takes failures from a caller who has proved one factor. Each count is applied by a single atomic store call, so parallel failures that reach the counter each land and a burst locks the account exactly as a serial run does. Within one API process, the sign-in and second-step checks on one account also run one at a time, and each failed sign-in holds that queue until its padded answer. So a burst of password-only sign-ins or second-step codes gets at most `lockout_threshold` guesses verified before the lock refuses the rest (BACKLOG #1943). Two cases fall outside that bound: engine shards serving their own API ports can each add one more, and the sign-in lock does not refuse a combined sign-in with both factors wrong. A lapsed window restarts the counter, so each lock expires on its own, and a live lock is never extended. **Each lock doubles per cycle, up to `lockout_max_minutes` (24 h), where the owner has a way past it**: the second-step lock on a local account, and the sign-in lock on a local account with TOTP enrolled. On every other lock **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. **While the credential in force is engine-generated** (created, reset or factor-reset, and not yet replaced), sign-in failures count and **arm no lock** (ADR 0197 Amendment A). Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_max_minutes = lockout_minutes` keeps every lock at the base length; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure, and a session is revoked on its first failed re-proof | limiters 2 + 3 only |
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below). Nothing then bounds how many sign-ins wait in one account's queue (control 1), so a flood on one username also delays that account's own sign-ins (BACKLOG #1943) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, **before** the per-session cap revokes the session | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled` | the per-session cap — `POST /me/reauth` and `POST /me/password` still count each failure, and a session is revoked at `lockout_threshold` failures. Re-proofs run one at a time per account, so a burst on one session is checked one at a time against its cap, within one engine process |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
@@ -2904,11 +2964,24 @@ changed is what a campaign costs, and whom:
 - **A caller holding one factor** (the password, the TOTP device, or a directory sign-in) feeds the
   second-step counter. That lock refuses every sign-in, and on a local account it doubles per cycle
   too, because one of the owner's two factors is already lost.
-- **Every other account** keeps the fixed lock: a local account with no TOTP (not yet enrolled,
-  passkey-only, or a site that narrowed `[security].require_mfa_scope`), and every directory
-  account's sign-in lock. There the account row persists a count and an expiry, the next lock starts
-  when the last one lapses, and the number of cycles has no ceiling. The account is reachable in the
-  gap between one lock expiring and the next being set, and no longer.
+- **A local account whose credential the engine generated** (ADR 0197 Amendment A): a new account,
+  or one an administrator reset. Wrong passwords count and are audited but **arm no sign-in lock**,
+  because nobody can guess the credential. Under the shipped `[security].require_mfa` the holder
+  enrols TOTP before replacing it, so the account goes from a generated credential to TOTP without a
+  lockable gap. The second-step lock arms as usual.
+- **Every other account** keeps the fixed lock: a local account with a chosen password and no TOTP
+  that the requirement does not cover (`require_mfa` off, or `[security].require_mfa_scope` narrowed
+  to administrators), one that reached that state some other way, and every directory account's
+  sign-in lock. There the account row persists a count and an expiry, the next lock starts when the
+  last one lapses, and the number of cycles has no ceiling. The account is reachable in the gap
+  between one lock expiring and the next being set, and no longer. **The engine names every covered
+  local account in that state**: at startup it logs a WARNING and writes one
+  `auth.lockable_account_census` audit row, and `messagefoundry verify` fails its
+  `auth.lockable_accounts` check. It also names every enabled TOTP key it cannot decrypt, directory
+  accounts included, which would turn the owner's way past into a self-lock. Disabled accounts are
+  named too, since one is lockable the moment it is re-enabled. Neither refuses to start. Run from a
+  shell without the store key, `verify` reports an ERROR naming the key rather than every enrolled
+  account.
 
 Sustaining any lock costs far fewer attempts than control 2's sign-in window admits from a single
 client address, so control 2 does not bound it. The exposure is availability, not credential
@@ -2922,7 +2995,13 @@ account rather than closing the case.
 
 **The residuals ADR 0197 names, each with its status.** (1) Accounts with no TOTP keep the fixed,
 unbounded lock above; a passkey-only account is one, and passkeys join the combined sign-in only in
-a later phase. Directory accounts are unaffected. *Accepted with option E, owner ruling 2026-09-27.*
+a later phase. Directory accounts are unaffected. *Not accepted for 6.1.1 scoring, owner ruling
+2026-09-28 ("No, fix it").* This tag used to read "Accepted with option E, owner ruling 2026-09-27",
+which was wrong: the 2026-09-27 rulings named residual 4 alone. ADR 0197 Amendment A, wave 1,
+closes (1) under the shipped defaults: every covered local account holds a generated credential or
+TOTP, and the census above names any that does not. It stays open, outside the documented
+protection, where `require_mfa` is off or narrowed. That scope is a Manager decision of 2026-09-28,
+not an owner ruling.
 (2) A TOTP-enrolled owner without the way past (a lost device, or a client that does not send the
 code) is kept out for up to `lockout_max_minutes`; the remedy is `admin-unlock`. *Accepted with
 option E, owner ruling 2026-09-27.* (3) A holder of one factor can hold a local owner out for up to
