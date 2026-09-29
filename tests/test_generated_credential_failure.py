@@ -29,7 +29,7 @@ import itertools
 import logging
 import string
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -301,6 +301,27 @@ def test_the_verify_probe_fails_on_an_unissuable_policy_and_passes_otherwise() -
     assert good.status is Status.PASS, good.detail
 
 
+def test_a_probe_reports_any_generator_failure_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generator that raises something other than TemporaryPasswordUnavailable (a later policy
+    clause, a data file) is reported by the shared probe, so neither `serve` nor `verify` dies."""
+    from messagefoundry.auth.policy import PasswordPolicy
+    from messagefoundry.verify import checks
+    from messagefoundry.verify.model import Status
+
+    def broken(*_a: object, **_k: object) -> str:
+        raise RuntimeError("synthetic generator fault")
+
+    monkeypatch.setattr(service_module, "generate_policy_password", broken)
+    problem = service_module.credential_generation_problem(
+        PasswordPolicy.from_settings(AuthSettings())
+    )
+    assert problem is not None and "RuntimeError" in problem
+    assert "synthetic generator fault" not in problem  # the type only, never the message
+    assert checks.check_credential_generation(AuthSettings()).status is Status.FAIL
+
+
 # --- the refund: only what this process spent, only for the two issuing routes -------------------
 
 
@@ -324,7 +345,7 @@ async def test_a_refund_restores_only_the_grant_this_request_spent() -> None:
         token = "a-synthetic-session-token"
         key = hash_token(token)
 
-        async def request(body: Callable[[], Awaitable[None]]) -> None:
+        async def request(body: Callable[[], Coroutine[Any, Any, None]]) -> None:
             await asyncio.create_task(body(), context=contextvars.copy_context())
 
         async def never_granted() -> None:
@@ -333,8 +354,17 @@ async def test_a_refund_restores_only_the_grant_this_request_spent() -> None:
         async def spend_then_refund_another_action() -> None:
             service._grant_action_step_up(key, mfa)
             assert await service.has_action_step_up(token, mfa) is True
-            assert service.refund_action_step_up(fed) is False  # another action: nothing
-            assert await service.has_action_step_up(token, mfa) is False  # spent, single-use
+            assert service.refund_action_step_up(fed) is False  # another action: nothing...
+            assert service.refund_action_step_up(mfa) is True  # ...and the right one still stands
+            assert await service.has_action_step_up(token, mfa) is True  # restored, spent again
+            assert await service.has_action_step_up(token, mfa) is False  # single-use
+
+        async def another_instance_cannot_take_it() -> None:
+            other = AuthService(store, AuthSettings())
+            service._grant_action_step_up(key, mfa)
+            assert await service.has_action_step_up(token, mfa) is True
+            assert other.refund_action_step_up(mfa) is False  # not the instance that spent it
+            assert (key, mfa) not in other._action_step_up_grants
 
         async def spend_then_refund() -> None:
             service._grant_action_step_up(key, mfa)
@@ -368,6 +398,7 @@ async def test_a_refund_restores_only_the_grant_this_request_spent() -> None:
 
         await request(never_granted)
         await request(spend_then_refund_another_action)
+        await request(another_instance_cannot_take_it)
         await request(spend_then_refund)
         await request(the_restored_grant_opens_once)
         await request(not_refundable)

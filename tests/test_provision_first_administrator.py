@@ -1694,3 +1694,114 @@ def test_the_cli_refuses_a_username_it_would_not_complete_before_any_prompt(
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", no_enrolment)
     assert main(["provision-admin", "--username", "bob", "--db", str(db)]) != 0
     assert "holds roles" in capsys.readouterr().err
+
+
+class _FakeStdin:
+    """A stdin that names descriptor 0, for the POSIX console fallback."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return 0
+
+
+def _no_controlling_terminal(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int]]:
+    """POSIX with no controlling terminal (``setsid``): /dev/tty refuses with ENXIO. Returns the
+    record of every path the writer then tries to open."""
+    import errno
+    import os
+
+    opened: list[tuple[str, int]] = []
+
+    def fake_open(path: str, flags: int, *_a: object) -> int:
+        opened.append((path, flags))
+        if path == "/dev/tty":
+            raise OSError(errno.ENXIO, "No such device or address")
+        if path == "/dev/pts/9":
+            raise PermissionError(errno.EACCES, "the operator's tty")
+        raise AssertionError(f"unexpected open {path}")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "isatty", lambda fd: fd == 0)
+    return opened
+
+
+def test_without_a_controlling_terminal_the_writer_duplicates_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``su <user> -c``: /dev/tty gives ENXIO and the operator's pts refuses the target user by path,
+    so the writer duplicates the inherited stdin descriptor, which is already open to that tty."""
+    import os
+
+    import messagefoundry.__main__ as cli
+
+    opened = _no_controlling_terminal(monkeypatch)
+    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/pts/9", raising=False)
+    monkeypatch.setattr(os, "dup", lambda fd: 4242 if fd == 0 else -1)
+    assert cli._open_terminal() == 4242
+    assert [p for p, _ in opened] == ["/dev/tty", "/dev/pts/9"]
+
+
+def test_the_writer_prefers_reopening_stdin_tty_by_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the tty CAN be opened by name (same user), a fresh write-only descriptor is used rather
+    than stdin's own, which may be read-only or non-blocking."""
+    import os
+
+    import messagefoundry.__main__ as cli
+
+    opened = _no_controlling_terminal(monkeypatch)
+    real_open = os.open  # already the fake; wrap it so /dev/pts/5 opens
+
+    def open_same_user_tty(path: str, flags: int, *a: int) -> int:
+        if path == "/dev/pts/5":
+            opened.append((path, flags))
+            return 777
+        return real_open(path, flags, *a)
+
+    monkeypatch.setattr(os, "open", open_same_user_tty)
+    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/pts/5", raising=False)
+    monkeypatch.setattr(os, "dup", lambda fd: pytest.fail("dup used although the path opened"))
+    assert cli._open_terminal() == 777
+    assert opened[-1] == ("/dev/pts/5", os.O_WRONLY)
+
+
+def test_a_console_lost_at_the_code_prompt_refuses_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The key is shown, then the console goes away at the prompt: a refusal, and no store."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(monkeypatch)
+
+    def lose_it_at_the_prompt(text: str) -> None:
+        if text.startswith("Authenticator code"):
+            raise OSError("synthetic console loss")
+        terminal.show(text)
+
+    monkeypatch.setattr(cli, "_show_on_terminal", lose_it_at_the_prompt)
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    err = capsys.readouterr().err
+    assert "console went away" in err and "nothing was written" in err
+    assert terminal.asked == 0
+    assert not db.exists()
+
+
+def test_the_last_wrong_code_is_not_told_to_try_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Five wrong codes: four retry messages, never a fifth, since no attempt is left after it."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(
+        monkeypatch, ["000000", "111111", "222222", "333333", "444444"]
+    )
+    assert (
+        main(["provision-admin", "--username", "site-admin", "--db", str(tmp_path / "p.db")]) != 0
+    )
+    assert sum("did not match" in text for text in terminal.shown) == 4

@@ -3821,6 +3821,9 @@ async def test_a_refused_issue_on_the_console_keeps_the_account_and_the_grant(
         monkeypatch.undo()
         r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200, "the refunded grant did not open the action"
+        # ...and that success spent it: single-use still holds on the console plane after a refund.
+        r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code != 200, "the refunded grant opened the action twice"
 
 
 async def test_delete_user_roundtrip_and_self_guard(engine: Engine) -> None:

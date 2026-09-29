@@ -405,13 +405,17 @@ _REFUNDABLE_ACTIONS = frozenset(
     {STEP_UP_ACTION_ADMIN_RESET_PASSWORD, STEP_UP_ACTION_ADMIN_RESET_MFA}
 )
 
-#: The grant THIS REQUEST spent on a refundable action, as ``(key, deadline)``, or ``None``. A
-#: context variable, not a map on the service: the route gate spends the grant and the handler that
-#: may refund it run in one request's context, so a refund can only ever restore the grant its own
-#: request spent -- never one a concurrent request of the same session spent, which a map keyed by
-#: (token, action) could not tell apart. Set on every :meth:`AuthService.has_action_step_up` call and
-#: cleared by the refund, so a value can never outlive the request that wrote it into a later one.
-_SPENT_REFUNDABLE_GRANT: ContextVar[tuple[tuple[str, str], float] | None] = ContextVar(
+#: The grant THIS REQUEST spent on a refundable action, as ``(service id, key, deadline)``, or
+#: ``None``. A context variable, not a map on the service: the route gate spends the grant and the
+#: handler that may refund it run in one request's context, so a refund can only ever restore the
+#: grant its own request spent -- never one a concurrent request of the same session spent, which a
+#: map keyed by (token, action) could not tell apart. The service id binds it to the instance that
+#: issued the grant, so no other instance can take it. Every
+#: :meth:`AuthService.has_action_step_up` call overwrites it, so every action-bound gate starts its
+#: request from a clean record; a successful action leaves its spend in place, which is harmless
+#: because a refund is reached only after a gate that has just overwritten it. It does NOT rely on
+#: a task boundary between requests.
+_SPENT_REFUNDABLE_GRANT: ContextVar[tuple[int, tuple[str, str], float] | None] = ContextVar(
     "_SPENT_REFUNDABLE_GRANT", default=None
 )
 
@@ -676,6 +680,11 @@ def credential_generation_problem(policy: PasswordPolicy) -> str | None:
         return (
             f"{exc}. Creating an account, resetting a password and resetting an account's factors "
             "will answer 503 until it is fixed."
+        )
+    except Exception as exc:  # noqa: BLE001 -- a probe reports; it never stops `serve` or `verify`
+        return (
+            f"the credential generator raised {type(exc).__name__}, so creating an account and both "
+            "resets would fail too"
         )
     return None
 
@@ -6328,7 +6337,12 @@ class AuthService:
         (single-use). ADR 0077. A grant is minted only by a step-up: ``reauth(purpose=action)`` (POST
         /me/reauth or /ui/reauth), or :meth:`complete_oidc_step_up` for an OIDC session's IdP leg. Never
         by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
-        new authenticator. Returns False for a missing token / no grant / an expired grant."""
+        new authenticator. Returns False for a missing token / no grant / an expired grant.
+
+        SIDE EFFECT, for :meth:`refund_action_step_up`: every call overwrites the request's
+        :data:`_SPENT_REFUNDABLE_GRANT` record, with this spend when ``action`` is refundable and
+        with nothing otherwise. So a second call in the same request, for any action, ends the
+        first spend's refund; a path that wants the refund must reach it with no call between."""
         _SPENT_REFUNDABLE_GRANT.set(None)
         if not token:
             return False
@@ -6340,7 +6354,7 @@ class AuthService:
         if deadline is None or deadline <= now:
             return False
         if action in _REFUNDABLE_ACTIONS:
-            _SPENT_REFUNDABLE_GRANT.set((key, deadline))
+            _SPENT_REFUNDABLE_GRANT.set((id(self), key, deadline))
         return True
 
     def refund_action_step_up(self, action: str) -> bool:
@@ -6360,12 +6374,12 @@ class AuthService:
         A live grant the session minted since (a fresh re-authentication) is left as it is rather than
         overwritten. Returns whether a grant was restored."""
         spent = _SPENT_REFUNDABLE_GRANT.get()
+        if spent is None or spent[0] != id(self) or spent[1][1] != action:
+            return False  # nothing spent here, by another instance, or for another action: kept
         _SPENT_REFUNDABLE_GRANT.set(None)
-        if spent is None:
-            return False
-        key, deadline = spent
+        _, key, deadline = spent
         now = time.monotonic()
-        if key[1] != action or deadline <= now or key in self._action_step_up_grants:
+        if deadline <= now or key in self._action_step_up_grants:
             return False
         _bounded_grant_put(self._action_step_up_grants, key, deadline, now)
         return True
