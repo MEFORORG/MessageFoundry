@@ -2606,6 +2606,7 @@ class RegistryRunner:
             return
         self._gate_parked.discard(name)
         self._outbound_paused.discard(name)
+        self._schedule_parked.discard(name)
         ev = self._outbound_quiesced.get(name)
         if ev is not None:
             ev.clear()
@@ -2767,6 +2768,8 @@ class RegistryRunner:
                 and name in self._schedule_parked
             ):
                 await self._resume_unscheduled_outbound(name)
+        # A lane the new graph dropped has no calendar left to have parked it.
+        self._schedule_parked.intersection_update(self.registry.outbound)
         await asyncio.gather(*retired, return_exceptions=True)
 
     async def _resume_unscheduled_outbound(self, name: str) -> None:

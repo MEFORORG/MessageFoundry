@@ -835,6 +835,8 @@ async def test_a_reload_that_drops_a_schedule_resumes_the_lane_its_calendar_park
         assert runner.outbound_running("OB_SCHED")  # always-on now, so up
 
         # Control: an OPERATOR pause survives the same reload, as a reload never undoes an operator.
+        # The new scheduler task may park the lane before or after the operator's stop below. Either
+        # order ends with the operator's stop, which drops the calendar's claim on the pause.
         await runner.reload(_scheduled_outbound_graph(tmp_path, schedule))
         await runner.stop_outbound("OB_SCHED")
         await runner.reload(_scheduled_outbound_graph(tmp_path, None))
