@@ -828,3 +828,102 @@ async def test_the_log_tail_withholds_the_audit_copy_from_a_reader_without_users
         assert "account_locked" in "\n".join(seen[_SECOND_ADMIN]["lines"])
     finally:
         await world.engine.stop()
+
+
+# --- The visible row's timestamp (Manager decision 2026-09-28) ------------------------------------
+
+
+async def test_the_visible_rows_timestamp_does_not_tell_a_lock_refusal_from_a_verified_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the refusal's ``auth.login_failed`` row is written before the failure pad.
+
+    A refusal by a live lock does one dummy password check before its row; a verified refusal also
+    reads the TOTP secret and counts the failure. The row's ``ts`` then sat nearer the request's
+    start on the lock path, and only a right candidate arms the second-step lock. The rows are now
+    written after ``_equalize_failure``'s pad, so both land on the same padded slot.
+
+    Measured the way AC-6's timing arms in ``tests/test_mfa.py`` measure (BACKLOG #1943): a fixed
+    40 ms verify, the failure count slowed by 250 ms so the gap is far wider than the host's jitter,
+    a lowered budget, and the offset read in whole budget slots."""
+    import messagefoundry.auth.service as svc
+
+    budget = 0.4
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
+
+    async def slot(second_step_locked: bool) -> int:
+        store = await _store()
+        try:
+            service = AuthService(store, _lock_settings())
+            identity, _, steps = await _totp_admin(service, monkeypatch)
+            await _set_sign_in_lock(store, identity.user_id)
+            if second_step_locked:
+                for _ in range(_LOCK_THRESHOLD):
+                    await store.increment_login_failure(
+                        identity.user_id,
+                        counter="second_step",
+                        threshold=_LOCK_THRESHOLD,
+                        lockout_seconds=900.0,
+                        max_lockout_seconds=86_400.0,
+                        now=time.time(),
+                    )
+
+            async def fixed_wrong(fn: Any, *args: Any) -> Any:
+                await asyncio.sleep(0.04)
+                return False
+
+            real_increment = store.increment_login_failure
+
+            async def slow_increment(*args: Any, **kwargs: Any) -> Any:
+                await asyncio.sleep(0.25)
+                return await real_increment(*args, **kwargs)
+
+            monkeypatch.setattr(service, "_argon2", fixed_wrong)
+            monkeypatch.setattr(store, "increment_login_failure", slow_increment)
+            steps.next_code()
+            started = time.time()
+            out = await service.login(ADMIN_USERNAME, "any-candidate", totp_code=steps.wrong_code())
+            assert not out.ok
+            rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_failed", limit=1)
+            return round((float(rows[0]["ts"]) - started) / budget)
+        finally:
+            await store.close()
+
+    lock_path = await slot(second_step_locked=True)
+    verified_path = await slot(second_step_locked=False)
+    assert lock_path == verified_path, (
+        f"the row's time tells the paths apart: lock={lock_path} verified={verified_path}"
+    )
+    assert lock_path == 1, lock_path
+
+
+async def test_a_cancelled_refusal_still_writes_its_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rows now wait for the pad, so a caller who drops the request during it must not also
+    drop the audit trail: the count-and-log rule holds for a refused attempt too."""
+    import messagefoundry.auth.service as svc
+
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", 2.0)
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        await _totp_admin(service, monkeypatch)
+
+        async def fixed_wrong(fn: Any, *args: Any) -> Any:
+            await asyncio.sleep(0.04)
+            return False
+
+        monkeypatch.setattr(service, "_argon2", fixed_wrong)
+        before = len(await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_failed"))
+        attempt = asyncio.ensure_future(service.login(ADMIN_USERNAME, "wrong"))
+        await asyncio.sleep(0.5)  # well inside the pad, after the verify and the count
+        attempt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attempt
+        for _ in range(50):
+            rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_failed")
+            if len(rows) > before:
+                break
+            await asyncio.sleep(0.05)
+        assert len(rows) == before + 1, "a cancelled refusal lost its audit row"
+    finally:
+        await store.close()

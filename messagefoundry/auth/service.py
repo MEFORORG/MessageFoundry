@@ -23,7 +23,7 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -880,6 +880,12 @@ def _live_lock(user: UserRecord, now: float) -> bool:
 #: and a slug saying it was wrong would be false in the administrator's view, while a different
 #: slug would show everyone else that a lock was live.
 _LOCAL_REFUSAL_REASON = "bad_credentials"
+
+
+async def _run_in_order(writes: Sequence[Callable[[], Awaitable[None]]]) -> None:
+    """Run deferred audit writes one after another, in the order they were queued."""
+    for write in writes:
+        await write()
 
 
 def _local_refusal_detail(reason: str, *, combined: bool) -> str:
@@ -2034,16 +2040,30 @@ class AuthService:
         arrived = totp.wall_clock()  # the instant a combined sign-in's code is judged at
         async with self._account_credential_lock(username):
             queued = time.monotonic() - started
-            outcome = await self._dispatch_login(
-                username,
-                password,
-                provider=provider,
-                client=client,
-                supersedes=supersedes,
-                totp_code=totp_code,
-                arrived=arrived,
-            )
-            return await self._equalize_failure(outcome, started, seam="login", queued=queued)
+            # A refused local sign-in's audit rows, written AFTER the pad (BACKLOG #1131, Manager
+            # decision 2026-09-28). Written before it, a row's ``ts`` showed how much work its branch
+            # did: a refusal by a live lock does one dummy verify, a verified refusal also reads the
+            # TOTP secret and counts the failure, and only a right candidate arms the second-step
+            # lock. After the pad, every refusal's rows land on its padded slot. The COUNT still
+            # happens before the pad, inside the queue, so counting is unchanged.
+            after_pad: list[Callable[[], Awaitable[None]]] = []
+            try:
+                outcome = await self._dispatch_login(
+                    username,
+                    password,
+                    provider=provider,
+                    client=client,
+                    supersedes=supersedes,
+                    totp_code=totp_code,
+                    arrived=arrived,
+                    after_pad=after_pad,
+                )
+                return await self._equalize_failure(outcome, started, seam="login", queued=queued)
+            finally:
+                # In ``finally`` and shielded, so a caller who drops the request during the pad
+                # cannot also drop the audit trail (count-and-log).
+                if after_pad:
+                    await asyncio.shield(_run_in_order(after_pad))
 
     async def _dispatch_login(
         self,
@@ -2055,6 +2075,7 @@ class AuthService:
         supersedes: str | None = None,
         totp_code: str | None = None,
         arrived: float | None = None,
+        after_pad: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -2084,6 +2105,7 @@ class AuthService:
             supersedes=supersedes,
             totp_code=totp_code,
             arrived=arrived,
+            after_pad=after_pad,
         )
 
     def _account_credential_lock(self, username: str) -> AbstractAsyncContextManager[None]:
@@ -2100,6 +2122,7 @@ class AuthService:
         supersedes: str | None = None,
         totp_code: str | None = None,
         arrived: float | None = None,
+        after_pad: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> LoginOutcome:
         """The local password sign-in, and inside it the COMBINED sign-in (ADR 0197, BACKLOG #1131).
         It runs inside :meth:`login`'s per-account queue, which is what keeps the check below and
@@ -2127,35 +2150,54 @@ class AuthService:
 
         Kept inside this method on purpose rather than in a ``_login*`` sibling:
         ``tests/test_docs_security_pathways.py`` treats every ``_login*`` coroutine as a new 6.1.3
-        pathway, and this is the local pathway with a second factor, not a new one."""
+        pathway, and this is the local pathway with a second factor, not a new one.
+
+        **A refusal's audit rows go to ``after_pad``** when the caller passes one, and :meth:`login`
+        writes them after its failure pad, so their ``ts`` does not show which branch refused.
+        Everything else, the failure count included, runs here as before."""
         code = totp_code.strip() if totp_code else ""
+
+        async def later(write: Callable[[], Awaitable[None]]) -> None:
+            if after_pad is None:
+                await write()
+            else:
+                after_pad.append(write)
+
         user = await self._store.get_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
-            await self._audit(
-                "auth.login_failed",
-                actor=username,
-                detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
-                client=client,
-            )
+
+            async def unknown_row() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
+                    client=client,
+                )
+
+            await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
         combined = bool(code) and user.totp_enabled
         if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
+
             # Owner ruling 2026-09-28 (BACKLOG #1131): first the row every reader sees, byte-identical
             # to a wrong credential's, then the lock row only ``users:manage`` reads. Without the
             # first, a live second-step lock -- which only a right candidate can set -- would show a
             # reader without ``users:manage`` a missing row where a wrong candidate leaves one.
-            await self._audit(
-                "auth.login_failed",
-                actor=username,
-                detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
-                client=client,
-            )
-            await self._audit(LOGIN_LOCKED_ACTION, actor=username, client=client)
+            async def locked_rows() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                    client=client,
+                )
+                await self._audit(LOGIN_LOCKED_ACTION, actor=username, client=client)
+
+            await later(locked_rows)
             return LoginOutcome(ok=False, error="account locked")
         refused: tuple[LockoutCounter, str, str | None] | None = None
         if combined:
@@ -2171,20 +2213,25 @@ class AuthService:
         if refused is not None:
             counter, reason, factor = refused
             failure = await self._register_failure(user, now, counter=counter)
-            await self._audit(
-                "auth.login_failed",
-                actor=username,
-                detail=_local_refusal_detail(reason, combined=combined),
-                client=client,
-            )
-            await self._record_lock(
-                user,
-                counter,
-                failure,
-                client=client,
-                audit_detail={"provider": "local"},
-                factor=factor,
-            )
+
+            async def refused_rows() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(reason, combined=combined),
+                    client=client,
+                )
+                # The lock this failure set, if any: its row, and its notice.
+                await self._record_lock(
+                    user,
+                    counter,
+                    failure,
+                    client=client,
+                    audit_detail={"provider": "local"},
+                    factor=factor,
+                )
+
+            await later(refused_rows)
             return LoginOutcome(ok=False, error="invalid credentials")
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
         # password verified, but a `must_change_password` temp that is older than
@@ -2200,12 +2247,16 @@ class AuthService:
         expiry_hours = self._settings.initial_password_expiry_hours
         deadline = self.initial_credential_deadline(user.password_changed_at)
         if user.must_change_password and deadline is not None and now > deadline:
-            await self._audit(
-                "auth.temp_password_expired",
-                actor=username,
-                detail=_json({"provider": "local", "expiry_hours": expiry_hours}),
-                client=client,
-            )
+
+            async def expired_row() -> None:
+                await self._audit(
+                    "auth.temp_password_expired",
+                    actor=username,
+                    detail=_json({"provider": "local", "expiry_hours": expiry_hours}),
+                    client=client,
+                )
+
+            await later(expired_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         # ``user.password_hash`` is not None past this point: the combined path's verify refuses a
         # row with no hash, and the password path's ``or`` does.

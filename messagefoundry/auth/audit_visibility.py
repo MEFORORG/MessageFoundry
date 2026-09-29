@@ -43,9 +43,12 @@ ruling).
 no per-event line (``auth.notifications.LOG_SILENT_EVENT_TYPES``), and the tee's audit-row copies
 are withheld from such a reader (:func:`reads_audit_copies_in_the_log`).
 
-**Left open:** the owner's own later sign-in, which a live lock refuses; and the visible row's
-``ts``, written after less work on a lock refusal than on a verified one. ``docs/SECURITY.md``
-(Audit) states them. The factor and directory lock refusals get
+**The visible row's time is covered too:** :meth:`AuthService.login` writes a refused local
+sign-in's rows after its failure pad, so their ``ts`` lands on the padded slot whichever branch
+refused.
+
+**Left open:** the owner's own later sign-in, which a live lock refuses. ``docs/SECURITY.md``
+(Audit) states it. The factor and directory lock refusals get
 no visible stand-in row: only a holder of the account's session or ticket causes one, and that
 holder's unrefused attempt would differ anyway (``auth.mfa_verified``, ``auth.login_success``).
 

@@ -1059,8 +1059,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   per-event log line, and is recorded instead as `mailed: false` on the administrator-only
   `auth.lock_notice` row. `GET /logs/tail` no longer shows the audit-row copies the off-box tee
   writes into the log to a reader without `users:manage`, the built-in Operator included; that
-  reader loses those lines from the log viewer. The channels still open are listed in
-  `docs/SECURITY.md` under Audit. (`BACKLOG #1131`, ASVS 6.1.1)
+  reader loses those lines from the log viewer. A refused local sign-in's audit rows are now
+  written after the failure pad, so their timestamp no longer shows whether a lock or a checked
+  credential refused it. The channel still open is listed in `docs/SECURITY.md` under Audit.
+  (`BACKLOG #1131`, ASVS 6.1.1)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
