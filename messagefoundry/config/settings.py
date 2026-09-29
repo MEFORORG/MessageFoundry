@@ -2516,9 +2516,12 @@ class AuthSettings(_Section):
     # security fix. THIS IS THE SINGLE PLACE that mismatch is explained; do not restate it (SDS-3.5).
     #
     # OPERATOR NOTE: under ``every_local_account`` a non-interactive bearer-token service account
-    # becomes MFA-pending and cannot enroll unattended — move it to mTLS (api/security.py:
-    # require_service_cert, which is exempt by design) or set this to ``administrators``. Moving it to
-    # AD is NO LONGER an escape: a directory account is in scope like any other.
+    # becomes MFA-pending and cannot enroll unattended. ``administrators`` frees only a LOCAL account
+    # without the Administrator role (AuthService._mfa_required_for keeps that role in scope under
+    # either value); ``require_mfa = false`` frees any un-enrolled account, at the exposure gate's
+    # cost. Moving it to AD is NO LONGER an escape: a directory account is in scope like any other.
+    # Nor is mTLS: require_service_cert (api/security.py) admits a cert identity on
+    # GET /service/identity alone, so it cannot carry a working service account.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     # TOTP clock-skew tolerance, in 30-second time steps, applied when verifying a submitted code
     # (BACKLOG #187; ASVS 6.5.5). Default 0 = STRICT: only the current 30 s step is accepted, so a

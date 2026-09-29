@@ -1275,6 +1275,13 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "test_docs_security_pathways.py",
         "test_the_console_dependency_of_the_browser_legs_is_stated",
     ): ("absence over text: a mention of serve_ui can only over-fire"),
+    (
+        "test_docs_security_pathways.py",
+        "test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double",
+    ): (
+        "absence of a retired mTLS remedy in two docs and a settings.py comment (BACKLOG #1133); "
+        "its code claims are pinned by AST and by calling the functions"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
     ),
