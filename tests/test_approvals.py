@@ -1488,6 +1488,9 @@ def _reports(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 def _loop_reports() -> Iterator[list[dict[str, Any]]]:
     """Capture every call to the running loop's exception handler, then restore the previous one."""
     loop = asyncio.get_running_loop()
+    # Collect first, so garbage left by EARLIER tests on the shared loop reports to the previous
+    # handler and is not counted against this one.
+    gc.collect()
     previous = loop.get_exception_handler()
     seen: list[dict[str, Any]] = []
     loop.set_exception_handler(lambda _loop, context: seen.append(context))
@@ -1495,6 +1498,11 @@ def _loop_reports() -> Iterator[list[dict[str, Any]]]:
         yield seen
     finally:
         loop.set_exception_handler(previous)
+
+
+def _described(loop_reports: list[dict[str, Any]]) -> list[str]:
+    """Each captured loop report as its message plus the exception, so a failure names the cause."""
+    return [f"{c.get('message')}: {c.get('exception')!r}" for c in loop_reports]
 
 
 async def _reported_after(caplog: pytest.LogCaptureFixture, text: str) -> list[logging.LogRecord]:
@@ -1534,7 +1542,7 @@ async def test_a_cancelled_claim_that_fails_is_logged_once(
     with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
         approval_id, ran = await _cancel_inside(_ClaimFails(engine.store), _runs)
         reports = await _reported_after(caplog, "its claim failed")
-    assert [c.get("message") for c in loop_reports] == []
+    assert _described(loop_reports) == []
     assert len(reports) == 1, [f"{r.name}: {r.getMessage()}" for r in reports]
     assert reports[0].levelno == logging.ERROR and approval_id in reports[0].getMessage()
     assert ran == []
@@ -1572,7 +1580,7 @@ async def test_a_cancelled_resolve_that_loses_the_race_logs_one_warning(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, _WAIT_S)
         reports = await _reported_after(caplog, "another operator resolved it first")
-    assert [c.get("message") for c in loop_reports] == []
+    assert _described(loop_reports) == []
     assert len(reports) == 1, [f"{r.name}: {r.getMessage()}" for r in reports]
     assert reports[0].levelno == logging.WARNING and approval_id in reports[0].getMessage()
     assert reports[0].exc_info is None
@@ -1601,7 +1609,7 @@ async def test_a_cancelled_claim_that_loses_the_race_settles_nothing(
     assert await _status_of(engine, approval_id) == "rejected"
     assert await engine.store.list_audit(action="approval.failed") == []
     assert _reports(caplog) == []
-    assert [c.get("message") for c in loop_reports] == []
+    assert _described(loop_reports) == []
 
 
 async def _orphan_a_held_approved_write(engine: Engine) -> tuple[ApprovalGate, Any, str]:
