@@ -251,18 +251,10 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         1,
         "Adds the headers to uvicorn's own HTTP 400; tests/test_header_floor_wire.py.",
     ),
-    Site(
-        _PROTOCOL,
-        "_build_floored_ws._FlooredLegacyWebSocketProtocol",
-        "protocol-override",
-    ): (
-        1,
-        "Adds the headers, where absent, to every handshake answer the legacy websockets server "
-        "writes; tests/test_header_floor_wire.py.",
-    ),
     Site(_PROTOCOL, "_build_floored_ws._FlooredWebSocketProtocol", "protocol-override"): (
-        1,
-        "Adds the headers to uvicorn's own WebSocket 500; tests/test_header_floor_wire.py.",
+        2,
+        "Adds the headers to uvicorn's own WebSocket 500 and, where absent, to every handshake "
+        "answer the legacy websockets server writes; tests/test_header_floor_wire.py.",
     ),
     Site("messagefoundry/transports/http_listener.py", "_status_line", "status-line"): (
         1,

@@ -28,10 +28,17 @@
 //      path is itself proof the origin is a tuple origin: an opaque origin could not be addressed
 //      this way at all. That is what makes `ev.origin === window.origin` a real comparison rather
 //      than the vacuous `"null" === "null"` it would be under an opaque origin.
-//   3. The bridge injects `window.parent = window; window.top = window; window.frameElement = null;`
-//      into the extension's document. So `ev.source === window.parent` is FALSE for a genuine host
-//      message. A receiver written that way would fail closed and silently kill its panel — the
-//      obvious source check is the broken one, which is why this note records the measurement.
+//   3. What `window.parent` is inside the extension's document DEPENDS ON THE VS CODE VERSION, so no
+//      check may rest on it. The 1.135.0 bridge read above injects
+//      `window.parent = window; window.top = window; window.frameElement = null;`. The BACKLOG #1123
+//      delivery probe (`ide/src/test/deliveryProbe.ts`) then measured two builds: at 1.95.0, the
+//      `engines.vscode` floor, the bridge runs `delete window.parent` and it is `undefined`; at
+//      1.139.1, stable at the time, `window.parent === window`. What BOTH builds share: a genuine host
+//      message arrives with `ev.origin === window.origin`, as the tuple `vscode-webview://<id>`, and
+//      with `ev.source !== window.parent`. So a receiver written as `ev.source === window.parent`
+//      would fail closed on both and silently kill its panel — the obvious source check is the
+//      broken one, which is why this note records the measurement. Builds between the two were not
+//      measured.
 //
 // WHAT EACH RECEIVER CHECKS, and the limits of each:
 //   * `ev.origin === window.origin`. A same-origin test whose comparand the document reads from its
@@ -39,9 +46,9 @@
 //     poster can change it, which is what distinguishes this from a sender-supplied comparand. It
 //     does not identify the extension host specifically: it rejects every cross-origin poster and
 //     admits anything already running at this panel's origin.
-//   * `ev.source !== window`. Rejects a same-document post. Narrow, and it is the arm that would
-//     break first if VS Code stopped shadowing `window.parent`; it is written against `window`
-//     rather than `window.parent` for the reason in fact 3.
+//   * `ev.source !== window`. Rejects a same-document post. Narrow. It is written against `window`
+//     rather than `window.parent` because `window.parent` is `undefined` on one measured build and
+//     `window` on another (fact 3), while `window` means the document itself on both.
 //   * A per-render 144-bit channel token, minted host-side by `openChannel()` and embedded in the
 //     document's own script. This is what actually authenticates the extension host: only code that
 //     can read this document can read the token, and the CSP below is what bounds who that is. It is
@@ -50,11 +57,22 @@
 //     would put it in every message the host sends.
 //
 // WHAT STILL BOUNDS THESE RECEIVERS BEYOND THE CHECKS, and the limits of each:
-//   * The nonce CSP on every panel. Each webview is served with `script-src 'nonce-<n>'` and a fresh
-//     cryptographically random nonce (see cspNonce.ts), so no injected or third-party script executes
-//     in the document. This is a real enforcement property of the browser, not an assertion about it
-//     — but it is scoped to THIS document, and it is the reason both the nonce and the token being
-//     unguessable is load-bearing rather than cosmetic.
+//   * The nonce CSP on every document that runs a script. That set is WIDER than the documents with
+//     one of these receivers: some panels run a nonced script and embed no receiver at all. Each such
+//     document is served a `<meta>` CSP of `default-src 'none'` with `script-src 'nonce-<n>'` and a
+//     fresh cryptographically random nonce (see cspNonce.ts), so no injected or third-party script
+//     executes in it. The one CSP variation is stepsView.ts's page, which has no receiver of this
+//     kind: its `script-src` also names `webview.cspSource`, because it loads
+//     `media/stepsWebview.js` (itself nonced), and `localResourceRoots` bounds that source to
+//     `media/`. This is a real enforcement
+//     property of the browser, not an assertion about it — but it is scoped to THIS document, and it
+//     is the reason both the nonce and the token being unguessable is load-bearing rather than
+//     cosmetic.
+//     NOT every document a panel shows carries it. Two static notices run no script and have no
+//     receiver: configEditors.ts's "outside the config dir" line has NO CSP and relies on the panel's
+//     scripts still being off (it is set before `enableScripts`), and stepsView.ts's `noticeHtml` has
+//     `default-src 'none'; style-src 'unsafe-inline'` with no `script-src`. What each panel shows when
+//     its script does not run is stated in docs/BROWSER-SUPPORT.md, "The IDE extension's webviews".
 //   * No nested frames. None of these panels embeds an iframe, so there is no child document that
 //     could post into them, and no policy in the extension sets `frame-src` or `child-src` — nested
 //     frames fall back to `default-src 'none'`.

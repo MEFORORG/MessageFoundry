@@ -4,9 +4,13 @@
 
 Modernized per ASVS 5.0 (WP-3): length-first (15+), **no mandatory character-class composition**
 (the class rules are kept as *opt-in* knobs, default off), plus **offline breached/common-password
-screening**, a small fixed **context-word deny-list** (``CONTEXT_WORDS``), and **username-in-password
-rejection** (6.2.11). Defaults remain a direct improvement on Mirth, whose password requirements
-default to zero. Operators tune these via the ``[auth]`` settings section.
+screening**, a **context-word deny-list** (ASVS 6.2.11: the documented list of context-specific words
+is the one used), and **username-in-password rejection**. The deny-list is the small shipped
+``CONTEXT_WORDS`` plus any terms a site adds in ``extra_context_words``. ``check_context`` turns both
+on or off together, and a site term can never remove a shipped one (BACKLOG #1132). No ASVS 5.0
+requirement names the username screen: 6.2.11 grades a *documented list*, and a user's own name is
+not on one. Defaults remain a direct improvement on Mirth, whose password requirements default to
+zero. Operators tune these via the ``[auth]`` settings section.
 
 The breach corpus is a bundled offline common-password list (see ``data/common_passwords.txt`` and
 its ``.NOTICE``, which carries the entry counts and the policy filter that built the list — BACKLOG
@@ -43,7 +47,8 @@ _MIN_USERNAME_MATCH = 4
 _HASH_LINE = re.compile(r"[0-9A-Fa-f]{40}(:\d+)?")
 
 #: Context-word deny-list terms a local password must not *contain* (case-insensitive) — so an obvious
-#: in-context credential like ``messagefoundry2026`` or ``Mefor-Admin!`` is rejected (ASVS 6.2.5).
+#: in-context credential like ``messagefoundry2026`` or ``Mefor-Admin!`` is rejected (ASVS 6.2.11;
+#: publishing it is 6.1.2). This comment once cited 6.2.5, which is the no-mandatory-composition rule.
 #: Members are this application's names, protocol and competing-engine names, and generic
 #: default-credential words such as ``admin`` and ``password`` -- not only "app/vendor terms", which
 #: is how this list was once mis-described. Kept short to keep false-positives rare; the broader
@@ -64,6 +69,20 @@ CONTEXT_WORDS: frozenset[str] = frozenset(
         "administrator",
         "password",
     }
+)
+
+
+#: The shortest term a site may add to the screen. The screen is a case-insensitive SUBSTRING test, so
+#: a one- or two-letter term would refuse a large share of ordinary passphrases. Derived from the
+#: shipped list (``hl7``) so a site can add a term as short as the shortest one the project ships, such
+#: as a three-letter organization acronym. ``config/settings.py`` keeps a copy for load-time refusal,
+#: since that module does not import this one; ``tests/test_site_context_words.py`` holds the two equal.
+EXTRA_CONTEXT_WORD_MIN_LENGTH = min(len(word) for word in CONTEXT_WORDS)
+
+#: The refusal for a site-added term. It names the deny-list, as the shipped clause does, and says the
+#: term is the site's, because the published list cannot hold it (BACKLOG #1132).
+SITE_CONTEXT_WORD_CLAUSE = (
+    "not contain a word from this site's additions to the context-word deny-list"
 )
 
 
@@ -183,12 +202,48 @@ class PasswordPolicy:
     require_digit: bool = False
     require_symbol: bool = False
     check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    check_context: bool = True  # reject passwords containing a CONTEXT_WORDS deny-list term
-    check_username: bool = True  # reject passwords containing the user's own username (6.2.11)
+    check_context: bool = True  # reject a CONTEXT_WORDS or extra_context_words term; gates both
+    check_username: bool = True  # reject passwords containing the user's own username (no ASVS id)
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15  # how long a locked account stays locked
     lockout_max_minutes: int = 1440  # the ceiling an escalating lock doubles up to (ADR 0197)
+    # A site's own context words, screened beside CONTEXT_WORDS (ASVS 6.1.2 / 6.2.11). Additive only:
+    # nothing here can remove a shipped term. LAST on purpose, so a positional caller of the fields
+    # above still binds them as before.
+    extra_context_words: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        # The settings loader already validates and lower-cases these. A caller that builds the
+        # dataclass directly skips that loader, and the dangerous inputs are not a case problem: an
+        # empty term matches every password and a one-letter term nearly every one. So the same rules
+        # hold here, and a bad term raises rather than loading as a screen that refuses everything.
+        terms: set[str] = set()
+        for raw in self.extra_context_words:
+            if not isinstance(raw, str) or raw != raw.strip() or any(c.isspace() for c in raw):
+                raise ValueError(f"extra context word {raw!r} must be one word with no whitespace")
+            if len(raw) < EXTRA_CONTEXT_WORD_MIN_LENGTH:
+                raise ValueError(
+                    f"extra context word {raw!r} is shorter than {EXTRA_CONTEXT_WORD_MIN_LENGTH} "
+                    "characters"
+                )
+            terms.add(raw.lower())
+        # Site terms act only through the context screen, so with it off they would screen nothing
+        # while reading as a working control. The settings loader refuses this pair; so does this.
+        if terms and not self.check_context:
+            raise ValueError(
+                "extra_context_words is set but check_context is False, so no site term would be "
+                "screened; turn the check on or remove the terms"
+            )
+        # A term the shipped list already holds is published there, so its refusal keeps the shipped
+        # clause alone rather than also claiming to be one of the site's additions.
+        object.__setattr__(self, "extra_context_words", frozenset(terms - CONTEXT_WORDS))
+
+    @property
+    def context_words(self) -> frozenset[str]:
+        """Every term the context screen refuses: the shipped ``CONTEXT_WORDS`` plus the site's own.
+        A union, so a site term can widen the list and never narrow it."""
+        return CONTEXT_WORDS | self.extra_context_words
 
     @classmethod
     def from_settings(cls, settings: AuthSettings) -> PasswordPolicy:
@@ -215,6 +270,7 @@ class PasswordPolicy:
             check_breached=settings.password_check_breached,
             check_context=settings.password_check_context,
             check_username=settings.password_check_username,
+            extra_context_words=frozenset(settings.password_extra_context_words),
             breach_corpus_file=settings.password_breach_corpus_file,
             lockout_threshold=settings.lockout_threshold,
             lockout_minutes=settings.lockout_minutes,
@@ -227,7 +283,7 @@ class PasswordPolicy:
         """Return clauses completing *"password must …"*; an empty list means the password is
         acceptable. Order: length → opt-in character classes → breach → username → context.
 
-        ``username`` enables the 6.2.11 own-username check (omit it where there is no user context,
+        ``username`` enables the own-username check (omit it where there is no user context,
         e.g. generating a temporary password).
 
         Raises :class:`BreachCorpusUnavailable` when ``check_breached`` is on and the bundled corpus is
@@ -272,8 +328,14 @@ class PasswordPolicy:
             and username.lower() in lowered
         ):
             problems.append("not contain your username")
-        if self.check_context and any(word in lowered for word in CONTEXT_WORDS):
-            problems.append("not contain a word from the context-word deny-list")
+        if self.check_context:
+            # Two clauses, so a refused user can tell which list fired: docs/SECURITY.md publishes
+            # the shipped terms in full, and cannot publish a site's own. Each list is tested on its
+            # own, so a password holding a term from both gets both clauses.
+            if any(word in lowered for word in CONTEXT_WORDS):
+                problems.append("not contain a word from the context-word deny-list")
+            if any(word in lowered for word in self.extra_context_words):
+                problems.append(SITE_CONTEXT_WORD_CLAUSE)
         return problems
 
     def _in_operator_corpus(self, password: str) -> bool:

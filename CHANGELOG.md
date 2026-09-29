@@ -7,6 +7,20 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
+  lists terms such as an organization, product, project or department name. They join the shipped
+  `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`
+  switches as a whole. They are screened at least on user create, password change,
+  first-administrator provisioning and an administrator's password reset, which the tests cover.
+  The reset screens each generated password, the own-username clause included. If none clears the
+  policy, it answers 503 with a detail naming the setting, and the account keeps its password. The
+  setting can only add; no setting removes a shipped term. Each term is trimmed and lower-cased at
+  load. It must be one word, no shorter than the floor `docs/CONFIGURATION.md` states. The load refuses a blank entry, a trailing
+  comma in the environment form, a term with a space inside, and terms set while
+  `password_check_context` is off. A site term's refusal says it is one of the site's additions, since
+  the published list cannot hold it. A password holding a shipped term and a site term gets both
+  refusals. Env: comma-separated or a JSON array, in `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`.
+  (`BACKLOG #1132`)
 - **Six connection factories take a per-connection `tls_ca_file`.** `Rest()`, `FHIR()`, `Soap()`,
   `DICOMweb()`, `FhirLookup()` and `Ftp()` (FTPS only) now accept a PEM path or an `env()`
   reference. When it is set, that hop trusts only the CAs in that file, never the OS store. The
@@ -241,6 +255,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
+  grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
+  (`BACKLOG #1135`)
 - **BREAKING: with `[auth].oidc_enabled` on, a config that sets `oidc_acr_values` while
   `oidc_required_acr_values` names no non-blank value now refuses to load.** `oidc_acr_values` only
   asks the identity provider for an assurance class. The sign-in gate checks the returned `acr`
@@ -253,6 +270,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   `oidc_acr_values` still loads. With both keys set, a token whose `amr` matches
   `oidc_mfa_amr_values` still passes the gate whatever its `acr`. The `oidc-auth-params` advisory in
   `messagefoundry check` now reports this case as a settings load failure. (`BACKLOG #2032`)
+- **The Vault clients now narrow and verify the TLS leg to an `https://` proxy, and refuse an
+  `http://` Vault behind one.** Both Vault clients (the `vault` secret provider and the store's
+  Vault key provider and Transit cipher) honour `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and, on
+  Windows, the system proxy. Through an `https://` proxy, the leg to the proxy used urllib3's own
+  context, which offered CBC suites off the approved list. It now gets a fresh engine context per
+  connection, narrowed to the approved suites. The engine checks that the leg ran on that context
+  before it sends `CONNECT`, and refuses otherwise. So a proxy that offers only a non-approved suite
+  would now refuse. Verification of that leg is unchanged: it was, and is, checked against the
+  Vault hop's anchor and the proxy's host name. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
+  proxy is refused when the client is built, and again before each send. requests does not verify
+  that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
+  nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
+- **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
+  `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
+  site proxy would have taken the loopback probe off the host and read a running engine as down.
+  The leg to an `https://` proxy also ran on httpcore's own context, not the narrowed one. The probe
+  now ignores proxy settings. (`BACKLOG #300`, ASVS 12.1.2)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
@@ -499,6 +534,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
+  whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
+  algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal
+  is an `HttpAuthError` naming the algorithm, raised before any hash uses the password. It is the
+  `__cause__` of the error a send, probe or token request reports. Before this, the proxy path used
+  urllib's own handler with no check. Endpoint Digest already refused MD5, and both paths now share
+  one check. `SHA-512-256` and every `-sess` form are refused too. urllib cannot compute them, so a
+  challenge naming one crashed with a bare `ValueError`. A challenge that is malformed, or leads with
+  another scheme such as NTLM, is refused the same way. A lowercase `sha-256` is answered as SHA-256.
+  Repeated refusals no longer leave the connection failing every later send as a `401`. A rejected
+  credential is answered once per request, not six times, so the peer's own status surfaces.
+  Separately, `proxy_auth_type = "digest"` never authenticated at all. urllib looked the proxy
+  credential up by the destination URL and found nothing, so every send failed as a bare `407`. For
+  an http destination it now finds the credential. It answers only a request that went through the
+  proxy, never one sent direct under a `no_proxy` match. (`BACKLOG #1171`, ASVS 11.4.1)
 - **The message for a group- or world-writable trust anchor now names its own fix.** It used to
   point at `docs/security/OFF-LOOPBACK-DEPLOYMENT.md`, which ships in neither a checkout nor a
   wheel. The same text is the refusal under `[security].enforcement = enforce` and the warning under
@@ -506,6 +556,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`R`), and names the rights the check counts as write. On POSIX it gives `chmod go-w`. Neither
   fix takes read away. The message now spans several lines. When the engine refuses or warns is
   unchanged. (`BACKLOG #2035`)
+- **The web console explains an uploaded-file action the engine refused, throttled or could not
+  serve.** The browse, resend and delete routes under `/ui/uploaded-logs` showed the engine's raw
+  JSON for any status they did not map. A browse the PHI-read hop guard refused (`403`), a browse
+  over the PHI-read rate limit (`429`), and a browse, resend or delete with no uploads directory
+  configured (`503`) now return to the uploaded-files list with a fixed notice. The `503` also
+  reaches both confirm pages, which now return to the list the same way. The `429` notice says to
+  wait and try again. The bad-criteria retry on browse is covered too. The list page answers `503`
+  as HTML with its own notice. No notice repeats the engine's own text, and the `404` answers are
+  unchanged, so a refused owner check still reads as a missing file. The console's own pacing and
+  permission refusals are not covered.
+  (`BACKLOG #1169`, PR 1506 follow-up A)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now
@@ -1036,6 +1097,50 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
+  reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
+  account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was
+  wrong, the code was wrong, or both. Before, the reason named the failing factor
+  (`bad_code`/`bad_password`/`bad_password_and_code`). Because the sign-in lock does not refuse a
+  combined sign-in, an `audit:read` holder who is not an administrator (the built-in `AUDITOR` role)
+  could arm a target's sign-in lock, send candidate passwords with any six digits, and read the
+  reason to learn which candidate was right — one request per candidate, up to the global sign-in
+  ceiling of about 86,400 a day, against ADR 0197's design bound of 35. ADR 0197's counting is
+  unchanged: a right password with a wrong code still charges the second-step counter, both wrong
+  still charges the sign-in counter, and which factor verified still reaches the account holder's
+  own lock notice and the `users:manage` lock-state surface. A coarser residual remains: the
+  lock rows a locked second-step counter emits (`auth.account_locked`, `auth.lock_notice`,
+  `auth.login_locked`) still tell the two outcomes apart at `lockout_threshold` requests per
+  candidate; removing them touches the AC-10 lock record, so it is left for an owner/ADR decision.
+  (`BACKLOG #1131`, ASVS 6.1.1)
+- **BREAKING: XML signature checks now refuse an RSA signing key under 2048 bits.** Before, the
+  XML-DSig `verify()` accepted a signature made with an RSA-1024 key, on both the `x509_cert` and
+  the `ca_pem_file` paths. Now it returns `verified=False` with the reason `WeakSigningKey`, even
+  when the signature itself is valid. A partner that signs XML with an RSA key under 2048 bits
+  will now be refused and must move to a key of at least 2048 bits. A key the check cannot read
+  is refused too, with the reason `UnreadableSigningKey`. The floor is 2048, not 3072, by owner
+  ruling: partner keys keep the 2048-bit floor. EC and DSA keys are not changed by this.
+  (`BACKLOG #1166`, ASVS 11.2.3)
+- **The Python security scan now flags new calls into the `random` module.** Bandit check B311 was
+  skipped in both the CI scan and the pre-commit hook, so nothing would have caught a weak generator
+  returning to shipped code. Both now run it. B311 matches a fixed list of calls, such as
+  `random.random()` and `random.choice()`, and misses a few, such as `random.shuffle()`. The five
+  existing uses are seeded on purpose, for pseudonym picking, synthetic HL7 and PDF fixtures, and one
+  fuzz script. Each carries a per-line `# nosec B311` with its reason. Security values still come from
+  `secrets` and `os.urandom`.
+  ([BACKLOG #1173](docs/BACKLOG.md))
+- **`serve` now refuses to start when uvicorn lacks a hook the protocol header floor needs.**
+  `messagefoundry/api/protocol_headers.py` checks each uvicorn and websockets internal it overrides
+  when it builds its protocol classes. A missing one used to fall back to uvicorn's own protocol,
+  whose `400` and `500` carry no `nosniff`. Now `serve` prints the missing hook and the installed
+  versions, and exits with code 2, before it mints a certificate or opens the store. `supervise`
+  refuses the whole fleet the same way before it spawns a shard. There is no opt-out. A hook the
+  floor calls synchronously that became a coroutine is refused too. A WebSocket protocol without
+  the legacy server's `write_http_response`, such as the sans-I/O one or wsproto, is refused the
+  same way. `pyproject.toml` now bounds uvicorn below 0.50, and the DAST target serves the same
+  floored protocols and the same bannerless `Server` setting `serve` does. Steps on a single
+  response still degrade to uvicorn's own response and log a WARNING, and uvicorn's
+  `100 Continue` still carries no header. (`BACKLOG #1120`)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -2070,11 +2175,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   `nosniff` and `frame-ancestors 'none'` to responses uvicorn writes below the app. It never adds
   HSTS. It covers at least uvicorn's `400` for a request it cannot parse, and its `500` when the
   app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
-  websockets server's own handshake answers. Each step it adds fails open. On an error it logs a
+  websockets server's own handshake answers. A step on a single response that errors logs a
   WARNING, once per response family and step, and leaves uvicorn's own response as it was. Those
   steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 16.0,
-  the versions `requirements.lock` pins. `pyproject.toml` admits other versions, and on one of
-  them a step may fail open and leave its headers off. (`BACKLOG #1120`)
+  the versions `requirements.lock` pins. When one of those internals is missing, `serve` refuses
+  to start; see the Security entry on the protocol header floor. (`BACKLOG #1120`)
 - **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
   0.4.0's P-256 pin for ES256 let `true`, `1.0` and some other non-integer CBOR values stand in for
   an integer. So an ES256 key whose curve read `true` or `1.0` could enrol past the pin.

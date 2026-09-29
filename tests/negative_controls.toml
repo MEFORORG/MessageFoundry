@@ -209,7 +209,7 @@ red = [
   "tests/test_lint_scope_parity.py::test_ci_bandit_scans_the_repo_not_an_allow_list",
 ]
 holds = """
-The reviewed `--skip B101,B110,B311,B404,B608` list must NOT be flagged. Each entry there is a per-check
+The reviewed `--skip B101,B110,B404,B608` list must NOT be flagged. Each entry there is a per-check
 exclusion with a stated reason, not a severity floor, and a detector that flagged it would be "fixed" by
 deleting a correct annotation. The excludes must also keep matching semgrep's, so widening one gate's
 blind spot cannot pass as tightening the other's.
