@@ -225,8 +225,8 @@ if ($ReleaseAddress) {
 # --- stop and remove --------------------------------------------------------------------------------
 
 # THE SCM, NOT NSSM, AND NOT A THIRD COPY OF Stop-ServiceAndConfirm. That function takes an empty
-# -NssmPath to mean "stop through the SCM" -- uninstall-service.ps1 calls it that way when nssm is
-# absent -- so it WOULD work here, and an earlier version of this comment wrongly said it required
+# -NssmPath to mean "stop through the SCM" -- uninstall-service.ps1 always calls it that way -- so
+# it WOULD work here, and an earlier version of this comment wrongly said it required
 # nssm. The real reason is the copies: it is shared byte-identically between the two engine scripts
 # with a drift test pinning the pair, and a third and fourth copy is a cost this script does not need
 # to pay for a helper that drains nothing. What it must not cost is the PROPERTY, so this does the
@@ -254,17 +254,14 @@ Write-Host "Removing '$ServiceName'..."
 # whatever the previous native command left - and this exit code is the ONLY evidence the removal
 # happened, because nothing below re-reads it. uninstall-service.ps1's removal records the full
 # reasoning and the per-host measurements.
-$nssmForRemoval = Join-Path $InstallDir "nssm.exe"
+#
+# sc.exe, NOT THE INSTALLED nssm.exe (BACKLOG #2364). Removing the registration deletes the NSSM
+# settings stored under it, so nssm adds nothing here, and running it would mean trusting a binary as
+# administrator on the strength of a check made at install time.
 $global:LASTEXITCODE = $null
-if (Test-Path $nssmForRemoval) {
-    & $nssmForRemoval remove $ServiceName confirm
-    if ($null -eq $LASTEXITCODE) { throw "nssm remove did not run ('$nssmForRemoval' left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "nssm remove failed (exit $LASTEXITCODE)" }
-} else {
-    & sc.exe delete $ServiceName | Out-Null
-    if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
-}
+& sc.exe delete $ServiceName | Out-Null
+if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
+if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
 Write-Host "Removed '$ServiceName'." -ForegroundColor Green
 
 # --- what is still here -----------------------------------------------------------------------------

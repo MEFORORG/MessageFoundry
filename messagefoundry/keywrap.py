@@ -29,7 +29,9 @@ PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written ei
 
 PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC rule: only a PBMAC1
 MAC at the PBKDF2 floor passes, because any other MAC is keyed by the PKCS#12 KDF, which Appendix C
-does not list (:func:`pkcs12_wrap_refusal`). SSH keys cannot reach an approved derivation at all,
+does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
+encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
+passes. SSH keys cannot reach an approved derivation at all,
 so the SFTP connector refuses an encrypted one outright (:func:`ssh_key_encrypted`). A database
 driver's own client key (libpq ``sslkey``) is checked as a key file before the driver opens it.
 
@@ -571,7 +573,8 @@ def _bags_problem(buf: bytes, safe_contents: _Tlv, depth: int) -> tuple[bool, st
 
 
 def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
-    """``(encrypted, problem)`` for a PKCS#12 bundle: its MAC, then every bag and encrypted part.
+    """``(needs_passphrase, problem)`` for a PKCS#12 bundle: every bag and encrypted part, then its
+    MAC. A bundle needs a passphrase when anything in it is encrypted or it carries a MAC.
 
     The bundle must be DER this reader can walk. ``cryptography`` falls back to BER, so a BER
     bundle loads there; here it is refused as unreadable rather than passed unchecked."""
@@ -605,16 +608,26 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
             return True, "holds a PKCS#12 part this engine does not recognise"
         if problem is not None:
             return True, problem
-    # The MAC is judged only when something is encrypted. Over clear bags its key guards no secret:
-    # guessing the password it is keyed by reveals nothing the bundle does not already show. An
-    # encrypted bundle with no MAC at all is refused: the floor says it must carry a PBMAC1 MAC.
-    if encrypted:
-        if len(parts) != 3:
-            return True, "carries no MAC; an encrypted bundle needs a PBMAC1 MAC"
+    # A MAC is judged whether or not any bag is encrypted (BACKLOG #1352). To verify it, the loader
+    # derives a key from the passphrase and runs the MAC's hash. A PKCS#12-KDF MAC therefore runs a
+    # derivation Appendix C does not list, and an MD5 or SHA-1 one runs a disallowed hash. That is
+    # true even when the passphrase is empty, so the rule does not ask what the passphrase is.
+    # A clear bundle with NO MAC passes. Nothing in it derives a key from a password, just as with
+    # an unencrypted PEM key. An encrypted bundle without a MAC is refused.
+    if len(parts) == 3:
         problem = _mac_problem(der, parts[2])
-        if problem is not None:
-            return True, problem
-    return encrypted, None
+        if problem is not None and not encrypted:
+            problem = problem.rstrip(".") + (
+                ". The MAC rule applies even though no bag is encrypted. Such a bundle passes with "
+                "a PBMAC1 MAC at the floor, or with no MAC (openssl pkcs12 -export -keypbe NONE "
+                "-certpbe NONE -nomac)"
+            )
+        # A MAC is keyed by the passphrase, so a bundle that carries one needs it, like an
+        # encrypted one does.
+        return True, problem
+    if encrypted:
+        return True, "carries no MAC; an encrypted bundle needs a PBMAC1 MAC"
+    return False, None
 
 
 def pkcs12_wrap_refusal(
@@ -629,7 +642,9 @@ def pkcs12_wrap_refusal(
     Refused: a MAC over MD5 or SHA-1, any MAC keyed by the PKCS#12 KDF rather than PBMAC1, a PBMAC1
     or PBES2 derivation under the Appendix C floor, the SHA-1 PKCS#12 PBE and PBES1 bag schemes,
     anything this reader cannot walk, an encrypted bundle with no MAC, and an encrypted bundle with
-    no passphrase. Same rules for the message as :func:`key_wrap_refusal`: the setting and the
+    no passphrase. The MAC rules apply over clear bags too (BACKLOG #1352), and a bundle that
+    carries a MAC needs a passphrase like an encrypted one. A clear bundle with no MAC passes with
+    or without one. Same rules for the message as :func:`key_wrap_refusal`: the setting and the
     reason, never the bundle's bytes."""
     if _too_large(pfx):
         return (
@@ -637,15 +652,15 @@ def pkcs12_wrap_refusal(
             "wrap; a certificate bundle is a few kilobytes, so check the path"
         )
     problem: str | None = "is a PKCS#12 bundle this engine cannot read to check its wrap"
-    encrypted = True
+    needs_passphrase = True
     with contextlib.suppress(_Malformed):
-        encrypted, problem = _pfx_problem(pfx)
+        needs_passphrase, problem = _pfx_problem(pfx)
     if problem is not None:
         return f"{setting}: the bundle {problem}. It is refused. {_REEXPORT}"
-    if encrypted and not passphrase_given:
+    if needs_passphrase and not passphrase_given:
         return (
-            f"{setting}: the bundle is encrypted and no passphrase is configured for it. It is "
-            f"refused before any library can try to open it. Set {unlock_setting}"
+            f"{setting}: the bundle is encrypted or carries a MAC, and no passphrase is configured "
+            f"for it. It is refused before any library can try to open it. Set {unlock_setting}"
         )
     return None
 

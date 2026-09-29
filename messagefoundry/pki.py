@@ -76,12 +76,13 @@ def load_pkcs12(
     """Parse a PKCS#12/.pfx bundle into ``(private_key, leaf_cert, additional_cas)``.
 
     Thin wrapper over ``cryptography``'s loader. ``password`` is the bundle passphrase (``None`` for an
-    unencrypted bundle); it is used only to decrypt here and is never logged or returned. A wrong
+    unencrypted bundle with no MAC); it is used only to decrypt here and is never logged or returned. A wrong
     password / malformed bundle raises ``ValueError`` from ``cryptography`` — the CLI scrubs that so the
     passphrase can never leak into stderr/logs.
 
     Before anything decrypts it, the bundle's MAC and bag encryption are checked (BACKLOG #1352,
-    #1171): a weak or unreadable wrap, or an encrypted bundle with no passphrase, raises
+    #1171): a weak or unreadable wrap, a MAC that is not PBMAC1 at the floor even over unencrypted
+    bags, or a bundle that is encrypted or carries a MAC with no passphrase, raises
     :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is safe to show."""
     refuse_weak_pkcs12(
         pfx_bytes,

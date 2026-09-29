@@ -67,10 +67,10 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate, IdentityRe
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import (
-    MASKED_UNTIL_REVEALED,
     count_exposed,
     count_masked,
     redact_unauthorized,
+    revealable,
 )
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
@@ -1678,6 +1678,12 @@ def create_app(
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
+    #
+    # redirect_slashes=False (BACKLOG #1968): Starlette otherwise answers a trailing-slash miss with a
+    # pre-auth 307 whose absolute Location carries the scope scheme. Behind a TLS-terminating proxy
+    # whose X-Forwarded-Proto is not trusted or not sent, that scheme is http, so the redirect would
+    # point the client at an http:// URL. A trailing-slash miss is now a 404.
+    # tests/test_api_redirect_slashes.py pins that no route ends in "/" and no mount redirects.
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -1685,6 +1691,7 @@ def create_app(
         docs_url="/docs" if expose_docs else None,
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
+        redirect_slashes=False,
     )
     if engine is not None:
         app.state.engine = engine
@@ -3506,6 +3513,8 @@ def create_app(
         # Same centralized per-property PHI gate as /messages (WP-9): messages:view_summary unlocks the
         # patient-identifying `summary` and the delivery `last_error` (which can quote field values —
         # review low-8); a caller without it gets them nulled. Exposure audited server-side (M-5).
+        # A holder gets both masked, and this list has no reveal of its own: see
+        # field_authz.ERROR_TEXT_MASKED_UNTIL_REVEALED (BACKLOG #2436).
         dead = [redact_unauthorized(d, identity) for d in dead]
         exposed, masked = count_exposed(dead), count_masked(dead)
         if exposed or masked:
@@ -3863,8 +3872,9 @@ def create_app(
         messages = [_summary(r) for r in rows]
         # Per-property PHI gate, centralized in api/field_authz (WP-9, ASVS 8.2.3): a caller without
         # messages:view_summary gets `summary` AND `error` (handler exception text can quote field
-        # values — review low-8) nulled; the detail endpoint keeps them, gated instead by
-        # messages:view_raw which already exposes the body.
+        # values — review low-8) nulled. A holder gets both masked here, with no reveal on the list:
+        # the summary and the error text are each lifted only by an explicit act on the single-message
+        # open (BACKLOG #2346, #2436).
         messages = [redact_unauthorized(m, identity) for m in messages]
         # Every patient-identifying value actually returned is audited SERVER-SIDE (coalesced per
         # actor/hour) — never gated on a client flag, so a scripted bulk fetch can't harvest the
@@ -4225,15 +4235,19 @@ def create_app(
         # Annotated rather than ``= Query(False)``, for the reason get_message_body gives: this is a
         # CoreHandlers seam function too, and an in-process caller that leaves it out must get False.
         reveal_summary: Annotated[bool, Query()] = False,
+        reveal_errors: Annotated[bool, Query()] = False,
     ) -> MessageDetail:
         """Open one message: metadata, deliveries, events and attachments, and never its body.
 
         ``reveal_summary`` is the explicit act that lifts the display mask on ``summary`` and
         ``metadata`` for this one response (BACKLOG #2346, ASVS 14.2.6). Left out, those two come
         back masked exactly as the list surfaces return them, so an open with no act aimed at the
-        summary (a dead-letter link, a replay redirect, a direct URL) does not unmask them. The open
-        still returns what no list does, the delivery errors and event details, gated on
-        ``messages:view_summary`` as before; the flag does not touch those."""
+        summary (a dead-letter link, a replay redirect, a direct URL) does not unmask them.
+
+        ``reveal_errors`` is a second, separate act (BACKLOG #2436, owner ruling R12). It lifts the
+        whole-value mask on the error-tier text: the message's ``error``, each delivery's
+        ``last_error`` and each event's ``detail``. Left out, those come back as a fixed mask. Both
+        flags only lift a mask; a caller without ``messages:view_summary`` still gets nulls."""
         row = await engine.store.get_message(message_id)
         # 404 (not 403) when the message is outside the caller's channel scope — don't reveal that a
         # message exists in another tenant's channel (per-channel RBAC).
@@ -4295,23 +4309,41 @@ def create_app(
         # and metadata exactly as the list does, and only ``reveal_summary`` lifts the mask, for THIS
         # response (BACKLOG #2346). The caller sets it on an act aimed at the summary: the web console
         # declares it per route, and a bare open (a dead-letter link, a replay redirect, a direct URL)
-        # leaves it off. The raw body is get_message_body's, a separate act with its own audit row.
-        # The unmask is a call argument with nowhere to live between calls, so it cannot become a
-        # session-wide toggle by accident.
-        outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
-        events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(
-            detail,
-            identity,
-            revealed=MASKED_UNTIL_REVEALED if reveal_summary else frozenset(),
-        ).model_copy(update={"outbox": outbox, "events": events})
+        # leaves it off; ``reveal_errors`` is the same for the error text (BACKLOG #2436). The raw
+        # body is get_message_body's, a separate act with its own audit row. Each unmask is a call
+        # argument with nowhere to live between calls, so it cannot become a session-wide toggle by
+        # accident. Each model's set is built once, here, and read by both the redaction and the
+        # audit below, so the two cannot disagree about what was revealed.
+        reveal = {
+            cls: revealable(cls, summary=reveal_summary, error_text=reveal_errors)
+            for cls in (MessageDetail, OutboxInfo, EventInfo)
+        }
+        outbox = [
+            redact_unauthorized(o, identity, revealed=reveal[OutboxInfo]) for o in detail.outbox
+        ]
+        events = [
+            redact_unauthorized(e, identity, revealed=reveal[EventInfo]) for e in detail.events
+        ]
+        detail = redact_unauthorized(detail, identity, revealed=reveal[MessageDetail]).model_copy(
+            update={"outbox": outbox, "events": events}
+        )
         # record_audit puts the open in the tamper-evident, GET /audit-visible compliance chain
         # (docs/PHI.md §6 names message_view as audited — review M-3), still before returning.
         # ``revealed`` names the masked-until-revealed properties this response carries complete,
-        # read from the redacted model rather than from the request: a caller without view_summary
+        # read from the redacted models rather than from the request: a caller without view_summary
         # got nulls, and an empty value had nothing to unmask, so neither is recorded as a
-        # disclosure it never received (BACKLOG #2346).
-        revealed = sorted(p for p in MASKED_UNTIL_REVEALED if reveal_summary and getattr(detail, p))
+        # disclosure it never received (BACKLOG #2346). A nested row's property is recorded under
+        # its list's name, `outbox.last_error` or `events.detail` (BACKLOG #2436).
+        revealed = sorted(
+            f"{prefix}{p}"
+            for prefix, cls, shown in (
+                ("", MessageDetail, [detail]),
+                ("outbox.", OutboxInfo, outbox),
+                ("events.", EventInfo, events),
+            )
+            for p in reveal[cls]
+            if any(getattr(m, p) for m in shown)
+        )
         await engine.store.record_audit(
             "message_view",
             actor=identity.username,
