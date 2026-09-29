@@ -70,6 +70,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.keywrap import refuse_weak_key_file
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
@@ -322,6 +323,37 @@ def _odbc_keyword(key: str, *, what: str) -> str:
     return key
 
 
+def _refuse_weak_driver_key(params: Mapping[str, Any], *, connection: str | None = None) -> None:
+    """Check a driver client key's passphrase wrap before the connection string reaches the driver
+    (BACKLOG #1352, #1171).
+
+    libpq's ``sslkey`` names a private key file, and ``sslpassword`` its passphrase; MySQL's ODBC
+    driver takes ``SSLKEY`` too. The DRIVER decrypts it, so the engine cannot choose the derivation,
+    but it hands the key over, so it reads the wrap first and refuses a weak one exactly as the TLS
+    loaders do. An encrypted key with no ``sslpassword`` is refused too: libpq would otherwise fall
+    back to OpenSSL's terminal prompt. Keywords match case-insensitively, as ODBC's do, so the same
+    keyword spelled twice in different case is refused: the driver reads one copy and this check
+    would read the other."""
+    lowered: dict[str, Any] = {}
+    for k, v in params.items():
+        name = str(k).strip().lower()
+        if name in ("sslkey", "sslpassword") and name in lowered:
+            raise ValueError(
+                f"{hop_name_prefix(connection)}DATABASE odbc_params names {name} more than once "
+                "(keywords are case-insensitive); give it once"
+            )
+        lowered[name] = v
+    key_path = lowered.get("sslkey")
+    if not key_path:
+        return
+    refuse_weak_key_file(
+        str(key_path),
+        setting=f"{hop_name_prefix(connection)}DATABASE odbc_params sslkey",
+        unlock_setting="odbc_params sslpassword",
+        passphrase_given=bool(lowered.get("sslpassword")),
+    )
+
+
 def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     """Build a GENERIC ODBC connection string (``dialect='generic'``, #66) — decoupled from the ODBC
     Driver 18 / T-SQL preset so any ODBC-reachable DB (PostgreSQL / Oracle / MySQL via that DB's own ODBC
@@ -372,6 +404,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
         raise ValueError("DATABASE odbc_params must be a mapping of ODBC keyword -> value")
+    _refuse_weak_driver_key(params, connection=connection)
     for key, value in params.items():
         k = _odbc_keyword(str(key), what="odbc_params key")
         if k.lower() in _ODBC_RESERVED_KEYS:
