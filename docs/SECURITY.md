@@ -3022,13 +3022,26 @@ selects rows by the caller's own username, so it shows the holder their own lock
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
 
-**What the ruling does not reach.** It covers the audit trail. At least these channels still differ
-between a right and a wrong candidate, and are open:
+**The general log no longer names lock events.** `GET /logs/tail` serves the application log to
+`logs:view`, which the built-in Operator holds without `users:manage`, so the ruling reaches it too:
 
-- **The general log.** With no mail relay configured, or no notification address on the target, a
-  lock that lands logs a WARNING naming the `account_locked` notice and the username. `GET /logs/tail`
-  serves that log to `logs:view`, which the built-in Operator holds without `users:manage`, and a
-  custom role may pair it with `audit:read`. The line is per notice by design (BACKLOG #1139).
+- **An undeliverable lock notice writes no per-event log line.** With no mail relay, no address on
+  the account, a full queue or a failed send, the engine used to log a WARNING naming the
+  `account_locked` notice and the username, once per lock. It logs nothing for a lock notice now. The
+  failure is still recorded for administrators: the `auth.lock_notice` row says `mailed: false`, with
+  `reason: no_notifier` when no relay is wired. An instance with no relay at all is still reported at
+  startup by the serve gate. Every other notice kind keeps its per-event line (BACKLOG #1139); none
+  of them fires on a refused sign-in. The list is `LOG_SILENT_EVENT_TYPES` in
+  `messagefoundry/auth/notifications.py`.
+- **The audit copies in the log are withheld from a reader without `users:manage`.** The off-box
+  tee writes every audit row into the application log, the lock rows included, each with its row
+  number. `GET /logs/tail` drops all of those copies for such a reader before it pages, so
+  `total_lines` does not count them. Dropping only the lock rows would leave numbered gaps. That
+  reader reads the trail, if it may, through `GET /audit`.
+
+**What the ruling does not reach.** At least these channels still differ between a right and a
+wrong candidate, and are open:
+
 - **The owner's own later activity.** A live second-step lock refuses the owner's own sign-in, which
   then shows as a refusal where it would have shown as `auth.login_success`. That follows from the
   lock refusing the owner at all.

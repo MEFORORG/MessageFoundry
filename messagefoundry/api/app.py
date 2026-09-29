@@ -39,6 +39,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -226,6 +227,7 @@ from messagefoundry.api.validation import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
+from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
@@ -601,7 +603,9 @@ def _log_sink_health() -> list[LogSinkInfo]:
     ]
 
 
-def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[list[str], int, bool]:
+def _read_log_tail(
+    log_dir: str | None, *, limit: int, offset: int, audit_copies: bool = True
+) -> tuple[list[str], int, bool]:
     """A **redacted** page of the newest app-log file's tail for the in-console viewer (#171, ADR 0130).
 
     Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
@@ -612,7 +616,12 @@ def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[lis
     identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
     gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
-    **never raises** (an unreadable dir/file yields an empty, unavailable page)."""
+    **never raises** (an unreadable dir/file yields an empty, unavailable page).
+
+    ``audit_copies=False`` drops the off-box tee's audit-row copies BEFORE paging, so ``total_lines``
+    and the page boundaries do not count them either (BACKLOG #1131; see
+    :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
+    from messagefoundry.auth.audit_visibility import is_audit_copy_line
     from messagefoundry.support.redact import redact_log_line
 
     if not log_dir:
@@ -631,6 +640,8 @@ def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[lis
     except OSError:
         return [], 0, False
     all_lines = text.splitlines()
+    if not audit_copies:
+        all_lines = [line for line in all_lines if not is_audit_copy_line(line)]
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
@@ -6013,7 +6024,13 @@ def create_app(
         log_dir = getattr(request.app.state, "log_dir", None)
         # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
         lines, total, available = await asyncio.to_thread(
-            _read_log_tail, log_dir, limit=limit, offset=offset
+            partial(
+                _read_log_tail,
+                log_dir,
+                limit=limit,
+                offset=offset,
+                audit_copies=reads_audit_copies_in_the_log(identity),
+            )
         )
         # Audit the redacted-log read like a message view (#171): actor + how many lines were exposed, never
         # the content. Only when something was actually served, so a poll of an empty/unconfigured tail

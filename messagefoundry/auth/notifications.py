@@ -102,6 +102,18 @@ ACCOUNT_CREATED = "account_created"
 # fixed (not an operator knob) so a single fat-fingered password does not generate a notice.
 SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 
+#: Notice kinds whose undeliverable, dropped or failed send writes NO per-event line to the general
+#: log (owner ruling 2026-09-28, BACKLOG #1131). ``GET /logs/tail`` serves that log to ``logs:view``,
+#: which the built-in Operator holds without ``users:manage``. A lock notice is sent only when a lock
+#: lands, and in a combined sign-in campaign under a live sign-in lock only a right candidate lands
+#: one, so a line per undelivered lock notice told that reader which candidate was right.
+#:
+#: Only ``ACCOUNT_LOCKED`` carries that bit. Every other kind is sent on an authenticated action, a
+#: completed sign-in, or a clock, so it keeps its per-event line (BACKLOG #1139). An undelivered lock
+#: notice is still recorded where only an administrator reads it: the ``auth.lock_notice`` row says
+#: ``mailed: false``. And an instance with no relay at all is reported at startup by the serve gate.
+LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
+
 
 @dataclass(frozen=True)
 class SecurityEvent:

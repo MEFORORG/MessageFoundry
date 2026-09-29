@@ -38,11 +38,14 @@ describe a session and not an account lock), and ``auth.temp_password_expired`` 
 password-right signal on an account whose temporary credential has already expired, outside this
 ruling).
 
-**Left open, because the ruling covers the audit trail only:** the general log's per-notice WARNING
-when a lock notice cannot be mailed (``AuthService._notify_security`` and
-``pipeline/security_notify.py``), served to ``logs:view``; the owner's own later sign-in, which a
-live lock refuses; and the visible row's ``ts``, written after less work on a lock refusal than on a
-verified one. ``docs/SECURITY.md`` (Audit) states them. The factor and directory lock refusals get
+**The general log is covered too** (Manager decision 2026-09-28): ``GET /logs/tail`` serves it to
+``logs:view``, which the Operator holds without ``users:manage``. An undeliverable lock notice writes
+no per-event line (``auth.notifications.LOG_SILENT_EVENT_TYPES``), and the tee's audit-row copies
+are withheld from such a reader (:func:`reads_audit_copies_in_the_log`).
+
+**Left open:** the owner's own later sign-in, which a live lock refuses; and the visible row's
+``ts``, written after less work on a lock refusal than on a verified one. ``docs/SECURITY.md``
+(Audit) states them. The factor and directory lock refusals get
 no visible stand-in row: only a holder of the account's session or ticket causes one, and that
 holder's unrefused attempt would differ anyway (``auth.mfa_verified``, ``auth.login_success``).
 
@@ -53,6 +56,7 @@ the holder their own lock and never another account's.
 from __future__ import annotations
 
 import json
+import re
 from typing import Final
 
 from messagefoundry.auth.identity import Identity
@@ -69,6 +73,8 @@ __all__ = [
     "LOCK_NOTICE_ACTION",
     "LOGIN_LOCKED_ACTION",
     "audit_exclusion_for",
+    "is_audit_copy_line",
+    "reads_audit_copies_in_the_log",
 ]
 
 ACCOUNT_LOCKED_ACTION: Final = "auth.account_locked"
@@ -110,3 +116,28 @@ def audit_exclusion_for(identity: Identity) -> AuditExclusion | None:
     if identity.has(Permission.USERS_MANAGE):
         return None
     return HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE
+
+
+#: A line of the general log that is the off-box tee's copy of an audit row
+#: (:mod:`messagefoundry.store.audit_tee`), in the text format (``<logger>: <message>``) or the JSON
+#: format (``"logger": "<logger>"``). The logger name is fixed, so it is the one reliable mark.
+_AUDIT_COPY_LINE: Final = re.compile(
+    r'(?:\smessagefoundry\.audit:\s|"logger":\s*"messagefoundry\.audit")'
+)
+
+
+def is_audit_copy_line(line: str) -> bool:
+    """Whether ``line`` of the general log is the tee's copy of an audit row."""
+    return _AUDIT_COPY_LINE.search(line) is not None
+
+
+def reads_audit_copies_in_the_log(identity: Identity) -> bool:
+    """Whether ``identity`` may read the tee's audit copies in ``GET /logs/tail``.
+
+    **The ruling reaches the general log** (Manager decision 2026-09-28): ``logs:view`` is held by
+    the built-in Operator, who lacks ``users:manage``, and the tee writes EVERY audit row into that
+    log, the lock rows included. Withholding only the lock rows there would not do: each copy carries
+    its ``row_id``, so the gaps would count the hidden rows. So a reader without ``users:manage``
+    gets no audit copies from the log at all. It reads the trail, if it may, through ``GET /audit``,
+    which applies :data:`HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE`."""
+    return audit_exclusion_for(identity) is None
