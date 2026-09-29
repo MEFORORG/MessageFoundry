@@ -19,6 +19,7 @@ from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 
 @pytest.fixture
@@ -272,7 +273,8 @@ async def test_dry_run_reload_audits_config_reload_check_under_the_acting_user(
     try:
         service = AuthService(eng.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_chosen(
+            service,
             username="deployer",
             password=pw,
             display_name=None,
@@ -284,7 +286,10 @@ async def test_dry_run_reload_audits_config_reload_check_under_the_acting_user(
         user = await service.store.get_user(uid)
         assert user is not None and user.password_hash is not None
         await service.store.set_password(
-            uid, password_hash=user.password_hash, must_change_password=False
+            uid,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
 
         transport = httpx.ASGITransport(app=create_app(eng, auth=service))

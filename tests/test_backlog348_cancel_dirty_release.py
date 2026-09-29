@@ -284,6 +284,7 @@ async def _create_user_with_audit(store: SqlServerStore) -> None:
         username="someone",
         auth_provider="local",
         audit=AuditAppend(action="user.created", actor="test"),
+        password_generated=False,
     )
 
 

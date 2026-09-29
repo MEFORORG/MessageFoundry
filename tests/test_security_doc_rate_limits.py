@@ -1703,6 +1703,38 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     )
 
 
+def test_the_generated_credential_arms_no_lock_and_the_doc_says_so() -> None:
+    """ADR 0197 Amendment A, AC-A1, as the 6.1.1 prose states it. Derived from the one predicate the
+    three backends call inside their atomic increment, then the doc: the control 1 cell and the
+    bullets beneath it name the case, and residual (1) no longer carries the wrong 2026-09-27 tag."""
+    from messagefoundry.store.store import lockout_arms
+
+    assert not lockout_arms("sign_in", password_generated=True)
+    assert lockout_arms("sign_in", password_generated=False)
+    assert lockout_arms("second_step", password_generated=True)
+    assert lockout_arms("second_step", password_generated=False)
+
+    table = _protection_rows()
+    window = table[0].index("Threshold / window")
+    row = next(r for r in table[1:] if "lockout_minutes" in "  ".join(r))
+    cell = " ".join(row[window].split()).lower()
+    assert "engine-generated" in cell and "arm no lock" in cell, (
+        "the lockout row must state that a generated credential arms no sign-in lock (ADR 0197 "
+        f"Amendment A); its Threshold / window cell reads {row[window]!r}."
+    )
+    flat = " ".join(_section(_H_SET).split())
+    assert "**arm no sign-in lock**" in flat, "the control 1 bullets must name the generated case"
+    assert "auth.lockable_accounts" in flat and "auth.lockable_account_census" in flat, (
+        "the 6.1.1 set must name the census that makes the invariant checkable (AC-A9)"
+    )
+    residual_one = flat.split("(1) Accounts with no TOTP", 1)[1].split("(2)", 1)[0]
+    assert "Not accepted for 6.1.1 scoring, owner ruling 2026-09-28" in residual_one
+    assert "*Accepted with option E, owner ruling 2026-09-27.*" not in residual_one, (
+        "residual (1) carried the wrong tag: the 2026-09-27 rulings named residual 4 alone, and the "
+        "2026-09-28 ruling declined residual (1) for scoring."
+    )
+
+
 def test_route_to_limiter_map_matches_the_call_sites() -> None:
     """The doc's route -> limiter map is rebuilt from the AST.
 

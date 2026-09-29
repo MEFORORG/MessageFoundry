@@ -32,6 +32,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 _BASE = "http://127.0.0.1:8765"
@@ -73,7 +74,8 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _service_with_operator(engine: Engine) -> AuthService:
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username="op",
         password=PW,
         display_name=None,
@@ -85,7 +87,10 @@ async def _service_with_operator(engine: Engine) -> AuthService:
     user = await engine.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await engine.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     return service
 

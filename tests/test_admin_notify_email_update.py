@@ -38,6 +38,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import AuditStore
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
 _ACTION = "user.notify_email_changed"
@@ -63,6 +64,7 @@ async def _account(store: MessageStore, *, notify: str | None, profile: str | No
         auth_provider="local",
         email=notify,
         password_hash=hash_password(PW),
+        password_generated=False,
     )
     await store.update_user_profile("u1", display_name="Bob", email=profile)
 
@@ -419,7 +421,8 @@ async def _api(engine: Engine, notifier: _FakeNotifier | None = None) -> tuple[A
         security_notifier=notifier,
     )
     await service.initialize()
-    boss = await service.create_local_user(
+    boss = await create_local_user_chosen(
+        service,
         username="boss",
         password=PW,
         display_name=None,
@@ -432,9 +435,10 @@ async def _api(engine: Engine, notifier: _FakeNotifier | None = None) -> tuple[A
     row = await service.store.get_user(boss)
     assert row is not None and row.password_hash is not None
     await service.store.set_password(
-        boss, password_hash=row.password_hash, must_change_password=False
+        boss, password_hash=row.password_hash, must_change_password=False, password_generated=False
     )
-    target = await service.create_local_user(
+    target = await create_local_user_chosen(
+        service,
         username="target",
         password=PW,
         display_name=None,

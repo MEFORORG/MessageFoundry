@@ -17,6 +17,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN999^^^H^MR||DOE^JANE\r"
@@ -36,8 +37,14 @@ async def _user(engine: Engine, role: Role, name: str) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    uid = await service.create_local_user(
-        username=name, password=PW, display_name=None, email=None, roles=[role.value], actor="t"
+    uid = await create_local_user_chosen(
+        service,
+        username=name,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[role.value],
+        actor="t",
     )
     # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
     # fixture still stands for an operator who has been provisioned; the channel axis itself
@@ -46,7 +53,7 @@ async def _user(engine: Engine, role: Role, name: str) -> AuthService:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     return service
 
@@ -62,7 +69,8 @@ async def test_preset_crud_and_owner_scoping(engine: Engine) -> None:
     from messagefoundry.api import create_app
 
     service = await _user(engine, Role.OPERATOR, "op")
-    await service.create_local_user(
+    await create_local_user_chosen(
+        service,
         username="op2",
         password=PW,
         display_name=None,
@@ -73,7 +81,7 @@ async def test_preset_crud_and_owner_scoping(engine: Engine) -> None:
     u2 = await service.store.get_user_by_username("op2")
     assert u2 is not None and u2.password_hash is not None
     await service.store.set_password(
-        u2.id, password_hash=u2.password_hash, must_change_password=False
+        u2.id, password_hash=u2.password_hash, must_change_password=False, password_generated=False
     )
 
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
@@ -335,7 +343,8 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         )
 
         # A NEW person is given the freed username.
-        new_id = await service.create_local_user(
+        new_id = await create_local_user_chosen(
+            service,
             username="alice",
             password=PW,
             display_name=None,
@@ -350,7 +359,10 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         fresh = await service.store.get_user(new_id)
         assert fresh is not None and fresh.password_hash is not None
         await service.store.set_password(
-            new_id, password_hash=fresh.password_hash, must_change_password=False
+            new_id,
+            password_hash=fresh.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
         assert new_id != alice.id, "same name, different principal -- that is the whole point"
 

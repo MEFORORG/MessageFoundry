@@ -13,8 +13,10 @@ here describes what a deploying site would inherit, never a live exposure.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -23,6 +25,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.notifications import FIRST_ADMINISTRATOR_TAKEOVER, SecurityEvent
+from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
     HOLDER_NOTICE_DISPATCHED,
@@ -34,7 +37,8 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.settings import AlertsSettings, AuthSettings
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, WebAuthnCredential
+from tests._admin_account import PROVISION_TOTP_SECRET, provision_totp
 
 # The directory-sign-in precondition, imported rather than re-derived: that module is where it is
 # measured, and this one only builds on it. Same convention as its own `_BACKENDS` import.
@@ -56,7 +60,7 @@ async def test_a_provisioned_administrator_is_usable_and_a_start_adds_no_account
     try:
         service = AuthService(store, AuthSettings())
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test"
+            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
         )
         assert outcome.repaired is False
 
@@ -88,13 +92,13 @@ async def test_it_refuses_once_an_enabled_administrator_exists() -> None:
     try:
         service = AuthService(store, AuthSettings())
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test"
+            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
         )
         assert await service.has_enabled_administrator() is True
 
         with pytest.raises(FirstAdministratorRefused, match="already has an enabled Administrator"):
             await service.provision_first_administrator(
-                username="second", password=_PASSWORD, actor="test"
+                username="second", password=_PASSWORD, actor="test", **provision_totp()
             )
         assert await store.get_user_by_username("second") is None
     finally:
@@ -118,7 +122,7 @@ async def test_the_guard_asks_for_an_administrator_not_an_empty_table() -> None:
 
         # The empty-table guard would have refused here. This one proceeds.
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test"
+            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None
@@ -151,10 +155,14 @@ async def test_an_interrupted_provision_is_completed_by_re_running(crashed_after
             email=None,
             password_hash=None,
             must_change_password=True,
+            password_generated=False,
         )
         if crashed_after == "set_password":
             await store.set_password(
-                "halfwritten", password_hash="not-the-operators", must_change_password=False
+                "halfwritten",
+                password_hash="not-the-operators",
+                must_change_password=False,
+                password_generated=False,
             )
             row = await store.get_user_by_username("site-admin")
             assert row is not None and row.password_claimed_at is not None, "the state under test"
@@ -163,7 +171,7 @@ async def test_an_interrupted_provision_is_completed_by_re_running(crashed_after
         assert (await service.login("site-admin", _PASSWORD)).ok is False
 
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test"
+            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
         )
         assert outcome.repaired is True and outcome.user_id == "halfwritten"
         # The operator's just-typed credential is authoritative, which matters on the second arm:
@@ -192,11 +200,12 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             auth_provider=AuthProvider.LOCAL.value,
             password_hash=None,
             must_change_password=True,
+            password_generated=False,
         )
         await store.set_user_roles("roled", [Role.OPERATOR.value], assigned_by="test")
         with pytest.raises(FirstAdministratorRefused, match="holds roles"):
             await service.provision_first_administrator(
-                username="bob", password=_PASSWORD, actor="test"
+                username="bob", password=_PASSWORD, actor="test", **provision_totp()
             )
 
         # Disabled is refused rather than silently revived -- and refusing rather than re-enabling
@@ -206,11 +215,12 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             username="carol",
             auth_provider=AuthProvider.LOCAL.value,
             password_hash=None,
+            password_generated=False,
         )
         await store.set_user_disabled("off", disabled=True)
         with pytest.raises(FirstAdministratorRefused, match="is disabled"):
             await service.provision_first_administrator(
-                username="carol", password=_PASSWORD, actor="test"
+                username="carol", password=_PASSWORD, actor="test", **provision_totp()
             )
 
         # A directory row is never promoted, whatever its role state: its authority comes from the
@@ -220,10 +230,11 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             username="dana",
             auth_provider=AuthProvider.AD.value,
             password_hash=None,
+            password_generated=False,
         )
         with pytest.raises(FirstAdministratorRefused, match="provision a separate"):
             await service.provision_first_administrator(
-                username="dana", password=_PASSWORD, actor="test"
+                username="dana", password=_PASSWORD, actor="test", **provision_totp()
             )
     finally:
         await store.close()
@@ -236,7 +247,7 @@ async def test_a_weak_password_is_refused_and_writes_nothing() -> None:
         service = AuthService(store, AuthSettings(password_min_length=20))
         with pytest.raises(FirstAdministratorRefused):
             await service.provision_first_administrator(
-                username="site-admin", password="short", actor="test"
+                username="site-admin", password="short", actor="test", **provision_totp()
             )
         assert await store.count_users() == 0
     finally:
@@ -254,6 +265,7 @@ async def test_a_supplied_address_lands_on_the_engine_owned_column() -> None:
             password=_PASSWORD,
             notify_email="ops@example.invalid",
             actor="test",
+            **provision_totp(),
         )
         fresh = await store.get_user_by_username("site-admin")
         assert fresh is not None and fresh.notify_email == "ops@example.invalid"
@@ -276,6 +288,7 @@ async def test_a_supplied_address_also_lands_on_a_repaired_row() -> None:
             auth_provider=AuthProvider.LOCAL.value,
             password_hash=None,
             must_change_password=True,
+            password_generated=False,
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and row.notify_email is None, "control: it starts without one"
@@ -285,6 +298,7 @@ async def test_a_supplied_address_also_lands_on_a_repaired_row() -> None:
             password=_PASSWORD,
             notify_email="ops@example.invalid",
             actor="test",
+            **provision_totp(),
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and row.notify_email == "ops@example.invalid"
@@ -302,7 +316,11 @@ async def test_a_blank_address_is_no_address_in_every_column_and_in_the_audit() 
     try:
         service = AuthService(store, AuthSettings())
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, notify_email="   ", actor="test"
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email="   ",
+            actor="test",
+            **provision_totp(),
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and row.notify_email is None and row.email is None
@@ -324,7 +342,7 @@ async def test_the_provision_is_audited() -> None:
     try:
         service = AuthService(store, AuthSettings())
         await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="cli:tester"
+            username="site-admin", password=_PASSWORD, actor="cli:tester", **provision_totp()
         )
         rows = [dict(r) for r in await store.list_audit(limit=50)]
         provisioned = [r for r in rows if r["action"] == "auth.first_administrator_provisioned"]
@@ -869,6 +887,7 @@ async def _roleless_account(store: MessageStore, *, email: str | None) -> None:
         email=email,
         password_hash=None,
         must_change_password=True,
+        password_generated=False,
     )
 
 
@@ -905,7 +924,11 @@ async def test_a_takeover_notifies_the_address_the_account_held_before(
         await _roleless_account(store, email="holder@example.invalid")
 
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, notify_email=new_email, actor="test"
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email=new_email,
+            actor="test",
+            **provision_totp(),
         )
         assert outcome.repaired is True
         assert outcome.holder_notice == HOLDER_NOTICE_DISPATCHED
@@ -955,6 +978,7 @@ async def test_a_takeover_of_an_account_with_no_address_sends_nothing_and_says_s
             password=_PASSWORD,
             notify_email="operator@example.invalid",
             actor="test",
+            **provision_totp(),
         )
         assert outcome.repaired is True
         assert outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS
@@ -977,6 +1001,7 @@ async def test_a_fresh_provision_sends_no_takeover_notice() -> None:
             password=_PASSWORD,
             notify_email="operator@example.invalid",
             actor="test",
+            **provision_totp(),
         )
         assert outcome.repaired is False and outcome.holder_notice is None
         assert notifier.events == []
@@ -997,7 +1022,7 @@ async def test_a_takeover_with_no_channel_records_that_nothing_was_sent(
         await _roleless_account(store, email="holder@example.invalid")
         with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
             outcome = await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test"
+                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
             )
         assert outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL
         assert (await _provision_audit(store))["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
@@ -1021,7 +1046,7 @@ async def test_a_notifier_that_raises_is_recorded_as_no_hand_off() -> None:
         service = AuthService(store, AuthSettings(), security_notifier=_Raising())
         await _roleless_account(store, email="holder@example.invalid")
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test"
+            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
         )
         assert outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL
         assert (await _provision_audit(store))["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
@@ -1239,3 +1264,544 @@ def test_a_channel_that_fails_to_build_costs_the_notice_not_the_recovery(
     )
     assert _offline_security_notifier(ServiceSettings(alerts=_smtp())) is None
     assert "synthetic build failure" in capsys.readouterr().err
+
+
+# --- ADR 0197 Amendment A, N-A (AC-A5): the first Administrator enrols TOTP at the terminal --------
+
+#: The secret ``totp.generate_secret`` is pinned to in these tests, so the terminal stub can compute
+#: the code the operator would read off the authenticator. Synthetic; not a secret.
+_TERMINAL_SECRET = PROVISION_TOTP_SECRET
+
+
+class _Terminal:
+    """A console for the TOTP prompt: ``isatty`` True, ``readline`` answers the queued codes, and
+    ``shown`` records what reached the console device (``_show_on_terminal``)."""
+
+    def __init__(self, codes: list[str]) -> None:
+        self._codes = codes
+        self.asked = 0
+        self.shown: list[str] = []
+
+    def show(self, text: str) -> None:
+        self.shown.append(text)
+
+    def fileno(self) -> int:
+        # A stand-in stream names no device, as a replaced real stdin would not either.
+        raise io.UnsupportedOperation("fileno")
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        self.asked += 1
+        return self._codes.pop(0) + "\n" if self._codes else ""
+
+
+def _drive_the_real_prompt(
+    monkeypatch: pytest.MonkeyPatch, codes: list[str] | None = None
+) -> _Terminal:
+    """Replace the suite-wide stub with the REAL ``_enrol_totp_at_terminal``, pin the generated
+    secret so a correct code can be computed, and present a terminal that answers ``codes`` (one
+    live code by default). ``getpass`` answers the two password prompts."""
+    import messagefoundry.__main__ as cli
+    from messagefoundry.auth import totp
+
+    real = cli._enrol_totp_at_terminal.__wrapped__  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", real)
+    monkeypatch.setattr(totp, "generate_secret", lambda: _TERMINAL_SECRET)
+    terminal = _Terminal(codes if codes is not None else [totp.totp(_TERMINAL_SECRET)])
+    monkeypatch.setattr(sys, "stdin", terminal)
+    monkeypatch.setattr(cli, "_show_on_terminal", terminal.show)
+    queued = [_PASSWORD, _PASSWORD]
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: queued.pop(0))
+    return terminal
+
+
+def test_the_cli_enrols_totp_and_the_administrator_passes_a_live_lock_with_a_combined_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-A5: provision-admin under the shipped require_mfa leaves TOTP ON before the role, and the
+    new Administrator has option E's way past: with the sign-in lock live, a combined sign-in works.
+    The key and the recovery codes went to the console device once each, and to neither stream: not
+    stdout, which carries the --json body, and not stderr, which a redirect can put in a log (CodeQL
+    alert 228). RED against the stderr print this replaced."""
+    from messagefoundry.auth import totp
+
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(monkeypatch)
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    captured = capsys.readouterr()
+    body = json.loads(captured.out.strip().splitlines()[-1])
+    assert body["ok"] is True and body["totp_enrolled"] is True
+    assert body["recovery_codes_shown"] is True
+    streams = captured.out + captured.err
+    assert _TERMINAL_SECRET not in streams
+    # The key, the code prompt and the codes, in that order, all on the console device.
+    assert len(terminal.shown) == 3, terminal.shown
+    key_text, prompt_text, codes_text = terminal.shown
+    assert _TERMINAL_SECRET in key_text and "otpauth://" in key_text
+    assert prompt_text == "Authenticator code: "
+    assert "Authenticator code" not in streams, "the prompt went to a stream"
+    assert "Recovery codes" in codes_text
+    codes = [
+        line.strip()
+        for line in codes_text.split("Recovery codes", 1)[1].splitlines()[1:]
+        if line.startswith("  ") and line.strip()
+    ]
+    assert codes, codes_text
+    assert not any(code in streams for code in codes)
+
+    async def check() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            row = await store.get_user_by_username("site-admin")
+            assert row is not None and row.totp_enabled and not row.password_generated
+            assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(row.id)
+            assert await store.get_totp_secret(row.id) == _TERMINAL_SECRET
+            assert len(await store.get_recovery_code_hashes(row.id)) == len(codes)
+            service = AuthService(store, AuthSettings(lockout_threshold=3, lockout_minutes=15))
+            for _ in range(3):
+                assert not (await service.login("site-admin", "a-wrong-guess-for-the-lock")).ok
+            row = await store.get_user_by_username("site-admin")
+            assert row is not None and row.locked_until is not None, "the sign-in lock is live"
+            later = time.time() + 2 * totp.DEFAULT_PERIOD
+            code = totp.totp(_TERMINAL_SECRET, now=later)
+            monkeypatch.setattr(totp, "time", types.SimpleNamespace(time=lambda: later))
+            out = await service.login("site-admin", _PASSWORD, totp_code=code)
+            assert out.ok, out.error
+        finally:
+            await store.close()
+
+    asyncio.run(check())
+
+
+def test_a_wrong_code_at_the_prompt_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N-A: the code is checked in memory before any store write. Five wrong codes stop the
+    command, and the store is not even created."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(
+        monkeypatch, ["000000", "111111", "222222", "333333", "444444"]
+    )
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    assert terminal.asked == 5
+    assert "nothing was written" in capsys.readouterr().err
+    assert not db.exists()
+
+
+def test_the_key_goes_to_the_console_device_and_nowhere_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CodeQL alert 228: the real ``_show_on_terminal`` writes to the device
+    ``_controlling_terminal_path`` names, here pointed at a file, and prints nothing to either
+    stream."""
+    import messagefoundry.__main__ as cli
+
+    real = cli._show_on_terminal.__wrapped__  # type: ignore[attr-defined]
+    device = tmp_path / "console"
+    device.write_text("")  # a device exists before anything writes to it; open() never creates one
+    monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(device))
+    real("  key: SYNTHETICKEY\n")
+    assert device.read_text(encoding="utf-8") == "  key: SYNTHETICKEY\n"
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+
+
+def test_with_no_console_the_key_is_not_shown_and_nothing_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No console device to open: the command refuses before any store write, and the key does not
+    fall back to a stream."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    real = cli._show_on_terminal.__wrapped__  # type: ignore[attr-defined]
+    terminal = _drive_the_real_prompt(monkeypatch)
+    monkeypatch.setattr(cli, "_show_on_terminal", real)
+    missing = tmp_path / "no-such-dir" / "console"
+    monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(missing))
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    captured = capsys.readouterr()
+    assert "could not open the console" in captured.err
+    assert _TERMINAL_SECRET not in captured.out + captured.err
+    assert terminal.asked == 0
+    assert not db.exists()
+
+
+def test_recovery_codes_that_cannot_be_shown_are_not_printed_instead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The console fails after the write, at the recovery codes: the command warns, still succeeds
+    (the account is written and has its authenticator), prints no code to either stream, and says
+    so in the --json body, for a caller that reads nothing else."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(monkeypatch)
+
+    def show_the_key_only(text: str) -> None:
+        if "Recovery codes" in text:
+            raise OSError("synthetic console loss")
+        terminal.show(text)
+
+    monkeypatch.setattr(cli, "_show_on_terminal", show_the_key_only)
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out.strip().splitlines()[-1])["recovery_codes_shown"] is False
+    assert "recovery codes could not be shown" in captured.err
+    assert "Recovery codes, shown once" not in captured.out + captured.err
+    assert len(terminal.shown) == 2 and _TERMINAL_SECRET in terminal.shown[0]
+
+
+def test_a_console_that_accepts_no_bytes_raises_rather_than_spins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled terminal can return 0 from write(2) without raising. The writer raises then, so
+    the caller refuses or warns instead of looping forever."""
+    import os
+
+    import messagefoundry.__main__ as cli
+
+    real = cli._show_on_terminal.__wrapped__  # type: ignore[attr-defined]
+    device = tmp_path / "console"
+    device.write_text("")
+    monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(device))
+    monkeypatch.setattr(os, "write", lambda _fd, _data: 0)
+    with pytest.raises(OSError, match="accepted no bytes"):
+        real("  key: SYNTHETICKEY\n")
+
+
+def test_no_totp_is_refused_while_mfa_is_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N-A: --no-totp is refused under the shipped require_mfa, before the store is created."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = tmp_path / "provision.db"
+    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--no-totp"])
+    assert rc != 0
+    assert "--no-totp is refused" in capsys.readouterr().err
+    assert not db.exists()
+
+
+async def test_the_service_refuses_no_totp_while_mfa_is_required_and_a_wrong_code() -> None:
+    """The service holds both lines too, and writes nothing on either refusal."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        with pytest.raises(FirstAdministratorRefused, match="require_mfa"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test"
+            )
+        kw = provision_totp()
+        kw["totp_code"] = "000000" if kw["totp_code"] != "000000" else "111111"
+        with pytest.raises(FirstAdministratorRefused, match="nothing was written"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test", **kw
+            )
+        assert await store.count_users() == 0
+        # With the requirement off, the service provisions without TOTP.
+        off = AuthService(store, AuthSettings(require_mfa=False))
+        outcome = await off.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test"
+        )
+        assert outcome.recovery_codes == ()
+    finally:
+        await store.close()
+
+
+async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions() -> None:
+    """AC-A5, and the ADR 0183 defect it fixes: a roleless row somebody else held must not carry
+    their TOTP, recovery codes, passkeys or a live session onto the new Administrator. Before this,
+    a session they kept became an Administrator session when the role was written."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        await store.create_user(
+            user_id="earlier",
+            username="site-admin",
+            auth_provider="local",
+            password_hash=None,
+            must_change_password=True,
+            password_generated=False,
+        )
+        await store.set_password(
+            "earlier",
+            password_hash=await asyncio.to_thread(hash_password, "the-earlier-holders-passphrase"),
+            must_change_password=False,
+            password_generated=False,
+        )
+        await store.set_totp_secret("earlier", secret="JBSWY3DPEHPK3PXP")
+        await store.enable_totp("earlier", recovery_code_hashes=["h1", "h2"])
+        await store.add_webauthn_credential(
+            WebAuthnCredential(
+                credential_id_hash="earlier-passkey-hash",
+                credential_id="earlier-passkey-id",
+                user_id="earlier",
+                rp_id="t",
+                public_key="cose-public-key-b64url",
+                sign_count=0,
+                transports=None,
+                device_type="multi_device",
+                backed_up=True,
+                label="theirs",
+                aaguid=None,
+                created_at=1.0,
+            )
+        )
+        kept = await service.login("site-admin", "the-earlier-holders-passphrase")
+        assert kept.ok and kept.token is not None
+
+        on = AuthService(store, AuthSettings())
+        outcome = await on.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+        )
+        assert outcome.repaired and outcome.recovery_codes
+        # The earlier holder's session is gone: it never becomes an Administrator session.
+        assert await on.identity_for_token(kept.token) is None
+        assert await store.list_webauthn_credentials("earlier") == []
+        row = await store.get_user("earlier")
+        assert row is not None and row.totp_enabled
+        assert await store.get_totp_secret("earlier") == PROVISION_TOTP_SECRET
+        assert "h1" not in await store.get_recovery_code_hashes("earlier")
+    finally:
+        await store.close()
+
+
+async def test_a_re_run_in_the_same_step_is_not_blocked_by_the_rows_old_step_mark() -> None:
+    """Review rounds 1 and 2. The row already spent this step (an interrupted earlier run, or an
+    earlier holder signing in with a code of their own). The repair clears the row's factors, and
+    since round 2 ``disable_totp`` forgets the old secret's step mark, so the operator's code for the
+    same 30 seconds is accepted rather than refused -- an earlier holder cannot block the repair by
+    spending each step first."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.create_user(
+            user_id="half",
+            username="site-admin",
+            auth_provider="local",
+            password_hash=None,
+            must_change_password=True,
+            password_generated=False,
+        )
+        kw = provision_totp()
+        from messagefoundry.auth import totp
+
+        spent = totp.verify_totp_step(
+            kw["totp_secret"], kw["totp_code"], now=kw["totp_code_read_at"]
+        )
+        assert spent is not None and await store.consume_totp_step("half", spent)
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test", **kw
+        )
+        assert outcome.repaired and outcome.recovery_codes
+        row = await store.get_user("half")
+        assert row is not None and row.totp_enabled
+        assert Role.ADMINISTRATOR.value in await store.get_user_role_ids("half")
+    finally:
+        await store.close()
+
+
+async def test_a_sign_in_during_the_repair_does_not_survive_into_the_administrator_role() -> None:
+    """Review round 2: the earlier holder's password works until the repair writes the new one. A
+    session minted in that window must not outlive the repair, so the sessions are revoked again
+    after the role is written."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        await store.create_user(
+            user_id="earlier",
+            username="site-admin",
+            auth_provider="local",
+            password_hash=None,
+            must_change_password=True,
+            password_generated=False,
+        )
+        await store.set_password(
+            "earlier",
+            password_hash=await asyncio.to_thread(hash_password, "the-earlier-holders-passphrase"),
+            must_change_password=False,
+            password_generated=False,
+        )
+        minted: list[str] = []
+        real_set_password = store.set_password
+
+        async def sign_in_just_before_the_new_password(*a: object, **k: object) -> bool:
+            if not minted:
+                out = await service.login("site-admin", "the-earlier-holders-passphrase")
+                assert out.ok and out.token is not None
+                minted.append(out.token)
+            return await real_set_password(*a, **k)  # type: ignore[arg-type]
+
+        store.set_password = sign_in_just_before_the_new_password  # type: ignore[method-assign]
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test"
+        )
+        assert outcome.repaired and minted
+        assert await service.identity_for_token(minted[0]) is None
+    finally:
+        await store.close()
+
+
+def test_the_cli_refuses_a_username_it_would_not_complete_before_any_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round 2: an account that holds roles is refused before the password prompt and before
+    an authenticator key is shown for it."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "provision.db"
+
+    async def seed() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            svc = AuthService(store, AuthSettings())
+            await svc.initialize()
+            await store.create_user(
+                user_id="bob",
+                username="bob",
+                auth_provider="local",
+                password_hash="h",
+                password_generated=False,
+            )
+            await store.set_user_roles("bob", [Role.VIEWER.value], assigned_by="test")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    _no_prompt(monkeypatch)
+    import messagefoundry.__main__ as cli
+
+    def no_enrolment(**_k: object) -> tuple[str, str, float]:
+        raise AssertionError("an authenticator key was shown for an account the store refuses")
+
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", no_enrolment)
+    assert main(["provision-admin", "--username", "bob", "--db", str(db)]) != 0
+    assert "holds roles" in capsys.readouterr().err
+
+
+class _FakeStdin:
+    """A stdin that names descriptor 0, for the POSIX console fallback."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return 0
+
+
+def _no_controlling_terminal(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int]]:
+    """POSIX with no controlling terminal (``setsid``): /dev/tty refuses with ENXIO. Returns the
+    record of every path the writer then tries to open."""
+    import errno
+    import os
+
+    opened: list[tuple[str, int]] = []
+
+    def fake_open(path: str, flags: int, *_a: object) -> int:
+        opened.append((path, flags))
+        if path == "/dev/tty":
+            raise OSError(errno.ENXIO, "No such device or address")
+        if path == "/dev/pts/9":
+            raise PermissionError(errno.EACCES, "the operator's tty")
+        raise AssertionError(f"unexpected open {path}")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "isatty", lambda fd: fd == 0)
+    return opened
+
+
+def test_without_a_controlling_terminal_the_writer_duplicates_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``su <user> -c``: /dev/tty gives ENXIO and the operator's pts refuses the target user by path,
+    so the writer duplicates the inherited stdin descriptor, which is already open to that tty."""
+    import os
+
+    import messagefoundry.__main__ as cli
+
+    opened = _no_controlling_terminal(monkeypatch)
+    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/pts/9", raising=False)
+    monkeypatch.setattr(os, "dup", lambda fd: 4242 if fd == 0 else -1)
+    assert cli._open_terminal() == 4242
+    assert [p for p, _ in opened] == ["/dev/tty", "/dev/pts/9"]
+
+
+def test_the_writer_prefers_reopening_stdin_tty_by_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the tty CAN be opened by name (same user), a fresh write-only descriptor is used rather
+    than stdin's own, which may be read-only or non-blocking."""
+    import os
+
+    import messagefoundry.__main__ as cli
+
+    opened = _no_controlling_terminal(monkeypatch)
+    real_open = os.open  # already the fake; wrap it so /dev/pts/5 opens
+
+    def open_same_user_tty(path: str, flags: int, *a: int) -> int:
+        if path == "/dev/pts/5":
+            opened.append((path, flags))
+            return 777
+        return real_open(path, flags, *a)
+
+    monkeypatch.setattr(os, "open", open_same_user_tty)
+    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/pts/5", raising=False)
+    monkeypatch.setattr(os, "dup", lambda fd: pytest.fail("dup used although the path opened"))
+    assert cli._open_terminal() == 777
+    assert opened[-1] == ("/dev/pts/5", os.O_WRONLY)
+
+
+def test_a_console_lost_at_the_code_prompt_refuses_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The key is shown, then the console goes away at the prompt: a refusal, and no store."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(monkeypatch)
+
+    def lose_it_at_the_prompt(text: str) -> None:
+        if text.startswith("Authenticator code"):
+            raise OSError("synthetic console loss")
+        terminal.show(text)
+
+    monkeypatch.setattr(cli, "_show_on_terminal", lose_it_at_the_prompt)
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    err = capsys.readouterr().err
+    assert "console went away" in err and "nothing was written" in err
+    assert terminal.asked == 0
+    assert not db.exists()
+
+
+def test_the_last_wrong_code_is_not_told_to_try_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Five wrong codes: four retry messages, never a fifth, since no attempt is left after it."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(
+        monkeypatch, ["000000", "111111", "222222", "333333", "444444"]
+    )
+    assert (
+        main(["provision-admin", "--username", "site-admin", "--db", str(tmp_path / "p.db")]) != 0
+    )
+    assert sum("did not match" in text for text in terminal.shown) == 4

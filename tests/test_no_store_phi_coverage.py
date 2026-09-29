@@ -151,6 +151,7 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     ("SecurityEventInfo", "detail"): "audit_log.detail",
     # --- composed in the route body; no store column to rate -----------------------------------
     ("SimpleMessage", "detail"): None,  # a literal operation-result string
+    ("MfaResetResponse", "detail"): None,  # the literal "MFA reset" (ADR 0197 Amendment A)
     # Both construction sites are engine-authored literals -- auth_routes.py `detail="re-verified"`
     # on /me/reauth and `detail="verified"` on /auth/mfa-verify. Neither route reads the store.
     ("ElevatedResponse", "detail"): None,

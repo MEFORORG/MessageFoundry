@@ -49,6 +49,7 @@ async def test_create_get_and_list_users() -> None:
             email="a@example.org",
             password_hash="hash",
             now=1000.0,
+            password_generated=False,
         )
         assert await store.count_users() == 1
         u = await store.get_user_by_username("alice")
@@ -65,7 +66,9 @@ async def test_role_assignment_replace_and_resolution() -> None:
     store = await _store()
     try:
         await _seed_roles(store)
-        await store.create_user(user_id="u1", username="alice", auth_provider="local", now=1.0)
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+        )
         await store.set_user_roles("u1", ["operator", "viewer"], assigned_by="admin", now=2.0)
         assert set(await store.get_user_role_ids("u1")) == {"operator", "viewer"}
         await store.set_user_roles("u1", ["viewer"], now=3.0)  # replace
@@ -109,7 +112,9 @@ async def test_ad_group_role_map_normalizes_and_resolves() -> None:
 async def test_login_failure_lockout_and_success_reset() -> None:
     store = await _store()
     try:
-        await store.create_user(user_id="u1", username="alice", auth_provider="local", now=1.0)
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+        )
         await store.record_login_failure("u1", failed_attempts=3, locked_until=500.0, now=10.0)
         u = await store.get_user("u1")
         assert u is not None and u.failed_attempts == 3 and u.locked_until == 500.0
@@ -136,7 +141,9 @@ async def test_lockout_counter_contract() -> None:
 async def test_sessions_lifecycle_and_purge() -> None:
     store = await _store()
     try:
-        await store.create_user(user_id="u1", username="alice", auth_provider="local", now=1.0)
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+        )
         await store.create_session(
             token_hash="abc", user_id="u1", expires_at=1000.0, client="console", now=10.0
         )
@@ -159,7 +166,9 @@ async def test_delete_user_cascades_roles_and_sessions() -> None:
     store = await _store()
     try:
         await _seed_roles(store)
-        await store.create_user(user_id="u1", username="alice", auth_provider="local", now=1.0)
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+        )
         await store.set_user_roles("u1", ["viewer"], now=2.0)
         await store.create_session(token_hash="t", user_id="u1", expires_at=1000.0, now=2.0)
         await store.delete_user("u1")
@@ -187,10 +196,22 @@ async def test_create_user_seeds_the_notification_address_from_the_one_it_is_giv
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", email="a@example.org"
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            email="a@example.org",
+            password_generated=False,
         )
-        await store.create_user(user_id="u2", username="bob", auth_provider="local")
-        await store.create_user(user_id="u3", username="carol", auth_provider="local", email="   ")
+        await store.create_user(
+            user_id="u2", username="bob", auth_provider="local", password_generated=False
+        )
+        await store.create_user(
+            user_id="u3",
+            username="carol",
+            auth_provider="local",
+            email="   ",
+            password_generated=False,
+        )
         alice = await store.get_user("u1")
         assert alice is not None
         assert alice.email == "a@example.org" and alice.notify_email == "a@example.org"
@@ -213,7 +234,11 @@ async def test_the_directory_sync_write_cannot_move_the_notification_address() -
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="ad", email="a@corp.example"
+            user_id="u1",
+            username="alice",
+            auth_provider="ad",
+            email="a@corp.example",
+            password_generated=False,
         )
         # The directory now says something else. This is exactly the shape of a repoint.
         await store.update_user_profile("u1", display_name="Alice A", email="attacker@evil.example")
@@ -238,7 +263,11 @@ async def test_the_notification_address_is_repointable_but_not_erasable() -> Non
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", email="a@example.org"
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            email="a@example.org",
+            password_generated=False,
         )
         await store.set_user_notify_email("u1", email="new@example.org")
         user = await store.get_user("u1")
@@ -268,9 +297,15 @@ async def test_the_schema_upgrade_seeds_the_new_column_on_a_pre_split_database(
     store = await MessageStore.open(str(db))
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", email="a@example.org"
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            email="a@example.org",
+            password_generated=False,
         )
-        await store.create_user(user_id="u2", username="bob", auth_provider="local")
+        await store.create_user(
+            user_id="u2", username="bob", auth_provider="local", password_generated=False
+        )
     finally:
         await store.close()
     # Drop the column to reproduce the pre-split shape (SQLite supports DROP COLUMN since 3.35).
@@ -376,6 +411,7 @@ async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_cl
             username="jsmith",
             auth_provider="ad",
             directory_object_id=BOUND_GUID,
+            password_generated=False,
         )
     finally:
         await store.close()
@@ -407,6 +443,7 @@ async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_cl
                 username=f"rebound{pass_no}",
                 auth_provider="ad",
                 directory_object_id=guid,
+                password_generated=False,
             )
             found = await store.get_user_by_directory_object_id(guid)
             assert found is not None and found.id == f"u-rebind-{pass_no}"
@@ -478,7 +515,9 @@ async def test_the_guard_reads_the_binding_while_holding_the_sqlite_writer_lock(
     """
     store = await _store()
     try:
-        await store.create_user(user_id="u1", username="alice", auth_provider="ad", now=1.0)
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+        )
         await store.set_user_federated_subject("u1", "https://idp.example", "S-1-a", now=1.0)
 
         real_execute = store._db.execute
@@ -545,7 +584,9 @@ async def test_an_unbind_clears_a_half_row_rather_than_calling_it_nothing_to_rem
     """
     store = await _store()
     try:
-        await store.create_user(user_id="u1", username="alice", auth_provider="ad", now=1.0)
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+        )
         # Straight to the column, because the typed setter cannot spell a half binding.
         await store._db.execute("UPDATE users SET oidc_issuer=? WHERE id=?", ("https://idp", "u1"))
         await store._db.commit()
@@ -582,7 +623,9 @@ async def test_a_failed_revocation_leaves_the_binding_in_place(
     """
     store = await _store()
     try:
-        await store.create_user(user_id="u1", username="alice", auth_provider="ad", now=1.0)
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+        )
         await store.set_user_federated_subject("u1", "https://idp.example", "S-1-a", now=1.0)
         await store.create_session(token_hash="t1", user_id="u1", expires_at=9e9, now=1.0)
 
@@ -623,7 +666,12 @@ def test_next_lockout_state_escalates_caps_and_never_extends_a_live_lock() -> No
     """ADR 0197 build step 3, on the pure policy function every backend runs."""
     from messagefoundry.store.store import next_lockout_state
 
-    base = {"threshold": 3, "lockout_seconds": 900.0, "max_lockout_seconds": 3_600.0}
+    base = {
+        "threshold": 3,
+        "lockout_seconds": 900.0,
+        "max_lockout_seconds": 3_600.0,
+        "lockable": True,
+    }
 
     def step(**kw: Any) -> tuple[Any, ...]:
         s = next_lockout_state(**{**base, **kw})

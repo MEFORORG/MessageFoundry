@@ -1343,6 +1343,21 @@ ruling.
   factor removal that would leave it no factor with a way past.
 - **AC-A4** -- WHEN `admin_reset_mfa` runs on a local account, THE SYSTEM SHALL issue a generated
   credential in the same call.
+> **Note (2026-09-29), a Manager decision prompted by PR 1761 (BACKLOG #1132), not an owner
+> ruling. It applies to AC-A2 and AC-A4.** This amendment treated the credential generator as
+> unable to fail. Since PR 1761 it screens the site's own context words and raises
+> `TemporaryPasswordUnavailable` after `_RESET_GENERATION_ATTEMPTS` misses, so account creation, the
+> password reset and the factor reset can answer 503. That happens only on a pathological
+> `[auth].password_extra_context_words` list. The screen stays, because #1132's intent is that no
+> issued credential fails the policy. The failure is made harmless and early instead. Every path
+> that issues a generated credential generates it before any row is written, any factor cleared or
+> any session revoked, and a route whose action-bound gate already spent the single-use step-up grant
+> gives it back (`AuthService.refund_action_step_up`, which restores only a grant it spent, with its
+> original deadline). And the engine probes the generator once at start, logging an ERROR on
+> failure, and `messagefoundry verify` reports the same as `auth.credential_generation`. Neither
+> refuses to start. `provision-admin` issues no generated credential, since the operator types it,
+> so it needed no change for this.
+
 - **AC-A5** -- WHEN `provision-admin` completes while `require_mfa` is on, THE SYSTEM SHALL have
   enabled TOTP on the new administrator before its role is written; and WHEN it repairs a roleless
   row, THE SYSTEM SHALL first clear that row's factors and revoke its sessions.

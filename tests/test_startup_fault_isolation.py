@@ -32,6 +32,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
+from tests._admin_account import create_local_user_chosen
 
 if TYPE_CHECKING:  # the API rig below imports these lazily, inside the tests that use them
     import httpx
@@ -133,7 +134,8 @@ async def _provision_viewer(service: AuthService) -> None:
     """Create the viewer the two API tests below log in as, scoped to the whole estate."""
     from messagefoundry.auth import Role
 
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="vw",
         password=_VIEWER_PW,
         display_name=None,
@@ -147,7 +149,9 @@ async def _provision_viewer(service: AuthService) -> None:
     await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     u = await service.store.get_user(uid)
     assert u is not None and u.password_hash is not None
-    await service.store.set_password(uid, password_hash=u.password_hash, must_change_password=False)
+    await service.store.set_password(
+        uid, password_hash=u.password_hash, must_change_password=False, password_generated=False
+    )
 
 
 async def _viewer_headers(client: httpx.AsyncClient) -> dict[str, str]:
@@ -587,7 +591,8 @@ async def test_status_reports_failed_inbounds_and_scopes_their_names(tmp_path: P
         # 'wide' sees the whole estate; 'narrow' is scoped to 'winner' only, so the FAILED inbound
         # is out of its scope.
         for username, channels in (("wide", [ALL_CHANNELS]), ("narrow", ["winner"])):
-            uid = await service.create_local_user(
+            uid = await create_local_user_chosen(
+                service,
                 username=username,
                 password=pw,
                 display_name=None,
@@ -599,7 +604,10 @@ async def test_status_reports_failed_inbounds_and_scopes_their_names(tmp_path: P
             u = await service.store.get_user(uid)
             assert u is not None and u.password_hash is not None
             await service.store.set_password(
-                uid, password_hash=u.password_hash, must_change_password=False
+                uid,
+                password_hash=u.password_hash,
+                must_change_password=False,
+                password_generated=False,
             )
 
         await engine.start()  # degraded — does NOT raise (ADR 0031)
