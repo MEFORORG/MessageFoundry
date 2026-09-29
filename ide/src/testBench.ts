@@ -133,8 +133,8 @@ export class TestBench {
   private collections: CollectionStore | undefined;
 
   private collectionStore(): CollectionStore {
-    // storageUri is VS Code's own per-workspace scope (the one workspaceState used); undefined only in
-    // a window with no folder open, which then gets a single shared scope, as workspaceState did.
+    // storageUri is VS Code's own per-workspace scope (the one workspaceState used). It is undefined
+    // only in a window with no folder open, where saving is refused anyway (it needs workspaceDir()).
     this.collections ??= new CollectionStore(
       this.context.secrets,
       this.context.workspaceState,
@@ -151,16 +151,39 @@ export class TestBench {
     return this.collectionStore().save(map);
   }
 
-  /** Run a collection action, reporting a storage failure without echoing anything it read. */
+  /**
+   * Run a collection action, reporting a storage failure without echoing anything it read: only the
+   * error's type is logged, never its message, which could quote a stored body. An unreadable stored
+   * value would block every collection command, so that case offers to delete the saved collections.
+   */
   private async withCollections(action: () => Promise<void>): Promise<void> {
     try {
       await action();
     } catch (e) {
-      const why =
-        e instanceof CollectionStoreError
-          ? e.message
-          : "saved Test Bench collections could not be read or written";
-      void vscode.window.showErrorMessage(`MessageFoundry: ${why}.`);
+      console.warn(
+        `MessageFoundry Test Bench: collection storage failed (${e instanceof Error ? e.name : typeof e})`,
+      );
+      if (!(e instanceof CollectionStoreError)) {
+        void vscode.window.showErrorMessage(
+          "MessageFoundry: saved Test Bench collections could not be read or written.",
+        );
+        return;
+      }
+      const reset = await vscode.window.showErrorMessage(
+        `MessageFoundry: ${e.message}. Delete the saved collections for this workspace?`,
+        { modal: true },
+        "Delete",
+      );
+      if (reset === "Delete") {
+        try {
+          await this.collectionStore().reset();
+          await this.postCollections();
+        } catch {
+          void vscode.window.showErrorMessage(
+            "MessageFoundry: the saved Test Bench collections could not be deleted.",
+          );
+        }
+      }
     }
   }
 
@@ -170,6 +193,9 @@ export class TestBench {
       return;
     }
     const map = await this.loadCollections();
+    if (!this.panel) {
+      return; // closed while the (possibly migrating) load ran
+    }
     const items = Object.values(map)
       .map((c) => ({ name: c.name, cases: c.cases.length }))
       .sort((a, b) => a.name.localeCompare(b.name));

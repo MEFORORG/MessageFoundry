@@ -175,6 +175,35 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     assert.strictEqual(memento.data.size, 0);
   });
 
+  test("a malformed collection is dropped so the rest still list", async () => {
+    const secrets = new FakeSecrets();
+    await secrets.store(
+      collectionsSecretKey("file:///ws/a"),
+      JSON.stringify({ good: coll("good"), noCases: { name: "noCases" }, notAMap: 3 }),
+    );
+    const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
+    assert.deepStrictEqual(await store.load(), { good: coll("good") });
+  });
+
+  test("a legacy value that is not a map is removed without blocking the store", async () => {
+    const secrets = new FakeSecrets();
+    const memento = new FakeMemento();
+    memento.data.set(LEGACY_COLLECTIONS_KEY, "not a map");
+    assert.deepStrictEqual(await new CollectionStore(secrets, memento, "file:///ws/a").load(), {});
+    assert.strictEqual(memento.data.size, 0);
+  });
+
+  test("reset deletes this workspace's saved collections, the way out of an unreadable value", async () => {
+    const secrets = new FakeSecrets();
+    await secrets.store(collectionsSecretKey("file:///ws/a"), "{not json");
+    await secrets.store(collectionsSecretKey("file:///ws/b"), JSON.stringify({ b: coll("b") }));
+    const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
+    await assert.rejects(store.load(), CollectionStoreError);
+    await store.reset();
+    assert.deepStrictEqual(await store.load(), {});
+    assert.ok(secrets.data.has(collectionsSecretKey("file:///ws/b")), "another workspace is untouched");
+  });
+
   test("an unreadable stored value raises without echoing any of it", async () => {
     const secrets = new FakeSecrets();
     await secrets.store(collectionsSecretKey("file:///ws/a"), "{not json MRN-123");
