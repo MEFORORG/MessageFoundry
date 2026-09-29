@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import difflib
 import ipaddress
-import json
 import logging
 import os
 import re
@@ -89,6 +88,7 @@ from messagefoundry.config.tls_policy import (
     validate_tls_ciphers,
 )
 from messagefoundry.logging_setup import LOG_LEVELS
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.service_status import is_safe_service_name
 
 __all__ = [
@@ -2860,13 +2860,17 @@ class AuthSettings(_Section):
             if not text:
                 return []
             if text.startswith("["):
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError as exc:
+                # The helper returns rather than raises, so this refusal has no decode error on its
+                # chain (BACKLOG #2085). It also turns json's RecursionError on a deeply nested value
+                # into a refusal. It hides nothing else: pydantic's error still quotes the raw value
+                # as input_value.
+                parsed, refusal = json_loads_or_refusal(text)
+                if refusal is not None:
                     raise ValueError(
                         "[auth].password_extra_context_words looks like a JSON array but does not "
-                        f"parse: {exc.msg}"
-                    ) from exc
+                        f"parse ({refusal}); check its brackets, quotes and commas"
+                    )
+                return parsed
             return v.split(",")
         return v
 

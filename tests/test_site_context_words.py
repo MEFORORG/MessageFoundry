@@ -203,8 +203,20 @@ def test_the_environment_accepts_a_json_array() -> None:
 
 
 def test_a_malformed_json_array_in_the_environment_refuses() -> None:
-    with pytest.raises(ValidationError, match="does not parse"):
+    with pytest.raises(ValidationError, match="does not parse") as info:
         load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": '["acme",'})
+    # Raised outside the decode handler, so the JSONDecodeError, which holds the whole value on
+    # `.doc`, is on neither chain (BACKLOG #2085). Red under a raise inside the handler.
+    error = info.value.errors()[0]["ctx"]["error"]
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_a_too_deeply_nested_json_array_refuses_rather_than_crashing() -> None:
+    # json raises RecursionError here, which no JSONDecodeError arm catches, so before the helper
+    # it escaped load_settings as a raw crash.
+    with pytest.raises(ValidationError, match="does not parse"):
+        load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": "[" * 100_000})
 
 
 def test_a_blank_environment_value_means_no_site_terms() -> None:
