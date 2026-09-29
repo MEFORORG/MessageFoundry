@@ -2223,6 +2223,8 @@ def _ftps_client() -> _FtpClient:
         ("login", "530 Too many connections from your internet address"),
         ("login", "530 Too many connections, please retry later"),
         ("login", "530 No more than 10 users permitted"),
+        # "entries" holds "tries"; a busy server's text must not read as a credential word.
+        ("login", "530 Too many connections; see the FAQ entries on our site"),
         ("login", "530 Connection limit reached"),
         ("login", "530 Maximum number of users exceeded"),
         (
@@ -2290,6 +2292,17 @@ def test_a_tls_refusal_is_a_configuration_fault_not_a_credential_fault(
         "530 Unknown user; too many users",
         "530 User not found: too many users",
         "530 Account suspended: maximum sessions exceeded",
+        # Fix round 3: a credential or account word with a prefix. Round 2's word boundaries let
+        # each of these read as a busy server, so the login was retried into a lockout.
+        "530 Too many connections, account temporarily blocked",
+        "530 Unauthorized: too many sessions",
+        "530 Too many connections from this user, try again after unlock",
+        "530 Too many sessions: user unauthenticated",
+        "530 Too many sessions: account deactivated",
+        "530 Too many users; access revoked",
+        "530 Forbidden: too many connections",
+        # Names TLS and the credential: the credential words win over the TLS demand.
+        "530 Login incorrect; SSL/TLS required",
     ],
 )
 def test_a_refused_credential_is_still_a_credential_fault(
@@ -2301,6 +2314,54 @@ def test_a_refused_credential_is_still_a_credential_fault(
     assert caught.value.permanent is True
     assert caught.value.credential_fault is True, "a refused credential must stop the lane"
     assert "login refused" in str(caught.value)
+
+
+def _scripted_plain_ftp(monkeypatch: pytest.MonkeyPatch, *, refuse_at: str, reply: str) -> None:
+    """Make ``ftplib.FTP`` a :class:`_ScriptedFtp`, for plain FTP under the insecure escape."""
+    import ftplib as _ftplib
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    _ScriptedFtp.instances = []
+
+    class _Plain(_ScriptedFtp):
+        def __init__(self, *, timeout: float | None = None) -> None:
+            super().__init__(refuse_at=refuse_at, reply=reply)
+
+    monkeypatch.setattr(_ftplib, "FTP", _Plain)
+
+
+@pytest.mark.parametrize("tls", [False, True], ids=["plain-ftp", "ftps"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "530 Non-anonymous sessions must use encryption.",  # vsftpd, force_local_logins_ssl
+        "550 SSL/TLS required on the control channel",  # ProFTPD, TLSRequired
+        "530 This server does not allow plain FTP. You have to use FTP over TLS.",  # FileZilla
+        "534 Policy requires SSL.",  # IIS
+    ],
+)
+def test_a_tls_demand_at_the_login_is_a_configuration_fault(
+    monkeypatch: pytest.MonkeyPatch, tls: bool, reply: str
+) -> None:
+    """Fix round 3: a server that demands TLS answers the login, but the fault is the connection's
+    TLS setting, not the credential, so it is classed as a refused ``AUTH TLS`` is."""
+    if tls:
+        _scripted_ftps(monkeypatch, refuse_at="login", reply=reply)
+        client = _ftps_client()
+    else:
+        _scripted_plain_ftp(monkeypatch, refuse_at="login", reply=reply)
+        client = _FtpClient(
+            {"host": "ftp.example.com", "remote_dir": "/in", "username": "u", "password": "p"},
+            tls=False,
+        )
+    with pytest.raises(_RemoteError) as caught:
+        client.list_dir("/in")
+    assert caught.value.permanent is True, "no retry makes the connection use TLS"
+    assert caught.value.credential_fault is False, "no credential was at fault"
+    assert "TLS configuration fault" in str(caught.value)
+    (ftp,) = _ScriptedFtp.instances
+    assert ftp.closed, "the refused connection must be closed"
+    assert ftp.steps == (["greeting", "auth", "login"] if tls else ["greeting", "login"])
 
 
 def test_a_refused_greeting_is_permanent_but_not_a_credential_fault(
@@ -2343,6 +2404,30 @@ async def test_validate_directory_stops_the_lane_only_on_a_refused_credential(
         assert caught.value.credential_fault is True
     else:
         assert not isinstance(caught.value, NegativeAckError), "a busy server is retried"
+
+
+@pytest.mark.parametrize(
+    ("refuse_at", "reply"),
+    [
+        ("greeting", "550 Access denied for your address"),
+        ("auth", "534 Request denied for policy reason."),
+        ("prot_p", "536 Requested PROT level not supported by mechanism."),
+    ],
+    ids=["greeting", "auth-tls", "prot-p"],
+)
+async def test_validate_directory_retries_a_configuration_fault(
+    monkeypatch: pytest.MonkeyPatch, refuse_at: str, reply: str
+) -> None:
+    """With ``validate_directory`` on, ``_list_or_retry`` re-raises every fault but a refused
+    credential as transient, so a refused greeting or TLS step is retried there, not dead-lettered.
+    The CHANGELOG entry says so; this pins it."""
+    _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
+    dest = build_destination(
+        _ftp_dest(tls=True, username="u", password="p", validate_directory=True, filename="m.hl7")
+    )
+    with pytest.raises(DeliveryError) as caught:
+        await dest.send(_UPLOAD_BODY)
+    assert not isinstance(caught.value, NegativeAckError), "retried under validate_directory"
 
 
 # --- BACKLOG #2071: the settle gate on the remote source -------------------------------------------

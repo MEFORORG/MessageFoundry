@@ -585,10 +585,11 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **A busy FTP server no longer stops an outbound lane.** Every 5xx reply while an FTP or FTPS
   session opened was treated as a refused credential, which stops the lane (ADR 0095). A reply that
   names a connection limit, such as ProFTPD's "maximum number of clients", is now retried. A refused
-  `AUTH TLS`, `PBSZ` or `PROT P` is now a permanent configuration fault, and a refused greeting is
-  permanent too; neither stops the lane. A refused login still does, and so does a 530 whose text
-  does not plainly name a limit. The same holds under `validate_directory`, whose per-send listing
-  passes a credential fault through. (`BACKLOG #2083`)
+  greeting, `AUTH TLS`, `PBSZ` or `PROT P` is now a permanent configuration fault. So is a login
+  refusal that says the server requires TLS. These do not stop the lane; each message is
+  dead-lettered instead. A refused login still stops it, and so does a 530 whose text does not
+  plainly name a limit. With `validate_directory` on, the per-send listing retries every one of these
+  faults except the refused login. (`BACKLOG #2083`)
 - **The SFTP and FTP source now waits for a file to stop growing before it reads it.** A file is
   read only once it lists at the same size on two polls in a row, as the local File source has done
   since `BACKLOG #1811`, so a partner that pauses between writes for less than `poll_seconds` is
