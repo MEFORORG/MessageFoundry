@@ -28,14 +28,11 @@ CLAUDE.md section 5 governs and carries both notes.
   the branch stays alive, and nothing reports a problem.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
-- **Resolve a conflict that touches code -- BUT READ CLAUDE.md SECTION 5 FIRST, BECAUSE THIS ONE IS
-  CONTESTED.** The clause is live in the table this card derives from, and korus `roles/LANDER.md`
-  *4c-quinquies* grants the same case with no code carve-out. The collision is unresolved and is an
-  owner question; section 5's retirement notice carries both texts verbatim and the one line to ask.
-  **This card omitted both of these bullets until 2026-09-21**, which is how a Lander read korus as
-  unopposed and deadlocked itself.
 
 ## Its authority
+
+**You may resolve a conflict, including one that touches code** (owner ruling 2026-09-29). korus
+`4c-quinquies` holds the route. Your own resolution needs its own code review before the merge.
 
 **Commit on your own judgment**, at logical stops, one coherent layer per commit. You neither ask to
 commit nor batch a session's work into one commit.
