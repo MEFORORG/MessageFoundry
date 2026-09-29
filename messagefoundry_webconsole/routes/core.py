@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any, TypedDict
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import uuid4
@@ -20,6 +21,7 @@ from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     EditResendRequest,
+    MessageBody,
     PendingApprovalResponse,
     ResendRequest,
 )
@@ -76,8 +78,9 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa`` refused a directory account the
-#: directory did not confirm (BACKLOG #2023). The code was never checked, so "invalid code" is false.
+#: What the MFA gate and the re-auth form say when ``verify_mfa`` or ``reauth`` refused a directory
+#: account the directory did not confirm (BACKLOG #2023, #2027). The code or password was never
+#: checked, so "invalid code" or "incorrect password" would be false.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )
@@ -105,6 +108,44 @@ _BAD_BOUND_MESSAGE = (
     f"{datetime.fromtimestamp(0.0, UTC):%Y-%m-%dT%H:%M} and "
     f"{datetime.fromtimestamp(EPOCH_SECONDS_MAX, UTC):%Y-%m-%dT%H:%M}"
 )
+
+#: What each /ui message route reveals, declared once per route (BACKLOG #2346, ASVS 14.2.6).
+#:
+#: ASVS 14.2.6 asks that complete data stay masked "unless the user specifically views it", and
+#: BACKLOG #1187 reads that strictly: opening a message is not the act of viewing its summary or its
+#: body. So a route reveals the summary or fetches the body ONLY when this table says it does, and
+#: the answer is a property of the route the operator chose, never of the permissions they hold.
+#: Holding ``messages:view_raw`` makes a reveal possible; the request to a revealing route is the act.
+#:
+#: - The bare detail page reveals nothing. The dead-letter "view" link, the redirect after a replay
+#:   or an edit-resend, and a typed URL all land there, and none of them is an act aimed at the data.
+#: - ``/summary`` is where the message list and content search link from the MASKED summary, so the
+#:   click is aimed at the summary. The detail page also offers it as a "Reveal" link.
+#: - ``/body`` is the detail page's "Show raw message" link. The summary is derived from the body, so
+#:   showing the body and masking the summary beside it would hide nothing.
+#: - The parse tree, the editor and the editor's reject arm exist to show the body.
+#:
+#: A route that is not listed reveals nothing, and :func:`_message_body` refuses to fetch a body for
+#: a route that does not declare ``body``. That refusal covers the helpers only: a handler calling
+#: ``core.get_message`` or ``core.get_message_body`` directly would go around it, which is what the
+#: console suite's source test over these modules fails on. Attachment downloads are not in this
+#: table; they are their own audited route.
+UI_MESSAGE_REVEALS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "/ui/messages/{message_id}": frozenset(),
+        "/ui/messages/{message_id}/summary": frozenset({"summary"}),
+        "/ui/messages/{message_id}/body": frozenset({"summary", "body"}),
+        "/ui/messages/{message_id}/parse-tree": frozenset({"body"}),
+        "/ui/messages/{message_id}/edit": frozenset({"body"}),
+        "/ui/messages/{message_id}/edit-resend": frozenset({"body"}),
+    }
+)
+
+
+def _declared_reveals(request: Request) -> frozenset[str]:
+    """This request's route's row in :data:`UI_MESSAGE_REVEALS`; nothing for an unlisted route."""
+    path = getattr(request.scope.get("route"), "path", None)
+    return UI_MESSAGE_REVEALS.get(path or "", frozenset())
 
 
 class _MsgFilters(TypedDict):
@@ -659,6 +700,65 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
         return HTMLResponse(pages.messages(data, **typed))
 
+    async def _open_message(
+        message_id: str, request: Request, engine: Any, identity: Identity
+    ) -> Any:
+        """Open one message through the engine's audited ``get_message``, revealing the summary only
+        when this route declares ``summary`` in :data:`UI_MESSAGE_REVEALS` (BACKLOG #2346)."""
+        return await core.get_message(
+            message_id,
+            request,
+            engine=engine,
+            identity=identity,
+            reveal_summary="summary" in _declared_reveals(request),
+        )
+
+    async def _message_body(
+        message_id: str, request: Request, engine: Any, identity: Identity
+    ) -> str:
+        """The raw body through the engine's own audited fetch (BACKLOG #2345). The engine records
+        the audit row's surface as ``console`` itself, because this call arrives on a /ui route; the
+        console passes no surface. Every caller's /ui gate must assert messages:view_raw with
+        phi=True, because calling the handler in-process skips its own require_phi_read gate (see
+        CoreHandlers).
+
+        Refuses unless this route declares ``body`` in :data:`UI_MESSAGE_REVEALS` (BACKLOG #2346).
+        That is a programming error, not an operator one, so it fails loudly rather than rendering."""
+        if "body" not in _declared_reveals(request):
+            raise RuntimeError(
+                "a /ui route fetched a message body without declaring 'body' in UI_MESSAGE_REVEALS"
+            )
+        # Annotated so the console's use of MessageBody.raw joins the discovered seam surface: a
+        # reshaped MessageBody then moves the digest and fails the handshake, not a page render.
+        body: MessageBody = await core.get_message_body(
+            message_id, request, engine=engine, identity=identity
+        )
+        return body.raw
+
+    async def _detail_page(
+        message_id: str, request: Request, engine: Any, identity: Identity
+    ) -> HTMLResponse:
+        """The detail page, showing what this route declares and nothing more (BACKLOG #2346)."""
+        reveals = _declared_reveals(request)
+        detail = await _open_message(message_id, request, engine, identity)
+        raw = (
+            await _message_body(message_id, request, engine, identity)
+            if "body" in reveals
+            else None
+        )
+        return HTMLResponse(
+            pages.message_detail(detail, raw, summary_revealed="summary" in reveals)
+        )
+
+    # Three routes, one page. What each reveals is its row in UI_MESSAGE_REVEALS, so the act is the
+    # route the operator chose: the bare path reveals nothing, /summary is the click on a masked
+    # summary, and /body is the "Show raw message" click. All three carry the gate the detail page
+    # always had, because each still opens the message through the view_raw-gated get_message.
+    #
+    # Three handlers rather than one function under three stacked decorators, on purpose. The
+    # PHI-read scope count in docs/SECURITY.md is derived from require_ui(..., phi=True) CALL SITES
+    # (tests/test_security_doc_rate_limits.py), so one shared gate would state 5 charging views
+    # where 7 routes charge. Each gate is also pinned per route by the /ui route map in SECURITY.md.
     @app.get("/ui/messages/{message_id}", response_class=HTMLResponse)
     async def ui_message_detail(
         message_id: str,
@@ -666,8 +766,25 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
     ) -> HTMLResponse:
-        detail = await core.get_message(message_id, request, engine=engine, identity=identity)
-        return HTMLResponse(pages.message_detail(detail))
+        return await _detail_page(message_id, request, engine, identity)
+
+    @app.get("/ui/messages/{message_id}/summary", response_class=HTMLResponse)
+    async def ui_message_detail_summary(
+        message_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
+    ) -> HTMLResponse:
+        return await _detail_page(message_id, request, engine, identity)
+
+    @app.get("/ui/messages/{message_id}/body", response_class=HTMLResponse)
+    async def ui_message_detail_body(
+        message_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
+    ) -> HTMLResponse:
+        return await _detail_page(message_id, request, engine, identity)
 
     @app.get("/ui/messages/{message_id}/parse-tree", response_class=HTMLResponse)
     async def ui_message_parse_tree(
@@ -676,12 +793,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
     ) -> HTMLResponse:
-        # Reuse the single audited PHI path (get_message → record_view + record_audit), then render
-        # the tree server-side via the pure parsing lib. Non-HL7 bodies (X12/DICOM/binary) have no
-        # HL7 tree — surface that rather than 500. No new PHI egress beyond the audited raw fetch.
-        detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+        # Reuse the single audited body path (get_message_body, which writes record_view and a
+        # message_body_view audit row), then render the tree server-side via the pure parsing lib. The page shows no
+        # metadata, so it does not open the message too. Non-HL7 bodies (X12/DICOM/binary) have no
+        # HL7 tree — surface that rather than 500. No new PHI egress beyond the audited body fetch.
+        raw = await _message_body(message_id, request, engine, identity)
         try:
-            nodes = parse_tree(detail.raw)
+            nodes = parse_tree(raw)
         except HL7PeekError as exc:
             return HTMLResponse(pages.parse_tree_unavailable(message_id, str(exc)))
         return HTMLResponse(pages.parse_tree_page(message_id, nodes))
@@ -803,6 +921,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         await core.replay_message(message_id, engine=engine, identity=identity, request=request)
+        # The bare detail path on purpose: a replay is not an act aimed at the summary or the body,
+        # so the page it lands on reveals neither (BACKLOG #2346, UI_MESSAGE_REVEALS).
         return RedirectResponse(f"/ui/messages/{message_id}", status_code=303)
 
     # Resend to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500) — ADR 0090's residual (a).
@@ -916,10 +1036,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). GET renders the editor (a COPY of the raw); the
     # step-up gate opens it inside a fresh window (unlock continuation). The origin row is only READ
-    # here (the audited get_message path); nothing is written until the operator POSTs /edit-resend.
+    # here (the audited get_message and get_message_body paths); nothing is written until the operator
+    # POSTs /edit-resend.
     #
     # view_raw is required ALONGSIDE edit (BACKLOG #324) because the editor inherently DISPLAYS the
-    # body: it renders `detail.raw` into the textarea and ships a second pristine copy in
+    # body: it renders the fetched body into the textarea and ships a second pristine copy in
     # `data-original`. `messages:edit` stays mintable on a custom role (ADR 0045 D1 is unchanged), so
     # without this a role meaning "may resubmit, must not read" would read raw PHI here — the read
     # permission its grant deliberately withheld. Such a role is still mintable and still resubmits
@@ -935,13 +1056,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             require_ui_step_up(Permission.MESSAGES_EDIT, Permission.MESSAGES_VIEW_RAW, phi=True)
         ),
     ) -> HTMLResponse:
-        detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+        detail = await _open_message(message_id, request, engine, identity)
+        raw = await _message_body(message_id, request, engine, identity)
         # A fresh per-open idempotency token: a double-submit of THIS rendered form is an idempotent
         # no-op; re-opening the editor mints a new token (a genuine second resubmit).
-        return HTMLResponse(pages.message_edit(detail, uuid4().hex))
+        return HTMLResponse(pages.message_edit(detail, uuid4().hex, original=raw))
 
     # Same two-permission gate as the GET (BACKLOG #324), because this verb ALSO renders the body: the
-    # `_reject` arm below re-reads the origin via the audited `core.get_message` and re-ships the
+    # `_reject` arm below re-reads the origin via the audited `core.get_message_body` and re-ships the
     # PRISTINE stored copy through `data_original`. Gating it on `messages:edit` alone would leave the
     # rejection path as an unauthorized read of exactly the body the GET now refuses. phi=True for the
     # same reason — otherwise the reject path is an UNTHROTTLED channel for re-reading stored bodies
@@ -974,12 +1096,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         async def _reject(msg: str) -> HTMLResponse:
             # Re-render the editor preserving the operator's edits (raw_value) AND their destination
             # choice (mode + to) — so a rejected direct send doesn't silently reset to re-route and drop
-            # the typed outbound (review #153-4). The audited get_message re-read is the same PHI path
+            # the typed outbound (review #153-4). The audited get_message_body re-read is the same PHI path
             # the GET used. NEVER echo the edited body in the error text.
-            detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+            detail = await _open_message(message_id, request, engine, identity)
+            original = await _message_body(message_id, request, engine, identity)
             return HTMLResponse(
                 pages.message_edit(
-                    detail, idem or uuid4().hex, raw_value=raw, error=msg, mode=mode, to=to
+                    detail,
+                    idem or uuid4().hex,
+                    original=original,
+                    raw_value=raw,
+                    error=msg,
+                    mode=mode,
+                    to=to,
                 ),
                 status_code=400,
             )
@@ -1343,7 +1472,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             wa_options, wa_notice = await _reauth_webauthn_state(
                 request, auth, token, mfa, not still_unsatisfied
             )
-            # The wrong-password exit AFTER a successful code leg — the stranded-cookie case.
+            # The wrong-password exit AFTER a successful code leg — the stranded-cookie case. A
+            # directory that could not judge the password never called it wrong (BACKLOG #2027).
             return _keep_session(
                 HTMLResponse(
                     pages.reauth(
@@ -1351,7 +1481,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=mfa_enrolled and still_unsatisfied,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error="Incorrect password.",
+                        error=(
+                            _DIRECTORY_UNCONFIRMED_ERROR
+                            if _directory_unconfirmed(pw_elevation)
+                            else "Incorrect password."
+                        ),
                     )
                 ),
                 token,

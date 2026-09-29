@@ -185,6 +185,66 @@ def test_apiclient_still_sends_a_query_that_fits(monkeypatch: pytest.MonkeyPatch
     )
 
 
+def test_get_message_body_names_its_surface_and_decodes_the_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2345: the body fetch goes to ``/messages/{id}/raw`` and carries ``surface``, which
+    the engine writes into the ``message_body_view`` audit row. The default names this library; a
+    caller such as the harness passes its own. The open (``get_message``) carries no ``surface``."""
+    from messagefoundry.apiclient.client import EngineClient
+
+    client = EngineClient("http://127.0.0.1:8765")
+    sent: list[str] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json={"message_id": "m1", "raw": "MSH|x"}, request=request)
+
+    monkeypatch.setattr(client._http, "send", _capture)
+    assert client.get_message_body("m1").raw == "MSH|x"
+    assert client.get_message_body("m1", surface="harness").message_id == "m1"
+    assert sent == [
+        "http://127.0.0.1:8765/messages/m1/raw?surface=apiclient",
+        "http://127.0.0.1:8765/messages/m1/raw?surface=harness",
+    ]
+
+
+def test_get_message_sends_the_summary_reveal_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2346: a plain open sends the bare URL, so the engine masks the summary; only
+    ``reveal_summary=True`` adds the parameter that lifts the mask. Both requests are captured, so
+    the bare URL is the control that the flag is what differs."""
+    from messagefoundry.apiclient.client import EngineClient
+
+    client = EngineClient("http://127.0.0.1:8765")
+    sent: list[str] = []
+    detail = {
+        "id": "m1",
+        "channel_id": "ch1",
+        "received_at": 0.0,
+        "source_type": "file",
+        "control_id": None,
+        "message_type": None,
+        "status": "processed",
+        "error": None,
+        "outbox": [],
+        "events": [],
+    }
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json=detail, request=request)
+
+    monkeypatch.setattr(client._http, "send", _capture)
+    client.get_message("m1")
+    client.get_message("m1", reveal_summary=True)
+    assert sent == [
+        "http://127.0.0.1:8765/messages/m1",
+        "http://127.0.0.1:8765/messages/m1?reveal_summary=true",
+    ]
+
+
 # --- ASVS 1.2.2 (BACKLOG #1107): contextual encoding + a URL scheme allow-list ----------------
 #
 # Two clauses, and only two. Clause 1 percent-encodes the identifiers this client interpolates into
@@ -233,6 +293,7 @@ _PATH_SEGMENT_SITES: list[tuple[str, Callable[[EngineClient, Any], object], str]
     ("restart_connection", lambda c, v: c.restart_connection(v), "/connections/{seg}/restart"),
     ("purge_connection", lambda c, v: c.purge_connection(v), "/connections/{seg}/purge"),
     ("get_message", lambda c, v: c.get_message(v), "/messages/{seg}"),
+    ("get_message_body", lambda c, v: c.get_message_body(v), "/messages/{seg}/raw"),
     ("replay", lambda c, v: c.replay(v), "/messages/{seg}/replay"),
     (
         "resolve_interrupted_approval",
@@ -932,7 +993,7 @@ def test_apiclient_releases_the_connection_on_every_exit(
 def test_apiclient_response_bound_clears_the_worst_case_escape() -> None:
     r"""The SIZE of the ceiling, pinned against the arithmetic that chose it.
 
-    `GET /messages/{id}` answers with a `MessageDetail` whose `raw` field carries the whole message
+    `GET /messages/{id}/raw` answers with a `MessageBody` whose `raw` field carries the whole message
     body JSON-escaped. Worst-case `\uXXXX` escaping costs 6 bytes per source byte, so a message at
     the engine's own 16 MiB ceiling can come back as roughly 96 MiB of JSON. Reusing that 16 MiB
     here -- the obvious move, and what `transports/bounded_read.py` does for an egress reply --
@@ -948,7 +1009,7 @@ def test_apiclient_response_bound_clears_the_worst_case_escape() -> None:
     bound = MAX_RESPONSE_BYTES
     assert bound >= worst_case, (
         f"the response bound is {bound} but a {DEFAULT_MAX_MESSAGE_BYTES}-byte message JSON-escapes "
-        f"to at most {worst_case}; this ceiling would refuse a legitimate GET /messages/<id> for a "
+        f"to at most {worst_case}; this ceiling would refuse a legitimate GET /messages/<id>/raw for a "
         "message the engine accepted"
     )
     assert bound < worst_case * 4, (

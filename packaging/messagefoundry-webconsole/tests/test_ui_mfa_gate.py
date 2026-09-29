@@ -1082,6 +1082,37 @@ async def test_the_reauth_code_leg_says_the_directory_could_not_confirm_the_acco
         assert "Invalid code." not in r.text
 
 
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["directory-refused", "wrong-password"])
+async def test_the_reauth_password_leg_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, unconfirmed: bool
+) -> None:
+    """BACKLOG #2027: a directory re-bind the directory could not judge (a row with no directory
+    id, an entry that is not the row's own, no entry, an outage) never checked the password, so the
+    form must not call it wrong. The service-level refusal is pinned in
+    tests/test_ad_directory_identity.py; here the answer is stubbed and the subject is the words.
+
+    RED when: /ui/reauth's password leg drops the directory_unconfirmed branch (the refused arm then
+    reads "Incorrect password."), or applies it to an ordinary wrong password (the control arm)."""
+    # No factor required and none enrolled, so the form goes straight to the password leg.
+    service = await _service(engine, require_mfa=False)
+    await _add(service, "op", Role.OPERATOR)
+
+    async def _refused(identity: object, password: str, **_kwargs: object) -> Elevation:
+        return Elevation(directory_unconfirmed=unconfirmed)
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        monkeypatch.setattr(service, "reauth", _refused)
+        r = await c.post(
+            "/ui/reauth",
+            data={"next": "/ui/account/mfa/disable", "password": PW},
+            headers={"origin": "http://t"},
+        )
+        assert r.status_code == 200
+        assert (_DIRECTORY_UNCONFIRMED_TEXT in r.text) is unconfirmed
+        assert ("Incorrect password." in r.text) is not unconfirmed
+
+
 # --- the temporary credential's deadline on the factor and password pages (BACKLOG #2009) ------
 
 

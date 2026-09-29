@@ -77,6 +77,16 @@ layering are **step-up-gated + audited**, and the content term **never round-tri
    > the normalised `objectGUID`). The one case still resolved by name is a directory that returns no
    > immutable identifier.
    >
+   > **Amendment 2026-09-29 (BACKLOG #2027): the sentence just above no longer describes the code, and
+   > is kept as the record.** It said a directory returning no immutable identifier was still resolved
+   > by name. A Windows SSO sign-in now refuses a principal with no `objectGUID` as
+   > `directory_object_id_missing`, first sight included, and so do the step-up re-bind and
+   > `verify_mfa` for a row with none. So on that directory no sign-in resolves a row by its name, and
+   > a recycled name cannot reach a departed operator's `user_id` or presets by signing in. The
+   > session reconciler still probes an id-less row with no federated binding by its name; that reads
+   > the directory and never selects the row a session is issued for. See ADR 0184's amendment of the
+   > same date.
+   >
    > Note also that `UNIQUE(owner, name)` now collides on a different thing: two accounts that once
    > shared a recycled name previously collided on save-by-name and no longer do. That is the intended
    > behaviour, but it is a change to the **upsert**, not only to the reads.

@@ -140,7 +140,7 @@ async def test_summary_redacted_for_caller_without_view_summary(engine: Engine) 
         op_msg = (await c.get("/messages", headers=op)).json()["messages"][0]
         vw_msg = (await c.get("/messages", headers=vw)).json()["messages"][0]
         # The LIST is the census surface, so an authorized operator sees the summary MASKED here
-        # (ASVS 14.2.6); opening one message is the act that reveals it. `error` is not a masked
+        # (ASVS 14.2.6); only an explicit per-message reveal lifts it (BACKLOG #2346). `error` is not a masked
         # property, so it comes through complete in the same response -- which is what keeps this a
         # test of the mask rather than of redaction.
         assert op_msg["summary"] == "MRN **** · ****"

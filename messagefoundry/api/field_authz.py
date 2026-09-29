@@ -20,8 +20,8 @@ permission-gated actions (replay / purge / reload / connection-control) — so t
 *write* authorization surface today. See docs/SECURITY.md "Field-level authorization" for the model and
 the trigger that would add one.
 
-The full message **body** (``MessageDetail.raw``) is governed separately, at the endpoint, by the
-coarser whole-body ``messages:view_raw`` gate — not by this per-property map.
+The full message **body** (``MessageBody.raw``, from ``GET /messages/{id}/raw``) is governed separately,
+at the endpoint, by the coarser whole-body ``messages:view_raw`` gate — not by this per-property map.
 """
 
 from __future__ import annotations
