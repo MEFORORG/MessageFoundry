@@ -61,6 +61,7 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
         email=None,
         password_hash="h",
         now=now,
+        password_generated=False,
     )
 
     # --- the happy path: a pure re-key -------------------------------------------------------

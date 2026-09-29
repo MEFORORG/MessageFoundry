@@ -30,6 +30,7 @@ from messagefoundry.config.ai_policy import (
 )
 from messagefoundry.config.settings import AiSettings, AuthSettings, load_settings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 # Scope ordering least->most sensitive, used to assert "never exceeds the ceiling".
 _SCOPE_ORDER = {
@@ -380,7 +381,8 @@ async def test_ai_policy_assist_permitted_reflects_role(engine: Engine) -> None:
     service = AuthService(engine.store, AuthSettings())
     await service.initialize()
     for username, role in (("coder", Role.CODING), ("vw", Role.VIEWER)):
-        await service.create_local_user(
+        await create_local_user_chosen(
+            service,
             username=username,
             password=PW,
             display_name=None,

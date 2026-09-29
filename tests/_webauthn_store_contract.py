@@ -59,10 +59,20 @@ def _cred(
 async def _assert_webauthn_store_contract(store: Any) -> None:
     """The webauthn_credentials contract every backend must satisfy (ADR 0068 §4)."""
     await store.create_user(
-        user_id="wa-u1", username="wa-alice", auth_provider="local", password_hash="h", now=100.0
+        user_id="wa-u1",
+        username="wa-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=100.0,
+        password_generated=False,
     )
     await store.create_user(
-        user_id="wa-u2", username="wa-bob", auth_provider="local", password_hash="h", now=100.0
+        user_id="wa-u2",
+        username="wa-bob",
+        auth_provider="local",
+        password_hash="h",
+        now=100.0,
+        password_generated=False,
     )
 
     # Multi-row round-trip: fields survive intact (transports JSON, backed_up bool, aaguid, rp_id).
@@ -146,7 +156,12 @@ async def _assert_totp_contract(store: Any) -> None:
     """The TOTP store contract (WP-14) — backfilled so the server backends' row-lock paths
     (Postgres ``FOR UPDATE`` / SQL Server ``UPDLOCK``) finally execute under test."""
     await store.create_user(
-        user_id="totp-u1", username="totp-alice", auth_provider="local", password_hash="h", now=1.0
+        user_id="totp-u1",
+        username="totp-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
     )
 
     # Secret staging round-trip (cipher-covered column) + clear.

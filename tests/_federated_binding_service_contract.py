@@ -48,6 +48,7 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
             auth_provider="ad",
             directory_object_id=f"guid-{uid}",
             now=1_000.0,
+            password_generated=False,
         )
     await store.create_session(
         token_hash="t-bind-a", user_id="bind-a", expires_at=_EXPIRES, now=1_000.0

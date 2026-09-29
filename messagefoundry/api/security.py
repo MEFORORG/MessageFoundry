@@ -86,6 +86,28 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset(
     {"/auth/logout", "/auth/me", "/auth/mfa-verify", "/me/password"}
 )
 
+# ADR 0197 Amendment A (N-B2 part 4, AC-A3): the TOTP enrolment path a must-change session reaches
+# while its account must enrol a factor with a way past the sign-in lock BEFORE it rotates. Under the
+# shipped require_mfa that is every new account. The rotation ends every session, so rotating first
+# would pass through "a chosen password, no factor, no session", which anyone who knows the username
+# can lock. So the order is enrol, then rotate, and these paths are open to such a session only; for
+# every other must-change session the set above stands. Passkey registration is deliberately absent:
+# in wave 1 a passkey is not a way past, and the service refuses it as a first factor anyway. Keyed
+# on (METHOD, path) for the reason _MFA_EXEMPT_ROUTES gives: GET /me/mfa reads the factor status,
+# and DELETE /me/mfa removes a factor, which a path-only entry would open too.
+_ENROL_FIRST_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/me/reauth"),
+        ("GET", "/me/mfa"),
+        ("POST", "/me/mfa/enroll"),
+        ("POST", "/me/mfa/confirm"),
+    }
+)
+
+#: The suffix a must-change refusal carries while the account must enrol first, so a JSON client is
+#: told the step it can take. Appended, never prefixed: clients match the refusal's leading text.
+_ENROL_FIRST_SUFFIX = "; enrol an authenticator app first"
+
 # ASVS 6.3.3: while a session's second factor is PENDING, only these self-service routes stay
 # reachable. Keyed on (METHOD, path), NOT on path alone like the must-change set above: /me/mfa is
 # GET (read your factor status — safe while pending) and DELETE (disable your factor — emphatically
@@ -363,21 +385,26 @@ def require(
         if identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
         if identity.must_change_password and request.url.path not in _MUST_CHANGE_EXEMPT_PATHS:
-            # BACKLOG #1141 (ASVS 6.4.5): this refusal is the renewal instruction every non-browser
-            # caller receives, so it states when the credential dies. The detail stays a string that
-            # STARTS with the old text, because clients match on it as a substring
-            # (``ide/src/engineStatusModel.ts`` ``classifyForbidden``).
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                _password_change_required(
-                    await pending_credential_deadline_for(auth, identity.user_id)
-                ),
-            )
+            enrol_first = await auth.must_enrol_before_rotating(identity)
+            if not (enrol_first and (request.method, request.url.path) in _ENROL_FIRST_ROUTES):
+                # BACKLOG #1141 (ASVS 6.4.5): this refusal is the renewal instruction every
+                # non-browser caller receives, so it states when the credential dies. The detail
+                # stays a string that STARTS with the old text, because clients match on it as a
+                # substring (``ide/src/engineStatusModel.ts`` ``classifyForbidden``).
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _password_change_required(
+                        await pending_credential_deadline_for(auth, identity.user_id)
+                    )
+                    + (_ENROL_FIRST_SUFFIX if enrol_first else ""),
+                )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
         # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
         # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
-        # /auth/mfa-verify with nothing to prove there — the brick. It rotates first instead, and
-        # /me/password lets it, because the factor refusal below skips an account with no factor.
+        # /auth/mfa-verify with nothing to prove there — the brick. Under require_mfa it ENROLS
+        # first, through _ENROL_FIRST_ROUTES above, and only then rotates (ADR 0197 Amendment A);
+        # with the requirement off it rotates first, and /me/password lets it, because the factor
+        # refusal below skips an account with no factor.
         # A must-change account that HAS a factor (an admin reset) is sent the other way: /me/password
         # refuses it with X-MFA-Required, and /auth/mfa-verify is must-change-exempt so it can answer
         # (BACKLOG #1954). And this stays ABOVE the permission loop: refusing below it would tell an

@@ -200,7 +200,9 @@ from messagefoundry.store.store import (
     audit_row_hash,
     birth_notify_email,
     build_audit_mac_keys,
+    check_password_generated,
     delivery_key,
+    lockout_arms,
     lockout_clear_set,
     lockout_escalates,
     next_lockout_state,
@@ -209,6 +211,7 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
+    rotation_factor_term,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -671,7 +674,10 @@ _SCHEMA: list[str] = [
         lock_cycles          INTEGER NOT NULL DEFAULT 0,
         second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,
         second_step_locked_until DOUBLE PRECISION,
-        second_step_lock_cycles INTEGER NOT NULL DEFAULT 0
+        second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,
+        -- ADR 0197 Amendment A (BACKLOG #1131): TRUE while the credential in force is
+        -- engine-generated; wrong passwords arm no sign-in lock then.
+        password_generated   BOOLEAN NOT NULL DEFAULT FALSE
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -889,7 +895,9 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # caveat: the CREATE TABLE moved as well, and the bump is what ties the migration body to the hash.
 # 5 (ADR 0197, BACKLOG #1131): the four lockout columns (lock_cycles and the three second_step_*
 # columns) are ADDed in the same function. Same contract, same caveat.
-_MIGRATION_REV = 5
+# 6 (ADR 0197 Amendment A, BACKLOG #1131): the users.password_generated ADD lands in the same
+# function. Same contract, same caveat.
+_MIGRATION_REV = 6
 
 
 def _schema_hash() -> str:
@@ -1718,6 +1726,9 @@ class PostgresStore:
             ("second_step_failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("second_step_locked_until", "DOUBLE PRECISION"),
             ("second_step_lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
+            # ADR 0197 Amendment A (BACKLOG #1131). FALSE on an existing row reads "the holder
+            # chose this credential", which keeps the account LOCKABLE -- the closed direction.
+            ("password_generated", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -7313,18 +7324,21 @@ class PostgresStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        password_generated: bool,
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
         audit: AuditAppend | None = None,
     ) -> None:
+        check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
         sql = (
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until, directory_object_id)"
-            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11)"
+            " must_change_password, failed_attempts, locked_until, directory_object_id,"
+            " password_generated)"
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11,$12)"
         )
         params = (
             user_id,
@@ -7338,6 +7352,7 @@ class PostgresStore:
             now if password_hash is not None else None,
             must_change_password,
             directory_object_id,
+            password_generated,
         )
         if audit is None:
             await self._execute(sql, *params)
@@ -7438,21 +7453,28 @@ class PostgresStore:
         user_id: str,
         *,
         password_hash: str,
+        password_generated: bool,
         must_change_password: bool = True,
+        require_totp: bool = False,
         now: float | None = None,
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
         # $2 is already `now`, so the claim term reuses it and the argument list is unchanged.
         claim_set = password_claim_set(must_change_password, "$2")
-        await self._execute(
-            "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
-            f"{claim_set}"
-            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=$2 WHERE id=$4",
-            password_hash,
-            now,
-            must_change_password,
-            user_id,
-        )
+        condition = rotation_factor_term("TRUE") if require_totp else ""
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
+                f"{claim_set}"
+                f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=$5, updated_at=$2"
+                f" WHERE id=$4{condition}",
+                password_hash,
+                now,
+                must_change_password,
+                user_id,
+                password_generated,
+            )
+        return _rowcount(result) > 0
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -7500,8 +7522,9 @@ class PostgresStore:
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
+            # ``last_totp_step`` too: see the SQLite twin (ADR 0197 Amendment A).
             "UPDATE users SET totp_secret=NULL, totp_enabled=FALSE, totp_enrolled_at=NULL,"
-            " totp_recovery_codes=NULL, updated_at=$1 WHERE id=$2",
+            " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=$1 WHERE id=$2",
             now,
             user_id,
         )
@@ -7766,8 +7789,8 @@ class PostgresStore:
         attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
-                " FROM users WHERE id=$1 FOR UPDATE",
+                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
+                " password_generated FROM users WHERE id=$1 FOR UPDATE",
                 user_id,
             )
             if row is None:
@@ -7785,6 +7808,7 @@ class PostgresStore:
                     auth_provider=str(row["auth_provider"]),
                     totp_enabled=bool(row["totp_enabled"]),
                 ),
+                lockable=lockout_arms(counter, password_generated=bool(row["password_generated"])),
             )
             await conn.execute(
                 f"UPDATE users SET {attempts_col}=$1, {until_col}=$2, {cycles_col}=$3,"

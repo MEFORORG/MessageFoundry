@@ -7869,6 +7869,24 @@ def create_managed_app(
                     alerts_settings=alerts_settings,
                     security_settings=security_settings,
                 )
+                # ADR 0197 Amendment A, AC-A9: name every account still lockable with no way past a
+                # sign-in lock. It warns and audits and NEVER refuses to start: an account-level fact
+                # must not get a site-wide veto, so even a failure of the census itself is logged
+                # and startup continues.
+                try:
+                    await auth.report_lockable_account_census()
+                except Exception:  # noqa: BLE001 -- see the comment above
+                    _log.exception("the lockable-account census could not run; startup continues")
+                # ADR 0197 Amendment A, Manager decision 2026-09-29: learn at start, not at the first
+                # account creation, that the password policy leaves no credential to issue. It logs
+                # an ERROR and returns, and is guarded like the census: a policy-level fact must
+                # never refuse the start, whatever a later policy clause raises.
+                try:
+                    auth.probe_credential_generation()
+                except Exception:  # noqa: BLE001 -- see the comment above
+                    _log.exception(
+                        "the credential-generation probe could not run; startup continues"
+                    )
                 if not auth.webauthn_available() and await store.any_webauthn_credentials():
                     # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
                     # not installed (engine moved/reinstalled, same DB) — affected users stay

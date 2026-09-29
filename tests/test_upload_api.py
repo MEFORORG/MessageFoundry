@@ -38,6 +38,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -63,7 +64,8 @@ async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username=name,
         password=PW,
         display_name=None,
@@ -74,7 +76,7 @@ async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     # BACKLOG #1152: an unset channel scope now denies. This file exercises the OWNER axis (ASVS
     # 8.2.2 on uploaded files, which carry no channel), so grant the estate explicitly and leave the
@@ -88,7 +90,8 @@ async def _add_user(service: AuthService, role: Role, *, name: str) -> str:
     """Add a SECOND user to an existing AuthService (the cross-operator tests need two principals on
     one app) and return its user_id. Mirrors _make_user's must-change-password clearing, which every
     route depends on."""
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username=name,
         password=PW,
         display_name=None,
@@ -99,7 +102,7 @@ async def _add_user(service: AuthService, role: Role, *, name: str) -> str:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     # BACKLOG #1152: an unset channel scope now denies. This file exercises the OWNER axis (ASVS
     # 8.2.2 on uploaded files, which carry no channel), so grant the estate explicitly and leave the

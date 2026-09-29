@@ -45,6 +45,7 @@ from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 # One account object, two spellings of the SAME identity: the 16 bytes as they arrive on the wire,
 # and the braced upper-case string ldap3's own formatter produces. Microsoft's GUID layout is
@@ -703,6 +704,7 @@ async def test_an_unbound_row_is_never_adopted_by_name() -> None:
             auth_provider=AuthProvider.AD.value,
             display_name="J Smith",
             email="jsmith@example.org",
+            password_generated=False,
         )
         out = await service._complete_ad_login(
             _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
@@ -750,6 +752,7 @@ async def test_a_reissued_name_cannot_reach_an_id_less_row() -> None:
             auth_provider=AuthProvider.AD.value,
             display_name="J Smith",
             email="jsmith@example.org",
+            password_generated=False,
         )
         roles_before = set(await store.get_user_role_ids("legacy-row"))
         out = await service._complete_ad_login(_principal("jsmith", None), None, mfa_verified=True)
@@ -790,7 +793,8 @@ async def test_a_like_named_local_account_is_still_refused_before_the_identity_c
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        await service.create_local_user(
+        await create_local_user_chosen(
+            service,
             username="jsmith",
             password="Sup3rSecret!!",
             display_name=None,

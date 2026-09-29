@@ -33,6 +33,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import ApiSettings, ApprovalsSettings, AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 from tests.test_trust_anchors import _block
 
 PW = "a-strong-test-passphrase"
@@ -108,7 +109,8 @@ def _fail_config_reload_audit(monkeypatch: pytest.MonkeyPatch, engine: Engine) -
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -119,7 +121,7 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     user = await service.store.get_user(uid)  # clear forced first-login rotation
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
 
 
