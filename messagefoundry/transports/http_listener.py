@@ -130,13 +130,24 @@ class HttpRequest:
     metadata (ADR 0004 §4), never executed; the body is handed verbatim to the pipeline handler.
     """
 
-    __slots__ = ("method", "target", "headers", "body")
+    __slots__ = ("method", "target", "headers", "body", "repeated")
 
-    def __init__(self, method: str, target: str, headers: dict[str, str], body: bytes) -> None:
+    def __init__(
+        self,
+        method: str,
+        target: str,
+        headers: dict[str, str],
+        body: bytes,
+        repeated: frozenset[str] = frozenset(),
+    ) -> None:
         self.method = method
         self.target = target
         self.headers = headers
         self.body = body
+        #: Lower-cased names of the headers that appeared more than once. ``headers`` keeps only the
+        #: LAST value of each, so a caller that reads a security-relevant header checks here first
+        #: (BACKLOG #2051).
+        self.repeated = repeated
 
 
 def _status_line(status: int) -> str:
@@ -501,7 +512,8 @@ async def _read_head(
     if host_count == 0 and version != "HTTP/1.0":
         raise HttpRequestError(400, "missing Host header", kind="framing_error")
 
-    return HttpRequest(method, target, headers, b"")
+    repeated = frozenset(name for name, count in header_counts.items() if count > 1)
+    return HttpRequest(method, target, headers, b"", repeated)
 
 
 async def _read_body(
@@ -856,12 +868,26 @@ class HttpSource(SourceConnector):
         self._note_intake_success(peer)
         return None
 
+    def _credential_header(self) -> str | None:
+        """The one header this listener reads a credential from, or ``None`` when it reads none.
+
+        mTLS reads the peer certificate, not a header, and ``none`` reads nothing.
+        """
+        if self.intake_auth == "api_key":
+            return self.intake_api_key_header
+        if self.intake_auth == "bearer":
+            return "authorization"
+        return None
+
     def _presented_credential(self, head: HttpRequest) -> str | None:
         """The credential this request presents, or ``None``. Header names are already lower-cased."""
+        name = self._credential_header()
+        if name is None:
+            return None
         if self.intake_auth == "api_key":
-            return head.headers.get(self.intake_api_key_header)
+            return head.headers.get(name)
         if self.intake_auth == "bearer":
-            scheme, _, token = head.headers.get("authorization", "").partition(" ")
+            scheme, _, token = head.headers.get(name, "").partition(" ")
             # OWS only, matching the header-value trim in the head parse; str.strip() would also
             # remove NBSP and NEL, so a bearer token and an API key would be trimmed differently.
             return token.strip(" \t") if scheme.lower() == "bearer" else None
@@ -877,6 +903,15 @@ class HttpSource(SourceConnector):
             return
         if head.method in _HEALTH_PROBE_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
+        # A CREDENTIAL HEADER MUST APPEAR AT MOST ONCE (BACKLOG #2051). The head parse keeps the LAST
+        # of two same-named lines, while a front end that authenticates the FIRST would have checked
+        # a different credential from the one this listener accepts. Refused as framing, like a
+        # repeated Host (BACKLOG #1972), BEFORE the limiter and before any comparison: it is a
+        # malformed request, not an authentication attempt, so it charges no budget and writes no
+        # auth audit row. IDENTICAL values are refused too, because a proxy may still split, merge
+        # or rewrite them. The reason names neither the header nor its value.
+        if self._credential_header() in head.repeated:
+            raise HttpRequestError(400, "duplicate credential header", kind="framing_error")
         peer = peer_host or "unknown"
         limited = self._rate_limit_refusal(peer)
         if limited is not None:

@@ -362,6 +362,85 @@ async def test_bearer_mode_reads_authorization_and_challenges() -> None:
         await src.stop()
 
 
+def _raw_with(lines: list[str]) -> bytes:
+    head = ["POST /ingest HTTP/1.1", "Host: localhost", "Content-Length: 2", *lines, "", ""]
+    return "\r\n".join(head).encode("ascii") + b"{}"
+
+
+@pytest.mark.parametrize(
+    ("settings", "lines"),
+    [
+        # BACKLOG #2051's reported shape: a front end reading the FIRST value sees a wrong key, while
+        # the listener kept the LAST one and answered 202.
+        ({"intake_auth": "api_key"}, ["x-api-key: wrong", f"x-api-key: {KEY}"]),
+        # The mirror: the right key first. The old code answered 401 and charged the budget.
+        ({"intake_auth": "api_key"}, [f"x-api-key: {KEY}", "x-api-key: wrong"]),
+        # IDENTICAL values are refused too; a proxy may still split or rewrite them.
+        ({"intake_auth": "api_key"}, [f"x-api-key: {KEY}", f"x-api-key: {KEY}"]),
+        # Header names are case-insensitive, so two spellings are still one header twice.
+        ({"intake_auth": "api_key"}, ["X-Api-Key: wrong", f"x-api-key: {KEY}"]),
+        # The configurable header name is covered, not only the default.
+        (
+            {"intake_auth": "api_key", "intake_api_key_header": "x-acme-key"},
+            ["x-acme-key: wrong", f"x-acme-key: {KEY}"],
+        ),
+        # Bearer mode reads Authorization.
+        (
+            {"intake_auth": "bearer"},
+            ["Authorization: Bearer wrong", f"Authorization: Bearer {KEY}"],
+        ),
+        (
+            {"intake_auth": "bearer"},
+            [f"Authorization: Bearer {KEY}", f"Authorization: Bearer {KEY}"],
+        ),
+    ],
+)
+async def test_a_repeated_credential_header_is_refused_before_any_comparison(
+    settings: dict[str, Any], lines: list[str]
+) -> None:
+    """BACKLOG #2051. The head parse keeps the last of two same-named headers, while a front end may
+    authenticate the first. So a listener that reads a credential header refuses a request carrying
+    it twice with 400, before the limiter or any comparison: no audit row, no charge, no echo."""
+    audit = _Audit()
+    limiter = _CountingLimiter()
+    events: list[tuple[str, str | None]] = []
+
+    async def sink(kind: str, _peer: str | None, why: str | None) -> None:
+        events.append((kind, why))
+
+    src = await _start(intake_api_key=KEY, **settings)
+    src.on_intake_audit = audit
+    src.intake_rate_limiter = limiter
+    src.on_connection_event = sink
+    try:
+        resp = await _request(src.sockport, raw=_raw_with(lines))
+    finally:
+        await src.stop()
+    assert resp.status in (400, 0), resp.status  # 0: the Proactor loop reset before the flush
+    assert ("framing_error", "duplicate credential header") in events
+    assert audit.rows == []
+    assert limiter.checks == [] and limiter.charges == []
+    for leak in (KEY, "wrong"):
+        assert leak.encode() not in resp.body
+        assert all(leak not in (why or "") for _kind, why in events)
+
+
+async def test_a_repeated_header_the_mode_does_not_read_is_still_accepted() -> None:
+    """BACKLOG #2051 scope: only the header the active mode reads a credential from is refused."""
+    src = await _start(intake_auth="bearer", intake_api_key=KEY)
+    try:
+        raw = _raw_with([f"Authorization: Bearer {KEY}", "x-api-key: a", "x-api-key: b"])
+        assert (await _request(src.sockport, raw=raw)).status == 202
+    finally:
+        await src.stop()
+    src = await _start()  # intake_auth="none" reads no credential at all
+    try:
+        raw = _raw_with(["x-api-key: a", "x-api-key: b", "Authorization: x", "Authorization: y"])
+        assert (await _request(src.sockport, raw=raw)).status == 202
+    finally:
+        await src.stop()
+
+
 async def test_successful_auth_never_consumes_rate_budget() -> None:
     """AC-13: the budget bounds guessing; it must not become a throughput cap."""
     limiter = _CountingLimiter()

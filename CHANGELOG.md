@@ -285,6 +285,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **BREAKING: the `Http()` listener answers 400 to a request that repeats its credential header.** Under
+  `intake_auth="api_key"` that is `intake_api_key_header`, and under `"bearer"` it is
+  `Authorization`. In the shipped code the listener kept the last copy, so `x-api-key: wrong` then
+  `x-api-key: <key>` was accepted, while a front end that authenticates the first copy would have
+  checked a different credential. The request is now refused before the rate limiter and before any
+  comparison, as a `framing_error` event with no audit row and no charge against the failure budget.
+  Two identical copies are refused too, since a proxy may still split or rewrite them. The refusal
+  names neither the header nor its value. A repeated header the active mode does not read, and every
+  header under `none` or `mtls_subject`, is unaffected. (`BACKLOG #2051`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
