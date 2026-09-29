@@ -116,6 +116,24 @@ def closure_lines(text: str) -> list[str]:
     return [s for s in (raw.strip() for raw in text.splitlines()) if s and not s.startswith("#")]
 
 
+def closure_pins(path: Path) -> dict[str, str]:
+    """Name to version for every pin line in a closure file. A name listed twice raises.
+
+    A dict keeps only the last line, so a stale first line would stay in the file for a reader to
+    find while every comparison passed.
+    """
+    pins: dict[str, str] = {}
+    for line in closure_lines(path.read_text(encoding="utf-8")):
+        if "==" not in line:
+            continue
+        name, _, version = line.partition("==")
+        key = canonical_name(name)
+        if key in pins:
+            raise LockFormatError(f"{path.name} lists {key} twice")
+        pins[key] = version.strip()
+    return pins
+
+
 def render_closure(current: str, pins: dict[str, str]) -> str:
     """A closure file's text with its pin lines replaced by its lock's.
 
