@@ -120,7 +120,9 @@ async def test_finalizer_sees_pending_response_row(store: MessageStore) -> None:
     await _insert_response_row(store, message_id=mid, now=100.0)
     item = (await store.claim_ready(destination_name="OB_X", now=100.0))[0]
     await store.mark_done(item.id, now=101.0)  # outbound delivered, but the response row is pending
-    assert (await store.get_message(mid))["status"] != MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] != MessageStatus.PROCESSED.value
     # consume the response row (simulating ingress_handoff) and finalize
     await store._db.execute(
         "DELETE FROM queue WHERE stage=? AND message_id=?", (Stage.RESPONSE.value, mid)
@@ -128,7 +130,9 @@ async def test_finalizer_sees_pending_response_row(store: MessageStore) -> None:
     async with store._lock:
         await store._maybe_finalize_message(mid, 102.0)
         await store._db.commit()
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 # --- Step 2: Loopback connector + reingress_to declaration surface + validation ---
@@ -302,7 +306,9 @@ async def test_reingress_work_row_holds_origin_then_releases(store: MessageStore
     await store.complete_with_response(
         item.id, body="RSP", outcome="accepted", reingress_to="IB_LOOP", now=101.0
     )
-    assert (await store.get_message(mid))["status"] != MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] != MessageStatus.PROCESSED.value
     # consume the work-row (Step 4's ingress_handoff does this atomically) and finalize
     await store._db.execute(
         "DELETE FROM queue WHERE stage=? AND message_id=?", (Stage.RESPONSE.value, mid)
@@ -310,7 +316,9 @@ async def test_reingress_work_row_holds_origin_then_releases(store: MessageStore
     async with store._lock:
         await store._maybe_finalize_message(mid, 103.0)
         await store._db.commit()
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 # --- Step 4: ingress_handoff (the atomic re-ingress edge) ---
@@ -344,7 +352,9 @@ async def test_ingress_handoff_produces_child_and_finalizes_origin(store: Messag
     assert ok is True
     # the work-row is consumed; the origin finalizes PROCESSED (its last outstanding row is gone)
     assert await store.claim_next_fifo("IB_LOOP", now=111.0, stage=Stage.RESPONSE.value) is None
-    assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(origin)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
     # a re-ingressed child message + one ingress queue row on the loopback lane
     assert (await store.pending_depth("IB_LOOP", stage=Stage.INGRESS.value))[0] == 1
     child_ing = await store.claim_next_fifo("IB_LOOP", now=112.0, stage=Stage.INGRESS.value)
@@ -386,7 +396,9 @@ async def test_ingress_handoff_depth_cap_dead_letters_and_errors_origin(
         now=110.0,
     )
     assert ok is True  # token consumed (must not re-loop)
-    assert (await store.get_message(origin))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(origin)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
     assert (await store.pending_depth("IB_LOOP", stage=Stage.INGRESS.value)) == (0, None)
     # the work-row is DEAD, not re-claimable
     assert await store.claim_next_fifo("IB_LOOP", now=111.0, stage=Stage.RESPONSE.value) is None
@@ -408,7 +420,9 @@ async def test_ingress_handoff_peek_failed_errors_child_with_no_ingress_row(
     )
     assert ok is True
     # the origin's reply was handled (token gone) → PROCESSED; the child is ERROR with NO ingress row
-    assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(origin)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
     assert (await store.pending_depth("IB_LOOP", stage=Stage.INGRESS.value)) == (0, None)
     child_mid = store._reingress_message_id(origin, "OB_X", 1, "NOT-AN-HL7-BODY")
     child = await store.get_message(child_mid)
@@ -455,7 +469,9 @@ async def test_response_worker_reingresses_and_routes_end_to_end(tmp_path: Any) 
             await runner.stop()
 
         # the origin finalized PROCESSED (its response work-row was handed off + consumed)
-        assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+        fetched = await store.get_message(origin)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.PROCESSED.value
         # the re-ingressed child exists, was routed by route_loop, transformed by h_loop → FILTERED,
         # and carries the correlation back to the origin
         child = await store.get_message(child_mid)
@@ -627,7 +643,9 @@ async def test_ingress_handoff_corrupt_ref_dead_letters_not_loops(store: Message
         now=110.0,
     )
     assert ok is True  # token consumed, NOT re-looped
-    assert (await store.get_message(origin))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(origin)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
     assert await store.claim_next_fifo("IB_LOOP", now=111.0, stage=Stage.RESPONSE.value) is None
     assert (await store.pending_depth("IB_LOOP", stage=Stage.INGRESS.value)) == (0, None)
 

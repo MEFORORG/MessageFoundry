@@ -190,7 +190,9 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
             row["last_error"] or "", aad=cell_aad("queue", "last_error", ingress_id)
         )
         # Dead ingress row with no outbound rows → the message is finalized to ERROR.
-        assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.ERROR.value
     finally:
         await store.close()
 
@@ -242,7 +244,9 @@ async def test_error_and_event_detail_encrypted_at_rest_and_decrypt(tmp_path: Pa
         assert err_at_rest.startswith(MARKER_PREFIX) and "SECRET" not in err_at_rest
         assert det_at_rest.startswith(MARKER_PREFIX) and "SECRET" not in det_at_rest
         # ...and decrypt on every read path.
-        assert (await store.get_message(mid))["error"] == PHI_ERR
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["error"] == PHI_ERR
         assert any(m["error"] == PHI_ERR for m in await store.list_messages())
         assert any(e["detail"] == PHI_ERR for e in await store.events_for(mid))
     finally:
@@ -431,7 +435,9 @@ async def test_rotation_reencrypts_and_retired_key_bridges(tmp_path: Path) -> No
     assert isinstance(rotating_cipher, AesGcmCipher)
     rotating = await MessageStore.open(db, cipher=rotating_cipher)
     try:
-        assert (await rotating.get_message(mid))["raw"] == ADT
+        fetched = await rotating.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == ADT
         assert await rotating.reencrypt_to_active() >= 2  # raw + the outbound payload
         assert await rotating.reencrypt_to_active() == 0  # idempotent
     finally:
@@ -447,7 +453,9 @@ async def test_rotation_reencrypts_and_retired_key_bridges(tmp_path: Path) -> No
     # B alone (no retired key) now reads everything — the bridge key is no longer needed.
     final = await MessageStore.open(db, cipher=make_cipher(key_b))
     try:
-        assert (await final.get_message(mid))["raw"] == ADT
+        fetched = await final.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == ADT
     finally:
         await final.close()
 

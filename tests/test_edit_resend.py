@@ -195,7 +195,9 @@ async def test_reingress_same_key_delivers_once(store: MessageStore) -> None:
         cur = await db.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE id=?", (first.new_message_id,)
         )
-        assert (await cur.fetchone())["n"] == 1
+        fetched = await cur.fetchone()
+        assert fetched is not None
+        assert fetched["n"] == 1
     assert len(await _ingress_rows(store, first.new_message_id)) == 1  # exactly ONE ingress row
 
 

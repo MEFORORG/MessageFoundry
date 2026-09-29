@@ -138,7 +138,9 @@ async def test_state_upsert_overwrites_same_key(store: MessageStore) -> None:
     )
     assert store.state_view()[("ns", "k")] == "second"
     cur = await store._db.execute("SELECT COUNT(*) FROM state WHERE namespace='ns' AND key='k'")
-    assert (await cur.fetchone())[0] == 1  # upsert, not a second row
+    fetched = await cur.fetchone()
+    assert fetched is not None
+    assert fetched[0] == 1  # upsert, not a second row
 
 
 # --- ADVERSARIAL: re-run safety (crash-before-commit) ------------------------
@@ -166,7 +168,9 @@ async def test_rollback_leaves_no_state_row_and_no_cache_entry(
     monkeypatch.undo()
     # No state row, no outbound row, and nothing in the read-through cache.
     cur = await store._db.execute("SELECT COUNT(*) FROM state")
-    assert (await cur.fetchone())[0] == 0
+    fetched = await cur.fetchone()
+    assert fetched is not None
+    assert fetched[0] == 0
     assert ("ns", "k") not in store.state_view()
     assert await store.outbox_for(mid) == []
     # The routed row is recoverable so the transform re-runs (pure re-derivation).
@@ -235,7 +239,9 @@ async def test_rerun_after_recovery_reapplies_identically(store: MessageStore) -
     )
     assert store.state_view()[("ns", "k")] == "v"
     cur = await store._db.execute("SELECT COUNT(*) FROM state")
-    assert (await cur.fetchone())[0] == 1  # exactly once
+    fetched = await cur.fetchone()
+    assert fetched is not None
+    assert fetched[0] == 1  # exactly once
 
 
 # --- ADVERSARIAL: atomicity (state + outbound commit together) ---------------

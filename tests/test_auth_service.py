@@ -278,7 +278,9 @@ async def test_reset_temp_password_expires_when_unclaimed() -> None:
         assert not out.ok  # expired → refused, even with the CORRECT temp password
         assert out.error == "invalid credentials"  # generic — not distinguishable from a wrong pw
         # the account is NOT disabled — an admin can re-issue a fresh temp
-        assert (await store.get_user_by_username("alice")).disabled is False
+        fetched = await store.get_user_by_username("alice")
+        assert fetched is not None
+        assert fetched.disabled is False
     finally:
         await store.close()
 
@@ -292,6 +294,7 @@ async def test_claimed_temp_password_is_not_gated() -> None:
         await service.initialize()
         await _make_reset_temp(store, service)
         alice = await store.get_user_by_username("alice")
+        assert alice is not None
         await store.set_password(
             alice.id,
             password_hash=hash_password("the-users-own-chosen-passphrase"),
@@ -315,6 +318,7 @@ async def test_initial_password_expiry_zero_disables_the_gate() -> None:
         await service.initialize()
         temp = (await _make_reset_temp(store, service)).password
         alice = await store.get_user_by_username("alice")
+        assert alice is not None
         await store._db.execute(
             "UPDATE users SET password_changed_at=? WHERE id=?",
             (time.time() - 9999 * 3600, alice.id),

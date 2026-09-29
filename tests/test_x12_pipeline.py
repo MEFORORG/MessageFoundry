@@ -28,6 +28,7 @@ from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
+    Payload,
     Registry,
     Send,
 )
@@ -35,6 +36,7 @@ from messagefoundry.parsing.message import RawMessage
 from messagefoundry.parsing.x12 import X12Peek
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from messagefoundry.transports.base import DestinationConnector
 from messagefoundry.transports.x12 import X12Destination
 
 # --- synthetic X12 corpus (mirrors test_x12_transport's ISA builder) ---------
@@ -106,20 +108,21 @@ def _malformed_interchange() -> str:
 # --- routing logic under test ------------------------------------------------
 
 
-def _route(msg: RawMessage) -> list[str]:
+def _route(msg: Payload) -> list[str]:
     """Route a 270 to the handler; decline anything else. ``X12Peek.parse`` raises ``X12PeekError``
     (a ``ValueError``) on a malformed ISA, which the router worker dead-letters as ``ERROR``."""
+    assert isinstance(msg, RawMessage)  # an X12 inbound hands its router the raw text
     if not msg.raw.lstrip().startswith("ISA"):
         return []
     peek = X12Peek.parse(msg.raw)  # raises on a malformed ISA -> dead-letter
     return ["handler"] if "270" in peek.transaction_ids() else []
 
 
-def _handler(msg: RawMessage) -> Send:
+def _handler(msg: Payload) -> Send:
     return Send("OB_X12", msg)  # verbatim pass-through to the outbound
 
 
-class _Recorder:
+class _Recorder(DestinationConnector):
     """A stand-in outbound connector that records each delivered payload (like ``_NeverSends`` in
     ``test_wiring_engine``) so we can drive real inbound traffic without a second listener/egress hop."""
 

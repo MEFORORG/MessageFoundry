@@ -159,7 +159,9 @@ async def test_a_dead_lettered_row_stays_replayable(store: MessageStore) -> None
         t += 10
 
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DEAD.value
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
     assert len(await store.list_dead(channel_id="c1")) == 1  # visible to the operator
 
     assert await store.replay_dead(channel_id="c1", now=t) == 1
@@ -168,7 +170,9 @@ async def test_a_dead_lettered_row_stays_replayable(store: MessageStore) -> None
     assert row["status"] == OutboxStatus.PENDING.value
     assert row["attempts"] == 0  # a full budget again, not a row wedged at the cap
     assert row["last_error"] is None
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     # Claimable again — the strongest form of "replayable" is that a worker can actually take it.
     assert await store.claim_next_fifo("d1", now=t) is not None
 

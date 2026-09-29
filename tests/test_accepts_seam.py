@@ -166,7 +166,9 @@ async def test_no_accepts_materializes_every_routed_row(
     item = await _claimed(store)
     await runner._process_ingress_item("IB", item)
     assert await _routed_rows(store, item.message_id) == ["a", "b"]  # both, as today
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 # --- AC-1: the decline lands BEFORE a routed row exists ----------------------
@@ -196,7 +198,9 @@ async def test_accepts_declines_before_a_routed_row_exists(
     # filtered inside route_only, so no routed row for them ever existed to be rolled back.
     assert seen == [["h00", "h01", "h02", "h03"]]
     assert await _routed_rows(store, item.message_id) == ["h00", "h01", "h02", "h03"]
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     # ADR 0051's 2H term: 4 routed rows, not 20 (txn/msg 51 -> 19 for the reference hub).
     assert len(await _routed_rows(store, item.message_id)) == 4
 
@@ -438,7 +442,9 @@ async def test_accepts_lookup_dead_letters_on_the_live_path(
     runner = RegistryRunner(reg, store)
     item = await _claimed(store)
     await runner._process_ingress_item("IB", item)
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 # --- ADR 0057: the inline fast-path now gates on the POST-decline count -------
@@ -475,7 +481,9 @@ async def test_accepts_makes_a_multi_select_message_inline_eligible(
     assert await _routed_rows(store, item.message_id) == []
     outbound = await store.outbox_for(item.message_id)
     assert [o["destination_name"] for o in outbound] == ["OB"]
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 # --- registry surface --------------------------------------------------------

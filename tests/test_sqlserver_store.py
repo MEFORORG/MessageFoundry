@@ -2495,7 +2495,9 @@ async def test_error_lasterror_detail_encrypted_at_rest_and_decrypt(store) -> No
             assert "bad parse" not in d["detail"] and "refused" not in d["detail"]
 
         # DECRYPT ON READ: every read path returns the cleartext.
-        assert (await s.get_message(eid))["error"] == err
+        fetched = await s.get_message(eid)
+        assert fetched is not None
+        assert fetched["error"] == err
         assert any(m["error"] == err for m in await s.list_messages())
         [dead] = await s.list_dead()
         assert dead["last_error"] == fail
@@ -2589,7 +2591,9 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
         drows = await keyed._fetchall("SELECT detail FROM message_events WHERE detail IS NOT NULL")
         assert drows and all(d["detail"].startswith(MARKER_PREFIX) for d in drows)
         # reads still return the original cleartext after the in-place migration.
-        assert (await keyed.get_message(eid))["error"] == err
+        fetched = await keyed.get_message(eid)
+        assert fetched is not None
+        assert fetched["error"] == err
         assert (await keyed.list_dead())[0]["last_error"] == fail
     finally:
         await keyed.close()
@@ -2637,8 +2641,12 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -
         assert row["raw"] == plant, "the keyed reopen sealed a planted row on a sealed surface"
         row = (await reopened._fetchall("SELECT raw FROM messages WHERE id=?", (blank,)))[0]
         assert row["raw"] == "", "a purged blank was sealed into ciphertext-of-empty"
-        assert (await reopened.get_message(good))["raw"] == RAW
-        assert (await reopened.get_message(blank))["raw"] == ""
+        fetched = await reopened.get_message(good)
+        assert fetched is not None
+        assert fetched["raw"] == RAW
+        fetched = await reopened.get_message(blank)
+        assert fetched is not None
+        assert fetched["raw"] == ""
         with pytest.raises(CipherError, match=r"messages\.raw"):
             await reopened.get_message(planted)
         assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
@@ -4791,7 +4799,9 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     verify = await SqlServerStore.open(settings, cipher=cipher_b)  # key_b alone, no retired
     try:
         assert len(await verify.list_messages()) == 1
-        assert (await verify.get_message(mid))["raw"] == RAW  # decrypts under the new key alone
+        fetched = await verify.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == RAW  # decrypts under the new key alone
         blobs = await verify._fetchall(
             "SELECT raw AS v FROM messages UNION ALL SELECT payload FROM queue WHERE payload <> ''"
         )

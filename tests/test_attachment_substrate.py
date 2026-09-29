@@ -292,7 +292,9 @@ async def test_ingress_detach_creates_join_row_and_refcount(store: MessageStore)
     cur = await store._db.execute(
         "SELECT attachment_id FROM message_attachment WHERE message_id=?", (mid,)
     )
-    assert (await cur.fetchone())["attachment_id"] == ref
+    fetched = await cur.fetchone()
+    assert fetched is not None
+    assert fetched["attachment_id"] == ref
 
 
 async def test_purge_decrefs_and_deletes_linkage_atomically(store: MessageStore) -> None:
@@ -305,7 +307,9 @@ async def test_purge_decrefs_and_deletes_linkage_atomically(store: MessageStore)
 
     assert purged == 1
     # Body nulled (the mfdoc:v1:ref: handle is gone) AND the attachment reclaimed at its last referrer.
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
     assert await _refcount(store, ref) is None  # decref'd to 0 → GC'd
     assert await _chunk_count(store, ref) == 0  # chunks reclaimed too
     assert await _join_count(store, mid) == 0  # linkage released
@@ -403,7 +407,9 @@ async def test_no_attachment_retention_byte_identical(store: MessageStore) -> No
     assert await _join_count(store, mid) == 0
 
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM message_attachment")
     assert int((await cur.fetchone())["n"]) == 0  # linkage table untouched
 
@@ -474,9 +480,9 @@ async def test_dead_row_keeps_attachment_through_body_purge(store: MessageStore)
     purged = await store.purge_message_bodies(older_than=10 * DAY)
 
     assert purged == 1
-    assert (await store.get_message(mid))[
-        "raw"
-    ] == ""  # body nulled (the mfdoc handle left messages.raw)
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""  # body nulled (the mfdoc handle left messages.raw)
     # The DEAD row stays replayable AND its attachment SURVIVES — no premature GC / data loss.
     assert await _row_payload(store, oid) == "MSH|dead|mfdoc:v1:ref:doc"
     assert await _refcount(store, ref) == 1
@@ -514,7 +520,9 @@ async def test_dead_letter_purge_releases_attachment_when_run_first(store: Messa
 
     # A subsequent body purge nulls the (still-present) message row and is a no-op on the linkage.
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
     assert await _refcount(store, ref) is None  # no double-decref / underflow
 
 

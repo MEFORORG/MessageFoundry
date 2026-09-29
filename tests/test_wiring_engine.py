@@ -240,7 +240,9 @@ async def test_unrecognised_handler_return_dead_letters_in_the_live_runner(
     # Replayable: the dead row is a routed-stage row, so a fixed Handler re-runs this message rather
     # than the operator re-sending it from the partner.
     assert await store.replay(mid) == 1
-    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
 
 
 class _BoomSource(SourceConnector):
@@ -1272,7 +1274,9 @@ async def test_ingress_inbound_not_in_registry_reschedules_not_dead_letters(
     await runner._router_worker("GONE")  # returns after rescheduling the one residual row
     # Not dead-lettered (would be ERROR under the finite cap if it used the delivery policy); the
     # message is preserved and the row is pending again.
-    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
     rows = [  # noqa: C416
         r
         for r in await (
@@ -1723,7 +1727,9 @@ async def test_transform_worker_dead_letters_missing_handler(
         await _until_message(store, MessageStatus.ERROR.value)
     finally:
         await runner.stop()
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 # --- connection controls: outbound operator PAUSE (PR3 engine layer) ------------------------------

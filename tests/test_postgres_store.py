@@ -1839,8 +1839,12 @@ async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
                     f"still plaintext at rest after the keyed reopen: {sql}"
                 )
             # ... and the read paths still return the original cleartext through the new key.
-            assert (await keyed.get_message(eid))["error"] == err
-            assert (await keyed.get_message(qid))["raw"] == RAW
+            fetched = await keyed.get_message(eid)
+            assert fetched is not None
+            assert fetched["error"] == err
+            fetched = await keyed.get_message(qid)
+            assert fetched is not None
+            assert fetched["raw"] == RAW
             assert (await keyed.list_dead())[0]["last_error"] == fail
             assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
             assert keyed.reference_view()["providers"]["P1"] == {"mrn": "M-LEGACY-REF"}
@@ -1904,7 +1908,9 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -
             assert refused == [("messages", "raw")], "the open must report the surface exactly once"
             row = await reopened._fetchone("SELECT raw AS v FROM messages WHERE id=$1", planted)
             assert row["v"] == plant, "the keyed reopen sealed a planted row on a sealed surface"
-            assert (await reopened.get_message(good))["raw"] == RAW
+            fetched = await reopened.get_message(good)
+            assert fetched is not None
+            assert fetched["raw"] == RAW
             with pytest.raises(CipherError, match=r"messages\.raw"):
                 await reopened.get_message(planted)
             assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
@@ -4475,7 +4481,9 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     verify = await PostgresStore.open(settings, cipher=cipher_b)  # key_b alone, no retired
     try:
         assert len(await verify.list_messages()) == 1
-        assert (await verify.get_message(mid))["raw"] == RAW  # decrypts under the new key alone
+        fetched = await verify.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == RAW  # decrypts under the new key alone
         blobs = await verify._fetchall(
             "SELECT raw AS v FROM messages UNION ALL SELECT payload AS v FROM queue WHERE payload <> ''"
         )

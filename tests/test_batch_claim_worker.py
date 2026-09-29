@@ -118,7 +118,9 @@ async def test_t7_batch_mode_routes_backlog_in_order(
     # All 5 routed (each has a routed-stage row now), in order — the ingress lane is drained.
     assert await store.claim_next_fifo("IB", now=500.0, stage=Stage.INGRESS.value) is None
     for mid in mids:
-        assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.ROUTED.value
     # The routed rows came out in FIFO order (handler 'h' rows, oldest-first).
     cur = await store._db.execute(
         "SELECT message_id FROM queue WHERE stage=? AND channel_id=? ORDER BY created_at, rowid",
@@ -142,6 +144,7 @@ async def _drain_router(runner: RegistryRunner, name: str, store: MessageStore) 
                 (Stage.INGRESS.value, name, "pending"),
             )
             row = await cur.fetchone()
+            assert row is not None
             if row["c"] == 0:
                 break
             await asyncio.sleep(0.01)

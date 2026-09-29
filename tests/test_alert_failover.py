@@ -168,6 +168,9 @@ class _RecordingStore:
         self.resolves.append({"event_type": event_type, "connection": connection})
         return 1
 
+    async def list_active_alert_instances(self, *, limit: int = 1000) -> list[Any]:
+        return []
+
 
 async def test_leadership_lost_auto_resolves_acquired() -> None:
     store = _RecordingStore()
@@ -202,7 +205,7 @@ class _Clock:
 class _FakeLeaseDB:
     def __init__(self, db_clock: _Clock) -> None:
         self._db_clock = db_clock
-        self.row: dict[str, object] | None = None
+        self.row: dict[str, Any] | None = None
 
 
 class _FakeLeasePool:
@@ -224,7 +227,7 @@ class _FakeLeasePool:
         expired = float(row["lease_expires_at"]) + float(delay) < now  # type: ignore[arg-type]
         if row["owner"] == owner or expired:
             if row["owner"] != owner:
-                row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
+                row["leader_epoch"] = int(row["leader_epoch"]) + 1
             row["owner"] = owner
             row["lease_expires_at"] = now + float(ttl)  # type: ignore[arg-type]
             return {"owner": owner, "leader_epoch": row["leader_epoch"]}

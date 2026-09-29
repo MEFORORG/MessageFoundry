@@ -261,7 +261,9 @@ async def test_v1_rows_still_read_under_aad_bind(tmp_path: Path) -> None:
     )
     async with v1._read() as conn:
         cur = await conn.execute("SELECT raw FROM messages WHERE id=?", (mid,))
-        assert (await cur.fetchone())["raw"].startswith(PREFIX)  # frozen v1 marker
+        fetched = await cur.fetchone()
+        assert fetched is not None
+        assert fetched["raw"].startswith(PREFIX)  # frozen v1 marker
     await v1.close()
     bound = await _open_bound(db, key)
     try:
@@ -282,7 +284,9 @@ async def test_rotate_key_upgrades_v1_to_v2_in_place(tmp_path: Path) -> None:
     # Reopen with a NEW active key (old retired) AND aad_bind ON — the rotation scenario.
     store = await _open_bound(db, new, retired=[old])
     try:
-        assert (await store.get_message(mid))["raw"] == RAW  # keyring read before rotation
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == RAW  # keyring read before rotation
         rotated = await store.reencrypt_to_active()
         assert rotated >= 1
         async with store._read() as conn:

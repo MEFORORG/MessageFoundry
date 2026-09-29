@@ -158,7 +158,9 @@ async def test_purge_sweeps_metadata_left_by_a_pre_upgrade_engine(store: Message
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1  # the pre-upgrade purge
     # Re-attach metadata the way the old engine would have left it: body already blank.
     await _set_meta(store, mid, {"user": {"mrn": "MRN001"}})
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
 
     purged = await store.purge_message_bodies(older_than=10 * DAY)
 
@@ -179,7 +181,9 @@ async def test_purge_skips_recent_messages(store: MessageStore) -> None:
     # Cutoff (older_than) is before the message's received_at → not eligible.
     purged = await store.purge_message_bodies(older_than=9 * DAY)
     assert purged == 0
-    assert (await store.get_message(mid))["raw"] == "MSH|^~\\&|raw-body"
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == "MSH|^~\\&|raw-body"
 
 
 async def test_purge_skips_pending_and_inflight_messages(store: MessageStore) -> None:
@@ -196,8 +200,12 @@ async def test_purge_skips_pending_and_inflight_messages(store: MessageStore) ->
     purged = await store.purge_message_bodies(older_than=10 * DAY)
 
     assert purged == 0  # a body still in the pipeline must never be purged (at-least-once)
-    assert (await store.get_message(a))["raw"] == "MSH|first"  # inflight — kept
-    assert (await store.get_message(b))["raw"] == "MSH|second"  # pending — kept
+    fetched = await store.get_message(a)
+    assert fetched is not None
+    assert fetched["raw"] == "MSH|first"  # inflight — kept
+    fetched = await store.get_message(b)
+    assert fetched is not None
+    assert fetched["raw"] == "MSH|second"  # pending — kept
     # The widened statement must not reach an in-flight row through its metadata arm either: the
     # `metadata IS NOT NULL` disjunct is OR-ed INSIDE the eligible-set guard, never around it.
     assert await store.message_metadata_json(a) is not None
@@ -235,7 +243,9 @@ async def test_messages_window_keeps_dead_payload_for_its_own_window(store: Mess
     # its own window) — and because replay re-queues the row's own payload, never messages.raw, this
     # can't break a later replay.
     await store.purge_message_bodies(older_than=10 * DAY)
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
     assert await _payload(store, dead_id) == "OUT|dead-body"
 
     # The dead-letter window then nulls the dead payload, keeping the row + status.
@@ -316,7 +326,9 @@ async def test_purge_dead_letters_reaches_a_dead_ingress_row(store: MessageStore
     # The hazard this closes: the message window blanks `messages.raw`, so the message READS as
     # purged while the ingress row still holds the same body.
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
     assert await _payload(store, ingress_id) != ""  # ...and the body is still here
 
     # Its own (later) window then blanks it, keeping the row + DEAD status (counts/disposition).
@@ -326,7 +338,9 @@ async def test_purge_dead_letters_reaches_a_dead_ingress_row(store: MessageStore
     assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # idempotent
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (ingress_id,))
-    assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+    fetched = await cur.fetchone()
+    assert fetched is not None
+    assert fetched["status"] == OutboxStatus.DEAD.value
 
 
 async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore) -> None:
@@ -339,7 +353,9 @@ async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore)
     assert await store.purge_dead_letters(older_than=10 * DAY) == 0
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (routed_id,))
-    assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+    fetched = await cur.fetchone()
+    assert fetched is not None
+    assert fetched["status"] == OutboxStatus.DEAD.value
 
 
 async def test_dead_ingress_row_does_not_pin_a_streaming_attachment_forever(
@@ -688,7 +704,9 @@ async def test_run_once_no_ops_on_follower(store: MessageStore) -> None:
     assert result.messages_purged == 0 and result.dead_purged == 0
     assert not result.did_work
     # Nothing purged: the raw body is still present, and no audit row was written.
-    assert (await store.get_message(mid))["raw"] is not None
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] is not None
     assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
 
 

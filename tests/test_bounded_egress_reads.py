@@ -493,19 +493,15 @@ def test_ai_broker_maps_an_over_cap_reply_onto_its_own_error_type() -> None:
 # --- the alert webhook --------------------------------------------------------------------------
 
 
-def test_alert_webhook_drain_is_bounded() -> None:
+def test_alert_webhook_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     import messagefoundry.pipeline.alert_sinks as sinks
 
-    original = sinks._NO_REDIRECT_OPENER.open
-    sinks._NO_REDIRECT_OPENER.open = opener.open  # type: ignore[method-assign]
-    try:
-        with pytest.raises(ResponseTooLargeError):
-            transport._post({"type": "queue_buildup", "connection": "OB_X"})
-    finally:
-        sinks._NO_REDIRECT_OPENER.open = original  # type: ignore[method-assign]
+    monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", opener.open)
+    with pytest.raises(ResponseTooLargeError):
+        transport._post({"type": "queue_buildup", "connection": "OB_X"})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
@@ -784,18 +780,18 @@ def test_a_probe_still_reports_reachable_when_the_peer_answers_short() -> None:
     dest._probe()  # no raise
 
 
-def test_an_alert_already_accepted_is_not_reported_as_a_failed_send() -> None:
+def test_an_alert_already_accepted_is_not_reported_as_a_failed_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The webhook POST is accepted before the drain runs, so raising here would tell an operator
     the alert failed when the host took it."""
     transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
     import messagefoundry.pipeline.alert_sinks as sinks
 
-    original = sinks._NO_REDIRECT_OPENER.open
-    sinks._NO_REDIRECT_OPENER.open = _FakeOpener(_wire(_FIXED_TRUNCATED)).open  # type: ignore[method-assign]
-    try:
-        transport._post({"type": "queue_buildup", "connection": "OB_X"})  # no raise
-    finally:
-        sinks._NO_REDIRECT_OPENER.open = original  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        sinks._NO_REDIRECT_OPENER, "open", _FakeOpener(_wire(_FIXED_TRUNCATED)).open
+    )
+    transport._post({"type": "queue_buildup", "connection": "OB_X"})  # no raise
 
 
 # --- every site that RETYPES a refusal must retype the whole family -------------------------------
@@ -1024,4 +1020,6 @@ def test_the_unreadable_error_body_warning_names_the_connection(
         ]
         assert len(warned) == 1
         assert warned[0].startswith(identity + " returned")
-        assert urllib.parse.urlsplit(url).hostname not in warned[0]
+        host = urllib.parse.urlsplit(url).hostname
+        assert host is not None
+        assert host not in warned[0]

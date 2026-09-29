@@ -963,7 +963,9 @@ async def test_an_unwritable_log_makes_the_engine_refuse_to_process(
         assert list(outdir.iterdir()) == []  # nothing was delivered
         assert await store.outbox_for(message_id) == []  # nothing even reached the outbound stage
         # RECEIVED, not ROUTED/FILTERED/UNROUTED/PROCESSED: the router never ran on it.
-        assert (await store.get_message(message_id))["status"] == MessageStatus.RECEIVED.value
+        fetched = await store.get_message(message_id)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.RECEIVED.value
         # …and the row is intact and still claimable, so fixing the disk and restarting drains it.
         claimed = await store.claim_next_fifo(INBOUND, stage=Stage.INGRESS.value)
         assert claimed is not None and claimed.message_id == message_id
@@ -1042,7 +1044,9 @@ async def test_a_restart_is_refused_while_the_log_is_still_unwritable(
         assert INBOUND not in runner._sources  # …and intake did not come back either
         assert list(outdir.iterdir()) == []
         assert await store.outbox_for(message_id) == []
-        assert (await store.get_message(message_id))["status"] == MessageStatus.RECEIVED.value
+        fetched = await store.get_message(message_id)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.RECEIVED.value
 
         # The refusal is not permanent — it is conditioned on the log, so the SAME restart works once
         # the disk is fixed. Without this the test would also pass against an engine that simply never
@@ -1297,7 +1301,9 @@ async def test_a_runner_started_into_a_dead_log_comes_up_halted(
         await asyncio.sleep(1.0)  # generous: the healthy rig above delivers far inside this
         assert list(outdir.iterdir()) == []
         assert await store.outbox_for(message_id) == []
-        assert (await store.get_message(message_id))["status"] == MessageStatus.RECEIVED.value
+        fetched = await store.get_message(message_id)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.RECEIVED.value
 
         # …and the halt is CONDITIONED, not permanent — otherwise this test would also pass against a
         # runner that simply never processes anything, which is the wrong control for the right reason.

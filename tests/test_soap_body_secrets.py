@@ -135,7 +135,7 @@ def test_missing_env_value_fails_loud_at_resolution() -> None:
     [
         ({TOKEN: "literal-secret"}, "must be an env"),  # inline literal refused
         ({TOKEN: env("pw", default="fallback")}, "default="),  # fallback secret refused
-        ({TOKEN: env("pw", cast="int")}, "cast="),  # cast refused
+        ({TOKEN: env("pw", cast=int)}, "cast="),  # cast refused
         ({"short": env("pw")}, "must match"),  # low-entropy token refused
         ({TOKEN: env("a"), TOKEN + "XX": env("b")}, "substring"),  # overlapping tokens refused
     ],
@@ -234,7 +234,7 @@ async def test_no_body_secrets_is_byte_identical() -> None:
         Destination(name="OB", type=ConnectorType.SOAP, settings={"url": URL, "soap_action": "u"})
     )
     op = _Opener()
-    plain._opener = op  # type: ignore[assignment]
+    plain._opener = op  # type: ignore[attr-defined]
     await plain.send("<env>unchanged</env>")
     assert op.requests[0].data == b"<env>unchanged</env>"
 
