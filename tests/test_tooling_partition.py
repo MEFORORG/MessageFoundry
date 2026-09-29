@@ -186,6 +186,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
         # leave exactly the change that reintroduces the defect facing nothing.
         "test_username_access_key_screen.py",
+        # NOT engine source, so this entry widens the list's stated rule, as
+        # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
+        # TEST TREES: it AST-scans both `testpaths` roots for `assert not <collected list>` with no
+        # earlier count assertion (BACKLOG #1746 limb 2). What it catches arrives as a new test in an
+        # ordinary engine PR, which sets `code=true` but NOT `tooling=true`, so listed as tooling it
+        # would run on no leg for the change that adds the vacuous assertion.
+        "test_vacuous_absence_assert_lint.py",
         # AST-scans messagefoundry/store/store.py and reds on any `execute("BEGIN")` -- or on the
         # nested-transaction verbs `SAVEPOINT`, `ROLLBACK TO` and `RELEASE` -- outside
         # `_writer_txn` (ADR 0159). Same shape as sqlserver_encrypt_pass_tables below -- a guard whose
