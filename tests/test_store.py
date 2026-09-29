@@ -1047,7 +1047,7 @@ def _watch_aiosqlite_connects(
     real_connect = aiosqlite.connect
     opened: list[aiosqlite.Connection] = []
 
-    def spy_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def spy_connect(*args, **kwargs):
         # `connect` builds the Connection (and its Thread) synchronously and returns it awaitable,
         # so the worker is watchable before a single statement has run on it.
         conn = real_connect(*args, **kwargs)
@@ -1090,7 +1090,7 @@ def _park_workers_inside_the_close_window(
     original = loop.call_soon_threadsafe
     parked: list[str] = []
 
-    def call_soon_threadsafe(callback, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def call_soon_threadsafe(callback, *args, **kwargs):
         handle = original(callback, *args, **kwargs)
         worker = threading.current_thread()
         # The length guard is load-bearing, not defensive: this shadows the method on the LOOP, so
@@ -1107,7 +1107,7 @@ def _park_workers_inside_the_close_window(
         # `del` rather than reassigning `original`: the loop is session-scoped and shared with every
         # other test, so drop the instance attribute and let the class method show through again
         # instead of leaving a permanent shadow behind on it.
-        del loop.call_soon_threadsafe  # type: ignore[method-assign]
+        del loop.call_soon_threadsafe
 
 
 async def test_close_waits_for_every_aiosqlite_worker_thread(tmp_path) -> None:

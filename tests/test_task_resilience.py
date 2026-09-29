@@ -101,7 +101,7 @@ async def test_dead_worker_is_respawned_while_running() -> None:
     # per_lane: exercises the per-outbound delivery worker respawn (pooled has no per-outbound worker).
     runner = RegistryRunner(
         Registry(), _FlakyStore(fail_times=0), poll_interval=0.02, claim_mode="per_lane"
-    )  # type: ignore[arg-type]
+    )
     runner._running = True
 
     async def _boom() -> None:

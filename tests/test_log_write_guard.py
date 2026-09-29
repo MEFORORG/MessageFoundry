@@ -409,7 +409,7 @@ def test_stdout_sink_is_guarded_and_reports_when_the_stream_is_gone(
 
 
 @pytest.fixture(autouse=True)
-def _restore_process_logging():  # type: ignore[no-untyped-def]
+def _restore_process_logging():
     """configure_logging replaces the ROOT handlers and publishes a process-wide guard. Snapshot and
     restore both, so a test here cannot leak a rolled/unwritable sink into the rest of the suite."""
     root = logging.getLogger()
@@ -560,7 +560,7 @@ def _graph(store: MessageStore, sink: _RecordingSink) -> tuple[RegistryRunner, _
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "guard.db")
     yield s
     await s.close()

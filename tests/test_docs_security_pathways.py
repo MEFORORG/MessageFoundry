@@ -737,12 +737,10 @@ def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> No
     neither the default flip nor the opt-out can regress without reddening this guard.
     """
     service = AuthService.__new__(AuthService)
-    service._settings = AuthSettings(require_mfa=True)  # type: ignore[attr-defined]
+    service._settings = AuthSettings(require_mfa=True)
     user = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)
     assert (
-        service._mfa_required_for(  # type: ignore[arg-type]
-            user, frozenset({Role.OPERATOR}), second_factor_enrolled=False
-        )
+        service._mfa_required_for(user, frozenset({Role.OPERATOR}), second_factor_enrolled=False)
         is True
     ), (
         "_mfa_required_for no longer demands a second factor for a plain local account under the "
@@ -750,25 +748,19 @@ def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> No
         "same change."
     )
     narrowed = AuthService.__new__(AuthService)
-    narrowed._settings = AuthSettings(  # type: ignore[attr-defined]
-        require_mfa=True, require_mfa_scope="administrators"
-    )
+    narrowed._settings = AuthSettings(require_mfa=True, require_mfa_scope="administrators")
     assert (
-        narrowed._mfa_required_for(  # type: ignore[arg-type]
-            user, frozenset({Role.OPERATOR}), second_factor_enrolled=False
-        )
+        narrowed._mfa_required_for(user, frozenset({Role.OPERATOR}), second_factor_enrolled=False)
         is False
     ), "require_mfa_scope='administrators' must restore the pre-6.3.3 non-admin exemption"
     assert (
-        service._mfa_required_for(  # type: ignore[arg-type]
+        service._mfa_required_for(
             user, frozenset({Role.ADMINISTRATOR}), second_factor_enrolled=False
         )
         is True
     )
     assert (
-        service._mfa_required_for(  # type: ignore[arg-type]
-            user, frozenset({Role.OPERATOR}), second_factor_enrolled=True
-        )
+        service._mfa_required_for(user, frozenset({Role.OPERATOR}), second_factor_enrolled=True)
         is True
     )
     factor = next(r for r in _primary_table()[1:] if r[0].startswith("**Local**"))[1]

@@ -309,7 +309,7 @@ async def test_strict_downgraded_to_header_only_over_threshold(
     # Over the streaming threshold, whole-body hl7apy validation is NOT invoked (header-only downgrade).
     calls: list[str] = []
 
-    def _boom(text, *, expected_version=None):  # type: ignore[no-untyped-def]
+    def _boom(text, *, expected_version=None):
         calls.append(text)
         raise AssertionError("whole-body validate must not run over the streaming threshold")
 
@@ -337,7 +337,7 @@ async def test_strict_still_runs_below_threshold(store: MessageStore, monkeypatc
         ok = True
         errors: list[str] = []
 
-    def _spy(text, *, expected_version=None):  # type: ignore[no-untyped-def]
+    def _spy(text, *, expected_version=None):
         called.append(text)
         return _Result()
 

@@ -428,7 +428,7 @@ async def test_retention_runner_purges_state(tmp_path: Path) -> None:
 # --- backward compatibility (Send-only handlers) -----------------------------
 
 
-def _registry_with_handler(handle):  # type: ignore[no-untyped-def]
+def _registry_with_handler(handle):
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
@@ -462,7 +462,7 @@ def test_handler_returning_none_yields_no_deliveries_no_state() -> None:
 
 
 def test_mixed_send_and_setstate_list_is_partitioned() -> None:
-    def handle(msg: Message) -> list:  # type: ignore[type-arg]
+    def handle(msg: Message) -> list:
         return [Send("out", msg), SetState("ns", "k", "v")]
 
     reg = _registry_with_handler(handle)
@@ -475,7 +475,7 @@ def test_mixed_send_and_setstate_list_is_partitioned() -> None:
 
 
 def test_dry_run_resolves_state_get_and_captures_ops() -> None:
-    def handle(msg: Message) -> list:  # type: ignore[type-arg]
+    def handle(msg: Message) -> list:
         prior = state_get("patient_anon", "MRN1")  # no active store cache in dry-run
         assert prior is None  # nothing written yet this simulation
         return [Send("out", msg), SetState("patient_anon", "MRN1", "ANON-1")]
@@ -493,7 +493,7 @@ def test_dry_run_state_get_sees_earlier_handler_write() -> None:
     def h1(msg: Message) -> SetState:
         return SetState("ns", "k", "from-h1")
 
-    def h2(msg: Message):  # type: ignore[no-untyped-def]
+    def h2(msg: Message):
         assert state_get("ns", "k") == "from-h1"
         return Send("out", msg)
 

@@ -97,13 +97,13 @@ async def test_source_select_closes_its_cursor_before_release() -> None:
     src = object.__new__(db.DatabaseSource)
     log: list[str] = []
     pool = _FakePool(log, "select")
-    src._get_pool = lambda: _pool_coro(pool)  # type: ignore[method-assign,assignment]
-    src._acquire_timeout = 5.0  # type: ignore[attr-defined]
-    src._poll_sql = "SELECT 1"  # type: ignore[attr-defined]
+    src._get_pool = lambda: _pool_coro(pool)  # type: ignore[method-assign]
+    src._acquire_timeout = 5.0
+    src._poll_sql = "SELECT 1"
     src._poll_max_rows = db.DEFAULT_MAX_ITEMS_PER_POLL  # type: ignore[attr-defined]
     # _select decodes each row under the open cursor (BACKLOG #1662), so it reads body_column to
     # check the static config case once per poll. None = the whole-row JSON body.
-    src._body_column = None  # type: ignore[attr-defined]
+    src._body_column = None
 
     await src._select()
     assert "close:select" in log, f"the poll cursor was never closed; log={log}"
@@ -116,9 +116,9 @@ async def test_source_mark_closes_its_cursor_before_release() -> None:
     src = object.__new__(db.DatabaseSource)
     log: list[str] = []
     pool = _FakePool(log, "mark")
-    src._get_pool = lambda: _pool_coro(pool)  # type: ignore[method-assign,assignment]
-    src._acquire_timeout = 5.0  # type: ignore[attr-defined]
-    src._mark_sql = "UPDATE t SET done=1 WHERE id=?"  # type: ignore[attr-defined]
+    src._get_pool = lambda: _pool_coro(pool)  # type: ignore[method-assign]
+    src._acquire_timeout = 5.0
+    src._mark_sql = "UPDATE t SET done=1 WHERE id=?"
     src._mark_names = ("id",)  # type: ignore[attr-defined]
 
     await src._mark({"id": 1})

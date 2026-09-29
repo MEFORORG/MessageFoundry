@@ -320,7 +320,7 @@ def test_peer_cert_expiry_none_when_absent_or_unparseable() -> None:
     assert peer_cert_expiry({}, now=_REF_TS) is None
     assert peer_cert_expiry({"notAfter": ""}, now=_REF_TS) is None
     assert peer_cert_expiry({"notAfter": "not a date at all"}, now=_REF_TS) is None
-    assert peer_cert_expiry({"notAfter": 12345}, now=_REF_TS) is None  # type: ignore[dict-item]
+    assert peer_cert_expiry({"notAfter": 12345}, now=_REF_TS) is None
 
 
 def test_peer_cert_expiry_day_math_matches_the_pem_path() -> None:

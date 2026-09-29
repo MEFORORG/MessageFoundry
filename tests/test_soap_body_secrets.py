@@ -236,7 +236,7 @@ async def test_no_body_secrets_is_byte_identical() -> None:
     op = _Opener()
     plain._opener = op  # type: ignore[assignment]
     await plain.send("<env>unchanged</env>")
-    assert op.requests[0].data == b"<env>unchanged</env>"  # type: ignore[union-attr]
+    assert op.requests[0].data == b"<env>unchanged</env>"
 
 
 # --- construction-time credential validation, no value in the error ----------
@@ -340,7 +340,7 @@ DEST = "OB_REGISTRY"
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "bs.db")
     yield s
     await s.close()
@@ -398,7 +398,7 @@ async def test_stored_rows_hold_only_the_token_while_the_wire_gets_the_secret(
 
     d, op = _dest()
     runner = _runner(store)
-    runner._destinations[DEST] = d  # type: ignore[assignment]
+    runner._destinations[DEST] = d
     item = await store.claim_next_fifo(DEST, now=1.0)
     assert item is not None
     await runner._process_delivery_item(DEST, item)
@@ -418,7 +418,7 @@ async def test_forced_dead_letter_never_persists_the_secret(store: MessageStore)
     # a permanent HTTP 4xx dead-letters the row (NOT a credential rejection — that would be captured)
     d, _ = _dest(exc=_http_error(400, b"bad request"))
     runner = _runner(store)
-    runner._destinations[DEST] = d  # type: ignore[assignment]
+    runner._destinations[DEST] = d
     item = await store.claim_next_fifo(DEST, now=1.0)
     assert item is not None
     await runner._process_delivery_item(DEST, item)
@@ -439,7 +439,7 @@ async def test_replay_re_substitutes(store: MessageStore) -> None:
     # first attempt dead-letters
     d1, _ = _dest(exc=_http_error(400, b"bad"))
     runner = _runner(store)
-    runner._destinations[DEST] = d1  # type: ignore[assignment]
+    runner._destinations[DEST] = d1
     item = await store.claim_next_fifo(DEST, now=1.0)
     assert item is not None
     await runner._process_delivery_item(DEST, item)
@@ -447,7 +447,7 @@ async def test_replay_re_substitutes(store: MessageStore) -> None:
     # replay re-pends the SAME stored (token-only) payload (explicit now: the claim below must be later)
     assert await store.replay(mid, now=2.0) == 1
     d2, op2 = _dest()  # a fresh, healthy connector
-    runner._destinations[DEST] = d2  # type: ignore[assignment]
+    runner._destinations[DEST] = d2
     item2 = await store.claim_next_fifo(DEST, now=3.0)
     assert item2 is not None
     await runner._process_delivery_item(DEST, item2)

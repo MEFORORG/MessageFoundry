@@ -45,7 +45,7 @@ ADT_A01 = (
 )
 
 
-def _registry(route, handlers, *, strict: bool = False) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(route, handlers, *, strict: bool = False) -> Registry:
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
@@ -298,7 +298,7 @@ def test_select_inbound_caps_the_names_it_lists() -> None:
 # --- parse-once on the per-message fan-out (hotpath) --------------------------
 
 
-def _raw_registry(route, handlers, *, content_type: ContentType):  # type: ignore[no-untyped-def]
+def _raw_registry(route, handlers, *, content_type: ContentType):
     """A non-HL7 inbound: Router/Handlers receive a RawMessage (ADR 0004)."""
     reg = Registry()
     reg.add_inbound(

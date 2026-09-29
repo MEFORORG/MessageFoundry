@@ -204,7 +204,7 @@ async def test_poisoned_member_does_not_reject_its_siblings_via_store_api(
     # The poisoned one produced nothing, is still RECEIVED, and its ingress row is still inflight —
     # held for recovery, never silently dropped (count-and-log intact).
     assert (await store.get_message(mids[1]))["status"] == MessageStatus.RECEIVED.value
-    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (items[1].id,))  # type: ignore[union-attr]
+    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (items[1].id,))
     assert (await cur.fetchone())["status"] == OutboxStatus.INFLIGHT.value
 
     # Recover just that row and re-run cleanly — it routes (the re-run its rejection licenses), and no
@@ -413,7 +413,7 @@ async def test_claim_never_enrolls_in_committer(store: MessageStore) -> None:
     calls = {"n": 0}
     real_submit = gc.submit
 
-    async def counting_submit(run, **kwargs):  # type: ignore[no-untyped-def]
+    async def counting_submit(run, **kwargs):
         calls["n"] += 1
         return await real_submit(run, **kwargs)
 

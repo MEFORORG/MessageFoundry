@@ -49,7 +49,7 @@ async def store(tmp_path: Path):
 # --- helpers -----------------------------------------------------------------
 
 
-def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:
     reg = Registry()
     reg.add_outbound(
         OutboundConnection(

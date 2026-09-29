@@ -31,7 +31,7 @@ ADT_A01 = (
 
 
 def _out_json(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
-    return json.loads(capsys.readouterr().out)  # type: ignore[no-any-return]
+    return json.loads(capsys.readouterr().out)
 
 
 def _check(report: dict[str, object], name: str) -> dict[str, object]:

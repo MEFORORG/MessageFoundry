@@ -163,7 +163,7 @@ def test_build_ack_propagates_custom_field_separator() -> None:
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()

@@ -170,7 +170,7 @@ def test_verify_disposition_queries_per_control_id_and_surfaces_send_errors() ->
     queried: list[str | None] = []
 
     class FakeClient:
-        def list_messages(self, *, control_id: str | None = None, limit: int = 50, **k: object):  # type: ignore[no-untyped-def]
+        def list_messages(self, *, control_id: str | None = None, limit: int = 50, **k: object):
             queried.append(control_id)
             return SimpleNamespace(
                 messages=[SimpleNamespace(control_id=control_id, status="processed")]

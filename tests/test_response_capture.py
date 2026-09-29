@@ -420,7 +420,7 @@ def _rest(capture: bool) -> Any:
 
 async def test_rest_capture_2xx_body_and_empty() -> None:
     d = _rest(True)
-    d._opener = _Opener(_Resp(b'{"id":7}', 201))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(b'{"id":7}', 201))
     r = await d.send("{}")
     assert (
         r is not None
@@ -428,14 +428,14 @@ async def test_rest_capture_2xx_body_and_empty() -> None:
         and r.body == '{"id":7}'
         and r.detail == "HTTP 201"
     )
-    d._opener = _Opener(_Resp(b"", 204))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(b"", 204))
     r2 = await d.send("{}")
     assert r2 is not None and r2.outcome == "no_reply"
 
 
 async def test_rest_noncapture_returns_none() -> None:
     d = _rest(False)
-    d._opener = _Opener(_Resp(b"anything", 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(b"anything", 200))
     assert await d.send("{}") is None
 
 
@@ -457,18 +457,18 @@ def _soap(capture: bool) -> Any:
 
 async def test_soap_capture_clean_and_fault() -> None:
     d = _soap(True)
-    d._opener = _Opener(_Resp(_SOAP_OK.encode(), 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(_SOAP_OK.encode(), 200))
     r = await d.send("<req/>")
     assert r is not None and r.outcome == "accepted" and "Result" in r.body
     # A 2xx <Fault> is CAPTURED as 'rejected' (not raised) for a capturing outbound.
-    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))
     r2 = await d.send("<req/>")
     assert r2 is not None and r2.outcome == "rejected"
 
 
 async def test_soap_noncapture_fault_still_raises() -> None:
     d = _soap(False)
-    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))
     with pytest.raises((DeliveryError, NegativeAckError)):
         await d.send("<req/>")
 

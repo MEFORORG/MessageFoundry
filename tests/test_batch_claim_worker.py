@@ -71,11 +71,11 @@ async def test_t5_n1_uses_single_claim_never_batch(
     real_single = store.claim_next_fifo
     real_batch = store.claim_next_fifo_batch
 
-    async def spy_single(*a, **k):  # type: ignore[no-untyped-def]
+    async def spy_single(*a, **k):
         single_calls["n"] += 1
         return await real_single(*a, **k)
 
-    async def spy_batch(*a, **k):  # type: ignore[no-untyped-def]
+    async def spy_batch(*a, **k):
         batch_calls["n"] += 1
         return await real_batch(*a, **k)
 
@@ -102,7 +102,7 @@ async def test_t7_batch_mode_routes_backlog_in_order(
     batch_calls = {"n": 0}
     real_batch = store.claim_next_fifo_batch
 
-    async def spy_batch(*a, **k):  # type: ignore[no-untyped-def]
+    async def spy_batch(*a, **k):
         batch_calls["n"] += 1
         return await real_batch(*a, **k)
 

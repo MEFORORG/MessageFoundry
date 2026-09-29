@@ -689,8 +689,8 @@ async def test_reference_backend_gate_refuses_declared_sets_on_unsupporting_back
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "gate.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     try:
         with pytest.raises(WiringError) as exc:
             check_reference_backend_supported(_ref_graph(csv), store)
@@ -709,8 +709,8 @@ async def test_reference_backend_gate_is_a_noop_without_declared_sets(tmp_path: 
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "gate.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     try:
         check_reference_backend_supported(_ref_graph(csv, with_reference=False), store)  # no raise
     finally:
@@ -737,8 +737,8 @@ async def test_engine_start_refuses_graph_with_reference_set_on_unsupporting_bac
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "start.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     engine = Engine(store)
     engine.add_registry(_ref_graph(csv))
     try:
@@ -764,8 +764,8 @@ async def test_reload_refuses_adding_a_reference_set_on_unsupporting_backend(
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "reload.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     engine = Engine(store)
     engine.add_registry(_ref_graph(csv, with_reference=False))
     try:
@@ -810,7 +810,7 @@ async def test_sync_does_not_retry_a_backend_that_cannot_materialize(
         attempts.append(name)
         raise NotImplementedError("this backend has no reference tables")
 
-    store.write_reference_snapshot = raising_write  # type: ignore[assignment,method-assign]
+    store.write_reference_snapshot = raising_write  # type: ignore[method-assign]
     alerts = _CapturingAlerts()
     runner = ReferenceSyncRunner(
         store, lambda: [_spec("provider_npi", csv)], REF, alert_sink=alerts
@@ -1001,7 +1001,7 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
         real_execute = store._db.execute
         fired = False
 
-        async def racing_execute(sql: str, params: Any = None):  # type: ignore[no-untyped-def]
+        async def racing_execute(sql: str, params: Any = None):
             nonlocal fired
             if not fired and sql.lstrip().upper().startswith("DELETE FROM REFERENCE"):
                 # The reload lands HERE: after eligibility was decided, before the rows are removed.

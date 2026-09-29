@@ -47,7 +47,7 @@ ADT = (
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()
@@ -56,8 +56,8 @@ async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
 def _registry(
     inbox: Path,
     outdir: Path,
-    route,  # type: ignore[no-untyped-def]
-    handlers: dict,  # type: ignore[type-arg]
+    route,
+    handlers: dict,
     *,
     inline: bool = False,
     with_lookup: bool = False,
@@ -396,7 +396,7 @@ async def test_inline_handler_raises_stop_policy_halts_lane(
         def connection_stopped(self, name: str, *, detail: str = "") -> None:
             self.stopped.append(name)
 
-        def __getattr__(self, _n: str):  # type: ignore[no-untyped-def]
+        def __getattr__(self, _n: str):
             return lambda *a, **k: None
 
     def boom(msg: Message) -> Send:

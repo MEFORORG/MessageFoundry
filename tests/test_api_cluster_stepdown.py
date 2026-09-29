@@ -163,7 +163,7 @@ async def _service(store: MessageStore, settings: AuthSettings | None = None) ->
 
 
 def _client(engine: Engine | None, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))  # type: ignore[arg-type]
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 

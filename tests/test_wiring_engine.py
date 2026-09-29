@@ -54,7 +54,7 @@ async def store(tmp_path: Path):
     await s.close()
 
 
-def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:
     reg = Registry()
     reg.add_outbound(
         OutboundConnection(
@@ -250,7 +250,7 @@ class _BoomSource(SourceConnector):
 
     polls_shared_resource = False
 
-    async def start(self, handler, *, leader_gate=None) -> None:  # type: ignore[no-untyped-def]
+    async def start(self, handler, *, leader_gate=None) -> None:
         raise OSError("address already in use")
 
     async def stop(self) -> None:
@@ -290,7 +290,7 @@ async def test_start_isolates_inbound_bind_failure_and_recovers(
     real_build_source = wr.build_source
     calls = {"n": 0}
 
-    def flaky(cfg: object):  # type: ignore[no-untyped-def]
+    def flaky(cfg: object):
         calls["n"] += 1
         return _BoomSource() if calls["n"] == 1 else real_build_source(cfg)
 
@@ -326,7 +326,7 @@ async def test_fatal_startup_error_still_unwinds_and_raises(
     )
     runner = RegistryRunner(reg, store)
 
-    def boom():  # type: ignore[no-untyped-def]
+    def boom():
         raise RuntimeError("lookup executor build failed")
 
     monkeypatch.setattr(runner, "_build_lookup_executor", boom)
@@ -390,7 +390,7 @@ async def test_handler_exception_redacts_phi_from_stored_error(
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))  # carries PID|...||DOE^JANE
 
-    def boom(m):  # type: ignore[no-untyped-def]
+    def boom(m):
         raise ValueError(f"cannot transform {m}")  # str(m) is the full HL7 body (PHI)
 
     reg = _registry(inbox, outdir, lambda m: ["boom"], {"boom": boom})
@@ -466,7 +466,7 @@ async def test_pipeline_handler_exception_logs_no_phi(store: MessageStore, tmp_p
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(PHI_ADT.encode("utf-8"))
 
-    def boom(m):  # type: ignore[no-untyped-def]
+    def boom(m):
         raise ValueError(f"cannot transform {m}")  # str(m) is the full HL7 body (PHI)
 
     reg = _registry(inbox, outdir, lambda m: ["boom"], {"boom": boom})
@@ -1030,7 +1030,7 @@ class _RecordingAlertSink:
     def connection_restored(self, name: str) -> None: ...
 
 
-def _stop_registry(inbox: Path, outdir: Path, internal_error) -> Registry:  # type: ignore[no-untyped-def]
+def _stop_registry(inbox: Path, outdir: Path, internal_error) -> Registry:
     """Like _retry_registry but with an explicit per-connection internal_error policy and no retry
     override (so it inherits the retry-forever default)."""
     reg = Registry()
@@ -1058,7 +1058,7 @@ def _stop_registry(inbox: Path, outdir: Path, internal_error) -> Registry:  # ty
     return reg
 
 
-async def _until(predicate, timeout: float = 3.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(predicate, timeout: float = 3.0) -> None:
     elapsed = 0.0
     while not predicate():
         await asyncio.sleep(0.02)
@@ -1162,7 +1162,7 @@ async def test_stop_policy_via_global_default(store: MessageStore, tmp_path: Pat
 # --- ingress-worker error / alert / lifecycle paths (staged pipeline, ADR 0001) ----------------
 
 
-def _raising_router_registry(inbox: Path, outdir: Path, route):  # type: ignore[no-untyped-def]
+def _raising_router_registry(inbox: Path, outdir: Path, route):
     reg = _registry(inbox, outdir, route, {"h": lambda m: Send("file_out", m)})
     return reg
 
@@ -1392,7 +1392,7 @@ async def test_message_stall_alert_fires_over_threshold(
     )
     old = _time.time() - 120.0  # oldest pending row created 120s ago → over the 60s threshold
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (3, old)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1418,7 +1418,7 @@ async def test_message_stall_alert_silent_under_threshold(
     )
     young = _time.time() - 5.0  # 5s old → well under the 60s threshold
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (3, young)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1438,7 +1438,7 @@ async def test_message_stall_alert_off_by_default(
     runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)  # no stall_default
     old = _time.time() - 9999.0
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (3, old)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1459,7 +1459,7 @@ async def test_message_stall_per_connection_override(
     runner._stall["OB_TIGHT"] = StallThreshold(max_oldest_seconds=10.0)  # per-connection override
     old = _time.time() - 30.0
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (1, old)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1489,7 +1489,7 @@ async def test_saturation_alert_fires_on_rising_backlog(
     )
     depths = iter([0, 5, 10, 15])
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (next(depths), None)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1520,7 +1520,7 @@ async def test_saturation_alert_silent_on_bursty_but_draining_lane(
     )
     depths = iter([0, 50, 40, 20, 10])  # a burst the worker is clearing (a decrease appears)
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (next(depths), None)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1542,7 +1542,7 @@ async def test_saturation_alert_off_by_default(
     )  # no saturation_default
     read = False
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         nonlocal read
         read = True
         return (10_000, None)
@@ -1570,7 +1570,7 @@ async def test_saturation_alert_not_paged_for_paused_outbound(
     runner._outbound_paused.add("OB_PAUSED")
     depths = iter([0, 5, 10, 15, 20])
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (next(depths), None)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1598,7 +1598,7 @@ async def test_buildup_realert_throttle_fires_suppresses_then_refires(
         alert_sink=sink,
     )
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (5, None)  # depth 5 >= max_depth 1 on every tick → always crossed
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1637,7 +1637,7 @@ async def test_stall_realert_throttle_fires_suppresses_then_refires(
     clock = [1000.0]
     monkeypatch.setattr(_wr.time, "time", lambda: clock[0])
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (3, clock[0] - 120.0)  # oldest pending row always 120s old → over the 60s threshold
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1675,7 +1675,7 @@ async def test_saturation_realert_throttle_fires_suppresses_then_refires(
     )
     depths = iter([0, 10, 20, 30, 40, 50])  # strictly rising → signals once primed (4th sample)
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (next(depths), None)
 
     monkeypatch.setattr(store, "pending_depth", _stub)
@@ -1748,7 +1748,7 @@ class _Recorder:
         return None
 
 
-async def _poll(pred, timeout: float = 3.0) -> bool:  # type: ignore[no-untyped-def]
+async def _poll(pred, timeout: float = 3.0) -> bool:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
@@ -2040,7 +2040,7 @@ async def test_paused_outbound_suppresses_buildup_and_stall_then_lifts(
     )
     old = _time.time() - 120.0  # deep + aged -> crosses BOTH thresholds
 
-    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+    async def _stub(name: str, *, stage: str):
         return (5, old)
 
     monkeypatch.setattr(store, "pending_depth", _stub)

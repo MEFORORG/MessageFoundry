@@ -65,7 +65,7 @@ ESC = "MSH|^~\\&|ESC|F|R|RF|20260101||ADT^A01|MSG3|P|2.5.1\rPID|1||900003||POE^P
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "accepts.db")
     yield s
     await s.close()

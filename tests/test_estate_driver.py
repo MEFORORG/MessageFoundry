@@ -51,7 +51,7 @@ def _driver_with_fakes(
         def __init__(self, idx: int) -> None:
             self._idx = idx
 
-        def submit_nowait(self, out, on_done=None):  # type: ignore[no-untyped-def]
+        def submit_nowait(self, out, on_done=None):
             sent_per_conn[self._idx] += 1
             return True
 
@@ -59,7 +59,7 @@ def _driver_with_fakes(
     return driver, sent_per_conn, flags
 
 
-def _build_corpus():  # type: ignore[no-untyped-def]
+def _build_corpus():
     ids = ControlIds(prefix="ES")
     return build_corpus(
         LoadProfile(

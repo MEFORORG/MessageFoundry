@@ -47,7 +47,7 @@ ADT = (
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "fault.db")
     yield s
     await s.close()
@@ -69,7 +69,7 @@ class _RecordingAlertSink:
         self.errors.append((name, kind))
 
 
-async def _until(predicate, timeout: float = 10.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(predicate, timeout: float = 10.0) -> None:
     elapsed = 0.0
     while not predicate():
         await asyncio.sleep(0.02)

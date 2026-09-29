@@ -215,7 +215,7 @@ async def test_rider1_crash_replay_before_commit(store: Any) -> None:
         def _boom(conn: Any, **kw: Any) -> bool:
             raise RuntimeError("handoff commit fault (pre-commit crash)")
 
-        store.route_handoff_sync = _boom  # type: ignore[method-assign]
+        store.route_handoff_sync = _boom
         with pytest.raises(RuntimeError):
             await runner._process_ingress_item("IB", ing)
         store.route_handoff_sync = orig  # restore
@@ -293,7 +293,7 @@ async def test_rider2_handoff_rollback_preserves_claim(store: Any) -> None:
         def _boom(conn: Any, **kw: Any) -> Any:
             raise RuntimeError("transform handoff commit fault")
 
-        store.transform_handoff_sync = _boom  # type: ignore[method-assign]
+        store.transform_handoff_sync = _boom
         with pytest.raises(RuntimeError):
             await runner._process_routed_item("IB", rtd)
         store.transform_handoff_sync = orig  # restore
@@ -356,7 +356,7 @@ async def test_rider4_infra_propagates_content_dead_letters(store: Any) -> None:
         def _boom(conn: Any, **kw: Any) -> bool:
             raise RuntimeError("simulated SQL fault / sync-pool acquire timeout")
 
-        store.route_handoff_sync = _boom  # type: ignore[method-assign]
+        store.route_handoff_sync = _boom
         with pytest.raises(RuntimeError):
             await runner._process_ingress_item("IB", ing)
         store.route_handoff_sync = orig
@@ -456,7 +456,7 @@ async def test_rider6_loopback_response_view_parity(store: Any) -> None:
     async def _correlate(corr: str) -> list[CapturedResponse]:
         return captured
 
-    store.correlate_response = _correlate  # type: ignore[method-assign]
+    store.correlate_response = _correlate
     meta = json.dumps({"correlation_id": "corr-1"})
 
     runner = await _runner_with_fusion(store, reg)

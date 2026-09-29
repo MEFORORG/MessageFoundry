@@ -289,7 +289,7 @@ async def test_self_fence_demotes_when_renew_stalls() -> None:
     mono = _Clock(0.0)
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader, _last_renew_ok = 0
-    a._pool.fail = True  # type: ignore[attr-defined]  # partition: no more renews land
+    a._pool.fail = True  # partition: no more renews land
     mono.t = 20.0
     a._check_fence()
     assert a.is_leader() is True  # exactly at the timeout: not yet (strict >)
@@ -314,7 +314,7 @@ async def test_maintain_does_not_demote_on_db_error_watchdog_does() -> None:
     mono = _Clock(0.0)
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader
-    a._pool.fail = True  # type: ignore[attr-defined]
+    a._pool.fail = True
     with pytest.raises(RuntimeError, match="partitioned"):
         await a._maintain_leadership()
     assert a.is_leader() is True  # the error alone did not demote
@@ -336,7 +336,7 @@ async def test_fence_fires_before_standby_can_acquire() -> None:
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", ttl=30.0, fence=20.0)
 
     await a._maintain_leadership()  # A leader (lease expiry 30)
-    a._pool.fail = True  # type: ignore[attr-defined]  # A partitioned: no more renews
+    a._pool.fail = True  # A partitioned: no more renews
 
     # t = 20+: A self-fences. The standby, querying the (still-live until 30) lease, cannot acquire yet.
     a_mono.t = 20.1
@@ -435,7 +435,7 @@ async def test_epoch_cleared_on_self_fence() -> None:
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader, epoch 1
     assert a.current_epoch() == 1
-    a._pool.fail = True  # type: ignore[attr-defined]  # partition: renews stop
+    a._pool.fail = True  # partition: renews stop
     mono.t = 20.1
     a._check_fence()
     assert a.is_leader() is False
@@ -1349,7 +1349,7 @@ def _sql_coord(
     # Same timings as _coord above, so the two backends' tests are comparable at a glance. `mono` is
     # passed in when a test needs to move this node's monotonic clock past its own stepdown pause.
     return SqlServerCoordinator(
-        store,  # type: ignore[arg-type]
+        store,
         node,
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=30.0,
@@ -1560,7 +1560,7 @@ async def test_sqlserver_a_handicapped_sibling_takes_over_after_a_stepdown() -> 
     mono_a = _Clock(0.0)
     a = _sql_coord(_FakeSqlLeaseStore(db), "A", mono_a)
     b = SqlServerCoordinator(
-        _FakeSqlLeaseStore(db),  # type: ignore[arg-type]
+        _FakeSqlLeaseStore(db),
         "B",
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=30.0,

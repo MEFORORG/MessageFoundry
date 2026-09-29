@@ -148,8 +148,8 @@ def test_set_batch_handoff_statements_toggles_and_returns_effective() -> None:
 
 def _bare_runner(*, flag: bool, store: object, fusion_active: bool = False) -> RegistryRunner:
     runner = object.__new__(RegistryRunner)
-    runner._batch_handoff_statements = flag  # type: ignore[attr-defined]
-    runner._fusion_active = fusion_active  # type: ignore[attr-defined]
+    runner._batch_handoff_statements = flag
+    runner._fusion_active = fusion_active
     runner.store = store  # type: ignore[assignment]
     return runner
 

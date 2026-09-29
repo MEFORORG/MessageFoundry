@@ -607,7 +607,7 @@ async def test_notifier_failure_is_isolated_from_the_auth_op() -> None:
         # and this test is about the rotation's own effects.
         service = AuthService(
             store, AuthSettings(require_mfa=False), security_notifier=_BoomNotifier()
-        )  # type: ignore[arg-type]
+        )
         await _local_user(store)
         out = await service.login("bob", GOOD_PASSWORD)
         assert out.ok and out.identity is not None
@@ -635,7 +635,7 @@ async def test_a_failed_notice_logs_the_kind_the_account_and_the_exception_class
     address or an EMAIL_CHANGED ``detail``."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(), security_notifier=_AddressQuotingNotifier())  # type: ignore[arg-type]
+        service = AuthService(store, AuthSettings(), security_notifier=_AddressQuotingNotifier())
         await _local_user(store)
         with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
             await service.update_user(
@@ -664,7 +664,7 @@ async def test_the_two_notice_warnings_escape_a_line_break_in_the_username(
     escape them at the call site, and an unknown kind is logged as ``unrecognised``, not echoed."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)  # type: ignore[arg-type]
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
         with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
             await service._notify_security(PASSWORD_CHANGED, username="bob\r\nforged", email=None)
             await service._notify_security("free-form kind", username="bob", email=None)

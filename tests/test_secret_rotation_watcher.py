@@ -83,7 +83,7 @@ class _RecordingSink:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    def __getattr__(self, _name: str):  # type: ignore[no-untyped-def]
+    def __getattr__(self, _name: str):
         # Any AlertSink method other than the one under test is a no-op (keeps the double small).
         return lambda *a, **k: None
 
@@ -152,7 +152,7 @@ def test_new_class_stamps_tracked_since_today_as_age_floor() -> None:
     # retroactive age — a pre-existing year-old key does not start alerting on upgrade.
     store = _FakeMetaStore()
     stamps = _reconcile(store)
-    dek = stamps[_DEK]  # type: ignore[index]
+    dek = stamps[_DEK]
     assert dek.tracked_since == _TODAY  # type: ignore[attr-defined]
     assert dek.last_rotated == _TODAY  # type: ignore[attr-defined]
     assert store.rows[_DEK].fingerprint == "dekid-aaa"
@@ -164,7 +164,7 @@ def test_fingerprint_change_resets_the_clock() -> None:
     prior = SecretRotationMetaRow(_DEK, "dekid-OLD", "2025-01-01", "2025-01-01")
     store = _FakeMetaStore(rows={_DEK: prior})
     stamps = _reconcile(store, dek_key_id="dekid-NEW")
-    dek = stamps[_DEK]  # type: ignore[index]
+    dek = stamps[_DEK]
     assert dek.last_rotated == _TODAY  # reset on change  # type: ignore[attr-defined]
     assert dek.tracked_since == datetime.date(
         2025, 1, 1
@@ -178,7 +178,7 @@ def test_unchanged_class_is_not_rewritten() -> None:
     store = _FakeMetaStore(rows={_DEK: prior})
     stamps = _reconcile(store, dek_key_id="dekid-SAME")
     assert store.upserts == []  # untouched
-    dek = stamps[_DEK]  # type: ignore[index]
+    dek = stamps[_DEK]
     assert dek.last_rotated == datetime.date(2025, 3, 1)  # type: ignore[attr-defined]
 
 
@@ -443,7 +443,7 @@ def test_held_env_secret_values_reads_present_nonempty_only() -> None:
 # --- end-to-end against a real keyed MessageStore ---------------------------
 
 
-def test_real_store_meta_roundtrip_and_reconcile(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_real_store_meta_roundtrip_and_reconcile(tmp_path) -> None:
     async def _go() -> None:
         store = await MessageStore.open(tmp_path / "rot.db", cipher=make_cipher(generate_key()))
         try:
@@ -536,7 +536,7 @@ def test_non_ascii_stored_fingerprint_is_a_rotation_not_a_type_error() -> None:
     prior = SecretRotationMetaRow(_DEK, "brøken", "2025-01-01", "2025-01-01")
     store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
     stamps = _reconcile(store, dek_key_id="dekid-aaa")
-    dek = stamps[_DEK]  # type: ignore[index]
+    dek = stamps[_DEK]
     assert dek.last_rotated == _TODAY  # type: ignore[attr-defined]
     assert dek.tracked_since == datetime.date(2025, 1, 1)  # type: ignore[attr-defined]
     assert store.rows[_DEK].fingerprint == "dekid-aaa"
@@ -548,7 +548,7 @@ def test_lone_surrogate_stored_fingerprint_is_a_rotation_not_a_type_error() -> N
     prior = SecretRotationMetaRow(_DEK, "\ud800", "2025-01-01", "2025-01-01")
     store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
     stamps = _reconcile(store, dek_key_id="dekid-aaa")
-    assert stamps[_DEK].last_rotated == _TODAY  # type: ignore[index,attr-defined]
+    assert stamps[_DEK].last_rotated == _TODAY  # type: ignore[attr-defined]
 
 
 def test_fingerprint_bytes_is_total_and_injective() -> None:

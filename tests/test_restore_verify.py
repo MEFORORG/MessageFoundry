@@ -831,7 +831,7 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
     monkeypatch.setattr(dr_backup, "_remove_tree", lambda path: False)
     real_open = open
 
-    def open_refusing_writes(file, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+    def open_refusing_writes(file, mode="r", *args, **kwargs):
         if mode == "r+b":
             raise PermissionError(13, "synthetic sharing violation", str(file))
         return real_open(file, mode, *args, **kwargs)
@@ -910,7 +910,7 @@ def test_a_directory_that_cannot_be_listed_is_not_reported_empty(tmp_path, monke
     staging.mkdir()
     (staging / "extracted_store.db").write_bytes(b"synthetic")
 
-    def walk_refusing(top, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
+    def walk_refusing(top, onerror=None, **kwargs):
         assert onerror is not None
         onerror(PermissionError(13, "synthetic listing refusal", str(top)))
         return iter(())

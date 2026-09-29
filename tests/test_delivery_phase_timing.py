@@ -191,13 +191,13 @@ def _reg(inbox: Path, outdir: Path) -> Registry:
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "phase.db")
     yield s
     await s.close()
 
 
-async def _until(pred, *, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(pred, *, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if await pred():

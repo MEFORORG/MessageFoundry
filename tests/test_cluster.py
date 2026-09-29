@@ -738,7 +738,7 @@ async def _run_one_claim(coordinator: ClusterCoordinator, worker: str) -> list[t
     # the loop exits on the next guard) — keeps the test fast and deterministic.
     runner = RegistryRunner(
         Registry(), store=_NullStore(), coordinator=coordinator, poll_interval=0.0
-    )  # type: ignore[arg-type]
+    )
     spy = _FifoClaimSpyStore(runner._stop)
     runner.store = spy  # type: ignore[assignment]
     await getattr(runner, worker)("LANE")

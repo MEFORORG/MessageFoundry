@@ -1255,7 +1255,7 @@ async def test_respond_drain_is_bounded(
 # ingress row (status is asserted with the same (4xx, 0) tolerance the file already uses).
 
 
-async def _wait_for(predicate, timeout: float = 2.0) -> bool:  # type: ignore[no-untyped-def]
+async def _wait_for(predicate, timeout: float = 2.0) -> bool:
     """Poll ``predicate`` until true or ``timeout`` — mirrors the MLLP analog rather than sleeping."""
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout

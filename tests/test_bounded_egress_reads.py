@@ -329,7 +329,7 @@ class _UnboundedHTTPError(urllib.error.HTTPError):
         super().__init__(url, code, "err", email.message.Message(), io.BytesIO(b""))
         self.requested: list[int] = []
 
-    def read(self, amt: int = -1) -> bytes:  # type: ignore[override]
+    def read(self, amt: int = -1) -> bytes:
         self.requested.append(amt)
         if amt < 0:
             raise AssertionError("unbounded read: the call site asked for the whole error body")
@@ -681,8 +681,8 @@ def test_a_real_reply_is_read_in_pieces_not_in_one_bound_sized_read() -> None:
         read_bounded(wire(b"HTTP/1.1 200 OK\r\n\r\n" + body), limit=piece, connector="c")
     # A non-2xx arrives wrapped in HTTPError, and is read in pieces too.
     inner = wire(b"HTTP/1.1 500 Internal Server Error\r\n\r\n" + body)
-    err = urllib.error.HTTPError(REST_URL, 500, "err", inner.headers, inner)  # type: ignore[arg-type]
-    assert read_bounded(err, connector="c") == body  # type: ignore[arg-type]
+    err = urllib.error.HTTPError(REST_URL, 500, "err", inner.headers, inner)
+    assert read_bounded(err, connector="c") == body
     assert asked and max(asked) <= piece
 
 
@@ -708,7 +708,7 @@ def test_a_truncated_error_body_is_caught_on_the_non_2xx_path_too() -> None:
     inner = _wire(_FIXED_TRUNCATED)
     err = urllib.error.HTTPError(REST_URL, 500, "err", inner.headers, inner)
     with pytest.raises(TruncatedResponseError):
-        read_bounded(err, limit=1024, connector="OB_TEST")  # type: ignore[arg-type]
+        read_bounded(err, limit=1024, connector="OB_TEST")
 
 
 def test_the_refusal_is_a_delivery_error_not_a_permanent_nak_either() -> None:

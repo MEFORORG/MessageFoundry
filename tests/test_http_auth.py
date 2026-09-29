@@ -426,7 +426,7 @@ def test_rest_oauth2_bearer_on_the_wire() -> None:
         def invalidate(self) -> None:
             pass
 
-    dest._token_provider = _P()  # type: ignore[assignment]
+    dest._token_provider = _P()
 
     class _Resp:
         headers: dict[str, str] = {}

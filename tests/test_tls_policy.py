@@ -1254,7 +1254,7 @@ def test_the_tls_strength_floor_is_not_the_key_material_floor() -> None:
     ctx = ssl.create_default_context()
     assert ctx.security_level == 2
     with pytest.raises(AttributeError):
-        ctx.security_level = 3  # type: ignore[misc]
+        ctx.security_level = 3
 
 
 # --- BACKLOG #1005: opt-in CRL checking on the verifying server contexts -----------------------------

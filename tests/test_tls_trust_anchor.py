@@ -67,7 +67,7 @@ def _ca_pem(tmp_path: Path, cn: str = "mefor-internal-ca") -> str:
 def test_connection_ca_wins_verbatim_over_every_mode() -> None:
     # A connection that names its own tls_ca_file is authoritative regardless of the instance policy.
     for mode in ("system", "augment", "pinned"):
-        policy = TrustAnchorPolicy(internal_ca_file="/org/internal-ca.pem", mode=mode)  # type: ignore[arg-type]
+        policy = TrustAnchorPolicy(internal_ca_file="/org/internal-ca.pem", mode=mode)
         anchor = resolve_trust_anchor(
             connection_ca_file="/conn/own-ca.pem", host="pacs.internal", policy=policy
         )

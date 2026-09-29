@@ -160,7 +160,7 @@ async def test_notifier_sink_update_available_phi_free() -> None:
             self.events.append(event)
 
     t = _RecordingTransport()
-    sink = NotifierAlertSink([t])  # type: ignore[list-item]
+    sink = NotifierAlertSink([t])
     sink.start()
     sink.update_available("messagefoundry", current_version="0.2.9", pinned_version="0.3.0")
     await asyncio.sleep(0)  # let the dispatch task pick up

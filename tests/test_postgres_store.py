@@ -4681,7 +4681,7 @@ async def test_crash_orphan_sweep_and_rerun_dedups_pg(store) -> None:
 async def test_strict_downgraded_to_header_only_over_threshold_pg(store, monkeypatch) -> None:
     # Over the streaming threshold, whole-body hl7apy validation is NOT invoked (header-only downgrade) —
     # the detached document is opaque, so the header parse Peek already did is the validation seam.
-    def _boom(text, *, expected_version=None):  # type: ignore[no-untyped-def]
+    def _boom(text, *, expected_version=None):
         raise AssertionError("whole-body validate must not run over the streaming threshold")
 
     monkeypatch.setattr(wiring_runner, "validate", _boom)

@@ -98,7 +98,7 @@ async def test_unsupported_method_returns_405(client: httpx.AsyncClient) -> None
 async def test_chunked_request_body_rejected(client: httpx.AsyncClient) -> None:
     # M-19: a chunked body (no Content-Length) can't be size-bounded up front, so it's refused with
     # 411 rather than buffered unbounded (pre-auth memory DoS guard).
-    async def _stream():  # type: ignore[no-untyped-def]
+    async def _stream():
         yield b"{}"
 
     r = await client.post("/auth/login", content=_stream())
@@ -692,7 +692,7 @@ async def test_summary_audit_coalescer_rolls_over_with_count() -> None:
         def __init__(self) -> None:
             self.rows: list[tuple[str, str | None, str | None, str | None]] = []
 
-        async def record_audit(self, action, *, actor=None, channel_id=None, detail=None):  # type: ignore[no-untyped-def]
+        async def record_audit(self, action, *, actor=None, channel_id=None, detail=None):
             self.rows.append((action, actor, channel_id, detail))
 
     store = _Rec()

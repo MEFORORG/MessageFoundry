@@ -188,7 +188,7 @@ def test_webhook_rejects_host_outside_allowlist() -> None:
 def test_webhook_no_redirect_handler_refuses_redirects() -> None:
     handler = _NoRedirectHandler()
     req = urllib.request.Request("http://a/x")
-    assert handler.redirect_request(req, None, 302, "Found", {}, "http://b/y") is None  # type: ignore[arg-type]
+    assert handler.redirect_request(req, None, 302, "Found", {}, "http://b/y") is None
 
 
 # --- WP-7c: file content sniff ----------------------------------------------

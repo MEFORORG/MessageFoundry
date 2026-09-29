@@ -44,7 +44,7 @@ RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "fusion.db")
     yield s
     await s.close()
@@ -88,7 +88,7 @@ class _Collector:
         return None
 
 
-async def _until(pred, *, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(pred, *, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if await pred():
