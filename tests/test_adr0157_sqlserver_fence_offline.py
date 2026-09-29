@@ -89,7 +89,9 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     "mark_batch_done": (1, 1),
     "complete_with_response": (1, 1),
     "ingress_handoff": (2, 2),  # both DEAD branches; the success path ADMITS and is not guarded
-    "mark_failed": (1, 1),  # one statement, suffix "" on the retry branch
+    # One statement each. The suffix is the epoch guard on the DEAD branch and, since ADR 0157
+    # Amendment A, a status term (never an epoch guard) on the retry branch.
+    "mark_failed": (1, 1),
     "mark_batch_failed": (1, 1),
     "dead_letter_batch": (1, 1),
     # --- Bring-up sweeps + operator paths: unguarded, allowlisted. ---
@@ -374,21 +376,86 @@ async def test_unfenced_terminal_sql_is_character_identical_and_reads_no_result(
     assert conn.commits == 1
 
 
-async def test_mark_failed_fences_the_dead_branch_and_leaves_the_retry_branch_unguarded() -> None:
-    """C1's split. The seeded row has 3 attempts. ``max_attempts=1`` takes the DEAD branch, which is
-    fenced; retry-forever takes the PENDING branch, whose result must never be read."""
+_RETRY_SQL = (
+    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+    + _RESOLVE_OUTPUT
+    + " WHERE id=? AND status=?"
+)
+
+
+def _counting_events(store: SqlServerStore) -> list[str]:
+    """Replace the no-op ``_event`` with one that records each event's kind."""
+    events: list[str] = []
+
+    async def record(_cur: Any, _mid: Any, kind: str, *_a: Any, **_k: Any) -> None:
+        events.append(kind)
+
+    store._event = record  # type: ignore[method-assign,assignment]
+    return events
+
+
+async def test_mark_failed_fences_the_dead_branch_and_status_filters_the_retry_branch() -> None:
+    """C1's split, as ADR 0157 Amendment A left it. The seeded row has 3 attempts. ``max_attempts=1``
+    takes the DEAD branch, which is epoch-fenced. Retry-forever takes the PENDING branch, which carries
+    NO epoch guard but a status term, read from the OUTPUT rowset."""
     cur, conn = _Cursor(matched=0), _Conn()
     store, released = _store(cur, conn, epoch=5)
     assert await store.mark_failed("row-1", "boom", RetryPolicy(max_attempts=1), now=1.0) is None
     assert released == [["row-1"]] and store.fenced_writes == 1 and conn.commits == 0
 
-    cur2, conn2 = _Cursor(read_forbidden=True), _Conn()
+    cur2, conn2 = _Cursor(matched=1), _Conn()
     store2, released2 = _store(cur2, conn2, epoch=5)
+    events = _counting_events(store2)
     next_at = await store2.mark_failed("row-2", "x", RetryPolicy(max_attempts=None), now=1.0)
     assert isinstance(next_at, float)
     (sql, params), *_ = _updates(cur2)
-    assert "leader_lease" not in sql and "OUTPUT" not in sql and _LEASE_KEY not in params
+    assert sql == _RETRY_SQL
+    assert "leader_lease" not in sql and _LEASE_KEY not in params
+    assert params[-2:] == ("row-2", OutboxStatus.INFLIGHT.value)
+    assert events == ["failed"]
     assert released2 == [] and store2.fenced_writes == 0 and conn2.commits == 1
+
+
+async def test_a_retry_that_matches_no_inflight_row_is_a_quiet_no_op() -> None:
+    """ADR 0157 Amendment A (BACKLOG #2078, #2348). A late worker's retry finds the row already DONE,
+    DEAD, CANCELLED or PENDING, so the status term matches nothing. The fake cursor's ``rowcount`` is
+    ``-1``, so only the OUTPUT rowset can tell. It must write no event, raise no fence, re-pend nothing
+    through D1, commit, and still return the retry time for the wake. Mutations that break it: read
+    ``cur.rowcount``, route the retry through ``_exec_terminal(checked=True)``, or write the event
+    unconditionally."""
+    for epoch in (None, 5):
+        cur, conn = _Cursor(matched=0), _Conn()
+        store, released = _store(cur, conn, epoch=epoch)
+        events = _counting_events(store)
+        next_at = await store.mark_failed("row-1", "x", RetryPolicy(max_attempts=None), now=1.0)
+        assert isinstance(next_at, float) and next_at > 1.0, epoch
+        assert events == [], epoch
+        assert released == [] and store.fenced_writes == 0, epoch
+        assert conn.commits == 1 and conn.rollbacks == 0, epoch
+        assert [s for s, _p in _updates(cur)] == [_RETRY_SQL], epoch
+
+
+async def test_a_batch_retry_skips_the_members_no_longer_inflight() -> None:
+    """The batch twin. Every member misses here, so no event is written and no fence fires, and the
+    shared retry time still comes back. Each member's UPDATE carries the status term."""
+    cur, conn = _Cursor(matched=0), _Conn()
+    store, released = _store(cur, conn, epoch=5)
+    events = _counting_events(store)
+    next_at = await store.mark_batch_failed(
+        ["a", "b", "c"], "x", RetryPolicy(max_attempts=None), now=1.0
+    )
+    assert isinstance(next_at, float)
+    assert events == [] and released == [] and store.fenced_writes == 0
+    assert [p[-2:] for _s, p in _updates(cur)] == [
+        (oid, OutboxStatus.INFLIGHT.value) for oid in ("a", "b", "c")
+    ]
+    assert conn.commits == 1
+
+    cur2, conn2 = _Cursor(matched=1), _Conn()
+    store2, _ = _store(cur2, conn2, epoch=None)
+    events2 = _counting_events(store2)
+    await store2.mark_batch_failed(["a", "b"], "x", RetryPolicy(max_attempts=None), now=1.0)
+    assert events2 == ["failed", "failed"]
 
 
 async def test_a_rejected_batch_repends_every_member_including_those_never_walked() -> None:

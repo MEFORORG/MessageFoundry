@@ -270,7 +270,7 @@ async def test_mark_failed_dead_branch_fenced_retry_branch_lands(store: Any) -> 
     next_at = await store.mark_failed(claimed_b.id, "transient", RetryPolicy(max_attempts=None))
     assert isinstance(next_at, float)  # rescheduled, not dead-lettered
     assert (await store.outbox_for(mid_b))[0]["status"] == OutboxStatus.PENDING.value
-    assert store.fenced_writes == 1  # UNCHANGED — the retry branch is never inspected
+    assert store.fenced_writes == 1  # UNCHANGED — the retry branch is never fenced
 
 
 async def test_repend_writes_land_under_a_bumped_epoch(store: Any) -> None:
@@ -367,6 +367,75 @@ async def test_a_current_leaders_write_lands_under_nocount_on(
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
     assert await _ledger_count(store, claimed.id) == 1
     assert store.fenced_writes == 0
+
+
+# --- Amendment A: the retry branch's status term (BACKLOG #2078, #2348) ------------------------
+
+
+@pytest.mark.parametrize("nocount", [False, True], ids=["nocount-off", "nocount-on"])
+async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(
+    store: Any, monkeypatch: pytest.MonkeyPatch, nocount: bool
+) -> None:
+    """#2078's interleaving on SQL Server: the ex-leader claims under epoch 5, is superseded, and the
+    successor delivers the row. The ex-leader's retry must leave it DONE, write no ``failed`` event,
+    raise no fence, and still return the retry time. Under a forced session NOCOUNT too, because the
+    miss is read from the OUTPUT rowset and never from ``cursor.rowcount``. Mutation: drop the status
+    term and the row goes back to PENDING."""
+    if nocount:
+        _force_nocount(store, monkeypatch)
+    mid = await _enqueue(store)
+    claimed = await _claim_one(store)
+    await _superseded(store)
+    store.set_leader_epoch(6, lease_key=_LEASE_KEY)  # act as the successor for one write
+    await store.mark_done(claimed.id)
+    store.set_leader_epoch(5, lease_key=_LEASE_KEY)  # back to the stale ex-leader
+
+    next_at = await store.mark_failed(claimed.id, "late", RetryPolicy(max_attempts=None))
+
+    assert isinstance(next_at, float)
+    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    assert "failed" not in await _events(store, mid)
+    assert store.fenced_writes == 0
+
+    # The positive control: an INFLIGHT row still re-pends, with its event, in the same NOCOUNT state.
+    mid2 = await _enqueue(store, ("OB2", "p"))
+    live = await _claim_one(store, "OB2", epoch=6)
+    assert isinstance(await store.mark_failed(live.id, "x", RetryPolicy(max_attempts=None)), float)
+    assert (await store.outbox_for(mid2))[0]["status"] == OutboxStatus.PENDING.value
+    assert (await _events(store, mid2)).count("failed") == 1
+
+
+async def test_measure_the_zero_match_rowcount_of_the_retry_update(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A MEASUREMENT, recorded as a warning (grep ``ADR0157-AMENDA-ROWCOUNT``), not an assertion on
+    ``rowcount``. The retry branch's miss is read from the OUTPUT rowset; this reports what
+    ``cursor.rowcount`` says for the same zero-match UPDATE with and without a session NOCOUNT, so the
+    choice rests on a reading rather than on a belief. The assertion is only that OUTPUT is empty."""
+    mid = await _enqueue(store)
+    claimed = await _claim_one(store)
+    await store.mark_done(claimed.id)
+    readings: list[str] = []
+    for nocount in (False, True):
+        async with store._acquire() as conn, store._cursor(conn) as cur:
+            if nocount:
+                await cur.execute("SET NOCOUNT ON;")
+            try:
+                await cur.execute(
+                    "UPDATE queue SET updated_at=updated_at OUTPUT inserted.id"
+                    " WHERE id=? AND status=?",
+                    (claimed.id, OutboxStatus.INFLIGHT.value),
+                )
+                rowcount = cur.rowcount  # read before the fetch, which may reset it
+                assert await cur.fetchall() == []
+                readings.append(f"nocount={'on' if nocount else 'off'} rowcount={rowcount!r}")
+            finally:
+                if nocount:
+                    await cur.execute("SET NOCOUNT OFF;")
+                await conn.rollback()
+    warnings.warn(f"ADR0157-AMENDA-ROWCOUNT {'; '.join(readings)}", stacklevel=1)
+    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
 
 
 # --- C5: the UNORDERED claim path ------------------------------------------------------------

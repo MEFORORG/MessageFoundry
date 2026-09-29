@@ -1,6 +1,12 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3) **Amended:** 2026-09-28 (Amendment A, at the end)
+
+> **Amendment A (2026-09-28, BACKLOG #2078, #2348):** `mark_failed`'s retry branch, and
+> `mark_batch_failed`'s, now carry `AND status='inflight'` on all three backends, by owner ruling.
+> That is a status term, not an epoch fence, and C1 still holds. A reload that drops an inbound now
+> warns with the count of rows it leaves waiting. Read the amendment before quoting C2's "no
+> `status='inflight'` conjunct" line; it now binds the terminal resolves only.
 
 > **All six increments are BUILT: 0, 1, 2, 3, 4 and 5.** C1 (terminal writes only, fail-open) and C6
 > (yes, bounded, abandon-don't-await) were decided by the owner. Two named residuals stay open: the
@@ -182,6 +188,10 @@ conjunct would reject it and force a genuine re-send — a duplicate manufacture
 WAN lanes. The epoch does not fire there (same node, same term), so the conjunct would be the only thing
 firing, and firing is worse.
 
+> *Scoped by Amendment A (2026-09-28).* This paragraph binds the TERMINAL resolves, and they still
+> carry no status conjunct. `mark_failed`'s retry branch, which C1 leaves unfenced, now carries one.
+> The amendment says why the argument above does not reach it.
+
 **C3 — A fenced write is all-or-nothing, and it RE-PENDS the row. It must not leave it INFLIGHT.**
 Zero rows affected ⇒ roll back the enclosing transaction (discarding the `delivered_keys` row, the
 `message_events` row and the `_maybe_finalize_message` call), **then re-pend the row with an unguarded
@@ -273,6 +283,10 @@ amend: this ADR **corrects a comment**, it does not supersede ADR 0066.
 `return None`; the guard string is only emitted in the two server dialects; `build_coordinator` returns
 the NullCoordinator whose `current_epoch()` is `None`; and `[cluster].enabled` rejects SQLite at config
 load, so `_stop_graph` never runs and `reason` is always SHUTDOWN.
+
+> *Amendment A (2026-09-28) changes SQLite on purpose.* Its `mark_failed` and `mark_batch_failed`
+> retry UPDATEs now carry `AND status=?`, and write the `failed` event only on a changed row. The
+> epoch fence itself is still absent on SQLite, so the rest of this paragraph holds.
 
 ---
 
@@ -692,6 +706,7 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
   duplicate, which the invariant permits, but it also writes a `failed` event on a PROCESSED message.
   A status conjunct on the retry branch would stop it without risking a strand, because SQL Server
   has no owner-blind lease sweep for such a conjunct to fight. This ADR does not decide that.
+  **Decided 2026-09-26 by the owner and built 2026-09-28, on all three backends: see Amendment A.**
 
 **Inc 4 — `TeardownReason` + bounded, concurrent source stop (DEMOTE only). BUILT.** The enum lands
 **here**: `_teardown_unsafe` is the single shutdown path, so bounding it unguarded would change
@@ -857,3 +872,150 @@ still stands**, since that renew still inherits `command_timeout`; construct it 
 **Standing gate, every increment:** `ruff check` + `ruff format --check`, `mypy` strict, `pytest`, and the
 Windows CI legs. Local pytest **silently skips** the Postgres and SQL Server legs, so a green local run
 proves nothing about anything above; delete `message_events` before any soak.
+
+---
+
+## Amendment A (2026-09-28): the retry branch carries a status term, and a reload counts what a dropped inbound strands (BACKLOG #2078, #2348)
+
+**This answers the note "Flagged for a decision, not built" under Inc 3.** The owner ruled #2078 on
+2026-09-26, after adversarial review, and chose the option recorded as "B-VARIANT". The ruling is on
+the Rows tab of the maintainer-internal runbook workbook, row #2078; the batch 174 Manager relayed it
+to the builder, which did not read the workbook itself. The owner funded #2348 on 2026-09-28, in the
+batch 174 Manager's dialog. #2348's predicate is #2078's narrower option, so one change builds both.
+
+### What changed
+
+1. `mark_failed`'s retry branch, and `mark_batch_failed`'s, end `AND status='inflight'` on SQLite,
+   Postgres and SQL Server. The DEAD branch is unchanged. It keeps the epoch guard (C1) and carries no
+   status term (C2).
+2. The `failed` event is written only when the UPDATE changed a row. Before this, all three backends
+   wrote it whatever the UPDATE matched.
+3. A retry that matched no row still returns its retry time, so a row a lease sweep left PENDING
+   still gets its wake.
+4. SQL Server reads the match from an `OUTPUT inserted.id` rowset, never from `cursor.rowcount`, for
+   the reason *Inc 3, as built* gives. Postgres reads the command tag. SQLite reads `cursor.rowcount`.
+   The retry branch does not go through `_exec_terminal`, because a miss there is a no-op and must
+   never raise the fence sentinel.
+5. `RegistryRunner.reload` logs a WARNING for each inbound it dropped that still has rows waiting,
+   with the count per stage.
+
+### Why C1 still holds
+
+C1 forbids *fencing* a write that returns a row to PENDING. A fence can reject a write while the row is
+still INFLIGHT, and that leaves it INFLIGHT, which is a strand. A status term cannot do that. It
+declines a row only when the row is not INFLIGHT. So the row it declines is already DONE, DEAD,
+CANCELLED or PENDING, and none of those is a strand.
+
+C1 already treats a status term this way. `release_claimed` and `reschedule_claimed` both carry
+`AND status='inflight'`, and C1 lists both as not guarded.
+
+### A no-op guard, not an epoch fence
+
+The term checks the row's state, not who is writing. Suppose the successor re-pended the row and then
+claimed it again. The row is INFLIGHT, the term is true, and the stale write lands exactly as it did
+before. **The owner's ruling accepts that residual:** one more send, which at-least-once allows, and
+nothing lost. Only a per-claim token closes it (see *Why this and not the alternatives*). The ruling
+did not choose a Postgres-only owner term.
+
+### Why C2's argument does not reach the retry branch
+
+C2 keeps a status conjunct off the terminal resolves. There, the owner-blind `reclaim_expired_leases`
+can re-pend the current leader's own long-running row, and a conjunct would reject a `mark_done` that
+should land. That forces a real re-send.
+
+The retry branch differs. When the lease sweep has re-pended the row, it has already done what the
+retry would do: the row is PENDING. Declining the write costs three things for that attempt:
+
+- the retry's backoff, so the row is claimed again at the sweep's deadline, which is "now";
+- its `failed` event;
+- its `last_error`.
+
+**The cost repeats on every attempt whose send outlasts `lease_ttl_seconds`,** not only once. On a lane
+where every send does, the retries run back to back against the failing partner and none of their
+errors is recorded, until the DEAD branch fires. Under `max_attempts=None` it never does. The next claim
+still counts each attempt, so a finite `max_attempts` still binds. That is a lease-sizing condition,
+which Consequence 9 already names as a bug of its own: the sweep re-pending a live send is the defect,
+and before this amendment the same interleaving could also hand the row to a second sender. The cost
+is booked here, not closed. The DEAD branch keeps C2 as written.
+
+### When the term matches nothing
+
+The UPDATE changes 0 rows. The callers read on 2026-09-28 do not treat that as an error, and none of
+them loses or strands the message: at least `_mark_failed_and_arm`, `_mark_batch_failed_and_arm`, and
+the router, transform and response workers' direct `mark_failed` calls, which ignore the return. What
+the miss does lose is the attempt's own record, as the section above says. In detail:
+
+1. `mark_failed` writes nothing more and returns the retry time.
+2. `_mark_failed_and_arm` arms its wake as for any retry. The pooled dispatcher parks the lane until
+   that time.
+3. The row is untouched. A PENDING row is claimed again. A DONE, DEAD or CANCELLED row is already
+   resolved.
+4. On SQLite the no-op aborts its grouped write member, as the store's other zero-mutation exits do.
+   Inline, that rolls its transaction back; under group commit the member adds nothing to the batch's
+   COMMIT. On the server backends the transaction commits with nothing written.
+
+The park in step 2 is a cost, not a loss. On a FIFO lane whose late row is already DONE, the rows
+behind it wait out one backoff. Before this amendment the same late write parked the lane the same
+way, and also re-sent the row, so the cost is not new.
+
+### A batch that only partly matches
+
+`mark_batch_failed` runs one UPDATE per member. On the retry branch a member no longer INFLIGHT is
+skipped, event and all. The members still INFLIGHT re-pend together to the one shared deadline, so they
+stay one contiguous prefix. The shared retry time comes back even when every member was skipped.
+
+### The reload warning
+
+A dropped inbound's ingress, routed and response rows key on its `channel_id`. No worker drains them,
+and the buildup and stall alerts never ask about a lane the registry lacks. `dead_letter_missing_inbounds`
+runs only from `Engine._start_graph`. So until the next start, those rows would sit with nothing
+reporting them.
+
+`RegistryRunner._warn_stranded_by_dropped_inbounds` now names each one. It works like this:
+
+- "Dropped" means gone from `inbound_names()`, the whole deployment's set, which is what the startup
+  sweep uses. An inbound that leaves only one engine shard's slice is a sibling's live lane and is not
+  counted. So under engine sharding every shard that reloads logs the same warning, for the same rows.
+- The count is PENDING rows at ingress, routed and response, through `pending_depth`. It is a floor: a
+  row still INFLIGHT at that moment is not in it.
+- It runs only after the swap commits, so a rolled-back reload warns of nothing. It runs as a
+  detached task, after the reload's wake and outside `_reload_lock`, so its reads delay neither the
+  wake nor the next reload, and a cancellation of the reload's caller cannot land inside them. Each
+  inbound is re-checked against the live registry first, so one a later reload re-added is skipped.
+- It changes no row. A failed count logs a WARNING and never rolls the reload back.
+
+### What this does not close
+
+- The duplicate when the successor already holds the row INFLIGHT, as above.
+- The ruling notes that D1's `release_claimed`, run after a fenced DEAD branch, has a gap of the same
+  shape. It is out of scope here and was not re-analysed.
+- The DEAD branch still carries no status term. A late worker whose retries are exhausted can still
+  write DEAD over a finished row wherever no epoch is armed, which includes every single-node store.
+  `mark_batch_failed` also still decides retry or DEAD from the head member's attempts, even when the
+  head is a member the retry branch would skip.
+- A partly matched batch re-pends its INFLIGHT members to one deadline, but a skipped member keeps
+  its own. If another writer gave a middle member a later deadline, the envelope is re-claimed in two
+  parts, which splits the ADR 0082 batch. By reading, strict FIFO then holds the later members behind
+  the skipped one, so the lane is not reordered. That is not tested.
+- A retry that misses a DONE, DEAD or CANCELLED row still parks its lane for one backoff, because the
+  ruling returns the retry time on every miss.
+- The stranded rows still wait for the next start. The warning makes them visible; it does not move
+  them. The operator-declared retire verb that #1188 recommends is not built.
+
+### Tests
+
+- `tests/test_mark_failed_status_term.py` runs everywhere, on SQLite, inline and under group commit.
+  A late retry cannot re-pend a DONE, DEAD, CANCELLED or already-PENDING row, and writes no event.
+  An INFLIGHT row still re-pends with its event. A partly matched batch moves only its INFLIGHT members. A mutation
+  that makes the term always true turned twelve of its sixteen tests red; the four that stayed green are
+  the positive controls and the DEAD-branch pin.
+- `tests/test_adr0157_sqlserver_fence_offline.py` runs everywhere. The retry UPDATE carries the OUTPUT
+  clause and the term, and a zero-row OUTPUT is a quiet no-op against a cursor whose `rowcount` is `-1`.
+- `tests/test_adr0157_postgres_fence.py` and `tests/test_adr0157_sqlserver_fence.py` run only on the
+  hosted legs. Each drives #2078's own interleaving: a superseded node's retry after the successor
+  delivered. The SQL Server twin runs with and without a forced session NOCOUNT. A second SQL Server
+  test records what `cursor.rowcount` reads for a zero-match retry UPDATE, as a warning tagged
+  `ADR0157-AMENDA-ROWCOUNT`, so the OUTPUT choice rests on a reading and not a belief. **Until a hosted
+  run is read, that value is unmeasured.**
+- `tests/test_reload_stranded_inbound_warning.py` runs everywhere. It covers the warning, its silence
+  when nothing is stranded, a rolled-back reload, the engine-shard slice, and a failed count.

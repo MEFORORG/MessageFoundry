@@ -1362,6 +1362,9 @@ class RegistryRunner:
         # of restating it.
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
+        # BACKLOG #2348: the post-reload stranded-row report runs detached, so a committed reload never
+        # waits on (or is cancelled inside) its store reads. Held here so the task is not collected.
+        self._reload_report_tasks: set[asyncio.Task[dict[str, int]]] = set()
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
@@ -4050,6 +4053,9 @@ class RegistryRunner:
         for _guard_task in list(self._log_guard_tasks):
             _guard_task.cancel()
         self._log_guard_tasks.clear()
+        for _report_task in list(self._reload_report_tasks):
+            _report_task.cancel()  # a read-only report; nothing to finish
+        self._reload_report_tasks.clear()
         # #147 (ADR 0095): cancel the active-window scheduler tasks FIRST so no schedule tick calls
         # start/stop_inbound/outbound while the rest of teardown runs (a task blocked awaiting the reload
         # lock is interrupted by cancel). Empty in the always-on case, so this is a no-op there.
@@ -5064,6 +5070,58 @@ class RegistryRunner:
             log.info("reload: re-pended %d row(s) a stopped worker left in flight", recovered)
         return recovered
 
+    async def _warn_stranded_by_dropped_inbounds(
+        self, old: Registry, new: Registry
+    ) -> dict[str, int]:
+        """Log a WARNING, per inbound this reload dropped, with the count of rows it leaves waiting
+        (BACKLOG #2348, ADR 0157 Amendment A).
+
+        A dropped inbound's ingress, routed and response rows key on its ``channel_id``. No worker
+        drains them, and the buildup and stall alerts never ask about a lane the registry lacks. The
+        sweep that dead-letters them, ``dead_letter_missing_inbounds``, runs only from the engine's
+        ``_start_graph``. So until the next start, or a later reload that re-adds the inbound, they
+        sit unseen. This makes them seen. It changes no row.
+
+        "Dropped" is keyed on ``inbound_names()``, the whole deployment's set, as the startup sweep
+        is. Under engine sharding an inbound leaving THIS shard's slice is a sibling's live lane, not
+        a stranded one. Every shard that reloads therefore logs the same warning, for the same rows
+        in the shared store. The count is PENDING rows, read through ``pending_depth``, so it is a
+        floor: a row still INFLIGHT at this moment is not in it. ``reload`` runs this detached, so
+        each inbound is re-checked against the LIVE registry first: one a later reload re-added has
+        a draining lane again and is skipped. Best effort: a failed read logs and never touches the
+        reload. Returns ``{inbound: count}`` for the inbounds with rows waiting."""
+        dropped = sorted(old.inbound_names() - new.inbound_names())
+        stranded: dict[str, int] = {}
+        for name in dropped:
+            if name in self.registry.inbound_names():
+                continue  # a later reload already re-added it, so its lane is live again
+            try:
+                per_stage = [
+                    (await self.store.pending_depth(name, stage=stage.value))[0]
+                    for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE)
+                ]
+            except Exception:  # noqa: BLE001 — best effort; see the docstring
+                log.warning(
+                    "reload dropped inbound %r; could not count the rows it leaves waiting",
+                    name,
+                    exc_info=True,
+                )
+                continue
+            total = sum(per_stage)
+            if not total:
+                continue
+            stranded[name] = total
+            log.warning(
+                "reload dropped inbound %r and left at least %d row(s) waiting on it (ingress %d, "
+                "routed %d, response %d). No worker drains them and no queue alert covers them. They "
+                "are dead-lettered at the next engine start, or drained if a later reload re-adds "
+                "the inbound.",
+                name,
+                total,
+                *per_stage,
+            )
+        return stranded
+
     async def reload(self, new_registry: Registry) -> None:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
@@ -5078,9 +5136,11 @@ class RegistryRunner:
         both READ that decision and would otherwise take the unknown-lane default (ADR 0066 D4, and
         the ordering constraint BACKLOG #1867 turned on — do not move it below either);
         (3) reconcile the outbound connectors/workers *without* tearing them down, so in-flight
-        outbox rows keep draining (at-least-once preserved). If any step fails the previous graph's
-        intake is restored before the error propagates. Restarting inbounds before reconciling
-        outbounds means a slow/hung outbound never blocks the engine's intake.
+        outbox rows keep draining (at-least-once preserved); (4) once the swap has committed, start a
+        detached report that warns with the count of rows each dropped inbound leaves waiting
+        (:meth:`_warn_stranded_by_dropped_inbounds`). If any of steps 0-3 fails the previous graph's
+        intake is restored before the error propagates, and step 4 does not run. Restarting inbounds
+        before reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
             self.build_check(new_registry)  # raises before any change on a bad connector
@@ -5257,6 +5317,14 @@ class RegistryRunner:
                 len(new_registry.inbound),
                 len(new_registry.outbound),
             )
+        # (4) BACKLOG #2348: name the rows each dropped inbound leaves with no consumer until the next
+        # start. Reached only when the swap committed: a failed reload raised above, and a reload of a
+        # stopped graph returned. DETACHED, after the wake and outside _reload_lock: its store reads
+        # can delay neither the new graph's wake, the next reload, nor this call's return, and a
+        # cancellation of the caller cannot land inside them and make a committed reload look failed.
+        report = asyncio.create_task(self._warn_stranded_by_dropped_inbounds(old, new_registry))
+        self._reload_report_tasks.add(report)
+        report.add_done_callback(self._reload_report_tasks.discard)
 
     # --- inbound path --------------------------------------------------------
 
@@ -8056,9 +8124,11 @@ class RegistryRunner:
         get-or-create by stable lane name), and at-least-once never depends on it (the backstop and the
         always-re-claim loop still bound a lost timer to added latency, never loss).
 
-        Returns the row's re-pended ``next_attempt_at`` (``None`` when it dead-lettered/vanished) — the
+        Returns the row's retry ``next_attempt_at`` (``None`` when it dead-lettered/vanished) — the
         additive ADR 0066 return the delivery body surfaces as its ``retry_until`` so the pooled
-        dispatcher PARKs the lane on it. The arming is skipped for a lane the DISPATCHER drains (it arms
+        dispatcher PARKs the lane on it. Since ADR 0157 Amendment A it comes back even when the row was
+        no longer INFLIGHT and nothing was re-pended, so a RETRY built from it does not prove the head
+        is PENDING. The arming is skipped for a lane the DISPATCHER drains (it arms
         its own exact park timer off the returned deadline) and taken for a lane a per-lane WORKER
         drains — which under pooled means an UNORDERED lane (ADR 0066 D4), whose retry would otherwise
         ride the idle backstop because no dispatcher parks on its behalf."""
