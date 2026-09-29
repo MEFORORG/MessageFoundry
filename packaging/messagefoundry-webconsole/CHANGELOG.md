@@ -82,6 +82,12 @@ under Changed says why engine 0.4.0 does not work with this console.
   dead-letter list masks each last error the same way and links it to that message's `/errors`.
   The engine masks the text in its response, so the page never carries it. Needs an engine whose
   `get_message` accepts `reveal_errors`.
+- **The engine UI seam moved because the seam gate now covers the `auth.service` names this console
+  imports** (`BACKLOG #2015`). Seam discovery used to read only `AuthService` from
+  `messagefoundry.auth.service`. It now reads every name the console imports from there, such as
+  the step-up action constants, `NotifyEmailAlreadySet` and `Elevation`. So an engine that renames
+  one of them ships a different seam. Nothing the console does changed. Same one-value
+  `SUPPORTED_ENGINE_SEAMS` rule as 0.2.15 (`BACKLOG #279`).
 - **The message detail page shows the body and the summary only when the operator asks**
   (`BACKLOG #2346`, ASVS 14.2.6). `/ui/messages/{id}` now shows the metadata with the summary
   masked and no body. A "Show raw message" link opens `/ui/messages/{id}/body`, and a "Reveal"

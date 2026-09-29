@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import enum
+import inspect
 import typing
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -76,6 +77,10 @@ class DiscoveredSurface:
     #: DEFINING module is the only non-arbitrary key for it.
     dtos: tuple[str, ...]
     security_symbols: tuple[str, ...]
+    #: Every name the console imports from ``messagefoundry.auth.service``, ``AuthService`` included
+    #: (BACKLOG #2015). ``auth_service_methods`` below covers the class's MEMBERS; this covers the
+    #: module's other names, such as step-up action constants, exceptions and result dataclasses.
+    auth_service_symbols: tuple[str, ...]
     auth_service_methods: tuple[str, ...]
     app_state_attrs: tuple[str, ...]
 
@@ -354,7 +359,7 @@ def _literal_values(annotation: object) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
-# --- api.security, AuthService, app.state ------------------------------------------------------
+# --- api.security, auth.service, AuthService, app.state ----------------------------------------
 
 
 def _security_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
@@ -366,6 +371,58 @@ def _security_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
                     if alias.name == "*":
                         _fail(path, node, "star import from api.security cannot be enumerated")
                     found.add(alias.name)
+    return found
+
+
+def _auth_service_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
+    """Every name the console imports from ``messagefoundry.auth.service`` (BACKLOG #2015).
+
+    The same rule as :func:`_security_symbols`: read the ``from ... import`` statements, and refuse a
+    star import. Before this, discovery read only the ``AuthService`` class out of this module, so
+    renaming a step-up constant or an exception the console imports moved nothing, and the pair
+    failed at import instead.
+
+    Two idioms that ``_security_symbols`` never had to face fail loud here:
+
+    * Binding the module itself (``import messagefoundry.auth.service`` or
+      ``from messagefoundry.auth import service``). Names read through that binding are not in any
+      import statement, so the walk could not claim to have found them all.
+    * A RE-EXPORT through another ``messagefoundry`` module is resolved rather than refused. The walk
+      imports the module the statement names and reads the object there. A class or function carries
+      its defining module, so it is recorded exactly, under its name in ``auth.service``. A plain
+      constant carries none, so a re-exported constant is the one case this cannot see; it measures
+      zero today.
+
+    The re-export check reads the SOURCE module, never ``auth.service`` by the imported name. The
+    console imports ``CustomRoleInfo`` from ``api.auth_models``, and ``auth.service`` defines a
+    different class of that name, so a lookup by name alone records a class the console never sees.
+    """
+    import importlib
+
+    parent, _, leaf = AUTH_SERVICE_MODULE.rpartition(".")
+    found: set[str] = set()
+    for path, tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(alias.name == AUTH_SERVICE_MODULE for alias in node.names):
+                    _fail(path, node, "module import of auth.service cannot be enumerated")
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                if node.module == AUTH_SERVICE_MODULE:
+                    for alias in node.names:
+                        if alias.name == "*":
+                            _fail(path, node, "star import from auth.service cannot be enumerated")
+                        found.add(alias.name)
+                elif node.module == parent and any(a.name == leaf for a in node.names):
+                    _fail(path, node, "module import of auth.service cannot be enumerated")
+                elif node.module.startswith("messagefoundry."):
+                    source = importlib.import_module(node.module)
+                    for alias in node.names:
+                        obj = getattr(source, alias.name, None)
+                        # Only a class or function names its defining module; see the docstring.
+                        if (isinstance(obj, type) or inspect.isfunction(obj)) and (
+                            obj.__module__ == AUTH_SERVICE_MODULE
+                        ):
+                            found.add(obj.__name__)
     return found
 
 
@@ -507,6 +564,7 @@ def discover(console_dir: Path, engine_dir: Path) -> DiscoveredSurface:
     return DiscoveredSurface(
         dtos=qualified(dtos),
         security_symbols=tuple(sorted(_security_symbols(console))),
+        auth_service_symbols=tuple(sorted(_auth_service_symbols(console))),
         auth_service_methods=tuple(sorted(_auth_service_methods(console, auth_service))),
         app_state_attrs=tuple(sorted(_app_state_attrs(console, engine))),
     )

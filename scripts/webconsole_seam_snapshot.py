@@ -24,8 +24,9 @@ The snapshot captures:
   2. the ``api._ui_seam`` dataclass field names (``UiDeps`` / ``CoreHandlers`` / ``AdminHandlers``)
      via ``dataclasses.fields`` -- the injected handler/reference bundle shape;
   3. the cross-seam surface the console consumes OUTSIDE the injected bundle, discovered from its own
-     imports and uses: ``api.security`` deps, ``AuthService`` members (methods AND properties), and
-     the ``app.state`` attributes it sets/reads;
+     imports and uses: ``api.security`` deps, every other name it imports from ``auth.service``
+     (BACKLOG #2015), ``AuthService`` members (methods AND properties), and the ``app.state``
+     attributes it sets/reads;
   4. the DTO FIELD SETS the console renders, closed over nested models -- one level of field names
      was not enough, because a nested model's fields never appeared at all;
   5. the ENUM MEMBER sets and ``Literal`` VALUE sets those DTOs expose. Field names alone are not the
@@ -99,6 +100,7 @@ from messagefoundry.api._ui_seam import (  # noqa: E402
     CoreHandlers,
     UiDeps,
 )
+from messagefoundry.auth import service as auth_service  # noqa: E402
 from messagefoundry.auth.service import AuthService  # noqa: E402
 
 
@@ -170,6 +172,37 @@ def _member(obj: Any) -> str:
     return f"attribute: {type(obj).__name__}"
 
 
+def _auth_service_symbol(obj: Any) -> str:
+    """Render a name the console imports from ``auth.service`` (BACKLOG #2015).
+
+    Classes need their own rules, because :func:`_member` renders a class by its constructor
+    signature. That RAISES on an exception class with no ``__init__`` of its own, such as
+    ``NotifyEmailAlreadySet``. On a dataclass it records the constructor, while the console only
+    reads the fields and properties. A rename moves the digest either way, since the name is the key.
+
+    A constant renders by its type, not its value. The console imports the value from the installed
+    engine, so both sides always agree on it; a digest that moved on a value change would move for a
+    change that cannot break the pair.
+    """
+    if obj is AuthService:
+        # Its constructor is the engine's to call, never the console's. Its members have their own
+        # section, so rendering the signature here would move the seam for nothing the console uses.
+        return "class; its members are the AuthService section"
+    if isinstance(obj, type):
+        if issubclass(obj, BaseException):
+            return f"exception ({', '.join(b.__name__ for b in obj.__bases__)})"
+        if dataclasses.is_dataclass(obj):
+            props = sorted(
+                n
+                for n in dir(obj)
+                if not n.startswith("_") and isinstance(inspect.getattr_static(obj, n), property)
+            )
+            rendered = f"dataclass: {', '.join(_dto_fields(obj))}"
+            return f"{rendered}; properties: {', '.join(props)}" if props else rendered
+        return "class"
+    return _member(obj)
+
+
 def contract_sections() -> list[tuple[str, list[tuple[str, str]]]]:
     """``(section title, [(key, value)])`` for the CONTRACT surface.
 
@@ -206,6 +239,15 @@ def contract_sections() -> list[tuple[str, list[tuple[str, str]]]]:
         (
             "api.security surface (imported directly by the console, outside UiDeps)",
             [(s, _member(getattr(security, s))) for s in surface.security_symbols],
+        )
+    )
+    sections.append(
+        (
+            "auth.service names imported by the console",
+            [
+                (s, _auth_service_symbol(getattr(auth_service, s)))
+                for s in surface.auth_service_symbols
+            ],
         )
     )
     sections.append(

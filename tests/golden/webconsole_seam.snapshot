@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-44e3109437ae7510
+3cdb350a7babe130
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -113,6 +113,24 @@ get_auth: (request: 'Request') -> 'AuthService | None'
 initial_credential_window_hours: (auth: 'AuthService') -> 'float | None'
 pending_credential_deadline: (auth: 'AuthService', user: 'UserRecord | None') -> 'float | None'
 pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float | None'
+
+## auth.service names imported by the console
+AuthService: class; its members are the AuthService section
+Elevation: dataclass: directory_unconfirmed, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
+FEDERATED_BINDING_CHANGED: attribute: str
+MfaStatus: dataclass: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
+NotifyEmailAlreadySet: exception (RuntimeError)
+OidcStepUp: dataclass: elevation, error, reason, return_to; properties: ok
+STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
+STEP_UP_ACTION_ADMIN_RESET_MFA: attribute: str
+STEP_UP_ACTION_ADMIN_RESET_PASSWORD: attribute: str
+STEP_UP_ACTION_ADMIN_USER_UPDATE: attribute: str
+STEP_UP_ACTION_MFA_CONFIRM: attribute: str
+STEP_UP_ACTION_MFA_DISABLE: attribute: str
+STEP_UP_ACTION_MFA_ENROLL: attribute: str
+STEP_UP_ACTION_SESSION_TERMINATE: attribute: str
+STEP_UP_ACTION_WEBAUTHN_DELETE: attribute: str
+STEP_UP_ACTION_WEBAUTHN_ENROLL: attribute: str
 
 ## AuthService members reached by the console
 abandon_oidc_step_up: (self, flow_id: 'str', *, state: 'str | None', reason: 'str', client: 'str | None') -> 'OidcStepUp'

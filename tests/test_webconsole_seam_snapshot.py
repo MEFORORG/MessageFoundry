@@ -21,6 +21,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "webconsole_seam_snapshot.py"
 _GOLDEN = _REPO_ROOT / "tests" / "golden" / "webconsole_seam.snapshot"
@@ -226,6 +228,50 @@ def test_the_digest_moves_when_a_rendered_dto_gains_a_field() -> None:
         models.UploadedFileList = original  # type: ignore[misc]
 
     assert module.contract_digest() == before  # and it restores exactly
+
+
+def test_the_digest_moves_when_an_imported_auth_service_name_is_renamed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2015's closing condition: a planted rename of ``NotifyEmailAlreadySet`` moves the
+    seam digest. Before #2015 discovery read only ``AuthService`` out of ``auth.service``, and this
+    rename moved nothing.
+
+    The rename is planted on BOTH sides, as the one commit making it would: in a copy of the
+    console's source and on the engine module. A copy with no rename must derive the same digest
+    first, or the second assertion could pass because the copy differs, not because of the rename.
+
+    This is the digest, not the handshake. An engine and console from opposite sides of this rename
+    still fail at import rather than with ``UiSeamMismatch``, because the console's route modules
+    import the name eagerly. That part is BACKLOG #1907."""
+    import shutil
+
+    from messagefoundry.auth import service
+
+    spec = importlib.util.spec_from_file_location("_seam_gen_rename", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_seam_gen_rename"] = module
+    spec.loader.exec_module(module)
+
+    before = module.contract_digest()
+    copy = tmp_path / "messagefoundry_webconsole"
+    shutil.copytree(
+        module._CONSOLE_DIR, copy, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
+    )
+    monkeypatch.setattr(module, "_CONSOLE_DIR", copy)
+    assert module.contract_digest() == before  # the control: copying alone moves nothing
+
+    account = copy / "routes" / "account.py"
+    source = account.read_text(encoding="utf-8")
+    assert "NotifyEmailAlreadySet" in source  # the plant has something to rename
+    account.write_text(
+        source.replace("NotifyEmailAlreadySet", "NotifyEmailTaken"), encoding="utf-8"
+    )
+    monkeypatch.setattr(service, "NotifyEmailTaken", service.NotifyEmailAlreadySet, raising=False)
+    monkeypatch.delattr(service, "NotifyEmailAlreadySet")
+
+    assert module.contract_digest() != before
 
 
 def _digest_by_path(env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

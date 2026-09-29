@@ -169,8 +169,9 @@ omissions, because the gate's coverage *is* the list. Nothing below asks you to 
 Four files implement it:
 
 - [`scripts/seam_discovery.py`](../scripts/seam_discovery.py) — walks the console's own imports and
-  uses to derive the surface it depends on: the `api.security` deps, the `AuthService` members
-  (methods **and** properties), the `app.state` attributes, and the DTOs it renders, closed over
+  uses to derive the surface it depends on: the `api.security` deps, every other name it imports
+  from `auth.service` (constants, exceptions, result dataclasses; BACKLOG #2015), the `AuthService`
+  members (methods **and** properties), the `app.state` attributes, and the DTOs it renders, closed over
   nested models. An idiom the walk cannot resolve exactly raises `SeamDiscoveryError` rather than
   being skipped, so a new blind spot is loud instead of silent.
 - [`scripts/webconsole_seam_snapshot.py`](../scripts/webconsole_seam_snapshot.py) — emits a stable,
@@ -199,7 +200,8 @@ surface `seam_discovery.py` finds, so it exists only once the change is made and
 
 When you deliberately change the injected contract (add/rename a `CoreHandlers`/`AdminHandlers` field,
 change an `api.security` dep signature, rename a rendered DTO field or one of its `Literal` values,
-add/remove an `app.state` hook or a consumed `AuthService` member):
+add/remove an `app.state` hook or a consumed `AuthService` member, rename a name the console imports
+from `auth.service`):
 
 1. Make the contract change in the engine (and the matching consumer change in the package).
 2. Regenerate the engine side:
