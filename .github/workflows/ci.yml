@@ -2376,7 +2376,9 @@ jobs:
           fi
           # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
           # or this workflow (engine-wide regressions are already covered by the `test` job + push-to-main).
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
+          # ci/locks/release-tools.lock is in because the image's builder stage installs from it
+          # (BACKLOG #1193), so a bump to it can break the image build.
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
