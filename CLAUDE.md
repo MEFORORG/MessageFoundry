@@ -819,16 +819,15 @@ gates a merge**, and no seat has to clear one.
   change (owner ruling 2026-09-29, in session).** Proof is a code-review tag on the PR, such as the
   Builder's QA line under the `qa` label. Other evidence that code review ran against this change
   also counts. With proof, the Lander does not need to review the diff. Without it, the Lander sends
-  the change to code review: a `code-review` subagent at `xhigh`. A single inline pass is weaker
-  proof, and when that is all there is, the Lander may send the change to a subagent review. The
-  proof must cover the change being merged. A review of an earlier head still counts after a push
-  that only merges `main` in or resolves a conflict without new content. A later commit that changes
-  content needs its own proof. Read what the review found, not only that a tag exists: a label
-  records that a step *happened*, not what it found. The review's findings go on the PR. A finding
-  that names a defect the merge would ship is fixed before the merge; korus `roles/LANDER.md`
-  *4a-quinquies* says who fixes it. **CORRECTED 2026-09-29:** this bullet read *"Reading a diff
-  before merging it is still the job; no check now asks whether you did."* The owner replaced it
-  because the Builders already run code review.
+  the change to code review: a `code-review` subagent at `xhigh`. The proof must cover the change
+  being merged. A review of an earlier head still counts after a push that only merges `main` in
+  cleanly. A conflict resolution the Lander wrote itself needs its own review. So does a later
+  commit that changes content. Read what the review found, not only that a tag exists: a label
+  records that a step *happened*, not what it found. The Lander posts the review's findings on the
+  PR. A finding that names a defect the merge would ship goes back to the owner for a ruling, as
+  korus `roles/LANDER.md` *4a-quinquies* says. **CORRECTED 2026-09-29:** this bullet read
+  *"Reading a diff before merging it is still the job; no check now asks whether you did."* The
+  owner replaced it because the Builders already run code review.
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
   `BEHIND` or `DIRTY` in preference to `BLOCKED`, so it hides one blocking reason behind another.

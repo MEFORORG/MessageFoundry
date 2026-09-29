@@ -84,7 +84,7 @@ Measured 2026-09-05: that context was already absent from live branch protection
 owner retired the label and the seat rather than restore the gate. **CORRECTED 2026-09-29:** this
 paragraph read *"Nothing now requires that anyone read a PR before it merges."* Since an owner ruling
 that day, the Lander merges only on proof that code review ran, or sends the change to code review.
-CLAUDE.md section 5 carries the rule. What blocks a merge is the required check set and nothing else.
+CLAUDE.md section 5 carries the rule. No machine gate beyond the required check set blocks a merge.
 
 Nothing in this system gets pushed to anybody. Everything is polled.
 

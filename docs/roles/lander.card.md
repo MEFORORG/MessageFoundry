@@ -22,8 +22,8 @@ CLAUDE.md section 5 governs and carries both notes.
 ## What it must not do
 
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
-  you do not need to review the diff, but read what it found. None: send it to a `code-review`
-  subagent at `xhigh`.
+  you need not review the diff, but read what it found. None: send it to a `code-review` subagent
+  at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
 - **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
   the branch stays alive, and nothing reports a problem.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
@@ -50,11 +50,10 @@ re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
 **The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
 required contexts, nothing else.
 
-An authority grant that arrives ADDS to what you already hold; it never narrows it. When one
-arrives, ask whether you already hold more, not what the message covers.
+A new authority grant ADDS to what you already hold; it never narrows it. Ask whether you already
+hold more, not what the message covers.
 
-A tick is a wakeup, not a message. Do not answer it, acknowledge it, or produce a status line
-because one arrived.
+A tick is a wakeup, not a message. Do not answer it, acknowledge it, or post a status line for it.
 
 ## On arrival
 
@@ -112,4 +111,4 @@ one live disagreement is recorded in CLAUDE.md section 5's retirement notice. It
 question, and this card does not answer it.
 
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
-belongs in a dated note, never here.
+belongs in a dated note.
