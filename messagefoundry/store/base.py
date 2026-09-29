@@ -865,6 +865,20 @@ class QueueStore(StoreLifecycle, Protocol):
         raise a ``queue_buildup`` alert when a lane stops draining. Cheap: a single COUNT + MIN."""
         ...
 
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """The in-flight sibling of :meth:`pending_depth`, for every lane at ``stage`` at once
+        (BACKLOG #1611 part B): ``{lane: (inflight_count, oldest_claimed_at)}``, with only lanes
+        that hold an ``inflight`` row present.
+
+        ``oldest_claimed_at`` is the smallest ``updated_at`` among the lane's in-flight rows. Every
+        claim path writes ``updated_at`` in the statement that flips a row to ``inflight``, and
+        nothing rewrites it while the row stays in flight, so it is the claim time. An in-flight row
+        is invisible to :meth:`pending_depth` and to every claim, which is what let a row stranded by
+        a fault between its claim and its handoff sit unseen until a restart. The runner's in-flight
+        watch pages on this age. Lane key is stage-aware, as in :meth:`pending_depth`. One grouped
+        read per stage: in-flight rows are bounded by what is being worked, so the result is small."""
+        ...
+
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3): the message's own
         status, the awaited destination's outbound row states, and the highest committed

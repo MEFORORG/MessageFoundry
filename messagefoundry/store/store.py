@@ -8885,6 +8885,23 @@ class MessageStore:
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
 
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol). The
+        ``(stage, status)`` pair seeks ``ix_queue_ready``, as :meth:`reset_stale_inflight` does."""
+        lane_col = (
+            "channel_id"
+            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
+            else "destination_name"
+        )
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT {lane_col} AS lane, COUNT(*) AS n, MIN(updated_at) AS oldest FROM queue"
+                f" WHERE stage=? AND status=? GROUP BY {lane_col}",
+                (stage, OutboxStatus.INFLIGHT.value),
+            )
+            rows = await cur.fetchall()
+        return {str(r["lane"]): (int(r["n"]), float(r["oldest"])) for r in rows}
+
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
 
