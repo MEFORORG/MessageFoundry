@@ -582,6 +582,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **The SFTP and FTP source now waits for a file to stop growing before it reads it.** A file is
+  read only once it lists at the same size on two polls in a row, as the local File source has done
+  since `BACKLOG #1811`, so a partner that pauses between writes for less than `poll_seconds` is
+  waited out. Every file now waits at least one poll. The gate is always on and reads the listed
+  size alone, since a remote listing has no reliable modification time; it cannot see a same-size
+  rewrite, nor anything on a server that lists every file at size 0. (`BACKLOG #2071`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
