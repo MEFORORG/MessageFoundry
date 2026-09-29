@@ -183,3 +183,59 @@ export function compareCase(
 
   return { pass: deliveries.every((d) => d.status === "match"), deliveries };
 }
+
+/** What one case's rerun produced, as the host reads it off the dry-run row. `undefined`: no row. */
+export interface CaseRerun {
+  disposition: string;
+  error: string | null;
+  deliveries: readonly ExpectedDelivery[];
+}
+
+/** The part of one case's result the run view shows at once: no field value, no error text. */
+export interface CaseRunSummary {
+  name: string;
+  pass: boolean;
+  disposition: string;
+}
+
+/** The part shown only when that one case is clicked (ASVS 14.2.6, BACKLOG #2437). */
+export interface CaseRunDetail {
+  error: string | null;
+  deliveries: DeliveryComparison[];
+}
+
+/** One collection rerun, split so the summaries can go to the view and the details stay behind. */
+export interface CollectionRunResult {
+  passed: number;
+  summaries: CaseRunSummary[];
+  details: CaseRunDetail[]; // aligned 1:1 with `summaries` by index
+}
+
+/**
+ * Judge every case of a collection against its rerun, and split each result in two. A summary carries
+ * no `before`/`after` value and no error text, so the host can post all of them. A detail carries the
+ * differences and the error, and the host posts one only when its case is clicked. `reruns[i]` is case
+ * `i`'s rerun, or `undefined` when the dry-run produced no row for it, which fails the case.
+ */
+export function judgeCollectionRun(
+  cases: readonly TestCase[],
+  reruns: readonly (CaseRerun | undefined)[],
+  ignore: readonly VolatileField[] = DEFAULT_VOLATILE_FIELDS,
+): CollectionRunResult {
+  const summaries: CaseRunSummary[] = [];
+  const details: CaseRunDetail[] = [];
+  cases.forEach((c, i) => {
+    const rerun = reruns[i];
+    const cmp = compareCase(c.expected, rerun ? rerun.deliveries : [], ignore);
+    summaries.push({
+      name: c.name,
+      pass: rerun ? cmp.pass : false,
+      disposition: rerun?.disposition ?? "NO RESULT",
+    });
+    details.push({
+      error: rerun ? rerun.error : "no dry-run row produced for this case",
+      deliveries: cmp.deliveries,
+    });
+  });
+  return { passed: summaries.filter((s) => s.pass).length, summaries, details };
+}
