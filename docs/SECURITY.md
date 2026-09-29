@@ -3538,7 +3538,8 @@ the wrap first and refuses a weak one: the TLS listeners and client hops, outbou
 SMART assertion, the DIRECT signing key, `cert import`, the SFTP key, and a database driver's
 `sslkey`. Refusal is the default and has no setting. Weak wraps include legacy `Proc-Type` PEM
 (MD5), SHA-1-based derivations, PBKDF2 under 600,000 iterations over HMAC-SHA-256 (the common tools
-write 2048), and a PKCS#12 MAC keyed by the PKCS#12 KDF rather than PBMAC1. An encrypted key with
+write 2048), and a PKCS#12 MAC keyed by the PKCS#12 KDF rather than PBMAC1, whether or not the
+bundle's bags are encrypted. An encrypted key with
 no passphrase is refused before any library can prompt at a terminal. SSH keys cannot reach an
 approved derivation, so the SFTP connector takes only an unencrypted key.
 
