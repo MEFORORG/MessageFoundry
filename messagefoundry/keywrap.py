@@ -617,7 +617,7 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
     if len(parts) == 3:
         problem = _mac_problem(der, parts[2])
         if problem is not None and not encrypted:
-            problem += (
+            problem = problem.rstrip(".") + (
                 ". The MAC rule applies even though no bag is encrypted. Such a bundle passes with "
                 "a PBMAC1 MAC at the floor, or with no MAC (openssl pkcs12 -export -keypbe NONE "
                 "-certpbe NONE -nomac)"
