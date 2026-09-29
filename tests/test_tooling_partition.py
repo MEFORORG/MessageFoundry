@@ -193,6 +193,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # ordinary engine PR, which sets `code=true` but NOT `tooling=true`, so listed as tooling it
         # would run on no leg for the change that adds the vacuous assertion.
         "test_vacuous_absence_assert_lint.py",
+        # Reads messagefoundry/** off disk: every row of scripts/ci/invariant_mutations.toml names
+        # engine text that must occur exactly once (BACKLOG #1746 limb 5). What breaks a row is an
+        # engine refactor moving that text, which is an engine diff the tooling path gate does not
+        # see, so listed as tooling the list would rot on exactly the change that stales it.
+        "test_invariant_mutations.py",
         # AST-scans messagefoundry/store/store.py and reds on any `execute("BEGIN")` -- or on the
         # nested-transaction verbs `SAVEPOINT`, `ROLLBACK TO` and `RELEASE` -- outside
         # `_writer_txn` (ADR 0159). Same shape as sqlserver_encrypt_pass_tables below -- a guard whose

@@ -1,0 +1,165 @@
+# The bounded mutation list over the named invariant tests (BACKLOG #1746, limb 5).
+#
+# Each entry is one deliberate break of engine code and the tests that must turn RED under it.
+# `scripts/ci/invariant_mutations.py` applies each break alone, runs its tests, and restores the file.
+# A mutation whose tests stay green SURVIVED: the tests that name the property cannot see it broken,
+# which is the defect class #1746 exists to close. Not a repository-wide mutation score -- the
+# anti-metric rule in docs/Code_Quality_Standards.md section 4.1 forbids certifying on one. It is a
+# checked-in list, so each row is a reviewed claim that a named control has a red.
+#
+# Seeded from the thirteen instances Fable review packet 18 (finding P18-01) named, where the instance
+# is reachable offline. The server-backend locks (#1610) need a live PostgreSQL or SQL Server and are
+# not here; a row for them belongs on the gated live leg, not in this list.
+#
+# Fields, all required:
+#   id       stable name, used by --only
+#   item     the BACKLOG item whose control this pins
+#   file     repository-relative path of the file to break
+#   find     exact text, which must occur EXACTLY ONCE in `file` (a literal string, not a pattern)
+#   replace  the text that breaks it
+#   tests    pytest node ids; at least one must FAIL under the break, and all must pass without it
+#
+# A row goes stale when refactoring moves its `find` text. tests/test_invariant_mutations.py fails
+# on that at once, on every engine leg, so the list cannot rot into a run that breaks nothing.
+
+[[mutation]]
+id = "ack-after-commit-swallowed"
+item = 1608
+file = "messagefoundry/pipeline/wiring_runner.py"
+find = '''
+        # the AA ACK below still fires only after the whole document is durable.
+        mid = await self.store.enqueue_ingress(
+            channel_id=ic.name,
+            raw=skeleton,
+            control_id=fields.control_id,
+            message_type=fields.message_type,
+            source_type=src,
+            summary=fields.summary,
+            attachment_refs=attachment_refs or None,
+        )
+'''
+replace = '''
+        # the AA ACK below still fires only after the whole document is durable.
+        try:
+            mid = await self.store.enqueue_ingress(
+                channel_id=ic.name,
+                raw=skeleton,
+                control_id=fields.control_id,
+                message_type=fields.message_type,
+                source_type=src,
+                summary=fields.summary,
+                attachment_refs=attachment_refs or None,
+            )
+        except Exception:
+            mid = "mutated-ack-before-commit"
+'''
+tests = [
+    "tests/test_ack_after_commit_invariant.py::test_mllp_ingress_commit_failure_sends_no_aa_and_persists_nothing",
+]
+
+[[mutation]]
+id = "check-gate-never-blocks"
+item = 1746
+file = "messagefoundry/checks.py"
+find = '''
+        return self.required and not self.ok and not self.skipped
+'''
+replace = '''
+        return False
+'''
+tests = [
+    "tests/test_checks.py::test_expect_mismatch_fails",
+    "tests/test_checks.py::test_expect_invalid_value_fails",
+]
+
+[[mutation]]
+id = "check-dryrun-zero-runs-passes"
+item = 1671
+file = "messagefoundry/checks.py"
+find = '''
+    if total == 0:
+'''
+replace = '''
+    if False:
+'''
+tests = [
+    "tests/test_checks.py::test_check_dryrun_fails_when_nothing_was_actually_run",
+]
+
+[[mutation]]
+id = "audit-verify-zero-byte-accepted"
+item = 1669
+file = "messagefoundry/__main__.py"
+find = '''
+    if not is_sqlite:
+        return None
+'''
+replace = '''
+    return None
+'''
+tests = [
+    "tests/test_audit_integrity.py::test_audit_cli_refuses_a_zero_byte_database",
+]
+
+[[mutation]]
+id = "empty-config-accepted"
+item = 1648
+file = "messagefoundry/config/wiring.py"
+find = '''
+        if not allow_empty and self.declares_no_connections:
+'''
+replace = '''
+        if False:
+'''
+tests = [
+    "tests/test_wiring.py::test_load_config_refuses_a_config_that_declares_no_connections",
+]
+
+[[mutation]]
+id = "writer-txn-cancel-not-unwound"
+item = 1548
+file = "messagefoundry/store/store.py"
+find = '''
+            yield
+        except BaseException as exc:
+            await _unwind_and_raise(db, exc, role="writer")
+'''
+replace = '''
+            yield
+        except Exception as exc:
+            await _unwind_and_raise(db, exc, role="writer")
+'''
+tests = [
+    "tests/test_backlog1548_writer_txn_cancel_unwind.py::test_inline_writer_unwinds",
+]
+
+[[mutation]]
+id = "db-lookup-semicolon-only-gate"
+item = 1658
+file = "messagefoundry/transports/database.py"
+find = '''
+        if text not in _SQL_WRITE_KEYWORDS:
+            continue
+'''
+replace = '''
+        continue
+'''
+tests = [
+    "tests/test_db_lookup.py::test_write_shaped_select_and_cte_rejected",
+]
+
+[[mutation]]
+id = "connection-flag-audit-renamed"
+item = 1643
+file = "messagefoundry/api/app.py"
+find = '''
+        await engine.store.record_audit(
+            "connection_flag_set",
+'''
+replace = '''
+        await engine.store.record_audit(
+            "connection_flag_set_mutated",
+'''
+tests = [
+    "tests/test_connection_audit_writes.py::test_flag_route_audits_connection_flag_set_under_the_acting_user",
+]
