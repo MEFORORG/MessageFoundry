@@ -58,6 +58,16 @@ export interface LensRow {
   // webview offers ONLY these as editable inputs (an expression/list slot always refuses a scalar edit,
   // F6). Absent on an older contract / a hand-built test row → treated as "all params editable".
   literal_params?: string[];
+  // ADR 0076 Amendment E (#237) -- per-argument input modes, emitted on action / lookup / diagnostic rows
+  // at contract 2 by an engine that carries them. `param_modes` is TOTAL over `params` (AC-M1) and says
+  // what SHAPE each argument is; `literal_params` above still says what is EDITABLE as a literal, and the
+  // two are different questions (E.10). `param_parts` maps each templated argument to the parts the
+  // engine read back out of its f-string, or null when it has no parts form. `template_params` lists the
+  // arguments the engine will accept a `{"parts": [...]}` write into. All three are ABSENT on contract 1
+  // and on an engine that predates them -- read through {@link paramModeViews}, never directly.
+  param_modes?: Record<string, string>;
+  param_parts?: Record<string, unknown>;
+  template_params?: string[];
   // control rows
   control?: "if" | "elif" | "else" | "for" | "raise";
   test_src?: string | null;
@@ -232,6 +242,14 @@ export interface RowViewModel {
    * hand-built RowViewModel (tests) may omit it — treated as "nothing editable".
    */
   editableParams?: string[];
+  /**
+   * Per-argument input modes (ADR 0076 Amendment E, BACKLOG #237), keyed by param name. Present ONLY when
+   * the engine sent `param_modes` for this row; ABSENT means the engine is older or was asked for contract
+   * 1, and the row renders exactly as it did before modes existed ({@link editableParams} alone). Absence
+   * never means "every argument is dynamic" (E.8). It widens nothing on its own: {@link editableParams}
+   * is unchanged, so a renderer that ignores this field behaves as it always has.
+   */
+  paramModes?: Record<string, ParamModeView>;
   code?: string; // verbatim source slice — code rows only (the degradation-ladder passthrough)
   liveValue?: string; // redacted-by-default #92 annotation (see mergeLiveValues); undefined = none
   /**
@@ -514,6 +532,11 @@ export function isRowDeletable(row: LensRow): boolean {
   return isRowMutable(row) || (row.kind === "control" && (row.control === "if" || row.control === "for"));
 }
 
+/** Whether a row kind carries typed call arguments: `params`, `literal_params` and (Amendment E) modes. */
+function hasTypedParams(kind: RowKind): boolean {
+  return kind === "action" || kind === "lookup" || kind === "diagnostic";
+}
+
 /**
  * The param names editable in phase 3 for a row (a subset of its rendered fields). `action`/`lookup`
  * rows expose only their **literal-valued** params (`literal_params` from the contract): an
@@ -527,7 +550,7 @@ export function isRowDeletable(row: LensRow): boolean {
 export function editableParamNames(row: LensRow): string[] {
   // action / lookup / diagnostic expose only their literal-valued params (diagnostics: the template/label
   // literal — operands are excluded by the engine, so `literal_params` already omits them, ADR 0106 §5 K).
-  if (row.kind === "action" || row.kind === "lookup" || row.kind === "diagnostic") {
+  if (hasTypedParams(row.kind)) {
     const names = Object.keys(row.params ?? {});
     if (row.literal_params === undefined) {
       return names;
@@ -550,8 +573,221 @@ export function editableParamNames(row: LensRow): string[] {
   return [];
 }
 
+// ---- per-argument input modes (ADR 0076 Amendment E, BACKLOG #237) ---------------------------------
+//
+// The engine decides every mode and every permission; this section only reads what it sent. It never
+// looks at an argument's Python source to classify it, because a TypeScript reading of Python would be
+// the second grammar E.5 refuses. Every writable mode below comes from an engine-issued list
+// (`literal_params` via editableParamNames, and `template_params`), so the IDE offers only writes the
+// engine has said it will accept.
+
+const PARAM_MODES = ["static", "templated", "dynamic"] as const;
+
+/** An argument's shape: a literal, a bounded interpolation over message reads, or anything else. */
+export type ParamMode = (typeof PARAM_MODES)[number];
+
+function isParamMode(value: unknown): value is ParamMode {
+  return (PARAM_MODES as readonly unknown[]).includes(value);
+}
+
+/** Whether `value` is a plain JSON object (not null, not an array). */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** One part of a templated argument: literal text, or one HL7 path read. Exactly one key, always. */
+export type TemplatePart = { text: string } | { path: string };
+
+/** The `set_params` value that writes a template: `{"parts": [...]}` (the engine renders the f-string). */
+export interface TemplateValue {
+  parts: TemplatePart[];
+}
+
+/** What the model knows about one argument's mode, for the mode selector (step 3 of #237). */
+export interface ParamModeView {
+  mode: ParamMode;
+  /**
+   * The engine's parts for a `templated` argument: the list, or `null` when the interpolation has no parts
+   * form (for example a `msg.field("X", 2)` read). `undefined` when the argument is not templated, or the
+   * engine sent no `param_parts`. With no parts, show the argument's source (its `params` value) instead.
+   */
+  parts?: TemplatePart[] | null;
+  /**
+   * The modes an edit may WRITE into this argument, in the order `static`, `templated`. Empty means
+   * read-only. `dynamic` is never here: a dynamic argument is read-only (E.6.4, AC-M5), and nothing may
+   * write a dynamic value.
+   */
+  writable: readonly ParamMode[];
+}
+
+/** Whether `value` is exactly one wire part: an object with one key, `text` or `path`, holding a string. */
+function isTemplatePart(value: unknown): value is TemplatePart {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  return (
+    keys.length === 1 &&
+    (keys[0] === "text" || keys[0] === "path") &&
+    typeof value[keys[0]] === "string"
+  );
+}
+
+function isTemplatePartList(value: unknown): value is TemplatePart[] {
+  return Array.isArray(value) && value.every(isTemplatePart);
+}
+
+/**
+ * Read a wire parts list, or `null` when it is not a list of well-formed parts. Only the JSON shape is
+ * checked. Whether the parts make a valid template (a non-empty path, at least one path) stays the
+ * engine's call, and a bad one comes back as a refusal.
+ */
+export function readTemplateParts(value: unknown): TemplatePart[] | null {
+  return isTemplatePartList(value) ? value : null;
+}
+
+/** A fresh one-key copy of a part, so no stray property rides into a rewrite payload. */
+function copyTemplatePart(part: TemplatePart): TemplatePart {
+  return "text" in part ? { text: part.text } : { path: part.path };
+}
+
+/**
+ * Whether `value` is a `{"parts": [...]}` template value, and nothing else. The guard for a webview
+ * message that posts a template (step 3 of #237), next to the `string | number` check an edit has today.
+ */
+export function isTemplateValue(value: unknown): value is TemplateValue {
+  return isRecord(value) && Object.keys(value).length === 1 && isTemplatePartList(value.parts);
+}
+
+/** The `set_params` value that writes `parts` as a template: `{parts}`, each part copied to one key. */
+export function templateValue(parts: readonly TemplatePart[]): TemplateValue {
+  return { parts: parts.map(copyTemplatePart) };
+}
+
+/**
+ * The per-argument modes of one row, keyed by param name, or `undefined` when the row has none to give.
+ *
+ * `undefined` for any row that is not an action, lookup or diagnostic, and for one whose engine sent no
+ * `param_modes` map: contract 1, or an engine older than Amendment E. The caller then keeps today's
+ * literal-or-read-only split ({@link editableParamNames}). An absent map is never read as "every argument
+ * is dynamic" (E.8).
+ *
+ * Inside a map, the rules are:
+ *
+ * - An argument's mode is the engine's. A name with no mode, or a mode string this IDE does not know (a
+ *   newer engine), is left out, so {@link paramWritableModes} falls back to the old split for it alone.
+ * - `dynamic` is read-only, always.
+ * - `static` is writable exactly where it was before modes existed ({@link editableParamNames}), and also
+ *   on an argument in `template_params`, because the engine accepts a literal wherever it accepts a
+ *   template. That is how a templated argument switches back to a literal.
+ * - `templated` is writable only on an argument in `template_params`. An absent `template_params` (an
+ *   engine that sends modes but predates template writes) offers no template write at all.
+ * - A templated argument outside `template_params` (a lookup's statement, a diagnostic's template) is
+ *   read-only here. The engine would take a literal into some of those, but it issues no list saying
+ *   which, and this model offers only writes an engine list names.
+ */
+export function paramModeViews(
+  row: LensRow,
+  editableNames: readonly string[] = editableParamNames(row),
+): Record<string, ParamModeView> | undefined {
+  const modes: unknown = row.param_modes;
+  if (!hasTypedParams(row.kind) || !isRecord(modes)) {
+    return undefined;
+  }
+  const editable = new Set(editableNames);
+  const templateOk = new Set(Array.isArray(row.template_params) ? row.template_params : []);
+  const partsMap: unknown = row.param_parts;
+  const views: Record<string, ParamModeView> = {};
+  for (const name of Object.keys(row.params ?? {})) {
+    const mode = Object.hasOwn(modes, name) ? modes[name] : undefined;
+    if (!isParamMode(mode)) {
+      continue;
+    }
+    const writable: ParamMode[] = [];
+    if (mode !== "dynamic") {
+      if (editable.has(name) || templateOk.has(name)) {
+        writable.push("static");
+      }
+      if (templateOk.has(name)) {
+        writable.push("templated");
+      }
+    }
+    const view: ParamModeView = { mode, writable };
+    if (mode === "templated" && isRecord(partsMap) && Object.hasOwn(partsMap, name)) {
+      view.parts = readTemplateParts(partsMap[name]);
+    }
+    views[name] = view;
+  }
+  return views;
+}
+
+/**
+ * The mode of one argument of a rendered row, or `undefined` when the engine sent none for it. Show no
+ * mode selector for `undefined`: the row predates modes, and its argument is not known to be dynamic.
+ */
+export function paramModeOf(vm: RowViewModel, name: string): ParamMode | undefined {
+  return vm.paramModes?.[name]?.mode;
+}
+
+/**
+ * The modes an edit may write into one argument of a rendered row: the one call the mode selector needs,
+ * whichever engine it meets. With modes it is the engine-derived {@link ParamModeView.writable}. Without
+ * them it is today's split: `["static"]` for an argument in {@link RowViewModel.editableParams}, else
+ * `[]`.
+ */
+export function paramWritableModes(vm: RowViewModel, name: string): readonly ParamMode[] {
+  const view = vm.paramModes?.[name];
+  if (view !== undefined) {
+    return view.writable;
+  }
+  return (vm.editableParams ?? []).includes(name) ? ["static"] : [];
+}
+
+/** Which of the engine's `set_params` refusals a `lens rewrite` error is, for an inline message. */
+export type RewriteRefusalKind = "dynamic" | "literal-only" | "template-shape" | "column-limit";
+
+// Keyed on substrings of the engine's own refusal text (messagefoundry/lens.py, `_render_moded_value`,
+// `_refuse_templated_write`, `_check_parts_spec`, `_refuse_overlong_template_lines`). Checked in this
+// order, so the most specific reason wins when one message could match two.
+const REWRITE_REFUSALS: ReadonlyArray<[RewriteRefusalKind, readonly string[]]> = [
+  ["dynamic", ["is in dynamic mode", "would write a dynamic-mode argument"]],
+  ["literal-only", ["takes a literal only"]],
+  [
+    "template-shape",
+    [
+      "write a template as {'parts'",
+      // Narrower than "must be a list": a route row's refusal "'handlers' must be a list" is not this.
+      "'parts' must be a list",
+      "exactly one key",
+      "must be {'text'",
+      "at least one 'path'",
+      "must be non-empty",
+    ],
+  ],
+  ["column-limit", ["column limit"]],
+];
+
+/**
+ * Classify a `set_params` refusal from `lens rewrite` ({@link RewriteOutcome.error}) as one of the mode
+ * refusals, or `undefined` for any other error. The message itself is still the thing to show; this only
+ * says which field state it belongs to. Meant for a param edit's outcome: a structural op's refusal can
+ * also name the column limit.
+ */
+export function classifyRewriteRefusal(error: string | undefined): RewriteRefusalKind | undefined {
+  if (!error) {
+    return undefined;
+  }
+  for (const [kind, needles] of REWRITE_REFUSALS) {
+    if (needles.some((needle) => error.includes(needle))) {
+      return kind;
+    }
+  }
+  return undefined;
+}
+
 /** Fold one contract row + the module lines into its view-model. */
 export function buildRowViewModel(row: LensRow, index: number, lines: string[]): RowViewModel {
+  const editable = editableParamNames(row);
   const vm: RowViewModel = {
     index,
     kind: row.kind,
@@ -562,7 +798,7 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
     isReturn: isReturnRow(row),
     title: rowTitle(row),
     params: rowParams(row),
-    editableParams: editableParamNames(row),
+    editableParams: editable,
     action: row.action ?? row.call, // ADR 0104 §2.3: recognized name (action OR lookup call, e.g. code_lookup)
 
     // The row's projected source — sliced from the SAME (engine-newline) lines the projection parsed, so
@@ -602,6 +838,10 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
   if (row.kind === "note") {
     vm.code = row.raw ?? sliceSource(lines, row.line_start, row.line_end);
     vm.pragma = row.pragma === true;
+  }
+  const modes = paramModeViews(row, editable);
+  if (modes !== undefined) {
+    vm.paramModes = modes;
   }
   return vm;
 }
@@ -896,7 +1136,10 @@ export interface EditMessage {
   // The new value, as typed in the field. A `number` for a number-kind widget (BACKLOG #1760) so it
   // round-trips to the engine as a JSON number and renders as an int/float literal — a string would
   // render a re-typed string literal (`_render_literal` emits `6` for an int but `"6"` for a str).
-  value: string | number;
+  // A {@link TemplateValue} writes the argument in templated mode (ADR 0076 Amendment E, #237): the
+  // engine renders the parts to an f-string and checks it reads back. Offer it only for an argument
+  // whose {@link paramWritableModes} include `templated`.
+  value: string | number | TemplateValue;
   // The row's PROJECTION-TIME source text (the row as the user saw it when the lens projected the inputs),
   // echoed back from the webview's `data-expect-src` and carried to `lens rewrite` as `expect_src` (F7).
   // Optional so a hand-built message (tests / an older payload) may omit it — then no stale check is sent.
@@ -910,8 +1153,9 @@ export interface EditRequest {
   line_end: number;
   op: "set_params";
   // A number-kind field carries a JS number so `JSON.stringify` emits a bare `6` (an int/float literal),
-  // not `"6"` (a re-typed string literal) — BACKLOG #1760. Every other param stays a string.
-  params: Record<string, string | number>;
+  // not `"6"` (a re-typed string literal) — BACKLOG #1760. A template is `{"parts": [...]}` (#237).
+  // Every other param stays a string.
+  params: Record<string, string | number | TemplateValue>;
   // The projected row's source text from the LIVE buffer (no EOL). `lens rewrite` verifies it still
   // matches the row before splicing, so a stale coordinate (a coincidental same-shape row) is refused
   // instead of edited in the wrong place (F7). Omitted → no stale check (older/no-buffer callers).
@@ -939,7 +1183,12 @@ export function buildEditRequest(msg: EditMessage, expectSrc?: string): EditRequ
     line_start: msg.lineStart,
     line_end: msg.lineEnd,
     op: "set_params",
-    params: { [msg.name]: msg.value },
+    // A template is re-copied part by part, so the payload carries exactly `{"parts": [{text}|{path}]}`
+    // whatever else rode along on the posted object.
+    params: {
+      [msg.name]:
+        typeof msg.value === "object" ? templateValue(msg.value.parts) : msg.value,
+    },
   };
   const src = expectSrc ?? msg.expectSrc;
   if (src !== undefined) {
