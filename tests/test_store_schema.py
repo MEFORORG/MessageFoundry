@@ -512,6 +512,35 @@ def test_only_a_schema_shaped_error_is_wrapped(tmp_path: Path) -> None:
     assert not is_schema_step_error(locked.value)
     assert not is_schema_step_error(RuntimeError("no sqlite code at all"))
 
+    # SQLITE_ERROR too, but this build's fault, not the store's: recreating the store fixes nothing.
+    conn = sqlite3.connect(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as syntax:
+            conn.execute("SELEC x FROM t")
+    finally:
+        conn.close()
+    assert syntax.value.sqlite_errorcode & 0xFF == sqlite3.SQLITE_ERROR
+    assert not is_schema_step_error(syntax.value)
+
+
+async def test_a_counted_store_with_no_salt_table_gets_the_new_key_remedy(tmp_path: Path) -> None:
+    """When the schema script itself fails, an older file may have no ``store_salt`` table. A count
+    with no salt table means the store sealed under the DEK, so the keyed remedy applies."""
+    import aiosqlite
+
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    db = tmp_path / "counted.db"
+    _sql(
+        db,
+        "CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER); INSERT INTO cipher_meta VALUES ('k', 1);",
+    )
+    async with aiosqlite.connect(db) as conn:
+        assert await _counts_under_a_dek(conn) is True
+        await conn.execute("CREATE TABLE store_salt (salt TEXT)")
+        await conn.execute("INSERT INTO store_salt VALUES ('s')")
+        assert await _counts_under_a_dek(conn) is False  # control: a salt row means cell-bound
+
 
 # --- BACKLOG #2101 item 2: the forensic subcommands and a store this build refuses ------------------
 

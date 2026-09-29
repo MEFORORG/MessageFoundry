@@ -2536,8 +2536,10 @@ class StoreNotFoundError(RuntimeError):
             message=(
                 f"no MessageFoundry store in the {backend.value} database {database!r}: it has no "
                 "schema_meta table this login can see, and this command does not build one (check "
-                "[store].database and the login's default schema; `messagefoundry serve` builds the "
-                "store on its first run)"
+                "[store].database and the login's default schema. Under [store].schema_management = "
+                "'external', the default, a DBA builds the store with "
+                f"`{PROVISION_SCHEMA_COMMAND}`; under 'auto', `messagefoundry serve` builds it on "
+                "its first run)"
             ),
         )
 

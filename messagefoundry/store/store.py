@@ -128,6 +128,8 @@ from messagefoundry.store.metadata import (
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.schema_verify import (
+    SchemaMismatchError,
+    is_schema_step_error,
     live_schema_differences,
     run_schema_step,
     verify_live_schema,
@@ -4790,7 +4792,14 @@ class MessageStore:
         salt bind, no invocation reserve, no at-rest sweep, no audit keying watermark. The schema is
         still compared with this build's, but a difference is logged as a WARNING rather than
         refused, because an inspection of an incompatible store is the point. A later read that
-        needs a missing object raises ``sqlite3.OperationalError``, and so does any write."""
+        needs a missing object raises ``sqlite3.OperationalError``, and so does any write. SQLite
+        still creates the ``-wal`` and ``-shm`` files of a WAL store it reads, as any reader does,
+        and leaves them after a read-only close; the store file itself is not written.
+
+        The ``state`` and ``reference`` read caches are NOT loaded on a read-only handle: they serve
+        the pipeline, and loading them decrypts every cell, which refuses a legacy plaintext value
+        the writable open would have sealed first. ``state_get`` and ``reference_view`` therefore
+        read empty there. The audit keying watermark is loaded, because the audit reads need it."""
         sync = synchronous.upper()
         if sync not in ("NORMAL", "FULL"):
             raise ValueError(
@@ -4862,13 +4871,16 @@ class MessageStore:
                 await store.checkpoint_cipher_invocations()
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
-            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-            await (
-                store._load_state_cache()
-            )  # populate the in-memory state read-through cache (ADR 0005)
-            await (
-                store._load_reference_cache()
-            )  # populate the reference-snapshot read cache (ADR 0006)
+            if read_only:
+                await store._load_read_only()
+            else:
+                await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+                await (
+                    store._load_state_cache()
+                )  # populate the in-memory state read-through cache (ADR 0005)
+                await (
+                    store._load_reference_cache()
+                )  # populate the reference-snapshot read cache (ADR 0006)
             await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
             if store._group_commit is not None:
                 store._group_commit.start()  # spin the committer coroutine (needs the running loop)
@@ -4969,6 +4981,25 @@ class MessageStore:
                 "; ".join(problems),
             )
 
+    async def _load_read_only(self) -> None:
+        """The at-open loads of a read-only handle (BACKLOG #1780): the audit keying watermark only.
+
+        A store that lacks what that load reads fails here with a :class:`SchemaMismatchError` that
+        says so, rather than as a bare "no such column": the read-only open never migrates, so an
+        older store that the writable open would have migrated cannot be read by this build."""
+        try:
+            await self._load_audit_chain_meta()
+        except Exception as exc:
+            if not is_schema_step_error(exc):
+                raise
+            cause = str(exc)
+            raise SchemaMismatchError(
+                f"store {self.path} was opened read-only and lacks what this build reads: it is "
+                "from an incompatible version, or it is older and needs the migration an ordinary "
+                f"open of this build runs. The read failed: {cause}.",
+                cause=cause,
+            ) from exc
+
     async def _open_read_pool(self, path: str) -> None:
         """Open the bounded read-only connection pool for a file-backed WAL store (lockfree-reads).
 
@@ -4982,7 +5013,12 @@ class MessageStore:
             return
         pool: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue(maxsize=_READ_POOL_SIZE)
         for _ in range(_READ_POOL_SIZE):
-            conn = await aiosqlite.connect(path)
+            if self._read_only:
+                # BACKLOG #1780: the pool is part of the read-only handle, so it opens `mode=ro` too.
+                uri = _sqlite_readonly_uri(str(Path(path).resolve()))
+                conn = await aiosqlite.connect(uri, uri=True)
+            else:
+                conn = await aiosqlite.connect(path)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA query_only=ON")  # defence in depth: a read conn never writes
             await conn.execute("PRAGMA busy_timeout=5000")

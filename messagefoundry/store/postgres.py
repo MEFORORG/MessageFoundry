@@ -1454,9 +1454,11 @@ class PostgresStore:
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
         )
         async with self._timed_acquire() as conn:
-            if external:
+            if external and not read_only:
                 # BEFORE the marker read: that read needs SELECT on schema_meta, and without it the
                 # operator would get a raw permission error naming one table instead of the full list.
+                # Not on a read-only open (#1780): it demands the write grants an inspecting login
+                # should not hold.
                 await self._verify_runtime_grants(conn)
             # FAST PATH: two cheap reads, no lock, no transaction. A virgin/pre-marker DB probes as
             # not-current and falls through to the full run.

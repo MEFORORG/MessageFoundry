@@ -303,3 +303,55 @@ def test_status_snapshot_reports_a_store_this_build_would_refuse(tmp_path: Path)
     assert _durable(target, "SELECT sql FROM sqlite_master WHERE name = 'ix_messages_control'") == [
         ("CREATE INDEX ix_messages_control ON messages(control_id)",)
     ]
+
+
+async def test_read_only_open_names_an_older_store_it_cannot_read(tmp_path: Path) -> None:
+    """An older store that only needs migrating lacks a column the read-only open's own audit load
+    reads. It is refused as a schema mismatch that says why, not as a bare "no such column"."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    target = tmp_path / "older.db"
+    assert await _open_then_close(target, create=True) is None
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute("ALTER TABLE audit_chain_meta DROP COLUMN key_id")
+        conn.commit()
+    finally:
+        conn.close()
+
+    raised = await _open_then_close(target, read_only=True)
+
+    assert isinstance(raised, SchemaMismatchError)
+    assert "opened read-only and lacks what this build reads" in str(raised)
+    assert "no such column: key_id" in str(raised)
+    # Control: the ordinary open migrates it, after which the read-only open reads it.
+    assert await _open_then_close(target) is None
+    assert await _open_then_close(target, read_only=True) is None
+
+
+async def test_read_only_open_of_a_keyed_store_does_not_decrypt_the_caches(tmp_path: Path) -> None:
+    """A keyed store with a legacy plaintext `state` value: the writable open seals it first, and a
+    load of the cache refuses it unsealed. The read-only open loads no cache, so it opens."""
+    from messagefoundry.store.crypto import CipherError
+
+    target = tmp_path / "legacy.db"
+    settings = await _store_missing_an_index(target, encryption_key=generate_key())
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute(
+            "INSERT INTO state (namespace, key, value, set_at) VALUES ('ns', 'k', '\"plain\"', 1.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = await open_store(settings, read_only=True, keyless_chain_refusal=None)
+    await store.close()
+
+    # Control: the cache load itself refuses that value, so the open above is the skipped load.
+    store = await open_store(settings, read_only=True, keyless_chain_refusal=None)
+    try:
+        with pytest.raises(CipherError):
+            await store._load_state_cache()  # type: ignore[attr-defined]
+    finally:
+        await store.close()

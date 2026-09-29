@@ -5431,7 +5431,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -5468,7 +5472,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     try:
         outcome, report = run_guarded(run())
-    except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
+    # #1916; #1780: a server database with no store (auto mode). Could not start.
+    except (KeylessAuditChainRefused, StoreNotFoundError, _UnauditableWrite) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6219,7 +6224,12 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     from messagefoundry.auth.permissions import Role
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store, store_driver_errors
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+        store_driver_errors,
+    )
     from messagefoundry.store.crypto import StoreKeylessError
     from messagefoundry.store.store import require_notify_email
 
@@ -6308,7 +6318,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     try:
         outcome, username, extra = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780: could not start
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6601,7 +6611,11 @@ def _rekey_audit(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -6636,7 +6650,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
 
     try:
         ok, message = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780: could not start
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6741,7 +6755,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import StoreBackend, load_settings
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
-    from messagefoundry.store.base import open_store, resolve_active_key
+    from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
     from messagefoundry.uploads import ResealResult, UploadStore
@@ -6871,7 +6885,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # skip what is already under the active key — it is a resumable rotation, not a rollback.
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
-    except NotImplementedError as exc:
+    except (NotImplementedError, StoreNotFoundError) as exc:  # #1780: no store there
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database

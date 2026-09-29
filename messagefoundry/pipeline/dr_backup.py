@@ -55,7 +55,7 @@ from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSe
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
-from messagefoundry.redaction import json_loads_or_refusal, safe_exc
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import Store
 from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
@@ -1569,6 +1569,10 @@ def _full_open_check(
     return _decrypt_check(snap, snap_settings)
 
 
+#: Longer than safe_exc's default, so the remedy and at least the first differences survive.
+_INCOMPATIBLE_REASON_LIMIT = 600
+
+
 def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str:
     """The restore-verify refusal of a snapshot this build's schema cannot open (BACKLOG #2101).
 
@@ -1584,10 +1588,13 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
         tail = f"Differences: {'; '.join(exc.differences)}."
     else:
         tail = f"The schema step failed: {exc.cause or ''}."
-    return (
+    # Redacted and bounded like every other arm's reason (safe_exc there): the tail is driver text
+    # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
+    return safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
-        f" it with {wrote}. The archive itself decrypted and passed its integrity and row-count"
-        f" checks. {tail}"
+        f" it with {wrote}. The archive opened and passed its integrity and row-count checks; its"
+        f" cells were not decrypted. {tail}",
+        limit=_INCOMPATIBLE_REASON_LIMIT,
     )
 
 

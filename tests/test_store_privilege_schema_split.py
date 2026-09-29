@@ -559,6 +559,18 @@ async def test_postgres_read_only_refuses_a_database_with_no_store(
     assert conn.writes == []
 
 
+async def test_postgres_read_only_external_open_needs_no_write_grants() -> None:
+    """An inspecting login should hold SELECT only; the runtime-grants check demands writes, so a
+    read-only open skips it. The control is the ordinary external open refusing the same role."""
+    from messagefoundry.store.base import StoreGrantsMissingError
+    from messagefoundry.store.postgres import _schema_hash
+
+    conn = _FakePgConn(present=True, schema_hash=_schema_hash(), ungranted=("messages",))
+    assert await _postgres_store_over(conn, None)._ensure_schema(read_only=True) is False
+    with pytest.raises(StoreGrantsMissingError):
+        await _postgres_store_over(conn, None)._ensure_schema()
+
+
 async def test_postgres_read_only_opens_a_current_store_under_auto() -> None:
     from messagefoundry.store.postgres import _schema_hash
 

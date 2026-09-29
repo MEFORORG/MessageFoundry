@@ -336,18 +336,32 @@ async def verify_live_schema(
         )
 
 
+#: The SQLite messages that name an existing object's shape. A syntax error in this build's own
+#: DDL, or a statement the local SQLite is too old for, is also SQLITE_ERROR, and it is not fixed
+#: by recreating the store, so the code alone is not enough.
+_SHAPE_MESSAGES = (
+    "no such column",
+    "no such table",
+    "has no column named",
+    "duplicate column name",
+    "already exists",
+)
+
+
 def is_schema_step_error(exc: BaseException) -> bool:
     """Whether ``exc``, raised by the schema script or a migration, says the store's shape is wrong.
 
-    Only SQLite's generic ``SQLITE_ERROR`` counts, which is what a missing or clashing table, column
-    or index raises. A busy or locked file, a read-only file, an I/O error, a full disk and a corrupt
-    file each carry their own primary code, and none of them is fixed by recreating the store, so
-    each keeps its own error rather than getting this remedy (BACKLOG #2101)."""
+    Two tests, both needed. The code must be SQLite's generic ``SQLITE_ERROR``: a busy or locked
+    file, a read-only file, an I/O error, a full disk and a corrupt file each carry their own primary
+    code. And the message must name a missing or clashing table, column or index, because a syntax
+    error is ``SQLITE_ERROR`` too. None of the others is fixed by recreating the store, so each
+    keeps its own error rather than getting this remedy (BACKLOG #2101)."""
     code = getattr(exc, "sqlite_errorcode", None)
     return (
         isinstance(exc, sqlite3.OperationalError)
         and isinstance(code, int)
         and code & 0xFF == sqlite3.SQLITE_ERROR
+        and any(m in str(exc) for m in _SHAPE_MESSAGES)
     )
 
 
@@ -384,12 +398,18 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     only by a writer that seals under the DEK itself (ADR 0196). A cell-bound writer mints the salt
     row on its first keyed open, so a counted file without one never had its data key derived.
 
-    The schema script has already run, so ``store_salt`` exists here even on an older file."""
+    The two tables are read separately. When the schema script itself failed (BACKLOG #2101), an
+    older file may have no ``store_salt`` table at all, and that too means no salt was ever minted."""
     try:
-        async with db.execute(
-            "SELECT EXISTS (SELECT 1 FROM cipher_meta) AND NOT EXISTS (SELECT 1 FROM store_salt)"
-        ) as cur:
+        async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
             row = await cur.fetchone()
-    except sqlite3.OperationalError:  # an incompatible table is reported as a difference
+    except sqlite3.OperationalError:  # no count table, or an incompatible one: no count to reset
         return False
-    return bool(row and row[0])
+    if not (row and row[0]):
+        return False
+    try:
+        async with db.execute("SELECT EXISTS (SELECT 1 FROM store_salt)") as cur:
+            salted = await cur.fetchone()
+    except sqlite3.OperationalError:  # no salt table: this file never had a salt minted
+        return True
+    return not (salted and salted[0])
