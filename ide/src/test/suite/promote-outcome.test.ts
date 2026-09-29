@@ -115,4 +115,27 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     assert.ok(pre.message.text.includes(pendingBody.approval_id), pre.message.text);
     assert.ok(pre.message.text.includes("reject"), pre.message.text);
   });
+
+  test("a 2xx that is not a reload result is an ERROR, never 'promoted' with undefined counts", async () => {
+    replyStatus = 200;
+    replyBody = {};
+    const outcome = await reloadConfig(url, null, false, "tok");
+    const msg = promoteOutcomeMessage("PROD", outcome);
+    assert.strictEqual(msg.level, "error");
+    assert.ok(msg.text.includes("unknown whether the new config is live"), msg.text);
+    assert.ok(!msg.text.includes("undefined"), msg.text);
+    const pre = preflightOutcome(outcome);
+    assert.ok(!pre.ok, "the pre-flight must not confirm a graph it never saw");
+    assert.strictEqual(pre.message.level, "error");
+  });
+
+  test("a hold whose body carries no usable id still says HELD, and says the id is missing", async () => {
+    replyStatus = 202;
+    replyBody = {};
+    const msg = promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
+    assert.strictEqual(msg.level, "warning");
+    assert.ok(msg.text.includes("held for a second approver"), msg.text);
+    assert.ok(msg.text.includes("did not report an approval id"), msg.text);
+    assert.ok(!msg.text.includes("undefined"), msg.text);
+  });
 });

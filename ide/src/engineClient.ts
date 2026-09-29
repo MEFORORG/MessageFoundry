@@ -6,7 +6,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 
-import { engineHostKey, trustRemedy } from "./engineTrustModel";
+import { engineHostKey, isRecord, trustRemedy } from "./engineTrustModel";
 
 /** A non-2xx engine response. `status` lets callers branch (e.g. 401 → (re)authenticate). */
 export class HttpError extends Error {
@@ -199,8 +199,8 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
  * `{"detail": ...}` when present — and a plain Error when the engine is unreachable, so a caller's
  * try/catch shows a useful message and can special-case 401/403.
  *
- * A route dual control can hold answers 202 with a pending-approval body instead of a result, so
- * call such a route through {@link postApprovable}. Here that reply rejects rather than decoding as
+ * A route dual control can hold answers 202 instead of running the action, so call such a route
+ * through {@link postApprovable}. Here a 202 rejects with a {@link HeldError} rather than decoding as
  * `T`: a caller that does not handle a hold must not read one as success (BACKLOG #1981).
  */
 export function postJson<T>(
@@ -210,83 +210,77 @@ export function postJson<T>(
   token?: string,
 ): Promise<T> {
   return postReply(baseUrl, route, body, token).then((reply) => {
-    if (reply.status === HTTP_PENDING_APPROVAL && isPendingApproval(reply.body)) {
-      throw new Error(
-        `engine held this action for a second approver (approval ${reply.body.approval_id}); ` +
-          "it has not run",
-      );
+    const outcome = classifyApprovable<T>(reply.status, reply.body);
+    if (outcome.kind === "held") {
+      throw new HeldError(outcome.hold.approvalId);
     }
-    return reply.body as T;
+    return outcome.body;
   });
 }
 
 /**
  * The status the engine answers when dual control holds an action instead of running it (ADR 0041
- * D2, ASVS 2.3.5). The Python client keys on the same number (`_HTTP_PENDING_APPROVAL` in
- * `messagefoundry/apiclient/client.py`).
+ * D2, ASVS 2.3.5). The engine answers it for nothing else, so the status alone marks a hold, as it
+ * does in the Python client (`_HTTP_PENDING_APPROVAL` in `messagefoundry/apiclient/client.py`).
  */
 export const HTTP_PENDING_APPROVAL = 202;
 
-/** Mirrors `messagefoundry/api/models.py:PendingApprovalResponse`, the body of that 202. */
-export interface PendingApproval {
-  approval_id: string;
-  operation: string;
-  status: "pending_approval";
-  detail: string;
+/**
+ * What the IDE keeps from a hold. The engine's body is `models.py:PendingApprovalResponse`; only its
+ * id is ever shown, and it is `undefined` when the body did not carry a usable one.
+ */
+export interface Hold {
+  approvalId: string | undefined;
 }
 
 /**
  * The outcome of a route dual control may hold: the finished result, or the hold. A tagged union,
  * so a caller has to check `kind` before it can read a result, and a hold can never be read as one.
  */
-export type Approvable<T> = { kind: "done"; body: T } | { kind: "held"; pending: PendingApproval };
+export type Approvable<T> = { kind: "done"; body: T } | { kind: "held"; hold: Hold };
+
+/** A hold reached a caller that only handles a finished result. The action has not run. */
+export class HeldError extends Error {
+  constructor(readonly approvalId: string | undefined) {
+    super(`engine held this action for a second approver (${approvalText(approvalId)}); it has not run`);
+    this.name = "HeldError";
+  }
+}
 
 /**
  * Sort a decoded 2xx reply into done or held (BACKLOG #1981).
  *
- * The status is the discriminator, as it is in the Python client, because it is what the engine
- * varies. A 202 must also carry the pending-approval body: a 202 without one is neither a result nor
- * a hold the user can act on, so it throws rather than being read as success. The body's free text
- * is server text headed for a notification, so it is bounded like an error detail. The id is not
- * bounded by cutting it, because a cut id matches nothing in the approvals queue: an id that is not
- * a short token is refused instead (the engine issues a uuid4 hex).
+ * The status decides, not the body, because the status is what the engine varies. So a 202 is a
+ * hold even when its body is odd: calling it a failure would invite a retry, and each retry leaves
+ * another pending approval whose release runs the action for real.
  */
 export function classifyApprovable<T>(status: number, body: unknown): Approvable<T> {
   if (status !== HTTP_PENDING_APPROVAL) {
     return { kind: "done", body: body as T };
   }
-  if (!isPendingApproval(body)) {
-    throw new Error(
-      `engine answered HTTP ${status} without a pending-approval body, so it is unknown whether ` +
-        "the action was held or ran; check the engine before retrying",
-    );
-  }
-  return {
-    kind: "held",
-    pending: {
-      approval_id: body.approval_id,
-      operation: clamp(body.operation),
-      status: body.status,
-      detail: clamp(body.detail),
-    },
-  };
+  return { kind: "held", hold: { approvalId: approvalIdOf(body) } };
 }
 
-/** An approval id as the engine issues it: a short token with no spaces or punctuation to hide in. */
+/**
+ * An approval id as the engine issues it (a uuid4 hex): a short token with nothing to hide in. An
+ * id that does not match is dropped rather than cut short, because a cut id matches nothing in the
+ * approvals queue, and this server text is headed for a notification.
+ */
 const APPROVAL_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
-function isPendingApproval(body: unknown): body is PendingApproval {
-  if (body === null || typeof body !== "object") {
-    return false;
+function approvalIdOf(body: unknown): string | undefined {
+  if (!isRecord(body)) {
+    return undefined;
   }
-  const b = body as Record<string, unknown>;
-  return (
-    b.status === "pending_approval" &&
-    typeof b.approval_id === "string" &&
-    APPROVAL_ID_RE.test(b.approval_id) &&
-    typeof b.operation === "string" &&
-    typeof b.detail === "string"
-  );
+  const id = body.approval_id;
+  return typeof id === "string" && APPROVAL_ID_RE.test(id) ? id : undefined;
+}
+
+/** How a message names a hold's approval: by id, or by saying the engine did not report one. */
+export function approvalText(approvalId: string | undefined): string {
+  return approvalId === undefined
+    ? "the engine did not report an approval id"
+    : `approval ${approvalId}`;
 }
 
 /**
