@@ -179,51 +179,120 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 # other threads while the statement still ran, and pyodbc then read the result's column metadata from
 # freed handles. On a live server that could kill the process natively, so it runs in a CHILD: a crash
 # there fails this test as an assertion, which the leg's native-crash retry wrapper never re-runs.
+#
+# The store's statement takes its applock TRANSACTION-owned, as every applock the store takes is. The
+# first version took it SESSION-owned, and round 1's holder timed out on both legs. The reading that
+# fits is ODBC connection pooling. pyodbc turns it on by default, and it can keep a closed
+# connection's server session alive. A session-owned lock then outlives the close. pyodbc's close
+# rolls back first, so a transaction-owned lock does not. Each round now checks the server side
+# directly: once the close lands, the abandoned statement's session holds no lock and no open
+# transaction. A close that never ran fails by name.
 _CANCEL_CHILD = r"""
 import asyncio, os, sys
 from messagefoundry.config.settings import load_settings
-from messagefoundry.store.sqlserver import SqlServerStore
+from messagefoundry.store.sqlserver import SqlServerStore, _call_gate
 
 RESOURCE, ROUNDS = sys.argv[1], int(sys.argv[2])
-LOCK = ("SET NOCOUNT ON; DECLARE @r int; EXEC @r = sp_getapplock @Resource = ?, @LockMode = 'Exclusive',"
-        " @LockOwner = 'Session', @LockTimeout = 20000; ")
-TAKE = LOCK + "SELECT @r AS r;"
-BLOCKED = LOCK + "SELECT @r AS r, CAST(N'x' AS NVARCHAR(40)) AS pad;"
+GETLOCK = ("DECLARE @r int; EXEC @r = sp_getapplock @Resource = ?, @LockMode = 'Exclusive',"
+           " @LockOwner = '{owner}', @LockTimeout = 20000; ")
+# The holder is a separate session that releases its lock explicitly, so session-owned is right.
+TAKE = "SET NOCOUNT ON; " + GETLOCK.format(owner="Session") + "SELECT @r AS r;"
 RELEASE = "EXEC sp_releaseapplock @Resource = ?, @LockOwner = 'Session';"
-# Waiting on THIS resource only. The name stays under 32 characters, which is as much of an applock
-# name as resource_description shows.
-WAITING = ("SELECT COUNT(*) FROM sys.dm_tran_locks WHERE resource_type = 'APPLICATION'"
-           " AND request_status = 'WAIT' AND CHARINDEX(?, resource_description) > 0;")
+# A transaction-owned applock needs an open transaction. Open one only if none is, so the
+# statement never nests @@TRANCOUNT the way the store itself never does.
+BLOCKED = ("SET NOCOUNT ON; IF @@TRANCOUNT = 0 BEGIN TRANSACTION; " + GETLOCK.format(owner="Transaction")
+           + "SELECT @r AS r, CAST(N'x' AS NVARCHAR(40)) AS pad;")
+# The session waiting on THIS resource. The name stays under 32 characters, which is as much of an
+# applock name as resource_description shows.
+WAITER = ("SELECT TOP (1) request_session_id FROM sys.dm_tran_locks WHERE resource_type = 'APPLICATION'"
+          " AND request_status = 'WAIT' AND CHARINDEX(?, resource_description) > 0;")
+# What a session still holds: locks beyond the shared DATABASE lock every session has, and its open
+# transactions (NULL once the session is gone).
+HELD = ("SELECT (SELECT COUNT(*) FROM sys.dm_tran_locks WHERE request_session_id = ?"
+        " AND resource_type <> 'DATABASE'),"
+        " (SELECT open_transaction_count FROM sys.dm_exec_sessions WHERE session_id = ?);")
+GRANTED = ("SELECT l.request_session_id, l.request_owner_type, s.status, s.open_transaction_count"
+           " FROM sys.dm_tran_locks l LEFT JOIN sys.dm_exec_sessions s ON s.session_id = l.request_session_id"
+           " WHERE l.resource_type = 'APPLICATION' AND l.request_status = 'GRANT'"
+           " AND CHARINDEX(?, l.resource_description) > 0;")
+
+
+def check(ok, message):
+    # Not `assert`: an inherited PYTHONOPTIMIZE would strip it, and the child would pass unchecked.
+    if not ok:
+        raise AssertionError(message)
 
 
 async def main() -> None:
     store = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    quarantined = []
+    real_release_dirty = store._release_dirty
+
+    async def spy(conn):
+        quarantined.append((conn, getattr(conn, "_conn", None)))
+        await real_release_dirty(conn)
+
+    store._release_dirty = spy
     try:
         holder = await store._pool.acquire()
         try:
             hcur = await holder.cursor()
-            for n in range(ROUNDS):
-                await hcur.execute(TAKE, RESOURCE)
-                assert (await hcur.fetchone())[0] >= 0, f"round {n}: the holder did not get the lock"
+
+            async def one(sql, *params):
+                await hcur.execute(sql, *params)
+                row = await hcur.fetchone()
                 await holder.commit()
-                task = asyncio.create_task(store._fetchall(BLOCKED, (RESOURCE,)))
-                for _ in range(200):  # until the store's statement is waiting on the server
-                    await hcur.execute(WAITING, RESOURCE)
-                    waiting = (await hcur.fetchone())[0]
+                return row
+
+            for n in range(ROUNDS):
+                try:
+                    got = (await one(TAKE, RESOURCE))[0]
+                except Exception as exc:
+                    got = exc
+                if not isinstance(got, int) or got < 0:
+                    await hcur.execute(GRANTED, RESOURCE)
+                    held_by = [tuple(r) for r in await hcur.fetchall()]
                     await holder.commit()
-                    if waiting:
+                    raise AssertionError(f"round {n}: the holder did not get the lock ({got!r});"
+                                         f" granted to (session, owner, status, open txns): {held_by}")
+                task = asyncio.create_task(store._fetchall(BLOCKED, (RESOURCE,)))
+                sid = None
+                for _ in range(200):  # until the store's statement is waiting on the server
+                    row = await one(WAITER, RESOURCE)
+                    if row is not None:
+                        sid = row[0]
                         break
                     await asyncio.sleep(0.05)
-                assert waiting and not task.done(), f"round {n}: the store call never blocked"
+                check(sid is not None and not task.done(), f"round {n}: the store call never blocked")
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-                await hcur.execute(RELEASE, RESOURCE)
-                await holder.commit()
-                # The abandoned statement now gets the lock and returns: the crash window.
-                await asyncio.sleep(1.0)
+                try:
+                    check(len(quarantined) == n + 1, f"round {n}: the cancel did not quarantine")
+                    conn, raw = quarantined[-1]
+                    check(raw is not None, f"round {n}: the quarantined connection had no raw handle")
+                    gate = _call_gate(conn)
+                    # The statement is still blocked, so the close must have been handed to it.
+                    check(gate is not None and gate._deferred is raw,
+                          f"round {n}: the close was not handed to the running statement")
+                finally:
+                    # Release even when a check failed, so the abandoned statement is not left
+                    # parked for its whole lock timeout.
+                    await hcur.execute(RELEASE, RESOURCE)
+                    await holder.commit()
+                # The abandoned statement now gets the lock and returns: the crash window. Its call
+                # then closes the connection, and the close's rollback frees the session.
+                state = None
+                for _ in range(200):
+                    state = tuple(await one(HELD, sid, sid))
+                    if state[0] == 0 and not state[1]:
+                        break
+                    await asyncio.sleep(0.05)
+                check(state is not None and state[0] == 0 and not state[1],
+                      f"round {n}: session {sid} still holds (locks, open txns) {state} after the close")
+                check(raw.closed, f"round {n}: the quarantined raw connection never closed")
             await hcur.close()
         finally:
             await store._pool.release(holder)
