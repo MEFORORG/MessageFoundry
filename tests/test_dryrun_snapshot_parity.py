@@ -31,6 +31,7 @@ from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
+    Payload,
     Registry,
     Send,
 )
@@ -83,11 +84,11 @@ def _write_config(tmp_path: Path) -> tuple[str, str]:
     return str(cfg), str(msg)
 
 
-def _delivered(entry: dict) -> dict[str, Message]:  # type: ignore[type-arg]
+def _delivered(entry: dict) -> dict[str, Message]:
     return {d["to"]: Message.parse(d["payload"]) for d in entry["deliveries"]}
 
 
-def _handler_writes(entry: dict) -> dict[str, str]:  # type: ignore[type-arg]
+def _handler_writes(entry: dict) -> dict[str, str]:
     inv = next(i for i in entry["invocations"] if i["kind"] == "handler")
     return {w["path"]: w["value"] for ev in inv["events"] for w in ev.get("writes", [])}
 
@@ -183,7 +184,8 @@ def test_cli_trace_byte_identical_to_plain_dryrun_under_both_postures(
 # --- library surface: trace_dry_run threads the flag; its own default stays False ----------------
 
 
-def probe_handler(msg: Message) -> Send:
+def probe_handler(msg: Payload) -> Send:
+    assert isinstance(msg, Message)  # registered with no accepts=, so the runner parses
     verdict = "SNAP" if snapshot_on_send_active() else "NOSNAP"
     msg["MSH-6"] = verdict
     return Send("OB_A", msg)

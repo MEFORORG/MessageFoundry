@@ -16,6 +16,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography import x509
@@ -715,7 +716,7 @@ def test_read_cert_facts_is_best_effort_on_unparseable_extensions(
         def extensions(self) -> x509.Extensions:
             raise x509.DuplicateExtension("duplicate SAN", x509.SubjectAlternativeName.oid)
 
-    monkeypatch.setattr(pki.x509, "load_pem_x509_certificate", lambda _pem: _BadExtCert())
+    monkeypatch.setattr(x509, "load_pem_x509_certificate", lambda _pem: _BadExtCert())
     facts = pki.read_cert_facts(
         b"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n", now=0.0
     )
@@ -795,8 +796,8 @@ def test_a_key_write_that_dies_midway_leaves_no_truncated_key(
 
     real_fdopen = os.fdopen
 
-    def _dying_fdopen(fd: int, *a: object, **k: object) -> _HandleThatDiesMidWrite:
-        return _HandleThatDiesMidWrite(real_fdopen(fd, *a, **k))  # type: ignore[arg-type]
+    def _dying_fdopen(fd: int, *a: Any, **k: Any) -> _HandleThatDiesMidWrite:
+        return _HandleThatDiesMidWrite(real_fdopen(fd, *a, **k))
 
     monkeypatch.setattr(os, "fdopen", _dying_fdopen)
     key_path = tmp_path / "key.pem"
