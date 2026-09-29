@@ -634,6 +634,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   refuse include, for example, a CIFS or Samba share without POSIX extensions, WSL `/mnt/c`
   without `metadata`, a Docker Desktop bind mount of a Windows path, and FAT or exFAT. Setups on
   such a volume that backed up before may now refuse. (`BACKLOG #1174`)
+- **A trailing-slash path is now a 404, never a redirect to an `http://` URL.** The engine used to
+  answer `GET /health/` or `GET /ui/` with a 307 before authentication, and its absolute `Location`
+  kept the request's scheme. Behind a TLS-terminating proxy whose `X-Forwarded-Proto` is not
+  trusted or not sent, that scheme is `http`, so the redirect would point a client at plaintext.
+  `create_app` now sets `redirect_slashes=False`. Use `/ui`, not `/ui/`, in a bookmark or a proxy
+  rule. (`BACKLOG #1968`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
