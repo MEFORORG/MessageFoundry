@@ -2532,6 +2532,22 @@ class AuthSettings(_Section):
     # How many single-use recovery codes are minted at enrollment (the lost-authenticator escape
     # hatch). 0 disables recovery codes (an admin reset is then the only recovery path).
     mfa_recovery_code_count: int = 10
+    # THE LEAST TIME BETWEEN SIGN-IN AND THE SECOND FACTOR, AND IT IS PROVISIONAL (BACKLOG #2301, ASVS
+    # 2.4.2; owner ruling R7 of 2026-09-23 chose published human-timing research over a timed
+    # session). A code or passkey that completes an MFA-pending session sooner than this after the
+    # session was minted is refused with the leg's ordinary failure, so the refusal says nothing about
+    # timing. It is audited with reason "too_early", charges no lockout and spends no code. Only the
+    # PENDING session is floored; a step-up code on a session whose factor is already satisfied is not.
+    # Sized from the keystroke-level model (Card, Moran and Newell, "The keystroke-level model for user
+    # performance time with interactive systems", Communications of the ACM 23(7), 1980, pp. 396-410):
+    #   M   take in a prompt the person has not seen, and decide    1.35 s
+    #   K   one keystroke by the fastest typist the model lists     0.08 s
+    # The second step is a new prompt and at least one submit, M + K = 1.43 s, even with the code
+    # filled in by a password manager. The default sits about 30% below, at 1.0 s, because M is an
+    # average and some people are faster; the dual-control dwell takes a margin for the same reason.
+    # It is a judgment, not a measurement, and nobody has timed a person on THIS console.
+    # [auth].oidc_callback_min_elapsed_seconds reuses this derivation. 0 turns the floor off.
+    mfa_verify_min_elapsed_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     # Admin-interface defense-in-depth contextual-risk signal (WP-L3-13, ADR 0002; ASVS 8.4.2). When
     # on, a step-up (sensitive admin) request arriving from a client IP that differs from the one the
     # session last verified from is treated as higher-risk: it emits an audit + out-of-band notice and
@@ -2761,6 +2777,15 @@ class AuthSettings(_Section):
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
+    # The FLOOR beside that ceiling (BACKLOG #2301, ASVS 2.4.2), PROVISIONAL: a callback that returns
+    # sooner than this after its flow started is refused as "federated sign-in failed". A step-up
+    # flow asks the IdP to authenticate afresh (max_age=0, prompt=login), so the floor always
+    # applies there. A sign-in flow is floored only when the id_token's auth_time shows the person
+    # signed in at the IdP during THIS flow: an IdP holding a live single sign-on session answers with
+    # no human step at all, and flooring that would refuse every such sign-in, retry after retry. The
+    # default reuses mfa_verify_min_elapsed_seconds' derivation (a new prompt and one submit, 1.43 s
+    # by the keystroke-level model, less a margin). 0 turns it off; it must be shorter than the TTL.
+    oidc_callback_min_elapsed_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
     # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
@@ -2849,7 +2874,7 @@ class AuthSettings(_Section):
     notify_security_events: bool = True
 
     @model_validator(mode="after")
-    def _check_admin_write_gap_inside_window(self) -> AuthSettings:
+    def _check_floors_inside_their_windows(self) -> AuthSettings:
         # A gap as long as the window measures nothing: the limiter prunes the last write before it
         # compares, so the gap would silently fall back to the count. Refused at load instead.
         if (
@@ -2859,6 +2884,12 @@ class AuthSettings(_Section):
             raise ValueError(
                 "admin_write_min_interval_seconds must be shorter than "
                 "admin_write_rate_limit_window_seconds"
+            )
+        # The same shape for the federated floor: at or past the flow TTL, every flow would expire
+        # before it could complete. Checked whether or not federation is on, as the TTL itself is.
+        if self.oidc_callback_min_elapsed_seconds >= self.oidc_flow_ttl_seconds:
+            raise ValueError(
+                "oidc_callback_min_elapsed_seconds must be shorter than oidc_flow_ttl_seconds"
             )
         return self
 

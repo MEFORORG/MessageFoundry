@@ -55,7 +55,10 @@ def _pin_totp_clock(monkeypatch: pytest.MonkeyPatch, instant: float) -> None:
 
 
 async def _service(engine: Engine, **kw: object) -> AuthService:
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False, **kw))  # type: ignore[arg-type]
+    service = AuthService(
+        engine.store,
+        AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False, **kw),
+    )  # type: ignore[arg-type]
     await service.initialize()
     return service
 
@@ -339,7 +342,9 @@ async def test_must_change_outranks_the_second_factor_on_the_gate_page(
     A first Administrator on a temporary password is BOTH. Leading with MFA parks it on a page it
     cannot answer until it has rotated — the cookie-plane twin of the JSON ordering rule.
     """
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     admin = await _must_change_admin(service)
     async with _client(engine, service) as c:
         r = await c.post("/ui/login", data={"username": admin, "password": _ADMIN_PW})
@@ -690,7 +695,9 @@ async def test_a_must_change_account_with_no_factor_still_rotates_first(engine: 
     must-change confinement refuses: the brick. Both must still land on the password page and rotate
     there.
     """
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     admin = await _must_change_admin(service)
     await service.create_local_user(
         username="newbie",
@@ -732,7 +739,9 @@ async def test_a_row_that_vanishes_mid_request_does_not_lift_the_confinement(
     nothing to deny. ``user`` hides only the user row: ``delete_user`` would take the sessions with
     it, and this case would then test a missing session twice.
     """
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await service.initialize()
     await service.create_local_user(
         username="newbie",

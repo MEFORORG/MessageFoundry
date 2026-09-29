@@ -45,7 +45,10 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     # Tests that DO exercise require_mfa pass it explicitly.
     service = AuthService(
         engine.store,
-        settings or AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
+        settings
+        or AuthSettings(
+            mfa_verify_min_elapsed_seconds=0, admin_write_min_interval_seconds=0, require_mfa=False
+        ),
     )
     await service.initialize()
     return service

@@ -58,7 +58,9 @@ async def _service() -> tuple[MessageStore, AuthService]:
     # this file never reads, and the worst arm would sit inside the 60 s per-test watchdog's shadow on
     # a loaded runner.
     store = await MessageStore.open(":memory:")
-    return store, AuthService(store, AuthSettings(mfa_recovery_code_count=1))
+    return store, AuthService(
+        store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1)
+    )
 
 
 async def _login(service: AuthService, password: str) -> str:

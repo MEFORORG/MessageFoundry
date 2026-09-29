@@ -128,6 +128,10 @@ class PendingFlow:
     #: at or after this instant, less the clock skew; ``max_age=0`` asks the IdP for that, and this
     #: is how the engine checks it was honoured. ``0.0`` on a flow that predates the field.
     issued_at: float = 0.0
+    #: The flow cache's clock (``time.monotonic``) when the flow was staged, the instant the
+    #: minimum-elapsed floor counts from (BACKLOG #2301). ``0.0`` on a flow built by hand, which reads
+    #: as staged long ago, so such a flow is never refused as too early.
+    started: float = 0.0
 
 
 class FlowCache:
@@ -177,6 +181,14 @@ class FlowCache:
             )
         self._entries[self._key(flow_id)] = flow
 
+    def now(self) -> float:
+        """This cache's clock, so a flow is staged and aged on the one clock its TTL runs on."""
+        return self._clock()
+
+    def age(self, flow: PendingFlow) -> float:
+        """Seconds since ``flow`` was staged, on this cache's clock (BACKLOG #2301)."""
+        return self._clock() - flow.started
+
     def peek(self, flow_id: str) -> PendingFlow | None:
         """The live flow for ``flow_id`` WITHOUT consuming it; None if absent or expired.
 
@@ -207,7 +219,7 @@ def start_flow(
     return_to: str,
     client_ip: str,
     ttl_seconds: float = DEFAULT_FLOW_TTL_SECONDS,
-    clock: Callable[[], float] = time.monotonic,
+    clock: Callable[[], float] | None = None,
     prior_session_hash: str | None = None,
     step_up_session_hash: str | None = None,
     step_up_purpose: str | None = None,
@@ -216,7 +228,9 @@ def start_flow(
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
     ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks.
+    ``clock`` defaults to the cache's own, so the TTL and the minimum-elapsed floor share one clock.
     """
+    now = (clock or cache.now)()
     flow_id = new_flow_id()
     verifier, _challenge = generate_pkce()
     flow = PendingFlow(
@@ -225,11 +239,12 @@ def start_flow(
         code_verifier=verifier,
         return_to=return_to,
         client_ip=client_ip,
-        deadline=clock() + ttl_seconds,
+        deadline=now + ttl_seconds,
         prior_session_hash=prior_session_hash,
         step_up_session_hash=step_up_session_hash,
         step_up_purpose=step_up_purpose,
         issued_at=wall_clock(),
+        started=now,
     )
     cache.put(flow_id, flow)
     return flow_id, flow

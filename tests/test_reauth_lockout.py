@@ -786,7 +786,12 @@ async def test_a_password_reauth_on_an_mfa_pending_session_does_not_clear_code_f
     otherwise password, four wrong codes, re-auth, four wrong codes would never lock."""
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(lockout_threshold=5, mfa_recovery_code_count=2))
+        service = AuthService(
+            store,
+            AuthSettings(
+                mfa_verify_min_elapsed_seconds=0, lockout_threshold=5, mfa_recovery_code_count=2
+            ),
+        )
         admin = await create_admin(service)
         first = await service.login(admin.username, admin.password)
         assert first.ok and first.identity is not None and first.token is not None

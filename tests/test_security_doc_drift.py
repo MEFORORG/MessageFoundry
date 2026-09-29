@@ -338,8 +338,11 @@ _CONTEXTUAL_TOKENS = frozenset(
         "admin_write_rate_limit_per_actor",
         "admin_write_rate_limit_window_seconds",
         "admin_write_rate_limit_enabled",
-        # BACKLOG #2301: the minimum gap between two admin writes by one actor, a THROTTLE.
+        # BACKLOG #2301: the minimum gap between two admin writes by one actor, a THROTTLE, and the
+        # two minimum-elapsed floors on a second step, each a DENY.
         "admin_write_min_interval_seconds",
+        "mfa_verify_min_elapsed_seconds",
+        "oidc_callback_min_elapsed_seconds",
         "ad_session_recheck_seconds",
         "ad_session_recheck_strikes",
         "ad_session_recheck_max_users",
@@ -430,6 +433,8 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "admin_write_rate_limit_window_seconds", 15.0, "per 15 s"),
     # BACKLOG #2301: the provisional minimum gap between two admin writes, pinned for the same reason.
     ("auth", "admin_write_min_interval_seconds", 0.15, "0.15 s"),
+    ("auth", "mfa_verify_min_elapsed_seconds", 1.0, "less than 1 s"),
+    ("auth", "oidc_callback_min_elapsed_seconds", 1.0, "less than 1 s"),
     ("auth", "ad_session_recheck_strikes", 2, "**2 consecutive**"),
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),
@@ -533,8 +538,8 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: gate), so the counts are pinned too: removing ANY row reds CI.
 # -1 BACKLOG #1136 (ADR 0183 Amendment A, Wave 4): the first-run account's claim-state row went with
 # that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome; +1 BACKLOG #1957
-# (ADR 0198): the reconciler's scope re-diff.
-_CONTEXT_TABLE_A_ROWS = 40
+# (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors.
+_CONTEXT_TABLE_A_ROWS = 42
 _CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with

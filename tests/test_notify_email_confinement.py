@@ -577,7 +577,9 @@ async def test_a_session_owing_its_factor_cannot_choose_the_address_and_nothing_
     choose where the account's notices go."""
     service = AuthService(
         engine.store,
-        AuthSettings(login_rate_limit_enabled=False),  # require_mfa on, the default
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),  # require_mfa on, the default
         security_notifier=_FakeNotifier(),
     )
     await service.initialize()

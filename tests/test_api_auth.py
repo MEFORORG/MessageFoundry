@@ -218,7 +218,9 @@ async def test_mfa_enroll_confirm_and_step_up_gate(
 ) -> None:
     # WP-14 / ASVS 6.3.3: the full TOTP lifecycle over the API + the step-up MFA gate. An MFA-required
     # session 403s on a require_step_up route with X-MFA-Required until POST /auth/mfa-verify.
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
@@ -270,7 +272,12 @@ async def test_mfa_enroll_confirm_and_step_up_gate(
 
 async def test_mfa_verify_accepts_recovery_code_once(engine: Engine) -> None:
     service = await _service(
-        engine, AuthSettings(login_rate_limit_enabled=False, mfa_recovery_code_count=3)
+        engine,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            login_rate_limit_enabled=False,
+            mfa_recovery_code_count=3,
+        ),
     )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -2050,7 +2057,13 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
     has genuinely lost every factor cannot call it at all.
     """
     service = await _service(
-        engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+        engine,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            admin_write_min_interval_seconds=0,
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+        ),
     )
     # `_add` discards the id it creates, and this test is specifically ABOUT the caller's own id --
     # so root is created the long way, exactly as `_add` does internally, to keep it.

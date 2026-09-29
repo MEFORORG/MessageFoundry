@@ -156,6 +156,8 @@ def _settings(**over: Any) -> AuthSettings:
         "oidc_token_endpoint": "https://idp.example/token",
         "oidc_jwks_uri": "https://idp.example/jwks",
         "oidc_allowed_endpoints": ["idp.example"],
+        # The start-to-callback floor is off: these callbacks return at machine speed (BACKLOG #2301).
+        "oidc_callback_min_elapsed_seconds": 0,
     }
     base.update(over)
     return AuthSettings(**base)
