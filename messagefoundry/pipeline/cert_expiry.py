@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import gc
 import logging
 import ssl
 import time
@@ -31,9 +32,17 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.config.loaded_crls import HeldCrlSnapshot, crl_fingerprint
+from messagefoundry.config.loaded_crls import snapshot as held_crl_snapshot
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pki import read_cert_facts, read_soonest_crl_facts
+from messagefoundry.pki import (
+    CertFacts,
+    CrlFacts,
+    read_cert_facts,
+    read_soonest_crl_facts,
+    soonest_crl,
+)
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
@@ -45,6 +54,7 @@ __all__ = [
     "CertExpiryRunner",
     "certs_from_registry",
     "crls_from_settings",
+    "held_crl_label",
     "peer_cert_expiry",
 ]
 
@@ -229,9 +239,14 @@ class CertExpiryRunner:
         *,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
+        watch_unlisted_held_crls: bool = False,
     ) -> None:
         self._cert_source = cert_source
         self._settings = settings
+        # BACKLOG #299: also judge CRL files that live hops hold and no row names. The registry is
+        # process-wide, so this is for the engine's own monitor; a runner handed a literal list (a
+        # test, a one-off scan) leaves it off and judges exactly the rows it was given.
+        self._watch_unlisted_held_crls = watch_unlisted_held_crls
         # Default to the logging sink so an expiring cert is at least visible without a notifier.
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._clock = clock
@@ -294,12 +309,14 @@ class CertExpiryRunner:
     def run_once(self, now: float | None = None) -> list[CertCheck]:
         """Inspect every served cert for ``now`` (default: the injected clock), emitting a
         ``cert_expiry`` alert for each expired or within-window cert. Synchronous (a few small file
-        reads); returns one :class:`CertCheck` per readable cert. Unreadable/missing certs are logged
-        and skipped — a typo'd path must not silence the monitor for the others."""
+        reads); returns one :class:`CertCheck` per cert it could judge. An unreadable or missing file
+        is logged, and skipped unless it is a CRL a live TLS context still holds a copy of, which is
+        then judged by that copy (BACKLOG #299). A typo'd path must not silence the others."""
         now = self._clock() if now is None else now
+        held = self._held_snapshot()
         checks: list[CertCheck] = []
-        for cert in self._cert_source():
-            check = self._inspect(cert, now)
+        for cert in self._rows(held):
+            check = self._inspect(cert, now, held)
             if check is None:
                 continue
             checks.append(check)
@@ -330,9 +347,41 @@ class CertExpiryRunner:
                     log.warning("cert_expiry alert sink failed for %r", check.label, exc_info=True)
         return checks
 
-    def _inspect(self, cert: MonitoredCert, now: float) -> CertCheck | None:
+    def _held_snapshot(self) -> HeldCrlSnapshot:
+        """One snapshot of the CRL copies live contexts hold, taken once per pass (BACKLOG #299).
+
+        The engine's monitor collects garbage first, so a probe or discarded connector caught in a
+        reference cycle does not read as a live hop holding a copy. A failure is logged and yields
+        an empty snapshot, which leaves each file's own verdict standing."""
+        try:
+            if self._watch_unlisted_held_crls:
+                gc.collect()
+            return held_crl_snapshot()
+        except Exception:
+            log.error("cert_expiry: could not read the CRL copies live hops hold", exc_info=True)
+            return HeldCrlSnapshot(())
+
+    def _rows(self, held: HeldCrlSnapshot) -> list[MonitoredCert]:
+        """The injected rows, plus one per CRL file a live context holds that no row names.
+
+        BACKLOG #299: a hop can load a CRL from a path the rows cannot spell, such as an inbound
+        ``tls_crl_file`` given as a deferred ``env()`` value, which :func:`certs_from_registry`
+        skips. Without a row, that copy could lapse and refuse every peer with no alert."""
+        rows = list(self._cert_source())
+        if not self._watch_unlisted_held_crls:
+            return rows
+        unwatched = held.unwatched(row.path for row in rows if row.kind == "crl")
+        rows.extend(MonitoredCert(held_crl_label(path), path, kind="crl") for path in unwatched)
+        return rows
+
+    def _inspect(
+        self, cert: MonitoredCert, now: float, held: HeldCrlSnapshot | None = None
+    ) -> CertCheck | None:
         # The load / notAfter / days-remaining path lives once in pki.read_cert_facts; this monitor
         # only needs notAfter + days_remaining from the returned public facts.
+        pem: bytes | None = None
+        crl_facts: CrlFacts | None = None
+        facts: CertFacts | None = None
         try:
             with open(cert.path, "rb") as fh:
                 pem = fh.read()
@@ -340,17 +389,10 @@ class CertExpiryRunner:
                 # The soonest nextUpdate in the file, not the first block's: a multi-issuer file
                 # fails a handshake once ANY of its CRLs lapses (BACKLOG #299).
                 crl_facts = read_soonest_crl_facts(pem, now=now)
-                return CertCheck(
-                    label=cert.label,
-                    path=cert.path,
-                    not_after_iso=crl_facts.next_update_iso,
-                    days_remaining=crl_facts.days_remaining,
-                    kind="crl",
-                )
-            facts = read_cert_facts(pem, now=now)
+            else:
+                facts = read_cert_facts(pem, now=now)
         except FileNotFoundError:
             log.warning("cert_expiry: %s for %r not found: %s", _noun(cert), cert.label, cert.path)
-            return None
         except Exception:
             log.warning(
                 "cert_expiry: could not read/parse %s for %r (%s)",
@@ -359,6 +401,11 @@ class CertExpiryRunner:
                 cert.path,
                 exc_info=True,
             )
+        if cert.kind == "crl":
+            return _judge_crl(
+                cert, now, pem, crl_facts, held if held is not None else held_crl_snapshot()
+            )
+        if facts is None:
             return None
         return CertCheck(
             label=cert.label,
@@ -366,3 +413,88 @@ class CertExpiryRunner:
             not_after_iso=facts.not_after_iso,
             days_remaining=facts.days_remaining,
         )
+
+
+def held_crl_label(path: str) -> str:
+    """The alert label for a CRL file a live hop holds that no configured row names (BACKLOG #299).
+
+    Namespaced like :func:`client_cert_label` and for the same reason: the label keys the re-alert
+    throttle, and a full path is injective where a connection name or setting name might not be."""
+    return f"held-crl:{path}"
+
+
+def _judge_crl(
+    cert: MonitoredCert,
+    now: float,
+    pem: bytes | None,
+    file_facts: CrlFacts | None,
+    held: HeldCrlSnapshot,
+) -> CertCheck | None:
+    """Judge a CRL by its file AND by the copies of it that live TLS contexts hold (BACKLOG #299).
+
+    A hop reads its CRL when it builds its context and keeps that copy, so once the file is replaced
+    the file is not what a running hop checks against. Judging only the file let the alert clear
+    while the hop still held a copy that would lapse and refuse every peer. So every held copy that
+    differs from the file is judged too, and the soonest ``nextUpdate`` of the file and those copies
+    decides, by the rule the file's own blocks follow (:func:`~messagefoundry.pki.soonest_crl`).
+
+    The alert therefore stays up until every context holding the old copy is gone: a restart, or a
+    rebuild of that hop. A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
+    silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged.
+    A failure judging the held copies is logged and leaves the file's own verdict standing."""
+    stale: list[CrlFacts] = []
+    try:
+        copies = held.copies(cert.path)
+        fingerprint = crl_fingerprint(pem) if copies and pem is not None else None
+        copies = [copy for copy in copies if copy.fingerprint != fingerprint]
+        # One verdict per distinct copy: many hops sharing one file hold identical copies.
+        stale = [copy.facts.at(now) for copy in {c.fingerprint: c for c in copies}.values()]
+        if copies:
+            oldest = soonest_crl(stale)
+            if pem is None:
+                why, remedy = (
+                    "whose file cannot be read",
+                    "Restore a readable CRL file before restarting: the engine refuses to "
+                    "start on one it cannot read",
+                )
+            elif file_facts is None:
+                why, remedy = (
+                    "whose file cannot be parsed",
+                    "Restore a valid CRL file before restarting: the engine refuses to start "
+                    "on one it cannot parse",
+                )
+            else:
+                why, remedy = "that differs from the file", "Restart the engine to apply the file"
+            holders = sorted({copy.setting or "a connection's tls_crl_file" for copy in copies})
+            log.warning(
+                "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), "
+                "from %s). The hop keeps the copy it read when it built its context; the soonest "
+                "CRL in it (issuer %r) lapses at %s. %s.",
+                cert.label,
+                cert.path,
+                why,
+                len(copies),
+                ", ".join(holders),
+                oldest.issuer,
+                oldest.next_update_iso,
+                remedy,
+            )
+    except Exception:
+        log.error(
+            "cert_expiry: could not judge the copies of %r CRL %s that live hops hold",
+            cert.label,
+            cert.path,
+            exc_info=True,
+        )
+        stale = []
+    judged = [*([file_facts] if file_facts is not None else []), *stale]
+    if not judged:
+        return None
+    facts = soonest_crl(judged)
+    return CertCheck(
+        label=cert.label,
+        path=cert.path,
+        not_after_iso=facts.next_update_iso,
+        days_remaining=facts.days_remaining,
+        kind="crl",
+    )

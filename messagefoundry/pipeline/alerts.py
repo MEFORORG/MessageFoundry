@@ -566,8 +566,8 @@ class LoggingAlertSink:
         # names no direction, because the same CRL may guard a listener or an outbound hop (#299):
         # a listener refuses every client, and an outbound hop cannot connect to its peer.
         # Both lines say to restart, not just to replace the file: a hop reads its CRL when it builds
-        # its TLS context and keeps that copy. This scan reads the file, so it goes quiet once the
-        # file is replaced, while a running hop can still hold the stale CRL.
+        # its TLS context and keeps that copy. The scan judges the copies live contexts hold as well
+        # as the file (BACKLOG #299), so replacing the file alone does not clear this alert.
         if days_remaining < 0:
             log.error(
                 "crl_expiry: %r CRL expired at %s (%d day(s) ago) — every TLS handshake it "
