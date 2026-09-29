@@ -128,3 +128,30 @@ a future per-collection override lands.
 **Out of scope** — Per-collection custom ignore policies (future amendment); encrypting
 `workspaceState`; cross-workspace/shared collections; any engine/CLI change (e.g. a `dryrun` stdin
 mode that would avoid temp files); an operator-console regression runner (§10).
+
+## Amendment 2026-09-29 -- case bodies move to SecretStorage (BACKLOG #1174)
+
+**What changed.** Saved collections now live in VS Code SecretStorage (`context.secrets`), the store
+`ide/src/auth.ts` already uses for the engine bearer token. VS Code encrypts it with a key the OS
+keychain holds. `workspaceState` stored the case bodies in plaintext in VS Code's per-workspace
+storage, which the Negative / risks paragraph above names. The new home is
+`ide/src/collectionStore.ts`, a `vscode`-free module that `testBench.ts` hands both stores to.
+
+**What it replaces.** AC-4's "only in machine-local `workspaceState`" now reads "only in SecretStorage,
+scoped to the workspace". The other limbs of AC-4 still hold: never a repo-tracked file, never
+`globalState`. The "encrypting `workspaceState`" line under Out of scope is answered by moving off it
+rather than encrypting it.
+
+**Two details carry the old behaviour over.**
+
+1. SecretStorage is shared by every workspace the extension runs in, while `workspaceState` was
+   per-workspace. So the key carries a SHA-256 of the workspace's storage URI, and names no local path.
+2. Existing collections migrate on the first load. The store writes them to SecretStorage and only
+   then deletes the `workspaceState` copy, so a crash between the two leaves both and the next load
+   finishes. On a name held in both, the SecretStorage copy wins.
+
+**What it does not change.** Case bodies are still PHI when an author saves real messages, so the
+synthetic-case steer and the in-UI notice stay. Encryption at rest here depends on VS Code having an
+OS keychain to use; on a Linux desktop with no keyring VS Code can fall back to a weaker store, which
+is VS Code's behaviour and outside this extension. The rerun still materializes inputs to a temp
+directory and deletes it in `finally`.

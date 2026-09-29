@@ -201,7 +201,7 @@ export function testBenchScript(token: string): string {
                         // is user text, so it stays out of attributes even though esc() now covers quotes).
     function renderCollections(items){
       collNames = items.map((c) => c.name);
-      const notice = '<div class="phi">Cases (input + expected output bodies) are stored machine-locally in this workspace only ' +
+      const notice = '<div class="phi">Cases (input + expected output bodies) are stored encrypted on this machine, for this workspace only ' +
         '(never synced, never committed). Use synthetic, de-identified messages — not real PHI.</div>';
       const list = items.length
         ? items.map((c, i) =>
