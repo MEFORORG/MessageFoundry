@@ -84,7 +84,10 @@ async def pool() -> AsyncIterator[Any]:
     """One autocommit aioodbc pool for raw DDL + assertions — acquire/release pooling mirrors the store
     suite's proven shape and avoids the bare-connection ``close()`` that once hung teardown."""
     p = await _make_pool(
-        _build_dsn(_conn()), 3, autocommit=True, login_timeout=_login_timeout(_conn(), "test")
+        _build_dsn(_conn()),
+        3,
+        autocommit=True,
+        login_timeout=_login_timeout(_conn(), "test", dialect="sqlserver"),
     )
     try:
         yield p

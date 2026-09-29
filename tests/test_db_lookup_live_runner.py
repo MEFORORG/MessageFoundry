@@ -119,7 +119,9 @@ def _patch_pool(
 ) -> _FakePool:
     pool = _FakePool(_FakeCursor(rows or [], columns or [], error, delay))
 
-    async def fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool, **_: Any) -> _FakePool:
+    async def fake_make_pool(
+        dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
+    ) -> _FakePool:
         return pool
 
     monkeypatch.setattr(database, "_make_pool", fake_make_pool)
@@ -323,7 +325,7 @@ async def test_a_handler_can_catch_a_down_database_as_a_lookup_error(
     # BACKLOG #2062: opening the lookup pool dials the database, and that failure once reached the
     # Handler as the driver's own exception, past an `except DbLookupError`. A Handler that falls
     # back on a failed lookup now gets to, and its message is delivered unchanged.
-    async def down(dsn: str, pool_max: int, *, autocommit: bool, **_: Any) -> Any:
+    async def down(dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None) -> Any:
         raise Exception("08001", "cannot connect")
 
     monkeypatch.setattr(database, "_make_pool", down)

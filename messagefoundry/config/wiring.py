@@ -689,10 +689,12 @@ def DatabaseRef(
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
     # Refused here, at declaration, because a reference set is first dialled at sync time, after
     # start (BACKLOG #2089). The other DATABASE declarations are checked when their connector is built.
-    try:
-        check_db_connect_timeout(connect_timeout, "DatabaseRef")
-    except ValueError as exc:
-        raise WiringError(str(exc)) from None
+    # An env() ref has no value yet; the sync checks it once resolved.
+    if not isinstance(connect_timeout, EnvRef):
+        try:
+            check_db_connect_timeout(connect_timeout, "DatabaseRef")
+        except ValueError as exc:
+            raise WiringError(str(exc)) from None
     return ReferenceSourceSpec(
         "database",
         {

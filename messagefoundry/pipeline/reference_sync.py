@@ -153,7 +153,7 @@ async def _load_database_source(
         dsn,
         int(settings.get("pool_max", 5)),
         autocommit=True,
-        login_timeout=_login_timeout(settings, "DATABASE reference source"),
+        login_timeout=_login_timeout(settings, "DATABASE reference source", dialect="sqlserver"),
     )
     # BACKLOG #1052: bound the borrow. This pool is throwaway (closed in the finally below), but the
     # acquire was unbounded, so an unresponsive server could hold the reference-sync runner's pass

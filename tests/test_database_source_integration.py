@@ -95,7 +95,10 @@ async def pool() -> AsyncIterator[Any]:
     DDL/assertions *and* the source's poll/mark run on it, so the test never opens a second pool or
     reopens one (the ODBC-18 / Python-3.14 driver instability described in the module docstring)."""
     p = await _make_pool(
-        _build_dsn(_conn()), 3, autocommit=True, login_timeout=_login_timeout(_conn(), "test")
+        _build_dsn(_conn()),
+        3,
+        autocommit=True,
+        login_timeout=_login_timeout(_conn(), "test", dialect="sqlserver"),
     )
     try:
         yield p

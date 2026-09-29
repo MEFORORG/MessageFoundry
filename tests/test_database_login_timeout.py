@@ -36,7 +36,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
 )
-from messagefoundry.config.wiring import DatabaseRef, WiringError
+from messagefoundry.config.wiring import DatabaseRef, WiringError, env
 from messagefoundry.transports.database import (
     DatabaseDestination,
     DatabaseLookupExecutor,
@@ -222,3 +222,25 @@ def test_a_bad_connect_timeout_is_refused_when_a_database_ref_is_declared() -> N
             key_column="code",
             connect_timeout=0,
         )
+
+
+def test_a_database_ref_accepts_an_env_ref_connect_timeout() -> None:
+    """An env() ref has no value at declaration, so it is left to the sync-time check."""
+    spec = DatabaseRef(
+        server="db.example",
+        database="d",
+        statement="SELECT code FROM t",
+        key_column="code",
+        connect_timeout=env("ref_timeout", cast=int),  # type: ignore[arg-type]
+    )
+    assert spec.kind == "database"
+
+
+async def test_lookup_pool_keeps_its_login_timeout_whatever_the_mapping_dialect(
+    pool_calls: list[dict[str, Any]],
+) -> None:
+    """The lookup always builds the SQL Server DSN, so a stray `dialect` key must not drop the bound."""
+    executor = DatabaseLookupExecutor({"clarity": {**_SQLSERVER, "dialect": "generic"}})
+    with pytest.raises(_StopPool):
+        await executor._get_pool("clarity")
+    assert pool_calls[0].get("timeout") == _LOGIN_TIMEOUT

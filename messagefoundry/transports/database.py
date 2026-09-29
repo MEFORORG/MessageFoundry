@@ -940,15 +940,18 @@ def _import_aioodbc() -> Any:
     return aioodbc
 
 
-def _login_timeout(s: Mapping[str, Any], label: str) -> int | None:
+def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | None:
     """The login timeout, in seconds, for a DATABASE connection's pool: its ``connect_timeout``
     setting, or ``None`` for the ``generic`` dialect (BACKLOG #2089). Every pool site calls this.
+
+    ``dialect`` is the one the caller built its DSN with, passed explicitly rather than read from
+    ``s``: ``db_lookup`` and reference sync always build the SQL Server DSN, whatever the mapping says.
 
     **Why it is not in the DSN.** The SQL Server preset used to emit ``Connection Timeout=<n>``. That
     is an ADO.NET keyword, and ODBC Driver 18 ignores it, so it bounded nothing (the store's #1626
     measured this: a DSN with ``Connection Timeout=2`` still waited 15.1 s). The driver's login
     timeout is ``SQL_ATTR_LOGIN_TIMEOUT``, which pyodbc sets from its ``timeout=`` argument, and
-    :func:`_make_pool` passes the value there. This is the one place that reason is stated.
+    :func:`_make_pool` passes the value there. The connector states that reason here only.
 
     The ``generic`` dialect gets ``None``, as before: its DSN never carried a login timeout, and
     whether an arbitrary operator-named driver accepts the attribute has not been measured.
@@ -958,9 +961,7 @@ def _login_timeout(s: Mapping[str, Any], label: str) -> int | None:
     call this at construction, so ``serve`` and ``messagefoundry check`` refuse a bad value at start.
     ``DatabaseRef`` checks its own value when it is declared."""
     value = check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
-    if str(s.get("dialect", "sqlserver")).lower() != "sqlserver":
-        return None
-    return value
+    return None if dialect == "generic" else value
 
 
 async def _make_pool(
@@ -1110,7 +1111,9 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
-        self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
+        self._login_timeout = _login_timeout(
+            s, f"DATABASE connection {config.name!r}", dialect=self._dialect
+        )
         self._pool_max = int(s.get("pool_max", 5))
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
@@ -1410,7 +1413,11 @@ class DatabaseSource(SourceConnector):
             transport="DATABASE source",
         )
         self._encoding: str = s.get("encoding", "utf-8")
-        self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
+        self._login_timeout = _login_timeout(
+            s,
+            f"DATABASE connection {inbound_record_name(config.name or '')!r}",
+            dialect=self._dialect,
+        )
         self._pool_max = int(s.get("pool_max", 5))
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
@@ -1829,7 +1836,9 @@ class DatabaseLookupExecutor:
             # fast on weakened-TLS / bad-auth config.
             self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
             self._pool_max[cname] = int(s.get("pool_max", 5))
-            self._login_timeout[cname] = _login_timeout(s, f"DatabaseLookup {cname!r}")
+            self._login_timeout[cname] = _login_timeout(
+                s, f"DatabaseLookup {cname!r}", dialect="sqlserver"
+            )
             self._acquire_timeout[cname] = float(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)
             )
