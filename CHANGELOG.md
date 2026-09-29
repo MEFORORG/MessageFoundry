@@ -582,6 +582,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A busy FTP server no longer stops an outbound lane.** Every 5xx reply while an FTP or FTPS
+  session opened was treated as a refused credential, which stops the lane (ADR 0095). A reply that
+  names a connection limit, such as ProFTPD's "maximum number of clients", is now retried. A refused
+  `AUTH TLS`, `PBSZ` or `PROT P` is now a permanent configuration fault, and a refused greeting is
+  permanent too; neither stops the lane. A refused login still does, and so does a 530 whose text
+  does not plainly name a limit. The same holds under `validate_directory`, whose per-send listing
+  passes a credential fault through. (`BACKLOG #2083`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
