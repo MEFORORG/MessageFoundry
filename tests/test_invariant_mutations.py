@@ -171,3 +171,83 @@ def test_zero_selected_rows_is_not_a_pass(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_an_unknown_id_is_refused() -> None:
     assert _MOD.main(["--only", "no-such-mutation"]) == 2
+
+
+# --- the verdict-deciding behaviours, pinned so a later edit cannot quietly undo them ------------
+
+
+def _completed(returncode: int, stdout: str = "") -> Any:
+    return _MOD.subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=""
+    )
+
+
+def _one_row_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    (tmp_path / "f.py").write_bytes(b"guard = True\n")
+    monkeypatch.setattr(_MOD, "REPO", tmp_path)
+    return _MOD.Mutation(
+        id="r", item=1, file="f.py", find="guard = True\n", replace="guard = False\n", tests=("t",)
+    )
+
+
+def test_a_skipped_listed_test_is_an_error_not_a_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _one_row_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(_MOD, "_pytest", lambda tests: _completed(0, "SKIPPED [1] t: no server\n"))
+    verdict, reason = _MOD.run_one(row)
+    assert (verdict, "skipped" in reason) == ("ERROR", True)
+    assert (tmp_path / "f.py").read_bytes() == b"guard = True\n"
+
+
+def test_a_row_that_stays_green_under_its_break_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _one_row_repo(tmp_path, monkeypatch)
+    seen: list[bytes] = []
+
+    def fake(tests: tuple[str, ...]) -> Any:
+        seen.append((tmp_path / "f.py").read_bytes())
+        return _completed(0)
+
+    monkeypatch.setattr(_MOD, "_pytest", fake)
+    assert _MOD.run_one(row)[0] == "SURVIVED"
+    # Green before, broken during, green again after the revert: three runs, the middle one mutated.
+    assert seen == [b"guard = True\n", b"guard = False\n", b"guard = True\n"]
+    assert not (tmp_path / "f.py.invariant-mutation-backup").exists()
+
+
+def test_a_survivor_outranks_an_error_in_the_exit_code() -> None:
+    assert _MOD.exit_code({"KILLED": 3, "SURVIVED": 1, "ERROR": 2}) == 1
+    assert _MOD.exit_code({"KILLED": 3, "SURVIVED": 0, "ERROR": 1}) == 2
+    assert _MOD.exit_code({"KILLED": 3, "SURVIVED": 0, "ERROR": 0}) == 0
+
+
+def test_one_rows_crash_does_not_stop_the_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    other = _MOD.Mutation(id="z", item=1, file="g.py", find="b\n", replace="", tests=("t",))
+
+    def run_one(m: Any) -> tuple[str, str]:
+        if m.id == "x":
+            raise TimeoutError("hung")
+        return "SURVIVED", "green under the break"
+
+    monkeypatch.setattr(_MOD, "run_one", run_one)
+    assert _MOD.judge([_row("a\n"), other]) == {"KILLED": 0, "SURVIVED": 1, "ERROR": 1}
+
+
+def test_a_leftover_backup_is_restored_only_over_its_own_break(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _one_row_repo(tmp_path, monkeypatch)
+    target, backup = tmp_path / "f.py", tmp_path / "f.py.invariant-mutation-backup"
+    backup.write_bytes(b"guard = True\n")
+    target.write_bytes(b"guard = False\n")  # a hard kill left the break in place
+    assert _MOD.restore_leftovers([row]) == ["f.py"]
+    assert (target.read_bytes(), backup.exists()) == (b"guard = True\n", False)
+
+    # The file moved on since the kill: writing the old bytes back would destroy that work.
+    backup.write_bytes(b"guard = True\n")
+    target.write_bytes(b"guard = True\nnew_work = 1\n")
+    with pytest.raises(_MOD.LeftoverBackup):
+        _MOD.restore_leftovers([row])
+    assert target.read_bytes() == b"guard = True\nnew_work = 1\n"

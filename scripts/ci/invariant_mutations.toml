@@ -15,9 +15,11 @@
 #   id       stable name, used by --only
 #   item     the BACKLOG item whose control this pins
 #   file     repository-relative path of the file to break
-#   find     exact text, which must occur EXACTLY ONCE in `file` (a literal string, not a pattern)
-#   replace  the text that breaks it
-#   tests    pytest node ids; at least one must FAIL under the break, and all must pass without it
+#   find     exact text, which must START EXACTLY ONE LINE of `file` (a literal string, not a
+#            pattern; an occurrence that begins mid-line is not counted)
+#   replace  the text that breaks it (empty is allowed: a deletion)
+#   tests    pytest node ids; at least one must FAIL under the break, and all must pass, none
+#            skipped, both before it and after the revert
 #
 # A row goes stale when refactoring moves its `find` text. tests/test_invariant_mutations.py fails
 # on that at once, on every engine leg, so the list cannot rot into a run that breaks nothing.

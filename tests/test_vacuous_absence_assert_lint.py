@@ -11,16 +11,20 @@ zero candidates is not a pass; it is a gate that never ran.
 
 WHAT COUNTS AS A SITE. Inside a ``test*`` function, an absence assertion over a NAME that was bound
 IN THAT FUNCTION to a comprehension, or to ``list``, ``sorted``, ``set``, ``tuple`` or
-``frozenset`` over one. The absence spellings are ``assert not NAME``, ``assert NAME == []`` and
-``assert len(NAME) == 0``. That is the "collect, then assert none" shape. An absence assertion on
-anything else (a flag, a return value, a helper's result) is not a site: the lint cannot see what
-such a name was built from, and guessing would bury the real shape in noise.
+``frozenset`` over one. The absence spellings are ``assert not NAME``, ``assert NAME == <empty>``
+(``[]``, ``{}``, ``()``, ``set()`` and the like) and ``assert len(NAME) == 0``. That is the
+"collect, then assert none" shape. An absence assertion on anything else (a flag, a return value, a
+helper's result) is not a site: the lint cannot see what such a name was built from, and guessing
+would bury the real shape in noise.
 
-WHAT GUARDS A SITE. An EARLIER ``assert`` in the same function that states a positive count:
-``len(x)`` compared with ``>`` or ``>=``, a bare ``assert len(x)``, or a bare truthiness assertion
-of a name, attribute or subscript (``assert files``). ``len(x) == 0``, ``all(...)`` and other calls
-do not guard: each is true on an empty input. A comprehension all of whose loops run over non-empty
-literal lists, tuples or sets is exempt, because it cannot iterate nothing.
+WHAT GUARDS A SITE. An EARLIER ``assert`` at the test function's own top level that states a
+positive count of something the comprehension iterates over: ``len(x)`` compared with ``>`` or
+``>=`` a bound that excludes zero, a bare ``assert len(x)``, or a bare truthiness assertion
+(``assert files``), where ``x`` or ``files`` reads a name the comprehension's loops read. An
+assertion about something else does not guard, nor does one inside a loop, a ``with`` block or a
+nested def, which may run zero times. ``len(x) == 0``, ``len(x) >= 0``, ``all(...)`` and other
+calls do not guard: each is true on an empty input. A comprehension all of whose loops run over
+non-empty literal lists, tuples or sets, with nothing starred, is exempt: it cannot iterate nothing.
 
 WHAT THIS DOES NOT CATCH is at least the following, so read its zero as no more than that. A floor
 enforced in a helper the test calls (``_guarded_scan`` in test_dependency_boundaries.py is one) is
@@ -63,6 +67,8 @@ _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 #: Lower a row when you guard a site; delete it at zero. Never raise one: guard the new site.
 _BASELINE: dict[str, int] = {
     "packaging/messagefoundry-webconsole/tests/test_ui_csp_canary.py": 1,
+    "packaging/messagefoundry-webconsole/tests/test_ui_mfa_gate.py": 1,
+    "packaging/messagefoundry-webconsole/tests/test_webui.py": 1,
     "tests/test_adaptive_attributes_doc_drift.py": 1,
     "tests/test_adr0071_fused_callables_sqlserver.py": 1,
     "tests/test_ai_provenance_claims.py": 1,
@@ -71,7 +77,7 @@ _BASELINE: dict[str, int] = {
     "tests/test_api_security_header_floor.py": 2,
     "tests/test_api_tls.py": 1,
     "tests/test_asvs_crypto_agility_seam.py": 1,
-    "tests/test_asvs_file_surface_inventory.py": 1,
+    "tests/test_asvs_file_surface_inventory.py": 2,
     "tests/test_auth_hardening.py": 1,
     "tests/test_binary_carriage.py": 1,
     "tests/test_bounded_egress_reads.py": 2,
@@ -83,6 +89,7 @@ _BASELINE: dict[str, int] = {
     "tests/test_cla_action_provenance.py": 1,
     "tests/test_claude_settings_contract.py": 2,
     "tests/test_communications_inventory.py": 1,
+    "tests/test_conftest_restores_process_logging.py": 1,
     "tests/test_connection_factory_redaction_domain.py": 2,
     "tests/test_connections_file.py": 1,
     "tests/test_connections_file_container_settings.py": 1,
@@ -93,6 +100,8 @@ _BASELINE: dict[str, int] = {
     "tests/test_coord_lock.py": 1,
     "tests/test_coord_usage.py": 1,
     "tests/test_corepoint_import.py": 1,
+    "tests/test_credential_parameter_mapping.py": 1,
+    "tests/test_credential_reply_no_store.py": 1,
     "tests/test_crit2_inline_doc_drift.py": 1,
     "tests/test_crypto_inventory_doc.py": 4,
     "tests/test_csv_formula_consistency.py": 1,
@@ -100,14 +109,16 @@ _BASELINE: dict[str, int] = {
     "tests/test_dast_auth_sweep.py": 2,
     "tests/test_dast_claims.py": 1,
     "tests/test_dast_ingress_sweep.py": 1,
-    "tests/test_dependency_boundaries.py": 2,
+    "tests/test_dependency_boundaries.py": 3,
     "tests/test_dicom_parse_error_contract.py": 1,
     "tests/test_doc_guards_lane.py": 1,
+    "tests/test_docs_cite_no_refused_config_keys.py": 1,
     "tests/test_docs_db_grants.py": 2,
     "tests/test_docs_no_first_run_account.py": 1,
     "tests/test_docs_security_pathways.py": 3,
     "tests/test_durability_hook_remote_guard.py": 2,
     "tests/test_engine_text_survives_the_name_run.py": 1,
+    "tests/test_environments.py": 1,
     "tests/test_failure_signal.py": 2,
     "tests/test_feature_map_claims.py": 1,
     "tests/test_field_authz_enforcement_sites.py": 1,
@@ -124,34 +135,36 @@ _BASELINE: dict[str, int] = {
     "tests/test_key_usage_scope_inventory.py": 2,
     "tests/test_ldap_timeouts.py": 2,
     "tests/test_lens_param_modes.py": 1,
-    "tests/test_log_redaction_secret_domain.py": 2,
+    "tests/test_log_redaction_secret_domain.py": 3,
     "tests/test_logging.py": 1,
     "tests/test_logging_credential_scrub.py": 2,
     "tests/test_mfa.py": 2,
     "tests/test_mypy_tests_scope.py": 3,
     "tests/test_negative_controls.py": 1,
     "tests/test_nightly_notice.py": 3,
-    "tests/test_no_store_phi_coverage.py": 2,
+    "tests/test_no_store_phi_coverage.py": 3,
     "tests/test_off_loopback_runbook.py": 1,
     "tests/test_packaged_tree_denylist.py": 2,
-    "tests/test_phi_at_rest_inventory.py": 5,
-    "tests/test_phi_logging_inventory.py": 8,
+    "tests/test_phi_at_rest_inventory.py": 7,
+    "tests/test_phi_logging_inventory.py": 9,
     "tests/test_provision_first_administrator.py": 1,
     "tests/test_quality_record_scope_claims.py": 2,
     "tests/test_redaction_structured_shapes.py": 6,
     "tests/test_release_member_gate.py": 1,
     "tests/test_release_pipeline.py": 3,
     "tests/test_relocated_key_messages.py": 3,
+    "tests/test_replay_erased_body_scope.py": 2,
     "tests/test_reply_hint_thread_affinity.py": 1,
     "tests/test_required_contexts.py": 1,
     "tests/test_required_contexts_drift.py": 1,
     "tests/test_retention_classification_drift.py": 2,
-    "tests/test_risky_component_designation.py": 3,
+    "tests/test_risky_component_designation.py": 4,
     "tests/test_sandbox_import_boundary.py": 1,
     "tests/test_scan_forbidden.py": 1,
     "tests/test_scan_tokens_source.py": 1,
     "tests/test_sds_rule_ids_are_stable.py": 5,
     "tests/test_secret_rotation_inventory.py": 4,
+    "tests/test_security_composite_parity.py": 1,
     "tests/test_security_doc_context_words.py": 1,
     "tests/test_security_doc_drift.py": 4,
     "tests/test_security_doc_rate_limits.py": 3,
@@ -159,7 +172,7 @@ _BASELINE: dict[str, int] = {
     "tests/test_security_static.py": 7,
     "tests/test_security_txt_expiry_reminder.py": 1,
     "tests/test_security_txt_rfc9116.py": 2,
-    "tests/test_service_install_manifest.py": 2,
+    "tests/test_service_install_manifest.py": 4,
     "tests/test_session_mail.py": 3,
     "tests/test_session_mail_held.py": 1,
     "tests/test_shardcert_partitioned.py": 1,
@@ -167,22 +180,24 @@ _BASELINE: dict[str, int] = {
     "tests/test_shipped_line_endings_pinned.py": 2,
     "tests/test_site_context_words.py": 1,
     "tests/test_steer_inject.py": 1,
-    "tests/test_store.py": 2,
+    "tests/test_store.py": 3,
     "tests/test_store_encryption.py": 1,
     "tests/test_store_key_calendar_expiry.py": 1,
     "tests/test_store_pool_acquire_timeout.py": 1,
     "tests/test_threat_model_doc_drift.py": 5,
-    "tests/test_tls_cipher_assertion_sites.py": 2,
+    "tests/test_tls_cipher_assertion_sites.py": 3,
     "tests/test_tls_default_suites.py": 2,
     "tests/test_tls_handshake_sigalgs.py": 1,
     "tests/test_tooling_partition.py": 3,
     "tests/test_tray_boundary.py": 1,
     "tests/test_tray_iconset.py": 1,
+    "tests/test_tray_logscrub.py": 1,
     "tests/test_uploads_cross_process_quota.py": 1,
     "tests/test_usage_headroom_inject.py": 2,
     "tests/test_verify_federation.py": 1,
     "tests/test_webconsole_mount.py": 1,
     "tests/test_workflow_pipefail_screen.py": 4,
+    "tests/test_worktree_new_cleanup_advice.py": 1,
     "tests/test_xml_signature_anchor.py": 2,
 }
 
@@ -211,10 +226,20 @@ def _comprehension(value: ast.expr) -> ast.expr | None:
 
 
 def _iterates_only_nonempty_literals(comp: ast.expr) -> bool:
+    """Every loop runs over a literal with elements, none of them starred (``[*xs]`` can be empty)."""
     generators: list[ast.comprehension] = getattr(comp, "generators", [])
     return bool(generators) and all(
-        isinstance(g.iter, (ast.List, ast.Tuple, ast.Set)) and bool(g.iter.elts) for g in generators
+        isinstance(g.iter, (ast.List, ast.Tuple, ast.Set))
+        and bool(g.iter.elts)
+        and not any(isinstance(e, ast.Starred) for e in g.iter.elts)
+        for g in generators
     )
+
+
+def _source_names(comp: ast.expr) -> set[str]:
+    """The names every loop of the comprehension iterates over reads."""
+    generators: list[ast.comprehension] = getattr(comp, "generators", [])
+    return {n.id for g in generators for n in ast.walk(g.iter) if isinstance(n, ast.Name)}
 
 
 def _len_argument(node: ast.expr) -> ast.expr | None:
@@ -229,21 +254,64 @@ def _len_argument(node: ast.expr) -> ast.expr | None:
     return None
 
 
-def _states_a_count(test: ast.expr) -> bool:
+def _floor_is_positive(op: ast.cmpop, bound: ast.expr) -> bool:
+    """``len(x) >= bound`` or ``len(x) > bound`` excludes zero, as far as the source shows.
+
+    A constant bound is checked (``>= 0`` and ``> -1`` do not exclude zero). A named bound such as
+    ``_MIN_FILES`` is taken on trust: the lint cannot evaluate it, and naming a floor is the habit
+    it wants.
+    """
+    if isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub):
+        return False  # a negative literal bound excludes nothing
+    if isinstance(bound, ast.Constant) and isinstance(bound.value, int):
+        return bound.value >= (1 if isinstance(op, ast.GtE) else 0)
+    return True
+
+
+def _counted_expr(test: ast.expr) -> ast.expr | None:
+    """What a positive-count assertion is about, or None when ``test`` is not one."""
     if isinstance(test, (ast.Name, ast.Attribute, ast.Subscript)):
-        return True
-    if _len_argument(test) is not None:
-        return True
-    return (
+        return test
+    counted = _len_argument(test)
+    if counted is not None:
+        return counted
+    if (
         isinstance(test, ast.Compare)
-        and _len_argument(test.left) is not None
         and len(test.ops) == 1
         and isinstance(test.ops[0], (ast.Gt, ast.GtE))
+        and _floor_is_positive(test.ops[0], test.comparators[0])
+    ):
+        return _len_argument(test.left)
+    return None
+
+
+def _guards(test: ast.expr, source: set[str]) -> bool:
+    """``test`` states a positive count of something the comprehension iterates over."""
+    counted = _counted_expr(test)
+    if counted is None:
+        return False
+    return any(isinstance(n, ast.Name) and n.id in source for n in ast.walk(counted))
+
+
+_EMPTY_CALLS = frozenset({"set", "dict", "list", "tuple", "frozenset"})
+
+
+def _is_empty_literal(node: ast.expr) -> bool:
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return not node.elts
+    if isinstance(node, ast.Dict):
+        return not node.keys
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _EMPTY_CALLS
+        and not node.args
+        and not node.keywords
     )
 
 
 def _absence_subject(test: ast.expr) -> str | None:
-    """The name an absence assertion is about: ``not X``, ``X == []`` or ``len(X) == 0``."""
+    """The name an absence assertion is about: ``not X``, ``X == <empty>`` or ``len(X) == 0``."""
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         return test.operand.id if isinstance(test.operand, ast.Name) else None
     if not (isinstance(test, ast.Compare) and len(test.ops) == 1):
@@ -251,7 +319,7 @@ def _absence_subject(test: ast.expr) -> str | None:
     if not isinstance(test.ops[0], ast.Eq):
         return None
     left, right = test.left, test.comparators[0]
-    if isinstance(left, ast.Name) and isinstance(right, ast.List) and not right.elts:
+    if isinstance(left, ast.Name) and _is_empty_literal(right):
         return left.id
     counted = _len_argument(left)
     if isinstance(counted, ast.Name) and isinstance(right, ast.Constant) and right.value == 0:
@@ -283,13 +351,21 @@ def _sites(source: str) -> list[Site]:
                 comp = _comprehension(value)
                 if comp is not None:
                     collected[target.id] = comp
+        # Only a guard at the function's own top level is sure to have RUN before the site: one in
+        # a loop body runs zero times on an empty input, and one in a `with pytest.raises` block or
+        # a nested def may never run at all.
+        top_level = [s for s in fn.body if isinstance(s, ast.Assert)]
         for node in asserts:
             name = _absence_subject(node.test)
             if name is None or name not in collected:
                 continue
-            if _iterates_only_nonempty_literals(collected[name]):
+            comp = collected[name]
+            if _iterates_only_nonempty_literals(comp):
                 continue
-            guarded = any(a.lineno < node.lineno and _states_a_count(a.test) for a in asserts)
+            source_names = _source_names(comp)
+            guarded = any(
+                a.lineno < node.lineno and _guards(a.test, source_names) for a in top_level
+            )
             found.append(Site(node.lineno, fn.name, name, guarded))
     return found
 
@@ -336,7 +412,14 @@ def test_the_lint_catches_a_planted_unguarded_absence() -> None:
 
 @pytest.mark.parametrize(
     "absence",
-    ["assert not bad", "assert bad == []", "assert len(bad) == 0"],
+    [
+        "assert not bad",
+        "assert bad == []",
+        "assert bad == set()",
+        "assert bad == {}",
+        "assert bad == ()",
+        "assert len(bad) == 0",
+    ],
 )
 def test_every_absence_spelling_is_a_site(absence: str) -> None:
     source = f"def test_x(files):\n    bad = [p for p in files if p]\n    {absence}\n"
@@ -370,6 +453,11 @@ def test_an_earlier_count_assertion_guards_the_site(guard: str) -> None:
         "assert len(files) == 0 or True",
         "assert isinstance(files, list)",
         "assert len(files) < 99",
+        "assert len(files) >= 0",
+        "assert len(files) > -1",
+        # Positive, but about something the comprehension does not iterate.
+        "assert other",
+        "assert len(other) > 3",
     ],
 )
 def test_an_assertion_true_on_an_empty_input_does_not_guard(not_a_guard: str) -> None:
@@ -380,6 +468,24 @@ def test_an_assertion_true_on_an_empty_input_does_not_guard(not_a_guard: str) ->
         "    assert not bad\n"
     )
     assert _unguarded_sites(source) == [(4, "test_x", "bad")]
+
+
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        "for f in roots:\n        assert files",
+        "with pytest.raises(AssertionError):\n        assert files",
+        "def inner():\n        assert files",
+    ],
+)
+def test_a_guard_that_may_never_run_does_not_guard(wrapped: str) -> None:
+    source = (
+        "def test_x(files, roots):\n"
+        f"    {wrapped}\n"
+        "    bad = [p for p in files if p]\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == [(5, "test_x", "bad")]
 
 
 def test_a_count_assertion_after_the_absence_does_not_guard_it() -> None:
@@ -419,8 +525,14 @@ def test_a_nonempty_literal_source_cannot_iterate_nothing() -> None:
         "    assert not empty\n"
         "    walked = [p for pat in ('*.py',) for p in root.glob(pat)]\n"
         "    assert not walked\n"
+        "    starred = [p for p in [*root] if p]\n"
+        "    assert not starred\n"
     )
-    assert _unguarded_sites(source) == [(5, "test_x", "empty"), (7, "test_x", "walked")]
+    assert _unguarded_sites(source) == [
+        (5, "test_x", "empty"),
+        (7, "test_x", "walked"),
+        (9, "test_x", "starred"),
+    ]
 
 
 def test_a_non_test_function_and_an_uncollected_name_are_not_sites() -> None:
