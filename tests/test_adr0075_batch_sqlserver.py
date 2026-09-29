@@ -271,7 +271,9 @@ async def test_batched_concurrent_finalizers_do_not_corrupt_disposition(store: A
 
 async def test_rowcount_ops_correct_after_batched_handoff(store: Any) -> None:
     # After a batched handoff (which runs SET NOCOUNT ON in its render), a cursor.rowcount-dependent op
-    # on the SAME pooled connection must still return the correct count. The canary is _execute, which
+    # must still return the correct count. The pool is not pinned, so the op may run on a different
+    # connection than the handoff did; the pinned reading is the BACKLOG-2097-NOCOUNT probe in
+    # test_sqlserver_store.py. The canary is _execute, which
     # returns the driver's rowcount. reset_stale_inflight was the canary until BACKLOG #2097 moved its
     # count to an OUTPUT rowset; it stays below only to re-pend the claimed row.
     store.set_batch_handoff_statements(True)

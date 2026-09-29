@@ -328,10 +328,13 @@ def _force_nocount(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
                 # Before this restore existed, a LATER test's freshly opened store read
                 # reset_stale_inflight() as -4 (-1 per stage) on both SQL Server legs. The suspected
                 # route is the ODBC driver manager reusing the physical connection with its session
-                # options; that is NOT measured here. BACKLOG #2097 moved the measurement to the
-                # BACKLOG-2097-NOCOUNT probe in test_sqlserver_store.py, and made the count
-                # independent of NOCOUNT.
-                await cur.execute("SET NOCOUNT OFF;")
+                # options; the BACKLOG-2097-NOCOUNT probe in test_sqlserver_store.py measures it.
+                # Since #2097 that count no longer shows a leak, so the restore reads itself back.
+                await cur.execute("SET NOCOUNT OFF; SELECT @@OPTIONS & 512")
+                row = await cur.fetchone()
+                assert row is not None and row[0] == 0, (
+                    "SET NOCOUNT OFF did not restore the session"
+                )
 
     monkeypatch.setattr(store, "_cursor", nocount_cursor)
 

@@ -753,8 +753,9 @@ def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tu
     unparameterized batch), a zero-match UPDATE did NOT report 0 on the hosted SQL Server legs. This
     batch runs parameterized, and SQL Server restores NOCOUNT when that call returns, so by reading it
     does not leak; ``test_resend_plain_parity_ss`` backs that by reading rowcount 0 right after the
-    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection, asserts
-    ``>= 1``, and never runs a zero-match statement. Keep this batch parameterized."""
+    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection and
+    never runs a zero-match statement. Whether the restore holds is the ``BACKLOG-2097-NOCOUNT`` probe
+    in ``tests/test_sqlserver_store.py``. Keep this batch parameterized."""
     parts = ["SET NOCOUNT ON;"]
     params: list[Any] = []
     for sql, p in group:
