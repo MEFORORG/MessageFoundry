@@ -32,7 +32,7 @@ from the page's own tiers. ``tests/test_risky_component_designation.py`` re-deri
 and re-renders the section, WITHOUT the network, and fails if either differs from what is tracked.
 
 A full run needs the network and runs by hand, never in CI. Standard library only, like
-``runtime_closure.py`` beside it, so it runs under a bare ``python3``:
+``runtime_closure.py`` beside it, so it runs under any Python 3.11 or later with nothing installed:
 
     python scripts/security/component_readings.py
 
@@ -123,6 +123,8 @@ BEGIN = (
 END = "<!-- END component-readings -->"
 #: The width the page's hand-written prose wraps at, so rendered prose matches it.
 _PAGE_WIDTH = 100
+#: What CommonMark reads as the start of a list item, heading, quote or table at a line's start.
+_BLOCK_START = re.compile(r"^(\d+[.)]|[-*+>#|])(\s|$)")
 #: The heading that ends the page's tier tables. The designation labels are read above it.
 READINGS_HEADING = "## Risky by ASVS's own examples, read from public data"
 
@@ -140,11 +142,11 @@ class Advisory(TypedDict):
     published: str
 
 
-class Dropped(TypedDict):
-    """An advisory left out because the GitHub advisory it mirrors has been withdrawn."""
+class Twin(TypedDict):
+    """A record from another database and the GitHub advisory it names, as ``screen`` judged it."""
 
     id: str
-    withdrawn: str
+    twin: str
 
 
 class Reading(TypedDict):
@@ -158,14 +160,15 @@ class Reading(TypedDict):
     pinned: str
     in_core: bool
     latest_version: str
-    newest_upload: str
+    newest_upload: str | None
     releases_in_maintenance_window: int
     development_status: list[str]
     project_status: str
     pinned_yanked: bool
     requires_python_latest: str
     advisories: list[Advisory]
-    advisories_dropped: list[Dropped]
+    advisories_dropped: list[Twin]
+    advisories_unresolved: list[Twin]
     advisories_affecting_pin: list[str]
     risky: dict[str, bool]
 
@@ -194,8 +197,9 @@ def _day(timestamp: str) -> dt.date:
 def _merge_aliases(vulns: Iterable[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Group OSV records that name each other, so one flaw published twice counts once.
 
-    Union-find over each record's id and aliases (a CVE id links a GHSA to its PYSEC twin).
-    Withdrawn records are dropped first.
+    Union-find over each record's id and aliases (a CVE id links a GHSA to its PYSEC twin). It is
+    transitive, so a record naming two CVEs joins both flaws into one advisory; that undercounts,
+    and never overcounts. Screen withdrawn records out first (``screen``).
     """
     parent: dict[str, str] = {}
 
@@ -205,7 +209,7 @@ def _merge_aliases(vulns: Iterable[dict[str, Any]]) -> list[list[dict[str, Any]]
             key = parent[key]
         return key
 
-    records = [v for v in vulns if not v.get("withdrawn")]
+    records = list(vulns)
     for record in records:
         for alias in record.get("aliases") or []:
             parent[find(alias)] = find(record["id"])
@@ -282,54 +286,90 @@ def _group_severity(group: list[dict[str, Any]]) -> tuple[str, str]:
     return (_cvss3_word(max(scores)), "cvss3") if scores else ("UNRATED", "none")
 
 
-def _group_ids(group: list[dict[str, Any]]) -> set[str]:
-    """Every id a group's records carry: their own and their aliases."""
-    return {str(r["id"]) for r in group} | {str(x) for r in group for x in r.get("aliases") or []}
+def screen(
+    name: str, vulns: list[dict[str, Any]], fetch: Fetch
+) -> tuple[list[dict[str, Any]], list[Twin], list[Twin]]:
+    """The records to count, and two lists naming what was judged: dropped, and unresolved.
 
+    Each record is judged on its own, never as a group. A withdrawn record is left out. A record
+    from another database is left out when every GitHub advisory it names FOR THIS PACKAGE is
+    withdrawn: its only reviewed view here is gone. A GitHub advisory about another package says
+    nothing either way. OSV's package query omits withdrawn records, so a GitHub alias the query did
+    not return is fetched by id. The fastapi record PYSEC-2024-38 is the case this exists for: its
+    fastapi GitHub twin was withdrawn, and the live one it also names is about python-multipart.
 
-def withdrawn_twins(vulns: list[dict[str, Any]], fetch: Fetch) -> dict[str, str]:
-    """Record id to the withdrawn GitHub advisory it mirrors, for each record that mirrors one.
-
-    OSV's package query leaves withdrawn records out, so a Python-advisory record whose GitHub twin
-    was withdrawn arrives alone and looks live. Each GitHub alias the query did not return is
-    fetched by id, and a withdrawn one takes its twin out. The fastapi record PYSEC-2024-38 is the
-    case this exists for: its GitHub twin was withdrawn because the flaw belongs to another package.
+    A GitHub alias that OSV does not have at all (404) cannot be judged, so it is treated as about
+    this package. When no alias is live, its record still counts and is listed as unresolved.
     """
-    returned = {str(v["id"]) for v in vulns}
-    out: dict[str, str] = {}
+    # GHSA id to (withdrawn, about this package). None for withdrawn means OSV does not have it.
+    status: dict[str, tuple[bool | None, bool]] = {
+        str(v["id"]): (bool(v.get("withdrawn")), True)
+        for v in vulns
+        if str(v["id"]).startswith("GHSA-")
+    }
+    kept: list[dict[str, Any]] = []
+    dropped: list[Twin] = []
+    unresolved: list[Twin] = []
     for record in vulns:
-        for alias in record.get("aliases") or []:
-            if not str(alias).startswith("GHSA-") or alias in returned:
-                continue
-            try:
-                twin = fetch(OSV_VULN.format(id=urllib.parse.quote(str(alias), safe="")), None)
-            except urllib.error.HTTPError as exc:
-                if exc.code == 404:
-                    continue
-                raise
-            if twin.get("withdrawn"):
-                out[str(record["id"])] = str(alias)
-    return out
+        if record.get("withdrawn"):
+            continue
+        twins = [str(a) for a in record.get("aliases") or [] if str(a).startswith("GHSA-")]
+        if not str(record["id"]).startswith("GHSA-"):
+            for alias in twins:
+                if alias not in status:
+                    status[alias] = _ghsa_status(alias, name, fetch)
+            twins = [a for a in twins if status[a][1]]
+        if str(record["id"]).startswith("GHSA-") or not twins:
+            kept.append(record)
+            continue
+        if all(status[a][0] is True for a in twins):
+            dropped.append({"id": str(record["id"]), "twin": twins[0]})
+            continue
+        kept.append(record)
+        if not any(status[a][0] is False for a in twins):
+            missing = next(a for a in twins if status[a][0] is None)
+            unresolved.append({"id": str(record["id"]), "twin": missing})
+    return kept, dropped, unresolved
 
 
-def advisories(
-    vulns: Iterable[dict[str, Any]], withdrawn: Mapping[str, str] | None = None
-) -> list[Advisory]:
-    """OSV records as merged advisories, sorted by id: one per flaw, dated by its first record.
+def _ghsa_status(ghsa: str, name: str, fetch: Fetch) -> tuple[bool | None, bool]:
+    """Whether OSV records the GitHub advisory as withdrawn, and whether it is about ``name``.
 
-    A group any of whose records mirrors a withdrawn GitHub advisory (``withdrawn``) is left out.
+    ``(None, True)`` when OSV does not have it: unknown, and not shown to be about another package.
+    """
+    try:
+        record = fetch(OSV_VULN.format(id=urllib.parse.quote(ghsa, safe="")), None)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None, True
+        raise
+    packages = {
+        runtime_closure.canonical_name(str((a.get("package") or {}).get("name", "")))
+        for a in record.get("affected") or []
+    }
+    return bool(record.get("withdrawn")), not packages or name in packages
+
+
+def _date(record: Mapping[str, Any]) -> str:
+    """A record's first-published day, or its last-modified day when OSV gives no publish date."""
+    return str(record.get("published") or record.get("modified") or "")[:10]
+
+
+def advisories(vulns: Iterable[dict[str, Any]]) -> list[Advisory]:
+    """Screened OSV records as merged advisories, sorted by id: one per flaw, dated by its first.
+
+    A group with no date at all is kept, dated ``unknown``, so it still reaches the page.
     """
     out: list[Advisory] = []
     for group in _merge_aliases(vulns):
-        if not any(r.get("published") for r in group) or _group_ids(group) & set(withdrawn or {}):
-            continue
+        dates = [d for d in (_date(r) for r in group) if d]
         severity, rated_by = _group_severity(group)
         out.append(
             {
                 "id": _representative(group),
                 "severity": severity,
                 "rated_by": rated_by,
-                "published": min(r["published"][:10] for r in group if r.get("published")),
+                "published": min(dates) if dates else "unknown",
             }
         )
     return sorted(out, key=lambda a: a["id"])
@@ -359,8 +399,11 @@ def in_window(
 ) -> list[Mapping[str, Any]]:
     """The reading's advisories first published inside the advisory window ending ``as_of``."""
     floor = as_of - dt.timedelta(days=int(criteria["advisory_window_days"]))
+    # An advisory OSV gives no date for cannot be shown to fall outside, so it counts as inside.
     return [
-        a for a in reading["advisories"] if floor <= dt.date.fromisoformat(a["published"]) <= as_of
+        a
+        for a in reading["advisories"]
+        if a["published"] == "unknown" or floor <= dt.date.fromisoformat(a["published"]) <= as_of
     ]
 
 
@@ -381,8 +424,10 @@ def classify(
     there without the network.
     """
     maintenance_floor = as_of - dt.timedelta(days=int(criteria["maintenance_window_days"]))
+    newest = reading["newest_upload"]
     return {
-        "maintenance": dt.date.fromisoformat(reading["newest_upload"]) < maintenance_floor,
+        # No unyanked release at all is the strongest reading of this example, not an error.
+        "maintenance": newest is None or dt.date.fromisoformat(newest) < maintenance_floor,
         "support": (
             reading["project_status"] in criteria["unsupported_statuses"]
             or criteria["inactive_classifier"] in reading["development_status"]
@@ -418,34 +463,35 @@ def read_component(
         for version, files in releases.items()
         if files and not all(f.get("yanked") for f in files)
     }
+    # A project with every release yanked, or a quarantined one PyPI offers no files for, reads as
+    # no release at all, and a pinned version PyPI no longer lists reads as yanked. Those are what
+    # the maintenance and support examples exist to catch, so neither stops the run.
     past = [d for d in uploads.values() if d <= as_of]
-    if not past:
-        raise ValueError(f"{name}: PyPI lists no unyanked release on or before {as_of}")
-    if pinned not in releases:
-        raise ValueError(f"{name}: PyPI has no release {pinned}, the version the closure pins")
     window_floor = as_of - dt.timedelta(days=MAINTENANCE_WINDOW_DAYS)
-    pinned_files = releases[pinned]
-    records = _osv_all(name, None, fetch)
-    withdrawn = withdrawn_twins(records, fetch)
+    pinned_files = releases.get(pinned, [])
+    kept, dropped, unresolved = screen(name, _osv_all(name, None, fetch), fetch)
+    gone = {t["id"] for t in dropped}
+    at_pin = [
+        r for r in _osv_all(name, pinned, fetch) if not r.get("withdrawn") and r["id"] not in gone
+    ]
 
     reading: Reading = {
         "name": name,
         "pinned": pinned,
         "in_core": in_core,
         "latest_version": str(info["version"]),
-        "newest_upload": max(past).isoformat(),
+        "newest_upload": max(past).isoformat() if past else None,
         "releases_in_maintenance_window": sum(window_floor <= d for d in past),
         "development_status": sorted(
             c for c in info.get("classifiers") or [] if c.startswith("Development Status ::")
         ),
         "project_status": str((simple.get("project-status") or {}).get("status", "absent")),
-        "pinned_yanked": bool(pinned_files) and all(f.get("yanked") for f in pinned_files),
+        "pinned_yanked": all(f.get("yanked") for f in pinned_files),
         "requires_python_latest": str(info.get("requires_python") or ""),
-        "advisories": advisories(records, withdrawn),
-        "advisories_dropped": [{"id": i, "withdrawn": w} for i, w in sorted(withdrawn.items())],
-        "advisories_affecting_pin": [
-            a["id"] for a in advisories(_osv_all(name, pinned, fetch), withdrawn)
-        ],
+        "advisories": advisories(kept),
+        "advisories_dropped": dropped,
+        "advisories_unresolved": unresolved,
+        "advisories_affecting_pin": [a["id"] for a in advisories(at_pin)],
         "risky": {},
     }
     reading["risky"] = classify(reading, as_of, criteria())
@@ -556,26 +602,27 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "",
         "| Example | A component is risky on it when | Source |",
         "|---|---|---|",
-        "| Poorly maintained | it has uploaded no release to PyPI, pre-releases included, in the "
-        f"{rules['maintenance_window_days']} days before the snapshot | PyPI JSON API |",
+        "| Poorly maintained | it has uploaded no release to PyPI in the "
+        f"{rules['maintenance_window_days']} days before the snapshot. A pre-release counts; a "
+        "release whose every file is yanked does not | PyPI JSON API |",
         "| Unsupported or end of life | its PyPI project status, the marker Python standard "
         "PEP 792 defines, is "
         + _either(rules["unsupported_statuses"])
         + f", or its latest release is classified `{rules['inactive_classifier']}`, or the "
-        "pinned version is yanked | PyPI JSON and Simple APIs |",
+        "pinned version is yanked or no longer listed | PyPI JSON and Simple APIs |",
         "| A history of significant vulnerabilities | at least one advisory rated "
         + _either(rules["significant_severities"])
         + f" was first published in the {rules['advisory_window_days']} days (about "
         f"{round(int(rules['advisory_window_days']) / 365)} years) before the snapshot | OSV API |",
         "",
         "OSV often records one flaw twice, once from the GitHub advisory database and once from the "
-        "Python advisory database. Records that name each other count once. A record whose GitHub "
-        "twin has been withdrawn does not count at all.",
+        "Python advisory database. Records that name each other count once. A record does not count "
+        "when every GitHub advisory it names about that package has been withdrawn.",
         "",
-        "The severity is the GitHub advisory database's rating. Where it gives none, the record's "
-        "CVSS 3 vector is scored, CVSS being the Common Vulnerability Scoring System, and rated on "
-        "that system's scale. An advisory with neither does not count. The ones in the window are "
-        "named below so a reader can judge them.",
+        "The severity is the GitHub advisory database's rating. Where it gives none, the script "
+        "scores the record's CVSS 3 vector and rates it on that system's scale. CVSS is the Common "
+        "Vulnerability Scoring System. An advisory with neither does not count. The ones in the "
+        "window are named below so a reader can judge them.",
         "",
         "These tests are mechanical. A small library that is finished can trip the first one "
         "without being neglected. The reading says where to look; it does not say the library is "
@@ -592,7 +639,7 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
     if flagged["maintenance"]:
         out += ["| Component | Newest release | Designated above |", "|---|---|---|"]
         out += [
-            f"| `{r['name']}` | {r['newest_upload']} | {designated(r['name'])} |"
+            f"| `{r['name']}` | {r['newest_upload'] or 'none'} | {designated(r['name'])} |"
             for r in flagged["maintenance"]
         ]
     else:
@@ -620,7 +667,8 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         ]
         for r in flagged["advisory_history"]:
             hits = significant_in_window(r, as_of, rules)
-            newest = max(a["published"] for a in hits)
+            # The default only shows on a hand-edited snapshot; the guard names that case.
+            newest = max((a["published"] for a in hits), default="none")
             out.append(f"| `{r['name']}` | {len(hits)} | {newest} | {designated(r['name'])} |")
     else:
         out.append("None on the snapshot date.")
@@ -637,7 +685,7 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
     else:
         out.append(
             f"On the snapshot date OSV listed no advisory against any pinned version, in any of "
-            f"the {size}. This is history, not an open finding."
+            f"the {size}. The table above counts past advisories only."
         )
     unrated = [
         (a["id"], r["name"])
@@ -657,15 +705,28 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         )
     else:
         out.append("Every advisory in the window carries a rating from one of the two sources.")
-    dropped = [
-        (d["id"], d["withdrawn"], r["name"]) for r in readings for d in r["advisories_dropped"]
-    ]
+    dropped = [(d["id"], d["twin"], r["name"]) for r in readings for d in r["advisories_dropped"]]
     if dropped:
         out += [
             "",
             _count(len(dropped), "record was", "records were")
-            + " left out because the GitHub advisory it mirrors is withdrawn: "
+            + " left out because every GitHub advisory about the package "
+            + ("it names is" if len(dropped) == 1 else "they name is")
+            + " withdrawn: "
             + "; ".join(f"`{i}` against `{n}`, twin of `{w}`" for i, w, n in dropped)
+            + ".",
+        ]
+    unresolved = [
+        (u["id"], u["twin"], r["name"]) for r in readings for u in r["advisories_unresolved"]
+    ]
+    if unresolved:
+        out += [
+            "",
+            _count(len(unresolved), "record names", "records name")
+            + " a GitHub advisory that OSV does not have, so its status is unknown. "
+            + ("It still counts" if len(unresolved) == 1 else "They still count")
+            + ": "
+            + "; ".join(f"`{i}` against `{n}`, naming `{w}`" for i, w, n in unresolved)
             + ".",
         ]
     out += ["", "### Not risky on any of the three", "", "| Components | Designated above |"]
@@ -720,14 +781,19 @@ def _wrap(line: str) -> str:
     if not line or line.startswith(("|", "#")):
         return line
     prefix = "> " if line.startswith("> ") else ""
-    return textwrap.fill(
+    lines = textwrap.wrap(
         line.removeprefix(prefix),
-        width=_PAGE_WIDTH,
-        initial_indent=prefix,
-        subsequent_indent=prefix,
+        width=_PAGE_WIDTH - len(prefix),
         break_long_words=False,
         break_on_hyphens=False,
     )
+    # A continuation line that opens like a list item or heading ("1. On support", "- x") would
+    # render as one and break the paragraph, so pull the previous line's last word down onto it.
+    for i in range(1, len(lines)):
+        while _BLOCK_START.match(lines[i]) and " " in lines[i - 1]:
+            head, _, word = lines[i - 1].rpartition(" ")
+            lines[i - 1], lines[i] = head, f"{word} {lines[i]}"
+    return "\n".join(prefix + ln for ln in lines)
 
 
 def _marker_bounds(page: str) -> tuple[int, int]:

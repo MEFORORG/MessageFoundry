@@ -35,6 +35,8 @@ import json
 import re
 import subprocess
 import sys
+import urllib.error
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -734,12 +736,20 @@ def test_every_verdict_follows_from_its_readings() -> None:
 def test_the_verdict_rederivation_can_fail() -> None:
     """RED when: ``classify`` stops seeing a change on any axis.
 
-    THE POSITIVE CONTROL FOR THE TEST ABOVE. Each mutation turns one axis on for a component the
-    snapshot reads as clean, so a ``classify`` that returned the stored verdict, or nothing, fails.
+    THE POSITIVE CONTROL FOR THE TEST ABOVE. Each mutation turns one axis on for a reading made
+    clean here, so a ``classify`` that returned the stored verdict, or nothing, fails. The clean
+    reading is built from the first real one, so this holds whatever a later snapshot flags.
     """
     data = _snapshot()
     as_of = dt.date.fromisoformat(data["snapshot_date"])
-    clean = next(r for r in _readings(data).values() if not any(r["risky"].values()))
+    clean = {
+        **data["readings"][0],
+        "newest_upload": as_of.isoformat(),
+        "project_status": "active",
+        "development_status": [],
+        "pinned_yanked": False,
+        "advisories": [],
+    }
     rules = data["criteria"]
     assert component_readings.classify(clean, as_of, rules) == dict.fromkeys(
         component_readings.AXES, False
@@ -881,16 +891,34 @@ def test_the_generator_reads_a_component_from_fake_replies() -> None:
          "severity": [{"type": "CVSS_V3",
                        "score": "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:C/C:H/I:H/A:H"}]},
         {"id": "PYSEC-3", "aliases": ["GHSA-twin"], "published": "2025-04-01T00:00:00Z"},
+        # Names one withdrawn GHSA (a duplicate) and one live one: it must survive.
+        {"id": "PYSEC-4", "aliases": ["GHSA-dupe", "GHSA-live"], "published": "2025-05-01T00:00:00Z"},
+        # The query DID return its withdrawn GHSA twin: it must still go.
+        {"id": "PYSEC-5", "aliases": ["GHSA-gone"], "published": "2025-06-01T00:00:00Z"},
+        # Names a GHSA that OSV does not have: it counts, and is listed as unresolved.
+        {"id": "PYSEC-6", "aliases": ["GHSA-lost"], "published": "2025-07-01T00:00:00Z"},
+        # The fastapi shape: its own GHSA is withdrawn, the live one is about another package.
+        {"id": "PYSEC-7", "aliases": ["GHSA-mine", "GHSA-other"], "published": "2025-08-01T00:00:00Z"},
     ]  # fmt: skip
-    replies[component_readings.OSV_VULN.format(id="GHSA-twin")] = {
-        "id": "GHSA-twin",
-        "withdrawn": "2025-04-02T00:00:00Z",
-    }
+    for ghsa, withdrawn, package in (
+        ("GHSA-twin", True, "demo"),
+        ("GHSA-dupe", True, "demo"),
+        ("GHSA-live", False, "demo"),
+        ("GHSA-mine", True, "demo"),
+        ("GHSA-other", False, "another-package"),
+    ):
+        replies[component_readings.OSV_VULN.format(id=ghsa)] = {
+            "id": ghsa,
+            "affected": [{"package": {"name": package, "ecosystem": "PyPI"}}],
+            **({"withdrawn": "2025-04-02T00:00:00Z"} if withdrawn else {}),
+        }
 
     def fetch(url: str, body: bytes | None) -> Any:
         if url == component_readings.OSV_QUERY:
             assert body is not None
             return {"vulns": [osv[3]] if "version" in json.loads(body) else osv}
+        if url not in replies:
+            raise urllib.error.HTTPError(url, 404, "Not Found", Message(), None)
         return replies[url]
 
     reading = component_readings.read_component(
@@ -902,10 +930,51 @@ def test_the_generator_reads_a_component_from_fake_replies() -> None:
     assert reading["advisories"] == [
         {"id": "GHSA-aaaa", "severity": "HIGH", "rated_by": "github", "published": "2025-01-01"},
         {"id": "PYSEC-2", "severity": "HIGH", "rated_by": "cvss3", "published": "2025-03-01"},
+        {"id": "PYSEC-4", "severity": "UNRATED", "rated_by": "none", "published": "2025-05-01"},
+        {"id": "PYSEC-6", "severity": "UNRATED", "rated_by": "none", "published": "2025-07-01"},
     ]
-    assert reading["advisories_dropped"] == [{"id": "PYSEC-3", "withdrawn": "GHSA-twin"}]
+    assert reading["advisories_dropped"] == [
+        {"id": "PYSEC-3", "twin": "GHSA-twin"},
+        {"id": "PYSEC-5", "twin": "GHSA-gone"},
+        {"id": "PYSEC-7", "twin": "GHSA-mine"},
+    ]
+    assert reading["advisories_unresolved"] == [{"id": "PYSEC-6", "twin": "GHSA-lost"}]
     assert reading["advisories_affecting_pin"] == ["PYSEC-2"]
     assert reading["risky"] == {"maintenance": True, "support": True, "advisory_history": True}
+
+
+def test_a_fully_yanked_project_is_read_not_refused() -> None:
+    """RED when: a project with every release yanked, and its pin gone, stops the run.
+
+    Those are what the maintenance and support examples exist to catch, so they must come out as
+    readings, not as an error that leaves the whole snapshot unwritten.
+    """
+    as_of = dt.date(2026, 1, 1)
+    replies: dict[str, Any] = {
+        "https://pypi.org/pypi/gone/json": {
+            "info": {"version": "1.0", "classifiers": []},
+            "releases": {"1.0": [{"upload_time_iso_8601": "2025-01-01T00:00:00Z", "yanked": True}]},
+        },
+        "https://pypi.org/simple/gone/": {"project-status": {"status": "quarantined"}},
+    }
+
+    def fetch(url: str, body: bytes | None) -> Any:
+        return {} if url == component_readings.OSV_QUERY else replies[url]
+
+    reading = component_readings.read_component(
+        "gone", "0.9", in_core=False, as_of=as_of, fetch=fetch
+    )
+    assert reading["newest_upload"] is None and reading["pinned_yanked"] is True
+    assert reading["risky"] == {"maintenance": True, "support": True, "advisory_history": False}
+
+
+def test_rendered_prose_never_opens_a_line_like_a_list_item() -> None:
+    """RED when: wrapping leaves a continuation line that CommonMark would read as a list item."""
+    words = " ".join(["word"] * 17) + " counts: 1. On support: 0. More words follow here."
+    for width in range(30, 101):
+        text = "x" * (100 - width) + " " + words
+        for line in component_readings._wrap(text).splitlines()[1:]:
+            assert not component_readings._BLOCK_START.match(line), (width, line)
 
 
 @pytest.mark.parametrize(

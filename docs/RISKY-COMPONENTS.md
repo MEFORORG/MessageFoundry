@@ -202,17 +202,17 @@ these examples even where the tiers did not designate it.
 
 | Example | A component is risky on it when | Source |
 |---|---|---|
-| Poorly maintained | it has uploaded no release to PyPI, pre-releases included, in the 730 days before the snapshot | PyPI JSON API |
-| Unsupported or end of life | its PyPI project status, the marker Python standard PEP 792 defines, is `archived`, `deprecated` or `quarantined`, or its latest release is classified `Development Status :: 7 - Inactive`, or the pinned version is yanked | PyPI JSON and Simple APIs |
+| Poorly maintained | it has uploaded no release to PyPI in the 730 days before the snapshot. A pre-release counts; a release whose every file is yanked does not | PyPI JSON API |
+| Unsupported or end of life | its PyPI project status, the marker Python standard PEP 792 defines, is `archived`, `deprecated` or `quarantined`, or its latest release is classified `Development Status :: 7 - Inactive`, or the pinned version is yanked or no longer listed | PyPI JSON and Simple APIs |
 | A history of significant vulnerabilities | at least one advisory rated `HIGH` or `CRITICAL` was first published in the 1825 days (about 5 years) before the snapshot | OSV API |
 
 OSV often records one flaw twice, once from the GitHub advisory database and once from the Python
-advisory database. Records that name each other count once. A record whose GitHub twin has been
-withdrawn does not count at all.
+advisory database. Records that name each other count once. A record does not count when every
+GitHub advisory it names about that package has been withdrawn.
 
-The severity is the GitHub advisory database's rating. Where it gives none, the record's CVSS 3
-vector is scored, CVSS being the Common Vulnerability Scoring System, and rated on that system's
-scale. An advisory with neither does not count. The ones in the window are named below so a reader
+The severity is the GitHub advisory database's rating. Where it gives none, the script scores the
+record's CVSS 3 vector and rates it on that system's scale. CVSS is the Common Vulnerability Scoring
+System. An advisory with neither does not count. The ones in the window are named below so a reader
 can judge them.
 
 These tests are mechanical. A small library that is finished can trip the first one without being
@@ -248,13 +248,16 @@ None on the snapshot date.
 | `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
 | `starlette` | 5 | 2026-06-15 | yes, tier 3 |
 
-On the snapshot date OSV listed no advisory against any pinned version, in any of the 43. This is
-history, not an open finding.
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 43. The table
+above counts past advisories only.
 
 Every advisory in the window carries a rating from one of the two sources.
 
-1 record was left out because the GitHub advisory it mirrors is withdrawn: `PYSEC-2024-38` against
-`fastapi`, twin of `GHSA-qf9m-vfgh-m389`.
+1 record was left out because every GitHub advisory about the package it names is withdrawn:
+`PYSEC-2024-38` against `fastapi`, twin of `GHSA-qf9m-vfgh-m389`.
+
+1 record names a GitHub advisory that OSV does not have, so its status is unknown. It still counts:
+`PYSEC-2026-2132` against `click`, naming `GHSA-47fr-3ffg-hgmw`.
 
 ### Not risky on any of the three
 
@@ -331,6 +334,6 @@ criteria. The section between the markers must be exactly what the snapshot and 
 render, so a tier change needs `python scripts/security/component_readings.py --render-only`.
 
 The test does not go red when the re-read date passes, because a date alone would then fail every
-unrelated pull request. Keeping the re-read date is a maintainer task: run
-`python scripts/security/component_readings.py`, which reads the public data again and rewrites
-both the snapshot and the section, then commit the result.
+unrelated pull request. Keeping the re-read date is a maintainer task. Run
+`python scripts/security/component_readings.py` and commit what it writes. It reads the public data
+again and rewrites both the snapshot and the section.
