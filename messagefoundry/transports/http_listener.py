@@ -138,15 +138,16 @@ class HttpRequest:
         target: str,
         headers: dict[str, str],
         body: bytes,
-        repeated: frozenset[str] = frozenset(),
+        repeated: frozenset[str],
     ) -> None:
         self.method = method
         self.target = target
         self.headers = headers
         self.body = body
-        #: Lower-cased names of the headers that appeared more than once. ``headers`` keeps only the
-        #: LAST value of each, so a caller that reads a security-relevant header checks here first
-        #: (BACKLOG #2051).
+        #: Names of the headers that appeared more than once, lower-cased with ``_`` read as ``-``
+        #: (so ``x_api_key`` and ``x-api-key`` count as one name, as a folding front end reads them).
+        #: ``headers`` keeps only the LAST value of each, so a caller that reads a security-relevant
+        #: header checks here first (BACKLOG #2051).
         self.repeated = repeated
 
 
@@ -405,6 +406,9 @@ async def _read_head(
 
     headers: dict[str, str] = {}
     header_counts: dict[str, int] = {}
+    # Counted with `_` folded into `-`, because some front ends fold the two (BACKLOG #1913), so a
+    # repeat hidden behind an underscore spelling is still a repeat (BACKLOG #2051).
+    folded_counts: dict[str, int] = {}
     for line in lines[1:]:
         if not line:
             continue
@@ -433,6 +437,8 @@ async def _read_head(
         if "_" in key and key.replace("_", "-") in _FRAMING_HEADERS:
             raise HttpRequestError(400, "underscore in a framing header name", kind="framing_error")
         header_counts[key] = header_counts.get(key, 0) + 1
+        folded = key.replace("_", "-")
+        folded_counts[folded] = folded_counts.get(folded, 0) + 1
         headers[key] = value.strip(" \t")
 
     # Reject AMBIGUOUS framing before any Content-Length is trusted — the HTTP request-smuggling
@@ -512,7 +518,7 @@ async def _read_head(
     if host_count == 0 and version != "HTTP/1.0":
         raise HttpRequestError(400, "missing Host header", kind="framing_error")
 
-    repeated = frozenset(name for name, count in header_counts.items() if count > 1)
+    repeated = frozenset(name for name, count in folded_counts.items() if count > 1)
     return HttpRequest(method, target, headers, b"", repeated)
 
 
@@ -689,6 +695,12 @@ class HttpSource(SourceConnector):
             s.get("intake_api_key_next"),
         )
         self.intake_api_key_header: str = str(s.get("intake_api_key_header") or "x-api-key").lower()
+        #: The one header this listener reads a credential from, or ``None`` when it reads none:
+        #: ``mtls_subject`` reads the peer certificate, and ``none`` reads nothing.
+        self._credential_header: str | None = {
+            "api_key": self.intake_api_key_header,
+            "bearer": "authorization",
+        }.get(self.intake_auth)
         subjects = s.get("intake_client_subjects")
         #: Matched through ``client_cert_principal``, so the allow-list is a map to itself: it gives us
         #: that helper's deny-by-default and its qualified CN/SAN namespacing for free, rather than a
@@ -868,26 +880,12 @@ class HttpSource(SourceConnector):
         self._note_intake_success(peer)
         return None
 
-    def _credential_header(self) -> str | None:
-        """The one header this listener reads a credential from, or ``None`` when it reads none.
-
-        mTLS reads the peer certificate, not a header, and ``none`` reads nothing.
-        """
-        if self.intake_auth == "api_key":
-            return self.intake_api_key_header
-        if self.intake_auth == "bearer":
-            return "authorization"
-        return None
-
     def _presented_credential(self, head: HttpRequest) -> str | None:
         """The credential this request presents, or ``None``. Header names are already lower-cased."""
-        name = self._credential_header()
-        if name is None:
-            return None
         if self.intake_auth == "api_key":
-            return head.headers.get(name)
+            return head.headers.get(self.intake_api_key_header)
         if self.intake_auth == "bearer":
-            scheme, _, token = head.headers.get(name, "").partition(" ")
+            scheme, _, token = head.headers.get("authorization", "").partition(" ")
             # OWS only, matching the header-value trim in the head parse; str.strip() would also
             # remove NBSP and NEL, so a bearer token and an API key would be trimmed differently.
             return token.strip(" \t") if scheme.lower() == "bearer" else None
@@ -903,19 +901,24 @@ class HttpSource(SourceConnector):
             return
         if head.method in _HEALTH_PROBE_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
-        # A CREDENTIAL HEADER MUST APPEAR AT MOST ONCE (BACKLOG #2051). The head parse keeps the LAST
-        # of two same-named lines, while a front end that authenticates the FIRST would have checked
-        # a different credential from the one this listener accepts. Refused as framing, like a
-        # repeated Host (BACKLOG #1972), BEFORE the limiter and before any comparison: it is a
-        # malformed request, not an authentication attempt, so it charges no budget and writes no
-        # auth audit row. IDENTICAL values are refused too, because a proxy may still split, merge
-        # or rewrite them. The reason names neither the header nor its value.
-        if self._credential_header() in head.repeated:
-            raise HttpRequestError(400, "duplicate credential header", kind="framing_error")
         peer = peer_host or "unknown"
         limited = self._rate_limit_refusal(peer)
         if limited is not None:
             raise limited
+        # A CREDENTIAL HEADER MUST APPEAR AT MOST ONCE (BACKLOG #2051). The head parse keeps the LAST
+        # of two same-named lines, while a front end that authenticates the FIRST would have checked
+        # a different credential from the one this listener accepts. Refused 400, as a repeated Host
+        # is (BACKLOG #1972), and before any comparison. IDENTICAL values are refused too, because a
+        # proxy may still split, merge or rewrite them. It sits AFTER the limiter and is charged and
+        # audited as a failed attempt: the 400 tells a peer the header name was right, which the
+        # 401 below does not, so that answer is held to the same budget as a guess. The reason
+        # names neither the header nor its value.
+        name = self._credential_header
+        if name is not None and name.replace("_", "-") in head.repeated:
+            raise self._charged(
+                peer,
+                HttpRequestError(400, "duplicate credential header", kind="intake_auth_failed"),
+            )
         if constant_time_match_any(self._presented_credential(head), self._intake_keys):
             self._note_intake_success(peer)
             return

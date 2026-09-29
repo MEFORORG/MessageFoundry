@@ -362,9 +362,14 @@ async def test_bearer_mode_reads_authorization_and_challenges() -> None:
         await src.stop()
 
 
-def _raw_with(lines: list[str]) -> bytes:
-    head = ["POST /ingest HTTP/1.1", "Host: localhost", "Content-Length: 2", *lines, "", ""]
-    return "\r\n".join(head).encode("ascii") + b"{}"
+def _raw_with(lines: list[str], *, method: str = "POST") -> bytes:
+    head = [f"{method} /ingest HTTP/1.1", "Host: localhost"]
+    body = b""
+    if method == "POST":
+        head.append("Content-Length: 2")
+        body = b"{}"
+    head.extend([*lines, "", ""])
+    return "\r\n".join(head).encode("ascii") + body
 
 
 @pytest.mark.parametrize(
@@ -373,12 +378,14 @@ def _raw_with(lines: list[str]) -> bytes:
         # BACKLOG #2051's reported shape: a front end reading the FIRST value sees a wrong key, while
         # the listener kept the LAST one and answered 202.
         ({"intake_auth": "api_key"}, ["x-api-key: wrong", f"x-api-key: {KEY}"]),
-        # The mirror: the right key first. The old code answered 401 and charged the budget.
+        # The mirror: the right key first. The old code answered 401.
         ({"intake_auth": "api_key"}, [f"x-api-key: {KEY}", "x-api-key: wrong"]),
         # IDENTICAL values are refused too; a proxy may still split or rewrite them.
         ({"intake_auth": "api_key"}, [f"x-api-key: {KEY}", f"x-api-key: {KEY}"]),
         # Header names are case-insensitive, so two spellings are still one header twice.
         ({"intake_auth": "api_key"}, ["X-Api-Key: wrong", f"x-api-key: {KEY}"]),
+        # A front end that folds `_` into `-` (BACKLOG #1913) reads these two as one header twice.
+        ({"intake_auth": "api_key"}, ["x_api_key: wrong", f"x-api-key: {KEY}"]),
         # The configurable header name is covered, not only the default.
         (
             {"intake_auth": "api_key", "intake_api_key_header": "x-acme-key"},
@@ -400,7 +407,8 @@ async def test_a_repeated_credential_header_is_refused_before_any_comparison(
 ) -> None:
     """BACKLOG #2051. The head parse keeps the last of two same-named headers, while a front end may
     authenticate the first. So a listener that reads a credential header refuses a request carrying
-    it twice with 400, before the limiter or any comparison: no audit row, no charge, no echo."""
+    it twice with 400 before any comparison. The refusal is charged and audited like a failed
+    attempt, and never echoes a value."""
     audit = _Audit()
     limiter = _CountingLimiter()
     events: list[tuple[str, str | None]] = []
@@ -417,12 +425,42 @@ async def test_a_repeated_credential_header_is_refused_before_any_comparison(
     finally:
         await src.stop()
     assert resp.status in (400, 0), resp.status  # 0: the Proactor loop reset before the flush
-    assert ("framing_error", "duplicate credential header") in events
-    assert audit.rows == []
-    assert limiter.checks == [] and limiter.charges == []
+    assert ("intake_auth_failed", "duplicate credential header") in events
+    mode = settings["intake_auth"]
+    assert audit.rows == [("intake.auth_failed", "127.0.0.1", f"mode={mode}")]
+    assert limiter.checks == ["127.0.0.1"] and limiter.charges == ["127.0.0.1"]
+    assert limiter.successes == []
+    blob = resp.body.decode("latin-1") + json.dumps(events) + json.dumps(audit.rows)
     for leak in (KEY, "wrong"):
-        assert leak.encode() not in resp.body
-        assert all(leak not in (why or "") for _kind, why in events)
+        assert leak not in blob
+
+
+async def test_a_repeated_credential_header_from_a_spent_peer_is_429() -> None:
+    """BACKLOG #2051. The limiter runs first, so a peer whose budget is gone cannot keep probing."""
+    limiter = _CountingLimiter(allow=False)
+    src = await _start(intake_auth="api_key", intake_api_key=KEY)
+    src.intake_rate_limiter = limiter
+    try:
+        raw = _raw_with([f"x-api-key: {KEY}", f"x-api-key: {KEY}"])
+        assert (await _request(src.sockport, raw=raw)).status in (429, 0)
+    finally:
+        await src.stop()
+    assert limiter.charges == []
+
+
+async def test_a_repeated_credential_header_on_a_health_probe() -> None:
+    """BACKLOG #2051. A probe inside the gate is held to the rule; an exempt probe reads no credential."""
+    raw = _raw_with(["x-api-key: a", "x-api-key: b"], method="GET")
+    src = await _start(intake_auth="api_key", intake_api_key=KEY)
+    try:
+        assert (await _request(src.sockport, raw=raw)).status in (400, 0)
+    finally:
+        await src.stop()
+    src = await _start(intake_auth="api_key", intake_api_key=KEY, intake_auth_health="allow")
+    try:
+        assert (await _request(src.sockport, raw=raw)).status == 200
+    finally:
+        await src.stop()
 
 
 async def test_a_repeated_header_the_mode_does_not_read_is_still_accepted() -> None:

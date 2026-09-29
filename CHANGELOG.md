@@ -289,9 +289,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   `intake_auth="api_key"` that is `intake_api_key_header`, and under `"bearer"` it is
   `Authorization`. In the shipped code the listener kept the last copy, so `x-api-key: wrong` then
   `x-api-key: <key>` was accepted, while a front end that authenticates the first copy would have
-  checked a different credential. The request is now refused before the rate limiter and before any
-  comparison, as a `framing_error` event with no audit row and no charge against the failure budget.
-  Two identical copies are refused too, since a proxy may still split or rewrite them. The refusal
+  checked a different credential. The request is now refused before any credential is compared. The
+  refusal is audited `intake.auth_failed` and charged against `intake_auth_rate_limit`, because
+  unlike the `401` it tells a peer the header name was right. Two identical copies are refused too,
+  since a proxy may still split or rewrite them, and `x_api_key` counts as a copy of `x-api-key`,
+  since some front ends fold `_` into `-`. The refusal
   names neither the header nor its value. A repeated header the active mode does not read, and every
   header under `none` or `mtls_subject`, is unaffected. (`BACKLOG #2051`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
