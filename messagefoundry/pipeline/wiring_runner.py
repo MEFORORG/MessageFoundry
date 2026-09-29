@@ -109,9 +109,7 @@ from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.parsing import (
     HL7PeekError,
     Peek,
-    RawMessage,
     encode_batch,
-    normalize,
     summarize,
     validate,
 )
@@ -124,9 +122,8 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES, PEEK_READ_FAULTS
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS
 from messagefoundry.parsing.sniff import (
-    _content_matches_declared,
     attachment_mime_agrees,
     b64_head,
     text_sniff_head,
@@ -136,7 +133,17 @@ from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
+    IngressGuardError,
+    IngressNulRejected,
+    carry_binary_ingress,
+    check_binary_size,
+    check_declared_type,
+    check_decoded,
+    decode_body,
+    listener_encoding,
+    peek_max_bytes,
     reingress_size_error,
+    store_safe_raw,
     streaming_over_threshold,
     strict_validate_timeout,
 )
@@ -493,6 +500,26 @@ _DEFAULT_TRANSFORM_CONCURRENCY = 1
 # is process-exit only, and the buildup/stall alerts fire only in the owner's delivery path.
 _SHARD_WATCHDOG_INTERVAL_SECONDS = 30.0
 
+# BACKLOG #1611 part B: how often the in-flight watch reads each stage's in-flight rows. Every other
+# buildup and stall check runs only from a lane's own processing path, and a stranded in-flight row
+# is exactly a lane that has stopped processing, so this one has to run on its own clock.
+_INFLIGHT_WATCH_INTERVAL_SECONDS = 30.0
+
+
+def _log_inflight_strand(stage: str, name: str, count: int, age: float) -> None:
+    """The in-flight watch's log line. The alert payloads carry no stage and do not say the rows are
+    in flight rather than pending, so this line does. Lane name and counts only, never content."""
+    log.warning(
+        "%d row(s) held in flight on %s lane %r, oldest claimed %.0fs ago with no handoff; "
+        "a stranded row stays in flight until a store recovery path re-pends it, at least a "
+        "restart",
+        count,
+        stage,
+        name,
+        age,
+    )
+
+
 # WS-C empty-claim storm (2026-07-02 bench finding; amends ADR 0061). With per-lane wake ON, a
 # committed row wakes ITS lane's worker directly, so the poll backstop is no longer the normal-case
 # latency path — it is only a lost-wake SAFETY NET. At connection scale a short backstop makes
@@ -529,40 +556,10 @@ _STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
 _strict_validate_timeout = strict_validate_timeout
 
 
-# Engine-level ingress size ceiling for NON-HL7 content types (SEC-017, CWE-770). The HL7 path already
-# enforces this via Peek.parse → enforce_size_limits; the binary/text branches had only the per-transport
-# frame cap (each individually disable-able with max_frame_bytes=0). Mirroring the HL7 cap here makes the
-# 16 MiB ceiling an engine-level invariant (belt-and-suspenders) rather than a per-transport one, so an
-# operator who disabled a transport cap (or a future transport that ships without one) still can't buffer
-# a multi-GB body whole. Measured on the raw BYTES pre-base64-inflation (binary) / the decoded str (text,
-# matching enforce_size_limits' len(norm) convention).
-_INGRESS_MAX_BYTES = DEFAULT_MAX_MESSAGE_BYTES
-
 # The generic MIME a detached document's stored content_type is downgraded to when the sender-declared
 # OBX-5.2 label contradicts the document's magic bytes (ASVS 1.3.4/5.2.2). Matches the download route's
 # _DEFAULT_ATTACHMENT_MIME so a mislabelled active-content payload is served as inert bytes either way.
 _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
-
-
-def _nul_safe_error_raw(raw: bytes, content_type: str, *, text: str | None = None) -> str:
-    """Return a store-bindable ``str`` for a failed-ingress ``raw`` (INGEST-4 / ADR 0028 §168).
-
-    The ERROR/dead-letter paths store a byte view of the rejected body. A latin-1 (or decoded) view
-    that carries a NUL (U+0000) is store-hostile: Postgres REJECTS it at bind (the raise is uncaught,
-    unwinds out of ``_handle_inbound`` into the transport's ``except`` and drops the whole TCP
-    connection with NO ERROR row — a count-and-log violation, CLAUDE.md §2), and SQLite/SQL Server
-    truncate the stored value at the first NUL. U+0000 is the ONLY store-hostile latin-1 codepoint
-    (U+0001..U+00FF ride TEXT/NVARCHAR intact), so we keep the faithful, human-readable view when it
-    is NUL-free and escalate to the ADR 0028 ``mfb64:v1:`` byte-carriage only when a NUL is present —
-    the exact original bytes are then recoverable via ``RawMessage.raw_bytes``. Because ``b"\\x00" in
-    raw`` and ``"\\x00" in raw.decode("latin-1")`` are bijective, the NUL check on the view is exact.
-
-    ``text`` supplies an already-decoded view (the post-decode NUL guard reuses this helper); when
-    omitted the pre-decode ERROR paths get the lossless ``latin-1`` view of the raw bytes."""
-    view = text if text is not None else raw.decode("latin-1")
-    if "\x00" not in view:
-        return view
-    return RawMessage.from_bytes(raw, content_type).raw
 
 
 class _StreamBudgetExceeded(Exception):
@@ -1352,6 +1349,8 @@ class RegistryRunner:
         self._conn_events_dropped = 0
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
         self._shard_watchdog: asyncio.Task[None] | None = None
+        # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
+        self._inflight_watch: asyncio.Task[None] | None = None
         # #122 (ADR 0162): fail-closed application-log write guard. The escalation arrives on whatever
         # thread was logging, so the response is bounced onto this runner's loop as a task; the latch
         # makes the stop fire once per break rather than once per dropped record.
@@ -3635,6 +3634,12 @@ class RegistryRunner:
             if self._connection_events:
                 self._conn_event_q = asyncio.Queue(maxsize=_CONN_EVENT_QUEUE_MAX)
                 self._conn_event_drainer = asyncio.create_task(self._connection_event_drainer())
+            # BACKLOG #1611 part B: page on a row stranded in flight. At most four grouped reads per
+            # tick, and none when every age threshold is off. A task left by a teardown that did not
+            # finish (ADR 0157 D7) is cancelled first, so two watches never page the same strand.
+            if self._inflight_watch is not None:
+                self._inflight_watch.cancel()
+            self._inflight_watch = asyncio.create_task(self._inflight_watch_loop())
             if self.registry.shard_id is not None:
                 # ADR 0073 sharded-mode extras: page on a non-owned lane backing up (a hung owner is
                 # invisible to the supervisor and never pages itself), and warn on the per_lane_wake
@@ -4130,6 +4135,10 @@ class RegistryRunner:
             self._shard_watchdog.cancel()
             await asyncio.gather(self._shard_watchdog, return_exceptions=True)
             self._shard_watchdog = None
+        if self._inflight_watch is not None:
+            self._inflight_watch.cancel()
+            await asyncio.gather(self._inflight_watch, return_exceptions=True)
+            self._inflight_watch = None
         for connector in self._destinations.values():
             await connector.aclose()
         # ADR 0071 B5: tear down the per-stage fusing executors + drop the dedicated synchronous handoff
@@ -5349,8 +5358,9 @@ class RegistryRunner:
         5.2.2, BACKLOG #1109). ``True`` means the body was dead-lettered here and the caller must stop;
         ``False`` means it matched (or the type carries no reliable signature) and ingress continues.
 
-        The file sources have run this same :func:`_content_matches_declared` since the 5.2.2 hardening,
-        quarantining a mismatch to their ``.error`` directory. A socket has no ``.error`` directory, so
+        The rule is :func:`~messagefoundry.pipeline.ingress_guards.check_declared_type`, which the
+        operator resend calls too. The file sources have run the same magic-byte sniff since the
+        5.2.2 hardening, quarantining a mismatch to their ``.error`` directory. A socket has no ``.error`` directory, so
         the disposition that fits here is the one the decode/NUL/size guards beside this already use: a
         persisted ``ERROR`` row. That keeps the count-and-log invariant (CLAUDE.md section 2) — the body
         is recorded, never accepted-and-dropped — and it makes the check *decide* rather than merely
@@ -5365,22 +5375,20 @@ class RegistryRunner:
         ``text`` is the decoded body for a text content type; passing it selects the encoding-independent
         head (see :func:`text_sniff_head`) and stores the readable decoded view in the ERROR row, exactly
         as the size guard beside it does. Omit it for a binary content type, whose bytes are the body."""
-        head = raw if text is None else text_sniff_head(text)
-        if _content_matches_declared(ic.content_type, head):
-            return False
-        # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
-        await self.store.record_received(
-            channel_id=ic.name,
-            raw=text if text is not None else _nul_safe_error_raw(raw, ic.content_type.value),
-            status=MessageStatus.ERROR,
-            error=(
-                f"ingress body does not match its declared content type "
-                f"{ic.content_type.value!r} (no matching magic bytes)"
-            ),
-            source_type=ic.spec.type.value,
-            message_type=ic.content_type.value,
-        )
-        return True
+        try:
+            check_declared_type(ic, raw if text is None else text_sniff_head(text))
+        except IngressGuardError as exc:
+            # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=text if text is not None else store_safe_raw(raw, ic.content_type.value),
+                status=MessageStatus.ERROR,
+                error=exc.reason,
+                source_type=ic.spec.type.value,
+                message_type=ic.content_type.value,
+            )
+            return True
+        return False
 
     async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> str | None:
         """Commit a POSTed HTTP body to the ingress stage and return the engine ``message_id`` (the
@@ -5401,14 +5409,16 @@ class RegistryRunner:
         hl7v2 = ic.content_type is ContentType.HL7V2
 
         if not hl7v2 and ic.content_type.is_binary:
-            # Binary ingress (ADR 0028) — base64-carry at the boundary; never text-decode. Engine size
-            # ceiling on the RAW bytes (SEC-017), mirroring _handle_inbound. ERROR + None on overrun.
-            if len(raw) > _INGRESS_MAX_BYTES:
+            # Binary ingress (ADR 0028) — base64-carry at the boundary; never text-decode. The shared
+            # guard bounds the RAW bytes (SEC-017), as _handle_inbound does. ERROR + None on overrun.
+            try:
+                check_binary_size(raw)
+            except IngressGuardError as exc:
                 await self.store.record_received(
                     channel_id=ic.name,
-                    raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                    raw=store_safe_raw(raw, ic.content_type.value),
                     status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
+                    error=exc.reason,
                     source_type=src,
                     message_type=ic.content_type.value,
                 )
@@ -5417,7 +5427,7 @@ class RegistryRunner:
                 return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
-                raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
+                raw=carry_binary_ingress(raw, ic),
                 control_id=None,
                 message_type=ic.content_type.value,
                 source_type=src,
@@ -5426,51 +5436,49 @@ class RegistryRunner:
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return mid
 
-        encoding = ic.spec.settings.get("encoding", "utf-8")
+        # The same decode and post-decode guards as _handle_inbound, from ingress_guards (#1689).
+        encoding = listener_encoding(ic)
         try:
-            text = (
-                normalize(raw, encoding=encoding, errors="strict")
-                if hl7v2
-                else raw.decode(encoding)
-            )
-        except UnicodeDecodeError as exc:
+            text = decode_body(raw, ic, encoding=encoding)
+        except IngressGuardError as exc:
             await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                raw=store_safe_raw(raw, ic.content_type.value),
                 status=MessageStatus.ERROR,
-                error=f"decode error ({encoding}): {safe_exc(exc)}",
+                error=exc.reason,
                 source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             return None
 
-        if "\x00" in text:
-            # INGEST-4: the body decoded cleanly but carries a NUL (U+0000) — invalid in every text
-            # payload we accept (HL7 v2 field data, JSON, XML 1.0, X12) and store-hostile (Postgres
-            # rejects it at bind → dropped connection; SQLite/SQL Server truncate). Dead-letter it here,
-            # BEFORE Peek.parse and any store write, so text (and every value derived from it) is
-            # NUL-free for the rest of this handler. HTTP owns its own 202/4xx response — no HL7 ACK.
+        try:
+            check_decoded(text, ic)
+        except IngressNulRejected as exc:
+            # INGEST-4: dead-letter a NUL-bearing body BEFORE Peek.parse and any store write, so text
+            # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
+            # own 202/4xx response — no HL7 ACK.
             await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value, text=text),
+                raw=store_safe_raw(raw, ic.content_type.value, text=text),
                 status=MessageStatus.ERROR,
-                error="ingress body contains a NUL (U+0000), invalid in a text/HL7 payload",
+                error=exc.reason,
                 source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
+            )
+            return None
+        except IngressGuardError as exc:
+            # The engine ceiling on a NON-HL7 body (SEC-017); check_decoded never raises it for HL7.
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=text,
+                status=MessageStatus.ERROR,
+                error=exc.reason,
+                source_type=src,
+                message_type=ic.content_type.value,
             )
             return None
 
         if not hl7v2:
-            if len(text) > _INGRESS_MAX_BYTES:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=text,
-                    status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(text)} > {_INGRESS_MAX_BYTES} bytes)",
-                    source_type=src,
-                    message_type=ic.content_type.value,
-                )
-                return None
             if await self._declared_content_mismatch(ic, raw, text=text):
                 return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
@@ -5489,10 +5497,9 @@ class RegistryRunner:
         # not an HL7 ACK frame (the HL7-ACK-over-HTTP / SOAP-reply path is the deferred ADR 0013 seam).
         # #149 (ADR 0105 Phase 1a): mirror the MLLP path — a streaming inbound raises the peek ceiling to
         # its max_message_bytes and downgrades whole-body strict validation to header-only over threshold.
-        peek_max_bytes = ic.max_message_bytes or DEFAULT_MAX_MESSAGE_BYTES
         streaming_over = self._streaming_over_threshold(ic, text)
         try:
-            peek = Peek.parse(text, max_bytes=peek_max_bytes)
+            peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             await self.store.record_received(
@@ -5638,17 +5645,17 @@ class RegistryRunner:
         hl7v2 = ic.content_type is ContentType.HL7V2
 
         if not hl7v2 and ic.content_type.is_binary:
-            # Engine-level ingress size guard (SEC-017, CWE-770): the HL7 path enforces a 16 MiB ceiling
-            # via Peek.parse → enforce_size_limits; mirror it here for binary ingress so the cap is an
-            # engine invariant, not just a per-transport frame cap (which is disable-able). Measure on the
-            # RAW bytes (pre-base64-inflation) so the carriage codec can't blow past the ceiling. Record
-            # ERROR + return None (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
-            if len(raw) > _INGRESS_MAX_BYTES:
+            # Engine-level ingress size guard (SEC-017, CWE-770) on the RAW bytes, so the cap is an engine
+            # invariant and not only a per-transport frame cap (which is disable-able). Record ERROR +
+            # return None (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
+            try:
+                check_binary_size(raw)
+            except IngressGuardError as exc:
                 await self.store.record_received(
                     channel_id=ic.name,
-                    raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                    raw=store_safe_raw(raw, ic.content_type.value),
                     status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
+                    error=exc.reason,
                     source_type=src,
                     message_type=ic.content_type.value,
                 )
@@ -5657,12 +5664,12 @@ class RegistryRunner:
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Binary ingress (ADR 0028): a byte-oriented content type carries raw bytes that cannot
             # ride the str/TEXT store as text — a NUL/non-UTF-8 body is rejected (Postgres) or
-            # truncated (SQLite/SQL Server). Base64-carry them at the source boundary via
-            # RawMessage.from_bytes (the one encode); never attempt a text decode. The router/transform
-            # workers route the carriage form as a RawMessage and a codec recovers bytes via .raw_bytes.
+            # truncated (SQLite/SQL Server). Base64-carry them at the source boundary (the one encode);
+            # never attempt a text decode. The router/transform workers route the carriage form as a
+            # RawMessage and a codec recovers bytes via .raw_bytes.
             await self.store.enqueue_ingress(
                 channel_id=ic.name,
-                raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
+                raw=carry_binary_ingress(raw, ic),
                 control_id=None,
                 message_type=ic.content_type.value,
                 source_type=src,
@@ -5676,18 +5683,17 @@ class RegistryRunner:
         # lossless latin-1 view) and NAK, rather than silently substituting U+FFFD into the stored
         # raw and the delivered copy (review H-3). HL7 also normalizes line endings to \r; a non-HL7
         # body (JSON/XML/text) is decoded verbatim — \r-normalizing it would corrupt it (ADR 0004).
-        encoding = ic.spec.settings.get("encoding", "utf-8")
+        # The decode and the post-decode guards below are ingress_guards' (#1689), the same two calls
+        # the dry-run makes. The encoding setting reaches decode_body unresolved on purpose;
+        # listener_encoding says why.
+        encoding = listener_encoding(ic)
         try:
-            text = (
-                normalize(raw, encoding=encoding, errors="strict")
-                if hl7v2
-                else raw.decode(encoding)
-            )
-        except UnicodeDecodeError as exc:
-            decode_err = f"decode error ({encoding}): {safe_exc(exc)}"
+            text = decode_body(raw, ic, encoding=encoding)
+        except IngressGuardError as exc:
+            decode_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                raw=store_safe_raw(raw, ic.content_type.value),
                 status=MessageStatus.ERROR,
                 error=decode_err,
                 source_type=src,
@@ -5709,7 +5715,9 @@ class RegistryRunner:
                 )
             return ack
 
-        if "\x00" in text:
+        try:
+            check_decoded(text, ic)
+        except IngressNulRejected as exc:
             # INGEST-4: the body decoded cleanly but carries a NUL (U+0000) — invalid in every text
             # payload we accept (HL7 v2 field data, JSON, XML 1.0, X12) and store-hostile (Postgres
             # rejects it at bind, which would unwind out of this handler into the transport and drop the
@@ -5717,10 +5725,10 @@ class RegistryRunner:
             # at the first NUL). Dead-letter it here, BEFORE Peek.parse and any store write, so text (and
             # control_id/summary/strict-fail errors derived from it) is NUL-free for the rest of this
             # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body.
-            nul_err = "ingress body contains a NUL (U+0000), invalid in a text/HL7 payload"
+            nul_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value, text=text),
+                raw=store_safe_raw(raw, ic.content_type.value, text=text),
                 status=MessageStatus.ERROR,
                 error=nul_err,
                 source_type=src,
@@ -5741,22 +5749,22 @@ class RegistryRunner:
                     detail=nul_err,
                 )
             return ack
+        except IngressGuardError as exc:
+            # Engine-level ingress size guard (SEC-017, CWE-770) on a NON-HL7 body, measured on the
+            # decoded text as the HL7 path's enforce_size_limits measures len(norm); check_decoded never
+            # raises it for HL7. Record ERROR + return None (no HL7 ACK for non-HL7) — count-and-log,
+            # never crash the connection.
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=text,
+                status=MessageStatus.ERROR,
+                error=exc.reason,
+                source_type=src,
+                message_type=ic.content_type.value,
+            )
+            return None
 
         if not hl7v2:
-            # Engine-level ingress size guard (SEC-017, CWE-770), mirroring the HL7 path's
-            # enforce_size_limits (which measures len(norm) on the decoded str). Measure on the decoded
-            # text the same way so the engine ceiling matches the HL7 path. Record ERROR + return None
-            # (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
-            if len(text) > _INGRESS_MAX_BYTES:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=text,
-                    status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(text)} > {_INGRESS_MAX_BYTES} bytes)",
-                    source_type=src,
-                    message_type=ic.content_type.value,
-                )
-                return None
             if await self._declared_content_mismatch(ic, raw, text=text):
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Payload-agnostic ingress (ADR 0004): a non-HL7 inbound skips HL7 peek/validate and the
@@ -5777,10 +5785,9 @@ class RegistryRunner:
         # per-connection max_message_bytes so a large document is admitted (then detached under the cap);
         # a non-streaming inbound keeps the engine 16 MiB default. A body over the resolved cap raises
         # HL7PeekError here → recorded ERROR + NAK AR (the max_message_bytes rejection).
-        peek_max_bytes = ic.max_message_bytes or DEFAULT_MAX_MESSAGE_BYTES
         streaming_over = self._streaming_over_threshold(ic, text)
         try:
-            peek = Peek.parse(text, max_bytes=peek_max_bytes)
+            peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             # Every peek read the ingress commit needs, taken inside this guard (BACKLOG #1594).
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
@@ -7892,11 +7899,33 @@ class RegistryRunner:
         )
         if not crossed:
             return
+        self._fire_buildup(key, name, depth=depth, age=oldest_age or 0.0, now=now)
+
+    def _fire_buildup(self, key: str, name: str, *, depth: int, age: float, now: float) -> None:
+        """Arm the ``(stage, lane)`` re-alert throttle ``key`` and emit ``queue_buildup``. The pending
+        check and the in-flight watch both fire through here, so one lane pages once per window
+        whichever saw it first. A sink must never raise (contract); the guard keeps an alerting bug
+        from killing the caller.
+
+        The throttle is checked again here because a pending check awaits its store read between its
+        own check and this call, and the in-flight watch can fire the same key inside that await."""
+        if now < self._next_buildup_alert.get(key, 0.0):
+            return
         self._next_buildup_alert[key] = now + _BUILDUP_REALERT_SECONDS
         try:
-            self._alert_sink.queue_buildup(name, depth=depth, oldest_age_seconds=oldest_age or 0.0)
+            self._alert_sink.queue_buildup(name, depth=depth, oldest_age_seconds=age)
         except Exception:
             log.exception("alert sink raised on queue_buildup for %r", name)
+
+    def _fire_stall(self, name: str, *, age: float, now: float) -> None:
+        """The ``message_stall`` twin of :meth:`_fire_buildup`, on the per-lane stall throttle."""
+        if now < self._next_stall_alert.get(name, 0.0):
+            return
+        self._next_stall_alert[name] = now + _BUILDUP_REALERT_SECONDS
+        try:
+            self._alert_sink.message_stall(name, oldest_age_seconds=age)
+        except Exception:
+            log.exception("alert sink raised on message_stall for %r", name)
 
     async def _maybe_alert_saturation(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
@@ -8002,11 +8031,126 @@ class RegistryRunner:
         oldest_age = now - oldest_created
         if oldest_age < threshold.max_oldest_seconds:
             return  # oldest message hasn't stalled long enough yet
-        self._next_stall_alert[name] = now + _BUILDUP_REALERT_SECONDS
-        try:
-            self._alert_sink.message_stall(name, oldest_age_seconds=oldest_age)
-        except Exception:
-            log.exception("alert sink raised on message_stall for %r", name)
+        self._fire_stall(name, age=oldest_age, now=now)
+
+    async def _inflight_watch_loop(self) -> None:
+        """Run :meth:`_check_inflight_strands` every ``_INFLIGHT_WATCH_INTERVAL_SECONDS`` until stop
+        (BACKLOG #1611 part B). A failed tick is logged and the next one retries: this task is the only
+        thing that can see a strand, so it must not die of one bad read."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=_INFLIGHT_WATCH_INTERVAL_SECONDS)
+                return  # stop signalled
+            except TimeoutError:
+                pass
+            try:
+                await self._check_inflight_strands()
+            except Exception:
+                log.exception("in-flight watch check failed; the next tick retries")
+
+    async def _check_inflight_strands(self, now: float | None = None) -> None:
+        """Page on a row held in flight past the lane's age threshold (BACKLOG #1611 part B, P3-03).
+
+        **Why this exists.** A claim is its own committed transaction, so a store fault between it and
+        the handoff leaves the row ``inflight``. Part A made the per-lane workers re-pend it, and the
+        pooled dispatcher already did (T17), but both re-pends are store writes that can fail too.
+        What is left then is recovered by ``reset_stale_inflight`` at the next start, and nothing
+        before that. It is invisible to ``pending_depth``, so the buildup and stall alerts read the
+        lane healthy, and those alerts only run from the lane's own processing path, which a strand
+        has stopped. This check runs on its own clock and reads in-flight rows directly.
+
+        **What it pages, on which threshold.** Every lane fires ``queue_buildup`` on the age its
+        pending check uses: an outbound lane's resolved :class:`BuildupThreshold`, and the global
+        default for an ingress, routed or response lane. That age is on by default (300 s), so a
+        default engine pages a strand. An outbound lane also fires ``message_stall`` on its resolved
+        :class:`StallThreshold`, which is off by default. Each shares its alert's throttle with the
+        pending check, so one lane is paged once per window whichever check saw it first. With every
+        age off this method reads nothing.
+
+        **The age is since the CLAIM, not since the enqueue.** A row that is being worked right now
+        has a small claim age however old its message is, so a fresh claim cannot page. A row held
+        past the threshold is either stranded or in a send or transform that has run that long, and
+        an operator wants the page in both cases.
+
+        **It does not recover the row.** A reclaim would have to know which in-flight rows no live
+        task still holds, and the pooled dispatcher keeps a claimed prefix inside its own serializer
+        where this runner cannot see it. Re-pending a held row sends it twice. So this pages, and
+        the store's existing recovery paths still re-pend. They include at least
+        ``reset_stale_inflight`` at a single-node start and, on Postgres only, the expired-lease
+        reclaim inside the FIFO head claims plus the clustered leader's ``reclaim_expired_leases``
+        sweep. An ``ordering=unordered`` lane claims through ``claim_ready``, which has no such
+        reclaim. And on a FIFO lane the lease reclaim re-pends the row after its successors have
+        shipped, so it is a reorder, not a heal. This is the one place that says so; the log line,
+        the CHANGELOG and ``CONFIGURATION.md`` do not repeat it.
+
+        **Only the leader pages.** Under active-passive HA the graph runs on the leader alone, and a
+        demoted node's teardown cancels this task; the gate closes the window between the two."""
+        if not self._coordinator.is_leader():
+            return  # a node that is not the leader runs no graph, so it pages no lane (HA)
+        inbound_age = self._buildup_default.max_oldest_seconds
+        outbound: dict[str, tuple[float | None, float | None]] = {}
+        for name in self.registry.outbound:
+            if not self._owns_destination(name) or name in self._outbound_paused:
+                continue
+            buildup = (self._buildup.get(name) or self._buildup_default).max_oldest_seconds
+            stall = (self._stall.get(name) or self._stall_default).max_oldest_seconds
+            if buildup is not None or stall is not None:
+                outbound[name] = (buildup, stall)
+        if inbound_age is None and not outbound:
+            return  # every age off: no store read
+        now = time.time() if now is None else now
+        if outbound:
+            held = await self.store.inflight_by_lane(stage=Stage.OUTBOUND.value)
+            for name, (count, oldest_claimed) in held.items():
+                if name in outbound:
+                    buildup, stall = outbound[name]
+                    self._page_inflight(
+                        Stage.OUTBOUND.value, name, count, now - oldest_claimed, buildup, stall, now
+                    )
+        if inbound_age is None:
+            return
+        stages = [Stage.INGRESS.value, Stage.ROUTED.value]
+        if self._has_loopback_inbound():
+            stages.append(Stage.RESPONSE.value)  # re-ingress tokens drain only on a loopback lane
+        for stage in stages:
+            held = await self.store.inflight_by_lane(stage=stage)
+            for name, (count, oldest_claimed) in held.items():
+                ic = self.registry.inbound.get(name)
+                if ic is None:
+                    continue  # not this engine's lane (another engine shard's, or reloaded away)
+                if stage == Stage.RESPONSE.value and ic.spec.type is not ConnectorType.LOOPBACK:
+                    continue  # the RESPONSE lane set is the loopback inbounds, as the dispatcher's
+                self._page_inflight(
+                    stage, name, count, now - oldest_claimed, inbound_age, None, now
+                )
+
+    def _page_inflight(
+        self,
+        stage: str,
+        name: str,
+        count: int,
+        age: float,
+        buildup: float | None,
+        stall: float | None,
+        now: float,
+    ) -> None:
+        """Fire ``queue_buildup`` (on the pending check's ``(stage, lane)`` key) and ``message_stall``
+        for an in-flight hold past each threshold that is set and not throttled. The log line is
+        written once per lane per tick, and only when something fires."""
+        key = f"{stage}:{name}"
+        fire_buildup = (
+            buildup is not None and age >= buildup and now >= self._next_buildup_alert.get(key, 0.0)
+        )
+        fire_stall = (
+            stall is not None and age >= stall and now >= self._next_stall_alert.get(name, 0.0)
+        )
+        if not (fire_buildup or fire_stall):
+            return
+        _log_inflight_strand(stage, name, count, age)
+        if fire_buildup:
+            self._fire_buildup(key, name, depth=count, age=age, now=now)
+        if fire_stall:
+            self._fire_stall(name, age=age, now=now)
 
     # --- pooled-mode per-stage adapters (ADR 0066) ---------------------------
     # The pooled StageDispatcher's process_item callable has signature (lane, item) -> LaneItemResult;

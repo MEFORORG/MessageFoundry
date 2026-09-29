@@ -224,15 +224,13 @@ def test_scp_shipped_default_refuses_above_the_engine_ingress_ceiling_before_dec
     # BACKLOG #1910: the shipped max_object_bytes is 128 MiB, but the engine's binary ingress records
     # anything over 16 MiB as ERROR. At the SHIPPED default the SCP must therefore refuse one byte over
     # the ceiling before decode, and let exactly the ceiling through to decode (the 0xC000 control).
-    from messagefoundry.pipeline.wiring_runner import _INGRESS_MAX_BYTES
+    from messagefoundry.pipeline.ingress_guards import INGRESS_MAX_BYTES
 
     scp = _build_scp([])  # no max_object_bytes: the shipped default
     uncompressed = "1.2.840.10008.1.2.1"
-    over = _FakeStoreEvent(
-        transfer_syntax=uncompressed, data_set=b"\x00" * (_INGRESS_MAX_BYTES + 1)
-    )
+    over = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * (INGRESS_MAX_BYTES + 1))
     assert scp._on_c_store(over) == 0xA700
-    at = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * _INGRESS_MAX_BYTES)
+    at = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * INGRESS_MAX_BYTES)
     assert scp._on_c_store(at) == 0xC000, "exactly the ceiling must reach the decode trap"
 
 

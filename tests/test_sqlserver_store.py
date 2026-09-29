@@ -536,6 +536,18 @@ async def test_reset_stale_inflight_recovers(store) -> None:
     assert (await store.outbox_for(item.message_id))[0]["status"] == OutboxStatus.PENDING.value
 
 
+async def test_inflight_by_lane_reports_claim_time(store) -> None:
+    # BACKLOG #1611 part B, SQLite parity: in-flight rows only, aged from the claim, not the enqueue.
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {}
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "q")], now=150.0)
+    await store.claim_next_fifo("OB1", now=500.0)
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB1": (1, 500.0)}
+    assert await store.inflight_by_lane(stage=Stage.INGRESS.value) == {}
+    await store.reset_stale_inflight(now=600.0)
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {}
+
+
 async def test_replay_requeues(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
