@@ -266,8 +266,8 @@ pool, so an impersonated identity cannot leak into unrelated work. `RevertToSelf
 ## 7. The parsers accept input an attacker chooses
 
 Message payloads, partner replies, uploaded files, browser requests and archives all arrive from
-outside. The tables below list every parser that reads them. `CLAUDE.md` states the rule this
-follows:
+outside. The tables below list at least the parsers that read them. `CLAUDE.md` states the rule
+this follows:
 **treat all message content as untrusted data, never as instructions.**
 
 **The HL7 parser is deliberately tolerant, and that is not a defect to fix.** Real clinical traffic
@@ -298,61 +298,85 @@ these:
 
 1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml`, `xml`,
    `xmlschema`, `signxml`, `pydicom`, `pynetdicom`, `pyx12`, `fhir.resources`, `fhirpathpy`,
-   `cbor2`, `webauthn`, `csv`, `email.parser` or `email.feedparser`.
-2. A JSON decode: a call to `json.loads`, `json.load` or the engine's `json_loads_or_refusal`, or a
-   `.json()` method call with no arguments.
-3. A form decode: a call to `parse_qs` or `parse_qsl`.
+   `cbor2`, `webauthn`, `csv`, `email.parser`, `email.feedparser`, `pickle`, `marshal` or
+   `shelve`.
+2. A JSON decode: a call to `json.loads`, `json.load` or the engine's `json_loads_or_refusal`, or
+   any `.json()` method call.
+3. A form or mail decode: a call to `parse_qs`, `parse_qsl`, `message_from_bytes` or
+   `message_from_string`.
 4. A hand-written byte parser: `split`, `rsplit`, `partition`, `rpartition`, `find`, `rfind`,
    `index` or `rindex` called with a bytes literal first, or any `unpack`, `unpack_from` or
    `iter_unpack` call.
+5. An inbound connector: a call to `register_source`.
 
 A hit inside a codec package under `parsing/`, such as `parsing/xml/`, counts for the whole package.
-Every parse site the scan finds sits in exactly one of the two tables below. The first holds the
-ones that read input from outside the engine. The second holds the ones that read only what the
-engine wrote itself or an operator supplied, with the reason.
+Every parse site the scan finds sits in exactly one of the first two tables below. The first holds
+the modules where any code reads input from outside the engine, whichever call the scan matched.
+The second holds the ones that read only what the engine wrote itself or an operator supplied. The
+third table lists hand-written parsers the patterns cannot see, found by reading the code.
 
 The scan leaves some parsing out on purpose, and it has limits:
 
-- `tomllib` reads only configuration files an operator writes, which section 1's directory
-  permissions already cover.
-- Protocol libraries parse their own wire: the HTTP server and clients, TLS, and `ldap3`. So does
-  FastAPI, which decodes every other API request body as JSON and checks it against a model before
-  a route sees it. [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) covers those libraries.
-- A hand-written parser that makes none of these calls would be missed. So would parsing inside
-  your own Routers and Handlers (section 1).
+- `tomllib` is not in pattern 1. It reads service settings, connection files and code sets. Of
+  those, only a code set can come from another system, and `config/code_sets.py` is in the first
+  table through its `csv` import.
+- Libraries parse their own wire: uvicorn's HTTP server, the HTTP clients, TLS and `ldap3`. FastAPI
+  decodes every other API request body as JSON, and checks it against a model before a route sees
+  it. [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) covers those libraries. The engine's own HTTP
+  inbound listener is hand-written, and it is in the first table.
+- A hand-written parser that makes none of these calls is missed by the scan. The third table holds
+  the ones found by reading, and there may be more. Parsing inside your own Routers and Handlers is
+  yours (section 1).
 - Archives and compressed streams have a scan of their own, in the list after these tables.
 
 **Parsers that read input from outside the engine.**
 
 | Input | Where it comes from | Modules |
 |---|---|---|
-| HL7 v2 | An inbound connection; strict validation is opt-in | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
+| Inbound connectors | Whatever a sender or a polled source delivers. `transports/http_listener.py` reads the HTTP request line and headers itself. | `transports/file.py`, `transports/http_listener.py`, `transports/remotefile.py`, `transports/tcp.py`, `transports/x12.py` |
+| The intake path | The shared ingress code that hands each received body to the parsers below | `pipeline/wiring_runner.py` |
+| HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
-| JSON and FHIR payloads | An inbound connection whose content type is `json` or `fhir`, parsed when a Router or Handler asks, as by `RawMessage.json()` | `parsing/message.py`, `parsing/fhir/` |
+| JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
 | XML and SOAP | An inbound payload, or a SOAP body fragment built from a message | `parsing/message.py`, `parsing/xml/`, `transports/soap.py` |
-| X12 | An inbound connection whose content type is `x12` | `parsing/x12/` |
+| X12 | An inbound whose content type is `x12` | `parsing/x12/` |
 | DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
 | A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |
-| An SVG attachment inside a stored message | A sender, through the message; read when the attachment is downloaded | `api/svg_sanitize.py` |
-| An uploaded file | The body of `POST /uploads`, a hand-written `multipart/form-data` parser (ADR 0134). The route needs the files-upload permission and step-up authentication. The parser caps each part's header block, and its own comment calls that block attacker-supplied. | `api/multipart.py` |
+| Captured traffic | The messages the de-identification tools read | `anon/hl7.py` |
+| An SVG attachment inside a stored message | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
+| An uploaded file | The body of `POST /uploads`. `api/multipart.py` is a hand-written `multipart/form-data` parser (ADR 0134), and its own comment calls each part's header block attacker-supplied. The route needs the files-upload permission and step-up authentication. | `api/app.py`, `api/multipart.py`, `uploads.py` |
+| Code sets | Files in the config directory, and the exports from another system that the reference sync re-reads | `config/code_sets.py` |
+| The sandbox child's replies | The child runs your Routers and Handlers, so the parent treats what it sends back as untrusted | `pipeline/sandbox.py`, `pipeline/_sandbox_codec.py` |
 | Partner and service replies | A partner's HTTP reply headers, a FHIR server, a DICOMweb server, a SMART token endpoint, the AI provider | `transports/bounded_read.py`, `transports/fhir.py`, `transports/dicomweb.py`, `transports/smart.py`, `transports/ai_broker.py` |
-| Replies from an engine address | Whatever answers at the address a client is given: the API client library, the tray's health probe, and the deployment verifier's smoke test. It is meant to be the engine, but nothing proves that before the parse. | `apiclient/client.py`, `tray/probe.py`, `verify/smoke.py` |
-| Identity provider replies | The OIDC token response and key set, and the header and claims of an ID token | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
-| Browser requests | A passkey response, JSON with CBOR inside that the `webauthn` library of the optional `[webauthn]` extra decodes; the web console's form bodies and the Content Security Policy reports a browser sends | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py`, `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
+| Replies from an engine address | Whatever answers at the address a client is given. It is meant to be the engine, but nothing proves that before the parse. | `apiclient/client.py`, `tray/probe.py`, `verify/smoke.py` |
+| Identity provider replies | The OpenID Connect token response and key set, and an ID token's header and claims | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
+| A passkey response | A browser sends JSON with CBOR (Concise Binary Object Representation) inside. The `webauthn` library, from the optional `[webauthn]` extra, decodes the CBOR. | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py` |
+| Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `corepoint_import.py` |
-| A backup | The manifest and encrypted blocks `messagefoundry restore` reads; the archive list below says what bounds them | `pipeline/dr_backup.py`, `store/backup_codec.py` |
+| A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
 
 **Parse sites left out, and why.**
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, message metadata, its log spool, and its encrypted upload metadata | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `api/app.py`, `api/approvals.py`, `api/auth_routes.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `pipeline/wiring_runner.py`, `log_spool.py`, `uploads.py` |
-| It reads what another part of the same engine sent: the wire from its own sandbox child, and the responses its own HTTP server writes | `pipeline/sandbox.py`, `pipeline/_sandbox_codec.py`, `api/protocol_headers.py` |
-| It reads what an operator supplies: service settings, code-set files, private key files, command-line JSON, the install's own package metadata, and a restore token file | `config/settings.py`, `config/code_sets.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py` |
-| It parses no input: it builds messages, reads `hl7apy`'s own schema tables, names an error type, quiets a library logger, or defines the JSON helper each caller above uses | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `anon/hl7.py`, `phi_log_silencer.py`, `redaction.py` |
+| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `api/approvals.py`, `api/auth_routes.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
+| It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
+| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata and a restore token file | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py` |
+| It is an inbound that reads nothing itself. The timer emits a body an operator configured. The loopback and pass-through inbounds only take what the engine hands over. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
+| It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. `redaction.py` defines the JSON helper that the callers above use. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py`, `redaction.py` |
 
-The second table rests on a judgement about where each input comes from, and the test cannot check
-that judgement. Re-read a row when its module changes what it reads.
+**Hand-written parsers the patterns cannot see.**
+
+| What it parses | Modules |
+|---|---|
+| MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
+| HL7 batch files, split into messages | `parsing/split.py` |
+| The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
+| The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
+| The reply from a network time server | `logging_setup.py` |
+
+The first two tables rest on a judgement about where each input comes from, and the test cannot
+check that judgement. Re-read a row when its module changes what it reads.
 
 **Archives and compressed streams are parsed too.** A small input can expand into a huge one, and
 an archive names its own members, so each reader below bounds both. These modules import an archive
@@ -577,18 +601,18 @@ reads the code and fails when one of these no longer matches it:
   `shell=True`;
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
-- the section 7 parser tables: a parse site the four patterns find that neither table names, a
-  site named in both, or a name the scan does not find. The four patterns the page states must be
-  the ones the test uses;
+- the section 7 parser tables: a parse site the five patterns find that the first two tables omit,
+  a site in both, or a name there the scan does not find. A hand-read parser must exist, and the
+  scan must not find it. The five patterns the page states must be the ones the test uses;
 - the section 7 archive list: a new module that imports an archive or compression library;
 - the section 8 table: a script added to or removed from `scripts/service/`, or one with no
   administrator check;
 - the section 9 table: each count in it. It also fails on any `child_process` call other than
   `execFile`, any VS Code task, and any use of `cluster`, `worker_threads` or `process.dlopen`, and
-  when a file the Webviews paragraph names is missing or writes no HTML into its page;
+  when a file its `innerHTML` sentence names is missing or writes no HTML into its page;
 - section 10: the count of HTML writes. It also checks that the console's Python starts no
   process, imports no `ctypes` or archive library, and imports nothing by name.
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
 Nothing checks what a script grants, what holds a site, which section 7 table a parse site belongs
-in, or sections 1, 2, 3 and 6. Keep that prose true by hand.
+in, whether that section's hand-read table is complete, or sections 1, 2, 3 and 6. Keep that prose true by hand.
