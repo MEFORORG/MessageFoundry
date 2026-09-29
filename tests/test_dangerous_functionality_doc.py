@@ -21,6 +21,12 @@ This file derives two inventories from ``messagefoundry/**`` by AST and holds th
   ``multiprocessing`` or ``CreateProcess``. So a new ``shell=True`` in a module the page lists as
   argument-list only fails here, not just a new module.
 
+Four more checks hold the page's later lists and counts to the tree (BACKLOG #1190): the section 7
+archive readers, the section 8 service-script table, the section 9 extension counts over ``ide/src``,
+and the section 10 count of ``innerHTML`` writes in the web console's scripts, plus the claim that
+the console's Python holds none of the engine's classes. The TypeScript and JavaScript checks read
+by pattern, not by parser, and skip whole-line comments only.
+
 The start detector covers at least the names in ``_SUBPROCESS_FUNCS``, ``_START_FORMS``,
 ``_OS_EXEC_RE`` and ``_ATTRIBUTE_STARTS``. Its known limits: it cannot see a start hidden behind
 ``getattr`` with a computed name, or one made inside a third-party library; it takes a ``subprocess``
@@ -132,17 +138,27 @@ def _parse(source: str) -> ast.Module:
 
 
 @functools.cache
-def _imports_ctypes(source: str) -> bool:
+def _imports_any(source: str, libs: tuple[str, ...], attr: str | None = None) -> bool:
+    """Whether a module imports one of ``libs`` or a submodule of one, at any depth, or reads an
+    attribute named ``attr``. A source that never spells any of those names is not parsed."""
+    if not any(name in source for name in (*libs, *(() if attr is None else (attr,)))):
+        return False
     for node in ast.walk(_parse(source)):
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module is not None:
             names = [node.module]
+        elif attr is not None and isinstance(node, ast.Attribute) and node.attr == attr:
+            return True
         else:
             continue
-        if any(name == "ctypes" or name.startswith("ctypes.") for name in names):
+        if any(name == lib or name.startswith(f"{lib}.") for name in names for lib in libs):
             return True
     return False
+
+
+def _imports_ctypes(source: str) -> bool:
+    return _imports_any(source, ("ctypes",))
 
 
 def _ctypes_modules(sources: Mapping[str, str]) -> set[str]:
@@ -583,3 +599,301 @@ def test_code_drift_is_reported() -> None:
     sources = dict(_package_sources())
     sources["tray/branding.py"] += "\nimport os\nos.system('x')\n"
     assert _start_drift(text, _start_sites(sources))
+
+
+# --- sections 7 to 10: archives, service scripts, the extension, the web console (BACKLOG #1190) ---
+
+_SERVICE_DIR = _ROOT / "scripts" / "service"
+_IDE_SRC = _ROOT / "ide" / "src"
+_CONSOLE = _ROOT / "messagefoundry_webconsole"
+
+#: Standard-library modules that read or write an archive or a compressed stream. ``compression`` is
+#: the 3.14 package that holds ``compression.zstd``.
+_ARCHIVE_LIBS = ("tarfile", "zipfile", "gzip", "zlib", "bz2", "lzma", "compression")
+
+_ARCHIVES_LEAD = "**Archives and compressed streams are parsed too.**"
+
+
+def _imports_archive_lib(source: str) -> bool:
+    """Whether a module imports an archive or compression library, or calls ``unpack_archive``."""
+    return _imports_any(source, _ARCHIVE_LIBS, "unpack_archive")
+
+
+def _archive_modules(sources: Mapping[str, str]) -> set[str]:
+    return {rel for rel, source in sources.items() if _imports_archive_lib(source)}
+
+
+def _set_drift(where: str, page: set[str], live: set[str]) -> list[str]:
+    if page == live:
+        return []
+    return [
+        f"{where} names {sorted(page - live)}, which the tree lacks, and omits {sorted(live - page)}"
+    ]
+
+
+def _archives_listed(text: str) -> set[str]:
+    """The module each bullet under the section 7 archives paragraph opens with."""
+    region = _section(text, 7).partition(_ARCHIVES_LEAD)[2]
+    assert region, f"section 7 has no {_ARCHIVES_LEAD!r} paragraph"
+    return {
+        first.group(1)
+        for line in region.splitlines()
+        if line.startswith("- ") and (first := _TICKED_PY_RE.search(line))
+    }
+
+
+def _archive_drift(text: str, live: set[str]) -> list[str]:
+    return _set_drift("section 7's archive list", _archives_listed(text), live)
+
+
+def _service_scripts() -> set[str]:
+    return {path.name for path in _SERVICE_DIR.glob("*.ps1")}
+
+
+def _service_rows(text: str) -> set[str]:
+    """The script each section 8 table row names in its first cell."""
+    return set(re.findall(r"^\|\s*`([\w.-]+\.ps1)`\s*\|", _section(text, 8), re.M))
+
+
+def _service_drift(text: str, live: set[str]) -> list[str]:
+    return _set_drift("section 8's table", _service_rows(text), live)
+
+
+def _script_code_lines(source: str) -> list[str]:
+    """Lines of a TypeScript or JavaScript file that are not whole-line comments, by the rule
+    ``_is_comment_only`` in ``scripts/security/crypto_inventory_check.py`` uses. A trailing comment
+    stays on its line; the patterns below never match inside one that follows a real call."""
+    return [line for line in source.splitlines() if not line.lstrip().startswith(("//", "*", "/*"))]
+
+
+@functools.cache
+def _ide_sources() -> dict[str, str]:
+    """``ide/src`` TypeScript, without its ``test`` folder."""
+    return {
+        path.relative_to(_IDE_SRC).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(_IDE_SRC.rglob("*.ts"))
+        if path.relative_to(_IDE_SRC).parts[0] != "test" and not path.name.endswith(".test.ts")
+    }
+
+
+#: Section 9's table rows, keyed by the Call cell, and the pattern that counts that call.
+_IDE_CALLS: dict[str, re.Pattern[str]] = {
+    "execFile": re.compile(r"\bexecFile\("),
+    "createTerminal": re.compile(r"\.createTerminal\("),
+    "enableScripts: true": re.compile(r"\benableScripts:\s*true\b"),
+}
+
+
+@functools.cache
+def _ide_file_counts(source: str) -> tuple[int, ...]:
+    """How many times one file makes each ``_IDE_CALLS`` call, in that order."""
+    lines = _script_code_lines(source)
+    return tuple(
+        sum(len(pattern.findall(line)) for line in lines) for pattern in _IDE_CALLS.values()
+    )
+
+
+def _ide_counts(sources: Mapping[str, str]) -> dict[str, tuple[int, int]]:
+    """For each call, how many sites and how many files."""
+    per_file = [_ide_file_counts(source) for source in sources.values()]
+    return {
+        call: (sum(n[i] for n in per_file), sum(1 for n in per_file if n[i]))
+        for i, call in enumerate(_IDE_CALLS)
+    }
+
+
+def _ide_rows(text: str) -> dict[str, tuple[int, int]]:
+    found = re.findall(
+        r"^\|[^|]*\|\s*`([^`]+)`\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*$", _section(text, 9), re.M
+    )
+    return {call: (int(sites), int(files)) for call, sites, files in found}
+
+
+def _ide_drift(text: str, live: Mapping[str, tuple[int, int]]) -> list[str]:
+    rows = _ide_rows(text)
+    return [
+        f"section 9 says `{call}` is at {rows.get(call)} (sites, files); the code has {live[call]}"
+        for call in sorted(live)
+        if rows.get(call) != live[call]
+    ]
+
+
+_CHILD_PROCESS_IMPORT_RE = re.compile(
+    r"""^\s*import\s*\{([^}]*)\}\s*from\s*["'](?:node:)?child_process["'];?\s*$"""
+)
+
+
+def _child_process_problems(sources: Mapping[str, str]) -> list[str]:
+    """Section 9 says every process start uses ``execFile``. So every code line naming
+    ``child_process`` must be a named import of ``execFile`` alone; a ``spawn``, an ``exec``, a
+    namespace import or a ``require`` fails here."""
+    problems: list[str] = []
+    for rel, source in sources.items():
+        for line in _script_code_lines(source):
+            if "child_process" not in line:
+                continue
+            match = _CHILD_PROCESS_IMPORT_RE.match(line)
+            names = {name.strip() for name in match.group(1).split(",")} if match else set()
+            if names != {"execFile"}:
+                problems.append(f"{rel}: {line.strip()}")
+    return problems
+
+
+@functools.cache
+def _console_scripts() -> dict[str, str]:
+    return {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted((_CONSOLE / "static").glob("*.js"))
+    }
+
+
+@functools.cache
+def _console_python() -> dict[str, str]:
+    return {
+        path.relative_to(_CONSOLE).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(_CONSOLE.rglob("*.py"))
+    }
+
+
+_INNER_HTML_RE = re.compile(r"\.innerHTML\s*=(?!=)")
+
+
+def _console_sink_count(scripts: Mapping[str, str]) -> int:
+    return sum(
+        len(_INNER_HTML_RE.findall(line))
+        for source in scripts.values()
+        for line in _script_code_lines(source)
+    )
+
+
+def _console_drift(text: str, live: int) -> list[str]:
+    match = re.search(r"into `innerHTML` in (\d+) places", _section(text, 10))
+    assert match is not None, "section 10 does not state 'into `innerHTML` in <N> places'"
+    page = int(match.group(1))
+    return [] if page == live else [f"section 10 says {page} innerHTML writes; the code has {live}"]
+
+
+#: Calls that import or run a module named at run time.
+_DYNAMIC_IMPORTS = frozenset(
+    {"import_module", "__import__", "exec_module", "spec_from_file_location"}
+)
+
+
+def _called_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return call.func.id if isinstance(call.func, ast.Name) else None
+
+
+def _console_python_problems(sources: Mapping[str, str]) -> list[str]:
+    """Section 10 says the console's Python makes no process start, native call, archive read or
+    import by name. The first three reuse the engine inventories above."""
+    problems = [f"{rel} imports ctypes" for rel in sorted(_ctypes_modules(sources))]
+    problems += [f"{rel} starts a process" for rel in sorted(_start_sites(sources))]
+    problems += [f"{rel} reads an archive" for rel in sorted(_archive_modules(sources))]
+    for rel, source in sorted(sources.items()):
+        if not any(name in source for name in _DYNAMIC_IMPORTS):
+            continue
+        problems += [
+            f"{rel} imports by name ({_called_name(node)})"
+            for node in ast.walk(_parse(source))
+            if isinstance(node, ast.Call) and _called_name(node) in _DYNAMIC_IMPORTS
+        ]
+    return problems
+
+
+def _assert_no_drift(section: int, problems: list[str]) -> None:
+    assert not problems, f"docs/DANGEROUS-FUNCTIONALITY.md section {section} has drifted:\n  " + (
+        "\n  ".join(problems)
+    )
+
+
+def test_the_archive_readers_match_the_code() -> None:
+    _assert_no_drift(7, _archive_drift(_doc_text(), _archive_modules(_package_sources())))
+
+
+def test_every_service_script_has_a_row() -> None:
+    _assert_no_drift(8, _service_drift(_doc_text(), _service_scripts()))
+
+
+def test_the_extension_counts_match_the_code() -> None:
+    problems = _ide_drift(_doc_text(), _ide_counts(_ide_sources()))
+    _assert_no_drift(9, problems + _child_process_problems(_ide_sources()))
+
+
+def test_the_console_matches_the_code() -> None:
+    problems = _console_drift(_doc_text(), _console_sink_count(_console_scripts()))
+    _assert_no_drift(10, problems + _console_python_problems(_console_python()))
+
+
+def test_the_later_section_detectors_fire() -> None:
+    """Each scan must find something on the real tree, and must see a planted site."""
+    assert _imports_archive_lib("import tarfile\n")
+    assert _imports_archive_lib("from compression import zstd\n")
+    assert _imports_archive_lib("import shutil\nshutil.unpack_archive(p, d)\n")
+    assert not _imports_archive_lib('"""import tarfile"""\nNOTE = "zipfile"\n')
+    assert "install-service.ps1" in _service_scripts()
+    live = _ide_counts(_ide_sources())
+    assert all(sites and files for sites, files in live.values()), (
+        f"an IDE scan found nothing: {live}"
+    )
+    quiet = (
+        "// vscode.window.createTerminal(x)\n * execFile(a, b)\nconst s = 'enableScripts: false';\n"
+    )
+    assert _ide_counts({"a.ts": quiet}) == dict.fromkeys(_IDE_CALLS, (0, 0))
+    assert _console_sink_count(_console_scripts()), "no innerHTML write found: the scan is dead"
+    assert _console_sink_count({"a.js": "// el.innerHTML = x\nif (el.innerHTML == y) {}\n"}) == 0
+    assert _console_sink_count({"a.js": "el.innerHTML = x; // server-built\n"}) == 1
+    for planted in (
+        'import { spawn } from "node:child_process";',
+        'import { execFile, exec } from "child_process";',
+        'import * as cp from "node:child_process";',
+        'const cp = require("child_process");',
+    ):
+        assert _child_process_problems({"a.ts": planted}), planted
+    assert _console_python(), "no console Python found: the scan is dead"
+    assert not _console_python_problems({"a.py": '"""subprocess.run, import ctypes"""\n'})
+    for planted in (
+        "import ctypes\n",
+        "import subprocess\nsubprocess.run(['x'])\n",
+        "import zipfile\n",
+        "import importlib\nimportlib.import_module(name)\n",
+        "__import__(name)\n",
+    ):
+        assert _console_python_problems({"a.py": planted}), planted
+
+
+def test_later_section_drift_is_reported() -> None:
+    """Break the page and the tree in memory, one way at a time, and each break must be reported."""
+    text = _doc_text()
+    archives = _archive_modules(_package_sources())
+    scripts = _service_scripts()
+    ide = _ide_counts(_ide_sources())
+    sinks = _console_sink_count(_console_scripts())
+    assert not (
+        _archive_drift(text, archives)
+        or _service_drift(text, scripts)
+        or _ide_drift(text, ide)
+        or _console_drift(text, sinks)
+    )
+
+    assert _archive_drift(_drop_line(text, "- `support/bundle.py` only writes"), archives)
+    assert _archive_drift(text, archives | {"pipeline/new_restore.py"})
+
+    assert _service_drift(_drop_line(text, "| `import-db-ca.ps1` |"), scripts)
+    assert _service_drift(text, scripts | {"install-other.ps1"})
+
+    n_sites, n_files = ide["createTerminal"]
+    row = f"| `createTerminal` | {n_sites} | {n_files} |"
+    assert _ide_drift(
+        _replace_once(text, row, f"| `createTerminal` | {n_sites + 1} | {n_files} |"), ide
+    )
+    grown = dict(_ide_sources())
+    grown["newPanel.ts"] = "panel.webview.options = { enableScripts: true };\n"
+    assert _ide_drift(text, _ide_counts(grown))
+
+    claim = f"into `innerHTML` in {sinks} places"
+    assert _console_drift(
+        _replace_once(text, claim, f"into `innerHTML` in {sinks + 1} places"), sinks
+    )
+    assert _console_drift(text, sinks + 1)
