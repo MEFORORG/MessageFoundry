@@ -349,15 +349,17 @@ Other switches on `install-service.ps1` change more than the service:
 
 **The installers run NSSM only from a folder administrators alone can write, and only a checked
 copy.** `install-service.ps1` keeps the service's `nssm.exe` in `-NssmDir`,
-`C:\Program Files\MessageFoundry\nssm` by default. It reads that folder's owner and permissions and
-refuses it when anyone else can write there. It fills the folder from `-NssmPath`, from `PATH`, or
-by downloading NSSM. It checks a download against a fixed SHA-256 hash of the archive. Every copy,
-from any of those places, must also match a fixed SHA-256 hash of `nssm.exe` itself before it is
-copied in. The installer refuses a `-NssmPath` copy that does not match, and a copy already in the
-folder that does not match. It skips a `PATH` copy that does not match, and downloads instead. Each
-message names both hashes. It holds the copy open from the check to its last NSSM call, so no other
-process can change, rename or delete it in between. On a reinstall it refuses a service registered
-to start any other `nssm.exe`.
+`C:\Program Files\MessageFoundry\nssm` by default. It makes any folder it creates there
+administrator-only. It then reads the owner and permissions of the file, its folder and each folder
+above it, stopping below the drive root. It refuses when anyone else can write to or rename any of
+them. It
+fills the folder from `-NssmPath`, from `PATH`, or by downloading NSSM. It checks a download against
+a fixed SHA-256 hash of the archive. Every copy, from any of those places, must also match a fixed
+SHA-256 hash of `nssm.exe` itself before it is copied in. The installer refuses a `-NssmPath` copy
+that does not match, and a copy already in the folder that does not match. It skips a `PATH` copy
+that does not match, and downloads instead. Each message names both hashes. It then points the
+service's registration at that copy, quoted, and reads it back. On a reinstall that replaces
+whatever `nssm.exe` an earlier registration named. If it cannot, it disables the service.
 
 The copy used to be cached in the data directory, where the engine's service account can modify
 files. From there, code running as the engine could have replaced it, planted a library beside it,
@@ -370,14 +372,16 @@ check alone would have caught only the first of those three.
 and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. `nssm.exe` must match the same
 fixed hash. `mefor-net-helper.exe` must match `-HelperSha256`, a hash the operator has to pass.
 This repository pins none for it, because each release builds the helper again. The script checks
-each file before the copy. It checks the installed copies again, holds them open until its last
-NSSM call, and deletes both if either fails. It prints the helper's signature status without
-requiring one. It then starts the helper as LocalSystem.
+each file before the copy. It checks the installed copies again, and deletes both if either fails,
+or disables the service when it cannot delete them. It points the registration at the checked
+`nssm.exe`, quoted, and reads it back. It prints the helper's signature status without requiring
+one. It then starts the helper as LocalSystem.
 
 **At least these gaps remain.** An administrator who runs some other `nssm.exe` by hand, such as
 one on `PATH`, runs a copy nothing checked. `Start-Service` and `Restart-Service` need no NSSM.
-`-HelperSha256` is only as good as the channel the operator took it from. `-AllowBroadAcl` lets the
-helper's folder stay writable by others between runs.
+`-HelperSha256` is only as good as the channel the operator took it from. With `-AllowBroadAcl`,
+whoever can write the helper's folder can swap a binary, plant a library beside it, or edit its
+configuration file, both between runs and during one.
 
 It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless `-AppExe`
 names another, to read the address settings. It checks no hash on that program, and it runs it

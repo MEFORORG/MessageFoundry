@@ -13,28 +13,27 @@ What the scripts do now, and what this file pins:
 
 1. **One pin, two identical copies.** ``install-service.ps1`` and ``install-net-helper.ps1`` share a
    byte-identical block: ``$NssmExeSha256`` (the win64 ``nssm.exe`` inside the pinned archive, which
-   is NOT the archive's own ``$NssmSha256``), ``Get-FilePinProblem``, ``Lock-PinnedFile`` and
-   ``Get-BroadWriteHolders``.
-2. **The engine installer keeps nssm.exe in an administrator-only folder,** ``-NssmDir``, checks every
-   source against the pin before copying it in, and refuses a folder anyone else can write. The
-   resolver is lifted out by PowerShell AST and run against stand-in files, with the folder reading
-   stubbed, because a test's temp folder is never administrator-only. Every refusal has a positive
-   control beside it.
-3. **The lock holds**: a locked file cannot be written through another handle, and a refused lock
-   leaves nothing open.
-4. **The registration is read back.** ``Get-ServiceImageProblem`` is run against stubbed service
-   records, and a reinstall refuses a service registered to start any other nssm.exe.
-5. **Each top level uses these in order**, read from the AST: check before stop, lock before the
-   first nssm call and released after the last, a trap that releases it on failure.
-6. **The uninstallers run no nssm.exe at all.** The SCM stops the service and ``sc.exe`` removes it.
+   is NOT the archive's own ``$NssmSha256``), ``Get-FilePinProblem``, ``Get-BroadWriteHolders``,
+   ``Get-ServiceImageProblem`` and ``Set-ServiceImage``.
+2. **The engine installer keeps nssm.exe in an administrator-only folder,** ``-NssmDir``. It sets
+   the ACL of every folder it creates there and of the file it copies in, checks every source against
+   the pin before copying it in, and refuses when anyone else can write the file, its folder, or a
+   folder above. The resolver is lifted out by PowerShell AST and run against stand-in files, with
+   the ACL reading stubbed per path, because a test's temp folder is never administrator-only.
+3. **The registration is pointed at the checked copy, quoted, and read back.** Both functions run
+   against a stubbed registry and a stubbed ``Win32_Service.Change``.
+4. **Each top level uses these in order**, read from the AST.
+5. **The uninstallers run no nssm.exe at all.** The SCM stops the service and ``sc.exe`` removes it.
 
-Everything runs in ONE pwsh process, because this file imports the engine and so runs on every
-engine leg, where each spawn costs about a second.
+Every refusal has a positive control beside it: a check that refuses everything would pass a
+refusal-only test. Everything runs in ONE pwsh process, because this file imports the engine and so
+runs on every engine leg, where each spawn costs about a second.
 
-WHAT THIS DOES NOT TEST: that ``$NssmExeSha256`` is the hash of the real binary, and that the SCM
-starts a service registered from ``-NssmDir``. The download path checks the extracted binary against
-the pin, so a wrong pin fails closed on the first download. The ``windows-service-smoke`` leg runs
-that download and that start.
+WHAT THIS DOES NOT TEST: that ``$NssmExeSha256`` is the hash of the real binary, that
+``Win32_Service.Change`` behaves as stubbed, and that the SCM starts a service registered from
+``-NssmDir``. The download path checks the extracted binary against the pin, so a wrong pin fails
+closed on the first download. The ``windows-service-smoke`` leg runs that download, that change and
+that start.
 """
 
 from __future__ import annotations
@@ -45,7 +44,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -145,27 +143,45 @@ def test_no_script_restates_the_pin_outside_the_block() -> None:
 _FUNCTIONS = {
     "install-service.ps1": [
         "Get-FilePinProblem",
-        "Lock-PinnedFile",
+        "Get-ServiceImageProblem",
+        "Set-ServiceImage",
+        "Set-AdminOnlyAcl",
+        "Get-NssmHomeProblem",
         "Resolve-Nssm",
         "Save-PinnedNssm",
-        "Get-ServiceImageProblem",
     ],
     "install-net-helper.ps1": ["Resolve-AbsolutePath", "Resolve-HelperNssm"],
 }
 
 # Stubs, defined AFTER the lifted functions so they win. A test's temp folder is never
-# administrator-only, so the folder reading is set per case; the download must never be reached;
-# the service records are whatever a case says they are.
+# administrator-only, so the ACL reading is set per path; icacls calls are recorded, not run; the
+# download must never be reached; the registry and Win32_Service are whatever a case says they are.
 _STUBS = """
-  $broadHolders = @()
-  function Get-BroadWriteHolders { param($Path) $broadHolders }
+  $broadFor = @{}
+  function Get-BroadWriteHolders { param($Path) if ($broadFor.ContainsKey("$Path")) { $broadFor["$Path"] } }
   function Invoke-WebRequest { throw 'NETWORK TOUCHED' }
-  function icacls { }
-  $services = @()
-  function Get-CimInstance { $services }
+  $icaclsCalls = [Collections.Generic.List[string]]::new()
+  function icacls { $icaclsCalls.Add(($args -join ' ')) }
+  $registry = @{}
+  $changeResult = 0
+  $changeApplies = $true
+  $changes = [Collections.Generic.List[string]]::new()
+  function Get-ItemProperty {
+    param($LiteralPath, $Name, $ErrorAction)
+    $svcName = Split-Path -Leaf $LiteralPath
+    if (-not $registry.ContainsKey($svcName)) { throw "no such key: $LiteralPath" }
+    [pscustomobject]@{ ImagePath = $registry[$svcName] }
+  }
+  function Get-CimInstance { @($registry.Keys | ForEach-Object { [pscustomobject]@{ Name = $_ } }) }
+  function Invoke-CimMethod {
+    param($InputObject, $MethodName, $Arguments)
+    $changes.Add("$($InputObject.Name)=$($Arguments.PathName)")
+    if ($changeApplies -and $changeResult -eq 0) { $registry[$InputObject.Name] = $Arguments.PathName }
+    [pscustomobject]@{ ReturnValue = $changeResult }
+  }
 """
 
-_CASES = """
+_CASES = r"""
   # --- Get-FilePinProblem
   Invoke-Case 'pin-good' 'path-none' { Get-FilePinProblem -Path $good -Expected $NssmExeSha256 }
   Invoke-Case 'pin-good-lower' 'path-none' {
@@ -175,7 +191,7 @@ _CASES = """
     Get-FilePinProblem -Path (Join-Path $root 'nope.exe') -Expected $NssmExeSha256 }
   # --- install-service.ps1 Resolve-Nssm, each case with a folder of its own
   Invoke-Case 'install-provided-good' 'path-bad' {
-    Resolve-Nssm -Provided $good -NssmDir (Join-Path $root 'home-provided-good') }
+    Resolve-Nssm -Provided $good -NssmDir (Join-Path $root 'new/home-provided-good') }
   Invoke-Case 'install-provided-bad' 'path-good' {
     Resolve-Nssm -Provided $bad -NssmDir (Join-Path $root 'home-provided-bad') }
   Invoke-Case 'install-path-good' 'path-good' {
@@ -188,51 +204,54 @@ _CASES = """
     Resolve-Nssm -NssmDir (Join-Path $root 'home-bad') }
   Invoke-Case 'install-home-good-provided-bad' 'path-good' {
     Resolve-Nssm -Provided $bad -NssmDir (Join-Path $root 'home-good') }
-  $broadHolders = @('BUILTIN\\Users (Write)')
+  $broadFor[(Join-Path $root 'home-broad')] = @('BUILTIN\Users (Write)')
   Invoke-Case 'install-broad-folder' 'path-good' {
     Resolve-Nssm -NssmDir (Join-Path $root 'home-broad') }
-  $broadHolders = @()
+  $broadFor = @{ "$root" = @('BUILTIN\Users (DeleteSubdirectoriesAndFiles)') }
+  Invoke-Case 'install-broad-parent' 'path-good' {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-under-broad') }
+  $broadFor = @{ (Join-Path $root 'home-good/nssm.exe') = @('DOMAIN\op (FullControl)') }
+  Invoke-Case 'install-broad-file' 'path-good' {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-good') }
+  $broadFor = @{}
   # --- install-net-helper.ps1 Resolve-HelperNssm
   Invoke-Case 'helper-provided-good' 'path-bad' { Resolve-HelperNssm -Provided $good }
   Invoke-Case 'helper-provided-bad' 'path-good' { Resolve-HelperNssm -Provided $bad }
   Invoke-Case 'helper-path-good' 'path-good' { Resolve-HelperNssm }
   Invoke-Case 'helper-path-bad' 'path-bad' { Resolve-HelperNssm }
   Invoke-Case 'helper-none' 'path-none' { Resolve-HelperNssm }
-  # --- Get-ServiceImageProblem, over stubbed service records
-  $img = 'C:\\Program Files\\MessageFoundry\\nssm\\nssm.exe'
+  # --- Get-ServiceImageProblem, over a stubbed registry
+  $img = 'C:\Program Files\MessageFoundry\nssm\nssm.exe'
   foreach ($row in @(
       @{ key = 'image-quoted'; line = ('"' + $img + '"') },
-      @{ key = 'image-unquoted'; line = $img },
       @{ key = 'image-quoted-args'; line = ('"' + $img + '" -x') },
-      @{ key = 'image-other'; line = '"C:\\ProgramData\\MessageFoundry\\bin\\nssm.exe"' },
-      @{ key = 'image-longer-name'; line = ($img + '.evil.exe') })) {
-    $services = @([pscustomobject]@{ Name = 'Svc'; PathName = $row.line },
-                  [pscustomobject]@{ Name = 'Other'; PathName = ('"' + $img + '"') })
-    $line = $row.line
+      @{ key = 'image-unquoted'; line = $img },
+      @{ key = 'image-other'; line = '"C:\ProgramData\MessageFoundry\bin\nssm.exe"' },
+      @{ key = 'image-longer-name'; line = ('"' + $img + '.evil.exe"') })) {
+    $registry = @{ Svc = $row.line }
     Invoke-Case $row.key 'path-none' { Get-ServiceImageProblem -ServiceName 'Svc' -Path $img }
   }
-  $services = @([pscustomobject]@{ Name = 'Other'; PathName = ('"' + $img + '"') })
+  $registry = @{ Other = ('"' + $img + '"') }
   Invoke-Case 'image-missing' 'path-none' { Get-ServiceImageProblem -ServiceName 'Svc' -Path $img }
-  # --- Lock-PinnedFile. LAST, because the write probes change the files they reach.
-  Invoke-Case 'lock-good' 'path-none' {
-    $h = Lock-PinnedFile -Path $lockGood -Expected $NssmExeSha256
-    try {
-      try { [IO.File]::WriteAllBytes($lockGood, [byte[]](1, 2, 3)); 'write allowed' }
-      catch { 'write refused' }
-    } finally { $h.Dispose() }
-  }
-  Invoke-Case 'lock-bad' 'path-none' { Lock-PinnedFile -Path $lockBad -Expected $NssmExeSha256 }
-  Invoke-Case 'lock-bad-released' 'path-none' {
-    try { $null = Lock-PinnedFile -Path $lockBad -Expected $NssmExeSha256 } catch { }
-    [IO.File]::WriteAllBytes($lockBad, [byte[]](1, 2, 3)); 'released'
-  }
-  # Where each resolver case left nssm.exe, and what it holds.
+  # --- Set-ServiceImage, over the same stubs
+  $registry = @{ Svc = $img }; $changes.Clear()
+  Invoke-Case 'set-unquoted' 'path-none' {
+    Set-ServiceImage -ServiceName 'Svc' -Path $img; "$($changes.Count)|$($registry['Svc'])" }
+  $registry = @{ Svc = ('"' + $img + '"') }; $changes.Clear()
+  Invoke-Case 'set-already' 'path-none' { Set-ServiceImage -ServiceName 'Svc' -Path $img; "$($changes.Count)" }
+  $registry = @{ Svc = '"C:\ProgramData\MessageFoundry\bin\nssm.exe"' }; $changeResult = 2
+  Invoke-Case 'set-refused' 'path-none' { Set-ServiceImage -ServiceName 'Svc' -Path $img }
+  $changeResult = 0; $changeApplies = $false
+  Invoke-Case 'set-not-applied' 'path-none' { Set-ServiceImage -ServiceName 'Svc' -Path $img }
+  $changeApplies = $true
+  # Where each resolver case left nssm.exe, and what it holds; and what was sent to icacls.
   $res['homes'] = @{}
-  foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Filter 'home-*')) {
+  foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -Filter 'home-*')) {
     $f = Join-Path $d.FullName 'nssm.exe'
     $res['homes'][$d.Name] = $(if (Test-Path -LiteralPath $f) {
       (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash } else { '' })
   }
+  $res['icacls'] = @($icaclsCalls)
 """
 
 _AST_PROBES = """
@@ -247,13 +266,9 @@ _AST_PROBES = """
         Where-Object { $_.CommandElements.Count -gt 0 } |
         ForEach-Object { @{ name = $_.GetCommandName(); first = $_.CommandElements[0].Extent.Text;
           text = $_.Extent.Text; offset = $_.Extent.StartOffset } })
-      calls = @($tree.FindAll({
-          $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) |
-        ForEach-Object { @{ text = $_.Extent.Text; offset = $_.Extent.StartOffset } })
       functions = @($tree.FindAll({
           $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         ForEach-Object { @{ name = $_.Name; start = $_.Extent.StartOffset; end = $_.Extent.EndOffset } })
-      traps = @($tree.EndBlock.Traps | ForEach-Object { $_.Extent.Text })
       params = @($tree.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
     }
   }
@@ -293,14 +308,7 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")
     root = tmp_path_factory.mktemp("nssmpin")
-    for name, data in (
-        ("good", _GOOD),
-        ("bad", _BAD),
-        ("lock-good", _GOOD),
-        ("lock-bad", _BAD),
-        ("home-good", _GOOD),
-        ("home-bad", _BAD),
-    ):
+    for name, data in (("good", _GOOD), ("bad", _BAD), ("home-good", _GOOD), ("home-bad", _BAD)):
         (root / name).mkdir()
         (root / name / "nssm.exe").write_bytes(data)
     _stand_in(root / "path-good", _GOOD)
@@ -342,8 +350,6 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
         "  }",
         "  $good = Join-Path $root 'good/nssm.exe'",
         "  $bad = Join-Path $root 'bad/nssm.exe'",
-        "  $lockGood = Join-Path $root 'lock-good/nssm.exe'",
-        "  $lockBad = Join-Path $root 'lock-bad/nssm.exe'",
         _CASES,
         _AST_PROBES,
         "  $res | ConvertTo-Json -Depth 8 -Compress",
@@ -360,6 +366,7 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     assert proc.returncode == 0, f"harness failed:\n{(proc.stderr + proc.stdout)[:3000]}"
     parsed = json.loads(proc.stdout.strip().splitlines()[-1])
     assert isinstance(parsed, dict)
+    parsed["_root"] = str(root)
     return parsed
 
 
@@ -381,7 +388,7 @@ def _from(value: object, directory: str) -> bool:
     return parent.parts[-len(Path(directory).parts) :] == Path(directory).parts
 
 
-# ---------------------------------------------------------------------- the check and the lock
+# ------------------------------------------------------------------------------------ the check
 
 
 def test_the_check_passes_a_match_and_names_both_hashes_on_a_mismatch(
@@ -394,26 +401,6 @@ def test_the_check_passes_a_match_and_names_both_hashes_on_a_mismatch(
     _names_both_hashes(str(_case(report, "pin-bad")["value"]))
     missing = str(_case(report, "pin-missing")["value"])
     assert "could not be hashed" in missing, f"an unreadable file must be a mismatch: {missing!r}"
-
-
-def test_the_lock_holds_a_matching_file_and_releases_a_refused_one(
-    report: dict[str, Any],
-) -> None:
-    locked = _case(report, "lock-good")
-    assert locked["threw"] is False, f"positive control: a matching file must lock: {locked}"
-    if sys.platform == "win32":
-        # Share modes are the Windows kernel's; .NET only emulates them, advisorily, elsewhere.
-        assert locked["value"] == "write refused", (
-            "a write through another handle succeeded while the lock was held, so a checked copy "
-            "could still be swapped before it runs"
-        )
-    refused = _case(report, "lock-bad")
-    assert refused["threw"] is True, "a copy that fails the check must not come back locked"
-    _names_both_hashes(str(refused["error"]))
-    released = _case(report, "lock-bad-released")
-    assert released["threw"] is False and released["value"] == "released", (
-        f"a refused lock left the file held open: {released}"
-    )
 
 
 # ------------------------------------------------------------- the engine installer's resolver
@@ -432,6 +419,22 @@ def test_the_installer_copies_a_matching_source_into_its_own_folder(report: dict
             f"{key} returned {case['value']!r}, not the copy in {home}"
         )
         assert homes[home] == _sha(_GOOD), f"{key}: the copy in {home} is not the checked bytes"
+
+
+def test_the_installer_makes_what_it_creates_administrator_only(report: dict[str, Any]) -> None:
+    calls = [str(c) for c in report["icacls"]]
+    root = Path(report["_root"])
+    for created in (root / "new", root / "new" / "home-provided-good"):
+        assert any(
+            c.startswith(str(created) + " /inheritance:r") and "*S-1-5-32-544:(OI)(CI)F" in c
+            for c in calls
+        ), f"the folder it created, {created}, was not given an administrator-only ACL: {calls}"
+    copied = root / "new" / "home-provided-good" / "nssm.exe"
+    assert f"{copied} /setowner *S-1-5-32-544" in calls, "the file it copied in keeps its creator"
+    # CONTROL: a folder that already existed is the operator's, and is left alone.
+    assert not any(c.startswith(str(root / "home-good") + " ") for c in calls), (
+        "an existing folder's ACL was rewritten"
+    )
 
 
 def test_the_installer_refuses_a_named_or_installed_copy_that_does_not_match(
@@ -462,19 +465,50 @@ def test_the_installer_skips_a_path_copy_that_does_not_match(report: dict[str, A
     assert report["homes"]["home-path-bad"] == "", "the mismatched PATH copy was copied in"
 
 
-def test_the_installer_refuses_a_folder_others_can_write(report: dict[str, Any]) -> None:
-    case = _case(report, "install-broad-folder")
+@pytest.mark.parametrize(
+    ("key", "home", "who"),
+    [
+        ("install-broad-folder", "home-broad", "BUILTIN\\Users (Write)"),
+        ("install-broad-parent", "home-under-broad", "DeleteSubdirectoriesAndFiles"),
+        ("install-broad-file", "home-good", "DOMAIN\\op"),
+    ],
+)
+def test_the_installer_refuses_a_copy_others_can_replace(
+    report: dict[str, Any], key: str, home: str, who: str
+) -> None:
+    """The folder, a folder above it, and the file itself each count."""
+    case = _case(report, key)
     assert case["threw"] is True and "not administrator-only" in str(case["error"]), case
-    assert "BUILTIN\\Users" in str(case["error"]), "the refusal must name who can write there"
-    assert report["homes"]["home-broad"] == "", "nssm.exe was copied into a folder others can write"
+    assert who in str(case["error"]), "the refusal must name who can write there"
+    if key != "install-broad-file":
+        assert report["homes"][home] == "", "nssm.exe was copied in where others can write"
 
 
-def test_the_registration_must_start_the_checked_copy(report: dict[str, Any]) -> None:
-    for key in ("image-quoted", "image-unquoted", "image-quoted-args"):
+# ------------------------------------------------------------------------ the registration
+
+
+def test_the_registration_must_start_the_checked_copy_quoted(report: dict[str, Any]) -> None:
+    for key in ("image-quoted", "image-quoted-args"):
         assert _case(report, key)["value"] == "", f"positive control {key}: {_case(report, key)}"
-    for key in ("image-other", "image-longer-name", "image-missing"):
+    # Unquoted with a space is CWE-428: the SCM would try C:\Program.exe first.
+    for key in ("image-unquoted", "image-other", "image-longer-name", "image-missing"):
         problem = str(_case(report, key)["value"])
         assert "is registered to start" in problem, f"{key} was accepted: {problem!r}"
+
+
+def test_the_registration_is_pointed_at_the_checked_copy(report: dict[str, Any]) -> None:
+    img = r"C:\Program Files\MessageFoundry\nssm\nssm.exe"
+    fixed = _case(report, "set-unquoted")
+    assert fixed["threw"] is False, fixed
+    assert fixed["value"] == f'1|"{img}"', f"the unquoted registration was not quoted: {fixed}"
+    same = _case(report, "set-already")
+    assert same["threw"] is False and same["value"] == "0", f"a correct one was changed: {same}"
+    refused = _case(report, "set-refused")
+    assert refused["threw"] is True and "returned 2" in str(refused["error"]), refused
+    lied = _case(report, "set-not-applied")
+    assert lied["threw"] is True and "reported success" in str(lied["error"]), (
+        f"a change that did not stick passed as done: {lied}"
+    )
 
 
 def test_the_helper_installer_refuses_every_copy_that_does_not_match(
@@ -540,59 +574,53 @@ def test_the_helper_binary_is_checked_before_anything_is_stopped(report: dict[st
     assert check < min(_at(commands, _named("Copy-Item"))), "the check comes after the copy"
 
 
-def test_the_helper_installer_holds_both_installed_copies(report: dict[str, Any]) -> None:
+def test_the_helper_installer_checks_both_installed_copies(report: dict[str, Any]) -> None:
     facts = _script(report, "install-net-helper.ps1")
     commands = facts["commands"]
     last_copy = max(_at(commands, _named("Copy-Item")))
-    nssm_runs = _at(commands, _named("Invoke-HelperNssm"))
+    first_nssm = min(_at(commands, _named("Invoke-HelperNssm")))
     for needles in (("$TargetExe", "$HelperSha256"), ("$TargetNssm", "$NssmExeSha256")):
-        for at in _at(commands, _named("Lock-PinnedFile", *needles)):
-            assert last_copy < at < min(nssm_runs), (
-                f"the installed copy {needles} is not held between the last copy and the first nssm "
-                "call, so the file the SCM starts as SYSTEM is not the file checked"
+        for at in _at(commands, _named("Get-FilePinProblem", *needles)):
+            assert last_copy < at < first_nssm, (
+                f"the installed copy {needles} is not checked between the last copy and the first "
+                "nssm call, so the file the SCM starts as SYSTEM is not the file checked"
             )
-    # A rejected copy is deleted, both binaries, so the registration cannot start it at boot.
+    # A rejected copy is deleted, both binaries, and a failed deletion disables the registration.
     assert _at(commands, _named("Remove-Item", "$TargetExe", "$TargetNssm"))
-    released = _at(facts["calls"], lambda c: c["text"] == "$held.Dispose()")
-    assert max(released) > max(nssm_runs), "the copies are released before the last nssm call"
-    assert any("$held.Dispose()" in trap for trap in facts["traps"]), (
-        "no trap releases the held copies when the install fails part-way"
-    )
+    assert _at(commands, _named("Set-Service", "Disabled"))
 
 
-def test_the_engine_installer_holds_its_copy_from_check_to_last_use(report: dict[str, Any]) -> None:
+def test_the_helper_installer_points_the_registration_before_the_start(
+    report: dict[str, Any],
+) -> None:
+    commands = _script(report, "install-net-helper.ps1")["commands"]
+    point = min(_at(commands, _named("Set-ServiceImage", "$TargetNssm")))
+    last_set = max(_at(commands, _named("Invoke-HelperNssm", " set ")))
+    start = min(_at(commands, _named("Invoke-HelperNssm", " start ")))
+    assert last_set < point < start, "the registration is not read back before the helper starts"
+
+
+def test_the_engine_installer_points_the_registration_before_configuring(
+    report: dict[str, Any],
+) -> None:
     facts = _script(report, "install-service.ps1")
     commands = facts["commands"]
-    resolved = min(_at(commands, _named("Resolve-Nssm")))
-    lock = min(_at(commands, _named("Lock-PinnedFile", "$NssmPath", "$NssmExeSha256")))
     top = _top_level(facts)
+    resolved = min(_at(commands, _named("Resolve-Nssm")))
     uses = _at(
         commands,
         lambda c: top(c) and c.get("name") in ("Invoke-Nssm", "Stop-ServiceAndConfirm"),
     )
-    assert resolved < lock < min(uses), "the copy is not held from its check to its first use"
-    dispose = _at(facts["calls"], lambda c: c["text"] == "$NssmLock.Dispose()")
-    # The trap's own Dispose() sits above the lock; the release on the success path comes after it.
-    top_dispose = [d for d in dispose if top({"offset": d}) and d > lock]
-    assert len(top_dispose) == 1 and top_dispose[0] > max(uses), (
-        "the copy is released before the last nssm call, or more than once"
-    )
-    assert any("$NssmLock.Dispose()" in trap for trap in facts["traps"]), (
-        "no trap releases the copy when the install fails part-way"
-    )
-
-
-def test_the_engine_installer_reads_the_registration_back(report: dict[str, Any]) -> None:
-    facts = _script(report, "install-service.ps1")
-    commands = facts["commands"]
-    top = _top_level(facts)
-    checks = _at(commands, lambda c: top(c) and c.get("name") == "Get-ServiceImageProblem")
-    stop = min(_at(commands, lambda c: top(c) and c.get("name") == "Stop-ServiceAndConfirm"))
+    assert resolved < min(uses), "an nssm.exe runs before the checked copy is resolved"
+    point = min(_at(commands, _named("Set-ServiceImage", "$NssmPath")))
     install = min(_at(commands, _named("Invoke-Nssm", "install $ServiceName")))
-    assert any(at < stop for at in checks), (
-        "a reinstall stops and reconfigures the service before checking which nssm.exe it starts"
+    first_set = min(_at(commands, _named("Invoke-Nssm", "set $ServiceName")))
+    assert install < point < first_set, (
+        "the registration is not pointed at the checked copy between the install and the first set"
     )
-    assert any(at > install for at in checks), "a fresh registration is not read back"
+    assert _at(commands, _named("Set-Service", "Disabled")), (
+        "a registration that could not be pointed at the checked copy is left able to start"
+    )
 
 
 @pytest.mark.parametrize("script", _WITHOUT_NSSM)

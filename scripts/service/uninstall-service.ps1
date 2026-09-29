@@ -283,8 +283,9 @@ function Get-UninstallResidueNotice {
 
     if ($CachedNssm) {
         $lines += "  NSSM binary      $CachedNssm"
-        $lines += "                   The copy the service was registered with. Delete it by hand"
-        $lines += "                   once you are sure you are not reinstalling."
+        $lines += "                   The copy the service was registered with. Any other service"
+        $lines += "                   installed with the same -NssmDir runs it too, so delete it by"
+        $lines += "                   hand only when none is left and you are not reinstalling."
     }
 
     if ($hasAccount) {

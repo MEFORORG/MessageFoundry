@@ -2,11 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Static-manifest policy guards for the NSSM integrity-verify path (DEPLOY-7).
 
-``install-service.ps1`` auto-downloads a pinned NSSM release when nssm is absent from PATH, then
-verifies it against a hard-coded SHA-256 before trusting the binary. That download + hash + extract
-runs only on Windows when nssm is missing, so it can't execute under pytest here (it's a
-ci-leg-to-add: exercise ``Resolve-Nssm`` on a runner with nssm stripped from PATH — a Pester test or
-the windows-service-smoke job). What IS unit-testable off-Windows is the *static shape* of the
+``install-service.ps1`` auto-downloads a pinned NSSM release when no checked copy is available,
+then verifies it against a hard-coded SHA-256 before trusting the binary. That download + hash +
+extract runs only on Windows, so it can't execute under pytest here (the windows-service-smoke job
+runs it, since the runner's PATH nssm does not match the binary pin). ``Resolve-Nssm``'s choice of
+source is exercised in ``tests/test_nssm_pin.py`` (BACKLOG #2364). What IS unit-testable off-Windows is the *static shape* of the
 integrity policy, which is the load-bearing part: a blanked/malformed pin or a mismatch branch
 downgraded from ``throw`` to ``Write-Warning`` is a silent fail-open of supply-chain verification.
 
@@ -808,7 +808,7 @@ def _sole_call(facts: dict, name: str) -> dict:
 def test_every_path_parameter_is_absolute_before_anything_consumes_it(tmp_path: Path) -> None:
     """Each of -DataDir, -AppExe, -Config, -DbPath is finalised BEFORE the Resolve-Nssm call.
 
-    Resolve-Nssm joins ``bin`` onto -DataDir and caches nssm.exe there; every later consumer
+    Resolve-Nssm is the first consumer of a normalized path (-NssmDir); every later consumer
     (Test-Path, the ACL grants, AppParameters) inherits whatever these hold. A normalization that
     runs after any of them is the #1554 defect in a new position.
     """

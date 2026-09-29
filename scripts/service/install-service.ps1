@@ -94,7 +94,8 @@ $NssmSha256 = "727D1E42275C605E0F04ABA98095C38A8E1E46DEF453CDFFCE42869428AA6743"
 # The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
 # pins as $NssmSha256. Both installers check every nssm.exe they copy or run against this value,
 # whichever source it came from - -NssmPath, PATH, an installed copy, or a download (BACKLOG #2364).
-# Only the download used to be checked. The two uninstallers do not run nssm at all.
+# Only the download used to be checked. The two uninstallers do not run nssm at all. The block also
+# carries the folder check and the registration read-back, which both installers need.
 $NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
 
 function Get-FilePinProblem {
@@ -116,33 +117,6 @@ function Get-FilePinProblem {
     return ""
 }
 
-function Lock-PinnedFile {
-    <#
-      Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
-      return the open handle. Throws, with the handle closed, when the file cannot be opened that
-      way or does not match. Dispose the handle once the script no longer runs the file.
-
-      The folder check is what keeps a copy safe between runs. This keeps the copy that was checked
-      the copy that runs, within one run. Measured 2026-09-29 on Windows 11 under PowerShell 7.6:
-      holding a FileShare.Read handle, this process could still hash the file and run it, and
-      another process's write, rename and delete of it, and a rename of its folder or of that
-      folder's parent, were all refused. A process already holding the file open for writing makes
-      the open itself fail, which is a refusal too.
-
-      THE PATH IS MADE ABSOLUTE FIRST. [IO.File]::Open resolves a relative path against the
-      process's directory, and Get-FileHash against the PowerShell location, so a relative path
-      could lock one file and hash another.
-    #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
-    $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-    $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $problem = Get-FilePinProblem -Path $Path -Expected $Expected
-    if ($problem) {
-        $handle.Dispose()
-        throw $problem
-    }
-    return $handle
-}
 
 function Get-BroadWriteHolders {
     <#
@@ -247,7 +221,97 @@ function Get-BroadWriteHolders {
     }
     return ($found | Select-Object -Unique)
 }
+function Get-ServiceImageProblem {
+    <#
+      Why the service's registration does not start "$Path", quoted, or "" when it does.
+
+      QUOTED OR NOTHING. An unquoted path with a space in it is CWE-428: the SCM tries each prefix
+      that ends at a space, so C:\Program Files\... is first tried as C:\Program.exe. NSSM 2.24
+      registers its own path unquoted, so Set-ServiceImage quotes it, and this accepts only that.
+      Arguments after the quoted path are allowed. Read from the service's registry key with
+      -LiteralPath, so the service name is never parsed as a wildcard or a query.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    $line = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $line = "$((Get-ItemProperty -LiteralPath $key -Name ImagePath -ErrorAction Stop).ImagePath)".Trim()
+    } catch { }
+    $quoted = "`"$Path`""
+    if (($line -eq $quoted) -or $line.StartsWith("$quoted ", [StringComparison]::OrdinalIgnoreCase)) {
+        return ""
+    }
+    return "'$ServiceName' is registered to start '$line', not the checked copy $quoted"
+}
+
+function Set-ServiceImage {
+    <#
+      Point the service's registration at "$Path", quoted, and read it back. Throws when it cannot.
+
+      This is what makes the checked copy the one the SCM starts. `nssm set` never changes the
+      image path, `nssm install` writes it unquoted, and a registration from an earlier install can
+      name any nssm.exe at all. Win32_Service.Change calls ChangeServiceConfig, which the SCM
+      applies at once; editing ImagePath in the registry would wait for a reboot. It is not passed
+      through sc.exe because Windows PowerShell 5.1 does not escape the quotes inside a native
+      argument.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    if (-not (Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path)) { return }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its image path cannot be set." }
+    $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ PathName = "`"$Path`"" }
+    if ($result.ReturnValue -ne 0) {
+        throw ("Could not point '$ServiceName' at `"$Path`": Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    $problem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path
+    if ($problem) { throw "$problem, although Win32_Service.Change reported success." }
+}
 # END pinned-hash check
+
+function Set-AdminOnlyAcl {
+    <#
+      Make a folder or file this script created administrator-only: inheritance off, SYSTEM and
+      Administrators full control, Users and Authenticated Users read and execute, and Administrators
+      as the owner.
+
+      A NEW FOLDER IS NOT ADMINISTRATOR-ONLY BY DEFAULT on every host. Under the "Object creator"
+      default-owner policy its owner is the individual operator, and Program Files' inheritable
+      CREATOR OWNER entry gives that operator full control of it. Measured by the 2026-09-29 review
+      of this change: a child of a folder carrying CREATOR OWNER:(OI)(CI)(IO)F gets
+      '<creator>:(I)(F)'. Either one is a write path Get-BroadWriteHolders refuses. So the ACL is set
+      rather than inherited. Best-effort: the check that follows reads the result either way.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $grants = @("*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX",
+        "*S-1-5-11:(OI)(CI)RX")
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $grants = @("*S-1-5-18:F", "*S-1-5-32-544:F", "*S-1-5-32-545:RX", "*S-1-5-11:RX")
+    }
+    & icacls $Path /inheritance:r /grant:r @grants | Out-Null
+    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
+}
+
+function Get-NssmHomeProblem {
+    <#
+      Who, other than administrators, could replace $File: through the file itself, its folder, or
+      any folder above that up to, not including, the drive root. "" when nobody.
+
+      THE PARENTS COUNT. Whoever can delete or rename a folder's child can move the checked folder
+      aside and put their own in its place. The drive root is left out because Windows lets
+      Authenticated Users create folders there by default, which moves nothing that already exists.
+    #>
+    param([Parameter(Mandatory)][string]$File)
+    $found = @()
+    if (Test-Path -LiteralPath $File) { $found += @(Get-BroadWriteHolders -Path $File) }
+    $dir = Split-Path -Parent $File
+    while ($dir -and (Split-Path -Parent $dir)) {
+        $found += @(Get-BroadWriteHolders -Path $dir | ForEach-Object { "$_ on '$dir'" })
+        $dir = Split-Path -Parent $dir
+    }
+    return ($found -join "; ")
+}
 
 function Resolve-Nssm {
     <#
@@ -258,9 +322,10 @@ function Resolve-Nssm {
       file as administrator. It used to be cached in <DataDir>\bin, where the engine's own account
       has modify rights. From there, code running as the engine could replace the file, plant a DLL
       beside it, or turn the folder into a junction, for the next install to run as administrator. A
-      hash check sees only the first of those three. So the copy that runs lives where the engine
-      cannot write, and Get-BroadWriteHolders reads the folder's owner and permissions rather than
-      assuming them.
+      hash check sees only the first of those three. So the copy lives where only administrators can
+      write, and Get-NssmHomeProblem reads that from the file, its folder and the folders above,
+      rather than assuming it. With nobody else able to write there, nothing can change the copy
+      between this check and its use.
 
       Every source is checked against $NssmExeSha256 before it is copied in:
         installed  the copy already in -NssmDir. Used as it is when it passes, and REFUSED when it
@@ -272,25 +337,29 @@ function Resolve-Nssm {
 
       TWO COPIES THAT PASS THE PIN ARE THE SAME BYTES, so a passing installed copy is never
       overwritten. That also means a reinstall never copies over the image a running service holds
-      open. The caller then holds the returned copy open with Lock-PinnedFile until its last nssm
-      call.
+      open.
     #>
     param([string]$Provided, [Parameter(Mandatory)][string]$NssmDir)
 
-    # A folder this script creates is handed to Administrators. Otherwise its owner follows the host's
-    # default-owner policy, which under "Object creator" is the individual operator, and the check
-    # below would refuse the folder it just made. An existing folder is left as it is: its owner is
-    # the operator's choice, and the check reads it either way.
-    $created = -not (Test-Path -LiteralPath $NssmDir)
-    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
-    if ($created) { & icacls $NssmDir /setowner "*S-1-5-32-544" | Out-Null }
-    $holders = @(Get-BroadWriteHolders -Path $NssmDir)
-    if ($holders.Count -gt 0) {
-        throw ("'$NssmDir' is not administrator-only: $($holders -join '; '). Whoever can write there " +
-            "can replace the nssm.exe this script runs as administrator, or plant a DLL beside it. " +
-            "Pass -NssmDir with a folder under Program Files, or fix its permissions, and re-run.")
+    # Every folder this call creates gets an administrator-only ACL. A folder that already existed is
+    # left as it is: its permissions are the operator's choice, and the check below reads them.
+    $missing = @()
+    $probe = $NssmDir
+    while ($probe -and -not (Test-Path -LiteralPath $probe)) {
+        $missing = @($probe) + $missing
+        $probe = Split-Path -Parent $probe
     }
+    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
+    foreach ($dir in $missing) { Set-AdminOnlyAcl -Path $dir }
     $target = Join-Path $NssmDir "nssm.exe"
+    $refuse = {
+        param($holders)
+        throw ("'$target' is not administrator-only: $holders. Whoever can write there can replace " +
+            "the nssm.exe this script runs as administrator, or plant a DLL beside it. Pass " +
+            "-NssmDir with a folder under Program Files, or fix its permissions, and re-run.")
+    }
+    $holders = Get-NssmHomeProblem -File $target
+    if ($holders) { & $refuse $holders }
 
     $source = $null
     if ($Provided) {
@@ -328,11 +397,15 @@ function Resolve-Nssm {
     } else {
         Save-PinnedNssm -Destination $target
     }
+    # The new file's owner follows the same default-owner policy as a new folder, so it is set too.
+    Set-AdminOnlyAcl -Path $target
     # The COPY is what runs, so the copy is what gets checked. With the download, a mismatch here
     # means the two pins disagree: a binary pin that does not match the pinned archive is wrong.
     $problem = Get-FilePinProblem -Path $target -Expected $NssmExeSha256
-    if ($problem) {
+    $holders = Get-NssmHomeProblem -File $target
+    if ($problem -or $holders) {
         Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        if ($holders) { & $refuse $holders }
         throw "The nssm.exe copied into '$NssmDir' failed its check: $problem."
     }
     Write-Host "NSSM installed to $target"
@@ -366,25 +439,6 @@ function Save-PinnedNssm {
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-function Get-ServiceImageProblem {
-    <#
-      Why the service's registration does not start the nssm.exe at $Path, or "" when it does.
-
-      The registered line is compared whole, quoted or not, with or without arguments after it. It is
-      not split on spaces: C:\Program Files holds one, so a split would cut every default path short.
-      Read from Win32_Service without a WQL filter, because -ServiceName is not validated here and a
-      quote in it would end a WQL literal.
-    #>
-    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
-    $svc = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
-    $line = if ($svc) { "$($svc.PathName)".Trim() } else { "" }
-    $quoted = "`"$Path`""
-    if (($line -eq $Path) -or ($line -eq $quoted) -or
-        $line.StartsWith("$quoted ", [StringComparison]::OrdinalIgnoreCase) -or
-        $line.StartsWith("$Path ", [StringComparison]::OrdinalIgnoreCase)) { return "" }
-    return "'$ServiceName' is registered to start '$line', not the checked copy '$Path'"
-}
 
 function Set-SecureDataDirAcl {
     <#
@@ -841,23 +895,6 @@ $NssmDir = Resolve-AbsolutePath $NssmDir
 # AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
 # with that path, so a relative one would be resolved against a different directory later.
 $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
-# HELD OPEN UNTIL THE LAST nssm CALL (BACKLOG #2364), and taken again under the handle. -NssmDir is
-# administrator-only, which keeps the copy safe between runs; this keeps the copy that was checked
-# the copy that runs. The trap closes it on the way out of a failed run, because an operator who ran
-# this in an open window, as `messagefoundry service install` does with -NoExit, would otherwise
-# keep the file locked until that window closed.
-$NssmLock = $null
-trap {
-    if ($NssmLock) { $NssmLock.Dispose() }
-    break
-}
-try {
-    $NssmLock = Lock-PinnedFile -Path $NssmPath -Expected $NssmExeSha256
-} catch {
-    throw ("Refusing '$NssmPath': it could not be held against change and checked " +
-        "($($_.Exception.Message)). Something else has it open or has changed it; find out what " +
-        "before you re-run.")
-}
 
 if (-not (Test-Path $AppExe)) {
     throw "Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, or pass -AppExe."
@@ -1024,14 +1061,6 @@ function Stop-ServiceAndConfirm {
 # Detect via Get-Service rather than `nssm status` (which errors to stderr on a missing
 # service and would abort under ErrorActionPreference=Stop).
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-    # CHECKED BEFORE ANYTHING IS STOPPED OR RECONFIGURED (BACKLOG #2364). `nssm set` never changes which
-    # nssm.exe the SCM starts, so a reinstall that only reconfigured would leave the service on the
-    # image it was first registered with, which may sit where the engine's account can write it.
-    $imageProblem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $NssmPath
-    if ($imageProblem) {
-        throw ("$imageProblem. This script will not reconfigure a service whose nssm.exe it has " +
-            "not checked. Remove it with .\uninstall-service.ps1 and re-run.")
-    }
     Write-Host "Service '$ServiceName' exists - stopping and reconfiguring..."
     if (-not (Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $NssmPath)) {
         Write-Warning ("Reconfiguring '$ServiceName' while it is still running. NSSM writes the new " +
@@ -1043,11 +1072,20 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 } else {
     Write-Host "Installing service '$ServiceName'..."
     Invoke-Nssm install $ServiceName $AppExe
-    # NSSM registers the path of the nssm.exe that ran `install`. Read back, not assumed.
-    $imageProblem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $NssmPath
-    if ($imageProblem) {
-        throw "$imageProblem. Remove it with .\uninstall-service.ps1 before starting it."
-    }
+}
+
+# THE REGISTRATION IS POINTED AT THE CHECKED COPY, QUOTED, AND READ BACK (BACKLOG #2364). `nssm set`
+# never changes which nssm.exe the SCM starts: a fresh `nssm install` writes its own path unquoted,
+# and a service from an earlier install may name any nssm.exe at all, where anyone could have
+# changed it. Nothing here runs that earlier binary; the stop above went through the checked copy.
+# On failure the service is set to Disabled before the throw, so a registration this script could
+# not make safe does not start at the next boot.
+try {
+    Set-ServiceImage -ServiceName $ServiceName -Path $NssmPath
+} catch {
+    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+    throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled so it cannot start from an " +
+        "unchecked image. Remove it with .\uninstall-service.ps1 and re-run.")
 }
 
 Invoke-Nssm set $ServiceName Application $AppExe
@@ -1202,10 +1240,6 @@ if ($SuppressCrashDumps) {
         "configured, a crash dump of the engine would contain plaintext PHI (docs/PHI.md).")
 }
 
-# The last nssm call is above. An operator who ran this in an open shell would otherwise keep the
-# file locked until that shell closed.
-$NssmLock.Dispose()
-
 Write-Host ""
 Write-Host "Installed '$ServiceName'." -ForegroundColor Green
 Write-Host "  Engine : $AppExe $AppParams"
@@ -1213,8 +1247,8 @@ Write-Host "  Logs   : $StdoutLog"
 Write-Host "           $StderrLog"
 Write-Host ""
 Write-Host "Next steps:"
-# Start-Service, not the nssm.exe this script just used: that copy may sit where the engine's own
-# account can write, and nothing checks it when an operator runs it by hand (BACKLOG #2364).
+# Start-Service needs no nssm.exe, so an operator following this never runs a copy nobody checked
+# (BACKLOG #2364).
 Write-Host "  Start-Service '$ServiceName'"
 # The engine ALWAYS serves TLS (BACKLOG #1276 part A, ADR 0172): with no [api].tls_cert_file
 # configured it mints a self-signed pair beside the store database on first start. So the health

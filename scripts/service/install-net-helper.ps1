@@ -107,7 +107,8 @@ $PSNativeCommandUseErrorActionPreference = $false
 # The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
 # pins as $NssmSha256. Both installers check every nssm.exe they copy or run against this value,
 # whichever source it came from - -NssmPath, PATH, an installed copy, or a download (BACKLOG #2364).
-# Only the download used to be checked. The two uninstallers do not run nssm at all.
+# Only the download used to be checked. The two uninstallers do not run nssm at all. The block also
+# carries the folder check and the registration read-back, which both installers need.
 $NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
 
 function Get-FilePinProblem {
@@ -129,33 +130,6 @@ function Get-FilePinProblem {
     return ""
 }
 
-function Lock-PinnedFile {
-    <#
-      Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
-      return the open handle. Throws, with the handle closed, when the file cannot be opened that
-      way or does not match. Dispose the handle once the script no longer runs the file.
-
-      The folder check is what keeps a copy safe between runs. This keeps the copy that was checked
-      the copy that runs, within one run. Measured 2026-09-29 on Windows 11 under PowerShell 7.6:
-      holding a FileShare.Read handle, this process could still hash the file and run it, and
-      another process's write, rename and delete of it, and a rename of its folder or of that
-      folder's parent, were all refused. A process already holding the file open for writing makes
-      the open itself fail, which is a refusal too.
-
-      THE PATH IS MADE ABSOLUTE FIRST. [IO.File]::Open resolves a relative path against the
-      process's directory, and Get-FileHash against the PowerShell location, so a relative path
-      could lock one file and hash another.
-    #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
-    $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-    $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $problem = Get-FilePinProblem -Path $Path -Expected $Expected
-    if ($problem) {
-        $handle.Dispose()
-        throw $problem
-    }
-    return $handle
-}
 
 function Get-BroadWriteHolders {
     <#
@@ -259,6 +233,53 @@ function Get-BroadWriteHolders {
         if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
     }
     return ($found | Select-Object -Unique)
+}
+function Get-ServiceImageProblem {
+    <#
+      Why the service's registration does not start "$Path", quoted, or "" when it does.
+
+      QUOTED OR NOTHING. An unquoted path with a space in it is CWE-428: the SCM tries each prefix
+      that ends at a space, so C:\Program Files\... is first tried as C:\Program.exe. NSSM 2.24
+      registers its own path unquoted, so Set-ServiceImage quotes it, and this accepts only that.
+      Arguments after the quoted path are allowed. Read from the service's registry key with
+      -LiteralPath, so the service name is never parsed as a wildcard or a query.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    $line = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $line = "$((Get-ItemProperty -LiteralPath $key -Name ImagePath -ErrorAction Stop).ImagePath)".Trim()
+    } catch { }
+    $quoted = "`"$Path`""
+    if (($line -eq $quoted) -or $line.StartsWith("$quoted ", [StringComparison]::OrdinalIgnoreCase)) {
+        return ""
+    }
+    return "'$ServiceName' is registered to start '$line', not the checked copy $quoted"
+}
+
+function Set-ServiceImage {
+    <#
+      Point the service's registration at "$Path", quoted, and read it back. Throws when it cannot.
+
+      This is what makes the checked copy the one the SCM starts. `nssm set` never changes the
+      image path, `nssm install` writes it unquoted, and a registration from an earlier install can
+      name any nssm.exe at all. Win32_Service.Change calls ChangeServiceConfig, which the SCM
+      applies at once; editing ImagePath in the registry would wait for a reboot. It is not passed
+      through sc.exe because Windows PowerShell 5.1 does not escape the quotes inside a native
+      argument.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    if (-not (Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path)) { return }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its image path cannot be set." }
+    $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ PathName = "`"$Path`"" }
+    if ($result.ReturnValue -ne 0) {
+        throw ("Could not point '$ServiceName' at `"$Path`": Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    $problem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path
+    if ($problem) { throw "$problem, although Win32_Service.Change reported success." }
 }
 # END pinned-hash check
 
@@ -604,30 +625,33 @@ if (-not $sameFile) {
 # reason and makes confirming it its own numbered step.
 $NssmPath = $TargetNssm
 
-# THE INSTALLED COPIES ARE CHECKED AND HELD, NOT ONLY THEIR SOURCES (BACKLOG #2364). They are what the
-# SCM starts as SYSTEM, and a source can change between its check and the copy. Each is opened against
-# change, hashed under that handle, and held until this script's last nssm call. The folder check
-# keeps them safe between runs; with -AllowBroadAcl that check is only a warning, so the hold is what
-# stands in for it during this one.
+# THE INSTALLED COPIES ARE CHECKED, NOT ONLY THEIR SOURCES (BACKLOG #2364). They are what the SCM
+# starts as SYSTEM, and a source can change between its check and the copy. The folder check above is
+# what keeps them from changing after this. With -AllowBroadAcl that check is only a warning, and then
+# nothing does: whoever can write the folder can still swap a binary, plant a DLL beside it or edit
+# the .conf before the start below.
 #
-# A COPY THAT FAILS IS DELETED BEFORE THE THROW, both files with it. On a reinstall the helper was
-# stopped and its files copied over, and the registration still starts them at boot, so a rejected
-# file left in place would be the next thing to run as LocalSystem.
-$HelperLocks = @()
-trap {
-    foreach ($held in $HelperLocks) { $held.Dispose() }
-    break
-}
-try {
-    $HelperLocks += Lock-PinnedFile -Path $TargetExe -Expected $HelperSha256
-    $HelperLocks += Lock-PinnedFile -Path $TargetNssm -Expected $NssmExeSha256
-} catch {
-    $problem = $_.Exception.Message
-    foreach ($held in $HelperLocks) { $held.Dispose() }
-    $HelperLocks = @()
+# A COPY THAT FAILS IS DELETED BEFORE THE THROW, both binaries, and the deletion is read back. On a
+# reinstall the helper was stopped and its files copied over, and the registration still starts them
+# at boot. So when a file cannot be deleted, the registration is set to Disabled instead, and the
+# message says which of the two happened.
+$problem = (@(
+    (Get-FilePinProblem -Path $TargetExe -Expected $HelperSha256),
+    (Get-FilePinProblem -Path $TargetNssm -Expected $NssmExeSha256)
+) -ne "") -join "; "
+if ($problem) {
     Remove-Item -LiteralPath $TargetExe, $TargetNssm -Force -ErrorAction SilentlyContinue
-    throw ("An installed copy failed its check: $problem. Both binaries were deleted from " +
-        "'$InstallDir' and nothing was started. Re-run from files you can match to their hashes.")
+    $left = @(@($TargetExe, $TargetNssm) | Where-Object { Test-Path -LiteralPath $_ })
+    $outcome = "Both binaries were deleted from '$InstallDir'."
+    if ($left.Count -gt 0) {
+        $outcome = "Could not delete $($left -join ' and ')."
+        if ($serviceExists) {
+            Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+            $outcome += " '$ServiceName' was set to Disabled so the registration cannot start them."
+        }
+    }
+    throw ("An installed copy failed its check: $problem. $outcome Nothing was started. Re-run from " +
+        "files you can match to their hashes.")
 }
 
 # The helper reads this with a strict UTF-8 decoder. Written with an explicit BOM-less UTF-8 encoder
@@ -684,19 +708,19 @@ Invoke-HelperNssm set $ServiceName AppRotateBytes 10485760
 # ERROR_ELEVATION_REQUIRED (740).
 Invoke-HelperNssm set $ServiceName ObjectName LocalSystem
 
-# READ THE REGISTRATION BACK. The exit code above says nssm accepted the setting, not that the SCM
-# will start the copy of nssm.exe in this folder - which is the property the folder's permissions are
-# protecting. net-helper/README.md makes this its own numbered step for that reason.
-$registered = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue).PathName
-if (-not $registered) {
-    throw "'$ServiceName' has no registered image path after the install; nothing to start."
-}
-# IndexOf and not -like: a path is not a wildcard pattern, and '[' or ']' anywhere in $TargetNssm
-# would make -like compare a character class instead of the text.
-if ($registered.IndexOf($TargetNssm, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-    throw ("'$ServiceName' would start '$registered', not '$TargetNssm'. Remove the service and " +
-        "re-run: a registration pointing at another copy of nssm.exe is a binary outside the folder " +
-        "whose permissions this install just checked.")
+# THE REGISTRATION IS POINTED AT THE CHECKED COPY, QUOTED, AND READ BACK (BACKLOG #2364). The exit
+# codes above say nssm accepted the settings, not that the SCM will start the copy of nssm.exe in this
+# folder - which is the property the folder's permissions protect. net-helper/README.md makes this its
+# own numbered step for that reason. `nssm install` writes its path unquoted, and the default folder
+# has a space in it (CWE-428), so Set-ServiceImage quotes it. It compares the whole registered line,
+# not a substring, so a longer path that merely contains this one does not pass. On failure the
+# service is set to Disabled before the throw, so it does not start at the next boot.
+try {
+    Set-ServiceImage -ServiceName $ServiceName -Path $TargetNssm
+} catch {
+    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+    throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled. Remove it with " +
+        ".\uninstall-net-helper.ps1 and re-run.")
 }
 
 # --- report -------------------------------------------------------------------------------------
@@ -713,8 +737,6 @@ if (-not $NoStart) {
     Write-Host "Starting '$ServiceName'..."
     Invoke-HelperNssm start $ServiceName
 }
-# The last nssm call is above. Released so an open window does not keep the files locked.
-foreach ($held in $HelperLocks) { $held.Dispose() }
 
 Write-Host ""
 Write-Host "Installed '$ServiceName'." -ForegroundColor Green

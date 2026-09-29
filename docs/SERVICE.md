@@ -648,7 +648,7 @@ list below says what it covers.
 | Left behind | Why | Clear it with |
 |---|---|---|
 | The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
-| The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself once you are sure you are not reinstalling |
+| The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself only when no other service installed with the same `-NssmDir` remains and you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
 | The `SeServiceLogonRight` ("Log on as a service") grant | NSSM's `ObjectName` does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
