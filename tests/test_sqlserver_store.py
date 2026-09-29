@@ -1479,8 +1479,15 @@ async def test_a_v032_preset_table_is_migrated_ss(store) -> None:
             ("pa", "alice", "ACME ADT", None),
             ("pb", "bob", "ACME ADT", None),
             ("pg", "ghost", "orphan", None),
-            ("pc", "carol", "inherited", 0.5),  # predates the carol account: an earlier holder's
-            ("ps", "system", "no-auth", None),  # the no-auth identity: its id is its username
+            ("pc", "carol", "inherited", 0.5),  # last saved before the carol account existed
+            ("pr", "carol", "resaved", 0.5),
+            ("pr", "carol", "resaved", 2.0),  # ...but the current carol saved this one again
+            (
+                "ps",
+                "system",
+                "no-auth",
+                None,
+            ),  # no-auth rows cannot be told from a deleted "system"
         ):
             await store.upsert_search_preset(
                 preset_id=pid,
@@ -1498,16 +1505,13 @@ async def test_a_v032_preset_table_is_migrated_ss(store) -> None:
 
         assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
         assert [p["id"] for p in await store.list_search_presets("u-bob")] == ["pb"]
-        assert await store.list_search_presets("u-carol") == []
-        assert [p["id"] for p in await store.list_search_presets("system")] == ["ps"]
+        assert [p["id"] for p in await store.list_search_presets("u-carol")] == ["pr"]
+        assert await store.list_search_presets("system") == []
         got = await store.get_search_preset(preset_id="pa", owner_user_id="u-alice")
         assert got is not None and json.loads(got["criteria"]) == {"target": "raw"}
         rows = await store._fetchall("SELECT id FROM search_presets ORDER BY id")
-        assert [r["id"] for r in rows] == [
-            "pa",
-            "pb",
-            "ps",
-        ]  # the two orphans are gone, nothing else is
+        # The three orphans are gone, nothing else is.
+        assert [r["id"] for r in rows] == ["pa", "pb", "pr"]
 
         await store.delete_user("u-bob")
         assert await store.list_search_presets("u-bob") == []

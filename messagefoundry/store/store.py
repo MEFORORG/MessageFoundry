@@ -4482,9 +4482,8 @@ _LAST_EVENT_COLUMN = (
 _MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
 
 # BACKLOG #1909: the account a 0.3.2 preset row belongs to. See MessageStore._migrate_preset_owner.
-_PRESET_ACCOUNT = (
-    "SELECT 1 FROM users WHERE users.username = search_presets.owner"
-    " AND users.created_at <= search_presets.created_at"
+_PRESET_OWNER_MATCH = (
+    "users.username = search_presets.owner AND users.created_at <= search_presets.updated_at"
 )
 
 
@@ -6039,21 +6038,22 @@ class MessageStore:
         0.3.2 keyed a preset on the owner's USERNAME; this version keys it on ``Identity.user_id``
         (#1225) under the renamed column (#1232). So a bare rename would keep every row and still
         orphan it: listing by id finds nothing and ``delete_user`` leaves it behind. Each value is
-        mapped to its account's id first, and only to an account created no later than the preset.
-        0.3.2's ``delete_user`` left a user's presets behind, and a later account given the same
-        username would otherwise inherit them, PHI-shaped criteria included: the defect #1225
-        closed. Every other row is dropped, because nobody could list, recall or delete it. The one
-        exception is ``system``, the no-auth identity, whose id equals its username. ``criteria`` is
-        sealed against the preset ``id``, which does not change, so no cell is re-encrypted. The
-        rename carries the unique index along with the column. Runs in the open's migration
-        transaction, so a refused open rolls all of it back."""
+        mapped to its account's id first, and only when the account existed at the preset's last
+        save. 0.3.2's ``delete_user`` left a user's presets behind, and a later account given the
+        same username would otherwise inherit them, PHI-shaped criteria included: the defect #1225
+        closed. A preset the new holder saved again is theirs, which is why the test reads
+        ``updated_at``. Every other row is dropped, because nobody could list, recall or delete it.
+        That includes rows of ``system``, the no-auth identity: its id equals its username, but so
+        would a deleted account's that was named ``system``, and the two cannot be told apart.
+        ``criteria`` is sealed against the preset ``id``, which does not change, so no cell is
+        re-encrypted. The rename carries the unique index along with the column. Runs in the open's
+        migration transaction, so a refused open rolls all of it back."""
         await db.execute(
-            f"DELETE FROM search_presets WHERE owner <> 'system' AND NOT EXISTS ({_PRESET_ACCOUNT})"
+            "DELETE FROM search_presets"
+            f" WHERE NOT EXISTS (SELECT 1 FROM users WHERE {_PRESET_OWNER_MATCH})"
         )
         await db.execute(
-            "UPDATE search_presets"
-            " SET owner = (SELECT id FROM users WHERE users.username = search_presets.owner)"
-            f" WHERE EXISTS ({_PRESET_ACCOUNT})"
+            f"UPDATE search_presets SET owner = users.id FROM users WHERE {_PRESET_OWNER_MATCH}"
         )
         await db.execute("ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id")
 

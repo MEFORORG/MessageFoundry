@@ -527,6 +527,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
+  The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
+  It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
+  account existed at the preset's last save, so a new account that reused a deleted user's name does
+  not inherit that user's presets. Every other preset is dropped, because no account could reach it.
+  That includes presets saved under the no-auth `system` identity. On PostgreSQL and SQL Server the
+  step runs in the schema batch, under `provision-schema` and `auto` alike. The 0.4.0 entry's advice
+  to drop the table first no longer applies from this release on. (`BACKLOG #1909`)
 - **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
   whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
   algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal

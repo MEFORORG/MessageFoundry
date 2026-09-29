@@ -138,9 +138,10 @@ async def _seed_v032_store(db: Path, cipher: Cipher) -> None:
     """Write presets with this version, then move them into the 0.3.2 table under usernames.
 
     Sealing them first shows the criteria still open after the migration: they are bound to the
-    preset id, which it leaves alone. ``ghost`` matches no account. ``pc`` predates the ``carol``
-    account (created at 1.0), so it belonged to an earlier holder of that username. ``system`` is
-    the no-auth identity, whose id equals its username."""
+    preset id, which it leaves alone. ``ghost`` matches no account. ``pc`` was last saved before
+    the ``carol`` account existed (created at 1.0), so an earlier holder of that username wrote it;
+    ``pr`` was created then too, but the current ``carol`` saved it again at 2.0. ``system`` is the
+    no-auth identity: its rows cannot be told from a deleted account's named ``system``."""
     import sqlite3
 
     s = await MessageStore.open(db, cipher=cipher)
@@ -152,6 +153,8 @@ async def _seed_v032_store(db: Path, cipher: Cipher) -> None:
             ("pb", "bob", "ACME ADT", None),
             ("pg", "ghost", "orphan", None),
             ("pc", "carol", "inherited", 0.5),
+            ("pr", "carol", "resaved", 0.5),
+            ("pr", "carol", "resaved", 2.0),
             ("ps", "system", "no-auth", None),
         ):
             await s.upsert_search_preset(
@@ -191,11 +194,11 @@ async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
             got = await s.get_search_preset(preset_id="pa", owner_user_id="u-alice")
             assert got is not None and json.loads(got["criteria"]) == json.loads(CRIT)
             assert [p["id"] for p in await s.list_search_presets("u-bob")] == ["pb"]
-            assert await s.list_search_presets("u-carol") == []
-            assert [p["id"] for p in await s.list_search_presets("system")] == ["ps"]
+            assert [p["id"] for p in await s.list_search_presets("u-carol")] == ["pr"]
+            assert await s.list_search_presets("system") == []
             async with s._read() as rdb:
                 cur = await rdb.execute("SELECT id FROM search_presets ORDER BY id")
-                assert [r["id"] for r in await cur.fetchall()] == ["pa", "pb", "ps"]
+                assert [r["id"] for r in await cur.fetchall()] == ["pa", "pb", "pr"]
             if reopened:
                 await s.delete_user("u-bob")
                 assert await s.list_search_presets("u-bob") == []
@@ -232,4 +235,4 @@ async def test_a_refused_open_leaves_the_v032_preset_table_untouched(tmp_path: P
     finally:
         conn.close()
     assert "owner" in cols and "owner_user_id" not in cols
-    assert owners == ["alice", "bob", "carol", "ghost", "system"]
+    assert owners == ["alice", "bob", "carol", "carol", "ghost", "system"]

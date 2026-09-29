@@ -1910,8 +1910,8 @@ _SCHEMA: list[str] = [
         criteria NVARCHAR(MAX) NULL, created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
         last_used_at FLOAT NULL)""",
     # BACKLOG #1909: a 0.3.2 table keys presets on the owner's USERNAME in a column named `owner`. Map
-    # each value to the id of an account created no later than the preset, drop every other row but
-    # the no-auth `system` identity's, then rename; sp_rename carries the unique index. The SQLite
+    # each value to the id of the account that existed at the preset's last save, drop every other
+    # row, then rename; sp_rename carries the unique index. The SQLite
     # _migrate_preset_owner gives the reasons. The body is EXEC'd because T-SQL compiles a whole batch
     # first, and a column the table lacks fails that compile even inside a false IF. SET NOCOUNT ON
     # sits inside the EXEC, so it ends with it: no rows-affected result reaches the driver ahead of an
@@ -1920,12 +1920,12 @@ _SCHEMA: list[str] = [
     """IF COL_LENGTH('search_presets','owner') IS NOT NULL
         AND COL_LENGTH('search_presets','owner_user_id') IS NULL
     EXEC(N'SET NOCOUNT ON;
-        DELETE p FROM search_presets p WHERE p.owner <> ''system'' AND NOT EXISTS
+        DELETE p FROM search_presets p WHERE NOT EXISTS
             (SELECT 1 FROM users u WHERE u.username = p.owner COLLATE Latin1_General_100_BIN2
-             AND u.created_at <= p.created_at);
+             AND u.created_at <= p.updated_at);
         UPDATE p SET p.owner = u.id FROM search_presets p
             JOIN users u ON u.username = p.owner COLLATE Latin1_General_100_BIN2
-            AND u.created_at <= p.created_at;
+            AND u.created_at <= p.updated_at;
         EXEC sp_rename ''search_presets.owner'', ''owner_user_id'', ''COLUMN'';')""",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
     # only last-edited. COL_LENGTH-gated ADD for a pre-existing (from #151) search_presets table; a
