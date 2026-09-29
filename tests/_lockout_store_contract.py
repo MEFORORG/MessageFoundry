@@ -104,12 +104,19 @@ async def _assert_lockout_contract(store: Any) -> None:
     await _assert_single_counter_policy(store)
     await _assert_escalation(store)
     await _assert_counters_stay_apart_and_clear(store)
+    await _assert_generated_credential(store)
+    await _assert_conditional_rotation(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
     """The per-cycle policy, on the sign-in counter of an account that does NOT escalate."""
     await store.create_user(
-        user_id="lock-u1", username="lock-alice", auth_provider="local", password_hash="h", now=1.0
+        user_id="lock-u1",
+        username="lock-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
     )
     t0 = 1_000.0
 
@@ -177,17 +184,28 @@ async def _assert_escalation(store: Any) -> None:
     """AC-7: which locks double per cycle up to the ceiling, and which keep the fixed length."""
     # A local account with TOTP enrolled: BOTH locks escalate.
     await store.create_user(
-        user_id="lock-totp", username="lock-totp", auth_provider="local", password_hash="h", now=1.0
+        user_id="lock-totp",
+        username="lock-totp",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
     )
     await store.set_totp_secret("lock-totp", secret="JBSWY3DPEHPK3PXP", now=1.0)
     await store.enable_totp("lock-totp", recovery_code_hashes=[], now=1.0)
     # A directory account, with TOTP enrolled too: NEITHER lock escalates (ADR 0197 Decision 5).
-    await store.create_user(user_id="lock-ad", username="lock-ad", auth_provider="ad", now=1.0)
+    await store.create_user(
+        user_id="lock-ad", username="lock-ad", auth_provider="ad", now=1.0, password_generated=False
+    )
     await store.set_totp_secret("lock-ad", secret="JBSWY3DPEHPK3PXP", now=1.0)
     await store.enable_totp("lock-ad", recovery_code_hashes=[], now=1.0)
     # A local account with no TOTP: only the second-step lock escalates.
     await store.create_user(
-        user_id="lock-plain", username="lock-plain", auth_provider="local", password_hash="h"
+        user_id="lock-plain",
+        username="lock-plain",
+        auth_provider="local",
+        password_hash="h",
+        password_generated=False,
     )
 
     expected_escalated = [LOCKOUT_SECONDS * 2**k for k in range(4)] + [MAX_LOCKOUT_SECONDS] * 2
@@ -230,7 +248,12 @@ async def _assert_escalation(store: Any) -> None:
 async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
     """The two counters never write each other's columns, and each writer clears what the ADR says."""
     await store.create_user(
-        user_id="lock-u2", username="lock-bob", auth_provider="local", password_hash="h", now=1.0
+        user_id="lock-u2",
+        username="lock-bob",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
     )
     t0 = 30_000.0
     # Two cycles of the sign-in lock, then two of the second-step lock, on one row.
@@ -272,9 +295,186 @@ async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
     await _lock_cycle(store, "lock-u2", start=step_until + 1.0, counter="sign_in")
     await _lock_cycle(store, "lock-u2", start=step_until + 10.0, counter="second_step")
     await store.set_password(
-        "lock-u2", password_hash="h3", must_change_password=True, now=step_until + 20.0
+        "lock-u2",
+        password_hash="h3",
+        must_change_password=True,
+        now=step_until + 20.0,
+        password_generated=False,
     )
     user = await store.get_user("lock-u2")
     assert user is not None and _lockout_columns(user) == (0, None, 1, 0, None, 0)
 
     await store.delete_user("lock-u2")
+
+
+async def _assert_generated_credential(store: Any) -> None:
+    """ADR 0197 Amendment A, AC-A1: while the credential in force is engine-generated, sign-in
+    failures COUNT and never set the sign-in lock; the second-step lock still arms; each writer of a
+    hash stores exactly the flag its caller states, and the login-time rehash leaves it alone."""
+    await store.create_user(
+        user_id="gen-u1",
+        username="gen-alice",
+        auth_provider="local",
+        password_hash="h",
+        must_change_password=True,
+        password_generated=True,
+        now=1.0,
+    )
+    user = await store.get_user("gen-u1")
+    assert user is not None and user.password_generated is True, "create_user dropped the flag"
+
+    # --- AC-A1: hammered far past the threshold, the sign-in lock is never set ----------------------
+    t0 = 40_000.0
+    for i in range(THRESHOLD * 4):
+        assert await _fail(store, "gen-u1", now=t0 + i) == (i + 1, False, 0)
+    user = await store.get_user("gen-u1")
+    assert user is not None
+    # Every attempt counted, and nothing locked: the count is the lock-state surface's signal.
+    assert (user.failed_attempts, user.locked_until, user.lock_cycles) == (THRESHOLD * 4, None, 0)
+
+    # --- the second-step counter is unchanged: whoever feeds it already proved a factor -------------
+    locked = await _lock_cycle(store, "gen-u1", start=t0 + 100.0, counter="second_step")
+    user = await store.get_user("gen-u1")
+    assert user is not None and user.second_step_locked_until == locked
+    assert user.locked_until is None, "a second-step lock leaked into the sign-in columns"
+
+    # --- the rehash write leaves the flag alone ----------------------------------------------------
+    await store.set_password_hash("gen-u1", password_hash="h-rehashed", now=t0 + 200.0)
+    user = await store.get_user("gen-u1")
+    assert user is not None and user.password_generated is True
+
+    # --- set_password stores what its caller states, both ways --------------------------------------
+    assert await store.set_password(
+        "gen-u1", password_hash="h-chosen", password_generated=False, must_change_password=False
+    )
+    user = await store.get_user("gen-u1")
+    assert user is not None and user.password_generated is False
+    # ... and a chosen credential is lockable again, at the shipped policy.
+    start = t0 + 300.0
+    for i in range(THRESHOLD - 1):
+        await _fail(store, "gen-u1", now=start + i)
+    assert (await _fail(store, "gen-u1", now=start + THRESHOLD))[1] is True
+    assert await store.set_password(
+        "gen-u1", password_hash="h-issued", password_generated=True, must_change_password=True
+    )
+    user = await store.get_user("gen-u1")
+    assert user is not None and user.password_generated is True
+    # A generated credential's write also clears the lock the chosen one had (the password change
+    # clear), so the issued credential starts unlocked.
+    assert user.locked_until is None
+
+    # --- create_user stores False when told False, and refuses a flagged row with no hash ----------
+    await store.create_user(
+        user_id="gen-u2",
+        username="gen-bob",
+        auth_provider="local",
+        password_hash="h",
+        password_generated=False,
+        now=1.0,
+    )
+    user = await store.get_user("gen-u2")
+    assert user is not None and user.password_generated is False
+    try:
+        await store.create_user(
+            user_id="gen-u3",
+            username="gen-carol",
+            auth_provider="local",
+            password_hash=None,
+            password_generated=True,
+            now=1.0,
+        )
+    except ValueError:
+        pass
+    else:  # pragma: no cover - the assertion is the failure
+        raise AssertionError("a generated flag on a hashless row was accepted")
+    assert await store.get_user("gen-u3") is None
+
+    for user_id in ("gen-u1", "gen-u2"):
+        await store.delete_user(user_id)
+
+
+async def _assert_conditional_rotation(store: Any) -> None:
+    """ADR 0197 Amendment A, N-B2 part 4: a rotation that requires TOTP carries the condition in its
+    own UPDATE, so TOTP cleared between the caller's check and the write makes the write match no
+    row -- and the credential in force is left exactly as it was."""
+    await store.create_user(
+        user_id="rot-u1",
+        username="rot-alice",
+        auth_provider="local",
+        password_hash="h-issued",
+        must_change_password=True,
+        password_generated=True,
+        now=1.0,
+    )
+    # No TOTP: the conditional write is refused and changes nothing.
+    assert not await store.set_password(
+        "rot-u1",
+        password_hash="h-chosen",
+        password_generated=False,
+        must_change_password=False,
+        require_totp=True,
+    )
+    user = await store.get_user("rot-u1")
+    assert user is not None
+    assert (user.password_hash, user.password_generated, user.must_change_password) == (
+        "h-issued",
+        True,
+        True,
+    )
+    # TOTP on: the caller "checks" here and sees it...
+    await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    await store.enable_totp("rot-u1", recovery_code_hashes=[], now=2.0)
+    user = await store.get_user("rot-u1")
+    assert user is not None and user.totp_enabled
+    # ... then an administrator's factor reset lands between the check and the write ...
+    await store.disable_totp("rot-u1", now=3.0)
+    # ... and the write refuses, because the condition rides in the UPDATE itself.
+    assert not await store.set_password(
+        "rot-u1",
+        password_hash="h-chosen",
+        password_generated=False,
+        must_change_password=False,
+        require_totp=True,
+    )
+    user = await store.get_user("rot-u1")
+    assert user is not None and user.password_hash == "h-issued" and user.password_generated
+    # With TOTP standing, the same write lands.
+    await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
+    await store.enable_totp("rot-u1", recovery_code_hashes=[], now=4.0)
+    assert await store.set_password(
+        "rot-u1",
+        password_hash="h-chosen",
+        password_generated=False,
+        must_change_password=False,
+        require_totp=True,
+    )
+    user = await store.get_user("rot-u1")
+    assert user is not None
+    assert (user.password_hash, user.password_generated, user.must_change_password) == (
+        "h-chosen",
+        False,
+        False,
+    )
+    # TOTP flagged on over a NULL secret (a confirm that raced a factor reset) is no way past: the
+    # conditional write refuses it too (review round 2).
+    await store.set_totp_secret("rot-u1", secret=None, now=5.0)
+    user = await store.get_user("rot-u1")
+    assert user is not None and user.totp_enabled
+    assert not await store.set_password(
+        "rot-u1",
+        password_hash="h-second",
+        password_generated=False,
+        must_change_password=False,
+        require_totp=True,
+    )
+    # disable_totp forgets the removed secret's step high-water mark (review round 2): a new
+    # secret's first code in the same 30 seconds is not refused as a replay.
+    assert await store.consume_totp_step("rot-u1", 1_000)
+    assert not await store.consume_totp_step("rot-u1", 1_000)
+    await store.disable_totp("rot-u1", now=6.0)
+    assert await store.consume_totp_step("rot-u1", 1_000)
+    # An unknown user matches no row either way.
+    assert not await store.set_password(
+        "no-such-user", password_hash="x", password_generated=False, must_change_password=False
+    )
+    await store.delete_user("rot-u1")

@@ -666,7 +666,13 @@ export class EngineStatusBar implements vscode.Disposable {
       `${admin.username}${admin.email?.trim() ? " (with a notification address)" : ""}`,
     );
     try {
-      return await exited;
+      const code = await exited;
+      // ADR 0197 Amendment A: provision-admin may have printed the authenticator key (it does so
+      // before any store write, so a failed run can show it too) and the recovery codes. So the
+      // terminal is closed on every exit rather than left with that scrollback. HOLD_OPEN_SCRIPT
+      // clears the screen and scrollback first, after the operator has read the output.
+      term.dispose();
+      return code;
     } finally {
       this.provisionTerminal = undefined;
     }

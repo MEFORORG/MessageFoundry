@@ -22,8 +22,10 @@ from messagefoundry.api.auth_models import (
     ExpectedFederatedPair,
     FederatedIdentityRequest,
     FederatedIdentityView,
+    MfaResetResponse,
     PasswordResetResponse,
     RolesUpdateRequest,
+    UserCreatedResponse,
     UserCreateRequest,
     UserUpdateRequest,
 )
@@ -219,20 +221,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             body = UserCreateRequest(
                 username=form.get("username", "").strip(),
-                password=form.get("password", ""),
                 display_name=form.get("display_name", "").strip() or None,
                 # BACKLOG #2018: required, so a blank is passed through for the service to refuse
                 # with a message the form can show, rather than as None.
                 email=form.get("email", "").strip(),
                 roles=roles,
             )
-            created = await admin.create_user(
+            # Annotated so the seam discovery seeds the DTO this route reads a field off, for the
+            # reason the password-reset route below gives.
+            created: UserCreatedResponse = await admin.create_user(
                 body=body, request=request, service=service, identity=identity
             )
         except (ValidationError, HTTPException) as exc:
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
             all_roles = await admin.list_roles(service=service, _=identity)
-            # Re-render preserving the NON-SECRET fields only — the password is never echoed.
             return HTMLResponse(
                 pages.user_new_page(
                     all_roles,
@@ -245,7 +247,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 status_code=400,
             )
-        return RedirectResponse(f"/ui/users/{created.id}", status_code=303)
+        # ADR 0197 Amendment A, AC-A2: the engine-generated credential is rendered ONCE, for
+        # out-of-band delivery, with its deadline -- never logged or stored.
+        return HTMLResponse(
+            pages.temp_password_page(
+                created.username,
+                created.temp_password,
+                created.credential_expires_at,
+                heading="Account created",
+            )
+        )
 
     @app.post("/ui/users/{user_id}/update")
     async def ui_user_update(
@@ -508,14 +519,28 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         try:
-            await admin.reset_user_mfa(user_id, service=service, identity=identity)
+            reset: MfaResetResponse = await admin.reset_user_mfa(
+                user_id, service=service, identity=identity
+            )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             return await _user_detail(
                 user_id, service, identity, error=str(exc.detail), status_code=400
             )
-        return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
+        if reset.temp_password is None:
+            return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
+        # ADR 0197 Amendment A, AC-A4: a local account's factor reset also issued a generated
+        # credential. Rendered ONCE, like the password reset's.
+        user = await service.store.get_user(user_id)
+        return HTMLResponse(
+            pages.temp_password_page(
+                user.username if user is not None else user_id,
+                reset.temp_password,
+                reset.expires_at,
+                heading="Authenticator reset",
+            )
+        )
 
     # --- users: federated identity (BACKLOG #1143 / #295, ADR 0184 slice B) -----------------------
     #

@@ -7,6 +7,8 @@
   multi-wave build. Waves 0 to 2 are built (Wave 2 on 2026-09-25); waves 3 to 5 are not.
   Amendment A below reverses the first sentence of
   *What it must not break*, states the end state, and lays out the waves.
+- **Amended 2026-09-28:** Amendment B below. `provision-admin` enrols TOTP at the terminal, and the
+  repair branch now clears the row's factors and sessions first (ADR 0197 Amendment A, N-A).
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -556,3 +558,42 @@ in the wheel. So it cannot be "present in the application". Two cautions keep th
 
 Fix the literal anyway, as hygiene that moves no verdict: require `MEFOR_STORE_PASSWORD`, or generate
 a random password per container.
+
+## Amendment B (2026-09-28) -- the first Administrator enrols TOTP, and a repair clears the row first
+
+Made by [ADR 0197](0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
+Amendment A, option N-A, built in its wave 1 (BACKLOG #1131). It changes two things here and keeps
+the rest.
+
+**1. `provision-admin` enrols TOTP at the terminal.** After the password prompt, and before any store
+write, the command generates a TOTP key in memory, shows it as base32 and as an `otpauth://` URI, and
+reads a code. It checks the code with the pure `totp.verify_totp_step` at the configured skew, and
+asks again on a wrong one, up to five times. Only then does it write. `provision_first_administrator`
+takes the key, the code and the instant it was read, and checks the code again against that instant.
+Then it writes the row, the password, the TOTP key with its step consumed, the recovery codes, the
+address, and the role **last**. The recovery codes print once, to the terminal. The key and codes go
+to the console device itself (`CONOUT$` on Windows, `/dev/tty` elsewhere), never to stdout or
+stderr, which a redirect can put in a file or a log, and never into `--json` output or argv. With no
+console to open, the command refuses before any write (CodeQL alert 228). `--no-totp` skips it, and is refused
+while `[security].require_mfa` is on; the service refuses a call with no key in that posture too.
+
+**This keeps the write order this ADR chose.** The role is still last, so every interruption leaves a
+roleless account a re-run completes. A wrong code writes nothing, so it cannot leave a half-built row
+that a re-run would treat as a takeover.
+
+**2. The repair branch clears everything the earlier holder could still use, first.** Before it writes
+anything for the new holder, it removes the row's TOTP key, recovery codes and passkeys (and the
+TOTP step mark, so the earlier holder cannot block the operator's code by spending each step), and
+revokes every session on the row. It revokes them again after the role is written, which catches a
+sign-in made with the earlier password while the repair ran. **This fixes a defect in this ADR's repair branch.** It revoked no session,
+and `_build_identity` re-reads roles on every request, so a live session the earlier holder kept became
+an Administrator session when `set_user_roles` ran. It also means a crash between the TOTP write and
+the role write no longer strands the row: the re-run clears the half-enrolled factor and enrols again.
+The `docs/SECURITY.md` sentence under
+*Provisioning the first administrator* that said the repair ends no session and removes no factor is
+replaced there.
+
+**One exposure is left, and ADR 0197 names it as residual 7.** The IDE's Start flow runs the command
+in a terminal it holds open, and a held-open terminal keeps its scrollback. The key is shown before any write, so a
+failed run can show it too; the flow now clears the scrollback and closes the terminal after every
+run, once the operator presses Enter, and the command tells the operator to clear their own. That mitigates the exposure; it does not close it.

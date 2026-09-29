@@ -37,6 +37,7 @@ from messagefoundry.store.base import (
     ResendSourceNotFound,
 )
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 # A transformed outbound body, distinct from the raw, so a test can prove resend ships the TRANSFORMED
@@ -399,7 +400,8 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_chosen(
+            service,
             username="op",
             password=PW,
             display_name=None,
@@ -414,7 +416,10 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
         user = await service.store.get_user(uid)
         assert user is not None and user.password_hash is not None
         await service.store.set_password(
-            uid, password_hash=user.password_hash, must_change_password=False
+            uid,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
         await service.set_channel_scope(uid, ["in1"], actor="admin")  # origin only, NOT OB2
         mid = await engine.store.enqueue_message(
@@ -448,7 +453,8 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_chosen(
+            service,
             username="v",
             password=PW,
             display_name=None,
@@ -463,7 +469,10 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
         user = await service.store.get_user(uid)
         assert user is not None and user.password_hash is not None
         await service.store.set_password(
-            uid, password_hash=user.password_hash, must_change_password=False
+            uid,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
         mid = await engine.store.enqueue_message(
             channel_id="in1", raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
@@ -499,7 +508,8 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_chosen(
+            service,
             username="op",
             password=PW,
             display_name=None,
@@ -514,7 +524,10 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
         user = await service.store.get_user(uid)
         assert user is not None and user.password_hash is not None
         await service.store.set_password(
-            uid, password_hash=user.password_hash, must_change_password=False
+            uid,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
         await service.set_channel_scope(uid, ["in1", "OB2"], actor="admin")  # BOTH origin + target
         mid = await engine.store.enqueue_message(

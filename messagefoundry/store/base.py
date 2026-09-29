@@ -1809,6 +1809,7 @@ class AuthStore(Protocol):
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        password_generated: bool,
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
@@ -1816,6 +1817,12 @@ class AuthStore(Protocol):
         audit: AuditAppend | None = None,
     ) -> None:
         """Insert one account row.
+
+        ``password_generated`` is REQUIRED, with no default, so every caller states whether the
+        credential it writes is engine-generated (ADR 0197 Amendment A). It is one of the two writers
+        of a hash; a caller that forgot it would ship every created account lockable, which is the
+        population the amendment exists for. A row flagged generated must carry a hash
+        (``store.check_password_generated``).
 
         ``notify_email`` is seeded from ``email`` through ``seed_notify_email`` unless
         ``adopt_notify_email`` is ``False``, which binds NULL and keeps ``email`` as the profile
@@ -1922,14 +1929,22 @@ class AuthStore(Protocol):
     # ADR 0197: a password change also clears BOTH locks and both failure counts, and zeroes the
     # second-step cycle count, because the password those failures proved is gone. The sign-in cycle
     # count stays (``store.PASSWORD_CHANGE_LOCKOUT_CLEAR``).
+    #
+    # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
+    # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
+    # ``require_totp`` makes the write CONDITIONAL on ``totp_enabled`` in the same UPDATE, so an
+    # ``admin_reset_mfa`` that clears TOTP between the caller's check and this write makes it match
+    # no row. Returns whether a row was written; a conditional caller refuses on False.
     async def set_password(
         self,
         user_id: str,
         *,
         password_hash: str,
+        password_generated: bool,
         must_change_password: bool = True,
+        require_totp: bool = False,
         now: float | None = None,
-    ) -> None: ...
+    ) -> bool: ...
 
     # THE LOGIN-TIME ARGON2 REHASH'S WRITE, AND IT MUST STAY NARROW (ADR 0197 AC-10b). It replaces the
     # hash and touches no lockout column, no ``password_changed_at`` and no claim stamp. The rehash

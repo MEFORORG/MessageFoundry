@@ -2007,6 +2007,7 @@ async def test_an_addressless_lock_notice_does_not_hold_back_a_later_mailable_on
             username="no-address",
             auth_provider="local",
             password_hash=user.password_hash,
+            password_generated=False,
         )
         bare = await store.get_user("u-noaddr")
         assert bare is not None and not bare.notify_email
@@ -2033,7 +2034,11 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
     store, service, notifier, clock, _user_id = await _notice_harness(monkeypatch)
     try:
         await store.create_user(
-            user_id="u-ad", username="ad-user", auth_provider="ad", now=clock.now
+            user_id="u-ad",
+            username="ad-user",
+            auth_provider="ad",
+            now=clock.now,
+            password_generated=False,
         )
         await store.set_user_notify_email("u-ad", email="ad@example.org")
         ad = await store.get_user("u-ad")
@@ -2150,5 +2155,535 @@ async def test_a_session_revoked_after_rotation_still_delivers_the_codes(
         assert (await service.mfa_status(identity)).enabled is True
         hashes = await store.get_recovery_code_hashes(identity.user_id)
         assert len(hashes) == len(enrolled.recovery_codes)
+    finally:
+        await store.close()
+
+
+# --- ADR 0197 Amendment A, wave 1 (BACKLOG #1131): every account is born with a way past ----------
+#
+# A lock exists to bound guesses. On an engine-generated 192-bit credential it bounds nothing, so
+# wrong passwords arm no sign-in lock while one stands (AC-A1). Under the shipped require_mfa the
+# holder enrols TOTP BEFORE replacing it (AC-A3), so the rotation that ends every session never
+# leaves a guessable password with no way past. These arms walk the service, not the store.
+
+
+async def _created_holder(service: AuthService, *, username: str = "holder") -> tuple[str, str]:
+    """Create a local Viewer through the admin surface. Returns ``(user_id, issued_password)``."""
+    await service.initialize()
+    created = await service.create_local_user(
+        username=username,
+        display_name=None,
+        email=f"{username}@example.org",
+        roles=["viewer"],
+        actor="test-admin",
+    )
+    return created.user_id, created.credential.password
+
+
+def _way_past(user: Any) -> bool:
+    """The invariant wave 1 exists for: a covered local account either holds an unguessable
+    generated credential (nothing to get past) or TOTP (option E's combined sign-in)."""
+    return bool(user.password_generated or user.totp_enabled)
+
+
+async def test_a_created_account_cannot_be_locked_while_its_issued_credential_stands() -> None:
+    """AC-A1 + AC-A2, through ``create_local_user`` -- the arm that catches a ``create_user`` call
+    that forgot the ``password_generated`` keyword, because that account would lock here."""
+    store = await _store()
+    try:
+        threshold = 3
+        service = AuthService(store, AuthSettings(lockout_threshold=threshold, lockout_minutes=15))
+        user_id, issued = await _created_holder(service)
+        row = await store.get_user(user_id)
+        assert row is not None and row.password_generated and row.must_change_password
+        # AC-A2: 192 bits from the CSPRNG, not an administrator's choice.
+        assert len(issued) >= 32
+        for _ in range(threshold * 3):
+            assert (await service.login("holder", "a-wrong-guess-xyz")).ok is False
+        row = await store.get_user(user_id)
+        assert row is not None
+        # Counted and audited, never locked.
+        assert row.failed_attempts == threshold * 3 and row.locked_until is None
+        failed_rows = await store.list_audit(limit=100, action="auth.login_failed")
+        assert len(failed_rows) >= threshold * 3
+        out = await service.login("holder", issued)
+        assert out.ok and out.must_change_password
+    finally:
+        await store.close()
+
+
+async def test_the_walk_from_creation_to_a_chosen_password_never_leaves_the_holder_lockable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-A3, the whole first sign-in. At every step the account holds a way past, and each step
+    that would break that is refused: the rotation before TOTP, and a passkey as the first factor."""
+    from messagefoundry.auth.service import FactorEnrolmentRequired
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
+        user_id, issued = await _created_holder(service)
+        assert _way_past(await store.get_user(user_id))
+
+        out = await service.login("holder", issued)
+        assert out.ok and out.identity is not None and out.token is not None
+        identity, token = out.identity, out.token
+
+        # The rotation is refused IN THE SERVICE while no TOTP exists, and writes nothing.
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, "a-brand-new-chosen-passphrase")
+        row = await store.get_user(user_id)
+        assert row is not None and row.password_generated and _way_past(row)
+        assert await service.must_enrol_before_rotating(identity)
+
+        # A passkey cannot be the first factor: it has no way past the lock in wave 1.
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id="localhost", rp_name="MessageFoundry"
+            )
+
+        # Enrolment is allowed, and it is TOTP.
+        enroll = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert confirmed.ok
+        row = await store.get_user(user_id)
+        assert row is not None and row.totp_enabled and row.password_generated
+        assert not await service.must_enrol_before_rotating(identity)
+
+        # Now the rotation lands, and the account is option E's case: chosen password, TOTP.
+        assert await service.change_password(identity, "a-brand-new-chosen-passphrase") == []
+        row = await store.get_user(user_id)
+        assert row is not None
+        assert (row.password_generated, row.totp_enabled, row.must_change_password) == (
+            False,
+            True,
+            False,
+        )
+        assert _way_past(row)
+    finally:
+        await store.close()
+
+
+async def test_an_account_with_no_must_change_flag_gets_the_same_gate() -> None:
+    """AC-A3, "with or without the must-change flag": an account whose TOTP went while the
+    requirement was off holds a chosen password and no flag. When the requirement is back on, its
+    rotation is refused all the same. With the requirement off, it rotates as today."""
+    from messagefoundry.auth.service import FactorEnrolmentRequired
+
+    store = await _store()
+    try:
+        admin = await create_admin(AuthService(store, AuthSettings()))
+        await store.set_password(
+            admin.user_id,
+            password_hash=await asyncio.to_thread(hash_password_for_test, admin.password),
+            must_change_password=False,
+            password_generated=False,
+        )
+        off = AuthService(store, AuthSettings(require_mfa=False))
+        out = await off.login(admin.username, admin.password)
+        assert out.ok and out.identity is not None
+        assert not out.identity.must_change_password
+
+        on = AuthService(store, AuthSettings())
+        with pytest.raises(FactorEnrolmentRequired):
+            await on.change_password(out.identity, "another-chosen-passphrase-1")
+        row = await store.get_user(admin.user_id)
+        assert row is not None and verify_password(row.password_hash or "", admin.password)
+
+        # Positive control: the requirement off, the same call rotates.
+        assert await off.change_password(out.identity, "another-chosen-passphrase-2") == []
+    finally:
+        await store.close()
+
+
+def hash_password_for_test(password: str) -> str:
+    from messagefoundry.auth.passwords import hash_password
+
+    return hash_password(password)
+
+
+async def test_a_factor_reset_racing_the_rotation_refuses_the_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N-B2 part 4: ``change_password`` checks for TOTP, hashes, then writes. An administrator's
+    factor reset that lands in that gap clears TOTP; the write then matches no row, and the holder
+    is refused rather than left with a chosen password and no way past."""
+    from messagefoundry.auth.service import FactorEnrolmentRequired
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        user_id, issued = await _created_holder(service)
+        out = await service.login("holder", issued)
+        assert out.identity is not None and out.token is not None
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        assert (
+            await service.confirm_mfa_enrollment(
+                out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+            )
+        ).ok
+
+        real_argon2 = service._argon2
+        raced: list[object] = []
+
+        async def argon2_with_a_reset_in_the_gap(fn: Any, *args: Any) -> Any:
+            if not raced:
+                raced.append("reset")  # first: the reset hashes its own credential through here
+                await service.admin_reset_mfa(user_id, actor="test-admin")
+            return await real_argon2(fn, *args)
+
+        monkeypatch.setattr(service, "_argon2", argon2_with_a_reset_in_the_gap)
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(out.identity, "a-chosen-passphrase-in-the-race")
+        row = await store.get_user(user_id)
+        assert row is not None
+        # The reset's generated credential stands; the holder's chosen one never landed.
+        assert row.password_generated and not row.totp_enabled
+        assert _way_past(row)
+    finally:
+        await store.close()
+
+
+async def test_admin_reset_mfa_issues_a_credential_before_it_clears_any_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-A4 + N-B2 part 5: the reset returns a generated credential, writes it FIRST, and leaves
+    the account unlockable until the holder claims it."""
+    store = await _store()
+    try:
+        threshold = 3
+        service = AuthService(store, AuthSettings(lockout_threshold=threshold, lockout_minutes=15))
+        identity = await _enrol_totp(service, monkeypatch)
+        order: list[str] = []
+        real_set_password = store.set_password
+        real_disable = store.disable_totp
+        real_delete = store.delete_all_webauthn_credentials
+
+        async def spy_set_password(*a: Any, **k: Any) -> bool:
+            order.append("set_password")
+            return await real_set_password(*a, **k)
+
+        async def spy_disable(*a: Any, **k: Any) -> None:
+            order.append("disable_totp")
+            await real_disable(*a, **k)
+
+        async def spy_delete(*a: Any, **k: Any) -> int:
+            order.append("delete_webauthn")
+            return await real_delete(*a, **k)
+
+        monkeypatch.setattr(store, "set_password", spy_set_password)
+        monkeypatch.setattr(store, "disable_totp", spy_disable)
+        monkeypatch.setattr(store, "delete_all_webauthn_credentials", spy_delete)
+        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        assert issued is not None and len(issued.password) >= 32
+        assert order[0] == "set_password", order
+        assert order.index("set_password") < order.index("disable_totp")
+
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.password_generated and not row.totp_enabled
+        for _ in range(threshold * 2):
+            assert (await service.login(ADMIN_USERNAME, "a-wrong-guess-xyz")).ok is False
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.locked_until is None
+        assert (await service.login(ADMIN_USERNAME, issued.password)).ok
+    finally:
+        await store.close()
+
+
+async def test_disable_mfa_refuses_removing_totp_while_covered_even_beside_a_passkey(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-A3a: a passkey is a second factor, but not a way past the sign-in lock in wave 1, so a
+    covered account keeps its TOTP however many passkeys it holds."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity = await _enrol_totp(service, monkeypatch)
+        await store.add_webauthn_credential(
+            WebAuthnCredential(
+                credential_id_hash="w1-passkey-hash",
+                credential_id="w1-passkey-id",
+                user_id=identity.user_id,
+                rp_id="t",
+                public_key="cose-public-key-b64url",
+                sign_count=0,
+                transports=None,
+                device_type="multi_device",
+                backed_up=True,
+                label="laptop",
+                aaguid=None,
+                created_at=1000.0,
+            )
+        )
+        with pytest.raises(ValueError) as exc:
+            await service.disable_mfa(identity)
+        assert "last second factor" in str(exc.value)
+        assert (await service.mfa_status(identity)).enabled is True
+    finally:
+        await store.close()
+
+
+# --- ADR 0197 Amendment A, AC-A9: the census of accounts with no way past -------------------------
+
+
+async def test_the_census_names_a_covered_chosen_password_with_no_totp_and_only_that(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A must-change Administrator whose password was typed for it (``create_admin``) is covered,
+    holds a chosen credential and no TOTP: named. A generated credential, a TOTP holder, a disabled
+    account and a directory account are not. With the requirement off, nothing is covered."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await create_admin(service)
+        await _created_holder(service, username="generated")
+        enrolled_id, _ = await _created_holder(service, username="enrolled")
+        await store.set_totp_secret(enrolled_id, secret="JBSWY3DPEHPK3PXP")
+        await store.enable_totp(enrolled_id, recovery_code_hashes=[])
+        disabled_id, _ = await _created_holder(service, username="disabled")
+        await store.set_password(
+            disabled_id, password_hash="h", password_generated=False, must_change_password=False
+        )
+        # Named although disabled: it is lockable the moment it is re-enabled (review round 2).
+        await store.set_user_disabled(disabled_id, disabled=True)
+        await store.create_user(
+            user_id="dir-1", username="directory", auth_provider="ad", password_generated=False
+        )
+        census = await service.lockable_account_census()
+        assert census.no_way_past == ("disabled", ADMIN_USERNAME)
+        assert census.undecryptable_totp == ()
+        assert not census.clean
+
+        off = await AuthService(store, AuthSettings(require_mfa=False)).lockable_account_census()
+        assert off.clean
+    finally:
+        await store.close()
+
+
+async def test_the_census_names_an_enabled_totp_secret_the_engine_cannot_decrypt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner's way past is the combined sign-in; with an unreadable secret it becomes "right
+    password, wrong code", which feeds the second-step lock. The census names it."""
+    from messagefoundry.store.crypto import CipherError
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity = await _enrol_totp(service, monkeypatch)
+        assert (await service.lockable_account_census()).clean
+        real = store.get_totp_secret
+
+        async def broken(user_id: str) -> str | None:
+            if user_id == identity.user_id:
+                raise CipherError("synthetic: the key this blob was sealed under is gone")
+            return await real(user_id)
+
+        monkeypatch.setattr(store, "get_totp_secret", broken)
+        census = await service.lockable_account_census()
+        assert census.undecryptable_totp == (ADMIN_USERNAME,)
+        assert census.no_way_past == ()
+    finally:
+        await store.close()
+
+
+async def test_the_census_names_nothing_on_a_store_built_through_the_new_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every account made and claimed through the shipped paths is generated or holds TOTP."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        user_id, issued = await _created_holder(service)
+        out = await service.login("holder", issued)
+        assert out.identity is not None and out.token is not None
+        assert (await service.lockable_account_census()).clean
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        confirmed = await service.confirm_mfa_enrollment(
+            out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+        )
+        assert confirmed.ok
+        assert await service.change_password(out.identity, "a-brand-new-chosen-passphrase") == []
+        assert (await service.lockable_account_census()).clean
+        await service.admin_reset_mfa(user_id, actor="test-admin")
+        assert (await service.lockable_account_census()).clean
+    finally:
+        await store.close()
+
+
+async def test_the_startup_census_warns_and_audits_and_does_not_refuse(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC-A9: a finding is a WARNING and one audit row naming usernames, never a raise."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await create_admin(service)
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            census = await service.report_lockable_account_census()
+        assert census.no_way_past == (ADMIN_USERNAME,)
+        assert any(ADMIN_USERNAME in r.getMessage() for r in caplog.records)
+        rows = await store.list_audit(limit=10, action="auth.lockable_account_census")
+        assert len(rows) == 1 and ADMIN_USERNAME in str(rows[0]["detail"])
+        assert "JBSWY" not in str(rows[0]["detail"])
+    finally:
+        await store.close()
+
+
+async def test_the_mfa_enabled_notice_to_a_must_change_account_says_who_to_tell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N-B2 "a new credential to protect": an interceptor can now enrol without rotating, so the
+    MFA_ENABLED notice to a must-change account tells the holder what an unexpected one means."""
+    from messagefoundry.pipeline.security_notify import _build_body
+
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        _user_id, issued = await _created_holder(service)
+        out = await service.login("holder", issued)
+        assert out.identity is not None and out.token is not None
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        await service.confirm_mfa_enrollment(
+            out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+        )
+        event = next(e for e in notifier.events if e.event_type == MFA_ENABLED)
+        assert event.detail.get("issued_credential") is True
+        body = _build_body(event)
+        assert "have not signed in" in body and "administrator" in body
+    finally:
+        await store.close()
+
+
+# --- review round 1 (ADR 0197 Amendment A) -------------------------------------------------------
+
+
+async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chosen_password_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other ordering of the reset/rotation race. The reset writes its credential, then a
+    holder's rotation -- which read TOTP on -- lands its conditional write before the reset clears
+    TOTP. The reset writes its credential again once the factors are gone, so the account ends with
+    the generated credential, never a chosen password with no factor. And the holder hears of the
+    password change as a PASSWORD_RESET, with its deadline."""
+    from messagefoundry.auth.notifications import PASSWORD_RESET
+
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        identity = await _enrol_totp(service, monkeypatch)
+        real_disable = store.disable_totp
+
+        async def rotation_lands_first(user_id: str, **k: Any) -> None:
+            assert await store.set_password(
+                user_id,
+                password_hash=await asyncio.to_thread(hash_password_for_test, "a-chosen-one-99x"),
+                password_generated=False,
+                must_change_password=False,
+                require_totp=True,
+            ), "the holder's conditional write must match here, TOTP is still on"
+            await real_disable(user_id, **k)
+
+        monkeypatch.setattr(store, "disable_totp", rotation_lands_first)
+        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        assert issued is not None
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.password_generated and not row.totp_enabled
+        assert (await service.login(ADMIN_USERNAME, issued.password)).ok
+        assert not (await service.login(ADMIN_USERNAME, "a-chosen-one-99x")).ok
+        assert any(e.event_type == PASSWORD_RESET for e in notifier.events)
+    finally:
+        await store.close()
+
+
+async def test_the_census_reads_every_account_it_should_and_nothing_it_should_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory account's unusable TOTP secret is named. A local row with no hash is not: nobody
+    can sign into it. A keyless read that hands ciphertext through is a fact about the shell, not
+    the account, so the census stops with CensusNeedsTheStoreKey rather than naming every enrolled
+    account (review round 2). Any other store error propagates too."""
+    from messagefoundry.auth.service import CensusNeedsTheStoreKey, lockable_account_census
+
+    store = await _store()
+    try:
+        await store.create_user(
+            user_id="dir-totp", username="directory", auth_provider="ad", password_generated=False
+        )
+        await store.set_totp_secret("dir-totp", secret="JBSWY3DPEHPK3PXP")
+        await store.enable_totp("dir-totp", recovery_code_hashes=[])
+        await store.create_user(
+            user_id="hashless",
+            username="half-built",
+            auth_provider="local",
+            password_generated=False,
+        )
+        real = store.get_totp_secret
+
+        async def not_a_key(user_id: str) -> str | None:
+            if user_id == "dir-totp":
+                return "not a base32 key!"
+            return await real(user_id)
+
+        monkeypatch.setattr(store, "get_totp_secret", not_a_key)
+        census = await lockable_account_census(store, AuthSettings())
+        assert census.undecryptable_totp == ("directory",)
+        assert census.no_way_past == ()
+
+        async def ciphertext_through(user_id: str) -> str | None:
+            return "mfenc:v4:aes:k1:00:c2VhbGVk"
+
+        monkeypatch.setattr(store, "get_totp_secret", ciphertext_through)
+        with pytest.raises(CensusNeedsTheStoreKey):
+            await lockable_account_census(store, AuthSettings())
+
+        async def unreachable(user_id: str) -> str | None:
+            raise ConnectionError("synthetic: the store went away")
+
+        monkeypatch.setattr(store, "get_totp_secret", unreachable)
+        with pytest.raises(ConnectionError):
+            await lockable_account_census(store, AuthSettings())
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_can_still_be_revoked_by_a_covered_account_with_no_totp() -> None:
+    """Review round 1: removing a passkey cannot take away a way past in wave 1, so a covered
+    account holding two passkeys and no TOTP may still remove a lost one."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, _token, _pw = await login_admin(service)
+        for n in (1, 2):
+            await store.add_webauthn_credential(
+                WebAuthnCredential(
+                    credential_id_hash=f"pk-{n}-hash",
+                    credential_id=f"pk-{n}-id",
+                    user_id=identity.user_id,
+                    rp_id="t",
+                    public_key="cose-public-key-b64url",
+                    sign_count=0,
+                    transports=None,
+                    device_type="multi_device",
+                    backed_up=True,
+                    label=f"key {n}",
+                    aaguid=None,
+                    created_at=1000.0,
+                )
+            )
+        assert await service.delete_webauthn_credential(identity, "pk-1-hash")
+        assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
     finally:
         await store.close()

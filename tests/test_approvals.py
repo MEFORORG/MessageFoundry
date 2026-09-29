@@ -38,6 +38,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import OutboxStatus
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -76,7 +77,8 @@ def _client(
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
     """Provision a usable local operator; returns the immutable ``users.id`` (BACKLOG #1540 keys the
     self-approval refusal on it, so the rename tests below need it)."""
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -91,7 +93,7 @@ async def _add(service: AuthService, username: str, *roles: Role) -> str:
     user = await service.store.get_user(uid)  # clear forced first-login rotation (WP-L3-12)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     return uid
 

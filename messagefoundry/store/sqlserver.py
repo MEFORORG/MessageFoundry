@@ -193,7 +193,9 @@ from messagefoundry.store.store import (
     audit_row_hash,
     birth_notify_email,
     build_audit_mac_keys,
+    check_password_generated,
     delivery_key,
+    lockout_arms,
     lockout_clear_set,
     lockout_escalates,
     next_lockout_state,
@@ -202,6 +204,7 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
+    rotation_factor_term,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -1866,7 +1869,10 @@ _SCHEMA: list[str] = [
         -- ADR 0197 (BACKLOG #1131): the sign-in lock's cycle count, and the second-step counter's
         -- three columns. Each defaults to no history, which is the pre-ADR state.
         lock_cycles INT NOT NULL DEFAULT 0, second_step_failed_attempts INT NOT NULL DEFAULT 0,
-        second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0)""",
+        second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0,
+        -- ADR 0197 Amendment A (BACKLOG #1131): 1 while the credential in force is
+        -- engine-generated; wrong passwords arm no sign-in lock then.
+        password_generated BIT NOT NULL DEFAULT 0)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1908,6 +1914,10 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD second_step_locked_until FLOAT NULL""",
     """IF COL_LENGTH('users','second_step_lock_cycles') IS NULL
         ALTER TABLE users ADD second_step_lock_cycles INT NOT NULL DEFAULT 0""",
+    # ADR 0197 Amendment A (BACKLOG #1131): COL_LENGTH-gated ADD. 0 on an existing row reads "the
+    # holder chose this credential", which keeps the account LOCKABLE -- the closed direction.
+    """IF COL_LENGTH('users','password_generated') IS NULL
+        ALTER TABLE users ADD password_generated BIT NOT NULL DEFAULT 0""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -11106,18 +11116,21 @@ class SqlServerStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        password_generated: bool,
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
         audit: AuditAppend | None = None,
     ) -> None:
+        check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
         sql = (
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until, directory_object_id)"
-            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)"
+            " must_change_password, failed_attempts, locked_until, directory_object_id,"
+            " password_generated)"
+            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?,?)"
         )
         params = (
             user_id,
@@ -11132,6 +11145,7 @@ class SqlServerStore:
             now if password_hash is not None else None,
             1 if must_change_password else 0,
             directory_object_id,
+            1 if password_generated else 0,
         )
         if audit is None:
             await self._execute(sql, params)
@@ -11204,18 +11218,40 @@ class SqlServerStore:
         user_id: str,
         *,
         password_hash: str,
+        password_generated: bool,
         must_change_password: bool = True,
+        require_totp: bool = False,
         now: float | None = None,
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
         claim_set = password_claim_set(must_change_password, "?")
         claim_args: tuple[float, ...] = () if must_change_password else (now,)
-        await self._execute(
-            "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
-            f"{claim_set}"
-            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=? WHERE id=?",
-            (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
-        )
+        condition = rotation_factor_term("1") if require_totp else ""
+        # OUTPUT, never ``cursor.rowcount``: a session-wide ``SET NOCOUNT ON`` suppresses the count
+        # (see ``_RESOLVE_OUTPUT``), and a conditional rotation must know whether it matched.
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
+                    f"{claim_set}"
+                    f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=?, updated_at=?"
+                    f" OUTPUT inserted.id WHERE id=?{condition}",
+                    (
+                        password_hash,
+                        now,
+                        1 if must_change_password else 0,
+                        *claim_args,
+                        1 if password_generated else 0,
+                        now,
+                        user_id,
+                    ),
+                )
+                written = bool(await cur.fetchall())
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return written
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -11261,8 +11297,9 @@ class SqlServerStore:
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
+            # ``last_totp_step`` too: see the SQLite twin (ADR 0197 Amendment A).
             "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-            " totp_recovery_codes=NULL, updated_at=? WHERE id=?",
+            " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
             (now, user_id),
         )
 
@@ -11569,8 +11606,8 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
-                    " FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                    f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
+                    " password_generated FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
                 # fetchall reads the counters AND drains the SELECT so the same-cursor UPDATE below is
@@ -11590,6 +11627,7 @@ class SqlServerStore:
                     escalate=lockout_escalates(
                         counter, auth_provider=str(rows[0][3]), totp_enabled=bool(rows[0][4])
                     ),
+                    lockable=lockout_arms(counter, password_generated=bool(rows[0][5])),
                 )
                 await cur.execute(
                     f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?,"

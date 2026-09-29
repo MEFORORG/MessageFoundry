@@ -20,6 +20,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, ServiceStatusSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
 
@@ -38,7 +39,8 @@ async def _service(engine: Engine) -> AuthService:
 
 
 async def _token(engine: Engine, svc: AuthService, *roles: Role) -> str:
-    await svc.create_local_user(
+    await create_local_user_chosen(
+        svc,
         username="u",
         password=PW,
         display_name=None,
@@ -49,7 +51,10 @@ async def _token(engine: Engine, svc: AuthService, *roles: Role) -> str:
     user = await svc.store.get_user_by_username("u")
     assert user is not None and user.password_hash is not None
     await svc.store.set_password(
-        user.id, password_hash=user.password_hash, must_change_password=False
+        user.id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     out = await svc.login("u", PW)
     assert out.token is not None

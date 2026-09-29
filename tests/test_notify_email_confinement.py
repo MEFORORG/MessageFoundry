@@ -40,6 +40,7 @@ from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyE
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
+from tests._admin_account import create_local_user_chosen, provision_totp
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -66,7 +67,8 @@ def _no_mfa(**overrides: Any) -> AuthSettings:
 
 async def _add_local(service: AuthService, username: str, *, email: str | None = None) -> str:
     """An onboarded local Administrator: the create path, with the forced rotation cleared."""
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -77,7 +79,10 @@ async def _add_local(service: AuthService, username: str, *, email: str | None =
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     return user_id
@@ -118,7 +123,11 @@ async def test_provision_admin_confines_only_when_email_was_left_out() -> None:
         try:
             service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
             await service.provision_first_administrator(
-                username="first", password=PW, notify_email=notify_email, actor="cli:test"
+                username="first",
+                password=PW,
+                notify_email=notify_email,
+                actor="cli:test",
+                **provision_totp(),
             )
             assert await _flag_after_login(service, "first") is expected
         finally:
@@ -513,7 +522,7 @@ async def test_the_api_create_seeds_the_address_and_tells_it(engine: Engine) -> 
         r = await c.post(
             "/users",
             headers=_auth(tok),
-            json={"username": "newbie", "password": PW, "email": "newbie@example.org"},
+            json={"username": "newbie", "email": "newbie@example.org"},
         )
         assert r.status_code == 201, r.text
     user = await engine.store.get_user_by_username("newbie")
@@ -530,13 +539,13 @@ async def test_the_api_create_refuses_a_missing_blank_or_malformed_address(engin
     before = len(await engine.store.list_audit(action="user.created", limit=100_000))
     async with _client(engine, service) as c:
         tok = (await _login(c, "root"))["token"]
-        missing = await c.post("/users", headers=_auth(tok), json={"username": "a", "password": PW})
+        missing = await c.post("/users", headers=_auth(tok), json={"username": "a"})
         assert missing.status_code == 422, missing.text
         for i, bad in enumerate((" ", "x", "a@b.org, c@d.org", "Name <a@b.org>")):
             r = await c.post(
                 "/users",
                 headers=_auth(tok),
-                json={"username": f"bad{i}", "password": PW, "email": bad},
+                json={"username": f"bad{i}", "email": bad},
             )
             assert r.status_code == 400, (bad, r.text)
             if "@" in bad:  # the refusal never echoes the value
@@ -556,7 +565,8 @@ async def test_the_service_refuses_a_malformed_address_before_any_write() -> Non
         await service.initialize()
         for bad in ("", "  ", "a@b.org; c@d.org"):
             with pytest.raises(InvalidNotifyEmail):
-                await service.create_local_user(
+                await create_local_user_chosen(
+                    service,
                     username="bad",
                     password=PW,
                     display_name=None,
@@ -735,7 +745,9 @@ async def test_the_confinement_holds_on_every_store_backend(backend_store: Any) 
     # A server database is shared across the run, so the name is unique rather than truncated.
     name = f"confine-{uuid4().hex[:12]}"
     user_id = uuid4().hex
-    await backend_store.create_user(user_id=user_id, username=name, auth_provider="local")
+    await backend_store.create_user(
+        user_id=user_id, username=name, auth_provider="local", password_generated=False
+    )
     try:
         identity = await service.identity_for_user_id(user_id)
         assert identity is not None and identity.must_set_notify_email is True
@@ -758,7 +770,12 @@ async def test_every_store_backend_can_create_an_account_without_adopting_its_ad
     user_id = uuid4().hex
     mail = _UNADOPTABLE_DIRECTORY_MAIL[0][1]
     await backend_store.create_user(
-        user_id=user_id, username=name, auth_provider="ad", email=mail, adopt_notify_email=False
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        email=mail,
+        adopt_notify_email=False,
+        password_generated=False,
     )
     try:
         user = await backend_store.get_user(user_id)
@@ -783,6 +800,7 @@ async def test_every_store_backend_commits_the_audit_row_with_the_insert(
         email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
         adopt_notify_email=False,
         audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name, detail=detail),
+        password_generated=False,
     )
     try:
         assert await backend_store.get_user(user_id) is not None
@@ -816,6 +834,7 @@ async def test_every_store_backend_rolls_the_insert_back_with_a_refused_audit_ro
                 email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
                 adopt_notify_email=False,
                 audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
+                password_generated=False,
             )
         assert await backend_store.get_user(user_id) is None
         rows = await backend_store.list_audit(action="auth.ad_notify_email_not_adopted", actor=name)
@@ -841,6 +860,7 @@ async def test_every_store_backend_binds_a_typed_address_in_the_same_insert(
         email=mail,
         adopt_notify_email=False,
         notify_email=ADDRESS,
+        password_generated=False,
     )
     try:
         user = await backend_store.get_user(user_id)

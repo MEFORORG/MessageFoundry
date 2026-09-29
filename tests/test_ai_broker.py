@@ -35,6 +35,7 @@ from messagefoundry.transports.ai_broker import (
     endpoint_host_allowed,
 )
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER
+from tests._admin_account import create_local_user_chosen
 from tests._malformed_reply import MALFORMED_REPLIES, RaisingOpener, RefusedAndMalformed
 
 PW = "Sup3rSecret!!"
@@ -298,7 +299,8 @@ async def test_ai_chat_requires_ai_assist_permission(
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     for username, role in (("coder", Role.CODING), ("vw", Role.VIEWER)):
-        user_id = await service.create_local_user(
+        user_id = await create_local_user_chosen(
+            service,
             username=username,
             password=PW,
             display_name=None,
@@ -315,7 +317,10 @@ async def test_ai_chat_requires_ai_assist_permission(
         # Admin-created accounts force first-login rotation (WP-L3-12); clear it for a usable login so
         # the require() gate tests the PERMISSION, not the password-change redirect.
         await service.store.set_password(
-            user_id, password_hash=user.password_hash, must_change_password=False
+            user_id,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
     app = create_app(engine, auth=service, ai_settings=_managed_ai())
     async with _client(app) as c:

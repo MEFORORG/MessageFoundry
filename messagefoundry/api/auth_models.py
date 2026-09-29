@@ -213,8 +213,12 @@ class ChannelScope(RequestModel):
 
 
 class UserCreateRequest(RequestModel):
+    """``POST /users``. THERE IS NO PASSWORD FIELD (ADR 0197 Amendment A, N-B2 part 1): the engine
+    generates the new account's credential and returns it once, in :class:`UserCreatedResponse`.
+    ``RequestModel`` refuses an unknown key, so a caller still sending ``password`` gets 422 rather
+    than a credential it believes it chose."""
+
     username: str = Field(max_length=_NAME_MAX)
-    password: str = Field(max_length=_PASSWORD_MAX)
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
     #: where every security notice goes. An account born without one is told nothing about a change
@@ -310,6 +314,27 @@ class ReauthRequest(RequestModel):
     # refreshing the session window. Bounded length — it is an opaque action tag, never reflected;
     # an unknown tag simply fails closed (nothing consumes it, so the action re-prompts).
     purpose: str | None = Field(default=None, max_length=64)
+
+
+class UserCreatedResponse(UserSummary):
+    """``POST /users``: the new account, plus its engine-generated credential, returned **once** for
+    the administrator to convey out-of-band (ADR 0197 Amendment A, AC-A2). The holder must enrol an
+    authenticator app, then replace it, at first sign-in. Wrong passwords arm no sign-in lock while
+    it stands, so nobody who merely knows the username can lock the account before that."""
+
+    temp_password: str
+    must_change_password: bool = True
+
+
+class MfaResetResponse(BaseModel):
+    """``POST /users/{id}/reset-mfa``: the factor reset, and on a LOCAL account the generated
+    credential it issued in the same call (ADR 0197 Amendment A, N-B2 part 5, AC-A4), returned
+    **once**. ``None`` on a directory account, which has no engine password. ``expires_at`` is the
+    same deadline :class:`PasswordResetResponse` carries."""
+
+    detail: str
+    temp_password: str | None = None
+    expires_at: float | None = None
 
 
 class PasswordResetResponse(BaseModel):

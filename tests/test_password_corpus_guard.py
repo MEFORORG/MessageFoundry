@@ -31,7 +31,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_admin
+from tests._admin_account import create_admin, provision_totp
 from tests.test_provision_first_administrator import _tty
 
 #: A password the stand-in corpora below declare leaked. Holds no CONTEXT_WORDS entry and clears the
@@ -186,7 +186,10 @@ async def test_the_startup_error_names_what_an_unusable_corpus_blocks(
 
     with pytest.raises(BreachCorpusUnavailable):
         await service.provision_first_administrator(
-            username="opsadmin", password="an-operator-chosen-passphrase", actor="installer"
+            username="opsadmin",
+            password="an-operator-chosen-passphrase",
+            actor="installer",
+            **provision_totp(),
         )
     admin = await create_admin(service)
     out = await service.login(admin.username, admin.password)
@@ -211,7 +214,7 @@ def test_startup_is_silent_when_screening_is_turned_off(
 #
 # #1438 above made an unusable corpus REFUSE a password. That is right for every password a person
 # chooses and wrong for exactly one caller, the temporary-credential generator -- whose reasoning is
-# stated at its own call site in `AuthService._generate_policy_password`, not repeated here.
+# stated at its own call site in `generate_policy_password` (auth/service.py), not repeated here.
 #
 # WHAT THESE ARMS ADD is the pairing. A blanket suppression passes the positive arms and fails the
 # controls, and that contrast is the only thing that can tell this targeted fix apart from the
@@ -282,7 +285,10 @@ async def test_an_operator_supplied_first_administrator_still_refuses_on_an_unus
     service = AuthService(empty_store, AuthSettings())
     with pytest.raises(BreachCorpusUnavailable):
         await service.provision_first_administrator(
-            username="opsadmin", password="an-operator-chosen-passphrase", actor="installer"
+            username="opsadmin",
+            password="an-operator-chosen-passphrase",
+            actor="installer",
+            **provision_totp(),
         )
 
 
@@ -337,9 +343,10 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     bundled_corpus: Callable[[Sequence[str] | None], None], empty_store: MessageStore
 ) -> None:
     """`admin_reset_password` reaches the same generator, so the same suppression covers it. Worth its
-    own arm because it was the SECOND caller of `_generate_policy_password`, and is now the only one:
-    a fix applied at the retired first-run call rather than inside the generator would have failed
-    this one. The pairing arm above mints through the same reset, so the two overlap; this arm keeps
+    own arm because it was the SECOND caller of `generate_policy_password`, and the first-run
+    call it followed is retired: a fix applied there rather than inside the generator would have
+    failed this one. Account creation, the factor reset and the startup and verify probe call it
+    too (ADR 0197 Amendment A), and all reach the suppression through the generator itself. The pairing arm above mints through the same reset, so the two overlap; this arm keeps
     the length check.
 
     SCOPE, because the assertion is weaker than the test name suggests. This proves only that
@@ -363,7 +370,7 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
 #: bulk-import path, or a route copying the kwarg to quieten a red corpus leg -- and silently stop
 #: screening an operator-supplied password with all thirteen arms above still green. Neither measured
 #: mutation detects that shape, because both mutate the gate rather than adding a caller.
-_BREACH_SUPPRESSION_CALL_SITES = {"messagefoundry/auth/service.py": ("_generate_policy_password",)}
+_BREACH_SUPPRESSION_CALL_SITES = {"messagefoundry/auth/service.py": ("generate_policy_password",)}
 
 
 def _suppression_call_sites() -> dict[str, tuple[str, ...]]:
@@ -408,4 +415,4 @@ def test_the_call_site_scanner_would_notice_a_new_suppression() -> None:
     """
     found = _suppression_call_sites()
     assert found, "the scanner found no suppression at all -- it has stopped measuring"
-    assert "_generate_policy_password" in found["messagefoundry/auth/service.py"]
+    assert "generate_policy_password" in found["messagefoundry/auth/service.py"]
