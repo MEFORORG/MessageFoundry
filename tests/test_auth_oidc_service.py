@@ -157,6 +157,8 @@ def _settings(**over: Any) -> AuthSettings:
         "oidc_token_endpoint": "https://idp.example/token",
         "oidc_jwks_uri": "https://idp.example/jwks",
         "oidc_allowed_endpoints": ["idp.example"],
+        # The start-to-callback floor is off: these callbacks return at machine speed (BACKLOG #2301).
+        "oidc_callback_min_elapsed_seconds": 0,
     }
     base.update(over)
     return AuthSettings(**base)
@@ -199,7 +201,7 @@ class _FakeLdap:
         self._by_username = by_username
         self.resolved: list[str] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return self._principal
 
     def resolve_principal(
@@ -1758,7 +1760,9 @@ class _PadSpy:
         monkeypatch.setattr(service, "_equalize_failure", spy)
 
 
-def _verified(subject: str = DEFAULT_SUB) -> oidc.FederatedPrincipal:
+def _verified(
+    subject: str = DEFAULT_SUB, *, auth_time: float | None = None
+) -> oidc.FederatedPrincipal:
     now = time.time()
     return oidc.FederatedPrincipal(
         username="jdoe",
@@ -1767,7 +1771,7 @@ def _verified(subject: str = DEFAULT_SUB) -> oidc.FederatedPrincipal:
         amr=("pwd", "mfa"),
         acr=None,
         expires_at=now + 600,
-        auth_time=now,
+        auth_time=now if auth_time is None else auth_time,
     )
 
 

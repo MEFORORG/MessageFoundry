@@ -98,7 +98,9 @@ async def test_non_last_admin_can_be_disabled_and_deleted(engine: Engine) -> Non
     # With two enabled admins, disabling or deleting one (not the last) succeeds.
     # Last-admin guard is a step-up admin-CRUD flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the disable/delete/roles ops first.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     async with _client(engine, service) as c:
         h, _ = await _admin_session(c, service)
         root2 = await _create_user(c, h, "root2", "administrator")
@@ -118,7 +120,9 @@ async def test_non_last_admin_can_be_disabled_and_deleted(engine: Engine) -> Non
 async def test_non_admin_can_always_be_disabled_and_deleted(engine: Engine) -> None:
     # Last-admin guard is a step-up admin-CRUD flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the disable/delete/roles ops first.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     async with _client(engine, service) as c:
         h, _ = await _admin_session(c, service)
         viewer = await _create_user(c, h, "viewer1", "viewer")
@@ -135,7 +139,9 @@ async def test_roles_path_still_refuses_to_strip_last_admin(engine: Engine) -> N
     # and once a second admin exists the demotion succeeds.
     # Last-admin guard is a step-up admin-CRUD flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the disable/delete/roles ops first.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     async with _client(engine, service) as c:
         h, my_id = await _admin_session(c, service)
         assert (
@@ -155,7 +161,9 @@ async def test_disable_and_delete_routes_carry_last_admin_guard(engine: Engine) 
     # fires for the acting admin on both routes (the message order the new guard must sit behind).
     # Last-admin guard is a step-up admin-CRUD flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the disable/delete/roles ops first.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     async with _client(engine, service) as c:
         h, my_id = await _admin_session(c, service)
         viewer = await _create_user(c, h, "viewer1", "viewer")

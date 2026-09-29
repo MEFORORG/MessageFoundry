@@ -73,7 +73,7 @@ class _CountingLdap(_FakeLdap):
         super().__init__(principal)
         self.binds: list[str] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         self.binds.append(username)
         return super().authenticate(username, password)
 

@@ -19,6 +19,12 @@ decision record is [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality
 | PEP 740 attestations | PyPI-side provenance (Trusted Publishing) | PyPI |
 | SLSA build provenance | in-toto attestation binding each artifact (incl. SBOM + VEX) to the source commit | GitHub attestations / Sigstore bundle |
 
+Every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
+job in `release.yml` sets `attestations: true`. So the web console wheel (`messagefoundry-webconsole`)
+and the harness wheel get a PyPI-side attestation whenever their PyPI publish runs. Both of those
+publishes are gated on a repository variable. That is all they get: their release jobs have no
+Sigstore, SBOM or SLSA step.
+
 Additional CycloneDX SBOMs — the **VS Code extension** (npm) and the **container image** (Debian base +
 system libs + installed Python) — are produced by the daily/​on-demand `security.yml` workflow and
 retained as CI artifacts (`sbom-cyclonedx`, `sbom-container-image`). The container and extension are not
@@ -26,30 +32,56 @@ released through the PyPI pipeline, so their SBOMs live with CI rather than as r
 
 ## Verifying what you downloaded
 
-### The PyPI package (provenance)
+### The PyPI packages (provenance)
 
 PyPI exposes a public **Integrity API**. Fetch the PEP 740 provenance for a specific file:
 
 ```
 GET https://pypi.org/integrity/messagefoundry/<version>/<filename>/provenance
+GET https://pypi.org/integrity/messagefoundry-webconsole/<version>/<filename>/provenance
 ```
 
-The response bundles the attestations with the publisher identity that produced them. `pip` verifies
-attestations automatically when installing from PyPI.
+The response bundles the attestations with the publisher identity that produced them.
+
+**Do not assume your installer checked them.** PEP 740 does not require an installer to verify
+attestations, so verify each file yourself before you install it. Check both distributions the
+engine runs: `messagefoundry` and the web console, `messagefoundry-webconsole`. The engine loads the
+console in-process, so an unverified console is as much a risk as an unverified engine.
+
+One tool that does this is `pypi-attestations`, maintained under the `pypi` GitHub organization. Its
+`verify pypi` command downloads a file and its provenance from PyPI. It then checks the file against
+the provenance and checks that the signer is the repository you name:
+
+```bash
+pypi-attestations verify pypi --repository https://github.com/MEFORORG/MessageFoundry \
+  pypi:messagefoundry-<version>-py3-none-any.whl
+pypi-attestations verify pypi --repository https://github.com/MEFORORG/MessageFoundry \
+  pypi:messagefoundry_webconsole-<console-version>-py3-none-any.whl
+```
+
+The console has its own version, so `<console-version>` is the console wheel you installed, not the
+engine version. Both commands should pass. A failure on either file means you should not install it.
 
 ### GitHub release artifacts (Sigstore + SLSA)
 
-One verifier covers our artifacts. Verify the SLSA build provenance of any released file:
+`gh attestation verify` checks the GitHub attestations the engine release job writes: the engine
+sdist, the engine wheel, the SBOM and the VEX. For the console, use the PyPI check above. Verify the
+SLSA build provenance of one of those four files:
 
 ```bash
-gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFoundry
+gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFoundry \
+  --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml \
+  --source-ref refs/tags/v<version>
 ```
+
+Keep the last two flags. With `--repo` alone, the command accepts an attestation from any workflow
+in the repository, on any ref, and at least one attestation exists that no release wrote.
 
 Or verify a Sigstore bundle directly (the SBOM and VEX are signed too):
 
 ```bash
 python -m sigstore verify identity \
-  --cert-identity-regexp 'https://github.com/.*/MessageFoundry/.github/workflows/release.yml@.*' \
+  --cert-identity 'https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v<version>' \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
   messagefoundry-sbom.cdx.json
 ```

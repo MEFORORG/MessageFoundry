@@ -457,6 +457,7 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
         return None
 
     from messagefoundry.store.base import (
+        StoreNotFoundError,
         open_store,
     )  # below the gate — see check_store_connectivity
 
@@ -468,7 +469,12 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
         finally:
             await handle.close()
 
-    return run_guarded(_newest())
+    try:
+        return run_guarded(_newest())
+    except StoreNotFoundError:
+        # BACKLOG #1780: an auto-mode server database with no store in it holds no prior message,
+        # as an absent SQLite file does above. The connectivity check is what reports it.
+        return None
 
 
 def _classify_disposition(status: str | None, *, control_id: str, timeout: float) -> CheckResult:

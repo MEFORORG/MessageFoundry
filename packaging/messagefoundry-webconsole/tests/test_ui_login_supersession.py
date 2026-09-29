@@ -52,7 +52,7 @@ _PRINCIPAL = AdPrincipal(
 class _FakeLdap:
     """The duck-typed directory the /ui SSO and OIDC suites use. No AD exists in any test infra."""
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return _PRINCIPAL if username == "jdoe" else None
 
     def resolve_principal(
@@ -79,6 +79,8 @@ def _directory_settings(**over: object) -> AuthSettings:
         "oidc_token_endpoint": "https://idp.example/token",
         "oidc_jwks_uri": "https://idp.example/jwks",
         "oidc_allowed_endpoints": ["idp.example"],
+        # The start-to-callback floor is off: these callbacks return at machine speed (BACKLOG #2301).
+        "oidc_callback_min_elapsed_seconds": 0,
     }
     base.update(over)
     return AuthSettings(**base)  # type: ignore[arg-type]

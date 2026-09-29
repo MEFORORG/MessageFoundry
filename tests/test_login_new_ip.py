@@ -237,10 +237,10 @@ async def test_a_wrong_password_from_a_new_address_writes_no_signal_row() -> Non
 
 
 class _FakeLdap:
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return None
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return None
 
 

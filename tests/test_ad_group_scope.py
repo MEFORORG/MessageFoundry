@@ -448,7 +448,9 @@ async def _admin_service(engine: Engine) -> AuthService:
 
     Step-up admin endpoint tests, not MFA tests: ``require_mfa=False`` so the admin's PUT isn't
     blocked first by the BACKLOG #187 secure default (require_mfa now ON)."""
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     boss_id = await create_local_user_with_password(
         service,

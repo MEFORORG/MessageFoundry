@@ -45,7 +45,12 @@ RETRY = "A retry may ask you to re-authenticate first."
 
 async def _service(engine: Engine, **over: object) -> AuthService:
     """MFA off, as the other console suites run, and the issuer the bind requires set."""
-    settings: dict[str, object] = {"require_mfa": False, "oidc_issuer": ISSUER}
+    # The gap between admin writes is off: these tests' writes land back to back (BACKLOG #2301).
+    settings: dict[str, object] = {
+        "require_mfa": False,
+        "oidc_issuer": ISSUER,
+        "admin_write_min_interval_seconds": 0,
+    }
     settings.update(over)
     service = AuthService(engine.store, AuthSettings(**settings))  # type: ignore[arg-type]
     await service.initialize()

@@ -51,7 +51,7 @@ class _FakeLdap:
     def __init__(self) -> None:
         self.binds: list[str] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         self.binds.append(username)
         return _PRINCIPAL if username == "jdoe" else None
 
@@ -63,6 +63,7 @@ class _FakeLdap:
 
 def _settings(*, require_mfa: bool = False) -> AuthSettings:
     return AuthSettings(
+        oidc_callback_min_elapsed_seconds=0,
         require_mfa=require_mfa,
         ad_enabled=True,
         ad_server="ldaps://x",

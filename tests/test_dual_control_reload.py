@@ -76,7 +76,9 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _service(engine: Engine) -> AuthService:
     # Dual-control reload is a step-up admin flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the reload before the approval path.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     return service
 
@@ -327,7 +329,9 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
     auth = AuthSettings(
-        ad_tls_ca_cert_file=str(anchor), ad_tls_ca_cert_pin=hashlib.sha256(good).hexdigest()
+        admin_write_min_interval_seconds=0,
+        ad_tls_ca_cert_file=str(anchor),
+        ad_tls_ca_cert_pin=hashlib.sha256(good).hexdigest(),
     )
     cfg = tmp_path / "cfg"
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")

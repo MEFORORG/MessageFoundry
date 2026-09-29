@@ -57,7 +57,10 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     # the single-factor admin posture they were written against. The MFA-default behaviour (a
     # required-but-unenrolled admin, and the no-lockout enroll path) is covered by the dedicated MFA
     # tests below, which pass require_mfa explicitly.
-    service = AuthService(engine.store, settings or AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store,
+        settings or AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
+    )
     await service.initialize()  # seeds the built-in roles; it creates no account (ADR 0183)
     return service
 
@@ -220,7 +223,9 @@ async def test_mfa_enroll_confirm_and_step_up_gate(
 ) -> None:
     # WP-14 / ASVS 6.3.3: the full TOTP lifecycle over the API + the step-up MFA gate. An MFA-required
     # session 403s on a require_step_up route with X-MFA-Required until POST /auth/mfa-verify.
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
@@ -272,7 +277,12 @@ async def test_mfa_enroll_confirm_and_step_up_gate(
 
 async def test_mfa_verify_accepts_recovery_code_once(engine: Engine) -> None:
     service = await _service(
-        engine, AuthSettings(login_rate_limit_enabled=False, mfa_recovery_code_count=3)
+        engine,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            login_rate_limit_enabled=False,
+            mfa_recovery_code_count=3,
+        ),
     )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -495,7 +505,11 @@ async def test_detail_disposition_text_visible_to_operator_and_audited(engine: E
 
 async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> None:
     # BACKLOG #1132: a site's own context words reach POST /users, not only the service method.
-    settings = AuthSettings(require_mfa=False, password_extra_context_words=["globex"])
+    settings = AuthSettings(
+        admin_write_min_interval_seconds=0,
+        require_mfa=False,
+        password_extra_context_words=["globex"],
+    )
     service = await _service(engine, settings)
     await _add(service, "root", Role.ADMINISTRATOR)
     from messagefoundry.auth import service as service_module
@@ -864,6 +878,7 @@ async def test_admin_write_is_pace_limited_but_reads_are_not(engine: Engine) -> 
     service = await _service(
         engine,
         AuthSettings(
+            admin_write_min_interval_seconds=0,
             require_mfa=False,
             login_rate_limit_enabled=False,
             admin_write_rate_limit_per_actor=2,
@@ -886,11 +901,19 @@ async def test_admin_write_is_pace_limited_but_reads_are_not(engine: Engine) -> 
         assert (await _login(c, "adm")).status_code == 200
 
 
-async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine) -> None:
+async def test_admin_write_floor_has_headroom_over_a_legit_burst(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # BACKLOG #193 floor tuning: at the DEFAULT floor a realistic operator burst — including the extra
     # write the 403 → POST /me/reauth → retry pattern costs, plus the reauth itself (a POST, but NOT a
     # require_step_up route, so it is uncounted) — must NOT 429. A handful of sensitive writes plus a
     # reauth stay comfortably under the default per_actor floor (12 writes per 15 s, BACKLOG #287).
+    # BACKLOG #2301: the writes land at the fastest modelled click, 0.2 s apart, which clears the
+    # default 0.15 s gap. The limiter's clock is faked so the pace does not depend on the runner.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
     service = await _service(
         engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
     )
@@ -902,9 +925,10 @@ async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine)
         _r, token = await _reauth(c, token)
         assert _r.status_code == 200  # uncounted (not a step-up route)
         h = _auth(token)  # the re-auth re-keyed the session (ASVS 7.2.4)
-        # Six sensitive writes back-to-back — twice the worst-case reauth-retry cost — all pass.
+        # Six sensitive writes at click pace — twice the worst-case reauth-retry cost — all pass.
         for _ in range(6):
             assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
+            clock[0] += 0.2
 
 
 async def test_the_403_reauth_retry_burst_passes_at_the_default_floor(
@@ -915,12 +939,18 @@ async def test_the_403_reauth_retry_burst_passes_at_the_default_floor(
     # step-up window still SPENDS a write (pacing runs before the step-up check), the client re-proves
     # at POST /me/reauth, then retries. That costs two writes. It must pass at the shipped default,
     # even for an operator who has already spent most of the budget in the same window.
-    # No admin_write_* override: the three pacing settings are the shipped defaults. The limiter's
-    # clock is frozen, so the whole flow sits inside one window however slow the runner is and the
-    # CONTROL below cannot flake. Only the limiter module's own `time` is replaced.
+    # No admin_write_* override: the four pacing settings are the shipped defaults. The limiter's
+    # clock is faked, so the whole flow sits inside one window however slow the runner is and the
+    # CONTROL below cannot flake. Only the limiter module's own `time` is replaced. Each write lands
+    # 0.2 s after the last, the fastest modelled click, which clears the 0.15 s gap (BACKLOG #2301).
+    clock = [1000.0]
     monkeypatch.setattr(
-        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: 1000.0)
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
     )
+
+    def click() -> None:
+        clock[0] += 0.2
+
     service = await _service(
         engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
     )
@@ -934,14 +964,17 @@ async def test_the_403_reauth_retry_burst_passes_at_the_default_floor(
             assert (
                 await c.put("/ad-group-map", json=body, headers=_auth(token))
             ).status_code == 200
+            click()
         await service.store.mark_session_reauthed(hash_token(token), now=0.0)  # age the window
         stale = await c.put("/ad-group-map", json=body, headers=_auth(token))
+        click()
         assert stale.status_code == 403, stale.text  # write 11: refused, but charged
         assert stale.headers.get("X-Step-Up-Required") == "1"
         _r, token = await _reauth(c, token)
         assert _r.status_code == 200
         retried = await c.put("/ad-group-map", json=body, headers=_auth(token))
         assert retried.status_code == 200, retried.text  # write 12: the retry is served
+        click()
         # CONTROL: the budget really was down to its last slot, so the pass above was not headroom.
         assert (await c.put("/ad-group-map", json=body, headers=_auth(token))).status_code == 429
 
@@ -952,7 +985,8 @@ def test_the_default_floor_admits_klm_pace_and_refuses_script_pace(
     # BACKLOG #287: the default is derived from the keystroke-level model (see the comment on
     # [auth].admin_write_rate_limit_window_seconds). The fastest modelled console write is a point
     # plus a click, 1.3 s. A person writing at that pace for a minute is never throttled; a loop at
-    # 0.1 s per write is refused at its thirteenth write. The clock is faked so no test sleeps, and
+    # 0.1 s per write is refused by the gap, and one that waits out the gap by the count. The clock
+    # is faked so no test sleeps, and
     # only the limiter module's own `time` is replaced, so the event loop keeps the real clock.
     clock = [1000.0]
     monkeypatch.setattr(
@@ -966,11 +1000,21 @@ def test_the_default_floor_admits_klm_pace_and_refuses_script_pace(
         clock[0] += 1.3
     assert all(verdicts), f"a KLM-paced writer was throttled at write {verdicts.index(False) + 1}"
 
+    # BACKLOG #2301: the 0.15 s gap refuses a loop at 0.1 s per write at its SECOND write. A refused
+    # write is not recorded, so the loop gets through only every other try.
     script = AuthService(engine.store, AuthSettings())
     verdicts = []
-    for _ in range(13):
+    for _ in range(4):
         verdicts.append(script.allow_admin_write("loop"))
         clock[0] += 0.1
+    assert verdicts == [True, False, True, False]
+
+    # A loop that waits out the gap still meets the count, at its thirteenth write.
+    paced = AuthService(engine.store, AuthSettings())
+    verdicts = []
+    for _ in range(13):
+        verdicts.append(paced.allow_admin_write("paced"))
+        clock[0] += 0.16
     assert verdicts == [True] * 12 + [False]
 
 
@@ -988,6 +1032,7 @@ async def test_require_paced_route_is_pace_limited(engine: Engine) -> None:
     service = await _service(
         engine,
         AuthSettings(
+            admin_write_min_interval_seconds=0,
             require_mfa=False,
             login_rate_limit_enabled=False,
             admin_write_rate_limit_per_actor=2,
@@ -1012,6 +1057,7 @@ async def test_require_paced_shares_one_bucket_with_step_up(engine: Engine) -> N
     service = await _service(
         engine,
         AuthSettings(
+            admin_write_min_interval_seconds=0,
             require_mfa=False,
             login_rate_limit_enabled=False,
             admin_write_rate_limit_per_actor=2,
@@ -1090,6 +1136,7 @@ async def test_connection_test_and_integrity_check_are_paced(engine: Engine) -> 
     service = await _service(
         engine,
         AuthSettings(
+            admin_write_min_interval_seconds=0,
             require_mfa=False,
             login_rate_limit_enabled=False,
             admin_write_rate_limit_per_actor=2,
@@ -1150,6 +1197,7 @@ async def test_backlog_287_routes_are_paced(
     service = await _service(
         engine,
         AuthSettings(
+            admin_write_min_interval_seconds=0,
             require_mfa=False,
             login_rate_limit_enabled=False,
             admin_write_rate_limit_per_actor=2,
@@ -1517,13 +1565,14 @@ async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> N
         email=None,
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-ops,dc=x"}),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(
@@ -2049,7 +2098,13 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
     has genuinely lost every factor cannot call it at all.
     """
     service = await _service(
-        engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+        engine,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            admin_write_min_interval_seconds=0,
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+        ),
     )
     # `_add` discards the id it creates, and this test is specifically ABOUT the caller's own id --
     # so root is created the long way, exactly as `_add` does internally, to keep it.

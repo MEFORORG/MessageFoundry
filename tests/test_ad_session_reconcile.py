@@ -103,7 +103,7 @@ class _FakeLdap:
         self.probes: list[str] = []
         self.probe_keys: list[tuple[str, str]] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         # Login/step-up binds are deliberately NOT counted in ``probes``; that list measures the
         # reconciler's directory load only.
         return self._lookup(username)
@@ -134,6 +134,16 @@ class _FakeLdap:
         return self.present.get(username)
 
 
+async def _clear_directory_object_id(store: MessageStore, username: str) -> None:
+    """Plant the legacy state: a directory row whose ``directory_object_id`` is NULL.
+
+    No engine path writes one any more (BACKLOG #2027), so the store is edited directly."""
+    await store._db.execute(
+        "UPDATE users SET directory_object_id = NULL WHERE username = ?", (username,)
+    )
+    await store._db.commit()
+
+
 async def _signed_in_ad_user(
     service: AuthService, store: MessageStore, username: str
 ) -> str | None:
@@ -148,6 +158,22 @@ async def _signed_in_ad_user(
     ldap = service._ldap
     principal = ldap.resolve_principal(username)  # type: ignore[union-attr]
     assert principal is not None, f"the fake directory holds no principal for {username!r}"
+    if principal.directory_object_id is None:
+        # BACKLOG #2027: a sign-in no longer mints a row with no id, so a principal with none is
+        # refused. The id-less row these tests need is one made before that refusal, or planted in
+        # the store. So sign in with the name's synthetic id and then clear the column, which leaves
+        # exactly that row behind a live session. A row already planted id-less is keyed for the
+        # sign-in first, or the sign-in would refuse it: the fixture wants a session, not a login.
+        object_id = _object_id_for(username)
+        await store._db.execute(
+            "UPDATE users SET directory_object_id = ? WHERE username = ?", (object_id, username)
+        )
+        await store._db.commit()
+        keyed = replace(principal, directory_object_id=object_id)
+        token = (await service._complete_ad_login(keyed, None, mfa_verified=True)).token
+        await _clear_directory_object_id(store, username)
+        ldap.probes.clear()  # type: ignore[union-attr]
+        return token
     token = (await service._complete_ad_login(principal, None, mfa_verified=True)).token
     # Forget the SETUP probe. Several tests assert on `probes` to prove the reconciler did or did
     # not reach the directory, and a fixture that leaves its own round trip in that list makes the
@@ -802,10 +828,11 @@ async def test_the_probe_is_keyed_on_the_immutable_id_when_the_row_carries_one()
 async def test_a_row_with_no_immutable_id_still_probes_by_name() -> None:
     """The residual path, and it is a DIRECTORY's property rather than a choice here.
 
-    A directory that returns no readable ``objectGUID`` leaves every row unbound, and the engine
-    cannot key on an identifier it is never given. Such a site keeps the pre-#1471 behaviour, rename
-    wart included; ``auth/ldap.py`` warns once per shape so an operator can find out. Asserted so the
-    fallback is a stated arm rather than something a later change silently deletes.
+    A row with no ``objectGUID`` gives the engine no identifier to key on. No sign-in mints such a
+    row since BACKLOG #2027, which refuses a principal with no id, so this is a row made before that
+    or planted in the store (the fixture plants it). The pass keeps the pre-#1471 behaviour for it,
+    rename wart included. Asserted so the fallback is a stated arm rather than something a later
+    change silently deletes.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -828,9 +855,9 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
 
     A bound row must never be re-resolved from its username, or a reissued name would hand the
     pair's holder the new person's groups. The name-keyed probe above is still there for a row with
-    no id, so AC-5 holds only if no such row can be bound. Both rows here are made by a real
-    directory sign-in: one through a directory answering with objectGUID, one through a directory
-    that returns none. The id-less row refuses the bind. Then one pass: the bound row is probed by
+    no id, so AC-5 holds only if no such row can be bound. One row is made by a real directory
+    sign-in through a directory answering with objectGUID. The other is id-less, which no sign-in
+    makes since BACKLOG #2027, so the fixture plants it. The id-less row refuses the bind. Then one pass: the bound row is probed by
     its id, and the only name-keyed probe is the unbound row's.
 
     The pass assertion is the one that discriminates: without the refusal the second bind lands,

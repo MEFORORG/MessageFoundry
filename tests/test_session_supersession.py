@@ -61,7 +61,8 @@ class _FakeLdap:
 
 
 async def _service(store: MessageStore, **over: object) -> AuthService:
-    settings: dict[str, object] = {"require_mfa": False}
+    # The start-to-callback floor is off: these callbacks return at machine speed (BACKLOG #2301).
+    settings: dict[str, object] = {"require_mfa": False, "oidc_callback_min_elapsed_seconds": 0}
     settings.update(over)
     service = AuthService(store, AuthSettings(**settings), ldap=_FakeLdap())  # type: ignore[arg-type]
     await service.initialize()

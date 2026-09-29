@@ -71,6 +71,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.keywrap import key_wrap_refusal
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -405,6 +406,16 @@ class DirectDestination(DestinationConnector):
         pw: bytes | None = None
         if password:
             pw = str(password).encode("utf-8")
+        # BACKLOG #1352 / #1171: read the passphrase wrap before cryptography derives a key through
+        # it, on the PEM and the DER paths alike.
+        refusal = key_wrap_refusal(
+            data,
+            setting="Direct destination 'signing_key'",
+            unlock_setting="'signing_key_password'",
+            passphrase_given=pw is not None,
+        )
+        if refusal is not None:
+            raise ValueError(refusal)
         try:
             return serialization.load_pem_private_key(data, password=pw)
         except (ValueError, TypeError):

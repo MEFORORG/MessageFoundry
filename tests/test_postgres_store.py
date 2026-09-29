@@ -3765,6 +3765,87 @@ async def test_search_preset_retention_keys_on_last_used_pg(store) -> None:
             await conn.execute("DELETE FROM search_presets")
 
 
+async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> None:
+    """BACKLOG #1909 on Postgres: a 0.3.2 ``search_presets`` table keeps its presets across the
+    upgrade, keyed on user ids, so listing and ``delete_user`` work.
+
+    Renaming the column back to ``owner`` and writing usernames into it gives exactly the 0.3.2
+    table: the DDL is otherwise the same, and the unique index follows the column. The marker row goes
+    too, so the batch really runs. It runs through ``provision_schema``, the path ADR 0192 makes the
+    default; ``auto`` runs the same ``_ensure_schema`` batch. ``ghost`` matches no account."""
+    from messagefoundry.store.postgres import PostgresStore
+
+    async def _preset_columns() -> set[str]:
+        async with store._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'search_presets'"
+            )
+        return {r["column_name"] for r in rows}
+
+    for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
+        await store.create_user(user_id=uid, username=uname, auth_provider="local", now=1.0)
+    try:
+        for pid, owner, name, now in (
+            ("pa", "alice", "ACME ADT", None),
+            ("pb", "bob", "ACME ADT", None),
+            ("pg", "ghost", "orphan", None),
+            ("pc", "carol", "inherited", 0.5),  # last saved before the carol account existed
+            ("pr", "carol", "resaved", 0.5),
+            ("pr", "carol", "resaved", 2.0),  # ...but the current carol saved this one again
+            (
+                "ps",
+                "system",
+                "no-auth",
+                None,
+            ),  # no-auth rows cannot be told from a deleted "system"
+        ):
+            await store.upsert_search_preset(
+                preset_id=pid,
+                owner_user_id=owner,
+                name=name,
+                criteria='{"target": "raw"}',
+                now=now,
+            )
+        async with store._pool.acquire() as conn:
+            await conn.execute("ALTER TABLE search_presets RENAME COLUMN owner_user_id TO owner")
+            await conn.execute("DELETE FROM schema_meta")
+        assert "owner_user_id" not in await _preset_columns()  # positive control
+
+        result = await PostgresStore.provision_schema(store._settings)
+        assert result.applied is True
+        cols = await _preset_columns()
+        assert "owner_user_id" in cols and "owner" not in cols
+
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+        assert [p["id"] for p in await store.list_search_presets("u-bob")] == ["pb"]
+        assert [p["id"] for p in await store.list_search_presets("u-carol")] == ["pr"]
+        assert await store.list_search_presets("system") == []
+        got = await store.get_search_preset(preset_id="pa", owner_user_id="u-alice")
+        assert got is not None and json.loads(got["criteria"]) == {"target": "raw"}
+        async with store._pool.acquire() as conn:
+            ids = [r["id"] for r in await conn.fetch("SELECT id FROM search_presets ORDER BY id")]
+        assert ids == ["pa", "pb", "pr"]  # the three orphans are gone, nothing else is
+
+        await store.delete_user("u-bob")
+        assert await store.list_search_presets("u-bob") == []
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+
+        async with store._pool.acquire() as conn:
+            await conn.execute("DELETE FROM schema_meta")
+        assert await store._ensure_schema() is True  # a second full run finds nothing to move
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+    finally:
+        # Put the column back whatever happened, or every later preset test fails on it.
+        async with store._pool.acquire() as conn:
+            await conn.execute("DELETE FROM search_presets")
+        if "owner_user_id" not in await _preset_columns():
+            async with store._pool.acquire() as conn:
+                await conn.execute(
+                    "ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id"
+                )
+
+
 # --- STOREF-8: resend_to plain-parity matrix (mirrors tests/test_resend.py, on real Postgres) --------
 
 

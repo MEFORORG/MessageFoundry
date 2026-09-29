@@ -57,6 +57,7 @@ from pydantic import (
     model_validator,
 )
 
+from messagefoundry.api_tls_source import api_tls_source
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -460,7 +461,7 @@ class StoreSettings(_Section):
         default=False,
         description=(
             "Execute the pooled claim via the two lane-family versioned procs "
-            "(dbo.mefor_claim_fifo_heads_cid_v1/_dst_v1; fixed-arity CALL) instead of the ~3KB ad-hoc "
+            "(dbo.mefor_claim_fifo_heads_cid_v2/_dst_v2; fixed-arity CALL) instead of the ~3KB ad-hoc "
             "batch. Fails safe to the batch (loud) whenever the startup gate cannot verify both "
             "deployed bodies against this build — at least: a missing proc, a body matching no form "
             "this build deploys, a definition this principal cannot read (no VIEW DEFINITION, or "
@@ -1181,6 +1182,19 @@ class ApiSettings(_Section):
         set. Undeclared → a prod-PHI Posture-B bind refuses (the engine cannot observe the proxy's TLS)."""
         return self.proxy_tls_min_version is not None
 
+    @property
+    def serves_plaintext_upstream_hop(self) -> bool:
+        """Whether the engine serves the proxy-to-engine hop in PLAINTEXT (BACKLOG #1179): a declared
+        upstream terminator and no operator certificate, in :func:`api_tls_source`'s order. The one
+        definition the serve refusal, its AUDIT line, the ``upstream-hop-ack`` check leg and
+        ``security_loosenings()`` share, so none of them can decide the question differently."""
+        return (
+            api_tls_source(
+                cert_file=self.tls_cert_file, tls_terminated_upstream=self.tls_terminated_upstream
+            )
+            == "upstream"
+        )
+
     @field_validator("public_origin", mode="after")
     @classmethod
     def _normalize_public_origin(cls, v: str | None) -> str | None:
@@ -1672,9 +1686,7 @@ class PipelineSettings(_Section):
     pooled_claim_lane_chunk: int = Field(default=256, ge=1, le=500)
     # Max concurrently-PROCESSING lanes per stage (the decrypted-body / crash-exposure bound).
     pooled_max_processing_lanes: int = Field(default=256, ge=1)
-    # SQL Server pooled mode fails closed at startup if READ_COMMITTED_SNAPSHOT is OFF; False downgrades
-    # to a loud warning + a /stats rcsi_off_degraded gauge (the §3.2 correctness proofs assume RCSI on).
-    require_rcsi_for_pooled: bool = Field(default=True)
+    # `require_rcsi_for_pooled` USED TO SIT HERE; it is refused at load (see `_REMOVED_KEYS`).
 
     # Pooled T17 (infra/machinery-fault) handling (ADR 0070). A store/handoff error, or any raise from
     # OUTSIDE the per-item body, is caught by the dispatcher's T17 handler; fix A always re-pends the
@@ -2516,9 +2528,12 @@ class AuthSettings(_Section):
     # security fix. THIS IS THE SINGLE PLACE that mismatch is explained; do not restate it (SDS-3.5).
     #
     # OPERATOR NOTE: under ``every_local_account`` a non-interactive bearer-token service account
-    # becomes MFA-pending and cannot enroll unattended — move it to mTLS (api/security.py:
-    # require_service_cert, which is exempt by design) or set this to ``administrators``. Moving it to
-    # AD is NO LONGER an escape: a directory account is in scope like any other.
+    # becomes MFA-pending and cannot enroll unattended. ``administrators`` frees only a LOCAL account
+    # without the Administrator role (AuthService._mfa_required_for keeps that role in scope under
+    # either value); ``require_mfa = false`` frees any un-enrolled account, at the exposure gate's
+    # cost. Moving it to AD is NO LONGER an escape: a directory account is in scope like any other.
+    # Nor is mTLS: require_service_cert (api/security.py) admits a cert identity on
+    # GET /service/identity alone, so it cannot carry a working service account.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     # TOTP clock-skew tolerance, in 30-second time steps, applied when verifying a submitted code
     # (BACKLOG #187; ASVS 6.5.5). Default 0 = STRICT: only the current 30 s step is accepted, so a
@@ -2532,6 +2547,22 @@ class AuthSettings(_Section):
     # How many single-use recovery codes are minted at enrollment (the lost-authenticator escape
     # hatch). 0 disables recovery codes (an admin reset is then the only recovery path).
     mfa_recovery_code_count: int = 10
+    # THE LEAST TIME BETWEEN SIGN-IN AND THE SECOND FACTOR, AND IT IS PROVISIONAL (BACKLOG #2301, ASVS
+    # 2.4.2; owner ruling R7 of 2026-09-23 chose published human-timing research over a timed
+    # session). A code or passkey that completes an MFA-pending session sooner than this after the
+    # session was minted is refused with the leg's ordinary failure, so the refusal says nothing about
+    # timing. It is audited with reason "too_early", charges no lockout and spends no code. Only the
+    # PENDING session is floored; a step-up code on a session whose factor is already satisfied is not.
+    # Sized from the keystroke-level model (Card, Moran and Newell, "The keystroke-level model for user
+    # performance time with interactive systems", Communications of the ACM 23(7), 1980, pp. 396-410):
+    #   M   take in a prompt the person has not seen, and decide    1.35 s
+    #   K   one keystroke by the fastest typist the model lists     0.08 s
+    # The second step is a new prompt and at least one submit, M + K = 1.43 s, even with the code
+    # filled in by a password manager. The default sits about 30% below, at 1.0 s, because M is an
+    # average and some people are faster; the dual-control dwell takes a margin for the same reason.
+    # It is a judgment, not a measurement, and nobody has timed a person on THIS console.
+    # [auth].oidc_callback_min_elapsed_seconds reuses this derivation. 0 turns the floor off.
+    mfa_verify_min_elapsed_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     # Admin-interface defense-in-depth contextual-risk signal (WP-L3-13, ADR 0002; ASVS 8.4.2). When
     # on, a step-up (sensitive admin) request arriving from a client IP that differs from the one the
     # session last verified from is treated as higher-risk: it emits an audit + out-of-band notice and
@@ -2761,6 +2792,15 @@ class AuthSettings(_Section):
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
+    # The FLOOR beside that ceiling (BACKLOG #2301, ASVS 2.4.2), PROVISIONAL: a callback that returns
+    # sooner than this after its flow started is refused as "federated sign-in failed". A step-up
+    # flow asks the IdP to authenticate afresh (max_age=0, prompt=login), so the floor always
+    # applies there. A sign-in flow is floored only when the id_token's auth_time shows the person
+    # signed in at the IdP during THIS flow: an IdP holding a live single sign-on session answers with
+    # no human step at all, and flooring that would refuse every such sign-in, retry after retry. The
+    # default reuses mfa_verify_min_elapsed_seconds' derivation (a new prompt and one submit, 1.43 s
+    # by the keystroke-level model, less a margin). 0 turns it off; it must be shorter than the TTL.
+    oidc_callback_min_elapsed_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
     # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
@@ -2828,6 +2868,18 @@ class AuthSettings(_Section):
     # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
     # every write after the twelfth would be refused for the life of the process.
     admin_write_rate_limit_window_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    # THE MINIMUM GAP BETWEEN TWO WRITES BY ONE ACTOR, AND IT IS PROVISIONAL TOO (BACKLOG #2301, ASVS
+    # 2.4.2; owner ruling R7 of 2026-09-23). The count above admits its twelve writes back to back;
+    # this refuses a write that lands sooner than this after the same actor's last admitted one. It
+    # charges nothing: a refused write is not recorded, as with the count. Same sources as above. The
+    # fastest console write the model allows, with the decision made and the hand already in place,
+    # is one click, BB = 0.2 s (Kieras 1993), or Tab then Enter at the fastest typist the model lists,
+    # 2 K = 2 x 0.08 s = 0.16 s (Card, Moran and Newell 1980). The default sits just under the faster,
+    # at 0.15 s. A real second write also waits for the page to come back, which only adds to the
+    # gap. It is a judgment, not a measurement, and nobody has timed a person on THIS console. 0 turns
+    # the gap off. It must be shorter than the window, or the last write ages out of the window before
+    # the gap is measured (checked below).
+    admin_write_min_interval_seconds: float = Field(default=0.15, ge=0, allow_inf_nan=False)
 
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
@@ -2835,6 +2887,33 @@ class AuthSettings(_Section):
     # touch the audit log; which events the /me/security-events feed shows is stated once, in
     # auth/notifications.py.
     notify_security_events: bool = True
+
+    @model_validator(mode="after")
+    def _check_floors_inside_their_windows(self) -> AuthSettings:
+        # A gap as long as the window measures nothing: the limiter prunes the last write before it
+        # compares, so the gap would silently fall back to the count. Refused at load instead.
+        if (
+            self.admin_write_rate_limit_enabled
+            and self.admin_write_min_interval_seconds >= self.admin_write_rate_limit_window_seconds
+        ):
+            raise ValueError(
+                "admin_write_min_interval_seconds must be shorter than "
+                "admin_write_rate_limit_window_seconds"
+            )
+        # The same shape for the federated floor: at or past the flow TTL, every flow would expire
+        # before it could complete. Checked whether or not federation is on, as the TTL itself is.
+        if self.oidc_callback_min_elapsed_seconds >= self.oidc_flow_ttl_seconds:
+            raise ValueError(
+                "oidc_callback_min_elapsed_seconds must be shorter than oidc_flow_ttl_seconds"
+            )
+        # And for the MFA floor: at or past the idle timeout, every pending session would idle out
+        # before its code could be accepted, so no account with a factor could finish signing in.
+        idle_seconds = self.session_idle_timeout_minutes * 60
+        if idle_seconds > 0 and self.mfa_verify_min_elapsed_seconds >= idle_seconds:
+            raise ValueError(
+                "mfa_verify_min_elapsed_seconds must be shorter than session_idle_timeout_minutes"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_lockout_ceiling(self) -> AuthSettings:
@@ -3691,7 +3770,6 @@ _ALERT_EVENT_TYPES = frozenset(
         "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
         "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
-        "rcsi_off_degraded",  # ADR 0066: pooled claim running with READ_COMMITTED_SNAPSHOT OFF (correctness-degraded)
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
@@ -5812,6 +5890,14 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
         "sets it. To request the web console explicitly, set [security].serve_web_console"
     ),
+    # BACKLOG #2090 (ADR 0066 §12): `false` could only start the mode that deadlocks.
+    ("pipeline", "require_rcsi_for_pooled"): (
+        "a SQL Server store no longer opens with READ_COMMITTED_SNAPSHOT off. The pooled start "
+        "check also always fails closed, so this key has nothing left to relax (BACKLOG #2090, "
+        "ADR 0066 section 12). Remove it from the config file, or unset "
+        "MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED if the environment sets it. To run pooled on SQL "
+        "Server, turn READ_COMMITTED_SNAPSHOT on for the database"
+    ),
 }
 
 #: ``[security]`` key → ``(section, field)`` for the switches that map 1:1 onto a settable internal field.
@@ -6005,6 +6091,7 @@ def security_loosenings(
     unverified_db_hops: Sequence[str],
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
+    api: ApiSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
 ) -> list[tuple[str, str]]:
@@ -6017,6 +6104,7 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
+    ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
@@ -6040,6 +6128,9 @@ def security_loosenings(
     needs a new REQUIRED parameter (every one here is required by design, so an optional detector
     cannot be added quietly), which is a larger change than the item that exposed it — filed as
     content rather than folded in.
+
+    ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
+    every call site names it. It carries the BACKLOG #1179 acknowledgement.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -6313,6 +6404,21 @@ def security_loosenings(
                 "a session token used from a NEW client address can perform a sensitive admin action "
                 "without a fresh step-up -- nothing audits, notifies or challenges the address change "
                 "mid-session",
+            )
+        )
+    # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS
+    # 12.3.3 at partial, so the acknowledgement is named here as well as warned at serve. Conditional
+    # on the hop actually being plaintext, by the predicate serve uses: with an operator tls_cert_file
+    # the engine serves that hop over TLS and the acknowledgement is inert.
+    if api.plaintext_upstream_hop_acknowledged and api.serves_plaintext_upstream_hop:
+        out.append(
+            (
+                "plaintext_upstream_hop_acknowledged",
+                "the proxy-to-engine hop behind [api].tls_terminated_upstream is PLAINTEXT and the "
+                "engine does nothing to protect it -- the operator has acknowledged that securing "
+                "it is the deploying site's job. At least sign-in credentials, session tokens and "
+                "PHI reads cross that hop unencrypted; isolating the hop limits who can read them "
+                "but encrypts nothing (set [api].tls_cert_file to serve it over TLS instead)",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the

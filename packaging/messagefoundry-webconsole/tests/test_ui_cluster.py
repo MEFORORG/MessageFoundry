@@ -400,7 +400,10 @@ async def _console(
     engine = await Engine.create(tmp_path / "ha.db", poll_interval=0.02, coordinator=coordinator)
     await engine.start()
     try:
-        service = AuthService(engine.store, settings or AuthSettings(require_mfa=False))
+        service = AuthService(
+            engine.store,
+            settings or AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
+        )
         await service.initialize()
         user_id = await create_local_user_with_password(
             service,
@@ -470,7 +473,9 @@ async def test_a_stale_step_up_returns_to_the_confirm_page_never_the_post(tmp_pa
     stale session to re-verify with the CONFIRM page as the continuation, so the operator reads the
     consequence again before anything moves."""
     coord = _Coordinator()
-    stale = AuthSettings(require_mfa=False, step_up_max_age_seconds=-1)
+    stale = AuthSettings(
+        admin_write_min_interval_seconds=0, require_mfa=False, step_up_max_age_seconds=-1
+    )
     async with _console(tmp_path, coord, settings=stale) as (_engine, c):
         for post, confirm in (
             ("/ui/cluster/stepdown", CONFIRM),

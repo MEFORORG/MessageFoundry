@@ -91,7 +91,9 @@ async def test_login_requires_second_factor_after_enrollment(
 ) -> None:
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(mfa_recovery_code_count=2))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=2)
+        )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         # Pin the TOTP clock so the enrollment confirm and the later login verify sit in distinct,
@@ -168,7 +170,9 @@ async def test_require_mfa_forces_admin_even_unenrolled() -> None:
 async def test_recovery_code_single_use() -> None:
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(mfa_recovery_code_count=3))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=3)
+        )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         enrolled = await service.confirm_mfa_enrollment(
@@ -199,7 +203,7 @@ async def test_totp_code_is_single_use_within_its_window(
     # ~30 s step window) on a fresh session is rejected, so a captured code can't be reused.
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings())
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         t0 = 1_000_000.0
@@ -308,13 +312,14 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-admins,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if (username == "jdoe" and password == "pw") else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
             def probe_principal(
@@ -326,6 +331,7 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
                 return DirectoryProbe(DirectoryAnswer.FOUND, principal)
 
         settings = AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
             require_mfa=True,  # MFA required + an admin role: the directory earns no exemption
             ad_enabled=True,
             ad_server="ldaps://x",
@@ -380,7 +386,9 @@ async def test_recovery_code_consume_is_atomic_under_concurrency() -> None:
     # distinct sessions, must consume it exactly once — only one session may become MFA-satisfied.
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(mfa_recovery_code_count=3))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=3)
+        )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         enrolled = await service.confirm_mfa_enrollment(
@@ -457,7 +465,10 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
         service = AuthService(
             store,
             AuthSettings(
-                lockout_threshold=threshold, lockout_minutes=15, mfa_recovery_code_count=3
+                mfa_verify_min_elapsed_seconds=0,
+                lockout_threshold=threshold,
+                lockout_minutes=15,
+                mfa_recovery_code_count=3,
             ),
             security_notifier=notifier,
         )
@@ -672,7 +683,9 @@ async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified(
     try:
         notifier = _FakeNotifier()
         service = AuthService(
-            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+            store,
+            AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=2),
+            security_notifier=notifier,
         )
         identity, token, password = await login_admin(service)
         await store.update_user_profile(
@@ -735,7 +748,9 @@ async def test_an_ordinary_totp_verify_spends_no_recovery_code_and_announces_not
     try:
         notifier = _FakeNotifier()
         service = AuthService(
-            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+            store,
+            AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=2),
+            security_notifier=notifier,
         )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
@@ -772,7 +787,9 @@ async def test_the_losing_racer_reports_no_second_consumption() -> None:
     try:
         notifier = _FakeNotifier()
         service = AuthService(
-            store, AuthSettings(mfa_recovery_code_count=3), security_notifier=notifier
+            store,
+            AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=3),
+            security_notifier=notifier,
         )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
@@ -808,7 +825,9 @@ async def test_mfa_failures_trip_the_per_account_lockout() -> None:
     # password path — sustained wrong codes lock the account (not just the shared IP limiter).
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(mfa_recovery_code_count=2))  # lockout_threshold=5
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=2)
+        )  # lockout_threshold=5
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
@@ -917,7 +936,9 @@ async def test_a_password_only_login_does_not_reset_the_second_factor_failure_co
     try:
         # lockout_threshold defaults to 5. The recovery-code count is trimmed because every WRONG
         # code falls through to the argon2id recovery path, so it sets this test's runtime.
-        service = AuthService(store, AuthSettings(mfa_recovery_code_count=2))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=2)
+        )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
@@ -967,7 +988,9 @@ async def test_completing_the_second_factor_still_clears_the_counter() -> None:
     """
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(mfa_recovery_code_count=3))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=3)
+        )
         identity, token, password = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         enrolled = await service.confirm_mfa_enrollment(
@@ -1092,7 +1115,12 @@ _LOCK_THRESHOLD = 3
 def _lock_settings(threshold: int = _LOCK_THRESHOLD) -> AuthSettings:
     """The ADR 0197 arms' settings: a small threshold, the shipped 15-minute base, and one recovery
     code, so a wrong code on the two-step path walks one argon2 slot rather than ten."""
-    return AuthSettings(lockout_threshold=threshold, lockout_minutes=15, mfa_recovery_code_count=1)
+    return AuthSettings(
+        mfa_verify_min_elapsed_seconds=0,
+        lockout_threshold=threshold,
+        lockout_minutes=15,
+        mfa_recovery_code_count=1,
+    )
 
 
 class _Steps:

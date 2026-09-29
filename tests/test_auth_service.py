@@ -391,13 +391,14 @@ async def test_ad_login_syncs_roles_from_group_map() -> None:
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if (username == "jdoe" and password == "pw") else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         settings = AuthSettings(
@@ -692,13 +693,14 @@ async def test_notifier_fires_on_ad_driven_role_change() -> None:
             email="jdoe@example.org",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if (username == "jdoe" and password == "pw") else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         settings = AuthSettings(
@@ -764,6 +766,7 @@ async def test_a_directory_repoint_cannot_redirect_the_accounts_notices() -> Non
             email="jdoe@example.org",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
         # The same account, after someone repoints the directory's mail attribute.
         repointed = AdPrincipal(
@@ -772,13 +775,14 @@ async def test_a_directory_repoint_cannot_redirect_the_accounts_notices() -> Non
             email="attacker@evil.example",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return None  # simple bind is retired (BACKLOG #1137); logins go through the tail
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return original if username == "jdoe" else None
 
         settings = AuthSettings(
@@ -981,6 +985,7 @@ def _principal(email: str | None, *, display_name: str | None = "J Doe") -> AdPr
         email=email,
         dn="CN=jdoe,DC=x",
         groups=frozenset(),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
 

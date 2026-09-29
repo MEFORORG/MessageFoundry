@@ -71,6 +71,7 @@ from messagefoundry.pipeline.cert_expiry import (
 )
 from messagefoundry.pki import IssuerIndex, canonical_dn
 from tests._admin_account import create_local_user_with_password
+from tests._approved_key_wrap import approved_pkcs8_pem
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
 
@@ -91,13 +92,16 @@ def _self_signed(tmp_path: Path, *, password: str | None = None) -> tuple[Path, 
     )
     cert_path, key_path = tmp_path / "cert.pem", tmp_path / "key.pem"
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    enc: serialization.KeySerializationEncryption = (
-        serialization.BestAvailableEncryption(password.encode())
-        if password
-        else serialization.NoEncryption()
-    )
+    # An encrypted key is written at the approved wrap: the loader refuses cryptography's own
+    # BestAvailableEncryption (2048 PBKDF2 iterations, BACKLOG #1352).
     key_path.write_bytes(
-        key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, enc)
+        approved_pkcs8_pem(key, password)
+        if password
+        else key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
     )
     return cert_path, key_path
 
@@ -1254,12 +1258,23 @@ def test_serve_starts_a_declared_terminator_once_the_hop_is_acknowledged(
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
     captured = capsys.readouterr()
     assert "plaintext_upstream_hop_acknowledged" not in captured.err
-    # The acknowledgement's only runtime record: named in the log at every start. serve's logging
-    # setup installs its own stdout handler, so the record is read from stdout, not caplog.
+    # The acknowledgement's runtime record: named in the log at every start. serve's logging setup
+    # installs its own stdout handler, so the record is read from stdout, not caplog.
+    # BACKLOG #1179, owner ruling 2026-09-27: a WARNING-level AUDIT line, in the shape of the #1967
+    # retention acknowledgements. It was INFO, which a WARNING-level log config filters out, and the
+    # owner held that a silent weakening keeps ASVS 12.3.3 at partial.
     assert (
-        "INFO     messagefoundry.__main__: [api].plaintext_upstream_hop_acknowledged"
-        in captured.out
+        "WARNING  messagefoundry.__main__: AUDIT: [api].plaintext_upstream_hop_acknowledged=true "
+        "permits a PLAINTEXT proxy-to-engine hop behind the upstream TLS terminator on a production "
+        "PHI instance (environment 'prod')" in captured.out
     )
+    # Negative control on the level: the old INFO record must be gone, not merely joined.
+    assert "INFO     messagefoundry.__main__: [api].plaintext_upstream_hop_acknowledged" not in (
+        captured.out
+    )
+    # And it is a listed loosening, so the serve-time loosening warning names it too.
+    assert "posture loosened from the secure defaults" in captured.out
+    assert "plaintext_upstream_hop_acknowledged (the proxy-to-engine hop" in captured.out
 
 
 @_ACK_MODES
@@ -1290,13 +1305,20 @@ def test_serve_needs_no_hop_acknowledgement_when_an_operator_cert_serves_the_hop
 
 
 def test_serve_allows_the_hop_acknowledgement_alongside_an_operator_cert(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # Harmless and allowed: an operator who acknowledged the hop and then added a certificate has
     # nothing to undo.
     cert, key = _self_signed(tmp_path)
     _posture_b_toml(tmp_path, intra="mtls", floor="1.2", ack=True, cert=(cert, key))
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    # BACKLOG #1179: with a certificate the hop is TLS, so the acknowledgement is inert. It writes no
+    # AUDIT line and is not a listed loosening, the control for the positive arm above.
+    out = capsys.readouterr().out
+    # The zeros below mean something only if serve's log records reached stdout in this run.
+    assert "messagefoundry." in out
+    assert "PLAINTEXT proxy-to-engine hop" not in out
+    assert "plaintext_upstream_hop_acknowledged (" not in out
 
 
 def test_hop_acknowledgement_without_a_declared_terminator_is_refused_at_load() -> None:

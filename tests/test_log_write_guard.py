@@ -1153,7 +1153,7 @@ def test_the_alert_type_is_operator_rule_targetable() -> None:
     # ADR 0162 §5 claims an operator can route "the engine went deaf" APART from one stalled lane.
     # That claim is only true if `log_write_failed` is in settings._ALERT_EVENT_TYPES — a name added
     # to alert_sinks but omitted there is silently un-targetable (AlertRule rejects it), which is
-    # precisely the defect ALERT-12 records for lane_stuck and rcsi_off_degraded.
+    # precisely the defect ALERT-12 records for lane_stuck.
     from messagefoundry.config.settings import AlertRule, AlertSeverity
     from messagefoundry.pipeline.alert_sinks import AlertRuleSet
 

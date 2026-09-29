@@ -60,7 +60,9 @@ def _uploads_settings(tmp_path: Path) -> StoreSettings:
 
 
 async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     uid = await create_local_user_with_password(
         service,

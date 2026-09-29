@@ -53,6 +53,7 @@ async def _service(
     # the caller set it — otherwise the test admin's mfa_status/last-factor-delete assertions,
     # written for require_mfa off, would flip.
     settings.setdefault("require_mfa", False)
+    settings.setdefault("mfa_verify_min_elapsed_seconds", 0)  # machine-speed factor (BACKLOG #2301)
     service = AuthService(store, AuthSettings(**settings), security_notifier=notifier)
     return service
 
@@ -540,6 +541,7 @@ async def test_a_directory_account_can_enroll_a_passkey() -> None:
             email=None,
             dn="CN=aduser,DC=x",
             groups=frozenset(),
+            directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
         )
         # mfa_verified is the per-mechanism grant (ASVS 6.3.4). Passing True here stands in for a
         # federated sign-in that DID carry a verified claim; what is under test is the enrollment

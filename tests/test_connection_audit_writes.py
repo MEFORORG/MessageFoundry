@@ -83,7 +83,9 @@ async def _deployer(engine: Engine, *channels: str) -> AuthService:
     ``require_mfa=False``: these are audit-write tests, not MFA tests, and the BACKLOG #187 secure
     default would otherwise refuse before the route body ever runs.
     """
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     uid = await create_local_user_with_password(
         service,

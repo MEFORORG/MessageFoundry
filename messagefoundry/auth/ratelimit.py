@@ -22,12 +22,27 @@ class SlidingWindowRateLimiter:
 
     A falsy ``per_key``/``glob`` disables that dimension. Empty per-key buckets are dropped as they
     age out, so memory is bounded by the number of *active* keys in the window.
+
+    ``min_interval_seconds`` adds a GAP floor beside the count (BACKLOG #2301, ASVS 2.4.2): a hit
+    for a key is refused while that key's last allowed hit is younger than this. A count alone
+    admits its whole budget back to back; the gap is what makes a burst wait. 0 disables it. It must
+    be shorter than the window, or the key's last hit is pruned before the gap is measured.
     """
 
-    def __init__(self, *, per_key: int, glob: int, window_seconds: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        per_key: int,
+        glob: int,
+        window_seconds: float = 60.0,
+        min_interval_seconds: float = 0.0,
+    ) -> None:
         self._per_key = per_key
         self._global = glob
         self._window = window_seconds
+        if min_interval_seconds and min_interval_seconds >= window_seconds:
+            raise ValueError("min_interval_seconds must be shorter than window_seconds")
+        self._min_interval = min_interval_seconds
         self._hits: dict[str, deque[float]] = {}
         self._global_hits: deque[float] = deque()
 
@@ -54,7 +69,8 @@ class SlidingWindowRateLimiter:
                 bucket = None
         global_full = bool(self._global) and len(self._global_hits) >= self._global
         key_full = bucket is not None and bool(self._per_key) and len(bucket) >= self._per_key
-        return not (global_full or key_full)
+        too_soon = bucket is not None and now - bucket[-1] < self._min_interval
+        return not (global_full or key_full or too_soon)
 
     def allow(self, key: str) -> bool:
         """Record and allow an attempt for ``key``, or return ``False`` if it would exceed a limit."""

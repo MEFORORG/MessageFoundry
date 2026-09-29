@@ -617,6 +617,7 @@ def _principal() -> AdPrincipal:
         email="dana@test.invalid",
         dn="CN=dana,OU=Staff,DC=test,DC=invalid",
         groups=frozenset({"CN=mf-operators,OU=Groups,DC=test,DC=invalid"}),
+        directory_object_id="a79c897c-1793-5458-bd1b-b3ae0642c0e3",
     )
 
 
@@ -628,7 +629,7 @@ class _FakeDirectory:
         self.down = False
         self.known = True  # False = the directory has no such principal (renamed, disabled, ...)
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         self.binds += 1
         if self.down:
             raise LdapError("synthetic: directory unreachable")
@@ -791,7 +792,12 @@ async def test_a_password_reauth_on_an_mfa_pending_session_does_not_clear_code_f
     otherwise password, four wrong codes, re-auth, four wrong codes would never lock."""
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(lockout_threshold=5, mfa_recovery_code_count=2))
+        service = AuthService(
+            store,
+            AuthSettings(
+                mfa_verify_min_elapsed_seconds=0, lockout_threshold=5, mfa_recovery_code_count=2
+            ),
+        )
         admin = await create_admin(service)
         first = await service.login(admin.username, admin.password)
         assert first.ok and first.identity is not None and first.token is not None

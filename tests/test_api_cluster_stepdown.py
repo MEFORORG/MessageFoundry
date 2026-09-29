@@ -152,7 +152,11 @@ async def _engine(tmp_path: Path, coordinator: ClusterCoordinator | None = None)
 
 async def _service(store: MessageStore, settings: AuthSettings | None = None) -> AuthService:
     service = AuthService(
-        store, settings or AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+        store,
+        settings
+        or AuthSettings(
+            admin_write_min_interval_seconds=0, require_mfa=False, login_rate_limit_enabled=False
+        ),
     )
     await service.initialize()
     return service

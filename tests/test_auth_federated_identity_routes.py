@@ -71,7 +71,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine, **over: object) -> AuthService:
-    settings: dict[str, object] = {"require_mfa": False, "oidc_issuer": ISSUER}
+    # The gap between admin writes is off: these tests' writes land back to back (BACKLOG #2301).
+    settings: dict[str, object] = {
+        "require_mfa": False,
+        "oidc_issuer": ISSUER,
+        "admin_write_min_interval_seconds": 0,
+    }
     settings.update(over)
     service = AuthService(engine.store, AuthSettings(**settings))  # type: ignore[arg-type]
     await service.initialize()
@@ -793,6 +798,7 @@ def _principal(username: str, *, object_id: str | None = "guid-from-directory") 
 async def _directory_service(engine: Engine, directory: _Directory) -> AuthService:
     """Directory on, Windows SSO off (``kerberos_enabled`` defaults False), an issuer configured."""
     settings = AuthSettings(
+        admin_write_min_interval_seconds=0,
         require_mfa=False,
         oidc_issuer=ISSUER,
         ad_enabled=True,

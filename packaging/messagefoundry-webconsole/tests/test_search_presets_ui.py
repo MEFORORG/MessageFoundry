@@ -34,7 +34,12 @@ async def _op(engine: Engine, *, per_actor: int = 120) -> AuthService:
     # per_actor mirrors AuthSettings' default (120); pass a smaller value to exercise the per-actor
     # PHI-read budget in a single test (see test_webui.py:616 test_edit_editor_charges_the_phi_read_budget).
     service = AuthService(
-        engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=per_actor)
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            require_mfa=False,
+            phi_read_rate_limit_per_actor=per_actor,
+        ),
     )
     await service.initialize()
     uid = await create_local_user_with_password(

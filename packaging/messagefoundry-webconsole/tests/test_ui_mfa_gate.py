@@ -55,7 +55,10 @@ def _pin_totp_clock(monkeypatch: pytest.MonkeyPatch, instant: float) -> None:
 
 
 async def _service(engine: Engine, **kw: object) -> AuthService:
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False, **kw))  # type: ignore[arg-type]
+    service = AuthService(
+        engine.store,
+        AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False, **kw),  # type: ignore[arg-type]
+    )
     await service.initialize()
     return service
 
@@ -348,7 +351,9 @@ async def test_must_change_outranks_the_second_factor_on_the_gate_page(
     prove. Under require_mfa it goes to enrol first (ADR 0197 Amendment A), from the sign-in and from
     the gate page alike -- never to the code prompt. The cookie-plane twin of the JSON order.
     """
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     admin = await _must_change_admin(service)
     async with _client(engine, service) as c:
         r = await c.post("/ui/login", data={"username": admin, "password": _ADMIN_PW})
@@ -712,7 +717,9 @@ async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
     sign-in, the gate page and the password page, and ``POST /ui/account/password`` -- which calls
     the JSON handler in-process, past its ``Depends`` gate -- changes nothing. Once TOTP is on, the
     holder proves it and rotates. RED against the old order: the first POST rotated."""
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await service.initialize()
     await create_local_user_with_password(
         service,
@@ -762,7 +769,10 @@ async def test_with_the_requirement_off_a_must_change_account_still_rotates_firs
     so the order stays as it was. A first Administrator on a temporary password and an
     administrator-created user both land on the password page and rotate there."""
     service = AuthService(
-        engine.store, AuthSettings(login_rate_limit_enabled=False, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False, require_mfa=False
+        ),
     )
     admin = await _must_change_admin(service)
     await create_local_user_with_password(
@@ -804,7 +814,10 @@ async def test_a_row_that_vanishes_mid_request_does_not_lift_the_confinement(
     # require_mfa off (ADR 0197 Amendment A): with it on, a no-factor account now enrols first, and
     # the rotate-first confinement this guards exists only on the uncovered path.
     service = AuthService(
-        engine.store, AuthSettings(login_rate_limit_enabled=False, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False, require_mfa=False
+        ),
     )
     await service.initialize()
     await create_local_user_with_password(
@@ -1074,7 +1087,12 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
 
     service = await _service(engine)
     principal = AdPrincipal(
-        username="aduser", display_name=None, email=None, dn="CN=aduser,DC=x", groups=frozenset()
+        username="aduser",
+        display_name=None,
+        email=None,
+        dn="CN=aduser,DC=x",
+        groups=frozenset(),
+        directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
     )
     if enrolled:
         _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check

@@ -43,6 +43,7 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
     query_sntp_offset,
 )
+from messagefoundry.odbc_env import disable_driver_manager_pooling
 
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
@@ -91,6 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     # subcommands stay ASCII (json.dumps ensure_ascii=True), so this keeps the stream's codec. The
     # shared helper is the one chokepoint every console entry point calls (BACKLOG #1875).
     harden_console_streams()
+    # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
+    # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
+    disable_driver_manager_pooling()
 
     # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
     # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
@@ -1728,6 +1732,7 @@ def _serve(args: argparse.Namespace) -> int:
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
+    from messagefoundry.keywrap import KeyWrapRefused
     from messagefoundry.pipeline.cert_expiry import crls_from_settings
     from messagefoundry.store.crypto import memory_locking_available
 
@@ -1747,6 +1752,12 @@ def _serve(args: argparse.Namespace) -> int:
     # container (RLIMIT_MEMLOCK=0) would otherwise print a WARNING to stderr on every start that no
     # log level could suppress and no SIEM would ever receive.
     _dumps = suppress_crash_dumps()
+
+    # BACKLOG #1120: before any side effect (a TLS mint, a store open).
+    floor = _protocol_floor_or_refusal("start")
+    if floor is None:
+        return 2
+    floored_http, floored_ws = floor
 
     # Single project-root anchor (ADR 0050): --project-root (== [environments].base_dir) is the bundle
     # root; a relative --config / --service-config / [store].path resolves UNDER it, an absolute one is
@@ -2305,6 +2316,12 @@ def _serve(args: argparse.Namespace) -> int:
         # which would have misled anyone reasoning about the guard's WARN arm at the same site.
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
+        # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
+        # the text names the setting and the fix, never the key.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler. With the
         # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
@@ -2385,6 +2402,7 @@ def _serve(args: argparse.Namespace) -> int:
         unverified_db_hops=(),
         attested_hops=(),
         revocation_attested_hops=(),
+        api=settings.api,
         store_privilege=None,
         audit_chain_unkeyed=None,
     )
@@ -2624,15 +2642,8 @@ def _serve(args: argparse.Namespace) -> int:
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
         # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
         # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
-        from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
+        from messagefoundry.api.tls import plaintext_upstream_hop_unacknowledged
 
-        serves_plaintext = (
-            api_tls_source(
-                cert_file=settings.api.tls_cert_file,
-                tls_terminated_upstream=settings.api.tls_terminated_upstream,
-            )
-            == "upstream"
-        )
         if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
@@ -2648,12 +2659,21 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if serves_plaintext:
+        if settings.api.serves_plaintext_upstream_hop:
             # The acknowledgement is the only record that someone took this hop on, so name it at
-            # every start rather than leaving it in the TOML alone.
-            logging.getLogger(__name__).info(
-                "[api].plaintext_upstream_hop_acknowledged: the proxy-to-engine hop is plaintext and "
-                "the operator has acknowledged that securing it is the deploying site's job."
+            # every start rather than leaving it in the TOML alone. WARNING with an AUDIT prefix, in
+            # the shape of the BACKLOG #1967 retention acknowledgements: owner ruling 2026-09-27
+            # (#2006 question (a)) holds that a silent weakening keeps ASVS 12.3.3 at partial, and an
+            # INFO line is filtered out by any WARNING-level log config. security_loosenings() names
+            # it too, so the serve warning above and GET /security/posture carry it. Worded as what
+            # the acknowledgement permits, not as a start: gates below this one can still refuse.
+            logging.getLogger(__name__).warning(
+                "AUDIT: [api].plaintext_upstream_hop_acknowledged=true permits a PLAINTEXT "
+                "proxy-to-engine hop behind the upstream TLS terminator on a %sPHI instance "
+                "(environment %r) -- the engine does nothing to protect that hop, and the operator "
+                "has acknowledged that securing it is the deploying site's job (ASVS 12.3.3).",
+                "production " if production else "",
+                env_name,
             )
         posture_b_missing = []
         if not settings.api.proxy_intra_service_declared:
@@ -4080,7 +4100,6 @@ def _serve(args: argparse.Namespace) -> int:
         pooled_sweep_interval=settings.pipeline.pooled_sweep_interval,
         pooled_claim_lane_chunk=settings.pipeline.pooled_claim_lane_chunk,
         pooled_max_processing_lanes=settings.pipeline.pooled_max_processing_lanes,
-        require_rcsi_for_pooled=settings.pipeline.require_rcsi_for_pooled,
         infra_fault_policy=settings.pipeline.infra_fault_policy,
         infra_fault_stop_after=settings.pipeline.infra_fault_stop_after,
         infra_fault_backoff_cap=settings.pipeline.infra_fault_backoff_cap,
@@ -4174,20 +4193,14 @@ def _serve(args: argparse.Namespace) -> int:
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
     # default — the direct TCP peer is used), overriding uvicorn's loopback default.
-    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
-    from messagefoundry.api.protocol_headers import (
-        floored_http_protocol_class,
-        floored_ws_protocol_class,
-    )
-
     run_kwargs: dict[str, Any] = {
         "log_config": None,
         "forwarded_allow_ips": settings.api.trusted_proxies,
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
-        "http": floored_http_protocol_class(),
-        "ws": floored_ws_protocol_class(),
+        "http": floored_http,
+        "ws": floored_ws,
     }
     from messagefoundry.api.tls import build_api_ssl_context
 
@@ -4203,7 +4216,13 @@ def _serve(args: argparse.Namespace) -> int:
         # tls_min_version floor is enforced exactly.
         # #285: build_api_ssl_context preflights [api].tls_client_ca_file (at least its pin, DACL
         # and path) at construction; enforcing is the [security].enforcement refuse/warn dial.
-        ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
+        try:
+            ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
+        except KeyWrapRefused as exc:
+            # BACKLOG #1352 / #1171: a weak or unreadable [api].tls_key_file wrap, or an encrypted
+            # key with no MEFOR_API_TLS_KEY_PASSWORD. A clean exit 2, as for the forwarder's key.
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
@@ -4225,6 +4244,25 @@ def _serve(args: argparse.Namespace) -> int:
         logging.getLogger(__name__).critical("server exited abnormally: %s", safe_exc(exc))
         raise
     return 0
+
+
+def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
+    """Build the protocol header floor serve hands uvicorn, or print why not and return None.
+
+    BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py. Fail
+    closed, no opt-out: a uvicorn that moved a hook the floor overrides would otherwise serve its own
+    400s and 500s without nosniff."""
+    from messagefoundry.api.protocol_headers import (
+        ProtocolFloorUnavailable,
+        floored_http_protocol_class,
+        floored_ws_protocol_class,
+    )
+
+    try:
+        return floored_http_protocol_class(), floored_ws_protocol_class()
+    except ProtocolFloorUnavailable as exc:
+        print(f"error: {exc}; refusing to {refusing_to}.", file=sys.stderr)
+        return None
 
 
 def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
@@ -4324,6 +4362,11 @@ def _supervise(args: argparse.Namespace) -> int:
     if settings is None:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+
+    # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
+    # below: every shard would refuse, and the supervisor would only restart them.
+    if _protocol_floor_or_refusal("start the fleet") is None:
         return 2
 
     # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the
@@ -5436,7 +5479,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -5473,7 +5520,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     try:
         outcome, report = run_guarded(run())
-    except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
+    # #1916; #1780: a server database with no store (auto mode). Could not start.
+    except (KeylessAuditChainRefused, StoreNotFoundError, _UnauditableWrite) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6305,7 +6353,12 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     from messagefoundry.auth.permissions import Role
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store, store_driver_errors
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+        store_driver_errors,
+    )
     from messagefoundry.store.crypto import StoreKeylessError
     from messagefoundry.store.store import require_notify_email
 
@@ -6394,7 +6447,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     try:
         outcome, username, extra = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780: could not start
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6500,7 +6553,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
     # succeeding, and refusing it early keeps a typo from costing a store open.
@@ -6518,9 +6575,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # A SQLite store would otherwise be CREATED (or schema-migrated) on open: a compliance job
-    # pointed at a typo'd path, or at the zero-byte file a touch/failed copy leaves behind, would
-    # get a fresh empty DB and report "OK: verified 0 audit row(s)" forever (M-31, #1669).
+    # A SQLite store was once CREATED (or schema-migrated) on open: a compliance job pointed at a
+    # typo'd path, or at the zero-byte file a touch/failed copy leaves behind, got a fresh empty DB
+    # and reported "OK: verified 0 audit row(s)" forever (M-31, #1669). The read-only open below
+    # (#1780) now does neither, but it would still read a zero-byte file as a database with an
+    # unreadable log, so this names "no audit_log table" as the question it is.
     refused = _refuse_a_store_that_is_not_an_audit_log(
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
@@ -6530,8 +6589,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
         return refused
 
     async def run() -> tuple[bool, str | None, int]:
+        # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
+        # this build does not match, so a store an incompatible version wrote can still be verified.
         store = await open_store(
             settings.store,
+            read_only=True,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
@@ -6547,7 +6609,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     try:
         ok, message, count = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+    ) as exc:  # #1916; #1780: a server database with no store. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6590,7 +6655,11 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -6601,9 +6670,9 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # The SAME guard as _audit_verify, and it matters MORE here: opening a SQLite store creates or
-    # migrates it, so a typo'd path or a zero-byte file would mint a fresh empty DB and print `0:` —
-    # an anchor OF NOTHING, which a later verify against the wrong database would happily confirm.
+    # The SAME guard as _audit_verify, and it matters MORE here: before the read-only open (#1780) a
+    # typo'd path or a zero-byte file minted a fresh empty DB and printed `0:` — an anchor OF
+    # NOTHING, which a later verify against the wrong database would happily confirm.
     # Unlike the verify twin this keeps exit 0 on a REAL store whose log is legitimately empty:
     # anchoring a fresh instance as `0:` is a supported workflow (#328), not a defect to refuse. On a
     # store with no key it needs the audited at-rest opt-out, as every command does (#1916).
@@ -6618,8 +6687,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         return refused
 
     async def run() -> tuple[int, str]:
+        # Read-only, as audit-verify opens it (BACKLOG #1780, #2101).
         store = await open_store(
             settings.store,
+            read_only=True,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
@@ -6629,7 +6700,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     try:
         count, head = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6662,7 +6733,11 @@ def _rekey_audit(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -6697,7 +6772,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
 
     try:
         ok, message = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780: could not start
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6802,7 +6877,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import StoreBackend, load_settings
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
-    from messagefoundry.store.base import open_store, resolve_active_key
+    from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
     from messagefoundry.uploads import ResealResult, UploadStore
@@ -6932,7 +7007,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # skip what is already under the active key — it is a resumable rotation, not a rollback.
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
-    except NotImplementedError as exc:
+    except (NotImplementedError, StoreNotFoundError) as exc:  # #1780: no store there
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6990,6 +7065,7 @@ def _backup(args: argparse.Namespace) -> int:
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
     from messagefoundry.store.base import KeylessAuditChainRefused, StoreNotFoundError, open_store
+    from messagefoundry.store.schema_verify import SchemaMismatchError
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -7044,6 +7120,17 @@ def _backup(args: argparse.Namespace) -> int:
     except (StoreNotFoundError, KeylessAuditChainRefused, _UnauditableWrite) as exc:
         # #1780, #1916: could not start, so exit 2 like #1670 below
         _emit_error(str(exc), as_json=args.json)
+        return 2
+    except SchemaMismatchError as exc:
+        # BACKLOG #2101: refused, and by design. A backup opens the store WRITABLE because it
+        # records a `dr_backup` audit row in it, even on failure, so it cannot take the read-only
+        # open audit-verify and audit-anchor use. Say so, and name the copy that needs no open.
+        _emit_error(
+            f"{exc} backup refuses it because it opens the store writable to record its dr_backup"
+            " audit row. To keep a copy first, stop the service and copy the store file with its"
+            " -wal and -shm files; `audit-verify` and `audit-anchor` open it read-only.",
+            as_json=args.json,
+        )
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
@@ -7876,6 +7963,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
         AlertsSettings,
+        ApiSettings,
         AuthSettings,
         SecretRotationSettings,
         SecuritySettings,
@@ -7886,8 +7974,9 @@ def _security(args: argparse.Namespace) -> int:
 
     path = args.service_config
 
-    # This subcommand edits [security], but security_loosenings() also reports [store]/[auth] deviations
-    # (ADR 0148: one posture). Resolve those from the whole file so the list is complete. If the file will
+    # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
+    # [secret_rotation]/[api] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
@@ -7896,6 +7985,9 @@ def _security(args: argparse.Namespace) -> int:
     # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
     # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
     _rotation = SecretRotationSettings()
+    # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
+    # degradation marker.
+    _api = ApiSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -7904,6 +7996,7 @@ def _security(args: argparse.Namespace) -> int:
             _full = load_settings(config_path=path)
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
             _rotation = _full.secret_rotation
+            _api = _full.api
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -7932,14 +8025,15 @@ def _security(args: argparse.Namespace) -> int:
                 unverified_db_hops=(),
                 attested_hops=(),
                 revocation_attested_hops=(),
+                api=_api,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
             )
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
-    #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
-    #: read at all (the file did not load); the scope string is the standing limitation above. It names
+    #: degraded or settings-only report for a complete one. `partial` means the sections outside
+    #: [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
     #: ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
     #: scope itself incomplete, which is the same defect one level up.
     #:
@@ -7952,7 +8046,7 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
+            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]); the per-connection "
             "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "

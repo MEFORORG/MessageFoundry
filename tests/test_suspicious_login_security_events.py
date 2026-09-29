@@ -175,7 +175,12 @@ async def test_a_lockout_crossed_on_the_second_factor_is_in_the_users_feed() -> 
     try:
         threshold = 3
         service = AuthService(
-            store, AuthSettings(lockout_threshold=threshold, mfa_recovery_code_count=2)
+            store,
+            AuthSettings(
+                mfa_verify_min_elapsed_seconds=0,
+                lockout_threshold=threshold,
+                mfa_recovery_code_count=2,
+            ),
         )
         admin = await create_admin(service)
         first = await service.login(admin.username, admin.password)
