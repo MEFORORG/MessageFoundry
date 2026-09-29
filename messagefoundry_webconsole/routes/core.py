@@ -498,8 +498,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
-        # account with NO factor (a new user holding an admin-issued password): it is BOTH and can
-        # only rotate.
+        # account with NO factor (a new user holding an admin-issued password): it is BOTH. With
+        # require_mfa off it can only rotate; under it, it enrols TOTP first (ADR 0197 Amendment A).
         # An account that HAS a factor (an admin reset keeps them) proves it first, because the
         # rotation page refuses it until then (BACKLOG #1954), and the factor page sends it on to
         # the rotation page afterwards.
@@ -1247,7 +1247,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if await rotation_comes_first(auth, identity.must_change_password, token):
             # must_change outranks MFA for an account with no factor, mirroring require()/require_ui:
             # a fresh account is both, and only rotation is reachable until it happens. One that
-            # still owes an enrolled factor stays here to answer it (BACKLOG #1954).
+            # still owes an enrolled factor stays here to answer it (BACKLOG #1954), and one that
+            # must enrol TOTP first never reaches this branch (rotation_comes_first is False).
             return RedirectResponse("/ui/account/password", status_code=303)
         if await auth.mfa_satisfied(token):
             return RedirectResponse("/ui", status_code=303)  # idempotent: nothing owed
