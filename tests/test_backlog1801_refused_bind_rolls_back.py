@@ -32,7 +32,9 @@ async def test_refused_bind_leaves_no_open_transaction(tmp_path: Path) -> None:
     store = await MessageStore.open(str(tmp_path / "store.db"))
     try:
         for uid in ("holder", "loser", "bystander"):
-            await store.create_user(user_id=uid, username=uid, auth_provider="ad", now=1_000.0)
+            await store.create_user(
+                user_id=uid, username=uid, auth_provider="ad", now=1_000.0, password_generated=False
+            )
         await store.set_user_federated_subject("holder", ISSUER, SUBJECT, now=1_000.0)
 
         # The race loser's write. The refusal must still reach the caller, which renders it.

@@ -44,6 +44,7 @@ from .._auth import (
     assert_not_cross_site,
     assert_same_origin,
     clear_session_cookie,
+    confined_before_its_factor,
     is_unlock_action,
     login_redirect_response,
     lookup_ui_action,
@@ -78,8 +79,9 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa`` refused a directory account the
-#: directory did not confirm (BACKLOG #2023). The code was never checked, so "invalid code" is false.
+#: What the MFA gate and the re-auth form say when ``verify_mfa`` or ``reauth`` refused a directory
+#: account the directory did not confirm (BACKLOG #2023, #2027). The code or password was never
+#: checked, so "invalid code" or "incorrect password" would be false.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )
@@ -498,8 +500,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #
         # UX only — require_ui and the rotation page are what actually enforce, and they cover the
         # other two cookie-minting legs (Kerberos SSO, the OIDC callback) without this branch.
-        if await rotation_comes_first(auth, outcome.must_change_password, outcome.token):
-            target = "/ui/account/password"
+        if outcome.must_change_password:
+            # The password page, the factor page, or -- under require_mfa with no TOTP -- the
+            # enrolment page first (ADR 0197 Amendment A): the one decision must_change_target makes.
+            target = await must_change_target(auth, outcome.token)
         elif outcome.mfa_required:
             target = "/ui/mfa"
         else:
@@ -1308,8 +1312,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # The session ended under the operator (expiry / revoke) — a post-termination landing
             # like any other, so it carries Clear-Site-Data + the explanatory code (14.3.1).
             return login_redirect_response()
-        if identity.must_change_password:
+        if identity.must_change_password and not await auth.must_enrol_before_rotating(identity):
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
+            # A session that must enrol before rotating (ADR 0197 Amendment A) re-proves its
+            # password here to reach the TOTP enrolment, so it is let through.
             return RedirectResponse(await must_change_target(auth, token), status_code=303)
         mfa = await auth.mfa_status(identity)
         if await auth.session_steps_up_at_idp(token):
@@ -1349,8 +1355,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return login_redirect_response()  # session ended mid-ceremony — see ui_reauth_form
-        if identity.must_change_password:
+        if identity.must_change_password and not await auth.must_enrol_before_rotating(identity):
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
+            # A session that must enrol before rotating (ADR 0197 Amendment A) re-proves its
+            # password here to reach the TOTP enrolment, so it is let through.
             return RedirectResponse(await must_change_target(auth, token), status_code=303)
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         next_ = form.get("next", "")
@@ -1471,7 +1479,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             wa_options, wa_notice = await _reauth_webauthn_state(
                 request, auth, token, mfa, not still_unsatisfied
             )
-            # The wrong-password exit AFTER a successful code leg — the stranded-cookie case.
+            # The wrong-password exit AFTER a successful code leg — the stranded-cookie case. A
+            # directory that could not judge the password never called it wrong (BACKLOG #2027).
             return _keep_session(
                 HTMLResponse(
                     pages.reauth(
@@ -1479,7 +1488,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=mfa_enrolled and still_unsatisfied,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error="Incorrect password.",
+                        error=(
+                            _DIRECTORY_UNCONFIRMED_ERROR
+                            if _directory_unconfirmed(pw_elevation)
+                            else "Incorrect password."
+                        ),
                     )
                 ),
                 token,
@@ -1511,8 +1524,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
-        if await rotation_comes_first(auth, identity.must_change_password, token):
-            # Mirror /ui/mfa's confinement (L4b).
+        if await confined_before_its_factor(auth, identity.must_change_password, token):
+            # Mirror /ui/mfa's confinement (L4b). A session that must enrol before rotating (ADR 0197
+            # Amendment A) stays confined here too: it has no passkey to prove.
             return JSONResponse({"ok": False, "error": "password change required"}, status_code=403)
         rp = webauthn_rp(request)
         if rp is None:

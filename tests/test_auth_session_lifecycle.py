@@ -17,7 +17,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._admin_account import ADMIN_USERNAME, create_local_user_chosen, login_admin
 from tests._totp_clock import pin_totp_clock
 
 PW = "Sup3rSecret!!"
@@ -28,8 +28,14 @@ async def _store() -> MessageStore:
 
 
 async def _local_user(service: AuthService, username: str) -> None:
-    await service.create_local_user(
-        username=username, password=PW, display_name=None, email=None, roles=[], actor="test"
+    await create_local_user_chosen(
+        service,
+        username=username,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[],
+        actor="test",
     )
 
 
@@ -40,7 +46,9 @@ async def test_backward_clock_step_revokes_session() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        await store.create_user(user_id="u", username="u", auth_provider="local")
+        await store.create_user(
+            user_id="u", username="u", auth_provider="local", password_generated=False
+        )
         # A session stamped in the "future" (as if the wall clock later stepped back) must be
         # rejected and revoked, not silently honoured.
         token = mint_token()
@@ -86,7 +94,9 @@ async def test_idle_clock_only_refreshed_on_user_activity() -> None:
 async def test_enforce_session_cap_revokes_oldest() -> None:
     store = await _store()
     try:
-        await store.create_user(user_id="u", username="u", auth_provider="local")
+        await store.create_user(
+            user_id="u", username="u", auth_provider="local", password_generated=False
+        )
         big = time.time() + 10_000
         for h, created in (("h1", 1.0), ("h2", 2.0), ("h3", 3.0)):
             await store.create_session(token_hash=h, user_id="u", expires_at=big, now=created)

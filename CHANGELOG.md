@@ -7,6 +7,27 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
+  before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
+  off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and
+  an account from before this change keeps it until it enrols. The engine now generates the credential of every account an
+  administrator creates, and the one an administrator's factor reset issues; `POST /users` takes no
+  password and returns the credential once as `temp_password`, and `POST /users/{id}/reset-mfa`
+  returns one for a local account. While a generated credential stands, wrong passwords are counted
+  and audited but arm no sign-in lock. Under the shipped `[security].require_mfa`, the holder must
+  enrol an authenticator app before choosing a password: `POST /me/password` and the console's
+  password form refuse with `enrol an authenticator app first` until TOTP is on, and a passkey
+  cannot be the first factor or replace TOTP yet. `provision-admin` now enrols TOTP at the terminal
+  and prints recovery codes once; `--no-totp` is refused while MFA is required. Its repair of a
+  roleless account now clears that account's factors and ends its sessions first. At startup the
+  engine warns about, and audits, every covered account that still has a chosen password and no
+  TOTP, and every TOTP key it cannot decrypt; `messagefoundry verify` reports the same as
+  `auth.lockable_accounts`. The `users.password_generated` column is added on all three backends.
+  If `[auth].password_extra_context_words` is so broad that no generated credential clears the
+  policy, creating an account and both resets answer 503 and change nothing, and a spent step-up
+  grant is given back; the engine logs an ERROR at start and `verify` fails
+  `auth.credential_generation`. `provision-admin` shows the TOTP key and recovery codes on the
+  controlling terminal only, never on stdout or stderr. (`BACKLOG #1131`, ASVS 6.1.1)
 - **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
   lists terms such as an organization, product, project or department name. They join the shipped
   `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`
@@ -253,6 +274,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   schema, as excess. Set `schema_management = "auto"` to keep the engine building its own schema;
   on a server DB that is reported by `security_loosenings()` as `schema_management`.
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
+- **A row stranded in flight now pages.** A store fault between a committed claim and its handoff
+  can leave a row `inflight` when the re-pend that follows fails too. A restart recovers it, and
+  until now nothing saw it: the buildup and stall checks counted pending rows only, and ran only
+  when the lane processed something. The engine now reads each stage's in-flight rows every 30 s,
+  on every store backend. It fires `queue_buildup` when a row has been held longer than the lane's
+  buildup `max_oldest_seconds`, which is on by default at 300 s. An outbound lane also fires
+  `message_stall` on its stall threshold, when one is set. The age runs from the claim, so a row
+  being worked right now does not page. The log line names the stage. This change re-pends
+  nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
@@ -272,6 +302,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   on the temp volume, as before. `docs/PHI.md` §2 states what "private" means on each platform. The archive key is
   now picked by comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and
   §8 state what is still unbounded. (`BACKLOG #1174`, `BACKLOG #1721`, `BACKLOG #1167`)
+- **BREAKING: every private-key loader now refuses a weak passphrase wrap.** Decrypting an
+  encrypted key file derives a key from its passphrase, and the engine now holds that derivation to
+  ASVS 11.4.4. It reads the wrap before anything decrypts it: at the TLS listeners and client hops,
+  outbound signing and the SMART assertion, the DIRECT signing key, `cert import`, the SFTP key, and
+  a database driver's `sslkey`. Refused, with no setting to allow them: legacy `Proc-Type` PEM,
+  SHA-1-based derivations, PBKDF2 under 600,000 iterations over HMAC-SHA-256 (or 210,000 over
+  HMAC-SHA-512), and a PKCS#12 MAC keyed by the PKCS#12 KDF rather than PBMAC1. **Keys written by
+  `openssl req`, `openssl genpkey -aes256` or `cryptography`'s `BestAvailableEncryption` use 2048
+  iterations and are refused until re-wrapped.** An encrypted key with no passphrase is refused
+  before any library can prompt at a terminal. The SFTP connector no longer takes `key_password`
+  or an encrypted key, and refuses an RSA key under 2048 bits. The refusal gives the `openssl`
+  command to re-wrap; docs/CONNECTIONS.md, *Encrypted private keys must meet the wrap floor*, has
+  both commands. (`BACKLOG #1352`, `#1171`)
 - **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
   grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
   (`BACKLOG #1135`)
@@ -568,6 +611,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   That includes presets saved under the no-auth `system` identity. On PostgreSQL and SQL Server the
   step runs in the schema batch, under `provision-schema` and `auto` alike. The 0.4.0 entry's advice
   to drop the table first no longer applies from this release on. (`BACKLOG #1909`)
+- **A pooled stage no longer gains a processing slot when a claimer dies mid-bookkeeping.** When a
+  claim ended with no serializer, the dispatcher returned the lane's slot and then booked the episode
+  and moved the lane on. If either step raised, the claimer died with the lane still marked as
+  claiming, and its replacement returned the same slot again. The stage could then run more lanes at
+  once than `pooled_max_processing_lanes` allows. Each lane now records whether it holds a slot, and
+  one helper returns it at most once per reservation, on every path that ends a claim.
+  (`BACKLOG #2075`)
+- **A lane that keeps killing its pooled claimer is now stopped, so the rest of the stage drains.**
+  Before, the respawned claimer released the lane's row and re-readied the lane, and its next
+  dispatch killed the claimer again. The release restores the row's attempts, so `max_attempts`
+  never dead-lettered it, and every other lane on that claimer waited through the respawn backoff,
+  up to 30 seconds, each time. The dispatcher now counts deaths per lane. After
+  `infra_fault_stop_after` in a row it releases the lane's rows, STOPs the lane and raises
+  `connection_stopped`. A reload, a recovery broadcast, or an operator stop and start re-arms it
+  with a fresh count. Only a dispatch that hands rows to a worker clears the count, so an empty
+  claim between deaths does not. This applies under both `infra_fault_policy` values.
+  (`BACKLOG #2074`)
 - **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
   whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
   algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal
@@ -1153,10 +1213,33 @@ All notable changes to MessageFoundry are documented here. The format follows
   ceiling of about 86,400 a day, against ADR 0197's design bound of 35. ADR 0197's counting is
   unchanged: a right password with a wrong code still charges the second-step counter, both wrong
   still charges the sign-in counter, and which factor verified still reaches the account holder's
-  own lock notice and the `users:manage` lock-state surface. A coarser residual remains: the
-  lock rows a locked second-step counter emits (`auth.account_locked`, `auth.lock_notice`,
-  `auth.login_locked`) still tell the two outcomes apart at `lockout_threshold` requests per
-  candidate; removing them touches the AC-10 lock record, so it is left for an owner/ADR decision.
+  own lock notice and the `users:manage` lock-state surface. The coarser residual, the lock rows a
+  locked second-step counter emits, is closed by the next entry. (`BACKLOG #1131`, ASVS 6.1.1)
+- **The Auditor no longer sees lockout events.** An audit reader without `users:manage`, the
+  built-in `AUDITOR` role included, no longer sees `auth.account_locked`, `auth.lock_notice`,
+  `auth.login_locked` or `auth.admin_unlocked`, nor the `reason: locked` refusals of the TOTP,
+  passkey and directory sign-ins, in `GET /audit`, `GET /audit/export` or the console's
+  `/ui/audit`. Administrators still see every row, and the engine still writes them all (ADR 0197
+  AC-10). In their place every refused sign-in on an existing, enabled local account writes one
+  `auth.login_failed` row with reason `bad_credentials`, whether a wrong credential or a live lock
+  refused it. A password-only
+  wrong password used to write `bad_password` and now writes `bad_credentials` too. Before, the
+  lock rows told an Auditor which candidate password was right: sending one candidate
+  `lockout_threshold` times in a combined sign-in locks the second-step counter only when the
+  password is right. The cost, accepted by owner ruling 2026-09-28: the Auditor can no longer
+  review lockouts. An account holder's own `/me/security-events` feed still shows their own lock.
+  The general log no longer names lock events either: an undeliverable lock notice writes no
+  per-event log line. With no relay or no address it is recorded instead as `mailed: false` on the
+  administrator-only `auth.lock_notice` row; a full queue or a failed send of a lock notice is now
+  recorded nowhere. `GET /logs/tail` no longer shows the audit-row copies the off-box tee
+  writes into the log to a reader without `users:manage`, the built-in Operator included; that
+  reader loses those lines from the log viewer. `GET /status` returns the log directory's
+  `size_bytes` and the database's `audit` row count as null to the same readers. A failed
+  lock-notice throttle read, a broken audit tee sink, and SMTP with `tls_verify = false` each log
+  without naming a lock: the last two once per process. A refused local sign-in's audit rows are now
+  written at a fixed point inside the failure pad, so their timestamp no longer shows whether a lock
+  or a checked credential refused it. The channels still open are listed in `docs/SECURITY.md` under
+  Audit.
   (`BACKLOG #1131`, ASVS 6.1.1)
 - **BREAKING: XML signature checks now refuse an RSA signing key under 2048 bits.** Before, the
   XML-DSig `verify()` accepted a signature made with an RSA-1024 key, on both the `x509_cert` and
@@ -1194,7 +1277,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `POST /ui/reauth`) refuses an account with no directory id for the same reason. It refuses before
   it sends the password anywhere. It also refuses an answer about a different directory object
   (`directory_identity_conflict`) or one with no readable id. None of these refusals counts toward
-  the account lockout. The web console still shows these step-up refusals as a wrong password.
+  the account lockout. The web console showed these step-up refusals as a wrong password until
+  the step-up entry just below.
   - **Why.** A username is the only key such an account has, and a directory can give a freed
     username to a new person. That person's sign-in would then reach the old account and give it
     their groups, and their password would step up the old account's session (ADR 0184 AC-5).
@@ -1207,6 +1291,40 @@ All notable changes to MessageFoundry are documented here. The format follows
     up. This adds no directory read: each lookup is keyed on the id instead of the name.
 
   (`BACKLOG #2027`, ADR 0184)
+- **BREAKING: a TOTP or recovery code no longer renews the step-up window of a directory account
+  with no directory id.** Before the code is checked, the engine asks the directory to confirm a
+  directory account. For an account with no `directory_object_id` and no federated link, it used
+  to ask by the account's username. It now refuses such an account without asking, as it already
+  did for a linked one. The code is not checked or spent, and nothing counts toward the lockout.
+  `POST /auth/mfa-verify` answers `403`, and `/ui/mfa` and `/ui/reauth` say the directory could not
+  confirm the account. The `auth.mfa_failed` row carries `directory_unconfirmed` and the outcome
+  `directory_object_id_missing`. The same refusal means an MFA-pending session on such an account
+  can never satisfy its second factor, so it reaches no MFA-gated route before it expires. The
+  remedy is the one in the entry above: delete the account and have it created again with an id.
+  - **A step-up the directory could not judge now says so.** That covers at least an account with
+    no directory id, no enabled entry for its id, an unreachable directory, and no directory
+    configured. `POST /me/reauth` answers `403` saying the directory could not confirm the account,
+    instead of `re-verification failed`. The web console's re-auth form says the same instead of
+    "Incorrect password." A password the directory refused still reads as wrong. The words name no
+    directory detail. The `auth.reauth` audit row now carries the cause as `reason` in every such
+    case: `directory_object_id_missing`, `not_in_directory`, `directory_unavailable` or
+    `not_configured`. Before, only the first carried one, so an outage's row looked like a wrong
+    password's. `Elevation.directory_unconfirmed` now carries this for `reauth` too.
+  - **BREAKING: a lookup by `objectGUID` treats an entry that does not read back that id as no
+    match.** Where the entry the directory finds by an account's `objectGUID` carries no readable
+    `objectGUID`, or another one, the engine now reads it as absent, before its account state. The
+    step-up re-bind never binds the typed password as it. The IdP step-up, a federated sign-in, the
+    TOTP check and the directory recheck all refuse it, and the recheck no longer takes that entry's
+    name as a rename. A federated sign-in or IdP step-up refused this way is audited
+    `not_in_directory`, and so is the re-bind, where it was `directory_object_id_missing` or
+    `directory_identity_conflict`. The engine logs a warning once when the id differs. **The
+    cost:** a directory-wide change that hides `objectGUID` reads as absent accounts. The recheck's
+    mass-revocation abort stops a large wave, but at or below its floor the affected sessions end
+    after `[auth].ad_session_recheck_strikes` passes.
+  - **What still asks by name:** at least the directory recheck, for an account with no directory
+    id and no federated link.
+
+  Federation still ships off. (`BACKLOG #2027`, ADR 0184)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -1542,7 +1660,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   - **Which accounts now refuse.** A directory account created by a Windows SSO sign-in through a
     directory that returned no readable `objectGUID`. Before this change it could be linked.
   - **The cost.** A site whose directory returns no readable `objectGUID` can link nobody, so
-    nobody there can sign in through the identity provider. Directory sign-in still works there.
+    nobody there can sign in through the identity provider. Windows SSO signs nobody in there
+    either, since the `BACKLOG #2027` directory-id entry in this section. (This line said
+    directory sign-in still works there, which stopped being true when that entry landed.)
   - **An account never gains an id after it is created.** To link one, make the directory return
     `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
     once with Windows SSO. Nothing else creates a directory account. The new account has a new

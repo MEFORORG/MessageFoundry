@@ -22,11 +22,11 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {
     "username": "newbie",
-    "password": PW,
     "roles": ["viewer"],
     "email": "newbie@example.org",
 }
@@ -60,7 +60,8 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add_admin(service: AuthService, username: str) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -76,7 +77,10 @@ async def _add_admin(service: AuthService, username: str) -> None:
     assert user is not None and user.password_hash is not None
     # Admin-created accounts force first-login rotation (WP-L3-12); clear it for a usable test login.
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -301,7 +305,8 @@ async def test_admin_user_update_is_action_bound(engine: Engine) -> None:
     the shared login window; the grant is consumed once, so a second PATCH re-prompts."""
     service = await _service(engine)
     await _add_admin(service, "boss")
-    target_id = await service.create_local_user(
+    target_id = await create_local_user_chosen(
+        service,
         username="target",
         password=PW,
         display_name=None,
@@ -336,7 +341,8 @@ async def test_admin_user_update_opt_out_uses_window(engine: Engine) -> None:
     # With require_action_step_up=False the PATCH falls back to the session window (fresh login unlocks).
     service = await _service(engine, AuthSettings(require_action_step_up=False, require_mfa=False))
     await _add_admin(service, "boss")
-    target_id = await service.create_local_user(
+    target_id = await create_local_user_chosen(
+        service,
         username="target",
         password=PW,
         display_name=None,
@@ -483,7 +489,8 @@ async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> N
 
 async def test_create_session_stamps_reauth_at(engine: Engine) -> None:
     service = await _service(engine)
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="u",
         password=PW,
         display_name=None,

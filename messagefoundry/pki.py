@@ -28,6 +28,8 @@ from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 
+from messagefoundry.keywrap import refuse_weak_pkcs12
+
 __all__ = [
     "CertFacts",
     "CrlFacts",
@@ -76,7 +78,17 @@ def load_pkcs12(
     Thin wrapper over ``cryptography``'s loader. ``password`` is the bundle passphrase (``None`` for an
     unencrypted bundle); it is used only to decrypt here and is never logged or returned. A wrong
     password / malformed bundle raises ``ValueError`` from ``cryptography`` — the CLI scrubs that so the
-    passphrase can never leak into stderr/logs."""
+    passphrase can never leak into stderr/logs.
+
+    Before anything decrypts it, the bundle's MAC and bag encryption are checked (BACKLOG #1352,
+    #1171): a weak or unreadable wrap, or an encrypted bundle with no passphrase, raises
+    :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is safe to show."""
+    refuse_weak_pkcs12(
+        pfx_bytes,
+        setting="the --pfx bundle",
+        unlock_setting="MEFOR_PFX_PASSWORD",
+        passphrase_given=password is not None,
+    )
     key, cert, cas = pkcs12.load_key_and_certificates(pfx_bytes, password)
     return key, cert, list(cas)
 

@@ -39,6 +39,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import uuid4
@@ -235,6 +236,7 @@ from messagefoundry.api.validation import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
+from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
@@ -620,7 +622,9 @@ def _log_sink_health() -> list[LogSinkInfo]:
     ]
 
 
-def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[list[str], int, bool]:
+def _read_log_tail(
+    log_dir: str | None, *, limit: int, offset: int, audit_copies: bool = True
+) -> tuple[list[str], int, bool]:
     """A **redacted** page of the newest app-log file's tail for the in-console viewer (#171, ADR 0130).
 
     Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
@@ -631,7 +635,12 @@ def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[lis
     identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
     gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
-    **never raises** (an unreadable dir/file yields an empty, unavailable page)."""
+    **never raises** (an unreadable dir/file yields an empty, unavailable page).
+
+    ``audit_copies=False`` drops the off-box tee's audit-row copies BEFORE paging, so ``total_lines``
+    and the page boundaries do not count them either (BACKLOG #1131; see
+    :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
+    from messagefoundry.auth.audit_visibility import is_audit_copy_line
     from messagefoundry.support.redact import redact_log_line
 
     if not log_dir:
@@ -650,6 +659,8 @@ def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[lis
     except OSError:
         return [], 0, False
     all_lines = text.splitlines()
+    if not audit_copies:
+        all_lines = [line for line in all_lines if not is_audit_copy_line(line)]
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
@@ -6016,6 +6027,14 @@ def create_app(
         # loop; it never raises, so /status does not either. `None` means stdout-only and NOTHING
         # else -- see LogInfo for the three states (BACKLOG #1563).
         logs = await asyncio.to_thread(_log_storage, getattr(request.app.state, "log_dir", None))
+        # BACKLOG #1131 (Manager decision 2026-09-28, under the owner's lock-rows ruling): the log
+        # directory's byte total counts the off-box tee's copy of every audit row, the hidden lock
+        # rows included, so on a quiet instance it grows by exactly one line when a lock lands.
+        # ``monitoring:read`` reaches this route and is held by the Auditor and the Operator, so the
+        # total goes only to a caller who may read those copies. The free-space half stays: the
+        # console's disk-full check reads it.
+        if logs is not None and not reads_audit_copies_in_the_log(_user):
+            logs = logs.model_copy(update={"size_bytes": None})
         # No-network version-update signal (#30, ADR 0026): the engine's latest local diff (version
         # strings only, no PHI). None when [update_check] is disabled / no pass has run — additive, so
         # the existing payload is unchanged when off.
@@ -6059,7 +6078,9 @@ def create_app(
                 journal_mode=db.journal_mode,
                 messages=db.messages,
                 events=db.events,
-                audit=db.audit,
+                # BACKLOG #1131: the whole-table count includes the hidden lock rows, so it goes only
+                # to a caller who may read them (see the log size above).
+                audit=db.audit if reads_audit_copies_in_the_log(_user) else None,
                 synchronous=db.synchronous,
             ),
             logs=logs,
@@ -6137,7 +6158,13 @@ def create_app(
         log_dir = getattr(request.app.state, "log_dir", None)
         # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
         lines, total, available = await asyncio.to_thread(
-            _read_log_tail, log_dir, limit=limit, offset=offset
+            partial(
+                _read_log_tail,
+                log_dir,
+                limit=limit,
+                offset=offset,
+                audit_copies=reads_audit_copies_in_the_log(identity),
+            )
         )
         # Audit the redacted-log read like a message view (#171): actor + how many lines were exposed, never
         # the content. Only when something was actually served, so a poll of an empty/unconfigured tail
@@ -7842,6 +7869,24 @@ def create_managed_app(
                     alerts_settings=alerts_settings,
                     security_settings=security_settings,
                 )
+                # ADR 0197 Amendment A, AC-A9: name every account still lockable with no way past a
+                # sign-in lock. It warns and audits and NEVER refuses to start: an account-level fact
+                # must not get a site-wide veto, so even a failure of the census itself is logged
+                # and startup continues.
+                try:
+                    await auth.report_lockable_account_census()
+                except Exception:  # noqa: BLE001 -- see the comment above
+                    _log.exception("the lockable-account census could not run; startup continues")
+                # ADR 0197 Amendment A, Manager decision 2026-09-29: learn at start, not at the first
+                # account creation, that the password policy leaves no credential to issue. It logs
+                # an ERROR and returns, and is guarded like the census: a policy-level fact must
+                # never refuse the start, whatever a later policy clause raises.
+                try:
+                    auth.probe_credential_generation()
+                except Exception:  # noqa: BLE001 -- see the comment above
+                    _log.exception(
+                        "the credential-generation probe could not run; startup continues"
+                    )
                 if not auth.webauthn_available() and await store.any_webauthn_credentials():
                     # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
                     # not installed (engine moved/reinstalled, same DB) — affected users stay

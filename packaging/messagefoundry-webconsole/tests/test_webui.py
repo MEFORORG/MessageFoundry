@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 import re
 import time
@@ -18,10 +19,12 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 import pytest
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider
+from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import ConnectorType
@@ -76,7 +79,8 @@ def _client(engine: Engine, service: AuthService, *, serve_ui: bool = True) -> h
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -91,7 +95,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -207,7 +214,8 @@ async def test_unprovisioned_operator_is_told_why_the_console_is_empty(engine: E
     banner and not a start-time refusal, which would make a fresh single-operator install
     unbootable for the same condition: asserted here by the page answering 200."""
     service = await _service(engine)
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="fresh",
         password=PW,
         display_name=None,
@@ -219,7 +227,7 @@ async def test_unprovisioned_operator_is_told_why_the_console_is_empty(engine: E
     assert user is not None and user.password_hash is not None
     assert user.channel_scope is None  # nobody has granted anything: the shipped create path
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     async with _client(engine, service) as c:
         await _cookie_login(c, "fresh")
@@ -3221,19 +3229,22 @@ async def test_create_user_end_to_end(engine: Engine) -> None:
             "/ui/users",
             [
                 ("username", "newop"),
-                ("password", PW),
                 ("display_name", "New Operator"),
                 ("email", "newop@example.test"),
                 ("roles", "operator"),
                 ("roles", "viewer"),
             ],
         )
-        assert r.status_code == 303
+        # ADR 0197 Amendment A, AC-A2: the page shows the engine-generated credential ONCE.
+        assert r.status_code == 200 and "Account created" in r.text
         user = await service.store.get_user_by_username("newop")
         assert user is not None
-        assert r.headers["location"] == f"/ui/users/{user.id}"
         assert sorted(await service.store.get_user_role_ids(user.id)) == ["operator", "viewer"]
-        assert user.must_change_password  # admin-set initial credential dies at first login
+        assert user.must_change_password and user.password_generated
+        shown = re.search(r"<code>([^<]+)</code>", r.text)
+        assert (
+            shown is not None and (await service.login("newop", html.unescape(shown.group(1)))).ok
+        )
 
 
 async def test_create_user_duplicate_rerenders_without_password(engine: Engine) -> None:
@@ -3251,16 +3262,24 @@ async def test_create_user_duplicate_rerenders_without_password(engine: Engine) 
         assert PW not in r.text  # ...the password is NEVER echoed back
 
 
-async def test_create_user_weak_password_rejected(engine: Engine) -> None:
+async def test_create_user_a_posted_password_is_never_the_credential(engine: Engine) -> None:
+    """ADR 0197 Amendment A, AC-A2: the create form has no password field, and a ``password`` a
+    caller posts anyway is ignored. The account gets a generated credential; the posted one does not
+    sign in. (Replaces the weak-password refusal test: there is no administrator-typed password left
+    to refuse.)"""
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
+        form = await c.get("/ui/users/new")
+        assert 'name="password"' not in form.text
         r = await c.post(
             "/ui/users",
-            data={"username": "weakling", "password": "short"},
+            data={"username": "chooser", "password": PW, "email": "chooser@example.test"},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
-        assert r.status_code == 400 and "password must" in r.text
-        assert await service.store.get_user_by_username("weakling") is None
+        assert r.status_code == 200 and PW not in r.text
+        user = await service.store.get_user_by_username("chooser")
+        assert user is not None and user.password_generated
+        assert not (await service.login("chooser", PW)).ok
 
 
 async def test_create_user_cross_site_rejected(engine: Engine) -> None:
@@ -3720,7 +3739,9 @@ async def test_resaving_a_directory_scope_needs_a_confirmation(engine: Engine) -
 
     service = await _service(engine)
     ada = uuid.uuid4().hex  # the shape a real account id has
-    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.create_user(
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     resave = {"scope_mode": "list", "channels": "IB_A"}
     same_origin = {"Sec-Fetch-Site": "same-origin"}
@@ -3774,7 +3795,9 @@ async def test_a_refused_scope_save_shows_the_submitted_edits(engine: Engine) ->
 
     service = await _service(engine)
     ada = uuid.uuid4().hex
-    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.create_user(
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     same_origin = {"Sec-Fetch-Site": "same-origin"}
     stored_textarea = '<textarea name="channels" rows="4">IB_A</textarea>'
@@ -3847,7 +3870,9 @@ async def test_the_other_scope_refusals_keep_the_edits_where_they_can(engine: En
 
     service = await _service(engine)
     ada = uuid.uuid4().hex
-    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.create_user(
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     same_origin = {"Sec-Fetch-Site": "same-origin"}
     stored_textarea = '<textarea name="channels" rows="4">IB_A</textarea>'
@@ -3932,7 +3957,9 @@ async def test_a_sign_in_landing_during_a_console_scope_save_is_refused(
 
     service = await _service(engine)
     len_ = uuid.uuid4().hex
-    await service.store.create_user(user_id=len_, username="len", auth_provider="ad")
+    await service.store.create_user(
+        user_id=len_, username="len", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(
         len_, json.dumps(["IB_M"]), source=SCOPE_SOURCE_MANUAL
     )
@@ -4034,8 +4061,57 @@ async def test_reset_mfa_and_revoke_sessions_roundtrip(engine: Engine) -> None:
                 assert "/ui/reauth" in bounced.headers["location"], action
                 await _mint_action(c, f"/ui/users/{uid}/{action}")
             r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
+            if action == "reset-mfa":
+                # ADR 0197 Amendment A, AC-A4: a local account's factor reset also issued a
+                # generated credential, shown once on the result page.
+                assert r.status_code == 200 and "Authenticator reset" in r.text, action
+                user = await service.store.get_user(uid)
+                assert user is not None and user.password_generated
+                continue
             assert r.status_code == 303, action
             assert r.headers["location"] == f"/ui/users/{uid}", action
+
+
+@pytest.mark.parametrize("action", ["reset-mfa", "reset-password"])
+async def test_a_refused_issue_on_the_console_keeps_the_account_and_the_grant(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    """ADR 0197 Amendment A, Manager decision 2026-09-29: when no credential can be issued, the
+    console's reset renders the refusal, changes nothing, and gives back the grant its gate spent,
+    so the same grant opens the action once the generator can issue again."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth import service as service_module
+
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            admin_write_min_interval_seconds=0,  # the retry is machine-speed (PR 1781, #2301)
+            password_extra_context_words=["globex"],
+        ),
+    )
+    await service.initialize()
+    await _add(service, "u2", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u2")
+        before = await service.store.get_user(uid)
+        await _mint_action(c, f"/ui/users/{uid}/{action}")
+        monkeypatch.setattr(
+            service_module,
+            "secrets",
+            SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
+        )
+        r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 400 and "password_extra_context_words" in r.text
+        after = await service.store.get_user(uid)
+        assert after == before, "a refused issue changed the account"
+        monkeypatch.undo()
+        r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200, "the refunded grant did not open the action"
+        # ...and that success spent it: single-use still holds on the console plane after a refund.
+        r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code != 200, "the refunded grant opened the action twice"
 
 
 async def test_delete_user_roundtrip_and_self_guard(engine: Engine) -> None:
@@ -4153,14 +4229,13 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
             "/ui/users",
             data={
                 "username": "hostile",
-                "password": PW,
                 "display_name": "<script>alert(9)</script>",
                 "email": "hostile@x.org",
             },
             headers={"Sec-Fetch-Site": "same-origin"},
         )
-        assert r.status_code == 303
-        for url in ("/ui/users", r.headers["location"]):
+        assert r.status_code == 200
+        for url in ("/ui/users", f"/ui/users/{await _uid(service, 'hostile')}"):
             body = (await c.get(url)).text
             assert "<script>alert(9)</script>" not in body
             assert "&lt;script&gt;alert(9)&lt;/script&gt;" in body
@@ -4177,7 +4252,7 @@ async def test_the_create_form_requires_a_notification_address(engine: Engine) -
         for email in ("", "a@b.org, c@d.org"):
             r = await c.post(
                 "/ui/users",
-                data={"username": "nomail", "password": PW, "email": email},
+                data={"username": "nomail", "email": email},
                 headers={"Sec-Fetch-Site": "same-origin"},
             )
             assert r.status_code == 400, email
@@ -4185,10 +4260,10 @@ async def test_the_create_form_requires_a_notification_address(engine: Engine) -
             assert await service.store.get_user_by_username("nomail") is None
         r = await c.post(
             "/ui/users",
-            data={"username": "nomail", "password": PW, "email": "nomail@x.org"},
+            data={"username": "nomail", "email": "nomail@x.org"},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
-        assert r.status_code == 303
+        assert r.status_code == 200
         user = await service.store.get_user_by_username("nomail")
         assert user is not None and user.notify_email == "nomail@x.org"
 
@@ -4198,7 +4273,8 @@ async def test_the_create_form_requires_a_notification_address(engine: Engine) -
 
 async def _add_with_role_ids(service: AuthService, username: str, role_ids: list[str]) -> None:
     """Like _add, but with raw role ids (so a CUSTOM role can be assigned)."""
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -4213,7 +4289,10 @@ async def _add_with_role_ids(service: AuthService, username: str, role_ids: list
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -4433,7 +4512,11 @@ async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:
     # enrollment a one-way door. That is the half of the carve-out set this test now pins OPEN.
     service = await _service(engine)
     await service.store.create_user(
-        user_id="ad-user-1", username="aduser", auth_provider="ad", display_name="AD User"
+        user_id="ad-user-1",
+        username="aduser",
+        auth_provider="ad",
+        display_name="AD User",
+        password_generated=False,
     )
     async with _boss_client(engine, service) as c:
         detail = await c.get("/ui/users/ad-user-1")
@@ -4564,7 +4647,8 @@ async def test_must_change_account_is_confined_to_rotation(engine: Engine) -> No
     # A must-change account: login lands on the rotation page, every other /ui route bounces back
     # there, and completing the rotation releases it (browser-only — no desktop console needed).
     service = await _service(engine)
-    await service.create_local_user(
+    await create_local_user_chosen(
+        service,
         username="fresh",
         password=PW,
         display_name=None,
@@ -4757,14 +4841,15 @@ async def test_stale_reauth_only_bounces_to_reauth(engine: Engine) -> None:
         )
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
-        # The change-password POST has NO step-up gate — it proceeds under the same stale window
-        # (the current password in the body is the proof).
+        # The change-password POST has NO step-up gate, but under require_mfa this account holds no
+        # TOTP, so it is sent to enrol first (ADR 0197 Amendment A, AC-A3) -- not refused by the
+        # stale window, which it never reaches.
         r = await c.post(
             "/ui/account/password",
             data={"current_password": PW, "new_password": NEW_PW, "new_password2": NEW_PW},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
-        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=pwchanged"
+        assert r.status_code == 303 and r.headers["location"] == "/ui/account?m=enroll_first"
 
 
 async def test_reauth_never_demands_code_from_unenrolled_user(engine: Engine) -> None:
@@ -5005,7 +5090,8 @@ async def test_reauth_confines_must_change_session(engine: Engine) -> None:
     # Review bug [0]: /ui/reauth (GET+POST) must mirror require_ui's must-change confinement — the JSON
     # /me/reauth twin refuses a must-change session, so the /ui gate must not be weaker.
     service = await _service(engine)
-    await service.create_local_user(
+    await create_local_user_chosen(
+        service,
         username="fresh",
         password=PW,
         display_name=None,
@@ -5119,7 +5205,7 @@ async def test_disabling_the_LAST_factor_renders_the_page_not_raw_json(engine: E
         # THE ASSERTION THAT DISCRIMINATES: a raw JSON refusal is also a 400, so the status code
         # alone would pass against the defect. What distinguishes them is the body being a page.
         assert "<html" in r.text.lower(), f"refusal did not render as HTML:\n{r.text[:300]}"
-        assert "enroll another factor first" in r.text
+        assert "last second factor" in r.text
         user = await service.store.get_user(uid)
         assert user is not None and user.totp_enabled  # refused, and nothing was stripped
 
@@ -5147,7 +5233,8 @@ async def test_mfa_posts_reject_cross_site(engine: Engine) -> None:
 async def test_must_change_confinement_on_posts_and_reauth_continuation(engine: Engine) -> None:
     # Confinement covers POSTs and the /ui/reauth-driven continuation, not just GETs.
     service = await _service(engine)
-    await service.create_local_user(
+    await create_local_user_chosen(
+        service,
         username="fresh",
         password=PW,
         display_name=None,
@@ -5476,8 +5563,10 @@ async def test_webauthn_enroll_requires_password_reproof(engine: Engine) -> None
             headers=_SFS,
         )
         assert r.status_code == 200 and 'action="/ui/account/webauthn/enroll"' in r.text
+        # ADR 0197 Amendment A, AC-A3: the continuation still works, and then the service refuses a
+        # passkey as this covered account's FIRST factor -- it has no way past the sign-in lock.
         r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
-        assert r.status_code == 200 and "data-mf-webauthn-create" in r.text
+        assert r.status_code == 400 and "enrol an authenticator app first" in r.text
 
 
 async def test_reauth_both_factors_enrolled_renders_code_and_passkey(engine: Engine) -> None:
@@ -7492,7 +7581,11 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     # BACKLOG #1143 (ADR 0184): a federated login selects its account by the (issuer, sub) pair and
     # never binds, so the account is bound through the admin path first.
     await engine.store.create_user(
-        user_id="f" * 32, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+        user_id="f" * 32,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id="guid-jdoe",
+        password_generated=False,
     )
     await service.bind_federated_subject(
         "f" * 32, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"
@@ -7773,20 +7866,28 @@ async def test_create_user_form_states_the_initial_password_window(engine: Engin
         await _cookie_login(c, "boss")
         r = await c.get("/ui/users/new")
         assert r.status_code == 200
-        assert "must change it at first sign-in" in r.text
+        assert "sets up an authenticator app, then chooses a password" in r.text
         assert "stops working" not in r.text
 
 
 async def test_the_page_after_create_states_the_initial_password_deadline(engine: Engine) -> None:
-    # (a) The create POST lands on the user's page, which states the instant off the stored stamp.
+    # (a) The create POST answers with the credential page, which states the instant off the
+    # stored stamp, and so does the user's own page.
     service = await _expiring_service(engine)
     async with _boss_client(engine, service) as c:
-        r = await _post_pairs(
-            c, "/ui/users", [("username", "hana"), ("password", PW), ("email", "hana@x.org")]
-        )
-        assert r.status_code == 303
+        r = await _post_pairs(c, "/ui/users", [("username", "hana"), ("email", "hana@x.org")])
+        assert r.status_code == 200
         hana = await _uid(service, "hana")
-        page = await c.get(r.headers["location"])
+        assert _console_stamp(await _stored_deadline(engine, hana)) in r.text
+        assert "stops working at" in r.text
+        # ADR 0197 Amendment A: the engine generated hana's credential. Give her the test's password
+        # so the holder arms below can sign in with a known one, keeping the deadline stamp.
+        row = await service.store.get_user(hana)
+        assert row is not None and row.password_generated
+        await engine.store.set_password_hash(
+            hana, password_hash=await asyncio.to_thread(hash_password, PW)
+        )
+        page = await c.get(f"/ui/users/{hana}")
         assert _console_stamp(await _stored_deadline(engine, hana)) in page.text
         assert "stops working at" in page.text
 
@@ -7795,8 +7896,8 @@ async def test_the_page_after_create_states_the_initial_password_deadline(engine
         page = await c.get(f"/ui/users/{hana}")
         assert _console_stamp(await _stored_deadline(engine, hana)) in page.text
         async with _client(engine, service) as holder:
-            ok = await holder.post("/ui/login", data={"username": "hana", "password": PW})
-            assert ok.headers["location"] == "/ui/account/password"  # before it: works
+            await holder.post("/ui/login", data={"username": "hana", "password": PW})
+            assert "mf_session" in holder.cookies  # before it: works
         await _move_deadline_to(engine, hana, time.time() - 1)
         page = await c.get(f"/ui/users/{hana}")
         assert _console_stamp(await _stored_deadline(engine, hana)) in page.text
@@ -7813,8 +7914,14 @@ async def test_the_page_after_create_states_the_initial_password_deadline(engine
 async def test_forced_change_page_states_the_deadline_the_gate_refuses_at(engine: Engine) -> None:
     # (d) The one surface the holder always reaches, with no address or mail relay needed.
     service = await _expiring_service(engine)
-    ivan = await service.create_local_user(
-        username="ivan", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    ivan = await create_local_user_chosen(
+        service,
+        username="ivan",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     await _move_deadline_to(engine, ivan, time.time() + 30)
     expected = _console_stamp(await _stored_deadline(engine, ivan))

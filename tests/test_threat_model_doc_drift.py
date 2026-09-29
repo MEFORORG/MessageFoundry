@@ -805,7 +805,7 @@ def _checks() -> list[tuple[str, object, object]]:
     from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.parsing import _builtin_hl7, peek
     from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
-    from messagefoundry.pipeline import sandbox, wiring_runner
+    from messagefoundry.pipeline import ingress_guards, sandbox, wiring_runner
     from messagefoundry.store import content_search
     from messagefoundry.transports import bounded_read, database, dicom, http_listener, mllp
     from messagefoundry.transports import file as file_transport
@@ -824,7 +824,7 @@ def _checks() -> list[tuple[str, object, object]]:
             wiring_runner._STRICT_VALIDATE_TIMEOUT_SECONDS,
             5.0,
         ),
-        ("15.1.3 non-HL7 ingress ceiling = 16 MiB", wiring_runner._INGRESS_MAX_BYTES, 16 * mib),
+        ("15.1.3 non-HL7 ingress ceiling = 16 MiB", ingress_guards.INGRESS_MAX_BYTES, 16 * mib),
         ("15.1.3 X12 interchange cap = 16 MiB", DEFAULT_MAX_INTERCHANGE_BYTES, 16 * mib),
         ("15.1.3 DICOM object cap = 128 MiB", dicom.DEFAULT_MAX_OBJECT_BYTES, 128 * mib),
         # BACKLOG #1961: the SCP clamps to min(max_object_bytes, this ceiling), so the 128 MiB default

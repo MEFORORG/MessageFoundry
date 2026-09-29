@@ -536,6 +536,18 @@ async def test_reset_stale_inflight_recovers(store) -> None:
     assert (await store.outbox_for(item.message_id))[0]["status"] == OutboxStatus.PENDING.value
 
 
+async def test_inflight_by_lane_reports_claim_time(store) -> None:
+    # BACKLOG #1611 part B, SQLite parity: in-flight rows only, aged from the claim, not the enqueue.
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {}
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "q")], now=150.0)
+    await store.claim_next_fifo("OB1", now=500.0)
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB1": (1, 500.0)}
+    assert await store.inflight_by_lane(stage=Stage.INGRESS.value) == {}
+    await store.reset_stale_inflight(now=600.0)
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {}
+
+
 async def test_replay_requeues(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
@@ -717,6 +729,7 @@ async def test_auth_users_roles_sessions(store) -> None:
         email="a@example.org",
         password_hash="hash",
         now=1000.0,
+        password_generated=False,
     )
     assert await store.count_users() == 1
     user = await store.get_user_by_username("alice")
@@ -961,6 +974,7 @@ async def test_directory_id_comparison_follows_this_servers_collation(store) -> 
         auth_provider="ad",
         directory_object_id=CASE_GUID,
         now=1_000.0,
+        password_generated=False,
     )
     # Unconditional, on every collation: the id as stored resolves to its own row. This is the half
     # the recycle defence rests on, and it is also the control that makes the miss-or-match below a
@@ -1001,7 +1015,13 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
             await cur.close()
         return None if row[0] is None else int(row[0])
 
-    await store.create_user(user_id="scope-src", username="scope-src", auth_provider="ad", now=1.0)
+    await store.create_user(
+        user_id="scope-src",
+        username="scope-src",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+    )
     await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
     got = await store.get_user("scope-src")
     assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
@@ -1038,7 +1058,9 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     paired with the write that does go through."""
     from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
 
-    await store.create_user(user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0)
+    await store.create_user(
+        user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0, password_generated=False
+    )
     cas = store.set_user_channel_scope_if_source
     assert (await store.get_user("cas-src")).channel_scope_source is None
     assert (
@@ -1079,7 +1101,11 @@ async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(st
     scope = json.dumps(sorted(f"IB_LONG_SCOPE_{n:04d}" for n in range(300)))
     assert len(scope) > 4000  # positive control: really past the NVARCHAR(n) limit
     await store.create_user(
-        user_id="long-scope", username="long-scope", auth_provider="ad", now=1.0
+        user_id="long-scope",
+        username="long-scope",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
     )
     await store.set_user_channel_scope("long-scope", scope, source=SCOPE_SOURCE_AD)
     assert (await store.get_user("long-scope")).channel_scope == scope  # stored whole
@@ -1139,6 +1165,7 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
         auth_provider="ad",
         directory_object_id=BOUND_GUID,
         now=1.0,
+        password_generated=False,
     )
     found = await store.get_user_by_directory_object_id(BOUND_GUID)
     assert found is not None and found.id == "dir-upgrade"
@@ -1168,6 +1195,7 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
         email=None,
         password_hash="h",
         now=1.0,
+        password_generated=False,
     )
     await store.create_session(
         token_hash="s1", user_id="u2", expires_at=9_999.0, client="10.1.1.1", now=1.0
@@ -1206,6 +1234,7 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
         email=None,
         password_hash="h0",
         now=1_000.0,
+        password_generated=False,
     )
     # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
     seeded = await store.get_user("u3")
@@ -1216,7 +1245,9 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
 
     # must_change_password False = a credential the holder chose, so this call records the claim. This
     # is the arity that carries the EXTRA positional argument in the middle of the list.
-    await store.set_password("u3", password_hash="h1", must_change_password=False, now=2_000.0)
+    await store.set_password(
+        "u3", password_hash="h1", must_change_password=False, now=2_000.0, password_generated=False
+    )
     claimed = await store.get_user("u3")
     assert claimed is not None
     assert claimed.password_claimed_at == 2_000.0
@@ -1228,7 +1259,9 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
 
     # Second rotation: COALESCE makes the claim write-once, so the stamp must NOT move. The other two
     # timestamps moving to 3000.0 is what makes that a real assertion — it proves this UPDATE ran.
-    await store.set_password("u3", password_hash="h2", must_change_password=False, now=3_000.0)
+    await store.set_password(
+        "u3", password_hash="h2", must_change_password=False, now=3_000.0, password_generated=False
+    )
     rotated = await store.get_user("u3")
     assert rotated is not None
     assert rotated.password_claimed_at == 2_000.0
@@ -1237,7 +1270,9 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
     # must_change_password True (an admin reset) takes the OTHER arity — an empty claim term and an
     # empty claim_args tuple, so the column is absent from the SET list and the statement can neither
     # stamp nor clear it. Both arities are hand-bound; neither was executed on this leg before this test.
-    await store.set_password("u3", password_hash="h3", must_change_password=True, now=4_000.0)
+    await store.set_password(
+        "u3", password_hash="h3", must_change_password=True, now=4_000.0, password_generated=False
+    )
     reset = await store.get_user("u3")
     assert reset is not None
     assert reset.password_claimed_at == 2_000.0  # an admin reset leaves the claim alone
@@ -1698,7 +1733,9 @@ async def test_a_v032_preset_table_is_migrated_ss(store) -> None:
         return row is not None and row["n"] is not None
 
     for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
-        await store.create_user(user_id=uid, username=uname, auth_provider="local", now=1.0)
+        await store.create_user(
+            user_id=uid, username=uname, auth_provider="local", now=1.0, password_generated=False
+        )
     try:
         for pid, owner, name, now in (
             ("pa", "alice", "ACME ADT", None),
@@ -5363,6 +5400,35 @@ async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(s
                 await store._execute(
                     "DELETE FROM cipher_meta WHERE key_id = ?", (c.invocation_key_id,)
                 )
+
+
+async def test_list_audit_exclusion_runs_in_sql_before_limit_mssql(store) -> None:
+    """BACKLOG #1131: the users:manage-only exclusion on the real backend. A whole-action hide, an
+    exact (action, detail) hide, a NULL-detail row of the same action that must survive, and a
+    LIMIT that counts only the rows left."""
+    from messagefoundry.store.audit_exclusion import AuditExclusion
+
+    ex = AuditExclusion(
+        actions=frozenset({"auth.account_locked"}),
+        rows=frozenset({("auth.mfa_failed", '{"reason": "locked"}')}),
+    )
+    who = "x1131-mssql"
+    for action, detail in (
+        ("auth.mfa_failed", None),
+        ("auth.mfa_failed", '{"reason": "expired"}'),
+        ("auth.account_locked", '{"provider": "local"}'),
+        ("auth.mfa_failed", '{"reason": "locked"}'),
+        ("auth.login_failed", '{"reason": "locked"}'),
+    ):
+        await store.record_audit(action, actor=who, detail=detail)
+    rows = await store.list_audit(actor=who, exclude=ex, limit=10)
+    assert [(r["action"], r["detail"]) for r in rows] == [
+        ("auth.login_failed", '{"reason": "locked"}'),
+        ("auth.mfa_failed", '{"reason": "expired"}'),
+        ("auth.mfa_failed", None),
+    ]
+    assert len(await store.list_audit(actor=who, exclude=ex, limit=2)) == 2
+    assert len(await store.list_audit(actor=who, limit=10)) == 5
 
 
 # --- BACKLOG #2097: can a pooled session carry SET NOCOUNT ON? --------------------------------------

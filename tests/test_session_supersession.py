@@ -30,6 +30,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 
@@ -66,7 +67,8 @@ async def _service(store: MessageStore, **over: object) -> AuthService:
     service = AuthService(store, AuthSettings(**settings), ldap=_FakeLdap())  # type: ignore[arg-type]
     await service.initialize()
     for name in ("op", "other"):
-        user_id = await service.create_local_user(
+        user_id = await create_local_user_chosen(
+            service,
             username=name,
             password=PW,
             display_name=None,
@@ -77,7 +79,10 @@ async def _service(store: MessageStore, **over: object) -> AuthService:
         user = await store.get_user(user_id)
         assert user is not None and user.password_hash is not None
         await store.set_password(
-            user_id, password_hash=user.password_hash, must_change_password=False
+            user_id,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
     return service
 
@@ -300,7 +305,11 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     # subject nobody bound, which is what makes it fail since the claimed name no longer selects.
     jdoe_id = uuid4().hex
     await store.create_user(
-        user_id=jdoe_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+        user_id=jdoe_id,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id="guid-jdoe",
+        password_generated=False,
     )
     await service.bind_federated_subject(
         jdoe_id, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"

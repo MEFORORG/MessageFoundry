@@ -36,6 +36,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink, _subject
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
+from tests._admin_account import create_local_user_chosen
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _client_with_sink, _hold_replay
 from tests.test_approval_requester_recheck import _Sink as _RecheckSink
@@ -146,6 +147,7 @@ async def test_a_password_changed_after_the_request_is_flagged(engine: Engine) -
         checker,
         password_hash=hash_password("another-strong-passphrase"),
         must_change_password=False,
+        password_generated=False,
     )
 
     await _release(gate, approval_id, checker)
@@ -253,7 +255,7 @@ async def _create(c: httpx.AsyncClient, headers: dict[str, str], name: str, role
     r = await c.post(
         "/users",
         headers=headers,
-        json={"username": name, "password": PW, "roles": [role.value], "email": f"{name}@x.org"},
+        json={"username": name, "roles": [role.value], "email": f"{name}@x.org"},
     )
     assert r.status_code == 201, r.text
     return str(r.json()["id"])
@@ -293,7 +295,12 @@ async def test_an_administrator_create_that_loses_the_username_race_pages_nobody
     async def racing(**kwargs: Any) -> None:
         # A rival takes the name between the route's check and this insert.
         monkeypatch.setattr(engine.store, "create_user", original)
-        await original(user_id="a" * 32, username=kwargs["username"], auth_provider="local")
+        await original(
+            user_id="a" * 32,
+            username=kwargs["username"],
+            auth_provider="local",
+            password_generated=False,
+        )
         await original(**kwargs)
 
     async with _app_client(engine, service, sink) as c:
@@ -304,7 +311,6 @@ async def test_an_administrator_create_that_loses_the_username_race_pages_nobody
             headers=headers,
             json={
                 "username": "contested",
-                "password": PW,
                 "roles": [Role.ADMINISTRATOR.value],
                 "email": "contested@x.org",
             },
@@ -342,7 +348,8 @@ async def test_account_created_notice_goes_to_the_new_accounts_address(engine: E
         security_notifier=notifier,
     )
     await service.initialize()
-    await service.create_local_user(
+    await create_local_user_chosen(
+        service,
         username="newbie",
         password=PW,
         display_name=None,

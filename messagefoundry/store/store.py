@@ -93,6 +93,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -1549,6 +1550,15 @@ class UserRecord:
     second_step_failed_attempts: int = 0
     second_step_locked_until: float | None = None
     second_step_lock_cycles: int = 0
+    # WHETHER THE CREDENTIAL IN FORCE IS ENGINE-GENERATED (ADR 0197 Amendment A, BACKLOG #1131). Set
+    # by every writer of a generated credential (account creation, an administrator's password reset,
+    # the factor reset) and cleared by every writer of a holder-chosen one. While it is set, wrong
+    # passwords arm no SIGN-IN lock (:func:`lockout_arms`): a 192-bit credential cannot be guessed,
+    # so a lock on it bounds nothing and hands anyone who knows the username a way to shut the owner
+    # out before they have signed in once. An explicit column rather than a reading of
+    # ``must_change_password``, for ADR 0164's reason: record a lifecycle fact, never infer it from
+    # mutable credential state. The login-time rehash (``set_password_hash``) never writes it.
+    password_generated: bool = False
 
     def sign_in_locked(self, now: float) -> bool:
         """Whether the SIGN-IN lock is live at ``now``."""
@@ -1606,6 +1616,9 @@ class UserRecord:
             second_step_failed_attempts=int(d["second_step_failed_attempts"]),
             second_step_locked_until=_opt_float(d["second_step_locked_until"]),
             second_step_lock_cycles=int(d["second_step_lock_cycles"]),
+            # A ``.get()``: a missing key decodes as "chosen", which keeps the account LOCKABLE --
+            # the closed direction for guessing.
+            password_generated=bool(d.get("password_generated", 0)),
         )
 
 
@@ -3761,6 +3774,26 @@ def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     return f" password_claimed_at=COALESCE(password_claimed_at, {placeholder}),"
 
 
+def check_password_generated(*, password_generated: bool, password_hash: str | None) -> None:
+    """Refuse a row that claims an engine-generated credential and carries none (ADR 0197
+    Amendment A). Shared by the three backends' ``create_user`` so the rule is stated once: a
+    generated flag on a hashless row would mark an account unlockable for a credential that does
+    not exist, and the census would then never name it."""
+    if password_generated and password_hash is None:
+        raise ValueError("password_generated needs a password_hash: there is no credential to flag")
+
+
+#: The WHERE term a conditional rotation adds (ADR 0197 Amendment A, N-B2 part 4). The rotation's
+#: own UPDATE carries the factor check, so an ``admin_reset_mfa`` that clears TOTP between the
+#: service's read and this write makes the write match no row, and the caller refuses. Backend
+#: truth literals differ, so each backend passes its own.
+def rotation_factor_term(true_literal: str) -> str:
+    # ``totp_secret IS NOT NULL`` too: an enrolment confirm that raced an administrator's factor
+    # reset can leave ``totp_enabled`` set over a NULL secret, and TOTP with no secret is no way
+    # past the lock.
+    return f" AND totp_enabled={true_literal} AND totp_secret IS NOT NULL"
+
+
 #: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
 #: ``failed_attempts`` / ``locked_until`` / ``lock_cycles`` triple: wrong passwords from a caller who
 #: has proved nothing, and the re-proof failures a session holder makes. ``"second_step"`` is the
@@ -3836,6 +3869,21 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
     return counter == "second_step" or totp_enabled
 
 
+def lockout_arms(counter: LockoutCounter, *, password_generated: bool) -> bool:
+    """Whether a failure on ``counter`` may SET that counter's lock (ADR 0197 Amendment A, N-B2 part 3).
+
+    Everything arms except the SIGN-IN counter while the credential in force is engine-generated.
+    A lock exists to bound guesses, and on a 192-bit credential it bounds nothing: the odds of a
+    guess landing are near 1 in 10^44 even at a million guesses a second for a year. What the lock
+    would still do there is let anyone who knows the username shut the owner out before their first
+    sign-in, which is the malicious lockout ASVS 6.1.1 asks about. The attempt is still counted and
+    audited. The second-step counter arms as before: whoever feeds it has already proved a factor.
+
+    Read by every backend inside its atomic increment, from ``password_generated`` on the row it
+    locked, so the decision and the count come from one read."""
+    return counter != "sign_in" or not password_generated
+
+
 @dataclass(frozen=True)
 class LockoutState:
     """What one failed credential attempt writes to one counter's three columns, plus whether that
@@ -3866,6 +3914,7 @@ def next_lockout_state(
     lockout_seconds: float,
     max_lockout_seconds: float,
     escalate: bool,
+    lockable: bool,
 ) -> LockoutState:
     """The per-account lockout policy for ONE failed credential attempt on ONE counter -- shared by
     all three backends so the rule is stated once. The same function serves the sign-in and the
@@ -3899,7 +3948,12 @@ def next_lockout_state(
 
     The exponent is capped before it is computed, so a huge stored count cannot overflow, and
     ``lockout_seconds = 0`` still means "the lock expires at once": zero times any power of two is
-    zero. A ceiling below the base never SHORTENS a lock: the base length is the floor."""
+    zero. A ceiling below the base never SHORTENS a lock: the base length is the floor.
+
+    **``lockable`` False counts the attempt and never sets the lock** (ADR 0197 Amendment A):
+    :func:`lockout_arms` passes it for the sign-in counter while the credential in force is
+    engine-generated. The count keeps climbing past ``threshold`` so the failures stay visible on
+    the lock-state surface, and the cycle count does not move, because no lock was set."""
     already_locked = locked_until is not None and now < locked_until
     if already_locked:
         return LockoutState(
@@ -3910,7 +3964,7 @@ def next_lockout_state(
         )
     lapsed = locked_until is not None
     attempts = (0 if lapsed else failed_attempts) + 1
-    if attempts < threshold:
+    if attempts < threshold or not lockable:
         return LockoutState(
             attempts=attempts, locked_until=None, cycles=lock_cycles, just_locked=False
         )
@@ -4386,7 +4440,8 @@ CREATE TABLE IF NOT EXISTS users (
     lock_cycles          INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: how many times the sign-in lock was set since the last full authentication
     second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: failures from a caller who already proved one factor
     second_step_locked_until REAL,             -- ADR 0197: the second-step lock expiry; NULL = not locked
-    second_step_lock_cycles INTEGER NOT NULL DEFAULT 0  -- ADR 0197: how many times the second-step lock was set. NO COMMA in this comment
+    second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: how many times the second-step lock was set
+    password_generated   INTEGER NOT NULL DEFAULT 0  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -6012,6 +6067,10 @@ class MessageStore:
             ("second_step_failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("second_step_locked_until", "REAL"),
             ("second_step_lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
+            # ADR 0197 Amendment A (BACKLOG #1131). 0 on an existing row reads "the holder chose
+            # this credential", which keeps the account LOCKABLE -- the closed direction. The
+            # startup census names any such account that has no way past the lock.
+            ("password_generated", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -8861,6 +8920,17 @@ class MessageStore:
 
         await self._run_grouped(_body)
 
+    @staticmethod
+    def _lane_col(stage: str) -> str:
+        """The lane column for a stage (code-controlled literal): ``channel_id`` for
+        ingress/routed/response, ``destination_name`` for outbound. The server backends' helper of
+        the same name."""
+        return (
+            "channel_id"
+            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
+            else "destination_name"
+        )
+
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
     ) -> tuple[int, float | None]:
@@ -8869,11 +8939,7 @@ class MessageStore:
         Lane key is stage-aware (mirrors :meth:`claim_next_fifo`): outbound lanes key on
         ``destination_name``; ingress and routed lanes on ``channel_id`` (their ``destination_name``
         is NULL)."""
-        lane_col = (
-            "channel_id"
-            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
-            else "destination_name"
-        )
+        lane_col = self._lane_col(stage)
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM queue"
@@ -8884,6 +8950,23 @@ class MessageStore:
         count = int(row["n"]) if row is not None else 0
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
+
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol).
+
+        The ``+`` on the GROUP BY term is load-bearing. Without it the planner, which has no
+        statistics here, picks the FIFO index that also covers the grouping and seeks on ``stage``
+        alone, walking every row at the stage. With it the ``(stage, status)`` pair seeks
+        ``ix_queue_ready``, as :meth:`reset_stale_inflight` does, and reads only the in-flight rows."""
+        lane_col = self._lane_col(stage)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT {lane_col} AS lane, COUNT(*) AS n, MIN(updated_at) AS oldest FROM queue"
+                f" WHERE stage=? AND status=? GROUP BY +{lane_col}",
+                (stage, OutboxStatus.INFLIGHT.value),
+            )
+            rows = await cur.fetchall()
+        return {str(r["lane"]): (int(r["n"]), float(r["oldest"])) for r in rows}
 
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
@@ -10568,6 +10651,7 @@ class MessageStore:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> list[aiosqlite.Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
 
@@ -10588,6 +10672,13 @@ class MessageStore:
         if until is not None:
             clauses.append("ts <= ?")
             params.append(until)
+        if exclude is not None:
+
+            def bind(value: str) -> str:
+                params.append(value)
+                return "?"
+
+            clauses.extend(exclude.clauses(bind))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         async with self._read() as db:
@@ -10943,19 +11034,22 @@ class MessageStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        password_generated: bool,
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
         audit: AuditAppend | None = None,
     ) -> None:
+        check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
                 " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-                " must_change_password, failed_attempts, locked_until, directory_object_id)"
-                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)",
+                " must_change_password, failed_attempts, locked_until, directory_object_id,"
+                " password_generated)"
+                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?,?)",
                 (
                     user_id,
                     username,
@@ -10969,6 +11063,7 @@ class MessageStore:
                     now if password_hash is not None else None,
                     1 if must_change_password else 0,
                     directory_object_id,
+                    1 if password_generated else 0,
                 ),
             )
             if audit is not None:
@@ -11067,20 +11162,34 @@ class MessageStore:
         user_id: str,
         *,
         password_hash: str,
+        password_generated: bool,
         must_change_password: bool = True,
+        require_totp: bool = False,
         now: float | None = None,
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
         claim_set = password_claim_set(must_change_password, "?")
         claim_args: tuple[float, ...] = () if must_change_password else (now,)
+        condition = rotation_factor_term("1") if require_totp else ""
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
+            cur = await self._db.execute(
                 "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
                 f"{claim_set}"
-                f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=? WHERE id=?",
-                (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
+                f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=?, updated_at=?"
+                f" WHERE id=?{condition}",
+                (
+                    password_hash,
+                    now,
+                    1 if must_change_password else 0,
+                    *claim_args,
+                    1 if password_generated else 0,
+                    now,
+                    user_id,
+                ),
             )
+            written = cur.rowcount > 0
             await self._commit()
+        return written
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -11189,9 +11298,13 @@ class MessageStore:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
+            # ``last_totp_step`` too (ADR 0197 Amendment A): the high-water mark belonged to the secret
+            # being removed, and a new secret has no history. Kept, it would refuse the first code of
+            # the next secret inside the same 30 seconds -- which the earlier holder of a row being
+            # repaired by ``provision-admin`` could use to block the repair.
             await self._db.execute(
                 "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-                " totp_recovery_codes=NULL, updated_at=? WHERE id=?",
+                " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
                 (now, user_id),
             )
             await self._commit()
@@ -11429,8 +11542,8 @@ class MessageStore:
         attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
-                " FROM users WHERE id=?",
+                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
+                " password_generated FROM users WHERE id=?",
                 (user_id,),
             )
             row = await cur.fetchone()
@@ -11447,6 +11560,7 @@ class MessageStore:
                 escalate=lockout_escalates(
                     counter, auth_provider=str(row[3]), totp_enabled=bool(row[4])
                 ),
+                lockable=lockout_arms(counter, password_generated=bool(row[5])),
             )
             await self._db.execute(
                 f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?, updated_at=?"

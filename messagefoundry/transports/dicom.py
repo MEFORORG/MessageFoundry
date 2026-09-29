@@ -130,7 +130,7 @@ DEFAULT_MAX_OBJECT_BYTES = 128 * 1024 * 1024
 #: ``ERROR`` and commits no ingress row, so an SCP that accepted one would answer Success for an object
 #: the engine never processes. The SCP's effective cap is therefore ``min(max_object_bytes, this)``,
 #: and an uncapped SCP (``0``/``None``) is capped here. The value mirrors
-#: ``messagefoundry.pipeline.wiring_runner._INGRESS_MAX_BYTES``; it is read from ``parsing.peek`` rather
+#: ``messagefoundry.pipeline.ingress_guards.INGRESS_MAX_BYTES``; it is read from ``parsing.peek`` rather
 #: than imported from the pipeline because transports never import pipeline, and a test pins the two
 #: equal.
 _ENGINE_INGRESS_CEILING_BYTES = DEFAULT_MAX_MESSAGE_BYTES

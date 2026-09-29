@@ -16,7 +16,8 @@ import io
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -46,6 +47,7 @@ from messagefoundry.api.auth_models import (
     MfaConfirmRequest,
     MfaConfirmResponse,
     MfaEnrollResponse,
+    MfaResetResponse,
     MfaStatusResponse,
     MfaVerifyRequest,
     NotifyEmailRequest,
@@ -60,6 +62,7 @@ from messagefoundry.api.auth_models import (
     SessionInfo,
     SessionList,
     SimpleMessage,
+    UserCreatedResponse,
     UserCreateRequest,
     UserLockState,
     UserPermissions,
@@ -94,9 +97,11 @@ from messagefoundry.auth import (
     Permission,
     Role,
 )
+from messagefoundry.auth.audit_visibility import audit_exclusion_for
 from messagefoundry.auth.ldap import LdapError
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
+    ENROL_AUTHENTICATOR_FIRST,
     STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
@@ -112,6 +117,7 @@ from messagefoundry.auth.service import (
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
+    FactorEnrolmentRequired,
     FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
@@ -126,6 +132,13 @@ from messagefoundry.store.store import SessionRecord, UserRecord
 _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
+
+#: What ``/auth/mfa-verify`` and ``/me/reauth`` say when ``Elevation.directory_unconfirmed`` is set
+#: (BACKLOG #2023, #2027): the directory could not vouch for the account, so the proof was never
+#: checked. It names no directory internals; the precise reason is on the audit row.
+_DIRECTORY_UNCONFIRMED_DETAIL = (
+    "the directory could not confirm this account; try again later, or ask an administrator"
+)
 
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
@@ -489,6 +502,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD passwords are managed in AD, not by this engine"
             )
+        # ADR 0197 Amendment A, AC-A3: asked BEFORE the current password, so a holder who must enrol
+        # first is not asked for a password the service would then refuse. The service refuses on
+        # its own as well (below); this is the courtesy, that is the control.
+        if await service.must_enrol_before_rotating(identity):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, ENROL_AUTHENTICATOR_FIRST)
         # Counts toward the account lockout and against this session's re-proof budget; the failure
         # that exhausts the budget revokes the session (BACKLOG #1138).
         check = await service.verify_current_password(
@@ -514,9 +532,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "new password must differ from the current password"
             )
-        violations = await service.change_password(
-            identity, body.new_password, client=_client(request)
-        )
+        try:
+            violations = await service.change_password(
+                identity, body.new_password, client=_client(request)
+            )
+        except FactorEnrolmentRequired as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, ENROL_AUTHENTICATOR_FIRST) from exc
         if violations:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
@@ -560,7 +581,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         period. Rate-limited like the password change; a failure is a 403 that counts against this
         session's re-proof budget, and toward the account lockout unless the sign-in lock is already
         live. The failure that exhausts the budget ends the session with a 401 (BACKLOG #1138).
-        Neither account lock refuses it.
+        Neither account lock refuses it. A directory re-bind the directory could not judge is also a
+        403, saying so, and charges nothing (BACKLOG #2027).
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -595,6 +617,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     "this session was signed in through the identity provider; re-authenticate"
                     " there through the web console at /ui/reauth, not with a password",
                 )
+            if elevation.directory_unconfirmed:
+                # BACKLOG #2027: the directory could not judge the password, so "failed" would
+                # call a password wrong that was never checked. Same words as /auth/mfa-verify's
+                # directory refusal; the precise reason is on the audit row only.
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         return ElevatedResponse(detail="re-verified", token=elevation.token)
 
@@ -628,11 +655,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
                 # 403 rather than the 401 that would send the client back to sign-in.
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "the directory could not confirm this account; try again later, or ask an"
-                    " administrator",
-                )
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"
@@ -939,25 +962,26 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             permissions=sorted(p.value for p in resolved.permissions),
         )
 
-    @app.post("/users", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/users",
+        response_model=UserCreatedResponse,
+        status_code=status.HTTP_201_CREATED,
+        # ADR 0197 Amendment A (AC-A2): the reply carries the generated credential (ASVS 14.2.2).
+        dependencies=[Depends(_no_store_reply)],
+    )
     async def create_user(
         body: UserCreateRequest,
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
-    ) -> UserSummary:
+    ) -> UserCreatedResponse:
         await _validate_roles(service, body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, USERNAME_TAKEN)
-        violations = service.password_violations(body.password, username=body.username)
-        if violations:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
-            )
         try:
-            user_id = await service.create_local_user(
+            # ADR 0197 Amendment A, AC-A2: the engine generates the credential; nobody chooses it.
+            created = await service.create_local_user(
                 username=body.username,
-                password=body.password,
                 display_name=body.display_name,
                 email=body.email,
                 roles=body.roles,
@@ -970,21 +994,28 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # BACKLOG #2018: raised before any write, as on PATCH /users/{id}. The message names the
             # rule and never echoes the value.
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except TemporaryPasswordUnavailable as exc:
+            # ADR 0197 Amendment A: the credential is generated now, so the reset's 503 applies here
+            # too -- a site setting no generated candidate clears, raised before any write.
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
         if Role.ADMINISTRATOR.value in body.roles:
             _alert_administrator_granted(
                 app, f"user:{body.username}", via="account_created", granted_by=identity.username
             )
-        user = await service.store.get_user(user_id)
+        user = await service.store.get_user(created.user_id)
         assert user is not None
         # BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
         # expires, so the one response the issuing administrator reads states when. Read back off the
         # stored stamp create_local_user just wrote, never a fresh clock.
-        return _user_summary(
+        summary = _user_summary(
             user,
             sorted(body.roles),
             credential_expires_at=pending_credential_deadline(service, user),
             lock_state_at=time.time(),
+        )
+        return UserCreatedResponse(
+            **summary.model_dump(), temp_password=created.credential.password
         )
 
     @app.post("/users/directory", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
@@ -1184,6 +1215,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             raise HTTPException(code, detail) from exc
         except TemporaryPasswordUnavailable as exc:
+            # Raised before any write, so the account is untouched; the grant the gate spent is
+            # given back, so a request that changed nothing costs no proof (ADR 0197 Amendment A,
+            # Manager decision 2026-09-29; the refund's docstring says what it can and cannot buy).
+            # It restores only the grant THIS request's gate spent, on either plane: the console
+            # calls this handler in-process, in the same request, after its own gate.
+            service.refund_action_step_up(STEP_UP_ACTION_ADMIN_RESET_PASSWORD)
             # A site setting, not a bad request, so a 503 like this module's other server-side
             # refusals. It is mapped rather than left to the generic handler, which says only
             # "internal error": the message names the setting to fix, and the web console renders
@@ -1191,7 +1228,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
-    @app.post("/users/{user_id}/reset-mfa", response_model=SimpleMessage)
+    @app.post(
+        "/users/{user_id}/reset-mfa",
+        response_model=MfaResetResponse,
+        # ADR 0197 Amendment A (AC-A4): a local account's reply carries the generated credential.
+        dependencies=[Depends(_no_store_reply)],
+    )
     async def reset_user_mfa(
         user_id: ResourceId,
         service: AuthService = Depends(_service),
@@ -1200,7 +1242,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_MFA, Permission.USERS_MANAGE)
         ),
-    ) -> SimpleMessage:
+    ) -> MfaResetResponse:
         """Admin MFA reset (lost authenticator + no recovery codes): clear the user's TOTP enrollment
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
         # SELF-EXCLUSION, AND IT BELONGS HERE RATHER THAN IN THE SERVICE (BACKLOG #1022).
@@ -1230,7 +1272,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 "use the self-service MFA settings for your own account",
             )
         try:
-            await service.admin_reset_mfa(user_id, actor=identity.username)
+            issued = await service.admin_reset_mfa(user_id, actor=identity.username)
+        except TemporaryPasswordUnavailable as exc:
+            # As on the password reset: raised before any write, so the factors and sessions are
+            # untouched, and the spent grant is given back.
+            service.refund_action_step_up(STEP_UP_ACTION_ADMIN_RESET_MFA)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except ValueError as exc:
             detail = str(exc)
             code = (
@@ -1239,7 +1286,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 else status.HTTP_400_BAD_REQUEST
             )
             raise HTTPException(code, detail) from exc
-        return SimpleMessage(detail="MFA reset")
+        # ADR 0197 Amendment A, AC-A4: a local account's reset also issued a generated credential,
+        # returned ONCE here for the administrator to convey out-of-band.
+        return MfaResetResponse(
+            detail="MFA reset",
+            temp_password=None if issued is None else issued.password,
+            expires_at=None if issued is None else issued.expires_at,
+        )
 
     # --- federated identity binding (BACKLOG #1143 / #295, ADR 0184) ---------------------------------
     #
@@ -1438,8 +1491,36 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     # --- audit ---------------------------------------------------------------
 
+    async def _read_audit(
+        service: AuthService,
+        identity: Identity,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> Sequence[Any]:
+        """THE ONE READ OF THE TRAIL FOR A CALLER. ``GET /audit``, the console's ``/ui/audit`` and
+        ``GET /audit/export`` all come through here, so none of them can skip the owner-ruled lock-row
+        exclusion of 2026-09-28 (BACKLOG #1131; :mod:`messagefoundry.auth.audit_visibility`). It is
+        keyed on ``identity``, which is why this takes one: a caller without ``users:manage`` gets
+        the trail minus the lock rows, applied in SQL before ``limit`` so a page is never short.
+
+        Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
+        across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
+        return await service.store.list_audit(
+            limit=limit,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=audit_exclusion_for(identity),
+        )
+
     async def _audit_list(
         service: AuthService,
+        identity: Identity,
         *,
         limit: int = 100,
         actor: str | None = None,
@@ -1447,11 +1528,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         since: float | None = None,
         until: float | None = None,
     ) -> AuditList:
-        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper. Every value
-        # is passed as a keyword to the store, which binds it as a SQL parameter across all three backends
-        # (BACKLOG #170) — filters are never string-interpolated into the query.
-        rows = await service.store.list_audit(
-            limit=limit, actor=actor, action=action, since=since, until=until
+        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
+        rows = await _read_audit(
+            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
         )
         return AuditList(
             entries=[
@@ -1470,7 +1549,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.get("/audit", response_model=AuditList)
     async def list_audit(
         service: AuthService = Depends(_service),
-        _: Identity = Depends(require(Permission.AUDIT_READ)),
+        identity: Identity = Depends(require(Permission.AUDIT_READ)),
         limit: int = Query(100, ge=1, le=1000),
         actor: ActorFilter | None = Query(None),
         action: ActionFilter | None = Query(None),
@@ -1482,7 +1561,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ),
     ) -> AuditList:
         return await _audit_list(
-            service, limit=limit, actor=actor, action=action, since=since, until=until
+            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
         )
 
     async def _audit_ui_list(*, service: AuthService, _: Identity, limit: int = 100) -> AuditList:
@@ -1494,8 +1573,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # there is no second page to reach and no total to compare against. Filter + CSV export are the
         # JSON GET /audit surface, and the export is what produces a complete record. AUDIT_READ is
         # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
-        # dependency of its own.
-        return await _audit_list(service, limit=limit)
+        # dependency of its own. The identity it is handed is the page's caller, and it decides which
+        # rows that caller may read (BACKLOG #1131).
+        return await _audit_list(service, _, limit=limit)
 
     @app.get("/audit/export")
     async def export_audit(
@@ -1521,9 +1601,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         channel_id, client, detail`` — the exact columns ``GET /audit`` already returns; the audit writers store
         only filter shapes / counts / ids in ``detail`` (never a raw message body), so no PHI leaves on
         this path. The export itself is recorded as an ``audit.export`` event (who, which filter, how
-        many rows)."""
-        rows = await service.store.list_audit(
-            limit=limit, actor=actor, action=action, since=since, until=until
+        many rows).
+
+        A caller without ``users:manage`` exports the trail without the lock rows, exactly as it reads
+        it (BACKLOG #1131), and ``count`` is the number of rows it received."""
+        rows = await _read_audit(
+            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
         )
         # Record the export as its own audit event BEFORE streaming — the detail is metadata only (the
         # applied filter + row count), never a message body.

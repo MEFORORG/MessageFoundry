@@ -145,10 +145,13 @@ def test_request_model_base_is_what_carries_the_rule() -> None:
 
 
 def test_unknown_key_is_refused_at_the_model_with_a_control() -> None:
-    good = {"username": "op", "password": "pw", "roles": ["viewer"], "email": "op@example.org"}
+    # No password in the control: the engine generates it (ADR 0197 Amendment A, N-B2 part 1), so
+    # a caller still sending one is refused like any other unknown key.
+    good = {"username": "op", "roles": ["viewer"], "email": "op@example.org"}
     assert UserCreateRequest.model_validate(good).username == "op"
-    with pytest.raises(ValidationError, match="extra_forbidden|Extra inputs"):
-        UserCreateRequest.model_validate({**good, "rolez": ["admin"]})
+    for extra in ({"rolez": ["admin"]}, {"password": "pw"}):
+        with pytest.raises(ValidationError, match="extra_forbidden|Extra inputs"):
+            UserCreateRequest.model_validate({**good, **extra})
 
 
 def test_the_channel_scope_typo_no_longer_widens_the_grant() -> None:
