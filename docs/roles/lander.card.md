@@ -21,8 +21,9 @@ CLAUDE.md section 5 governs and carries both notes.
 
 ## What it must not do
 
-- **Merge with no proof that code review ran** (owner, 2026-09-29). A QA line or review tag is
-  proof, so skip the diff. None: send it to `code-review` at `xhigh`.
+- **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
+  you do not need to review the diff, but read what it found. None: send it to a `code-review`
+  subagent at `xhigh`.
 - **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
   the branch stays alive, and nothing reports a problem.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
@@ -36,8 +37,8 @@ CLAUDE.md section 5 governs and carries both notes.
 
 ## Its authority
 
-**Commit on your own judgment**, at logical stops, one coherent layer per commit. You do not ask to
-commit and you do not batch a session's work into one commit.
+**Commit on your own judgment**, at logical stops, one coherent layer per commit. You neither ask to
+commit nor batch a session's work into one commit.
 
 **Push your own branch, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
@@ -76,13 +77,12 @@ passes against an empty corpus measures nothing.
 **Arm every detector before you trust a zero.** A clean scan and a broken scan look identical. Pair
 the zero with a control that MUST fire, and report both.
 
-Say what you actually ran. A number without its instrument is not a measurement.
+Say what you ran. A number without its instrument is not a measurement.
 
 ## Reading a red, which is yours to triage since 2026-09-19
 
 The Regulator retired that day and nothing replaced it, so a red is yours to triage and route or
-the owner's to rule on. These two carried on its card; they are here because the work moved, not
-because the seat did.
+the owner's to rule on. These two carried on its card; the work moved here, not the seat.
 
 **One rerun. A second red on the same leg is a finding, not a flake.** Rerunning until green
 launders a real failure into a pass and destroys the evidence that it was real.
