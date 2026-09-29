@@ -110,6 +110,12 @@ def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None)
     count. Styled ``muted`` rather than ``pager``: ``pager`` is the class :func:`_pager` uses for a
     line that CARRIES links, and borrowing it here would dress a dead end up as navigation.
 
+    WITHOUT ``total``, THE CAP IS STATED ONLY WHEN THE WINDOW IS FULL. A query that asked for
+    ``limit`` rows and got fewer reached the end of what it could read, so nothing is off the page.
+    Saying "capped" there would call a complete listing a partial one, which is the same misreading
+    turned around (BACKLOG #1743 residual (c)). A full window cannot tell "exactly ``limit``" from
+    "more than ``limit``", so it keeps the cap sentence.
+
     ``total`` is for a capped listing whose model ALSO carries the whole count, so the line can say
     "N of M" the way :func:`_pager` does without offering links the route cannot serve (BACKLOG
     #1821, the alerts page). The cap is stated only when the window is FULL and rows are missing:
@@ -121,7 +127,9 @@ def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None)
     It lives beside :func:`_pager` rather than in each page that calls it, because the next capped
     listing needs the same sentence and copying it is how the two pagers diverged."""
     if total is None:
-        return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
+        if shown >= limit:
+            return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
+        return el("p", f"{shown} {noun} shown.", class_="muted")
     total = max(total, shown)
     if total > shown and shown >= limit:
         return el(

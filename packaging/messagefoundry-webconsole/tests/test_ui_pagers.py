@@ -16,6 +16,7 @@ asserts they stay off both pages -- a pager that lost its filters would surface 
 
 from __future__ import annotations
 
+import re
 from urllib.parse import parse_qsl
 
 import httpx
@@ -323,6 +324,37 @@ async def test_the_capped_pages_say_they_are_windows_rather_than_the_record(engi
 
     The bound itself is in the assertion: "capped at the newest 200" is the sentence that separates
     a log holding 200 entries from a log holding 200,000, and a bare count states neither.
+
+    SEEDED PAST THE WINDOW. The cap sentence now shows only on a FULL window (residual (c)), and a
+    fresh engine holds a handful of sign-in rows, so an unseeded run would measure the short branch
+    and call it the capped one. 205 rows per page puts both pages over the 200 window. The seeded
+    actions are ``auth.*`` rows by ``op``, which is the only shape the security-event page reads.
+    """
+    service = await _service(engine)
+    for i in range(205):
+        await service.store.record_audit("auth.test_seed", actor="op", detail=f'{{"n": {i}}}')
+    async with _client(engine, service) as c:
+        await _login(c)
+        for path, noun in (("/ui/audit", "entry(s)"), ("/ui/security-events", "event(s)")):
+            r = await c.get(path)
+            assert r.status_code == 200, r.text
+            assert "only the most recent" in r.text, path
+            assert f"200 {noun} shown, capped at the newest 200." in r.text, path
+
+
+async def test_a_short_listing_is_not_called_capped_and_the_export_is_not_the_record(
+    engine: Engine,
+) -> None:
+    """BACKLOG #1743 residual (c): the two claims the capped pages must not make.
+
+    A listing shorter than its window reached the end of what its query could read, so "capped at
+    the newest 200" there calls a complete listing partial. Both pages filter in SQL before the
+    limit (``_read_audit`` and ``security_events_for_user``), so a short page is never a trimmed
+    one. The unseeded engine is the arm: it holds a few sign-in rows, far under 200.
+
+    The audit page also used to call the export "the complete record". ``GET /audit/export`` has
+    its own ``limit`` and no offset, so it is newest-first and capped as well. The replacement
+    sentence names the time filter that reaches older rows.
     """
     service = await _service(engine)
     async with _client(engine, service) as c:
@@ -330,5 +362,27 @@ async def test_the_capped_pages_say_they_are_windows_rather_than_the_record(engi
         for path, noun in (("/ui/audit", "entry(s)"), ("/ui/security-events", "event(s)")):
             r = await c.get(path)
             assert r.status_code == 200, r.text
-            assert "only the most recent" in r.text, path
-            assert f"{noun} shown, capped at the newest 200." in r.text, path
+            assert "capped at the newest" not in r.text, path
+            note = re.search(rf"(\d+) {re.escape(noun)} shown\.", r.text)
+            assert note is not None, path
+            assert int(note.group(1)) < 200, path
+        audit = await c.get("/ui/audit")
+        assert "complete record" not in audit.text
+        assert "since and until" in audit.text
+
+
+@pytest.mark.parametrize(
+    ("shown", "capped"),
+    [(0, False), (199, False), (200, True), (201, True)],
+)
+def test_window_note_states_the_cap_only_on_a_full_window(shown: int, capped: bool) -> None:
+    """The helper's ``total is None`` branch, at both sides of the window edge.
+
+    199 is the last short window and 200 the first full one, so a comparison off by one in either
+    direction fails one of the two middle cases. 201 covers a caller whose rows overran its limit.
+    """
+    from messagefoundry_webconsole.pages import _common
+
+    text = str(_common._window_note(shown, 200, "entry(s)"))
+    assert ("capped at the newest 200." in text) is capped
+    assert f"{shown} entry(s) shown" in text

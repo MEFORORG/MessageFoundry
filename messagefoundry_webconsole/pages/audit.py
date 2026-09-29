@@ -35,8 +35,13 @@ def audit_log(data: AuditList, *, limit: int) -> Markup:
     NEWEST FIRST, AND ONLY THE NEWEST — the route asks for ``limit`` rows and this page renders what
     came back (BACKLOG #1743). It cannot say window-of-total the way the messages and dead-letter
     pagers do, because ``AuditList`` carries no total and the store's ``list_audit`` has neither an
-    offset nor a count; giving this page a pager is a separate row that has to add both. Until then
-    the honest surface for a full trail is the ``audit:export`` CSV, which streams its own filter.
+    offset nor a count; giving this page a pager is a separate row that has to add both.
+
+    THE EXPORT IS NOT THE COMPLETE RECORD EITHER, so the page does not call it one (BACKLOG #1743
+    residual (c)). ``GET /audit/export`` reads the same newest-first query with its own ``limit``
+    and no offset, so it too returns only the newest rows up to that limit. What it adds is a time
+    filter: ``since`` and ``until`` walk it back to older entries. The page states that and no
+    number, because the export's bounds live on the route and a copy here would drift.
 
     ``limit`` is passed in rather than re-declared here so the sentence states the bound the query
     actually used — a second copy of the number would be wrong the day either one moved."""
@@ -51,7 +56,9 @@ def audit_log(data: AuditList, *, limit: int) -> Markup:
             "p",
             "The tamper-evident audit trail (metadata only — no PHI). Most recent first. This page "
             "shows only the most recent entries, so an older event missing here is off this page, "
-            "not out of the log; the audit export is the complete record.",
+            "not out of the log. The audit export (GET /audit/export, which needs audit:export) is "
+            "capped too: it returns the newest entries up to its own row limit. To reach older "
+            "entries, filter the export by time with since and until.",
             class_="muted",
         ),
         rows_table(["When", "Actor", "Action", "Channel", "Detail"], rows),
