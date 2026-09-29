@@ -7,6 +7,13 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Six connection factories take a per-connection `tls_ca_file`.** `Rest()`, `FHIR()`, `Soap()`,
+  `DICOMweb()`, `FhirLookup()` and `Ftp()` (FTPS only) now accept a PEM path or an `env()`
+  reference. When it is set, that hop trusts only the CAs in that file, never the OS store. The
+  connectors already read the key; before this, no factory could write it. Unset, every hop is
+  built exactly as before, so defaults are unchanged. `docs/CONNECTIONS.md`, "Pinning a private CA
+  per connection", covers what is refused at load, the token hop, CRLs and failures.
+  (`BACKLOG #1180`, ASVS 12.3.4)
 - **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
   and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
   at the same width, with no salt, so two captured sides still match. The default rules apply it
