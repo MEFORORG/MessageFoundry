@@ -3852,7 +3852,9 @@ class PostgresStore:
         stamping ``owner`` + row lease per claimed row exactly as today (N-active-ready), with the
         H1 ``epoch_guard`` appended verbatim. ``MATERIALIZED`` pins evaluation; all CTEs share one
         snapshot; ``FOR UPDATE`` re-checks post-lock via EvalPlanQual; non-kept rows were
-        locked-but-never-UPDATEd — their locks release at commit with ``attempts`` untouched.
+        locked-but-never-UPDATEd — their locks release at commit with ``attempts`` untouched. The
+        final SELECT also returns the lanes whose due head the probe skipped, which become
+        ``ClaimedHeads.head_skipped`` (BACKLOG #1270): same statement, no extra round-trip.
 
         The H2 skip-and-complete runs per claimed outbound row in the SAME txn (code-identical to
         :meth:`claim_next_fifo`'s); decode runs AFTER the commit — an undecryptable row is
@@ -3909,11 +3911,25 @@ class PostgresStore:
             " SELECT 1 FROM heads p"
             " WHERE p.lane = h.lane AND p.rn <= h.rn"
             " AND NOT EXISTS (SELECT 1 FROM locked k WHERE k.id = p.id))"
-            ")"
+            "), claimed AS ("
             " UPDATE queue q"  # STEP 5: claim exactly the kept prefixes
             " SET status=$6, attempts=attempts+1, updated_at=$4, owner=$7, lease_expires_at=$8"
             f" FROM keep WHERE q.id = keep.id{epoch_guard}"
             " RETURNING q.*"
+            ")"
+            # BACKLOG #1270, the head-of-line skip: the lanes whose DUE head (rn=1; `heads` already
+            # dropped a not-due head) the SKIP LOCKED probe passed over. `keep` emptied them, and
+            # without this they are indistinguishable from lanes with no work. They ride as ONE
+            # marker row, present only when a skip happened: NULL queue columns (so a NULL id) and
+            # every skipped lane in the `head_skipped` array. SQL Server differs on purpose: one
+            # marker row per lane, the lane in its lane column. The UPDATE UNION ALL costs one
+            # extra buffering of the claimed rows (a data-modifying CTE is materialized). The probe
+            # carries no epoch guard here (the UPDATE does), so a fenced node can still report a
+            # skip it truly observed.
+            " SELECT c.*, NULL::text[] AS head_skipped FROM claimed c"
+            " UNION ALL SELECT (NULL::queue).*, array_agg(h.lane) FROM heads h"
+            " WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM locked k WHERE k.id = h.id)"
+            " HAVING count(*) > 0"
         )
         rearm: set[str] = set()
         kept_rows: list[Any] = []
@@ -3933,6 +3949,12 @@ class PostgresStore:
                 OutboxStatus.INFLIGHT.value,
             )
             rows = await conn.fetch(claim_sql, *claim_args)
+            # BACKLOG #1270: split off the head-skip marker row (NULL id) before anything reads a
+            # queue column.
+            head_skipped = frozenset(
+                lane for r in rows if r["id"] is None for lane in r["head_skipped"]
+            )
+            rows = [r for r in rows if r["id"] is not None]
             # Iterate in CANONICAL message_id order: H2 may take the per-message finalize
             # advisory lock for SEVERAL messages in this one txn, and a monotone subsequence
             # of the sorted order can never form a lock cycle with _lock_finalize_batch
@@ -3986,7 +4008,7 @@ class PostgresStore:
                 by_lane[lane] = items
             else:
                 rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))
+        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
 
     async def list_fifo_lanes(
         self,

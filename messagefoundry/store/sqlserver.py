@@ -1041,18 +1041,26 @@ class _SyncHandoffPool:
 # ONE source of truth for the claim's table variables + STEPs 1-5 + the sole result-set SELECT:
 # the ad-hoc batch (claim_fifo_heads) renders it with a `(VALUES ...)` lane source and the spliced
 # epoch guard; the two ADR 0114 stored-procedure bodies render it with the OPENJSON lane source and
-# the fixed-nullable epoch guard. Rendering both copies from the same fragments makes in-repo drift
-# structurally impossible (the ADR's dual-copy rule); the AC-1 golden-text tests pin the batch's
+# the fixed-nullable epoch guard. Rendering both copies from the same fragments keeps the batch and
+# the CALLED procs from drifting apart (the ADR's dual-copy rule). It does NOT version a proc: an edit
+# here changes every called proc body under its existing name, so a result-set change needs a new
+# proc version (see _RETAINED_CLAIM_PROCS). The AC-1 golden-text tests pin the batch's
 # absolute bytes, and the DDL lint tests pin the proc render. Every STEP's comments live here with
 # the text they document.
 
 
-def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> str:
+def _fifo_heads_steps(
+    *, lane_col: str, lane_source: str, epoch_guard: str, head_skip_markers: bool = True
+) -> str:
     """The shared claim body (ADR 0066 §3.2 probe-then-claim, #285 inversion). ``lane_col`` is the
     code-controlled lane-column literal (``channel_id``/``destination_name``); ``lane_source`` the
     parenthesized derived table producing one ``lane`` column (``(VALUES (?),...)`` on the batch,
     the OPENJSON decode on the proc); ``epoch_guard`` the H1 fence predicate applied to the STEP-3
-    probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc)."""
+    probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc).
+
+    ``head_skip_markers=False`` renders the body WITHOUT the BACKLOG #1270 marker arm, byte for byte
+    the body the ``_v1`` procs shipped. Only :func:`_claim_proc_body` passes it, and only for a name
+    in ``_RETAINED_CLAIM_PROCS``; everything this build CALLS has the arm."""
     return (
         " DECLARE @heads TABLE (lane NVARCHAR(256) NOT NULL,"
         " id NVARCHAR(64) NOT NULL PRIMARY KEY,"
@@ -1120,18 +1128,50 @@ def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> s
         # claimed rows AND the kept==claimed defensive signal (a NULL claimed twin) in one fetch.
         " SELECT kp.id AS keep_id, c.id, c.message_id, c.channel_id, c.destination_name,"
         " c.handler_name, c.payload, c.attempts, c.seq, c.created_at"
-        " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id;"
+        " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id"
+        + (_head_skip_marker_arm(lane_col, epoch_guard) if head_skip_markers else ";")
+    )
+
+
+def _head_skip_marker_arm(lane_col: str, epoch_guard: str) -> str:
+    """The sole result set's BACKLOG #1270 arm, appended by :func:`_fifo_heads_steps`."""
+    return (
+        # BACKLOG #1270, the head-of-line skip: one marker row per lane whose DUE head (rn=1; STEP 2
+        # already removed a not-due head) the STEP-3 probe could not lock. STEP 4 emptied that lane,
+        # and without this row the EMPTY is indistinguishable from "no work". A NULL keep_id is the
+        # marker, with the lane in its own lane column. The epoch guard keeps a fenced ex-leader,
+        # whose probe declines every row, from reporting its whole chunk as skipped.
+        " UNION ALL SELECT NULL, NULL, NULL,"
+        + (" h.lane, NULL," if lane_col == "channel_id" else " NULL, h.lane,")
+        + " NULL, NULL, NULL, NULL, NULL FROM @heads h"
+        " WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM @locked k WHERE k.id = h.id)"
+        f"{epoch_guard};"
     )
 
 
 # The two lane-family, name-versioned claim procedures (ADR 0114 §4). TWO procs, not one: the lane
 # column is a code-controlled literal baked into the statement text (_lane_col), and a column name
 # cannot be a T-SQL parameter; dynamic SQL is rejected (per-call parse + an injection surface at
-# the reliability core). Name-versioned (_v1): engine sharding runs N builds against ONE unified
-# store (ADR 0037/0063), so a rolling upgrade briefly runs two builds — each calls exactly the body
-# it shipped; a retired version is dropped only by an explicit later _SCHEMA statement.
-_CLAIM_PROC_CID = "mefor_claim_fifo_heads_cid_v1"  # channel_id lanes: ingress / routed / response
-_CLAIM_PROC_DST = "mefor_claim_fifo_heads_dst_v1"  # destination_name lanes: outbound
+# the reliability core). Name-versioned: engine sharding runs N builds against ONE unified store
+# (ADR 0037/0063), so a rolling upgrade briefly runs two builds — each calls exactly the body it
+# shipped; a retired version is dropped only by an explicit later _SCHEMA statement.
+#
+# _v2 (BACKLOG #1270) adds the head-skip marker arm to the sole result set. It is a NEW name, not an
+# edit to _v1, because an older build still calling _v1 cannot parse a marker row: it would read the
+# NULL id as kept != claimed and roll the whole claim back. These two are the procs this build CALLS.
+# A split-principal site needs its EXECUTE and VIEW DEFINITION grants on each new version as well.
+_CLAIM_PROC_CID = "mefor_claim_fifo_heads_cid_v2"  # channel_id lanes: ingress / routed / response
+_CLAIM_PROC_DST = "mefor_claim_fifo_heads_dst_v2"  # destination_name lanes: outbound
+# RETAINED, never called by this build: still deployed, byte for byte as they shipped, for any older
+# build sharing the store mid-upgrade. Dropped only by a later explicit _SCHEMA statement, one release
+# after nothing ships them (ADR 0114). Do NOT drop them in the change that adds _v2. The body a name
+# renders is keyed on the NAME (see _claim_proc_body), so no call site can render a version wrongly.
+_RETAINED_CLAIM_PROCS: Final[tuple[tuple[str, str], ...]] = (
+    ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
+    ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
+)
+#: Retained names whose body predates the BACKLOG #1270 marker arm.
+_PRE_MARKER_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM_PROCS)
 
 # The OPENJSON lane decode (compat >= 130): one NVARCHAR(MAX) JSON-array parameter, so no delimiter
 # contract is ever imposed on connection names (lane names are data, never concatenated into SQL).
@@ -1238,6 +1278,8 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
             lane_col=lane_col,
             lane_source=_CLAIM_PROC_LANE_SOURCE,
             epoch_guard=_CLAIM_PROC_EPOCH_GUARD,
+            # Keyed on the name: a retained pre-#1270 version renders the bytes it shipped with.
+            head_skip_markers=proc_name not in _PRE_MARKER_CLAIM_PROCS,
         )
         + " IF @fold_reset = 1 SET LOCK_TIMEOUT -1;"
     )
@@ -1254,8 +1296,9 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
     CREATE OR ALTER (2016 SP1 = ProductVersion 13.0.4001; EngineEdition >= 5 is the Azure family,
     which always has it). The dynamic EXEC defers the body's parse (OPENJSON below compat 130 never
     parses) and satisfies CREATE OR ALTER's batch-initial rule. Riding ``_SCHEMA`` means the
-    ADR 0064 content hash versions the body for free: ANY edit changes ``_schema_hash()`` and
-    forces one guarded, applock-serialized re-apply — a forgotten version bump is impossible."""
+    ADR 0064 content hash re-applies the body on ANY edit: one guarded, applock-serialized re-apply
+    under the SAME name. That is a redeploy, not a version: a result-set change still needs a new
+    proc name, or an older build sharing the store calls a body it cannot parse (BACKLOG #1270)."""
     body = _claim_proc_body(proc_name, lane_col).replace("'", "''")
     version_check = (
         "CAST(SERVERPROPERTY('EngineEdition') AS INT) >= 5"
@@ -2047,13 +2090,15 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('secret_rotation_meta','U') IS NULL CREATE TABLE secret_rotation_meta (
         secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(255) NOT NULL,
         tracked_since NVARCHAR(32) NOT NULL, last_rotated NVARCHAR(32) NOT NULL)""",
-    # ADR 0114 sub-lever A: the two lane-family claim procedures, deployed as guarded,
+    # ADR 0114 sub-lever A: the lane-family claim procedures, deployed as guarded,
     # self-no-op'ing CREATE OR ALTER statements (see _claim_proc_ddl — a guard miss leaves the proc
     # uncreated, NEVER a failed open; the flag-ON startup gate then degrades loudly to the batch).
     # Their bodies render from the same _fifo_heads_steps fragments as the ad-hoc batch, so the
-    # content hash re-applies them on any body edit (no version constant to forget).
+    # content hash re-applies them on any body edit (under the same name: see _claim_proc_ddl).
     # #305: the cluster coordinator's tables (see CLUSTER_SCHEMA), before the procs that name one.
     *CLUSTER_SCHEMA,
+    # The retained _v1 pair first, byte for byte as it shipped, then the _v2 pair this build calls.
+    *(_claim_proc_ddl(proc_name, lane_col) for proc_name, lane_col in _RETAINED_CLAIM_PROCS),
     _claim_proc_ddl(_CLAIM_PROC_CID, "channel_id"),
     _claim_proc_ddl(_CLAIM_PROC_DST, "destination_name"),
 ]
@@ -2542,7 +2587,7 @@ class SqlServerStore:
                             " deploys — an out-of-band edit, a hand deploy (a head spelling this"
                             " code cannot emit, e.g. create proc or a differing case), a renamed"
                             " proc (sp_rename does not rewrite the stored definition), or a build"
-                            " whose body was changed without bumping the _v1 proc name. The"
+                            " whose body was changed without bumping the proc version. The"
                             " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
                             f"{proc_name}')) against this build's own definition to see the drift"
                         )
@@ -8176,7 +8221,9 @@ class SqlServerStore:
         The batch's single result set pairs every kept id with its claimed row (``SET NOCOUNT ON``
         keeps it the sole result set; ``fetchall`` drains it under the EF-6 ``_cursor``
         close-before-release discipline). A kept row with no claimed twin is the kept!=claimed
-        signal, on which the whole call rolls back and returns EMPTY-all (fail closed). The probe's
+        signal, on which the whole call rolls back and returns EMPTY-all (fail closed). The same
+        result set carries one marker row (NULL ``keep_id``) per lane whose due head the probe could
+        not lock, which becomes ``ClaimedHeads.head_skipped`` (BACKLOG #1270). The probe's
         U-locks (held through the UPDATE) rule out a queue-row cause, but the epoch guard re-reads
         the UNLOCKED ``leader_lease`` row on a fresh RCSI statement snapshot, so a leader-epoch
         bump committed between the probe and the UPDATE legitimately zeroes the claim while the
@@ -8354,9 +8401,11 @@ class SqlServerStore:
                 *lane_list,
                 *epoch_args,  # STEP 3 probe guard
                 *epoch_args,  # STEP 5 UPDATE guard
+                *epoch_args,  # head-skip marker guard (BACKLOG #1270)
             )
         rearm: set[str] = set()
         claimed_rows: list[dict[str, Any]] = []
+        head_skipped: frozenset[str] = frozenset()
         # ADR 0114 AC-4: True ONLY once the folded reset is DURABLY committed (commit#1 returned).
         # The flag has exactly ONE assignment site besides this init — immediately after commit#1's
         # await, with no intervening await — so no suspension point can land between commit success
@@ -8402,6 +8451,11 @@ class SqlServerStore:
                 # before the connection returns to the pool (no-MARS).
                 rows = await cur.fetchall()
                 decoded = [dict(zip(columns, r)) for r in rows]  # noqa: B905
+                # BACKLOG #1270: split the head-skip marker rows (NULL keep_id, see the sole
+                # result set in _fifo_heads_steps) from the kept rows before anything reads them.
+                # Set BEFORE any fail-closed return below, so a skip already read is still reported.
+                head_skipped = frozenset(d[lane_col] for d in decoded if d["keep_id"] is None)
+                decoded = [d for d in decoded if d["keep_id"] is not None]
                 if use_proc:
                     # The proc CALL pinned 9 parameter descriptors on this POOLED cursor
                     # (descriptor[0] = SQL_DOUBLE for @now FLOAT); those pins are PERSISTENT cursor
@@ -8430,7 +8484,7 @@ class SqlServerStore:
                         len(decoded),
                         sum(1 for d in decoded if d["id"] is not None),
                     )
-                    return ClaimedHeads(by_lane={}, rearm=frozenset())
+                    return ClaimedHeads(by_lane={}, rearm=frozenset(), head_skipped=head_skipped)
                 # Iterate in CANONICAL message_id order: H2 may take the per-message finalize
                 # applock for SEVERAL messages in this one txn, and a monotone subsequence of the
                 # sorted order can never form a lock cycle with _lock_finalize_batch callers (or a
@@ -8546,6 +8600,9 @@ class SqlServerStore:
                         lock_timeout=ClaimLockTimeout(
                             phase=abort_phase, lanes_in_claim=len(lane_list)
                         ),
+                        # Empty on a HEAD-phase abort (it precedes the fetch); on a FINALIZE-phase
+                        # abort the fetch already ran, so a skip it observed still rides out.
+                        head_skipped=head_skipped,
                     )
                 raise
             finally:
@@ -8643,7 +8700,7 @@ class SqlServerStore:
                 by_lane[lane] = items
             else:
                 rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))
+        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
 
     async def list_fifo_lanes(
         self,

@@ -190,7 +190,9 @@ grants, so you confirm them by hand. They never change the exit code. The full p
 > used on every finalize and at schema init, is a **system** procedure `public` can already execute —
 > no grant.) Their *creation* rides the schema batch, so step 4 deploys them. It is
 > permission-guarded and self-no-ops when the provisioning principal cannot take it. If you enable the
-> flag, grant the runtime login `EXECUTE` and `VIEW DEFINITION` on both procs. Without
+> flag, grant the runtime login `EXECUTE` and `VIEW DEFINITION` on both procs the engine calls
+> (`dbo.mefor_claim_fifo_heads_cid_v2` and `_dst_v2`). Each new proc version needs its own grant; a
+> grant made on `_v1` does not cover `_v2`. Without
 > `VIEW DEFINITION` the startup gate cannot read the bodies it verifies and degrades to the shipped
 > batch.
 
