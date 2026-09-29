@@ -606,6 +606,66 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     )
 
 
+@pytest.mark.parametrize(
+    ("present", "expect_ok", "expect_verifies"),
+    [("fresh", True, 0), ("replayed", False, 10), ("wrong", False, 10)],
+)
+async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    present: str,
+    expect_ok: bool,
+    expect_verifies: int,
+) -> None:
+    """A replayed TOTP and a wrong code must both fail after the same argon2 work (#1167, ADR 0170).
+
+    A replayed code matches the secret, so the branch used to return the store's refusal with no
+    argon2 work at all, while a wrong code fell through to the full recovery-code walk. Both return
+    False, and the wall clock told them apart. The ``wrong`` row is the control: it already paid
+    the walk, so it pins the count the ``replayed`` row must match. A success stays fast (zero), and
+    is not claimed to be equal.
+    """
+    import messagefoundry.auth.service as svc
+    from messagefoundry.auth import totp
+
+    calls = {"n": 0}
+    real = svc.verify_password
+
+    def counting(stored_hash: str, password: str) -> bool:
+        calls["n"] += 1
+        return real(stored_hash, password)
+
+    monkeypatch.setattr(svc, "verify_password", counting)
+
+    slots = 10
+    service = await _service(engine, AuthSettings(require_mfa=False, mfa_recovery_code_count=slots))
+    await _add(service, "totpeq", Role.VIEWER)
+    user = await engine.store.get_user_by_username("totpeq")
+    assert user is not None
+    secret = totp.generate_secret()
+    await engine.store.set_totp_secret(user.id, secret=secret)
+    # Fewer live codes than slots, so a walk that forgot the padding would show as 2, not 10.
+    await engine.store.enable_totp(
+        user.id, recovery_code_hashes=[hash_password(c) for c in ("AAAA-1111", "BBBB-2222")]
+    )
+    # A fixed arrival moment, so the step cannot roll over between minting and verifying the code.
+    arrived = 1_900_000_000.0
+    code = totp.totp(secret, now=arrived)
+    if present == "replayed":
+        assert await service._verify_second_factor(user, code, arrived=arrived) is True
+    elif present == "wrong":
+        code = f"{(int(code) + 1) % 1_000_000:06d}"
+
+    calls["n"] = 0
+    ok = await service._verify_second_factor(user, code, arrived=arrived)
+
+    assert ok is expect_ok
+    assert calls["n"] == expect_verifies, (
+        f"{present}: {calls['n']} argon2 verifies, expected {expect_verifies}. A replayed code "
+        "making 0 means the TOTP branch still returns before the recovery-code work"
+    )
+
+
 # --- L13: a secret in the config file is warned about ------------------------
 
 

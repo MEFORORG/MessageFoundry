@@ -3,7 +3,8 @@
 
 # ADR 0170 — Constant-work recovery-code verification: pad to the configured slot count rather than short-circuit
 
-- **Status:** Accepted (2026-08-22) — built with the change; see §"Consequences"
+- **Status:** Accepted (2026-08-22) — built with the change; see §"Consequences". Amended
+  2026-09-28: the TOTP replay refusal now pays the walk's work; see §"Amendment".
 - **Date:** 2026-08-22
 - **Related:** [BACKLOG #1167](../BACKLOG.md) (ASVS 11.2.4) · [auth/service.py](../../messagefoundry/auth/service.py) `_verify_second_factor` · [ADR 0077](0077-action-bound-step-up.md) (the neighbouring step-up work) · [CLAUDE.md](../../CLAUDE.md) §9 (PHI/security guardrails), §0 (not-deployed beta)
 
@@ -64,7 +65,8 @@ what is equalized. Not equalized, and not claimed to be:
 
 - the store round trip on a match (`consume_recovery_code_hash`) — a success does one more thing
   than a failure, and the response already reveals which happened;
-- the TOTP branch above, which returns before recovery codes are read at all;
+- the TOTP branch on **success**, which returns before recovery codes are read at all (a refused
+  replay no longer does; see §"Amendment");
 - anything about the underlying argon2 implementation, whose constant-timeness is **inherited from
   `argon2-cffi` and has never been measured in this tree** — a gap #1167 names and this does not close.
 
@@ -94,3 +96,40 @@ constant walk ever becomes a real problem.
   diagnostic naming the short-circuit, and the file restores byte-identical by SHA-256.
 - **Severity is conditional per CLAUDE.md §0** — zero deployments, so this is what a first
   deployment would have inherited, not a live exposure.
+
+## Amendment (2026-09-28, BACKLOG #1167): a refused TOTP replay pays the walk's work
+
+**What changed.** The list above excluded the TOTP branch. On its failure path that exclusion was
+the one argon2 work difference left between two refusals. A code that matches the TOTP secret but
+whose step the store has already consumed (a replay, or a second use inside one step) returned
+False with no argon2 work. A wrong code returned False after the full recovery-code walk. Both are
+refusals, so timing was the only thing that told them apart.
+
+`_verify_second_factor` now calls `_equalise_refused_totp` before that refusal. It does the same
+store read of the recovery hashes and runs the same `slots = max(mfa_recovery_code_count,
+len(real))` argon2 verifies through `_argon2`, each against `_DUMMY_PASSWORD_HASH` with the result
+discarded. A parametrized test pins the count: 0 for a fresh code, `slots` for a replay, and
+`slots` for a wrong code, which is the control. It was red first: the replay row made 0 verifies.
+
+**Why this adds no amplification ceiling.** The same argument as the Decision. A wrong code already
+costs `slots` verifies, so a replay now costs what a wrong code costs, under the same semaphore and
+the same per-account lockout. Only the refusal path changed.
+
+**What it now covers.** Equal argon2 work across every refused second-factor attempt on this
+method: a wrong code, a wrong recovery code, and a replayed TOTP code.
+
+**What it still does not cover.** Each limb below is stated so this amendment is not read as more
+than it is:
+
+- **A TOTP success stays fast.** It does no argon2 work, so a success and a refusal differ by the
+  whole walk. The response already says which one happened. Running the walk on every success
+  would add it to every normal MFA login, and that trade is the owner's call, not made here.
+- **The replay does one more store round trip than a wrong code**, the `consume_totp_step` write
+  attempt. That is the same line this ADR already draws for `consume_recovery_code_hash`.
+- **The replay verifies only against the dummy hash**, where a wrong code verifies against the live
+  hashes and pads with the dummy. The costs match only while the stored hashes and the dummy share
+  argon2 parameters. A change to `hash_password`'s parameters would leave older codes costing
+  differently, which the padding above already assumes away.
+- **Constant work, not constant time**, as above. No timing measurement has been run.
+- **Nothing outside this method.** The other sites the 11.2.4 cell names are not touched here, and
+  this amendment makes no claim about them or about the cell's verdict. No re-score follows from it.

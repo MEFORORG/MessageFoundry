@@ -6489,8 +6489,8 @@ class AuthService:
         arrived: float | None = None,
     ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
-        match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
-        single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
+        match). TOTP is checked first (fast, no argon2, on success; a refused replay pays the
+        recovery-code walk's work, ADR 0170); recovery codes are argon2id-hashed and single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
 
         ``client`` is the caller's address, carried onto the recovery-code audit row and notice
         (BACKLOG #1139) so the holder can tell their own use from someone else's."""
@@ -6516,7 +6516,15 @@ class AuthService:
                 # tolerated future (fast-clock) code to the CURRENT step (SEC-014), so consuming it
                 # can't advance the high-water mark past now and lock the user out of their own next
                 # legitimate code.
-                return await self._store.consume_totp_step(user.id, matched_step)
+                if await self._store.consume_totp_step(user.id, matched_step):
+                    return True
+                # ASVS 11.2.4 (BACKLOG #1167, ADR 0170 amendment). The step was already consumed:
+                # a replay, or a second use inside the same step. Returning here costs no argon2
+                # work, while a WRONG code falls through to the full recovery-code walk below. Both
+                # answer False, so the wall clock was the only thing telling them apart. Pay the
+                # walk's work before refusing. A success stays fast: it already reveals its outcome.
+                await self._equalise_refused_totp(user.id, code.upper())
+                return False
         normalized = code.upper()  # recovery codes are minted uppercase
         real = list(await self._store.get_recovery_code_hashes(user.id))
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
@@ -6575,6 +6583,19 @@ class AuthService:
             detail={"remaining": remaining},
         )
         return True
+
+    async def _equalise_refused_totp(self, user_id: str, normalized: str) -> None:
+        """Run the recovery-code walk's argon2 work for a TOTP code the store refused as consumed.
+
+        The same store read and the same slot count as :meth:`_verify_second_factor`'s walk, so a
+        refused replay costs what a wrong code costs. Every verify runs against the fixed dummy hash
+        and its result is discarded, so nothing here can authenticate anyone. Constant WORK, not
+        constant time: ADR 0170 draws the same line for the walk itself.
+        """
+        real = await self._store.get_recovery_code_hashes(user_id)
+        slots = max(self._settings.mfa_recovery_code_count, len(real))
+        for _ in range(slots):
+            await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, normalized)
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
