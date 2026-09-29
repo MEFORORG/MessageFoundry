@@ -79,18 +79,29 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 }
 
 
-#: Tasks started by :func:`_shielded`. Held here because a caller that was cancelled no longer holds
-#: one, and the event loop keeps only a weak reference to a running task.
-_SHIELDED: set[asyncio.Task[Any]] = set()
+#: How long :meth:`ApprovalGate.drain` waits for outcome writes still running at shutdown.
+DRAIN_TIMEOUT_SECONDS = 10.0
 
 
-def _log_orphaned_write(task: asyncio.Task[Any], approval_id: str) -> None:
-    """Log a shielded write whose caller was cancelled, since nothing else will read its error."""
+def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
+    """Log a shielded write whose caller was cancelled, since nothing else will read its error.
+
+    Reading the error here also marks it retrieved, so asyncio does not report it again."""
     if task.cancelled():
         log.error("approval %s: a shielded outcome write was cancelled", approval_id)
         return
     error = task.exception()
-    if error is not None:
+    if isinstance(error, ApprovalError):
+        # A refusal the gate raises on purpose, such as a resolve that lost the race to another
+        # operator (409). The row's status already says what won, so it is not an ERROR.
+        log.warning(
+            "approval %s: a shielded outcome write was refused after its caller was cancelled "
+            "(%d): %s",
+            approval_id,
+            error.status,
+            error.detail,
+        )
+    elif error is not None:
         log.error(
             "approval %s: a shielded outcome write failed after its caller was cancelled",
             approval_id,
@@ -98,21 +109,15 @@ def _log_orphaned_write(task: asyncio.Task[Any], approval_id: str) -> None:
         )
 
 
-async def _shielded[T](coro: Coroutine[Any, Any, T], approval_id: str) -> T:
-    """Await ``coro`` so that cancelling the CALLER does not cancel it (BACKLOG #1562).
+async def _outlive_caller[T](task: asyncio.Future[T]) -> T:
+    """Await ``task`` so that cancelling the CALLER does not cancel it.
 
-    A cancellation delivered while this awaits reaches the caller at once, and the write finishes on
-    its own. Once the caller is gone nothing would read the write's error, so it is logged with the
-    approval id. The set holding the task is module-wide and nothing drains it at shutdown; a write
-    still running when the store closes fails and is logged."""
-    task = asyncio.ensure_future(coro)
-    _SHIELDED.add(task)
-    task.add_done_callback(_SHIELDED.discard)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        task.add_done_callback(lambda t: _log_orphaned_write(t, approval_id))
-        raise
+    Not ``asyncio.shield``. When a shield's caller is cancelled and the task later raises, the shield
+    reports the error itself through the loop's exception handler ("exception in shielded future").
+    The gate logs that error too, so one failure was logged twice (BACKLOG #2087). ``asyncio.wait``
+    never cancels what it waits on and reports nothing, so the gate's own log line is the only one."""
+    await asyncio.wait((task,))
+    return task.result()
 
 
 @dataclass(frozen=True)
@@ -161,6 +166,52 @@ class ApprovalGate:
         # release (fail closed) rather than executing on authority it could not check.
         self._resolve_identity = resolve_identity
         self._alert_sink: AlertSink = alert_sink if alert_sink is not None else LoggingAlertSink()
+        # Outcome writes started by _shielded, mapped to their approval id. Held here because a
+        # caller that was cancelled no longer holds one, and the event loop keeps only a weak
+        # reference to a running task. Per gate rather than per module (BACKLOG #2087), so drain()
+        # sees only this gate's writes and no set outlives the loop its tasks ran on.
+        self._inflight: dict[asyncio.Future[Any], str] = {}
+
+    async def _shielded[T](self, coro: Coroutine[Any, Any, T], approval_id: str) -> T:
+        """Await ``coro`` so that cancelling the CALLER does not cancel it (BACKLOG #1562).
+
+        A cancellation delivered while this awaits reaches the caller at once, and the write finishes
+        on its own. Once the caller is gone nothing would read the write's error, so it is logged
+        once, with the approval id. :meth:`drain` waits for a write still running at shutdown."""
+        task = asyncio.ensure_future(coro)
+        self._inflight[task] = approval_id
+        task.add_done_callback(self._forget)
+        try:
+            return await _outlive_caller(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(lambda t: _log_orphaned_write(t, approval_id))
+            raise
+
+    def _forget(self, task: asyncio.Future[Any]) -> None:
+        self._inflight.pop(task, None)
+
+    async def drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> list[str]:
+        """Wait up to ``timeout`` seconds for outcome writes still running (BACKLOG #2087).
+
+        The managed lifespan calls this before ``engine.stop()`` closes the store. A write whose
+        caller was cancelled, such as by a request timeout, then lands instead of meeting a closed
+        store. Returns the approval ids of any writes still running at the deadline, and logs them
+        at ERROR. Nothing is cancelled: a write that outlives the drain meets the closing store, and
+        its own failure is logged."""
+        running = list(self._inflight)
+        if not running:
+            return []
+        _done, still = await asyncio.wait(running, timeout=timeout)
+        stuck = sorted(self._inflight[t] for t in still if t in self._inflight)
+        if stuck:
+            log.error(
+                "approvals: %d outcome write(s) still running after %.1fs at shutdown, so they may "
+                "fail when the store closes; approval ids: %s",
+                len(stuck),
+                timeout,
+                ", ".join(stuck),
+            )
+        return stuck
 
     def register(
         self,
@@ -425,14 +476,14 @@ class ApprovalGate:
             )
         )
         try:
-            claimed = await asyncio.shield(claim)
+            claimed = await _outlive_caller(claim)
         except asyncio.CancelledError:
             # Cancelled while claiming. The UPDATE can still commit, and the row would then sit in
             # 'executing' for an operation that never started. Settle it once the claim lands. The
             # approve waits for that settle before it re-raises, on purpose, like the interrupted
             # record below: the record lands before the caller answers. A second cancel stops the
             # wait, not the settle.
-            await _shielded(
+            await self._shielded(
                 self._settle_cancelled_claim(
                     claim,
                     approval_id,
@@ -455,7 +506,7 @@ class ApprovalGate:
             # (which says the operation did not happen) and never 'approved'. Nothing retries it; a
             # blind re-run of an operation that may already have run is worse than the stuck row.
             # Shielded, so a cancellation re-delivered here cannot cancel the record of the first one.
-            await _shielded(
+            await self._shielded(
                 self._record_interrupted_execution(
                     approval_id,
                     operation=operation,
@@ -477,7 +528,7 @@ class ApprovalGate:
             # compensate, and the original is re-raised below. CancelledError is handled above,
             # because a cancelled approve has an unknown outcome and must not be recorded as a failure.
             # Shielded for the same reason as the interrupted record above.
-            await _shielded(
+            await self._shielded(
                 self._compensate_failed_execution(
                     approval_id,
                     operation=operation,
@@ -495,7 +546,7 @@ class ApprovalGate:
             # skip it. Shielded (BACKLOG #1562): a cancellation that lands while the outcome is being
             # written must not leave the row in 'executing' for an operation that completed. The
             # caller still sees the cancellation; the record completes.
-            await _shielded(
+            await self._shielded(
                 self._record_approved_execution(
                     approval_id,
                     operation=operation,
@@ -514,7 +565,7 @@ class ApprovalGate:
             # Shielded: a cancellation re-delivered here (a request timeout inside a middleware task
             # group) would otherwise cancel the audit write too, on exactly the release it describes.
             if changed:
-                await _shielded(
+                await self._shielded(
                     self._flag_approver_provenance(
                         approval_id,
                         operation=operation,
@@ -547,7 +598,8 @@ class ApprovalGate:
         The operation has run by the time this is called, so NEITHER write raises (BACKLOG #1940's
         reasoning, applied to both). A 500 would tell the approver the release failed, and a new
         request would then run the operation a second time. A failed STATUS write is logged at ERROR
-        with the approval id and the row may be left ``executing``. The audit
+        with the approval id and the row may be left ``executing``. Nothing moves a row out of
+        ``executing`` yet; that waits on #1562's startup-reconciler design. The audit
         row is still attempted. A failed AUDIT write is logged at ERROR with the lost detail; the
         ``approval.release_attempted`` row written before the claim already records the release
         against both identities."""
@@ -995,7 +1047,7 @@ class ApprovalGate:
                 "the audit log could not record this resolution, so the request is still "
                 "interrupted; resolve it again once the audit log accepts writes",
             ) from exc
-        await _shielded(
+        await self._shielded(
             self._record_resolution(
                 approval_id,
                 status=status,
