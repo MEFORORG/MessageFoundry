@@ -1,9 +1,16 @@
 # 0201 -- A messagefoundry-toolkit distribution carries the authoring and development tooling out of the engine wheel
 
-- **Status:** Proposed. No code yet. This ADR designs the build that owner ruling R4 of 2026-09-28
-  asks for. The ruling set the tiers. The layout, the command surface, the gates and the slice order
-  below are this ADR's design choices, not owner rulings. They need the owner's sign-off before any
-  slice starts. The questions acceptance must settle are at the end.
+- **Status:** **Accepted -- 2026-09-29, by an owner ruling given in session to the batch 175
+  Manager through AskUserQuestion.** The owner chose *"Accept as written"*: a separate
+  `messagefoundry-toolkit` command, lockstep versions, and the toolkit uploaded first. Operators type
+  `messagefoundry-toolkit init` instead of `messagefoundry init`, and the production CLI gets no
+  plugin surface. The build slices go ahead in order. In the same sitting the owner answered the PyPI
+  question: *"I'll do it before slice 2"*, recorded at section 1. No code yet.
+  > **Superseded status text, kept as a record.** Until 2026-09-29 this line read: *"Proposed. No
+  > code yet. This ADR designs the build that owner ruling R4 of 2026-09-28 asks for. The ruling set
+  > the tiers. The layout, the command surface, the gates and the slice order below are this ADR's
+  > design choices, not owner rulings. They need the owner's sign-off before any slice starts. The
+  > questions acceptance must settle are at the end."*
 - **Date:** 2026-09-29
 - **Related:** BACKLOG #1192 (ASVS 15.2.3) · owner ruling R4 in vault
   `docs/security/ASVS-OWNER-RULINGS-2026-09-28-BATCH175.md` · engine PR 1775, which added
@@ -228,6 +235,11 @@ before that upload.**
    `messagefoundry-toolkit` on PyPI, for repository `MEFORORG/MessageFoundry` and workflow
    `release.yml`, with the environment blank to match the engine. Do not treat the pending publisher
    as a reservation. The claim this design relies on is the first upload.
+
+   The owner agreed to this step on 2026-09-29, in session, to the batch 175 Manager, answering
+   *"I'll do it before slice 2"*. So the owner sets up the pending publisher before slice 2 merges.
+   The answer is a commitment, not a record that the publisher exists: slice 2 must not merge until
+   it is in place.
 
    A second review raised, from memory and not from Warehouse's code, that PyPI may create the
    project at the first matching token exchange, which could be the engine's own publish step. That
