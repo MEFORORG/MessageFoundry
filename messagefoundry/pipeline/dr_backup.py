@@ -509,6 +509,10 @@ class BackupRunner:
         # writes afterwards behind. The loop's own release covers only the paths the worker never ran.
         staging_leftover: str | None = None
         try:
+            # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine
+            # leaves its decrypted copy there. Each backup sweeps it too, taking only what this
+            # account owns (see `_sweep_abandoned_staging`).
+            await asyncio.to_thread(_sweep_os_temp, work.path)
             snap_path: Path | None = None
             if not config_only:
                 snap_path = work.path / _STORE_MEMBER
@@ -1257,11 +1261,6 @@ def _verify_archive_blocking(
         work = _open_staging(staging_root, _VERIFY_STAGING_PREFIX, secure=secure)
     except (BackupCodecError, OSError, tarfile.TarError) as exc:
         return _verify_failure(exc)
-    if standalone:
-        # After the key precheck, so a verify that was never going to stage pays for no scan, and
-        # before the decrypt, so a dead run's plaintext is gone before this one needs the space. Only
-        # directories owned as this run's own are taken: the OS temp dir can be shared.
-        _sweep_abandoned_staging(staging_root, owned_like=work.path)
 
     # Everything from here writes decrypted plaintext into the staging directory, so its teardown is
     # explicit and not a `TemporaryDirectory`: that `__exit__` raised when one unlink was refused (on
@@ -1270,6 +1269,11 @@ def _verify_archive_blocking(
     # `release` never raises, so whatever the verify concluded is what reaches the caller, and an
     # exception escaping the verify is still the verify's own.
     try:
+        if standalone:
+            # After the key precheck, so a verify that was never going to stage pays for no scan, and
+            # before the decrypt, so a dead run's plaintext is gone before this one needs the space.
+            # Inside this block, so even a fault in the sweep still releases this run's directory.
+            _sweep_abandoned_staging(staging_root, owned_like=work.path)
         try:
             result = _verify_in_staging(
                 work.path,
@@ -1468,10 +1472,11 @@ def _discard_verify_staging(staging: Path) -> str | None:
 # * A STANDALONE verify (`restore-verify`, the DR cold-seed activation) is neither. It stages in a
 #   private `mkdtemp` directory under the OS temp dir: mode 0700 on POSIX, and on Windows the
 #   protected DACL Python 3.13+ writes for that mode (SYSTEM, Administrators, OWNER RIGHTS), with
-#   `_secure_file` on each staged file. Never in the archive's directory, which on a DR box may be
-#   a read-only share with no engine ACL, and never beside `[store].path`, which under the default
-#   relative path is the current directory. Each standalone verify first sweeps that temp dir of the
-#   directories it owns, and only those, since the temp dir can be shared.
+#   `_secure_file` on each staged file. So it does not stage in the archive's directory, which on a
+#   DR box may be a read-only share with no engine ACL. Nor does it stage beside `[store].path`,
+#   the current directory under the default relative path. The exception is when one of those IS
+#   the OS temp dir. Each standalone verify, and each backup, sweeps the temp dir of the
+#   directories this account owns, and only those, since the temp dir can be shared.
 #
 # Every staging directory holds a lock file, locked for the whole run. A crash or SIGKILL releases the
 # lock with the process, and that is the ONLY proof of abandonment the sweep accepts. Age is not proof:
@@ -1687,33 +1692,41 @@ def _staging_root_for(
 
 
 def _standalone_staging_root() -> Path:
-    """The OS temp dir, where a standalone verify stages. Raises ``OSError`` rather than fall back to
-    the current directory.
+    """The OS temp dir, where a standalone verify stages, and which each backup also sweeps.
 
-    ``tempfile.gettempdir`` falls back to the current directory when no temp candidate is writable,
-    and under the default relative ``[store].path`` that is beside the store. That fallback is refused
-    unless an environment variable names the directory, which is an operator's own choice."""
-    root = Path(tempfile.gettempdir()).absolute()
-    cwd = os.path.normcase(Path.cwd().absolute())
-    if os.path.normcase(root) == cwd and not any(
-        value and os.path.normcase(Path(value).absolute()) == cwd
-        for value in (os.environ.get(name) for name in ("TMPDIR", "TEMP", "TMP"))
-    ):
-        raise OSError(
-            f"no writable OS temp directory, so the verify will not stage in the current directory "
-            f"{root}; set TMPDIR (TEMP on Windows) to a directory only this account can read"
-        )
-    return root
+    Whatever ``tempfile.gettempdir`` answers. When no temp candidate is writable Python falls back to
+    the current directory, and this does not second-guess that: telling the fallback apart from a
+    temp dir that is also the current directory needs ``tempfile``'s private candidate list."""
+    return Path(tempfile.gettempdir()).absolute()
+
+
+def _sweep_os_temp(owned_like: Path) -> int:
+    """The backup's sweep of the OS temp dir, for what a killed standalone verify on this account
+    left there. Never raises: a temp dir that cannot be found is a reason to skip, not to fail."""
+    try:
+        root = _standalone_staging_root()
+    except OSError as exc:
+        log.warning("DR staging: no OS temp dir to sweep: %s", safe_exc(exc))
+        return 0
+    return _sweep_abandoned_staging(root, owned_like=owned_like)
 
 
 def _owner_of(path: Path) -> object | None:
-    """Who owns ``path``, without following a link: a uid on POSIX, an owner SID on Windows. ``None``
-    when it cannot be read. Compared only with another ``_owner_of`` answer."""
+    """Who owns ``path``: a uid on POSIX, an owner SID on Windows. ``None`` when it cannot be read,
+    and ``None`` for a link or any other reparse point, whose owner is never reported: Windows would
+    read through it to its target. Compared only with another ``_owner_of`` answer.
+
+    On Windows an elevated process's default owner is Administrators, not its user, so every elevated
+    account on the box, and SYSTEM, can share one owner here."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & reparse:
+        return None
     if sys.platform != "win32":
-        try:
-            return os.lstat(path).st_uid
-        except OSError:
-            return None
+        return st.st_uid
     from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl, _resolve_sid
 
     sddl = _read_dacl_sddl(path, owner=True)
@@ -1731,9 +1744,10 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> i
     never consulted. Returns how many directories were removed.
 
     ``owned_like`` names a directory this run just created. When given, only a directory with the same
-    owner is a candidate, and nothing is swept if that owner cannot be read. A standalone verify
-    passes it because the OS temp dir can be shared: another account could plant a directory there
-    holding a lock file and a marker, and the teardown must never run on a tree it controls."""
+    owner is a candidate, and nothing is swept if that owner cannot be read. A standalone verify and
+    each backup pass it for the OS temp dir, which can be shared: another account could plant a
+    directory there holding a lock file and a marker, and the teardown must never run on a tree it
+    controls."""
     swept = 0
     owner: object | None = None
     if owned_like is not None:
@@ -1759,6 +1773,12 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> i
         except OSError:
             continue
         path = Path(entry.path)
+        if owned_like is not None and path == owned_like:
+            continue  # this run's own directory, held live
+        # No lock file is no proof either way. Checked before the owner, which on Windows costs a
+        # security-descriptor read, so a temp dir full of other programs' leftovers stays cheap.
+        if not os.path.lexists(path / _LOCK_NAME):
+            continue
         if owner is not None and _owner_of(path) != owner:
             continue  # not this account's: another account's run, or a plant
         try:

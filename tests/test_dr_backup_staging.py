@@ -392,12 +392,14 @@ async def test_a_standalone_verify_sweeps_only_its_own_accounts_dead_staging(
         res = await run_restore_verify(
             str(archive), store_settings=StoreSettings(encryption_key=key)
         )
-        assert res.status == "PASS", res.reason
-        assert not dead.exists()
-        assert live.path.is_dir()
-        assert (planted / "archive.tar").read_bytes() == b"synthetic plaintext"
+        live_survived = live.path.is_dir()
     finally:
-        assert live.release() is None
+        leftover = live.release()
+    assert res.status == "PASS", res.reason
+    assert not dead.exists()
+    assert live_survived
+    assert leftover is None
+    assert (planted / "archive.tar").read_bytes() == b"synthetic plaintext"
     assert _everything_under(iso) == [
         planted,
         planted / ".lock",
@@ -406,20 +408,43 @@ async def test_a_standalone_verify_sweeps_only_its_own_accounts_dead_staging(
     ]
 
 
-def test_a_standalone_verify_never_falls_back_to_the_current_directory(
+async def test_a_verify_refused_at_the_key_check_does_not_sweep(tmp_path, monkeypatch) -> None:
+    """The sweep runs after the key precheck: a verify that never stages pays for no scan of the
+    OS temp dir."""
+    archive, _key = await _archive(tmp_path, config_only=False)
+    _isolate_os_temp(tmp_path, monkeypatch)
+    swept: list[Path] = []
+
+    def sweep(root: Path, **_kw: object) -> int:
+        swept.append(root)
+        return 0
+
+    monkeypatch.setattr(dr_backup, "_sweep_abandoned_staging", sweep)
+    res = await run_restore_verify(
+        str(archive), store_settings=StoreSettings(encryption_key=generate_key())
+    )
+    assert res.status == "KEY_MISMATCH", res.reason
+    assert swept == []
+
+
+async def test_a_backup_sweeps_what_a_killed_standalone_verify_left_in_the_os_temp_dir(
     tmp_path, monkeypatch
 ) -> None:
-    """`tempfile` falls back to the current directory when no temp candidate is writable, and under
-    the default relative `[store].path` that is beside the store. The verify refuses it, unless an
-    environment variable names that directory on purpose."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-    for name in ("TMPDIR", "TEMP", "TMP"):
-        monkeypatch.delenv(name, raising=False)
-    with pytest.raises(OSError, match="current directory"):
-        dr_backup._standalone_staging_root()
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    assert dr_backup._standalone_staging_root() == tmp_path.absolute()
+    """A DR cold-seed runs inside the engine. Killed mid-verify, it leaves its decrypted copy in the
+    engine account's OS temp dir, and no later cold-seed may ever run. The engine's next backup sweeps
+    it, by lock and by owner, as it sweeps its own staging."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    dead = _abandoned(iso, dr_backup._VERIFY_STAGING_PREFIX)
+    data_dir = tmp_path / "data"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    try:
+        result = await _runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None
+    assert not dead.exists()
+    assert _everything_under(iso) == []
 
 
 # --- cleanup on every failure path ----------------------------------------------
