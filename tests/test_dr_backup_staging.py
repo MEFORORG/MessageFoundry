@@ -981,3 +981,56 @@ async def test_a_standalone_verify_that_will_not_fit_fails_before_it_decrypts(
     assert res.reason is not None and "not a fault in it" in res.reason
     assert decrypted == []
     assert _everything_under(iso) == []
+
+
+async def test_a_backup_is_checked_again_with_the_snapshots_real_size(
+    tmp_path, monkeypatch
+) -> None:
+    """The first check counts the store file only. The second, once the snapshot exists, asks for the
+    tar and the archive still to come, and a refusal there still releases the staging directory."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    calls = [0]
+
+    def usage(_path: object) -> _Usage:
+        calls[0] += 1
+        # Room for the first check, none left for the second.
+        return _Usage(10**12 if calls[0] <= 1 else 1)
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, dest, key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "space"
+    assert "finish this backup" in str(caught.value)
+    assert calls[0] >= 2
+    assert _staging_dirs(data_dir) == [] and list(dest.iterdir()) == []
+    assert _everything_under(iso) == []
+
+
+def test_the_first_check_leaves_an_idle_wal_out(tmp_path, monkeypatch) -> None:
+    """SQLite keeps a WAL file at its high-water size, so counting it refused runs that fit."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "msg.db").write_bytes(b"x" * 1000)
+    (data_dir / "msg.db-wal").write_bytes(b"x" * 100_000)
+
+    class _Store:
+        path = str(data_dir / "msg.db")
+
+    needs: list[list[tuple[Path, int]]] = []
+    monkeypatch.setattr(dr_backup, "_space_shortfall", lambda n: needs.append(n))
+    runner = BackupRunner(
+        _Store(),  # type: ignore[arg-type]
+        BackupSettings(enabled=True, destination=str(tmp_path / "dest")),
+        store_settings=StoreSettings(path=str(data_dir / "msg.db")),
+        config_dir=None,
+        instance="dev",
+    )
+    runner._space_shortfall(data_dir, tmp_path / "dest", config_only=False)
+    assert [n for _p, n in needs[0]] == [2000, 1000]

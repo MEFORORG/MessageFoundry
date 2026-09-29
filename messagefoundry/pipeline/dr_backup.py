@@ -489,7 +489,10 @@ class BackupRunner:
         staging_root, secure = self._staging_root(dest_dir)
         await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
         # After the sweep, which frees what a dead run left, and before anything is written: a run
-        # that cannot fit fails here, naming the volume, not half-way through a multi-GB write.
+        # that cannot fit fails here, naming the volume, not half-way through a multi-GB write. It
+        # runs before the OS temp sweep below, which needs this run's own directory to know which
+        # account to sweep for; on a box where the temp dir shares the data volume, a killed
+        # standalone verify's leftovers are still counted as used here.
         shortfall = await asyncio.to_thread(
             self._space_shortfall, staging_root, dest_dir, config_only=config_only
         )
@@ -544,6 +547,16 @@ class BackupRunner:
                     # sqlite3.Error: since BACKLOG #1937 the copy opens its own read-only connection,
                     # and a failure there is a snapshot failure too, not a generic backup one.
                     raise BackupError("snapshot", safe_exc(exc)) from exc
+                # The snapshot's real size is known now, and it is already on disk, so this asks only
+                # for what is still to come: the tar beside it and the archive at the destination.
+                # Inside the try, so a refusal here still releases the staging directory.
+                shortfall = await asyncio.to_thread(
+                    self._space_shortfall_after_snapshot, snap_path, work.path, dest_dir
+                )
+                if shortfall is not None:
+                    raise BackupError(
+                        "space", f"not enough free space to finish this backup: it {shortfall}"
+                    )
             try:
                 (
                     snapshot_sha256,
@@ -1122,24 +1135,43 @@ class BackupRunner:
     ) -> str | None:
         """Whether this run fits, as :func:`_space_shortfall` answers it. Runs off the loop.
 
-        The peak, with ``S`` the store file plus its WAL and ``C`` the config bundle: the staging
-        root holds the snapshot and the tar at once (``2S + C``), and so does the backup's own verify
-        later (the decrypted tar and the extracted store); the destination holds the archive
-        (``S + C``, the tar plus a small framing overhead). On one volume that is ``3S + 2C``. The
-        WAL is counted because the snapshot may carry what a checkpoint has not yet moved."""
+        The peak, with ``S`` the store file and ``C`` the config bundle: the staging root holds the
+        snapshot and the tar at once (``2S + C``), and so does the backup's own verify later (the
+        decrypted tar and the extracted store); the destination holds the archive (``S + C``, the
+        tar plus a small framing overhead). On one volume that is ``3S + 2C``.
+
+        The WAL is left out on purpose. SQLite never shrinks it without a truncating checkpoint, so
+        its file can stand at a high-water size far above what the snapshot will carry, and counting
+        it would refuse runs that fit. :meth:`_space_shortfall_after_snapshot` checks again with the
+        snapshot's real size once it exists."""
         store_bytes = 0
         path = getattr(self._store, "path", None)
         if not config_only and isinstance(path, str) and path != ":memory:":
-            store_bytes = _file_size(Path(path)) + _file_size(Path(path + "-wal"))
-        config_bytes = 0
-        if self._settings.include_config and self._config_dir is not None:
-            config_bytes = _tree_size(Path(self._config_dir))
+            store_bytes = _file_size(Path(path))
+        config_bytes = self._config_bytes()
         return _space_shortfall(
             [
                 (staging_root, 2 * store_bytes + config_bytes),
                 (dest_dir, store_bytes + config_bytes),
             ]
         )
+
+    def _space_shortfall_after_snapshot(
+        self, snap_path: Path, staging: Path, dest_dir: Path
+    ) -> str | None:
+        """The second free-space check, once the snapshot is on disk. It asks only for what is still
+        to be written: the tar in staging (``S' + C``) and the archive at the destination
+        (``S' + C``), with ``S'`` the snapshot's real size. The backup's own verify later holds no
+        more on the staging volume than the build did, because the build's staging is released
+        first."""
+        rest = _file_size(snap_path) + self._config_bytes()
+        return _space_shortfall([(staging, rest), (dest_dir, rest)])
+
+    def _config_bytes(self) -> int:
+        """The bytes of the config bundle the archive will carry, or 0 when it carries none."""
+        if self._settings.include_config and self._config_dir is not None:
+            return _tree_size(Path(self._config_dir))
+        return 0
 
     def _backend_value(self) -> str:
         backend = getattr(self._store, "backend", None)

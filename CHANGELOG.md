@@ -584,8 +584,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Fixed
 - **A DR backup or standalone `restore-verify` that will not fit now fails before it writes.** A
   backup checks the free space on its staging and destination volumes after its sweep and before
-  anything is written. It counts the store file and its WAL twice on the staging volume, the
-  archive once on the destination, and all three when the two share a volume. A short run fails
+  anything is written. It counts the store file twice on the staging volume, the archive once on
+  the destination, and all three when the two share a volume. It checks again with the snapshot's
+  real size once the snapshot is taken, so a large idle WAL file does not refuse a run that fits.
+  A short run fails
   with a `backup_failed` alert of the new kind `space` that names the volume and both sizes. A
   standalone verify needs about twice the archive free under the OS temp dir. Short, it returns
   `FAIL` with a reason that says the volume, not the archive, is at fault. A volume whose free
