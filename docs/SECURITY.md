@@ -2738,13 +2738,13 @@ changed is what a campaign costs, and whom:
   read off the trail, one request per candidate, which candidate password was right. The uniform
   slug removes that per-request oracle; the per-factor failure **count** survives only on the
   `users:manage` lock-state surface, and the account holder's own out-of-band lock notice still
-  names which factor was right. **A coarser residual remains on the `audit:read` path.** Because the
-  second-step counter is fed only by a right factor, sending one candidate `lockout_threshold` times
-  locks it only when the password was right, and that lock's `auth.account_locked`,
-  `auth.lock_notice` and `auth.login_locked` rows are audit-visible while the live sign-in lock keeps
-  the sign-in counter from emitting any. That is the same oracle at `lockout_threshold` requests per
-  candidate rather than one. Removing it would drop the `auth.account_locked` row AC-10 requires, so
-  it is left as an owner/ADR decision, tracked as the lock-event limb of #1131.
+  names which factor was right. **The coarser lock-event oracle is closed too, by owner ruling
+  2026-09-28.** The second-step counter is fed only by a right factor, so sending one candidate
+  `lockout_threshold` times locks it only when the password was right. The rows that lock leaves
+  are now read only with `users:manage`, and a sign-in refused by a live lock writes the same
+  `auth.login_failed` row as a wrong credential. So a reader without `users:manage` sees one
+  identical row per refused attempt, whichever candidate it sent; see [Audit](#audit) for which rows
+  are hidden and from whom.
 - **A caller holding one factor** (the password, the TOTP device, or a directory sign-in) feeds the
   second-step counter. That lock refuses every sign-in, and on a local account it doubles per cycle
   too, because one of the owner's two factors is already lost.
@@ -2997,6 +2997,28 @@ user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.l
 and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded
 with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, tokens, and PHI bodies
 are never logged** (only ids/counts land in `detail`).
+
+**Lock rows are read only with `users:manage` (owner ruling 2026-09-28, BACKLOG #1131).** The engine
+still writes every lock row (ADR 0197 AC-10), and an Administrator reads them all. A reader without
+`users:manage`, the built-in Auditor included, does not see these rows in `GET /audit`,
+`GET /audit/export` or the console's `/ui/audit`:
+
+| Hidden row | Why a reader could use it |
+|---|---|
+| `auth.account_locked` | a lock landed, which in a combined campaign under a live sign-in lock only a right candidate causes |
+| `auth.lock_notice` | the lock mail's throttle row, whose detail names the counter |
+| `auth.login_locked` | a sign-in refused by a live lock, where a wrong candidate is refused as a plain wrong password |
+| `auth.admin_unlocked` (the whole row) | its detail records both lock expiries and both cycle counts |
+| `auth.mfa_failed` and `auth.webauthn_failed` with detail `{"reason": "locked"}`, and `auth.login_failed` with detail `{"provider": "ad", "reason": "locked"}` | the lock refusals of the factor and directory legs, which say a lock is live only in their detail |
+
+In their place, every refused local credential sign-in writes one `auth.login_failed` row with reason
+`bad_credentials` (plus `combined: true` for a combined sign-in), whether a wrong credential or a
+live lock refused it. The permission decides, not the role name; no custom role can grant
+`users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
+never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
+selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
+**The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
+reasons are in `messagefoundry/auth/audit_visibility.py`.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via

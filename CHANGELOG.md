@@ -1040,10 +1040,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   ceiling of about 86,400 a day, against ADR 0197's design bound of 35. ADR 0197's counting is
   unchanged: a right password with a wrong code still charges the second-step counter, both wrong
   still charges the sign-in counter, and which factor verified still reaches the account holder's
-  own lock notice and the `users:manage` lock-state surface. A coarser residual remains: the
-  lock rows a locked second-step counter emits (`auth.account_locked`, `auth.lock_notice`,
-  `auth.login_locked`) still tell the two outcomes apart at `lockout_threshold` requests per
-  candidate; removing them touches the AC-10 lock record, so it is left for an owner/ADR decision.
+  own lock notice and the `users:manage` lock-state surface. The coarser residual, the lock rows a
+  locked second-step counter emits, is closed by the next entry. (`BACKLOG #1131`, ASVS 6.1.1)
+- **The Auditor no longer sees lockout events.** An audit reader without `users:manage`, the
+  built-in `AUDITOR` role included, no longer sees `auth.account_locked`, `auth.lock_notice`,
+  `auth.login_locked` or `auth.admin_unlocked`, nor the `reason: locked` refusals of the TOTP,
+  passkey and directory sign-ins, in `GET /audit`, `GET /audit/export` or the console's
+  `/ui/audit`. Administrators still see every row, and the engine still writes them all (ADR 0197
+  AC-10). In their place every refused local sign-in writes one `auth.login_failed` row with
+  reason `bad_credentials`, whether a wrong credential or a live lock refused it. A password-only
+  wrong password used to write `bad_password` and now writes `bad_credentials` too. Before, the
+  lock rows told an Auditor which candidate password was right: sending one candidate
+  `lockout_threshold` times in a combined sign-in locks the second-step counter only when the
+  password is right. The cost, accepted by owner ruling 2026-09-28: the Auditor can no longer
+  review lockouts. An account holder's own `/me/security-events` feed still shows their own lock.
   (`BACKLOG #1131`, ASVS 6.1.1)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
