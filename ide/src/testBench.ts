@@ -177,10 +177,17 @@ export class TestBench {
       if (reset === "Delete") {
         try {
           await this.collectionStore().reset();
-          await this.postCollections();
         } catch {
           void vscode.window.showErrorMessage(
             "MessageFoundry: the saved Test Bench collections could not be deleted.",
+          );
+          return;
+        }
+        try {
+          await this.postCollections();
+        } catch {
+          void vscode.window.showErrorMessage(
+            "MessageFoundry: saved Test Bench collections could not be read or written.",
           );
         }
       }

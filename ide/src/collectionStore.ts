@@ -37,7 +37,9 @@ export function collectionsSecretKey(workspaceScope: string): string {
 }
 
 /** Raised when the stored value cannot be read back. Its message never carries the stored text. */
-export class CollectionStoreError extends Error {}
+export class CollectionStoreError extends Error {
+  override name = "CollectionStoreError";
+}
 
 function parseCollections(raw: string): Record<string, TestCollection> {
   let parsed: unknown;
