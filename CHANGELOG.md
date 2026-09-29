@@ -1093,14 +1093,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   `auth.login_locked` or `auth.admin_unlocked`, nor the `reason: locked` refusals of the TOTP,
   passkey and directory sign-ins, in `GET /audit`, `GET /audit/export` or the console's
   `/ui/audit`. Administrators still see every row, and the engine still writes them all (ADR 0197
-  AC-10). In their place every refused local sign-in writes one `auth.login_failed` row with
-  reason `bad_credentials`, whether a wrong credential or a live lock refused it. A password-only
+  AC-10). In their place every refused sign-in on an existing, enabled local account writes one
+  `auth.login_failed` row with reason `bad_credentials`, whether a wrong credential or a live lock
+  refused it. A password-only
   wrong password used to write `bad_password` and now writes `bad_credentials` too. Before, the
   lock rows told an Auditor which candidate password was right: sending one candidate
   `lockout_threshold` times in a combined sign-in locks the second-step counter only when the
   password is right. The cost, accepted by owner ruling 2026-09-28: the Auditor can no longer
   review lockouts. An account holder's own `/me/security-events` feed still shows their own lock.
-  (`BACKLOG #1131`, ASVS 6.1.1)
+  The general log, readable with `logs:view`, still names a lock notice as it happens; that and two
+  other open channels are listed in `docs/SECURITY.md` under Audit. (`BACKLOG #1131`, ASVS 6.1.1)
 - **BREAKING: XML signature checks now refuse an RSA signing key under 2048 bits.** Before, the
   XML-DSig `verify()` accepted a signature made with an RSA-1024 key, on both the `x509_cert` and
   the `ca_pem_file` paths. Now it returns `verified=False` with the reason `WeakSigningKey`, even

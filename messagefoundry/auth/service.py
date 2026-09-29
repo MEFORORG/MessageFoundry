@@ -883,8 +883,8 @@ def _live_lock(user: UserRecord, now: float) -> bool:
     return user.locked_until is not None and now < user.locked_until
 
 
-#: The ONE audit reason a refused local credential sign-in records, combined or password-only,
-#: whichever factor was wrong and whatever lock refused it (BACKLOG #1131). It must not name which factor verified: the
+#: The ONE audit reason a refused sign-in on an existing, enabled local account records, combined or
+#: password-only, whichever factor was wrong and whatever lock refused it (BACKLOG #1131). It must not name which factor verified: the
 #: ``auth.login_failed`` row is read by an ``audit:read`` holder who is not an administrator (the
 #: built-in ``AUDITOR`` role), and a per-factor slug there was a password oracle -- the sign-in lock
 #: does not refuse a combined sign-in, so such a reader could arm the lock, send candidate passwords
