@@ -343,9 +343,10 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     bundled_corpus: Callable[[Sequence[str] | None], None], empty_store: MessageStore
 ) -> None:
     """`admin_reset_password` reaches the same generator, so the same suppression covers it. Worth its
-    own arm because it was the SECOND caller of `generate_policy_password`, and is now the only one:
-    a fix applied at the retired first-run call rather than inside the generator would have failed
-    this one. The pairing arm above mints through the same reset, so the two overlap; this arm keeps
+    own arm because it was the SECOND caller of `generate_policy_password`, and the first-run call
+    it followed is retired: a fix applied there rather than inside the generator would have failed
+    this one. Account creation, the factor reset and the startup and verify probe call it too (ADR
+    0197 Amendment A), and all reach the suppression through the generator itself. The pairing arm above mints through the same reset, so the two overlap; this arm keeps
     the length check.
 
     SCOPE, because the assertion is weaker than the test name suggests. This proves only that

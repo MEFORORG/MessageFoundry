@@ -280,7 +280,9 @@ async def test_the_startup_probe_logs_an_error_and_does_not_raise(
         bad = AuthService(store, _unissuable())
         with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
             assert bad.probe_credential_generation() is False
-        text = " ".join(r.getMessage() for r in caplog.records)
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, "one failure, one ERROR record"
+        text = " ".join(r.getMessage() for r in errors)
         assert "password_extra_context_words" in text and "startup" in text
         good = AuthService(store, AuthSettings())
         assert good.probe_credential_generation() is True

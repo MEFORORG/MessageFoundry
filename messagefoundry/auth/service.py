@@ -670,7 +670,8 @@ def credential_generation_problem(policy: PasswordPolicy) -> str | None:
     followed by what it breaks. The generated value is discarded. The one probe behind both the
     engine's startup check and ``messagefoundry verify``'s ``auth.credential_generation``."""
     try:
-        generate_policy_password(policy, username=_PROBE_USERNAME)
+        # Quiet: each caller reports the failure once, in its own words.
+        generate_policy_password(policy, username=_PROBE_USERNAME, log_failure=False)
     except TemporaryPasswordUnavailable as exc:
         return (
             f"{exc}. Creating an account, resetting a password and resetting an account's factors "
@@ -686,7 +687,9 @@ def _temporary_password_chars(min_length: int) -> int:
     return max(32, min_length)
 
 
-def generate_policy_password(policy: PasswordPolicy, *, username: str | None = None) -> str:
+def generate_policy_password(
+    policy: PasswordPolicy, *, username: str | None = None, log_failure: bool = True
+) -> str:
     """A random password that satisfies the active policy — so an administrator-issued temporary
     credential is held to the same bar operators are. ``token_urlsafe(n)`` yields about 1.33 times
     n characters, cut to :func:`_temporary_password_chars`, so the length is at least
@@ -697,6 +700,8 @@ def generate_policy_password(policy: PasswordPolicy, *, username: str | None = N
     the call below (BACKLOG #1447).
 
     ``username`` is the account the password is for, so the own-username clause applies too.
+    ``log_failure=False`` is for :func:`credential_generation_problem`, whose callers log or print
+    the failure themselves; every issuing path keeps the ERROR.
 
     Raises :class:`TemporaryPasswordUnavailable` when no candidate clears the policy. It never
     returns an unscreened password. The old last-resort return appended ``aA1!`` without a screen,
@@ -736,12 +741,13 @@ def generate_policy_password(policy: PasswordPolicy, *, username: str | None = N
         for candidate in candidates:
             if not policy.violations(candidate, username=username, suppress_breach_check=True):
                 return candidate
-    _log.error(
-        "no temporary password cleared the password policy in %d tries; the likely cause is "
-        "[auth].password_extra_context_words holding so many short terms that nearly every "
-        "random string contains one, which would refuse most passphrases too",
-        _RESET_GENERATION_ATTEMPTS,
-    )
+    if log_failure:
+        _log.error(
+            "no temporary password cleared the password policy in %d tries; the likely cause is "
+            "[auth].password_extra_context_words holding so many short terms that nearly every "
+            "random string contains one, which would refuse most passphrases too",
+            _RESET_GENERATION_ATTEMPTS,
+        )
     raise TemporaryPasswordUnavailable(
         "could not generate a temporary password that clears the password policy; check "
         "[auth].password_extra_context_words for short or very common terms, then restart the "
