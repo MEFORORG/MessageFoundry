@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.serialization.pkcs12 import PKCS12PrivateKey
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.__main__ import main
+from tests._approved_key_wrap import approved_pfx, pkcs12_bundle
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 _UTC = datetime.UTC
@@ -67,12 +68,13 @@ def _make_pfx(
     cas: list[x509.Certificate] | None = None,
     password: bytes | None = None,
 ) -> bytes:
-    enc: serialization.KeySerializationEncryption = (
-        serialization.BestAvailableEncryption(password)
-        if password
-        else serialization.NoEncryption()
+    # An encrypted bundle is written at the approved wrap: PBES2 bags and a PBMAC1 MAC at the floor.
+    # `cert import` refuses BestAvailableEncryption, whose MAC is keyed by the PKCS#12 KDF (#1352).
+    if password:
+        return approved_pfx(key, cert, password, cas)
+    return pkcs12.serialize_key_and_certificates(
+        b"mefor", key, cert, cas, serialization.NoEncryption()
     )
-    return pkcs12.serialize_key_and_certificates(b"mefor", key, cert, cas, enc)
 
 
 def _pem(cert: x509.Certificate) -> bytes:
@@ -174,7 +176,81 @@ def test_import_missing_password_fails_cleanly(
     assert rc == 2
     combined = capsys.readouterr().err
     assert correct not in combined
+    # The wrap check's own refusal, not cryptography's generic failure, which also exits 2.
+    assert "no passphrase is configured" in combined
     assert not (out / "key.pem").exists()
+
+
+@pytest.mark.parametrize(
+    ("build", "why"),
+    [
+        # cryptography's own default: PBES2 bags at 20000 iterations and a PKCS#12-KDF MAC.
+        (
+            lambda k, c, pw: pkcs12.serialize_key_and_certificates(
+                b"x", k, c, None, serialization.BestAvailableEncryption(pw)
+            ),
+            "at 20000 iterations",
+        ),
+        # The SHA-1 PKCS#12 PBE for the bags and a SHA-1 MAC.
+        (
+            lambda k, c, pw: pkcs12.serialize_key_and_certificates(
+                b"x",
+                k,
+                c,
+                None,
+                serialization.PrivateFormat.PKCS12.encryption_builder()
+                .key_cert_algorithm(pkcs12.PBES.PBESv1SHA1And3KeyTripleDESCBC)
+                .hmac_hash(hashes.SHA1())
+                .build(pw),
+            ),
+            "SHA-1",
+        ),
+        # Approved PBES2 bags at the floor, and the PKCS#12-KDF MAC over SHA-256.
+        (lambda k, c, pw: pkcs12_bundle(k, c, pw), "rather than PBMAC1"),
+        # PBMAC1, but under the PBKDF2 floor.
+        (lambda k, c, pw: approved_pfx(k, c, pw, iterations=2048), "2048 iterations"),
+    ],
+    ids=["best-available", "sha1-pbe-sha1-mac", "sha256-pkcs12-kdf-mac", "pbmac1-2048"],
+)
+def test_import_refuses_a_weak_bundle_before_decrypting_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    build: object,
+    why: str,
+) -> None:
+    # BACKLOG #1352 / #1171. Each bundle is DECRYPTABLE with this passphrase, so without the check
+    # `cert import` writes its key out; with it, the import refuses and names the re-export command.
+    password = "synthetic-pfx-pass"
+    key, cert = _make_cert()
+    pfx_path = tmp_path / "weak.pfx"
+    pfx_path.write_bytes(build(key, cert, password.encode()))  # type: ignore[operator]
+    monkeypatch.setenv("MEFOR_PFX_PASSWORD", password)
+    out = tmp_path / "o"
+
+    rc = main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert why in err and "-pbmac1_pbkdf2" in err
+    assert password not in err
+    assert not (out / "key.pem").exists()
+
+
+def test_import_accepts_the_approved_bundle_with_a_ca_chain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control for the refusals above: PBES2 bags and a PBMAC1 MAC, both at the floor.
+    password = "synthetic-pfx-pass"
+    key, cert = _make_cert()
+    ca_key, ca_cert = _make_cert("ca.example.org")
+    pfx_path = tmp_path / "good.pfx"
+    pfx_path.write_bytes(approved_pfx(key, cert, password.encode(), [ca_cert]))
+    monkeypatch.setenv("MEFOR_PFX_PASSWORD", password)
+    out = tmp_path / "o"
+
+    assert main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out)]) == 0
+    capsys.readouterr()
+    assert (out / "key.pem").exists() and (out / "ca-chain.pem").exists()
 
 
 def test_import_refuses_to_overwrite_existing_key(

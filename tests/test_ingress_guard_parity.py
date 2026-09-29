@@ -7,13 +7,19 @@ and would ``NAK`` on the first live message is a gate that lies, and so is one t
 for a body the engine takes. Each test below drives ONE guard and fails on the pre-#1689 code, so the
 file doubles as the negative control — deleting a guard turns its own test red and nothing else.
 
-The parity assertions at the bottom pin the shared module against the listener's own constants, which
-matters because ``_handle_inbound`` still carries an inline copy of the sequence (part B of #1689
-points it at the shared function; that method is held by other open work today).
+The tests at the bottom hold the one-copy property of part B: both live listeners and the dry-run
+refuse each guard's body with the same reason, each caller reaches the shared functions, and no
+listener carries its own copy of the sequence.
 """
 
 from __future__ import annotations
 
+import inspect
+import io
+import textwrap
+import tokenize
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -29,7 +35,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.parsing.message import RawMessage
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import disposition_for, dry_run, route_message, split_messages
-from messagefoundry.store import MessageStatus
+from messagefoundry.store import MessageStatus, MessageStore
 
 #: A conformant 2.5.1 ADT^A01 whose PID-5 family name carries a byte that is latin-1 but NOT UTF-8
 #: (U+00DC, "Ü"). Which of the two charsets an inbound declares is exactly what decides whether the
@@ -297,24 +303,212 @@ def test_disposition_for_prefers_the_decline_over_the_filter() -> None:
     assert disposition_for(outcome) is MessageStatus.NOT_DEPLOYED
 
 
-# --- the shared module vs. the listener's inline copy -------------------------------------------
+# --- one copy: both listeners and the dry-run go through the shared guards (#1689 part B) --------
+#
+# Part A pinned the listener's inline copy to the shared module with two constant comparisons. Part B
+# deleted the copy, so those comparisons had nothing left to compare. What replaces them: the live
+# listeners and the dry-run are driven over the same bodies and must refuse with the same reason; each
+# caller is shown to reach the shared functions; and the listener source must not grow a copy back.
+
+_LISTENERS = ("_handle_inbound", "_handle_inbound_http")
 
 
-def test_shared_ceiling_matches_the_listeners() -> None:
-    """``_handle_inbound`` still carries its own copy of this sequence (part B of #1689 removes it).
+@pytest.fixture
+async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
+    s = await MessageStore.open(tmp_path / "parity.db")
+    yield s
+    await s.close()
 
-    Until it does, these two assertions are the whole drift detector: a change to either side that
-    forgets the other turns this red rather than quietly reopening the gap #1689 closed."""
-    assert ingress_guards.INGRESS_MAX_BYTES == wiring_runner._INGRESS_MAX_BYTES
+
+async def _live_rows(
+    store: MessageStore, ic: InboundConnection, body: bytes, listener: str
+) -> list[dict[str, Any]]:
+    """Hand ``body`` to one live listener and return every ``messages`` row (a fresh store per test)."""
+    reg = _registry(ic)
+    handler = getattr(wiring_runner.RegistryRunner(reg, store), listener)
+    await handler(reg.inbound[ic.name], body)
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    return [dict(r) for r in await cur.fetchall()]
 
 
-def test_shared_nul_reason_matches_the_listeners_wording() -> None:
-    # Pinned as a literal because the listener's copy is a local inside `_handle_inbound` and cannot
-    # be imported. If either side is reworded, this fails and names the other side.
+#: One body per guard, each with the inbound that makes that guard fire.
+_GUARD_CASES = [
+    pytest.param(_inbound(encoding="utf-8"), ADT_LATIN1, id="decode"),
+    pytest.param(
+        _inbound(encoding="utf-8"),
+        ADT_UMLAUT_TEXT.replace("JANE", "JA\x00NE").encode("utf-8"),
+        id="nul_hl7",
+    ),
+    pytest.param(_inbound(content_type=ContentType.JSON), b'{"a": "b\x00c"}', id="nul_text"),
+    pytest.param(
+        _inbound(content_type=ContentType.JSON), b'{"a": "' + b"y" * 64 + b'"}', id="size_text"
+    ),
+    pytest.param(_inbound(content_type=ContentType.BINARY), b"\x00\x01" * 40, id="size_binary"),
+    # The declared-type sniff: the listener refuses these, and the dry-run does not run it yet. Strict
+    # xfail, so the day the dry-run gains the sniff these turn red and ask to be promoted. Why it is
+    # not simply added: the ingress_guards module docstring, "still differ".
+    pytest.param(
+        _inbound(content_type=ContentType.JSON),
+        b"not json at all",
+        id="type_text",
+        marks=pytest.mark.xfail(strict=True, reason="the dry-run does not run the type sniff"),
+    ),
+    pytest.param(
+        _inbound(content_type=ContentType.DICOM),
+        b"\x00\x01\x02",
+        id="type_binary",
+        marks=pytest.mark.xfail(strict=True, reason="the dry-run does not run the type sniff"),
+    ),
+]
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+@pytest.mark.parametrize(("ic", "body"), _GUARD_CASES)
+async def test_the_listener_and_the_dry_run_refuse_with_the_same_reason(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    ic: InboundConnection,
+    body: bytes,
+    listener: str,
+) -> None:
+    """The gate's question and the engine's answer, asked of one body: they must agree word for word.
+
+    The ceiling is lowered so the size cases stay small. Both callers read it from the one module
+    attribute, so lowering it there is a test of that too: a listener with its own ceiling would take
+    the oversize bodies and this would go red."""
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
+
+    preview = dry_run(_registry(ic), body)
+    rows = await _live_rows(store, ic, body, listener)
+
+    assert preview.disposition is MessageStatus.ERROR, preview.error
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    assert rows[0]["error"] == preview.error
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, module: Any, names: tuple[str, ...]) -> list[str]:
+    """Wrap each named function in ``module`` so a call records its name, then runs the real one."""
+    calls: list[str] = []
+    for name in names:
+        real = getattr(module, name)
+
+        def spy(*args: Any, _real: Any = real, _name: str = name, **kwargs: Any) -> Any:
+            calls.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, spy)
+    return calls
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+@pytest.mark.parametrize(
+    ("content_type", "body", "expected"),
+    [
+        pytest.param(ContentType.HL7V2, ADT_UTF8, ["decode_body", "check_decoded"], id="hl7v2"),
+        pytest.param(ContentType.JSON, b'{"a": 1}', ["decode_body", "check_decoded"], id="json"),
+        pytest.param(
+            ContentType.BINARY,
+            b"\x00\x01",
+            ["check_binary_size", "carry_binary_ingress"],
+            id="binary",
+        ),
+    ],
+)
+async def test_each_listener_calls_the_shared_guards(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    listener: str,
+    content_type: ContentType,
+    body: bytes,
+    expected: list[str],
+) -> None:
+    """A listener that answered the parity test above from a private copy would never reach these."""
+    names = ("decode_body", "check_decoded", "check_binary_size", "carry_binary_ingress")
+    calls = _spy(monkeypatch, wiring_runner, names)
+
+    rows = await _live_rows(store, _inbound(content_type=content_type), body, listener)
+
+    assert rows == [{"status": MessageStatus.RECEIVED.value, "error": None}]
+    assert calls == expected
+
+
+def test_the_dry_run_calls_the_same_two_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of one copy: ``decode_ingress`` is those two calls, not a sibling of them."""
+    calls = _spy(monkeypatch, ingress_guards, ("decode_body", "check_decoded"))
+
+    result = dry_run(_registry(_inbound(encoding="utf-8")), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.RECEIVED, result.error
+    assert calls == ["decode_body", "check_decoded"]
+
+
+#: Code that only an inline copy of the guard sequence would put in a listener's body.
+_INLINE_GUARD_MARKERS = (
+    "normalize(",
+    ".decode(",
+    'errors="strict"',
+    '"\\x00" in',
+    "'\\x00' in",
+    "chr(0)",
+    "INGRESS_MAX_BYTES",
+    "no matching magic bytes",
+    "_content_matches_declared",
+    "ingress exceeds max size",
+    "invalid in a text/HL7 payload",
+    "RawMessage.from_bytes",
+    "max_message_bytes or",
+)
+
+
+def _code_without_comments(func: Any) -> str:
+    """``func``'s source with every ``#`` comment dropped, so a comment can name what code may not."""
+    source = textwrap.dedent(inspect.getsource(func))
+    tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+    return tokenize.untokenize(t for t in tokens if t.type != tokenize.COMMENT)
+
+
+@pytest.mark.parametrize(
+    ("method", "shared_call"),
+    [
+        ("_handle_inbound", "decode_body("),
+        ("_handle_inbound_http", "decode_body("),
+        ("_declared_content_mismatch", "check_declared_type("),
+    ],
+)
+def test_no_listener_carries_its_own_copy_of_the_guards(method: str, shared_call: str) -> None:
+    """Fails the day someone pastes a decode, a NUL test, a ceiling or a sniff back into a listener.
+
+    The spy test above cannot see that: a listener could call the shared guards AND keep a stale copy
+    beside them, and the copy is what drifts. So this reads the code, less its comments. It is a
+    tripwire over the spellings a paste would carry, not a proof that no copy exists."""
+    code = _code_without_comments(getattr(wiring_runner.RegistryRunner, method))
+    assert shared_call in code  # the instrument reads the method it names
+    assert [m for m in _INLINE_GUARD_MARKERS if m in code] == []
+
+
+def test_the_nul_reason_is_the_listeners_stored_wording() -> None:
+    # One copy now, in ingress_guards, so this pins the operator-facing wording of the stored reason
+    # rather than two copies to each other. The live rows above already assert both callers use it.
     assert (
         ingress_guards.NUL_REJECTED_REASON
         == "ingress body contains a NUL (U+0000), invalid in a text/HL7 payload"
     )
+
+
+async def test_the_codec_name_is_where_the_two_callers_still_differ(store: MessageStore) -> None:
+    """Pins the codec-name difference ``decode_ingress``'s docstring states, so a change to it has to
+    update that docstring too. It is reported, not endorsed: the listener's side is a raise with no
+    ERROR row."""
+    ic = InboundConnection(
+        "in",
+        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575, "encoding": None}),
+        router="r",
+        content_type=ContentType.HL7V2,
+    )
+    assert dry_run(_registry(ic), ADT_UTF8).disposition is MessageStatus.RECEIVED
+
+    with pytest.raises(TypeError):
+        await _live_rows(store, ic, ADT_UTF8, "_handle_inbound")
 
 
 def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:

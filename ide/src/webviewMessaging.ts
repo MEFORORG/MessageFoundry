@@ -28,6 +28,11 @@
 //      path is itself proof the origin is a tuple origin: an opaque origin could not be addressed
 //      this way at all. That is what makes `ev.origin === window.origin` a real comparison rather
 //      than the vacuous `"null" === "null"` it would be under an opaque origin.
+//      THE GUARD DOES NOT REST ON THIS FACT. It was read on one build and measured on two, and
+//      `engines.vscode ^1.95.0` has an open top, so no set of measured builds covers the range. The
+//      guard therefore refuses every message while `window.origin` is `"null"` (or not a string at
+//      all). On a build that served an opaque origin, every panel would discard every message and fail
+//      closed, rather than admit every opaque poster. That holds by construction, not by measurement.
 //   3. What `window.parent` is inside the extension's document DEPENDS ON THE VS CODE VERSION, so no
 //      check may rest on it. The 1.135.0 bridge read above injects
 //      `window.parent = window; window.top = window; window.frameElement = null;`. The BACKLOG #1123
@@ -41,6 +46,9 @@
 //      measured.
 //
 // WHAT EACH RECEIVER CHECKS, and the limits of each:
+//   * `window.origin` is a tuple origin. Checked first: when it is the opaque `"null"`, the guard
+//     discards the message before any other arm runs (fact 2 says why this cannot rest on a
+//     measurement). The cost is a panel that shows nothing on such a build, which is the safe failure.
 //   * `ev.origin === window.origin`. A same-origin test whose comparand the document reads from its
 //     OWN browsing context, not out of the incoming event. The embedder fixed that value and no
 //     poster can change it, which is what distinguishes this from a sender-supplied comparand. It
@@ -77,6 +85,9 @@
 //     could post into them, and no policy in the extension sets `frame-src` or `child-src` — nested
 //     frames fall back to `default-src 'none'`.
 //   * The discriminator check at each receiver, which is what makes an unexpected message a no-op.
+//   * The payload shape check at each receiver: every message it handles must carry its required
+//     fields with the right JS types, or it is discarded. Seven receivers use `SHAPE_HELPERS` below;
+//     Test Bench keeps its own `shapeOk()`. Types only: value ranges are not checked here.
 //
 // WHAT THIS DOES NOT COVER, stated so a reviewer does not have to infer it. The token authenticates
 // the SENDER, not the message: a host-side bug that posts the wrong payload is stamped as validly as
@@ -97,7 +108,8 @@ export const CHANNEL_FIELD = "__mfChannel";
 /** The single-line marker every webview `message` receiver in this extension carries, pointing here.
  *  Kept as an exported constant so the source-text test that enforces its presence and this file
  *  cannot drift apart. */
-export const WEBVIEW_GUARD_NOTE = "// Origin, source and channel token are checked — see webviewMessaging.ts.";
+export const WEBVIEW_GUARD_NOTE =
+  "// Origin, source, channel token and payload shape are checked — see webviewMessaging.ts.";
 
 /**
  * The part of `vscode.Webview` this module uses, spelled structurally.
@@ -171,9 +183,9 @@ export function postToWebview(
 /**
  * JSON for interpolation into an inline `<script>`, with `<` escaped so no value can close the tag.
  *
- * The same rule the per-panel `embed()` helpers use. The token is base64url and could not carry a
- * `<` today; routing it through the escape anyway is what keeps that from becoming an unstated
- * assumption the next value inherits.
+ * The panel scripts (`*Webview.ts`) embed their seed data with it too. The token is base64url and
+ * could not carry a `<` today; routing it through the escape anyway is what keeps that from becoming
+ * an unstated assumption the next value inherits.
  */
 export function embedJson(value: unknown): string {
   return JSON.stringify(value ?? null).replace(/</g, "\\u003c");
@@ -188,15 +200,63 @@ export function embedJson(value: unknown): string {
  */
 export function guardScript(token: string): string {
   return `
-    // The trust boundary for this panel — what these three checks rest on is in webviewMessaging.ts.
+    // The trust boundary for this panel — what these checks rest on is in webviewMessaging.ts.
     const MF_CHANNEL = ${embedJson(token)};
+    let mfOpaqueWarned = false;
     function mfTrusted(ev) {
+      // An opaque origin reads as the string 'null', and then the origin test below would compare
+      // 'null' with 'null' and pass for every opaque poster. Refuse everything instead, on any build,
+      // and say so once, so a panel that stays empty for this reason can be diagnosed.
+      if (typeof window.origin !== 'string' || window.origin === 'null') {
+        if (!mfOpaqueWarned) {
+          mfOpaqueWarned = true;
+          console.warn('MessageFoundry: this panel has an opaque origin, so every message to it is discarded');
+        }
+        return null;
+      }
       // Same-origin. window.origin is this document's own, not read out of the event.
       if (ev.origin !== window.origin) { return null; }
-      // Not a same-document post. NOT window.parent: VS Code shadows that to window itself.
+      // Not a same-document post. NOT window.parent: it differs by VS Code build (undefined at 1.95.0,
+      // where the bridge deletes it; window itself at 1.139.1), so no check may rest on it.
       if (ev.source === window) { return null; }
       const d = ev.data;
       if (!d || typeof d !== 'object' || d.${CHANNEL_FIELD} !== MF_CHANNEL) { return null; }
       return d;
     }`;
 }
+
+/**
+ * The payload-shape helpers a receiver runs AFTER `mfTrusted()`, as inline script source.
+ *
+ * ASVS 3.5.5 asks a receiver to check the syntax of what it is handed, not only who handed it. Here
+ * that means the REQUIRED FIELDS of each message and their JS types. Value ranges and business limits
+ * are a different requirement and are not checked here. A receiver declares one entry per message it
+ * handles and calls `mfShapeOk(d, 'command', SHAPES, '<panel>')`; on `false` it returns without
+ * acting. A message whose discriminator has no entry is discarded the same way.
+ *
+ * Test Bench predates this and keeps its own `shapeOk()` (testBenchWebview.ts). The `mf` prefix keeps
+ * these names clear of any panel's own helpers.
+ */
+export const SHAPE_HELPERS = `
+    // PAYLOAD SHAPE (ASVS 3.5.5): required fields and their JS types. See webviewMessaging.ts.
+    function mfStr(x) { return typeof x === 'string'; }
+    function mfNum(x) { return typeof x === 'number' && Number.isFinite(x); }
+    function mfInt(x) { return Number.isSafeInteger(x); }
+    function mfBool(x) { return typeof x === 'boolean'; }
+    function mfObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
+    function mfArrOf(x, f) {
+      if (!Array.isArray(x)) { return false; }
+      // By index, not every(): every() skips holes, and a hole reaches the renderer as undefined.
+      for (let i = 0; i < x.length; i++) { if (f(x[i]) !== true) { return false; } }
+      return true;
+    }
+    // An OPTIONAL field: absent (or null) passes, present must match.
+    function mfOpt(x, f) { return x === undefined || x === null || f(x) === true; }
+    function mfShapeOk(d, key, shapes, panel) {
+      const k = d[key];
+      const check = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k) ? shapes[k] : null;
+      if (check && check(d) === true) { return true; }
+      // Named in the webview console, so a host and page that drift apart read as a discard.
+      console.warn('MessageFoundry ' + panel + ': discarded a malformed "' + String(k) + '" message');
+      return false;
+    }`;

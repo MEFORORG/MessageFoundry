@@ -203,13 +203,13 @@ async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
     row and returns None. The receipt path used to answer that with "202 without a message_id",
     telling the caller a refused body was accepted. It now answers the sync path's 422. Only the
     answer changed: the ERROR row is still the count-and-log record, and no ingress row exists."""
-    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.pipeline import ingress_guards
 
     body = JSON_BODY.encode("utf-8")
     if cause == "over_ingress_ceiling":
         # Under the listener's max_body_bytes, so the listener reads it and hands it on; over the
         # engine's ingress ceiling, so the handler refuses it after reading.
-        monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 8)
+        monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 8)
         assert 8 < len(body) < DEFAULT_MAX_BODY_BYTES
     else:
         body = b'{"mrn": "1\x0000"}'

@@ -473,6 +473,13 @@ timing parity across its outcomes has to be measured, not assumed.
   Test: to build with the chosen shape, including an arm that runs `admin-unlock` and then a new
   lock at a high cycle count and asserts a mail, and an arm that locks every 15 minutes for 25
   hours and asserts exactly two mails.
+
+  *Note, 2026-09-28 (BACKLOG #1131):* the lock rows are read only with `users:manage`, by owner
+  ruling 2026-09-28. That covers `auth.account_locked`, `auth.lock_notice`, `auth.login_locked`,
+  `auth.admin_unlocked`, and the `reason: locked` refusals of the factor and directory legs. AC-10
+  is unchanged: the engine still writes every one, and an Administrator reads them all. A reader
+  without `users:manage`, the built-in Auditor included, sees one uniform `auth.login_failed` row
+  per refused sign-in in every lock state instead. The list is `messagefoundry/auth/audit_visibility.py`.
 - **AC-10a** — WHILE a counter's lock is live, WHEN an attempt reaches the store, THE SYSTEM SHALL
   leave that lock's expiry and cycle count unchanged. Test: to build with the chosen shape, in
   `tests/_lockout_store_contract.py`.
@@ -1168,6 +1175,11 @@ ahead of wave 1** (Manager decision 2026-09-28). It must land before 6.1.1 is re
 assessor reading control 1 will reach it. The lock-state counts separate the outcomes for an
 administrator too, who can already reset that password; whether that is acceptable belongs to that
 fix.
+
+*Update, 2026-09-28:* that branch builds the per-request reason slug. The lock-event half is closed
+by owner ruling 2026-09-28, which makes the lock rows `users:manage`-only, on its own branch
+stacked on that one (see the note under AC-10). The lock-state counts stay on the `users:manage`
+surface, where the administrator reading them can already reset the password.
 
 ### Recommendation
 

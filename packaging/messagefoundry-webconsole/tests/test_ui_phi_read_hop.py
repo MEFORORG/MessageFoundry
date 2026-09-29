@@ -95,22 +95,25 @@ async def _seed(engine: Engine) -> str:
     )
 
 
-#: The seventh ``phi=True`` route, and the only non-GET one, so it is exercised on its own below
+#: The ninth ``phi=True`` route, and the only non-GET one, so it is exercised on its own below
 #: rather than in the GET loop. It rides ``require_ui_step_up`` like ``/edit`` does.
 EDIT_RESEND = "/ui/messages/{}/edit-resend"
 
 
 def _phi_routes(message_id: str) -> list[str]:
-    """The six GET-reachable console routes whose gate passes ``phi=True``, derived by reading
-    ``messagefoundry_webconsole/routes/core.py``. With :data:`EDIT_RESEND` that is SEVEN in all.
+    """The eight GET-reachable console routes whose gate passes ``phi=True``, derived by reading
+    ``messagefoundry_webconsole/routes/core.py``. With :data:`EDIT_RESEND` that is NINE in all.
+    BACKLOG #2346 added ``/summary`` and ``/body``, the detail page with a reveal declared.
 
-    Seven, not the four handlers BACKLOG #1738 names: ``parse-tree`` reaches ``get_message`` too, and
+    More than the four handlers BACKLOG #1738 names: ``parse-tree`` reaches the body fetch too, and
     the edit pair rides ``require_ui_step_up``, which builds its base as ``require_ui(*perms,
     phi=phi, ...)`` -- so a call placed in ``require_ui``'s ``phi`` arm covers the pair with no call
     site of its own. That forwarding is why the pair is asserted here rather than assumed."""
     return [
         "/ui/messages",
         f"/ui/messages/{message_id}",
+        f"/ui/messages/{message_id}/summary",
+        f"/ui/messages/{message_id}/body",
         f"/ui/messages/{message_id}/parse-tree",
         f"/ui/messages/{message_id}/attachments/deadbeef",
         "/ui/dead-letters",
@@ -136,7 +139,7 @@ async def test_an_unproven_serve_hop_refuses_every_ui_phi_route(engine: Engine) 
 async def test_the_edit_resend_post_is_refused_before_it_reads_the_stored_body(
     engine: Engine,
 ) -> None:
-    """The seventh route, and the one a GET-only loop would miss.
+    """The ninth route, and the one a GET-only loop would miss.
 
     ``POST /ui/messages/{id}/edit-resend`` re-reads the PRISTINE stored copy on its reject path, so it
     emits PHI exactly as the GET editor does. It gets the refusal from the same ``phi`` arm, and it
@@ -178,7 +181,8 @@ async def test_a_proven_serve_hop_still_serves_the_same_routes(engine: Engine) -
         # non-403: a redirect everywhere would satisfy the loop above.
         listing = await c.get("/ui/messages")
         assert listing.status_code == 200, listing.status_code
-        detail = await c.get(f"/ui/messages/{mid}")
+        # /body, because the bare detail page shows no body until the operator asks (BACKLOG #2346).
+        detail = await c.get(f"/ui/messages/{mid}/body")
         assert detail.status_code == 200, detail.status_code
         assert NEEDLE in detail.text, "the raw view served no body over a proven hop"
 
@@ -222,10 +226,13 @@ async def test_a_forbidden_actor_is_still_refused_on_permission_not_on_posture(
     mid = await _seed(engine)
     async with _client(engine, service, secure_hop=False) as c:
         await _login(c, "vw")
-        r = await c.get(f"/ui/messages/{mid}")
-        assert r.status_code == 403, r.status_code
-        assert "PHI read refused" not in r.text, "posture disclosed to an unauthorized actor"
-        assert NEEDLE not in r.text
+        # /body, the one detail route that renders the body, so the NEEDLE check can fail
+        # (BACKLOG #2346: the bare detail page never renders it). The bare page is refused too.
+        for path in (f"/ui/messages/{mid}/body", f"/ui/messages/{mid}"):
+            r = await c.get(path)
+            assert r.status_code == 403, (path, r.status_code)
+            assert "PHI read refused" not in r.text, "posture disclosed to an unauthorized actor"
+            assert NEEDLE not in r.text
 
 
 #: Two routes an OPERATOR can actually reach, so a 403 here can only come from the hop guard. Not

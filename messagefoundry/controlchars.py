@@ -155,3 +155,20 @@ def scrub_control_chars(text: str) -> str:
     deliberately -- one C-level pass, no regex engine, no backtracking and no recursion, which is
     what makes it safe on the log write guard's failure path."""
     return text.translate(_CTRL_TRANSLATION)
+
+
+def scrub_log_argument(text: str) -> str:
+    """:func:`scrub_control_chars` for one argument of a log call, with CR and LF escaped first.
+
+    The result equals ``scrub_control_chars(text)`` for every input, which
+    ``tests/test_controlchars.py`` pins. The two ``replace`` calls use the same escapes as the
+    table, and the ``translate`` then escapes every other control character.
+
+    WHY A CALL SITE NEEDS IT WHEN EVERY HANDLER ALREADY SCRUBS. ``ControlCharScrubFilter`` escapes
+    the whole record on every configured handler, so on a shipped handler this changes nothing a
+    reader sees. It matters in two places. A handler with no filter chain gets the escaped value
+    anyway. And CodeQL's ``py/log-injection`` query cannot see a handler filter: it accepts a
+    ``replace`` of a line break as the neutraliser, and it does not accept ``translate``."""
+    return scrub_control_chars(
+        text.replace("\r", _CTRL_TRANSLATION[0x0D]).replace("\n", _CTRL_TRANSLATION[0x0A])
+    )

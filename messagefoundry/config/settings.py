@@ -1702,6 +1702,8 @@ class PipelineSettings(_Section):
     # Consecutive zero-progress T17 faults before a "stop"-policy lane transitions to STOPPED. Also the
     # "retry_forever" stuck horizon at which the throttled lane_stuck alert first fires. Under the
     # exponential backoff (cap infra_fault_backoff_cap) 10 spans ~4 min of wall clock — a duration gate.
+    # Also, under EITHER policy, the consecutive claimer deaths a lane's own dispatch may cause before
+    # the dispatcher STOPs that lane (BACKLOG #2074): each death stalls the lane's siblings too.
     infra_fault_stop_after: int = Field(default=10, ge=1)
     # Cap (seconds) on fix A's exponential head re-pend backoff (base = the dispatcher's 1s lane-error
     # backoff, doubling per consecutive zero-progress fault). ~60s keeps a recovered dependency picked

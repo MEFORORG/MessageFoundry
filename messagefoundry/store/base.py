@@ -39,6 +39,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
     MAX_SCAN_LIMIT,
@@ -870,6 +871,23 @@ class QueueStore(StoreLifecycle, Protocol):
         raise a ``queue_buildup`` alert when a lane stops draining. Cheap: a single COUNT + MIN."""
         ...
 
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """The in-flight sibling of :meth:`pending_depth`, for every lane at ``stage`` at once
+        (BACKLOG #1611 part B): ``{lane: (inflight_count, oldest_claimed_at)}``, with only lanes
+        that hold an ``inflight`` row present.
+
+        ``oldest_claimed_at`` is the smallest ``updated_at`` among the lane's in-flight rows. Every
+        claim path writes ``updated_at`` in the statement that flips a row to ``inflight``, and
+        nothing rewrites it while the row stays in flight, so it is the claim time.
+
+        An in-flight row is invisible to :meth:`pending_depth`, so a row stranded by a fault between
+        its claim and its handoff used to read as a healthy lane. The runner's in-flight watch now
+        reads this age and pages the strand. This read recovers nothing: the row stays in flight until
+        one of the store's existing recovery paths re-pends it, at least :meth:`reset_stale_inflight`
+        at a restart. Lane key is stage-aware, as in :meth:`pending_depth`. One grouped read per
+        stage: in-flight rows are bounded by what is being worked, so the result is small."""
+        ...
+
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3): the message's own
         status, the awaited destination's outbound row states, and the highest committed
@@ -1638,8 +1656,13 @@ class AuditStore(Protocol):
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally scoped (BACKLOG #170).
+
+        ``exclude`` leaves rows out inside the query, before ``limit`` (BACKLOG #1131): an API read by
+        a caller without ``users:manage`` passes the lock rows here. Internal readers pass nothing
+        and see every row.
 
         The optional filters — ``actor`` (exact identity), ``action`` (exact event type), and an
         inclusive time window ``since <= ts <= until`` (``ts`` is the epoch-float audit column on

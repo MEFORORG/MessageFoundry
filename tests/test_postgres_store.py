@@ -547,6 +547,18 @@ async def test_reset_stale_inflight_recovers(store) -> None:
     assert (await store.outbox_for(item.message_id))[0]["status"] == OutboxStatus.PENDING.value
 
 
+async def test_inflight_by_lane_reports_claim_time(store) -> None:
+    # BACKLOG #1611 part B, SQLite parity: in-flight rows only, aged from the claim, not the enqueue.
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {}
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "q")], now=150.0)
+    await store.claim_next_fifo("OB1", now=500.0)
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB1": (1, 500.0)}
+    assert await store.inflight_by_lane(stage=Stage.INGRESS.value) == {}
+    await store.reset_stale_inflight(now=600.0)
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {}
+
+
 # --- H1: store-checked leader epoch (fencing token) ---------------------------
 
 
@@ -5072,3 +5084,32 @@ async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(s
                     await conn.execute(
                         "DELETE FROM cipher_meta WHERE key_id = $1", c.invocation_key_id
                     )
+
+
+async def test_list_audit_exclusion_runs_in_sql_before_limit_pg(store) -> None:
+    """BACKLOG #1131: the users:manage-only exclusion on the real backend. A whole-action hide, an
+    exact (action, detail) hide, a NULL-detail row of the same action that must survive, and a
+    LIMIT that counts only the rows left."""
+    from messagefoundry.store.audit_exclusion import AuditExclusion
+
+    ex = AuditExclusion(
+        actions=frozenset({"auth.account_locked"}),
+        rows=frozenset({("auth.mfa_failed", '{"reason": "locked"}')}),
+    )
+    who = "x1131-pg"
+    for action, detail in (
+        ("auth.mfa_failed", None),
+        ("auth.mfa_failed", '{"reason": "expired"}'),
+        ("auth.account_locked", '{"provider": "local"}'),
+        ("auth.mfa_failed", '{"reason": "locked"}'),
+        ("auth.login_failed", '{"reason": "locked"}'),
+    ):
+        await store.record_audit(action, actor=who, detail=detail)
+    rows = await store.list_audit(actor=who, exclude=ex, limit=10)
+    assert [(r["action"], r["detail"]) for r in rows] == [
+        ("auth.login_failed", '{"reason": "locked"}'),
+        ("auth.mfa_failed", '{"reason": "expired"}'),
+        ("auth.mfa_failed", None),
+    ]
+    assert len(await store.list_audit(actor=who, exclude=ex, limit=2)) == 2
+    assert len(await store.list_audit(actor=who, limit=10)) == 5

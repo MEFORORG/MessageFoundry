@@ -25,6 +25,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
     LOGIN_AFTER_FAILURES,
+    NOTICE_KIND_LOG_LABELS,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
     ROLES_CHANGED,
@@ -599,6 +600,87 @@ async def test_notifier_failure_is_isolated_from_the_auth_op() -> None:
         assert await store.get_user_role_ids("u1") == ["viewer"]
     finally:
         await store.close()
+
+
+class _AddressQuotingNotifier:
+    """A notifier that raises with the event's address and detail in its message."""
+
+    async def notify(self, event: SecurityEvent) -> None:
+        raise RuntimeError(f"cannot mail {event.email}: {event.detail}")
+
+
+async def test_a_failed_notice_logs_the_kind_the_account_and_the_exception_class_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The failure warning names the notice kind, the account and the exception's CLASS. It never
+    carries the exception's text or traceback, which a notifier may fill with the recipient's
+    address or an EMAIL_CHANGED ``detail``."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(), security_notifier=_AddressQuotingNotifier())  # type: ignore[arg-type]
+        await _local_user(store)
+        with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
+            await service.update_user(
+                "u1",
+                display_name=None,
+                email="repointed@example.net",
+                disabled=None,
+                actor="admin",
+            )
+        failed = [r for r in caplog.records if r.name == _AUTH_LOGGER]
+        assert len(failed) == 1
+        assert failed[0].getMessage() == (
+            f"security-event notification failed ({EMAIL_CHANGED} for bob): RuntimeError"
+        )
+        assert failed[0].exc_info is None and failed[0].exc_text is None
+        assert "repointed@example.net" not in caplog.text
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("notifier", [None, _BoomNotifier()], ids=["no-notifier", "failed"])
+async def test_the_two_notice_warnings_escape_a_line_break_in_the_username(
+    caplog: pytest.LogCaptureFixture, notifier: _BoomNotifier | None
+) -> None:
+    """An administrator picks a username freely at create, so it can hold CR or LF. Both warnings
+    escape them at the call site, and an unknown kind is logged as ``unrecognised``, not echoed."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)  # type: ignore[arg-type]
+        with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
+            await service._notify_security(PASSWORD_CHANGED, username="bob\r\nforged", email=None)
+            await service._notify_security("free-form kind", username="bob", email=None)
+        records = [r for r in caplog.records if r.name == _AUTH_LOGGER]
+        # The ARGS, not only the rendered line: a scrub filter left on a root handler by another
+        # test would clean the rendered message even with the call-site scrub removed.
+        assert [r.args[:2] if isinstance(r.args, tuple) else r.args for r in records] == [
+            (PASSWORD_CHANGED, "bob\\r\\nforged"),
+            ("unrecognised", "bob"),
+        ]
+        lines = [r.getMessage() for r in records]
+        assert f"{PASSWORD_CHANGED} for bob\\r\\nforged" in lines[0]
+        assert "\r" not in lines[0] and "\n" not in lines[0]
+        assert "unrecognised for bob" in lines[1]
+        assert "free-form kind" not in lines[1]
+    finally:
+        await store.close()
+
+
+def test_every_notice_kind_has_a_log_label_equal_to_itself() -> None:
+    """The log names a kind through ``NOTICE_KIND_LOG_LABELS``. A kind missing from it would log as
+    ``unrecognised``, and a label that differed from its kind would change what the line says."""
+    from messagefoundry.auth import notifications
+
+    kinds = {
+        value
+        for name, value in vars(notifications).items()
+        if not name.startswith("_") and name.isupper() and isinstance(value, str)
+    }
+    assert len(kinds) >= 8, f"the notice-kind set collapsed to {sorted(kinds)}"
+    assert dict(NOTICE_KIND_LOG_LABELS) == {kind: kind for kind in kinds}
+    assert {kind: notifications.notice_kind_log_label(kind) for kind in kinds} == {
+        kind: kind for kind in kinds
+    }
 
 
 async def test_missing_notifier_reports_the_drop_rather_than_swallowing_it(

@@ -135,6 +135,9 @@ EXACT_RULES: dict[str, str] = {
     # reaches it carries the token. That makes the gate a tripwire for a file whose only route to
     # it is gone, not for each call site: a file with two routes keeps its token when one goes.
     "messagefoundry.keywrap.key_wrap_refusal": "key_cert",
+    # The same parse for a PKCS#12 bundle's MAC and bags, and for an SSH key's encryption header.
+    "messagefoundry.keywrap.pkcs12_wrap_refusal": "key_cert",
+    "messagefoundry.keywrap.ssh_key_encrypted": "key_cert",
 }
 
 #: Qualified-name PREFIXES, longest match wins. A prefix ends in ``.`` so ``hashlib.`` cannot match

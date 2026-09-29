@@ -70,6 +70,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
@@ -9661,6 +9662,17 @@ class SqlServerStore:
         oldest = row["m"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
 
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol). Routed
+        through ``_fetchall`` for the same RCSI read hygiene as :meth:`pending_depth`."""
+        lane_col = self._lane_col(stage)  # code-controlled literal
+        rows = await self._fetchall(
+            f"SELECT {lane_col} AS lane, COUNT(*) AS c, MIN(updated_at) AS m FROM queue"
+            f" WHERE stage=? AND status=? GROUP BY {lane_col}",
+            (stage, OutboxStatus.INFLIGHT.value),
+        )
+        return {str(r["lane"]): (int(r["c"]), float(r["m"])) for r in rows}
+
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
 
@@ -10955,6 +10967,7 @@ class SqlServerStore:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> list[dict[str, Any]]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
 
@@ -10975,6 +10988,14 @@ class SqlServerStore:
         if until is not None:
             clauses.append("ts <= ?")
             params.append(until)
+        if exclude is not None:
+            # After TOP (?)'s value in ``params``, which is the order the placeholders appear in.
+
+            def bind(value: str) -> str:
+                params.append(value)
+                return "?"
+
+            clauses.extend(exclude.clauses(bind))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT TOP (?) * FROM audit_log{where} ORDER BY id DESC"
         return await self._fetchall(sql, tuple(params))

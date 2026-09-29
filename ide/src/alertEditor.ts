@@ -11,7 +11,8 @@
 // at startup, so it takes effect on the next engine restart (not via Promote/reload) — the UI says so.
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
-import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
+import { openChannel, postToWebview } from "./webviewMessaging";
+import { alertEditorScript } from "./alertEditorWebview";
 
 const EVENT_TYPES = [
   "any",
@@ -144,10 +145,6 @@ async function remove(index: number, current: vscode.WebviewPanel): Promise<void
   await refresh(current);
 }
 
-function embed(value: unknown): string {
-  return JSON.stringify(value ?? null).replace(/</g, "\\u003c");
-}
-
 function formHtml(webview: vscode.Webview): string {
   const { nonce: n, token } = openChannel(webview);
   return `<!DOCTYPE html>
@@ -229,96 +226,7 @@ function formHtml(webview: vscode.Webview): string {
     <button id="close" class="secondary">Close</button>
   </div>
 
-  <script nonce="${n}">
-    const vscode = acquireVsCodeApi();${guardScript(token)}
-    const EVENT_TYPES = ${embed(EVENT_TYPES)};
-    const SEVERITIES = ${embed(SEVERITIES)};
-    const $ = (id) => document.getElementById(id);
-    const errorEl = $('error');
-
-    for (const t of EVENT_TYPES) { const o = document.createElement('option'); o.value = t; o.textContent = t; $('event_type').appendChild(o); }
-    for (const s of SEVERITIES) { const o = document.createElement('option'); o.value = s; o.textContent = s; $('severity').appendChild(o); }
-    $('severity').value = 'warning';
-
-    function transportsValue(sel) {
-      switch (sel) {
-        case 'webhook': return ['webhook'];
-        case 'email': return ['email'];
-        case 'both': return ['webhook', 'email'];
-        case 'suppress': return [];        // [] = suppress
-        default: return undefined;          // omit = all configured
-      }
-    }
-    function transportsLabel(t) {
-      if (t === undefined || t === null) return 'all';
-      if (t.length === 0) return 'suppress';
-      return t.join(', ');
-    }
-    const num = (id) => { const v = $(id).value.trim(); return v === '' ? undefined : Number(v); };
-
-    function build() {
-      const rule = {
-        event_type: $('event_type').value,
-        connection: $('connection').value.trim(),
-        severity: $('severity').value,
-      };
-      const d = num('min_depth'); if (d !== undefined) rule.min_depth = d;
-      const a = num('min_oldest_seconds'); if (a !== undefined) rule.min_oldest_seconds = a;
-      const c = num('cooldown_seconds'); if (c !== undefined) rule.cooldown_seconds = c;
-      const t = transportsValue($('transports').value); if (t !== undefined) rule.transports = t;
-      return rule;
-    }
-
-    function validate(rule) {
-      if (!rule.connection) { show('Connection is required (use * for all).'); return false; }
-      for (const [k, label] of [['min_depth','Min depth'],['min_oldest_seconds','Min oldest'],['cooldown_seconds','Cooldown']]) {
-        if (rule[k] !== undefined && !Number.isFinite(rule[k])) { show(label + ' must be a number.'); return false; }
-      }
-      errorEl.style.display = 'none';
-      return true;
-    }
-    function show(msg) { errorEl.textContent = msg; errorEl.style.display = ''; }
-
-    function renderRules(rules) {
-      const tbody = $('rows');
-      tbody.innerHTML = '';
-      $('empty').style.display = rules.length ? 'none' : '';
-      $('rules').style.display = rules.length ? '' : 'none';
-      for (const r of rules) {
-        const tr = document.createElement('tr');
-        const cells = [
-          r.index,
-          r.event_type || 'any',
-          r.connection || '*',
-          r.min_depth == null ? '' : r.min_depth,
-          r.min_oldest_seconds == null ? '' : r.min_oldest_seconds,
-          r.severity || 'warning',
-          transportsLabel(r.transports),
-          r.cooldown_seconds == null ? '' : r.cooldown_seconds,
-        ];
-        cells.forEach((text, i) => { const td = document.createElement('td'); if (i === 0) td.className = 'idx'; td.textContent = String(text); tr.appendChild(td); });
-        const tdBtn = document.createElement('td');
-        const rm = document.createElement('button'); rm.className = 'rm'; rm.textContent = 'Remove';
-        rm.addEventListener('click', () => vscode.postMessage({ command: 'remove', index: r.index }));
-        tdBtn.appendChild(rm); tr.appendChild(tdBtn);
-        tbody.appendChild(tr);
-      }
-    }
-
-    $('add').addEventListener('click', () => {
-      const rule = build();
-      if (!validate(rule)) return;
-      vscode.postMessage({ command: 'add', rule });
-    });
-    $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
-
-    ${WEBVIEW_GUARD_NOTE}
-    window.addEventListener('message', (e) => {
-      const d = mfTrusted(e);
-      if (!d) { return; }
-      if (d.command === 'rules') { renderRules(d.rules || []); errorEl.style.display = 'none'; }
-      else if (d.command === 'error') { show(d.message); }
-    });
+  <script nonce="${n}">${alertEditorScript(token, EVENT_TYPES, SEVERITIES)}
   </script>
 </body>
 </html>`;

@@ -16,7 +16,8 @@ import io
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -94,6 +95,7 @@ from messagefoundry.auth import (
     Permission,
     Role,
 )
+from messagefoundry.auth.audit_visibility import audit_exclusion_for
 from messagefoundry.auth.ldap import LdapError
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
@@ -126,6 +128,13 @@ from messagefoundry.store.store import SessionRecord, UserRecord
 _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
+
+#: What ``/auth/mfa-verify`` and ``/me/reauth`` say when ``Elevation.directory_unconfirmed`` is set
+#: (BACKLOG #2023, #2027): the directory could not vouch for the account, so the proof was never
+#: checked. It names no directory internals; the precise reason is on the audit row.
+_DIRECTORY_UNCONFIRMED_DETAIL = (
+    "the directory could not confirm this account; try again later, or ask an administrator"
+)
 
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
@@ -560,7 +569,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         period. Rate-limited like the password change; a failure is a 403 that counts against this
         session's re-proof budget, and toward the account lockout unless the sign-in lock is already
         live. The failure that exhausts the budget ends the session with a 401 (BACKLOG #1138).
-        Neither account lock refuses it.
+        Neither account lock refuses it. A directory re-bind the directory could not judge is also a
+        403, saying so, and charges nothing (BACKLOG #2027).
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -595,6 +605,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     "this session was signed in through the identity provider; re-authenticate"
                     " there through the web console at /ui/reauth, not with a password",
                 )
+            if elevation.directory_unconfirmed:
+                # BACKLOG #2027: the directory could not judge the password, so "failed" would
+                # call a password wrong that was never checked. Same words as /auth/mfa-verify's
+                # directory refusal; the precise reason is on the audit row only.
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         return ElevatedResponse(detail="re-verified", token=elevation.token)
 
@@ -628,11 +643,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
                 # 403 rather than the 401 that would send the client back to sign-in.
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "the directory could not confirm this account; try again later, or ask an"
-                    " administrator",
-                )
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"
@@ -1438,8 +1449,36 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     # --- audit ---------------------------------------------------------------
 
+    async def _read_audit(
+        service: AuthService,
+        identity: Identity,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> Sequence[Any]:
+        """THE ONE READ OF THE TRAIL FOR A CALLER. ``GET /audit``, the console's ``/ui/audit`` and
+        ``GET /audit/export`` all come through here, so none of them can skip the owner-ruled lock-row
+        exclusion of 2026-09-28 (BACKLOG #1131; :mod:`messagefoundry.auth.audit_visibility`). It is
+        keyed on ``identity``, which is why this takes one: a caller without ``users:manage`` gets
+        the trail minus the lock rows, applied in SQL before ``limit`` so a page is never short.
+
+        Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
+        across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
+        return await service.store.list_audit(
+            limit=limit,
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=audit_exclusion_for(identity),
+        )
+
     async def _audit_list(
         service: AuthService,
+        identity: Identity,
         *,
         limit: int = 100,
         actor: str | None = None,
@@ -1447,11 +1486,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         since: float | None = None,
         until: float | None = None,
     ) -> AuditList:
-        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper. Every value
-        # is passed as a keyword to the store, which binds it as a SQL parameter across all three backends
-        # (BACKLOG #170) — filters are never string-interpolated into the query.
-        rows = await service.store.list_audit(
-            limit=limit, actor=actor, action=action, since=since, until=until
+        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
+        rows = await _read_audit(
+            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
         )
         return AuditList(
             entries=[
@@ -1470,7 +1507,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.get("/audit", response_model=AuditList)
     async def list_audit(
         service: AuthService = Depends(_service),
-        _: Identity = Depends(require(Permission.AUDIT_READ)),
+        identity: Identity = Depends(require(Permission.AUDIT_READ)),
         limit: int = Query(100, ge=1, le=1000),
         actor: ActorFilter | None = Query(None),
         action: ActionFilter | None = Query(None),
@@ -1482,7 +1519,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ),
     ) -> AuditList:
         return await _audit_list(
-            service, limit=limit, actor=actor, action=action, since=since, until=until
+            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
         )
 
     async def _audit_ui_list(*, service: AuthService, _: Identity, limit: int = 100) -> AuditList:
@@ -1494,8 +1531,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # there is no second page to reach and no total to compare against. Filter + CSV export are the
         # JSON GET /audit surface, and the export is what produces a complete record. AUDIT_READ is
         # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
-        # dependency of its own.
-        return await _audit_list(service, limit=limit)
+        # dependency of its own. The identity it is handed is the page's caller, and it decides which
+        # rows that caller may read (BACKLOG #1131).
+        return await _audit_list(service, _, limit=limit)
 
     @app.get("/audit/export")
     async def export_audit(
@@ -1521,9 +1559,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         channel_id, client, detail`` — the exact columns ``GET /audit`` already returns; the audit writers store
         only filter shapes / counts / ids in ``detail`` (never a raw message body), so no PHI leaves on
         this path. The export itself is recorded as an ``audit.export`` event (who, which filter, how
-        many rows)."""
-        rows = await service.store.list_audit(
-            limit=limit, actor=actor, action=action, since=since, until=until
+        many rows).
+
+        A caller without ``users:manage`` exports the trail without the lock rows, exactly as it reads
+        it (BACKLOG #1131), and ``count`` is the number of rows it received."""
+        rows = await _read_audit(
+            service, identity, limit=limit, actor=actor, action=action, since=since, until=until
         )
         # Record the export as its own audit event BEFORE streaming — the detail is metadata only (the
         # applied filter + row count), never a message body.

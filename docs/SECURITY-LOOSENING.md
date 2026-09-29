@@ -719,7 +719,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
 - **How it is detected, precisely:** a TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) whose
   **value** is not one of the known no-TLS spellings. The value check matters: matching the key alone
-  read `SSLmode=disable` as TLS ownership. **Known residual:** an *encrypted-but-unverified* value
+  read `SSLmode=disable` as TLS ownership. A passphrase-shaped key such as `sslpassword` is not
+  TLS-shaped for this check, and its value is never classified or reported (BACKLOG #1352).
+  **Known residual:** an *encrypted-but-unverified* value
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
   for "verified" are not consistent enough to grade without guessing.
 - **It is never silent:** a WARN at each construction naming the connection and the offending keyword;

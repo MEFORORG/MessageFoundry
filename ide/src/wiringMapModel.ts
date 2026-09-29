@@ -290,3 +290,38 @@ export function buildWiringMap(g: Graph, focus: MapFocus | null, hops: number = 
 
   return { columns, edges, truncated, focusMissing: false };
 }
+
+/** The one message the Wiring Map host posts to its webview: the focused map plus every element name. */
+// A type alias rather than an interface, so it passes straight to postToWebview's Record parameter.
+export type WiringMapPayload = {
+  type: "map";
+  /** Null when no graph is loaded yet; the webview says so rather than drawing nothing. */
+  map: WiringMap | null;
+  focus: MapFocus | null;
+  /** Every element, in pipeline order, for the jump-to search box. */
+  names: MapFocus[];
+};
+
+/**
+ * Build the `map` message from the provider's current graph. Pure, so the webview's shape check can
+ * be tested against exactly what the host posts (webview-receivers.test.ts).
+ */
+export function wiringMapPayload(g: Graph | undefined, focus: MapFocus | null): WiringMapPayload {
+  const map = g ? buildWiringMap(g, focus, MAX_HOPS) : null;
+  const names: MapFocus[] = [];
+  if (g) {
+    for (const c of g.inbound) {
+      names.push({ kind: "inbound", name: c.name });
+    }
+    for (const r of g.routers) {
+      names.push({ kind: "router", name: r.name });
+    }
+    for (const h of g.handlers) {
+      names.push({ kind: "handler", name: h.name });
+    }
+    for (const o of g.outbound) {
+      names.push({ kind: "outbound", name: o.name });
+    }
+  }
+  return { type: "map", map, focus, names };
+}

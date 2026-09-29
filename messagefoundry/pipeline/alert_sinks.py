@@ -140,12 +140,16 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
 
-    def _enqueue(self, item: _T, *, dropped: str) -> None:
-        """Non-blocking enqueue; on a full queue, drop the item with a warning (``dropped`` names it)."""
+    def _enqueue(self, item: _T, *, dropped: str | None) -> None:
+        """Non-blocking enqueue; on a full queue, drop the item with a warning (``dropped`` names it).
+
+        ``dropped=None`` drops without a line, for an item whose drop must not show in the general
+        log (a lock notice, BACKLOG #1131; see ``auth.notifications.LOG_SILENT_EVENT_TYPES``)."""
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
-            log.warning("%s queue full; dropping %s", type(self).__name__, dropped)
+            if dropped is not None:
+                log.warning("%s queue full; dropping %s", type(self).__name__, dropped)
 
     def start(self) -> None:
         if self._task is None:
@@ -429,6 +433,11 @@ class WebhookTransport:
             drain_bounded(resp, connector=f"alert webhook {host}")
 
 
+#: The name the alerts SMTP hop logs under. The security notifier registers its verification-off
+#: warning under the same name at construction (BACKLOG #1131), so the two must not drift.
+ALERTS_SMTP_CELL = "alerts SMTP transport"
+
+
 def send_plain_email(
     *,
     host: str,
@@ -502,7 +511,7 @@ def send_plain_email(
     tls_context = (
         build_smtp_tls_context(
             host=host,
-            cell="alerts SMTP transport",
+            cell=ALERTS_SMTP_CELL,
             verify=tls_verify,
             ca_file=tls_ca_file,
             trust_anchor_policy=trust_anchor_policy,
@@ -532,7 +541,7 @@ def send_plain_email(
                 username,
                 password or "",
                 channel_encrypted=use_tls,
-                cell="alerts SMTP transport",
+                cell=ALERTS_SMTP_CELL,
             )
         smtp.send_message(msg)
 

@@ -540,9 +540,13 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
   chunk carries its own tag and the attachment's `id` is the SHA-256 of the **verbatim plaintext**, so a
   re-seal (rotation) never changes the content address. `shared_body.body` is likewise addressed by the
   plaintext hash.
-- **Confidentiality / access.** `messages.raw` and `queue.payload` are read through the audited
-  `GET /messages/{id}` path under `messages:view_raw` + `require_phi_read` (the PHI-read hop guard +
-  per-actor pacing) + per-channel scope. A detached document is the **same PHI**, so
+- **Confidentiality / access.** `messages.raw` is read through the audited
+  `GET /messages/{id}/raw` path under `messages:view_raw` + `require_phi_read` (the PHI-read hop guard +
+  per-actor pacing) + per-channel scope. That route writes a `record_view` and a `message_body_view`
+  audit row naming the `surface` that asked. Opening a message, `GET /messages/{id}`, returns its
+  metadata and no body, and writes `message_view` (BACKLOG #2345). The open returns `summary` and
+  `metadata` masked, as the list does, unless the caller passes `reveal_summary=true`; the
+  `message_view` row lists in `revealed` the properties it returned complete (BACKLOG #2346). A detached document is the **same PHI**, so
   `GET /messages/{message_id}/attachments/{attachment_id}` rides the *same* `messages:view_raw` gate and
   channel scope, **plus a `message_attachment` linkage check** — a guessed content address that is not
   linked to an in-scope message is a 404 — and writes a `record_view` **and** an `attachment_download`
@@ -557,7 +561,7 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
   *shape*, body count) **before** streaming — the code calls it the largest PHI surface in the
   cluster. The transformed outbound payload (`queue.payload`, stage `outbound`) is read by its own
   route, `GET /messages/{message_id}/outbound`, under `messages:view_raw` + `require_phi_read`,
-  audited `outbound.read` — not by `GET /messages/{id}`.
+  audited `outbound.read` — not by `GET /messages/{id}/raw`.
 - **Retention / destruction.** `messages.raw` is blanked in place by `purge_message_bodies`;
   `queue.payload` is blanked for done/cancelled outbound rows in the same transaction, and for dead rows
   at **every** stage by `purge_dead_letters`; `response.body` is set to `NULL` in place by the same pass;
@@ -944,7 +948,7 @@ The engine serves a same-origin, **read-only** browser ops dashboard under `/ui`
 binds; on an exposed instance a default-on console auto-degrades to JSON-only unless explicitly enabled
 with TLS + a public origin. It is a client of the existing API and reuses every server-side PHI
 control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redaction, the per-access
-`message_view` audit, the `require_phi_read` throttle). The browser-specific PHI rules:
+`message_view` and `message_body_view` audits, the `require_phi_read` throttle). The browser-specific PHI rules:
 
 - **No PHI in browser storage.** The session token lives in an **HttpOnly + SameSite=Strict** cookie
   JS cannot read (`mf_session`). **One** thing is written to `localStorage`, deliberately and
@@ -974,9 +978,24 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   see.** The route test reads a field only when its name is a rated column's name. The credential
   test reads only the credential field names it lists. A route outside the prefix families with no
   response model is outside both. Those shapes rest on review.
-- **Audited raw view only.** A raw message body is shown only via the same audited `GET /messages/{id}`
-  path as the desktop console (record_view + tamper-evident `message_view` audit); there is no second,
-  unaudited PHI render path (no server-side parse-tree endpoint in M1).
+- **Audited raw view only.** A raw message body is shown only via the same audited body fetch the
+  JSON API serves at `GET /messages/{id}/raw` (record_view + a tamper-evident `message_body_view` audit
+  row whose `surface` is `console`); there is no second, unaudited PHI render path.
+- **The body and the summary appear only on an explicit act (BACKLOG #2346, ASVS 14.2.6).** Opening
+  a message at `/ui/messages/{id}` shows its metadata with the summary masked and no body. That is
+  where the dead-letter "view" link, the redirect after a replay or an edit-resend, and a typed bare
+  URL land. The message list and content search link from the masked summary to
+  `/ui/messages/{id}/summary`, which reveals the summary. The detail page's "Show raw message" link
+  is `/ui/messages/{id}/body`, which shows the body and the summary. The parse-tree and edit pages
+  exist to show the body. What each message route reveals is declared once, in
+  `routes.core.UI_MESSAGE_REVEALS`. The console's body helper refuses a route that does not
+  declare `body`, and a source test fails if a route handler calls the engine's open or body
+  fetch around those helpers. A detached attachment has its own audited download route and no
+  row in that table. A reveal is a request, never a setting, so it does not carry to the next page.
+  The reveal addresses are ordinary GETs. Going back to one (history, a restored tab) is usually
+  a new request, audited and charged like the first, but a browser may also redisplay the page
+  from its back-forward cache without asking the engine, and then nothing is audited.
+  The test harness does the same with a Show body button.
 - **Attachments are neutralized at serve; the stored document is never rewritten.** A detached document (ADR 0105) is a
   verbatim clinical payload carrying its own attacker-influenced `OBX-5.2` MIME label, and the
   preserve-the-original invariant forbids editing the stored bytes — so the browser-safety control runs
@@ -1013,7 +1032,11 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
 **`[BUILT]`** (one cleanup)
 
 Every PHI access is recorded in the append-only `audit_log` with the **acting user**:
-`message_view` (raw body), `summary_access` (patient summaries), plus the auth and admin events
+`message_view` (opening one message, with `revealed` listing which of `summary` and `metadata`
+that open returned complete), `message_body_view` (its raw body, with a `surface` naming
+which client asked: `harness`, `apiclient` or `api` as the HTTP caller declares it, or `console`,
+which the engine records itself for the web console), `summary_access` (patient summaries),
+plus the auth and admin events
 listed in [SECURITY.md](SECURITY.md). Each row carries actor, action, timestamp, channel, the
 caller's `client` address, and a JSON `detail` (filters, counts, exposed control IDs — **not** the
 bodies). Read the trail via `GET /audit` (`audit:read`).

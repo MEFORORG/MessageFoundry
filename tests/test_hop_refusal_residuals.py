@@ -175,12 +175,13 @@ async def test_api_prod_phi_insecure_hop_refuses_raw_view(engine: Engine) -> Non
     # Production-PHI instance whose serve hop is NOT proven secure → the raw view is REFUSED (403), and
     # the PHI body never leaves.
     async with _client(engine, ai=AiSettings(environment="prod"), secure=False) as c:
-        r = await c.get(f"/messages/{mid}")
+        r = await c.get(f"/messages/{mid}/raw")
         assert r.status_code == 403
         assert "PHI read refused" in r.json()["detail"]
         assert ADT not in r.text
         # The summary list + attachment download ride the same folded guard.
         assert (await c.get("/messages")).status_code == 403
+        assert (await c.get(f"/messages/{mid}")).status_code == 403  # the open (BACKLOG #2345)
         assert (await c.get(f"/messages/{mid}/attachments/deadbeef")).status_code == 403
 
 
@@ -189,7 +190,7 @@ async def test_api_prod_phi_secure_hop_serves_raw_view(engine: Engine) -> None:
     # The SAME prod-PHI instance over a secure serve hop (loopback / TLS) serves the raw body: the guard
     # only bites the insecure hop, so a properly-exposed prod instance is unaffected.
     async with _client(engine, ai=AiSettings(environment="prod"), secure=True) as c:
-        r = await c.get(f"/messages/{mid}")
+        r = await c.get(f"/messages/{mid}/raw")
         assert r.status_code == 200
         assert r.json()["raw"] == ADT
 
@@ -201,7 +202,7 @@ async def test_api_dev_insecure_hop_refuses_exactly_as_prod_does(engine: Engine)
     # is no such declaration now, so `dev` takes the same 403 `prod` takes three tests above -- and
     # the PHI body still never leaves.
     async with _client(engine, ai=AiSettings(environment="dev"), secure=False) as c:
-        r = await c.get(f"/messages/{mid}")
+        r = await c.get(f"/messages/{mid}/raw")
         assert r.status_code == 403
         assert "PHI read refused" in r.json()["detail"]
         assert ADT not in r.text
@@ -212,7 +213,7 @@ async def test_api_dev_secure_hop_still_serves(engine: Engine) -> None:
     # ...and the loopback default every developer actually runs is untouched, which is what keeps
     # the refusal above a gate on EXPOSURE rather than a gate on the environment name.
     async with _client(engine, ai=AiSettings(environment="dev"), secure=True) as c:
-        r = await c.get(f"/messages/{mid}")
+        r = await c.get(f"/messages/{mid}/raw")
         assert r.status_code == 200
         assert r.json()["raw"] == ADT
 
