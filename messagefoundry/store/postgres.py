@@ -5506,6 +5506,19 @@ class PostgresStore:
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
 
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol). Every claim
+        writes ``updated_at`` with the lease, and no lease renewal rewrites it, so the smallest
+        ``updated_at`` is the oldest claim time."""
+        lane_col = self._lane_col(stage)
+        rows = await self._fetchall(
+            f"SELECT {lane_col} AS lane, COUNT(*) AS n, MIN(updated_at) AS oldest FROM queue"
+            f" WHERE stage=$1 AND status=$2 GROUP BY {lane_col}",
+            stage,
+            OutboxStatus.INFLIGHT.value,
+        )
+        return {str(r["lane"]): (int(r["n"]), float(r["oldest"])) for r in rows}
+
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
 

@@ -253,6 +253,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   schema, as excess. Set `schema_management = "auto"` to keep the engine building its own schema;
   on a server DB that is reported by `security_loosenings()` as `schema_management`.
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
+- **A row stranded in flight now pages.** A store fault between a committed claim and its handoff
+  can leave a row `inflight` when the re-pend that follows fails too. A restart recovers it, and
+  until now nothing saw it: the buildup and stall checks counted pending rows only, and ran only
+  when the lane processed something. The engine now reads each stage's in-flight rows every 30 s,
+  on every store backend. It fires `queue_buildup` when a row has been held longer than the lane's
+  buildup `max_oldest_seconds`, which is on by default at 300 s. An outbound lane also fires
+  `message_stall` on its stall threshold, when one is set. The age runs from the claim, so a row
+  being worked right now does not page. The log line names the stage. This change re-pends
+  nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,

@@ -493,6 +493,26 @@ _DEFAULT_TRANSFORM_CONCURRENCY = 1
 # is process-exit only, and the buildup/stall alerts fire only in the owner's delivery path.
 _SHARD_WATCHDOG_INTERVAL_SECONDS = 30.0
 
+# BACKLOG #1611 part B: how often the in-flight watch reads each stage's in-flight rows. Every other
+# buildup and stall check runs only from a lane's own processing path, and a stranded in-flight row
+# is exactly a lane that has stopped processing, so this one has to run on its own clock.
+_INFLIGHT_WATCH_INTERVAL_SECONDS = 30.0
+
+
+def _log_inflight_strand(stage: str, name: str, count: int, age: float) -> None:
+    """The in-flight watch's log line. The alert payloads carry no stage and do not say the rows are
+    in flight rather than pending, so this line does. Lane name and counts only, never content."""
+    log.warning(
+        "%d row(s) held in flight on %s lane %r, oldest claimed %.0fs ago with no handoff; "
+        "a stranded row stays in flight until a store recovery path re-pends it, at least a "
+        "restart",
+        count,
+        stage,
+        name,
+        age,
+    )
+
+
 # WS-C empty-claim storm (2026-07-02 bench finding; amends ADR 0061). With per-lane wake ON, a
 # committed row wakes ITS lane's worker directly, so the poll backstop is no longer the normal-case
 # latency path — it is only a lost-wake SAFETY NET. At connection scale a short backstop makes
@@ -1352,6 +1372,8 @@ class RegistryRunner:
         self._conn_events_dropped = 0
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
         self._shard_watchdog: asyncio.Task[None] | None = None
+        # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
+        self._inflight_watch: asyncio.Task[None] | None = None
         # #122 (ADR 0162): fail-closed application-log write guard. The escalation arrives on whatever
         # thread was logging, so the response is bounced onto this runner's loop as a task; the latch
         # makes the stop fire once per break rather than once per dropped record.
@@ -3635,6 +3657,12 @@ class RegistryRunner:
             if self._connection_events:
                 self._conn_event_q = asyncio.Queue(maxsize=_CONN_EVENT_QUEUE_MAX)
                 self._conn_event_drainer = asyncio.create_task(self._connection_event_drainer())
+            # BACKLOG #1611 part B: page on a row stranded in flight. At most four grouped reads per
+            # tick, and none when every age threshold is off. A task left by a teardown that did not
+            # finish (ADR 0157 D7) is cancelled first, so two watches never page the same strand.
+            if self._inflight_watch is not None:
+                self._inflight_watch.cancel()
+            self._inflight_watch = asyncio.create_task(self._inflight_watch_loop())
             if self.registry.shard_id is not None:
                 # ADR 0073 sharded-mode extras: page on a non-owned lane backing up (a hung owner is
                 # invisible to the supervisor and never pages itself), and warn on the per_lane_wake
@@ -4130,6 +4158,10 @@ class RegistryRunner:
             self._shard_watchdog.cancel()
             await asyncio.gather(self._shard_watchdog, return_exceptions=True)
             self._shard_watchdog = None
+        if self._inflight_watch is not None:
+            self._inflight_watch.cancel()
+            await asyncio.gather(self._inflight_watch, return_exceptions=True)
+            self._inflight_watch = None
         for connector in self._destinations.values():
             await connector.aclose()
         # ADR 0071 B5: tear down the per-stage fusing executors + drop the dedicated synchronous handoff
@@ -7892,11 +7924,33 @@ class RegistryRunner:
         )
         if not crossed:
             return
+        self._fire_buildup(key, name, depth=depth, age=oldest_age or 0.0, now=now)
+
+    def _fire_buildup(self, key: str, name: str, *, depth: int, age: float, now: float) -> None:
+        """Arm the ``(stage, lane)`` re-alert throttle ``key`` and emit ``queue_buildup``. The pending
+        check and the in-flight watch both fire through here, so one lane pages once per window
+        whichever saw it first. A sink must never raise (contract); the guard keeps an alerting bug
+        from killing the caller.
+
+        The throttle is checked again here because a pending check awaits its store read between its
+        own check and this call, and the in-flight watch can fire the same key inside that await."""
+        if now < self._next_buildup_alert.get(key, 0.0):
+            return
         self._next_buildup_alert[key] = now + _BUILDUP_REALERT_SECONDS
         try:
-            self._alert_sink.queue_buildup(name, depth=depth, oldest_age_seconds=oldest_age or 0.0)
+            self._alert_sink.queue_buildup(name, depth=depth, oldest_age_seconds=age)
         except Exception:
             log.exception("alert sink raised on queue_buildup for %r", name)
+
+    def _fire_stall(self, name: str, *, age: float, now: float) -> None:
+        """The ``message_stall`` twin of :meth:`_fire_buildup`, on the per-lane stall throttle."""
+        if now < self._next_stall_alert.get(name, 0.0):
+            return
+        self._next_stall_alert[name] = now + _BUILDUP_REALERT_SECONDS
+        try:
+            self._alert_sink.message_stall(name, oldest_age_seconds=age)
+        except Exception:
+            log.exception("alert sink raised on message_stall for %r", name)
 
     async def _maybe_alert_saturation(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
@@ -8002,11 +8056,126 @@ class RegistryRunner:
         oldest_age = now - oldest_created
         if oldest_age < threshold.max_oldest_seconds:
             return  # oldest message hasn't stalled long enough yet
-        self._next_stall_alert[name] = now + _BUILDUP_REALERT_SECONDS
-        try:
-            self._alert_sink.message_stall(name, oldest_age_seconds=oldest_age)
-        except Exception:
-            log.exception("alert sink raised on message_stall for %r", name)
+        self._fire_stall(name, age=oldest_age, now=now)
+
+    async def _inflight_watch_loop(self) -> None:
+        """Run :meth:`_check_inflight_strands` every ``_INFLIGHT_WATCH_INTERVAL_SECONDS`` until stop
+        (BACKLOG #1611 part B). A failed tick is logged and the next one retries: this task is the only
+        thing that can see a strand, so it must not die of one bad read."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=_INFLIGHT_WATCH_INTERVAL_SECONDS)
+                return  # stop signalled
+            except TimeoutError:
+                pass
+            try:
+                await self._check_inflight_strands()
+            except Exception:
+                log.exception("in-flight watch check failed; the next tick retries")
+
+    async def _check_inflight_strands(self, now: float | None = None) -> None:
+        """Page on a row held in flight past the lane's age threshold (BACKLOG #1611 part B, P3-03).
+
+        **Why this exists.** A claim is its own committed transaction, so a store fault between it and
+        the handoff leaves the row ``inflight``. Part A made the per-lane workers re-pend it, and the
+        pooled dispatcher already did (T17), but both re-pends are store writes that can fail too.
+        What is left then is recovered by ``reset_stale_inflight`` at the next start, and nothing
+        before that. It is invisible to ``pending_depth``, so the buildup and stall alerts read the
+        lane healthy, and those alerts only run from the lane's own processing path, which a strand
+        has stopped. This check runs on its own clock and reads in-flight rows directly.
+
+        **What it pages, on which threshold.** Every lane fires ``queue_buildup`` on the age its
+        pending check uses: an outbound lane's resolved :class:`BuildupThreshold`, and the global
+        default for an ingress, routed or response lane. That age is on by default (300 s), so a
+        default engine pages a strand. An outbound lane also fires ``message_stall`` on its resolved
+        :class:`StallThreshold`, which is off by default. Each shares its alert's throttle with the
+        pending check, so one lane is paged once per window whichever check saw it first. With every
+        age off this method reads nothing.
+
+        **The age is since the CLAIM, not since the enqueue.** A row that is being worked right now
+        has a small claim age however old its message is, so a fresh claim cannot page. A row held
+        past the threshold is either stranded or in a send or transform that has run that long, and
+        an operator wants the page in both cases.
+
+        **It does not recover the row.** A reclaim would have to know which in-flight rows no live
+        task still holds, and the pooled dispatcher keeps a claimed prefix inside its own serializer
+        where this runner cannot see it. Re-pending a held row sends it twice. So this pages, and
+        the store's existing recovery paths still re-pend. They include at least
+        ``reset_stale_inflight`` at a single-node start and, on Postgres only, the expired-lease
+        reclaim inside the FIFO head claims plus the clustered leader's ``reclaim_expired_leases``
+        sweep. An ``ordering=unordered`` lane claims through ``claim_ready``, which has no such
+        reclaim. And on a FIFO lane the lease reclaim re-pends the row after its successors have
+        shipped, so it is a reorder, not a heal. This is the one place that says so; the log line,
+        the CHANGELOG and ``CONFIGURATION.md`` do not repeat it.
+
+        **Only the leader pages.** Under active-passive HA the graph runs on the leader alone, and a
+        demoted node's teardown cancels this task; the gate closes the window between the two."""
+        if not self._coordinator.is_leader():
+            return  # a node that is not the leader runs no graph, so it pages no lane (HA)
+        inbound_age = self._buildup_default.max_oldest_seconds
+        outbound: dict[str, tuple[float | None, float | None]] = {}
+        for name in self.registry.outbound:
+            if not self._owns_destination(name) or name in self._outbound_paused:
+                continue
+            buildup = (self._buildup.get(name) or self._buildup_default).max_oldest_seconds
+            stall = (self._stall.get(name) or self._stall_default).max_oldest_seconds
+            if buildup is not None or stall is not None:
+                outbound[name] = (buildup, stall)
+        if inbound_age is None and not outbound:
+            return  # every age off: no store read
+        now = time.time() if now is None else now
+        if outbound:
+            held = await self.store.inflight_by_lane(stage=Stage.OUTBOUND.value)
+            for name, (count, oldest_claimed) in held.items():
+                if name in outbound:
+                    buildup, stall = outbound[name]
+                    self._page_inflight(
+                        Stage.OUTBOUND.value, name, count, now - oldest_claimed, buildup, stall, now
+                    )
+        if inbound_age is None:
+            return
+        stages = [Stage.INGRESS.value, Stage.ROUTED.value]
+        if self._has_loopback_inbound():
+            stages.append(Stage.RESPONSE.value)  # re-ingress tokens drain only on a loopback lane
+        for stage in stages:
+            held = await self.store.inflight_by_lane(stage=stage)
+            for name, (count, oldest_claimed) in held.items():
+                ic = self.registry.inbound.get(name)
+                if ic is None:
+                    continue  # not this engine's lane (another engine shard's, or reloaded away)
+                if stage == Stage.RESPONSE.value and ic.spec.type is not ConnectorType.LOOPBACK:
+                    continue  # the RESPONSE lane set is the loopback inbounds, as the dispatcher's
+                self._page_inflight(
+                    stage, name, count, now - oldest_claimed, inbound_age, None, now
+                )
+
+    def _page_inflight(
+        self,
+        stage: str,
+        name: str,
+        count: int,
+        age: float,
+        buildup: float | None,
+        stall: float | None,
+        now: float,
+    ) -> None:
+        """Fire ``queue_buildup`` (on the pending check's ``(stage, lane)`` key) and ``message_stall``
+        for an in-flight hold past each threshold that is set and not throttled. The log line is
+        written once per lane per tick, and only when something fires."""
+        key = f"{stage}:{name}"
+        fire_buildup = (
+            buildup is not None and age >= buildup and now >= self._next_buildup_alert.get(key, 0.0)
+        )
+        fire_stall = (
+            stall is not None and age >= stall and now >= self._next_stall_alert.get(name, 0.0)
+        )
+        if not (fire_buildup or fire_stall):
+            return
+        _log_inflight_strand(stage, name, count, age)
+        if fire_buildup:
+            self._fire_buildup(key, name, depth=count, age=age, now=now)
+        if fire_stall:
+            self._fire_stall(name, age=age, now=now)
 
     # --- pooled-mode per-stage adapters (ADR 0066) ---------------------------
     # The pooled StageDispatcher's process_item callable has signature (lane, item) -> LaneItemResult;
