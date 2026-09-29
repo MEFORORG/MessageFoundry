@@ -1351,6 +1351,319 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         assert token in step_up, f"the step-up section must state {token!r}."
 
 
+#: Every name that reads the SIGN-IN lock: the row's predicate, its column, the service's helper,
+#: and the directory sign-in's refusal helper, which reads it one call down.
+_SIGN_IN_LOCK_READS = frozenset(
+    {"sign_in_locked", "locked_until", "_live_lock", "_directory_login_refusal"}
+)
+
+
+def _names_read(node: ast.AST) -> set[str]:
+    """Every attribute and bare name ``node`` mentions, calls included."""
+    out: set[str] = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.Name):
+            out.add(n.id)
+    return out
+
+
+def _flow_cache_full_statuses(func: ast.AST) -> list[int]:
+    """The ``status_code=`` literal every ``except FlowCacheFullError`` handler in ``func`` returns."""
+    out: list[int] = []
+    for n in ast.walk(func):
+        if not isinstance(n, ast.ExceptHandler) or n.type is None:
+            continue
+        if ast.unparse(n.type) != "FlowCacheFullError":
+            continue
+        for ret in (r for r in ast.walk(n) if isinstance(r, ast.Return) and r.value is not None):
+            for call in (c for c in ast.walk(ret) if isinstance(c, ast.Call)):
+                for kw in call.keywords:
+                    if kw.arg == "status_code" and isinstance(kw.value, ast.Constant):
+                        out.append(int(kw.value.value))
+    return out
+
+
+def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
+    """ASVS 6.1.3 was held at partial a fifth time (BACKLOG #1133), and BACKLOG #2293 filed four more.
+
+    ADR 0197 (engine PR 1700) split the account lock in two: a SIGN-IN lock (``locked_until``) and a
+    SECOND-STEP lock (``second_step_locked_until``). The 6.1.3 and 6.1.1 prose still spoke of one
+    lock, "enforced wherever a pathway signs in or proves a second factor", and cited
+    ``finish_webauthn_assertion`` as checking ``locked_until``. Neither is true. This pins what the
+    code does, then refuses every phrasing that said otherwise:
+
+    1. The two second-factor legs read the second-step lock only. ``verify_mfa`` refuses through
+       ``_mfa_lock_refused``; ``finish_webauthn_assertion`` reads ``second_step_locked`` itself.
+    2. The local sign-in refuses on the second-step lock, or on the sign-in lock unless combined.
+       A directory sign-in refuses on either lock.
+    3. A good code or passkey writes ``record_login_success``, which clears both locks, so the
+       successful-login write runs under a live sign-in lock. The IdP step-up does not write it.
+    4. ``GET /ui/oidc/callback`` charges the sign-in window before it picks the step-up branch, so a
+       flood on the sign-in surface can deny an ``oidc`` session its IdP step-up.
+    5. ``POST /ui/reauth/oidc`` stages into the same flow cache, and answers a full one with 429,
+       where the sign-in start answers 303.
+    """
+    # 1. The second-factor legs.
+    assertion = _service_func("finish_webauthn_assertion")
+    assert "second_step_locked" in _names_read(assertion), (
+        "finish_webauthn_assertion no longer reads the second-step lock; the lockout paragraph's "
+        "table says that lock refuses the assertion leg."
+    )
+    assert not _names_read(assertion) & _SIGN_IN_LOCK_READS, (
+        f"finish_webauthn_assertion now reads {sorted(_names_read(assertion) & _SIGN_IN_LOCK_READS)}; "
+        "the doc says the sign-in lock refuses no second-factor leg."
+    )
+    lock_refused = _service_func("_mfa_lock_refused")
+    assert "second_step_locked" in _names_read(lock_refused), (
+        "_mfa_lock_refused no longer tests the second-step lock; the doc says that lock refuses the "
+        "TOTP/recovery leg."
+    )
+    verify = _service_func("verify_mfa")
+    for fn, label in ((lock_refused, "_mfa_lock_refused"), (verify, "verify_mfa")):
+        assert not _names_read(fn) & _SIGN_IN_LOCK_READS, (
+            f"{label} now reads {sorted(_names_read(fn) & _SIGN_IN_LOCK_READS)}; the doc says the "
+            "sign-in lock does not refuse the TOTP/recovery leg."
+        )
+    assert _called(verify, "_mfa_lock_refused"), "verify_mfa no longer refuses a locked account."
+
+    # 2. The sign-in legs. Exact, so a flipped `and not combined` reds too.
+    login_local = _service_func("_login_local")
+    refusal_tests = [
+        n.test
+        for n in ast.walk(login_local)
+        if isinstance(n, ast.If)
+        and any(
+            isinstance(s, ast.Expr)
+            and _called(s, "_audit")
+            and "auth.login_locked" in ast.unparse(s)
+            for s in n.body
+        )
+    ]
+    expected_refusal = ast.parse(
+        "user.second_step_locked(now) or (user.sign_in_locked(now) and not combined)", mode="eval"
+    ).body
+    assert [ast.dump(t) for t in refusal_tests] == [ast.dump(expected_refusal)], (
+        f"_login_local now refuses a locked account on {[ast.unparse(t) for t in refusal_tests]}; "
+        "restate the lock table."
+    )
+    directory = ast.parse(inspect.getsource(_directory_login_refusal))
+    assert {"locked_until", "second_step_locked_until"} <= _names_read(directory), (
+        "_directory_login_refusal no longer reads both locks; the doc says either refuses a "
+        "Kerberos or OIDC sign-in."
+    )
+
+    # 3. What writes the successful-login clear, which the Recovery paragraph enumerates.
+    service_tree = ast.parse(inspect.getsource(AuthService))
+    writers = sorted(
+        n.name
+        for n in ast.walk(service_tree)
+        if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
+        and _called(n, "record_login_success")
+    )
+    assert writers == [
+        "_complete_ad_login",
+        "_login_local",
+        "_reproof_serialized",
+        "finish_webauthn_assertion",
+        "verify_mfa",
+    ], f"record_login_success is now written by {writers}; restate the Recovery paragraph."
+    for fn_name in ("identity_for_token", "_build_identity"):
+        read = _names_read(_service_func(fn_name)) & (
+            _SIGN_IN_LOCK_READS | {"second_step_locked", "second_step_locked_until"}
+        )
+        assert not read, (
+            f"{fn_name} now reads {sorted(read)}; the Recovery paragraph says session validation "
+            "consults neither lock."
+        )
+
+    # 4. The callback charges the sign-in window before it picks the step-up branch.
+    routes = _console_route_funcs()
+    callback = routes["GET /ui/oidc/callback"]
+    charge_at = [i for i, s in enumerate(callback.body) if _called(s, "allow_login_attempt")]
+    branch_at = [i for i, s in enumerate(callback.body) if _called(s, "oidc_flow_is_step_up")]
+    assert charge_at and branch_at and charge_at[0] < branch_at[0], (
+        "GET /ui/oidc/callback no longer charges allow_login_attempt before its step-up branch; the "
+        "limiter-split residual in the 6.1.1 section says it does."
+    )
+    reauth_oidc = routes["POST /ui/reauth/oidc"]
+    assert _called(reauth_oidc, "allow_reauth_attempt") and not _called(
+        reauth_oidc, "allow_login_attempt"
+    ), "POST /ui/reauth/oidc changed limiter; control 7's 'what remains' cell names limiter 3."
+
+    # 5. The flow cache's two start legs.
+    assert _called(reauth_oidc, "begin_oidc_step_up")
+    assert _flow_cache_full_statuses(reauth_oidc) == [429], (
+        "POST /ui/reauth/oidc no longer answers a full flow cache with 429; control 7 says it does."
+    )
+    assert _flow_cache_full_statuses(routes["POST /ui/oidc/start"]) == [303], (
+        "POST /ui/oidc/start no longer answers a full flow cache with 303; control 7 says it does."
+    )
+    for leg in ("begin_oidc_step_up", "begin_oidc_login"):
+        caches = [
+            ast.unparse(n.args[0])
+            for n in ast.walk(_service_func(leg))
+            if isinstance(n, ast.Call)
+            and ast.unparse(n.func).split(".")[-1] == "start_flow"
+            and n.args
+        ]
+        assert caches == ["self._oidc_flows"], (
+            f"{leg} now stages into {caches}; control 7 says both start legs share one flow cache."
+        )
+    # The step-up start's 429 carries no Retry-After, which three passages say. The page it renders
+    # comes from reauth_idp_response, so neither function may set a header.
+    oidc_module = ast.parse((_CONSOLE_ROUTES / "oidc.py").read_text(encoding="utf-8"))
+    idp_page = next(
+        n
+        for n in ast.walk(oidc_module)
+        if isinstance(n, ast.FunctionDef) and n.name == "reauth_idp_response"
+    )
+    for fn, label in ((reauth_oidc, "POST /ui/reauth/oidc"), (idp_page, "reauth_idp_response")):
+        # A READ of request.headers (a Sec-Fetch-Mode check) is fine; a write to a response's is not.
+        sets_header = any(
+            (isinstance(n, ast.keyword) and n.arg == "headers")
+            or (isinstance(n, ast.Constant) and n.value == "Retry-After")
+            or (
+                isinstance(n, ast.Subscript)
+                and isinstance(n.ctx, ast.Store)
+                and isinstance(n.value, ast.Attribute)
+                and n.value.attr == "headers"
+            )
+            or (
+                isinstance(n, ast.Attribute)
+                and n.attr == "headers"
+                and isinstance(n.ctx, ast.Store)
+            )
+            for n in ast.walk(fn)
+        )
+        assert not sets_header, (
+            f"{label} now sets a header; the doc says the step-up start's 429 has no Retry-After."
+        )
+
+    # The Recovery paragraph's "a good password re-proof clears neither lock" and "nothing reaches it
+    # under a live second-step lock" rest on this guard, the only one on the re-proof's clear.
+    reproof = _service_func("_reproof_serialized")
+    cleared = [
+        n.value
+        for n in ast.walk(reproof)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(tg, ast.Name) and tg.id == "cleared" for tg in n.targets)
+    ]
+    assert len(cleared) == 1, "_reproof_serialized no longer assigns `cleared` exactly once."
+    guard = cleared[0]
+    assert isinstance(guard, ast.BoolOp) and isinstance(guard.op, ast.And), (
+        "_reproof_serialized no longer decides its lockout clear in one `cleared = ... and ...`."
+    )
+    terms = [ast.unparse(v) for v in guard.values]
+    assert "not locked" in terms and "not current.second_step_locked(now)" in terms, (
+        f"_reproof_serialized now clears the lockout on {terms}; the Recovery paragraph says a good "
+        "password re-proof clears neither lock while either is live."
+    )
+
+    raw = _doc_text()
+    text = " ".join(raw.split())
+    for retired in (
+        # Item 1 of the fifth re-read: one lock, enforced on every leg, read as `locked_until`.
+        "wherever a pathway signs in or proves a second factor against an engine account row",
+        "`finish_webauthn_assertion` checks `locked_until` first",
+        "so the lock is *enforced* across every factor leg",
+        "adds a refusal for a directory account and exempts none from the lock.",
+        # Item 2: Table A named one exception for the sign-in lock.
+        "except that the sign-in lock does **not** refuse a combined sign-in",
+        "The **sign-in** lock refuses a password-only sign-in but **not** a combined one",
+        "lock refuses every sign-in and the second step.",
+        # Item 3: the limiter split claimed every signed-in operator was covered.
+        "could otherwise exhaust it and deny re-authentication",
+        # Item 4: the #1138 note's subject is the sign-in lock, which does not refuse verify_mfa.
+        "and the lock still refuses the code leg",
+        # Item 5: the Recovery paragraph missed the code and passkey legs' clear.
+        "Two of the four can run while a lock is live",
+        # Review round 1: the failed-attempt write runs under a live lock too.
+        "Three of the four can run while a lock is live",
+        # Review round 2: a directory account with TOTP cannot pass its sign-in lock either.
+        "or the sign-in lock on an account with no TOTP.",
+        "so that write is not reached under a live lock except by a combined",
+        "A good step-up re-auth during a lock does not clear it either",
+        "consults `locked_until`, the lock does not refuse this re-proof",
+        # Found by the sweep: one lock named where two exist.
+        "as long as an attacker sustains the lock — only the host-gated",
+        "they read the lock only once the ticket",
+        "The re-proofs are not refused by the lock;",
+        "**not** refused by the lock; the IdP step-up",
+        "the re-proofs are not refused by it,",
+        "and the account lock does not refuse it.",
+        "The account lock does not refuse this password re-proof",
+        # BACKLOG #2293 items b and c: one start leg, one answer.
+        "which the start leg turns into a **303 redirect",
+        "flooding the OIDC start leg (`POST /ui/oidc/start`",
+        "limiter 2 (the same routes charge `allow_login_attempt` first)",
+    ):
+        assert retired not in text, (
+            f"docs/SECURITY.md says {retired!r} again; against the two-lock code it is false or "
+            "incomplete (BACKLOG #1133, #2293)."
+        )
+
+    # The lock table, row by row. Keyed on its header, so a restructure reds rather than passes.
+    lock_tables = [
+        t
+        for t in _tables(_section())
+        if t[0]
+        == [
+            "Leg",
+            "Sign-in lock (`locked_until`)",
+            "Second-step lock (`second_step_locked_until`)",
+        ]
+    ]
+    assert len(lock_tables) == 1, "the lockout paragraph's two-lock table is gone."
+    rows = {r[0]: (r[1], r[2]) for r in lock_tables[0][1:]}
+    no, yes = "does **not** refuse", "refuses"
+    expected = {
+        "Local password-only sign-in": (yes, yes),
+        "Combined sign-in (password and TOTP code), local account with TOTP enrolled": (no, yes),
+        "Kerberos and OIDC sign-in (`_directory_login_refusal`)": (yes, yes),
+        "TOTP/recovery leg (`verify_mfa`, through `_mfa_lock_refused`)": (no, yes),
+        "Passkey assertion leg (`finish_webauthn_assertion`)": (no, yes),
+        "The two password re-proofs, and an `oidc` session's IdP step-up": (no, no),
+    }
+    assert rows == expected, f"the two-lock table now reads {rows}."
+
+    table_a = next(
+        line
+        for line in raw.splitlines()
+        if line.startswith("| Consecutive credential failures on one account")
+    )
+    for token in ("The sign-in lock has **two** exceptions", "it refuses **no** second-factor leg"):
+        assert token in table_a, f"Table A's failures row must state {token!r}."
+    for token in (
+        "**An `oidc` session's step-up is not covered, and that is a residual of the shipped code.**",
+        "`allow_login_attempt` runs ahead of `oidc_flow_is_step_up`",
+        "Only the second-step lock refuses the code leg.",
+        "Three of the four can end a lock that is still live",
+        "The successful-login write can end a live **sign-in** lock only",
+        "it clears only its own counter's lock, and only once that lock has lapsed",
+        "a sign-in reaches the successful-login write under a live sign-in lock only as a combined",
+        "the sign-in lock on any account except a local one with TOTP enrolled",
+        "Only the second-step lock refuses those last two legs",
+        "turns it into a **429** that re-renders the step-up page",
+    ):
+        assert token in text, f"docs/SECURITY.md must state {token!r} (BACKLOG #1133, #2293)."
+
+    # BACKLOG #2293 item a: POST /ui/reauth/oidc among the routes that send no Retry-After.
+    none_clause = text.split("`POST /ui/mfa` (control 3);", 1)[1].split("carry none.", 1)[0]
+    assert "`POST /ui/reauth/oidc`" in none_clause, (
+        "the 6.1.1 paragraph's no-Retry-After list must name POST /ui/reauth/oidc."
+    )
+    # Items b and c: control 7 names the step-up start, and what remains under it.
+    control7 = next(line for line in raw.splitlines() if line.startswith("| 7 | **Federated"))
+    for token in ("`POST /ui/reauth/oidc`", "`begin_oidc_step_up`", "`allow_reauth_attempt`"):
+        assert token in control7, f"control 7 must name {token!r}."
+    # Item d: the console sign-in section states the combined sign-in.
+    console = " ".join(_heading_block("## Web console sign-in").split())
+    for token in ("**combined sign-in**", "**authenticator code**", "never a recovery code"):
+        assert token in console, f"the web console sign-in section must state {token!r}."
+
+
 # NOTE: test_the_mtls_runbook_and_the_table_cannot_diverge moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against
 # the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
 # this whole module's required test leg red — while the rest of this file guards shipped

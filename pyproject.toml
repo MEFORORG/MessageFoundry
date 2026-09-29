@@ -426,7 +426,7 @@ release-tools = [
 #                  supplied it. Same spec in both places ⇒ uv resolves ONE version and they cannot
 #                  disagree.
 ci-quality = [
-    "diff-cover==10.5.1",
+    "diff-cover==10.6.0",
     "mutmut==3.8.0",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3",
