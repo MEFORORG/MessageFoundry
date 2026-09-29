@@ -174,6 +174,115 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
     assert opened[0]._pool.closed, "the fixture left its pool open on the failure path"
 
 
+# BACKLOG #2049. The child below cancels a store read whose statement is blocked on the server, then
+# lets that statement return. Before the fix the cancellation closed the cursor and the connection on
+# other threads while the statement still ran, and pyodbc then read the result's column metadata from
+# freed handles. On a live server that could kill the process natively, so it runs in a CHILD: a crash
+# there fails this test as an assertion, which the leg's native-crash retry wrapper never re-runs.
+_CANCEL_CHILD = r"""
+import asyncio, os, sys
+from messagefoundry.config.settings import load_settings
+from messagefoundry.store.sqlserver import SqlServerStore
+
+RESOURCE, ROUNDS = sys.argv[1], int(sys.argv[2])
+LOCK = ("SET NOCOUNT ON; DECLARE @r int; EXEC @r = sp_getapplock @Resource = ?, @LockMode = 'Exclusive',"
+        " @LockOwner = 'Session', @LockTimeout = 20000; ")
+TAKE = LOCK + "SELECT @r AS r;"
+BLOCKED = LOCK + "SELECT @r AS r, CAST(N'x' AS NVARCHAR(40)) AS pad;"
+RELEASE = "EXEC sp_releaseapplock @Resource = ?, @LockOwner = 'Session';"
+# Waiting on THIS resource only. The name stays under 32 characters, which is as much of an applock
+# name as resource_description shows.
+WAITING = ("SELECT COUNT(*) FROM sys.dm_tran_locks WHERE resource_type = 'APPLICATION'"
+           " AND request_status = 'WAIT' AND CHARINDEX(?, resource_description) > 0;")
+
+
+async def main() -> None:
+    store = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    try:
+        holder = await store._pool.acquire()
+        try:
+            hcur = await holder.cursor()
+            for n in range(ROUNDS):
+                await hcur.execute(TAKE, RESOURCE)
+                assert (await hcur.fetchone())[0] >= 0, f"round {n}: the holder did not get the lock"
+                await holder.commit()
+                task = asyncio.create_task(store._fetchall(BLOCKED, (RESOURCE,)))
+                for _ in range(200):  # until the store's statement is waiting on the server
+                    await hcur.execute(WAITING, RESOURCE)
+                    waiting = (await hcur.fetchone())[0]
+                    await holder.commit()
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.05)
+                assert waiting and not task.done(), f"round {n}: the store call never blocked"
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                await hcur.execute(RELEASE, RESOURCE)
+                await holder.commit()
+                # The abandoned statement now gets the lock and returns: the crash window.
+                await asyncio.sleep(1.0)
+            await hcur.close()
+        finally:
+            await store._pool.release(holder)
+    finally:
+        await store.close()
+    print("SURVIVED", flush=True)
+
+
+asyncio.run(main())
+"""
+
+
+def test_cancelled_statement_returning_later_does_not_crash_the_process() -> None:
+    """BACKLOG #2049, live. The offline twin that pins the ordering on every runner is
+    ``tests/test_backlog2049_sqlserver_cancel_handle_free.py``. Five rounds, because the source
+    measured the crash as intermittent: 4 of 4 in one run, and one of two legs in another."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "faulthandler",
+            "-c",
+            _CANCEL_CHILD,
+            f"t2049:{uuid4().hex[:16]}",
+            "5",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0 and "SURVIVED" in proc.stdout, (
+        f"the child exited {proc.returncode} after a cancelled statement returned. A negative code"
+        " is the POSIX signal that killed it; on Windows a native crash is a large NTSTATUS such"
+        f" as 3221225477. stderr tail: {proc.stderr[-4000:]}"
+    )
+
+
+async def test_a_pooled_connection_runs_its_calls_through_the_call_gate(store) -> None:
+    """Pins the aioodbc shape the BACKLOG #2049 gate relies on. The gate wraps
+    ``Connection._execute`` and silently stands aside when that is not a bound method, so an aioodbc
+    that renamed it would bring the crash back with every offline test still green."""
+    from messagefoundry.store.sqlserver import _call_gate
+
+    async with store._acquire() as conn:
+        gate = _call_gate(conn)
+        assert gate is not None, "a real pooled connection did not get the call gate"
+        async with store._cursor(conn) as cur:
+            await cur.execute("SELECT 1 AS one")
+            rows = await cur.fetchall()
+            assert rows[0][0] == 1
+            # Attached is not enough: a cursor call must actually pass through the gate.
+            assert await cur._run_operation(lambda: gate._running) is True
+        await conn.commit()
+
+
 async def test_enqueue_creates_message_and_outbox(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], control_id="MSG1"
