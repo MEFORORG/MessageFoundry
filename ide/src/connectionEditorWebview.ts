@@ -293,9 +293,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     $('delete').addEventListener('click', () => vscode.postMessage({ command: 'delete', name: INITIAL.name }));
 
     // One entry per message its hosts post: at least connectionEditor.ts and configEditors.ts use
-    // this page, and both post the same two messages. A field is a FieldDescriptor from
-    // connectionForm.ts: its declared fields with their types. The two unknown-typed values (value,
-    // defaultValue) and the carried-through envDefault and preserveValue are not typed there either.
+    // this page. Both post "error"; only connectionEditor.ts answers with "fields". A field is a
+    // FieldDescriptor from connectionForm.ts: its declared fields with their types. The two
+    // unknown-typed values (value, defaultValue) and the carried-through envDefault and
+    // preserveValue are not typed there either.
     function mfFieldDescriptor(f) {
       return mfObj(f) && mfStr(f.key) && mfStr(f.label) && mfStr(f.control) && mfStr(f.type) &&
         mfStr(f.help) && mfBool(f.required) && mfBool(f.conditionallyRequired) && mfBool(f.secret) &&

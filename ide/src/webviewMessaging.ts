@@ -108,7 +108,8 @@ export const CHANNEL_FIELD = "__mfChannel";
 /** The single-line marker every webview `message` receiver in this extension carries, pointing here.
  *  Kept as an exported constant so the source-text test that enforces its presence and this file
  *  cannot drift apart. */
-export const WEBVIEW_GUARD_NOTE = "// Origin, source and channel token are checked — see webviewMessaging.ts.";
+export const WEBVIEW_GUARD_NOTE =
+  "// Origin, source, channel token and payload shape are checked — see webviewMessaging.ts.";
 
 /**
  * The part of `vscode.Webview` this module uses, spelled structurally.
@@ -201,10 +202,18 @@ export function guardScript(token: string): string {
   return `
     // The trust boundary for this panel — what these checks rest on is in webviewMessaging.ts.
     const MF_CHANNEL = ${embedJson(token)};
+    let mfOpaqueWarned = false;
     function mfTrusted(ev) {
       // An opaque origin reads as the string 'null', and then the origin test below would compare
-      // 'null' with 'null' and pass for every opaque poster. Refuse everything instead, on any build.
-      if (typeof window.origin !== 'string' || window.origin === 'null') { return null; }
+      // 'null' with 'null' and pass for every opaque poster. Refuse everything instead, on any build,
+      // and say so once, so a panel that stays empty for this reason can be diagnosed.
+      if (typeof window.origin !== 'string' || window.origin === 'null') {
+        if (!mfOpaqueWarned) {
+          mfOpaqueWarned = true;
+          console.warn('MessageFoundry: this panel has an opaque origin, so every message to it is discarded');
+        }
+        return null;
+      }
       // Same-origin. window.origin is this document's own, not read out of the event.
       if (ev.origin !== window.origin) { return null; }
       // Not a same-document post. NOT window.parent: it differs by VS Code build (undefined at 1.95.0,
@@ -235,7 +244,12 @@ export const SHAPE_HELPERS = `
     function mfInt(x) { return Number.isSafeInteger(x); }
     function mfBool(x) { return typeof x === 'boolean'; }
     function mfObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
-    function mfArrOf(x, f) { return Array.isArray(x) && x.every((v) => f(v) === true); }
+    function mfArrOf(x, f) {
+      if (!Array.isArray(x)) { return false; }
+      // By index, not every(): every() skips holes, and a hole reaches the renderer as undefined.
+      for (let i = 0; i < x.length; i++) { if (f(x[i]) !== true) { return false; } }
+      return true;
+    }
     // An OPTIONAL field: absent (or null) passes, present must match.
     function mfOpt(x, f) { return x === undefined || x === null || f(x) === true; }
     function mfShapeOk(d, key, shapes, panel) {

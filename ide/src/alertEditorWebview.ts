@@ -98,9 +98,10 @@ export function alertEditorScript(
 
     // One entry per message the host posts (at least alertEditor.ts). A rule is one "alert list" row: the
     // ordinal is always there, and every AlertRule field is optional but typed when present. The row
-    // is the raw TOML table, and the engine's lax model loads a quoted number for the three numeric
-    // fields, so a string passes there too: the engine accepts that file, and this table only shows it.
-    function mfNumeric(x) { return mfNum(x) || mfStr(x); }
+    // is the raw TOML table, and the engine's lax model loads a quoted number (and a boolean) for the
+    // three numeric fields, so any scalar passes there: the engine accepts that file, and this table
+    // only shows the value. A table or array is refused.
+    function mfNumeric(x) { return mfNum(x) || mfStr(x) || mfBool(x); }
     const SHAPES = {
       rules: (d) => mfArrOf(d.rules, (r) => mfObj(r) && mfInt(r.index) &&
         mfOpt(r.event_type, mfStr) && mfOpt(r.connection, mfStr) && mfOpt(r.severity, mfStr) &&

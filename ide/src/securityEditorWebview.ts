@@ -155,6 +155,7 @@ export function securityEditorScript(token: string, fields: unknown): string {
       defaults = state.defaults || {};
       for (const f of FIELDS) { setValue(f, state.values ? state.values[f.key] : undefined); }
       errorEl.style.display = 'none';
+      $('save').disabled = false;
     }
 
     function collectUpdates() {
@@ -193,6 +194,9 @@ export function securityEditorScript(token: string, fields: unknown): string {
       else if (d.command === 'error') { show(d.message); }
     });
 
+    // Save stays off until a state has rendered. Until then the form holds placeholders, not the file's
+    // values (every Yes/No shows its first option), and saving those would write them as explicit sets.
+    $('save').disabled = true;
     buildForm();
   `;
 }

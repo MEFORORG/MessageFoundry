@@ -215,7 +215,10 @@ const alertRules: Receiver = {
       ["transports is a string", variant(ALERT_OK, (c) => (c.rules[0].transports = "webhook"))],
       ["a transport is a number", variant(ALERT_OK, (c) => (c.rules[0].transports = [1]))],
       ["min_depth is an array", variant(ALERT_OK, (c) => (c.rules[0].min_depth = [500]))],
-      ["cooldown_seconds is a boolean", variant(ALERT_OK, (c) => (c.rules[1].cooldown_seconds = true))],
+      ["cooldown_seconds is a table", variant(ALERT_OK, (c) => (c.rules[1].cooldown_seconds = { s: 300 }))],
+      ["a rule is null", variant(ALERT_OK, (c) => (c.rules[1] = null))],
+      // Holes, which Array.prototype.every() would skip. Made after the clone, so they survive.
+      ["the rules array has holes", variant(ALERT_OK, (c) => (c.rules.length = 5))],
       ["connection is a number", variant(ALERT_OK, (c) => (c.rules[0].connection = 7))],
       ["severity is an array", variant(ALERT_OK, (c) => (c.rules[0].severity = ["critical"]))],
     ],
@@ -597,6 +600,18 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.ok(FIELDS_OK.groups[0].fields.length > 0);
     assert.ok(FIELDS_OK.groups.flatMap((g) => g.fields).some((f) => f.envKey === "PEER_HOST"));
     assert.ok(SECURITY_SHOW.loosenings.length > 0);
+  });
+
+  test("Security Settings: Save stays off until a state renders, and a discarded state leaves it off", () => {
+    // Before a state renders, the form holds placeholders, and saving them would write them as
+    // explicit values. A discard must not leave the form looking loaded AND saveable.
+    const p = security.load();
+    const save = p.window.document.getElementById("save");
+    assert.strictEqual(save.disabled, true, "Save was on before any state arrived");
+    p.deliver(variant(STATE_OK, (c) => delete c.state.defaults));
+    assert.strictEqual(save.disabled, true, "a discarded state turned Save on");
+    p.deliver(STATE_OK);
+    assert.strictEqual(save.disabled, false, "a well-formed state did not turn Save on");
   });
 
   for (const r of RECEIVERS) {

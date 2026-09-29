@@ -84,7 +84,9 @@ function harness(token: string, url = "https://localhost/"): Harness {
   const script = window.document.createElement("script");
   script.textContent = `${guardScript(token)}
     window.__mfAccepted = null;
+    window.__mfCalls = 0;
     window.addEventListener('message', (e) => {
+      window.__mfCalls += 1;
       const d = mfTrusted(e);
       if (!d) { return; }
       window.__mfAccepted = d;
@@ -242,6 +244,9 @@ suite("webview message guard — what it accepts and what it discards", () => {
     ]) {
       assert.strictEqual(opaque.deliver({ origin: "null", data }), null, `accepted ${String(data.command ?? data.type)}`);
     }
+    // The listener on THIS page did run for each message, so the discards above are the guard's and
+    // not a page that never dispatched them.
+    assert.strictEqual(opaque.window.__mfCalls, 3, "the opaque page's listener did not run");
 
     // THE CONTROL: the identical message at a tuple origin is accepted, so the discard above is the
     // opaque-origin arm and not a harness that rejects everything.
