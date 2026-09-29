@@ -13,6 +13,7 @@ identically, and the pre-routing decode + guards are shared through
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -60,6 +61,7 @@ from messagefoundry.pipeline.ingress_guards import (
 )
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
 from messagefoundry.store import MessageStatus
+from messagefoundry.store.metadata import encode_reference_value
 
 __all__ = [
     "DeliveryPreview",
@@ -583,7 +585,11 @@ def transform_one(
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
     declaration with a literal path. DB-backed or ``env()``-path sets can't be materialized without a
-    store/environment, so they're omitted (a read of one then raises, as a preview error)."""
+    store/environment, so they're omitted (a read of one then raises, as a preview error).
+
+    Each value goes through the same JSON encoding the store applies, so a preview reads what the live
+    engine's sealed reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. A
+    set the store would refuse to encode is omitted, as the live sync would refuse to commit it."""
     view: dict[str, Mapping[str, Any]] = {}
     for spec in registry.references.values():
         if spec.source.kind != "file":
@@ -592,8 +598,10 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
         if not isinstance(path, str):  # an env() ref — unresolved in a pure dry-run
             continue
         try:
-            view[spec.name] = dict(load_code_set(path))
-        except CodeSetError:
+            view[spec.name] = {
+                k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
+            }
+        except (CodeSetError, TypeError):
             continue
     return view
 
@@ -691,7 +699,9 @@ def route_message(
             )
             deliveries.extend(ds)
             for op in ops:
-                sim_state[(op.namespace, op.key)] = op.value  # visible to subsequent handlers
+                # Visible to subsequent handlers, in the JSON form the live sealed cache returns
+                # (BACKLOG #1174): a tuple reads back as a list there, so it does here too.
+                sim_state[(op.namespace, op.key)] = json.loads(json.dumps(op.value))
             state_ops.extend(ops)
             meta_ops.extend(meta)
             declined.extend(skipped)  # #233: Sends to a not-deployed connection (never delivered)

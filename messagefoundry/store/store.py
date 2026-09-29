@@ -12547,7 +12547,9 @@ class MessageStore:
         # Commit succeeded → evict the purged keys from the read-through cache (after commit, mirroring
         # the write path: the table is the source of truth, the cache follows it only once durable).
         for ck in purged_keys:
-            self._state_cache.pop(ck, None)
+            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+            if ck in self._state_cache:
+                del self._state_cache[ck]
         return len(purged_keys)
 
     async def wal_checkpoint(self) -> None:

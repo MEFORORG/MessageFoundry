@@ -2289,12 +2289,14 @@ class PostgresStore:
         refreshed: list[str] = []
         for ns, version, seen, fresh in pending:
             if self._state_versions.get(ns) == seen:
-                # No local write intervened during our read → safe destructive reseed (drop the
-                # namespace's old entries first, handling a sibling's deletes/purges, then re-seed).
-                for ck in [c for c in self._state_cache if c[0] == ns]:
-                    del self._state_cache[ck]
+                # No local write intervened during our read → safe reseed. Write the fresh rows
+                # FIRST, then drop the namespace's keys the read no longer holds (a sibling's
+                # deletes/purges): a Handler thread reading mid-reseed then never misses a key that
+                # is present, which the old drop-then-reseed order allowed.
                 for k, v in fresh.items():
                     self._state_cache[(ns, k)] = v
+                for ck in [c for c in self._state_cache if c[0] == ns and c[1] not in fresh]:
+                    del self._state_cache[ck]
             else:
                 # A local transform_handoff committed + published to THIS namespace during our read
                 # window, advancing the DB version past `version`. A destructive reseed from the stale
@@ -2303,7 +2305,8 @@ class PostgresStore:
                 # deliberately record `version` (< the DB version the local write bumped to) so the next
                 # tick does a clean reseed that reconciles any sibling deletes this merge could not see.
                 for k, v in fresh.items():
-                    self._state_cache.setdefault((ns, k), v)
+                    if (ns, k) not in self._state_cache:  # setdefault would decrypt the kept value
+                        self._state_cache[(ns, k)] = v
             self._state_versions[ns] = version
             refreshed.append(ns)
         return refreshed
@@ -8557,7 +8560,9 @@ class PostgresStore:
                     bumped.append((ns, int(vrow["version"])))
         # Commit succeeded → evict the purged keys from the read-through cache.
         for ck in purged_keys:
-            self._state_cache.pop(ck, None)
+            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+            if ck in self._state_cache:
+                del self._state_cache[ck]
         # Record this node's new per-namespace versions so its own converge skips re-reading them.
         for ns, ver in bumped:
             self._state_versions[ns] = ver

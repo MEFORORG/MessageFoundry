@@ -26,7 +26,8 @@ the first proposal (BACKLOG #1185). Two things in the code rule it out:
    call (:mod:`messagefoundry.store.crypto_transit`). Each ``state_get`` would become a network round
    trip, and a Vault outage after startup would turn every read into a Handler error.
 2. Even in-process, the store cipher's decrypt locks and wipes a buffer on every call. Measured
-   2026-09-29 on CPython 3.14: about 25 to 29 microseconds a read, against about 2 here.
+   2026-09-29 on CPython 3.14, Windows: about 25 to 40 microseconds a read, against about 2 to 4
+   here.
 
 The keyless-open refusal (``decrypt_json_cell`` raising ``StoreKeylessError``) is unchanged: each
 backend still decrypts every row once at open, exactly as before, and only then seals the decoded
@@ -115,8 +116,35 @@ def _process_sealer() -> _Sealer:
 
 
 def _after_fork_in_child() -> None:
+    global _sealer_lock
+    _sealer_lock = threading.Lock()  # a fork mid-_process_sealer() would leave it held
     if _sealer is not None:
         _sealer.reseed_after_fork()
+
+
+def _canonical(key: object) -> bytes:
+    """The key's bytes for the AEAD associated data.
+
+    It must be the same for every key the dict treats as equal, or a read with an equal key would
+    find the entry and then fail to open it. ``repr`` is not: a ``StrEnum`` namespace that a Handler
+    passed to ``SetState`` equals and hashes like its plain ``str`` value, which is what a reopened
+    store reads back, but its ``repr`` differs. So each ``str`` part is taken by value
+    (``str.__str__`` drops any subclass) and length-prefixed, which also keeps ``("a", "bc")`` apart
+    from ``("ab", "c")``.
+    """
+    if isinstance(key, tuple):
+        parts: tuple[object, ...] = key
+        out = [b"t"]
+    else:
+        parts = (key,)
+        out = [b"s"]
+    for part in parts:
+        # Every backend keys its caches by str. repr() is a fallback for any other hashable, where
+        # equal-but-differently-repr'd keys would still fail closed rather than read wrongly.
+        text = str.__str__(part) if isinstance(part, str) else repr(part)
+        raw = text.encode("utf-8", "surrogatepass")
+        out.append(len(raw).to_bytes(4, "big") + raw)
+    return b"".join(out)
 
 
 if hasattr(os, "register_at_fork"):
@@ -144,7 +172,7 @@ class SealedDict[K: Hashable](MutableMapping[K, Any]):
         self._sealer = _process_sealer()
 
     def _aad(self, key: K) -> bytes:
-        return self._scope + repr(key).encode("utf-8")
+        return self._scope + _canonical(key)
 
     def _open(self, key: K, blob: bytes) -> Any:
         return json.loads(self._sealer.open(blob, self._aad(key)))
@@ -183,6 +211,10 @@ class SealedDict[K: Hashable](MutableMapping[K, Any]):
             return default
         return self._open(key, blob)
 
+    def discard(self, key: K) -> None:
+        """Remove ``key`` if present, without decrypting it (``pop`` must decrypt to return it)."""
+        self._data.pop(key, None)
+
     def clear(self) -> None:
         self._data.clear()
 
@@ -207,7 +239,7 @@ def new_state_cache() -> SealedDict[tuple[str, str]]:
 
 def new_reference_set(name: str) -> SealedDict[str]:
     """An empty cache for one reference snapshot (ADR 0006), encoded as the ``reference`` table is."""
-    return SealedDict(f"reference {name!r}", encode_reference_value)
+    return SealedDict("reference " + repr(str.__str__(name)), encode_reference_value)
 
 
 def sealed_reference_set(name: str, encoded: Iterable[tuple[str, str]]) -> SealedDict[str]:
@@ -227,5 +259,8 @@ def point_in_time[K, V](view: Mapping[K, V]) -> Mapping[K, V]:
     stays sealed and costs what copying a plain dict does. Any other mapping is copied into a dict.
     """
     if isinstance(view, (MappingProxyType, SealedDict)):
-        return MappingProxyType(cast(Mapping[K, V], view.copy()))
+        try:
+            return MappingProxyType(cast(Mapping[K, V], view.copy()))
+        except AttributeError:
+            pass  # a proxy over a mapping with no copy(): fall through to a plain copy
     return dict(view)

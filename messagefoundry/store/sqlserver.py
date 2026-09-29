@@ -7785,7 +7785,9 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         for ck in purged_keys:
-            self._state_cache.pop(ck, None)
+            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+            if ck in self._state_cache:
+                del self._state_cache[ck]
         return len(purged_keys)
 
     async def purge_dead_letters(

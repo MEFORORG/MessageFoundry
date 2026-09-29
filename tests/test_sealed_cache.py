@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from enum import StrEnum
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,7 +29,8 @@ from messagefoundry.config.reference import activated as reference_activated
 from messagefoundry.config.reference import reference
 from messagefoundry.config.state import activated as state_activated
 from messagefoundry.config.state import state_get
-from messagefoundry.pipeline._sandbox_codec import _Blobs, _enc_table
+from messagefoundry.config.wiring import Registry
+from messagefoundry.pipeline._sandbox_codec import _Blobs, _enc_state_view, _enc_table
 from messagefoundry.store import sealed_cache
 from messagefoundry.store.crypto import StoreKeylessError, generate_key, make_cipher
 from messagefoundry.store.sealed_cache import (
@@ -137,6 +139,43 @@ def test_ciphertext_is_bound_to_its_key() -> None:
         cache[("ns", "a")]
 
 
+def test_an_equal_key_of_a_str_subclass_opens_the_entry_in_both_directions() -> None:
+    """A Handler may name a namespace with a StrEnum. It equals and hashes like the plain str a
+    reopened store reads back, so it must open the same entry -- a repr-based AAD made it fail."""
+
+    class NS(StrEnum):
+        DEDUP = "dedup"
+
+    written_plain = new_state_cache()
+    written_plain[("dedup", "k")] = 1
+    assert written_plain[(NS.DEDUP, "k")] == 1
+    written_enum = new_state_cache()
+    written_enum[(NS.DEDUP, "k")] = 2
+    assert written_enum[("dedup", "k")] == 2
+    assert dict(written_enum.items()) == {("dedup", "k"): 2}
+
+
+def test_length_prefixed_key_parts_do_not_collide() -> None:
+    cache = new_state_cache()
+    cache[("a", "bc")] = "one"
+    cache[("ab", "c")] = "two"
+    cache._data[("a", "bc")], cache._data[("ab", "c")] = (
+        cache._data[("ab", "c")],
+        cache._data[("a", "bc")],
+    )
+    with pytest.raises(InvalidTag):
+        cache[("a", "bc")]
+
+
+def test_discard_removes_without_decrypting(count_opens: list[int]) -> None:
+    cache = new_state_cache()
+    cache[("ns", "k")] = SECRET
+    cache.discard(("ns", "k"))
+    cache.discard(("ns", "absent"))
+    assert ("ns", "k") not in cache
+    assert count_opens[0] == 0
+
+
 def test_reference_sets_are_bound_to_their_set_name() -> None:
     one = new_reference_set("one")
     two = new_reference_set("two")
@@ -196,9 +235,42 @@ def test_point_in_time_of_a_plain_mapping_is_a_dict_copy() -> None:
 
 def test_sandbox_table_encoder_reads_each_entry_once(count_opens: list[int]) -> None:
     table = sealed_reference_set("codes", [(f"k{i}", json.dumps(f"v{i}")) for i in range(40)])
-    encoded = _enc_table("reference set", table, _Blobs())
+    encoded = _enc_table("reference set", MappingProxyType(table), _Blobs())
     assert encoded == {"s": {f"k{i}": f"v{i}" for i in range(40)}}
     assert count_opens[0] == 40
+
+
+def test_sandbox_state_encoder_walks_a_copy_not_the_live_cache() -> None:
+    """The encoder runs in a worker thread while the loop mutates the cache; it must walk a copy."""
+    cache = new_state_cache()
+    cache[("ns", "a")] = 1
+    cache[("ns", "b")] = 2
+    live = MappingProxyType(cache)
+    real_open = cache._sealer.open
+
+    def open_then_mutate(blob: bytes, aad: bytes) -> bytes:
+        cache.discard(("ns", "b"))  # the loop evicts a key mid-walk
+        return real_open(blob, aad)
+
+    cache._sealer = SimpleNamespace(open=open_then_mutate)  # type: ignore[assignment]
+    try:
+        encoded = _enc_state_view(live, _Blobs())
+    finally:
+        cache._sealer = sealed_cache._process_sealer()
+    assert len(encoded["state"]) == 2  # both rows, from the copy taken before the walk
+
+
+def test_dry_run_state_and_reference_read_back_in_the_live_json_form(tmp_path: Path) -> None:
+    from messagefoundry.pipeline.dryrun import _dry_run_reference_view
+
+    ref = tmp_path / "payers.toml"
+    ref.write_text('[acme]\nplan = "PPO"\neffective = 2026-01-01\n', encoding="utf-8")
+    registry = Registry()
+    registry.references["payers"] = SimpleNamespace(  # type: ignore[assignment]
+        name="payers", source=SimpleNamespace(kind="file", settings={"path": str(ref)})
+    )
+    view = _dry_run_reference_view(registry)
+    assert view["payers"]["acme"] == {"plan": "PPO", "effective": "2026-01-01"}
 
 
 # --- integration: a real SQLite store --------------------------------------------
@@ -359,12 +431,38 @@ async def test_server_backends_still_refuse_a_keyless_open(backend: str) -> None
 
 async def test_postgres_follower_convergence_keeps_the_caches_sealed() -> None:
     store = _bare_server_store("postgres", make_cipher(generate_key()))
+    store._state_cache[("ns", "GONE")] = "a sibling deleted this"
+    store._state_cache[("other", "KEEP")] = "another namespace"
     assert await store.converge_state_cache() == ["ns"]
+    assert (
+        "ns",
+        "GONE",
+    ) not in store._state_cache  # the reseed drops what the read no longer holds
+    assert store._state_cache[("other", "KEEP")] == "another namespace"
     assert await store.converge_reference_cache() == ["providers", "empty"]
     assert isinstance(store._state_cache, SealedDict)
     assert store._state_cache[("ns", "MRN2")] == "second"
     assert isinstance(store._reference_cache["providers"], SealedDict)
     assert store._reference_cache["providers"]["NPI1"] == SECRET
+
+
+async def test_purge_evicts_without_decrypting(tmp_path: Path, count_opens: list[int]) -> None:
+    store = await MessageStore.open(tmp_path / "purge.db", cipher=make_cipher(generate_key()))
+    try:
+        mid, routed_id = await _route_one_handler(store)
+        await store.transform_handoff(
+            routed_id=routed_id,
+            message_id=mid,
+            channel_id="IB",
+            deliveries=[("OB_A", "payload")],
+            state_ops=[("ns", "k", SECRET)],
+        )
+        before = count_opens[0]
+        assert await store.purge_state(older_than=float("inf")) == 1
+        assert ("ns", "k") not in store._state_cache
+        assert count_opens[0] == before
+    finally:
+        await store.close()
 
 
 async def test_keyless_open_of_an_encrypted_store_still_fails_at_open(tmp_path: Path) -> None:
