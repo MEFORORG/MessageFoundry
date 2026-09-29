@@ -234,6 +234,166 @@ def test_new_ip_step_up_off_with_auth_off_is_NOT_a_loosening() -> None:
     )
 
 
+# --- [auth] sign-in limiter and lockout (BACKLOG #1131, ASVS 6.1.1) ------------------------------
+# Owner ruling 2026-09-27 (#2006): a silent weakening of the sign-in anti-automation controls keeps
+# ASVS 6.1.1 at partial. Each value the limiter or the lockout rule reads as OFF must be named.
+
+#: (field, value that turns it off). Zero is the documented off value; the negative arms are the
+#: other values the code reads as off (a window that prunes every hit, a lock that ends before now).
+_SIGN_IN_OFF_VALUES = [
+    ("login_rate_limit_enabled", False),
+    ("login_rate_limit_per_ip", 0),
+    ("login_rate_limit_global", 0),
+    ("login_rate_limit_window_seconds", 0.0),
+    ("login_rate_limit_window_seconds", -1.0),
+    ("lockout_minutes", 0),
+    ("lockout_minutes", -5),
+]
+
+
+def _risk(auth: AuthSettings, switch: str) -> str | None:
+    """The risk text ``security_loosenings()`` gives ``switch`` for ``auth``, or None."""
+    return dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            auth,
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            api=ApiSettings(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    ).get(switch)
+
+
+def test_sign_in_limiter_and_lockout_defaults_are_not_loosenings() -> None:
+    """The absent arm, at the shipped defaults: none of the new entries fires."""
+    auth = AuthSettings()
+    assert auth.login_rate_limit_enabled is True
+    assert auth.login_rate_limit_per_ip == 10
+    assert auth.login_rate_limit_global == 60
+    assert auth.login_rate_limit_window_seconds == 60.0
+    assert auth.lockout_minutes == 15
+    named = _names()
+    for field, _ in _SIGN_IN_OFF_VALUES:
+        assert field not in named
+
+
+@pytest.mark.parametrize(("field", "value"), _SIGN_IN_OFF_VALUES)
+def test_each_sign_in_off_value_is_a_named_loosening(field: str, value: object) -> None:
+    """The present arm: each off value is named, alone, under its own switch."""
+    auth = AuthSettings(**{field: value})  # type: ignore[arg-type]
+    risk = _risk(auth, field)
+    assert risk is not None, f"[auth].{field} = {value!r} turns a sign-in control off, silently"
+    # Only the switch that was set: an off value must not also report its siblings, and nothing
+    # else in the registry may fire for an [auth]-only change.
+    assert _names(auth=auth) == [field]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        # Each of these refuses MORE, not less, so none is a loosening.
+        ("login_rate_limit_per_ip", -1),
+        ("login_rate_limit_global", -1),
+        ("login_rate_limit_window_seconds", float("inf")),
+        ("login_rate_limit_window_seconds", float("nan")),
+        ("login_rate_limit_per_ip", 1),
+        ("login_rate_limit_window_seconds", 0.5),
+        ("lockout_minutes", 1),
+        # No threshold turns the lockout off: 0 or less locks on the first failure.
+        ("lockout_threshold", 0),
+        ("lockout_threshold", -1),
+        ("lockout_threshold", 1000),
+    ],
+)
+def test_a_value_that_keeps_the_control_on_is_not_a_loosening(field: str, value: object) -> None:
+    assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+
+
+def test_a_zero_limiter_value_proves_the_limiter_off() -> None:
+    """Ground the entries in the limiter itself, so a change to what it reads as off reds here.
+
+    Each configuration the registry names must admit far more than the default budget, and the
+    default must refuse inside it."""
+    from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
+
+    def admitted(per_key: int, glob: int, window: float, keys: int) -> int:
+        limiter = SlidingWindowRateLimiter(per_key=per_key, glob=glob, window_seconds=window)
+        return sum(limiter.allow(f"10.0.0.{i % keys}") for i in range(200))
+
+    assert admitted(10, 60, 60.0, keys=1) == 10  # default, one address: the per-address limit
+    assert admitted(10, 60, 60.0, keys=50) == 60  # default, many addresses: the global limit
+    assert admitted(0, 60, 60.0, keys=1) == 60  # per_ip 0: only the global limit holds
+    assert admitted(10, 0, 60.0, keys=50) == 200  # global 0: a spread spray is never refused
+    assert admitted(10, 60, 0.0, keys=1) == 200  # window 0: nothing holds
+    assert admitted(10, 60, -1.0, keys=1) == 200  # window below 0: nothing holds
+
+
+def test_a_zero_lockout_proves_the_lock_expires_at_once() -> None:
+    """Ground the lockout entry in next_lockout_state: at 0 or less, the attempt after a lock is
+    not refused by it, and the count restarts."""
+    from messagefoundry.store.store import next_lockout_state
+
+    for minutes in (0, -5):
+        locked = next_lockout_state(
+            failed_attempts=4,
+            locked_until=None,
+            lock_cycles=0,
+            now=1000.0,
+            threshold=5,
+            lockout_seconds=minutes * 60,
+            max_lockout_seconds=1440 * 60,
+            escalate=True,
+            lockable=True,
+        )
+        assert locked.just_locked
+        assert locked.locked_until is not None and locked.locked_until <= 1000.0
+
+
+def test_sign_in_limiter_and_lockout_off_with_auth_off_are_NOT_loosenings() -> None:
+    """CONDITIONAL on sign-in, like admin_new_ip_step_up: with auth off there is no sign-in to limit,
+    and the auth-off posture is reported by its own gate."""
+    named = _names(
+        auth=AuthSettings(
+            enabled=False,
+            login_rate_limit_enabled=False,
+            login_rate_limit_global=0,
+            lockout_minutes=0,
+        )
+    )
+    for field, _ in _SIGN_IN_OFF_VALUES:
+        assert field not in named
+
+
+def test_a_disabled_limiter_does_not_also_report_its_zeroed_parts() -> None:
+    """With the limiter unbuilt, a zeroed per_ip, global or window changes nothing, so only the
+    enable switch is named, as email_tls_verify is not named under a cleartext email_use_tls."""
+    named = _names(
+        auth=AuthSettings(
+            login_rate_limit_enabled=False,
+            login_rate_limit_per_ip=0,
+            login_rate_limit_global=0,
+            login_rate_limit_window_seconds=0.0,
+        )
+    )
+    assert "login_rate_limit_enabled" in named
+    assert not {"login_rate_limit_per_ip", "login_rate_limit_global"} & set(named)
+    assert "login_rate_limit_window_seconds" not in named
+
+
+def test_both_zero_counts_are_each_named() -> None:
+    named = _names(auth=AuthSettings(login_rate_limit_per_ip=0, login_rate_limit_global=0))
+    assert "login_rate_limit_per_ip" in named
+    assert "login_rate_limit_global" in named
+
+
 # --- [api].plaintext_upstream_hop_acknowledged (BACKLOG #1179) --------------------------------
 # Owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS 12.3.3 at partial.
 # The acknowledgement is therefore a listed loosening, as the #1967 retention acknowledgements are.
@@ -1201,7 +1361,6 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "ad_tls_verify",  # gated by weakened_tls_escape_permitted
         "ad_allow_insecure_ldap",  # gated by the same clamp
         "oidc_require_mfa_claim",  # gated by the OIDC serve gate
-        "login_rate_limit_enabled",  # DoS hardening with its own serve-time defaults
         "phi_read_rate_limit_enabled",
         "admin_write_rate_limit_enabled",
     }

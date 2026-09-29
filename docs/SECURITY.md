@@ -3212,7 +3212,14 @@ picture including the ingest plane. That document is maintainer-internal;
 `lockout_threshold` / `lockout_minutes`, carries a Pydantic validator. So a `per_key` or `glob` of `0`
 silently disables that dimension, and a `*_window_seconds` of `0` ages every recorded hit out
 immediately — disabling enforcement while the limiter still reports as "enabled". Treat these as
-security-relevant values, not tuning knobs.
+security-relevant values, not tuning knobs. **The sign-in limiter and the lockout are no longer
+silent about it** ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). While sign-in is on,
+`security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a `login_rate_limit_per_ip`
+or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds` of `0` or less, and a
+`lockout_minutes` of `0` or less. Each then reaches the `serve` loosening warning, `messagefoundry
+security show` and `GET /security/posture`; see
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). The PHI-read and admin-write limiters are not named
+there yet, so a zeroed value on either is still silent.
 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained
