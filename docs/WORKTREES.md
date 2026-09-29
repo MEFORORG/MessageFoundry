@@ -21,7 +21,7 @@ a new branch `alerts` (off `origin/main`, the freshly fetched remote tip — so 
 can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with
 
 ```
-pip install --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault]" -e packaging/messagefoundry-webconsole
+pip install --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp]" -e packaging/messagefoundry-webconsole
 ```
 
 That install is `scripts\worktree\ensure-venv.ps1`'s, which `new.ps1` calls -- see

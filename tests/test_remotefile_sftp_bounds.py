@@ -488,7 +488,7 @@ def test_real_paramiko_silent_session_open_is_bounded(
     never answers the channel open, never answers the ``sftp`` subsystem request, or accepts that
     request and never sends the SFTP VERSION packet. This is what checks the stub model above.
 
-    SKIPS where the ``[sftp]`` extra is not installed, which is the default here and in CI; a skip
+    SKIPS where the ``[sftp]`` extra is not installed (tests/test_sftp_extra_on_ci_leg.py); a skip
     claims nothing. The operation runs on a daemon thread joined with a ceiling, so a regression
     fails this test instead of hanging the run.
     """

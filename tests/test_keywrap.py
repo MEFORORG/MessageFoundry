@@ -761,7 +761,7 @@ def _openssh_encrypted_by_hand() -> str:
     """An OpenSSH-format key whose header says aes256-ctr under bcrypt, built without bcrypt.
 
     cryptography writes an encrypted OpenSSH key only when the ``bcrypt`` package is installed, and
-    it arrives only with the ``sftp`` extra, which the CI test legs do not install. This takes a
+    it arrives only with the ``sftp`` extra, which an interpreter may lack. This takes a
     real unencrypted key and rewrites its header to the openssh-key-v1 encrypted shape, with the
     private section replaced by opaque bytes of the padded length. ``ssh_key_encrypted`` reads only
     the header, so this exercises the same branch a real encrypted key does."""
@@ -870,9 +870,13 @@ def test_the_sftp_key_has_a_2048_bit_rsa_floor(sftp_keys: dict[str, str]) -> Non
     paramiko = pytest.importorskip("paramiko")
     from messagefoundry.transports.remotefile import _RemoteError
 
-    assert _sftp(sftp_keys["plain-2048"])._load_key(paramiko).get_bits() == 2048
+    client = _sftp(sftp_keys["plain-2048"])
+    assert client._load_key(paramiko).get_bits() == 2048
+    # Construction refuses a 1024-bit key it can size (the test above), so reaching this backstop
+    # takes a client built on a good key and then handed a short one.
+    client._private_key = sftp_keys["plain-1024"]
     with pytest.raises(_RemoteError, match="RSA-1024, below the 2048-bit floor"):
-        _sftp(sftp_keys["plain-1024"])._load_key(paramiko)
+        client._load_key(paramiko)
 
 
 def _odbc(tmp_path: Path, key_bytes: bytes | None, sslpassword: str | None) -> str:
