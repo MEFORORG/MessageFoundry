@@ -938,7 +938,7 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
 - **Audited raw view only.** A raw message body is shown only via the same audited `GET /messages/{id}`
   path as the desktop console (record_view + tamper-evident `message_view` audit); there is no second,
   unaudited PHI render path (no server-side parse-tree endpoint in M1).
-- **Attachments are neutralized at serve, never rewritten.** A detached document (ADR 0105) is a
+- **Attachments are neutralized at serve; the stored document is never rewritten.** A detached document (ADR 0105) is a
   verbatim clinical payload carrying its own attacker-influenced `OBX-5.2` MIME label, and the
   preserve-the-original invariant forbids editing the stored bytes — so the browser-safety control runs
   at *serve* time, not on the stored document. The served `Content-Type` comes from an **allow-list** of
@@ -952,7 +952,10 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   none can be framed -- `frame-ancestors` is named in that policy rather than left to the API's
   header floor because it takes no fallback from `default-src` (ASVS 3.4.6). Trade-off: `svg`/`html` attachments no
   longer preview in the browser; the bytes are unchanged and still downloadable, since the allow-list
-  governs the declared type and never whether the file is served.
+  governs the declared type and never whether the file is served. The one exception is an SVG, found by
+  its label or its root element: the route serves a copy rebuilt from a tag and attribute allow-list
+  (`api/svg_sanitize.py`, ADR 0105 amendment 2026-09-28), and refuses with HTTP 422 an SVG it cannot
+  parse safely; the stored value stays verbatim either way.
 - **XSS-safe rendering.** All HL7/message content is escaped by an autoescape-by-default renderer and a
   strict CSP (`script-src 'self'`, no `unsafe-*`); attacker-influenced HL7 cannot execute in the DOM.
 - **Residual (documented, not a claimed control):** a shared clinical workstation, browser devtools, or a
