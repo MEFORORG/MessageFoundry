@@ -667,7 +667,8 @@ def test_stale_coordinate_guard_refuses_a_mismatched_row() -> None:
 
 
 def test_scalar_edit_of_an_expression_slot_is_refused() -> None:
-    # An expression-valued arg (a list) never takes a bare-scalar edit — supply {'expr': ...} instead.
+    # An expression-valued arg (a list) never takes a bare-scalar edit. It is dynamic mode, so it takes
+    # no edit at all through set_params (ADR 0076 AC-M5, BACKLOG #237); edit it as text.
     src = (
         "from messagefoundry import handler, Send, split_field\n\n\n"
         '@handler("h")\n'

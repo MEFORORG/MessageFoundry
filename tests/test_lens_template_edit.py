@@ -20,10 +20,12 @@ fixture here is adversarial and built in this file.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import itertools
 import random
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -107,8 +109,42 @@ def test_param_parts_is_total_over_the_templated_params_and_only_those() -> None
         "path": [{"path": "PID-3"}, {"text": "-"}, {"path": "PID-4"}],
         "value": [{"path": "A"}],
     }
+    # The path is templated and shows its parts, but it is not a value parameter, so it is not
+    # WRITABLE as a template: template_params is the engine's answer to that, not param_parts.
+    assert row["template_params"] == ["value"]
     static = _row(_one_row('set_field(msg, "PID-5.1", msg["PID-3"] + "x")'))
     assert static["param_parts"] == {}, "a static or dynamic param must not appear in param_parts"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        pytest.param('set_field(msg, "PID-5.1", "old")', ["value"], id="set-field-static-value"),
+        pytest.param('msg.set("PID-5.1", "old")', ["value"], id="native-set-field"),
+        pytest.param('append_to_field(msg, "PID-5.1", "!")', ["suffix"], id="append-suffix"),
+        pytest.param('replace_literal(msg, "PID-5.1", "a", "b")', ["new"], id="replace-new"),
+        pytest.param('set_field(msg, "PID-5.1", msg["PID-3"])', [], id="dynamic-value"),
+        pytest.param('copy_field(msg, "PID-3", "PID-4")', [], id="copy-field-paths"),
+        pytest.param('pad_field(msg, "PID-3", 10)', [], id="int-width"),
+        pytest.param('msg.set("OBX-5", "V", occurrence=2)', ["value"], id="display-kwarg-excluded"),
+        pytest.param('row = db_lookup("MPI", "select 1", {})', [], id="lookup"),
+        pytest.param('log_note("note {}", "x")', [], id="diagnostic"),
+    ],
+)
+def test_template_params_names_exactly_the_writable_value_params(
+    line: str, expected: list[str]
+) -> None:
+    """``template_params`` is the templated counterpart of ``literal_params``: the engine's own list of
+    where a ``{"parts"}`` write is accepted, so the IDE offers the mode only there."""
+    row = _row(_one_row(line))
+    assert row["template_params"] == expected
+    for pname in row["params"]:
+        edit = {pname: {"parts": [{"path": "PID-3"}]}}
+        if pname in expected:
+            _set(_one_row(line), edit)
+        elif row["param_modes"][pname] != MODE_DYNAMIC and pname in row["literal_params"]:
+            with pytest.raises(LensRewriteError, match="takes a literal only"):
+                _set(_one_row(line), edit)
 
 
 @pytest.mark.parametrize(
@@ -150,11 +186,46 @@ def test_the_two_bounded_modes_switch_in_both_directions() -> None:
     # templated -> templated, by new parts
     out = _set(templated, {"value": {"parts": [{"path": "PID-4"}, {"text": "!"}]}})
     assert out.splitlines()[5] == '    set_field(msg, "PID-5.1", f"{msg[\'PID-4\']}!")'
-    # an expr is still accepted when the ENGINE classifies it static or templated
-    out = _set(templated, {"value": {"expr": "f\"{msg['PID-9']}\""}})
-    assert _row(out)["param_modes"]["value"] == MODE_TEMPLATED
+    # an expr is still accepted when the ENGINE classifies it static
     out = _set(templated, {"value": {"expr": '"plain"'}})
     assert _row(out)["param_modes"]["value"] == MODE_STATIC
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pytest.param("f\"{msg['PID-9']}\"", id="round-trippable"),
+        pytest.param("f\"{msg.field('OBX-5', 2)}\"", id="no-parts-form-and-raises-at-runtime"),
+        pytest.param('f"no read"', id="no-placeholder"),
+    ],
+)
+def test_a_templated_expr_is_refused_so_every_template_passes_the_renderer(expr: str) -> None:
+    """A templated write has ONE route, ``{"parts"}``, so every one passes the round-trip gate in
+    ``_render_parts``. E.5 admits ``msg.field`` reads that no parts list can express, and
+    ``msg.field("OBX-5", 2)`` raises TypeError at runtime (occurrence is keyword-only)."""
+    src = _one_row('set_field(msg, "PID-5.1", "old")')
+    with pytest.raises(LensRewriteError, match="write a template as"):
+        _set(src, {"value": {"expr": expr}})
+
+
+def test_a_template_that_overruns_the_column_limit_is_refused() -> None:
+    """Gate 3: ``ruff format`` would re-wrap an over-long call, and the lens never wraps a line."""
+    src = _one_row('set_field(msg, "PID-5.1", "old")')
+    long_parts = [{"text": "x" * 70}, {"path": "PID-3"}]
+    with pytest.raises(LensRewriteError, match="column limit"):
+        _set(src, {"value": {"parts": long_parts}})
+    # A short template on the same row is fine.
+    _set(src, {"value": {"parts": [{"text": "x" * 10}, {"path": "PID-3"}]}})
+
+
+@pytest.mark.parametrize(
+    "bad", [float("inf"), float("-inf"), float("nan")], ids=["inf", "-inf", "nan"]
+)
+def test_a_non_finite_float_is_refused(bad: float) -> None:
+    """``repr`` of inf and nan is a bare name, so the spliced call would raise NameError."""
+    src = _one_row('pad_field(msg, "PID-3", 10)')
+    with pytest.raises(LensRewriteError, match="no Python literal form"):
+        _set(src, {"width": bad})
 
 
 @pytest.mark.parametrize(
@@ -167,12 +238,12 @@ def test_the_two_bounded_modes_switch_in_both_directions() -> None:
         pytest.param({"parts": [["path", "A"]]}, "exactly one key", id="not-an-object"),
         pytest.param({"parts": []}, "at least one 'path'", id="empty"),
         pytest.param({"parts": [{"text": "only text"}]}, "at least one 'path'", id="no-path"),
-        pytest.param({"parts": [{"path": ""}]}, "non-empty HL7 path", id="empty-path"),
-        pytest.param({"parts": [{"path": "A'B"}]}, "non-empty HL7 path", id="path-quote"),
-        pytest.param({"parts": [{"path": 'A"B'}]}, "non-empty HL7 path", id="path-dquote"),
-        pytest.param({"parts": [{"path": "A\\B"}]}, "non-empty HL7 path", id="path-backslash"),
-        pytest.param({"parts": [{"path": "A{B"}]}, "non-empty HL7 path", id="path-brace"),
-        pytest.param({"parts": [{"path": "A\nB"}]}, "non-empty HL7 path", id="path-newline"),
+        pytest.param({"parts": [{"path": ""}]}, "must be non-empty", id="empty-path"),
+        pytest.param({"parts": [{"path": "A'B"}]}, "must be non-empty", id="path-quote"),
+        pytest.param({"parts": [{"path": 'A"B'}]}, "must be non-empty", id="path-dquote"),
+        pytest.param({"parts": [{"path": "A\\B"}]}, "must be non-empty", id="path-backslash"),
+        pytest.param({"parts": [{"path": "A{B"}]}, "must be non-empty", id="path-brace"),
+        pytest.param({"parts": [{"path": "A\nB"}]}, "must be non-empty", id="path-newline"),
         pytest.param({"parts": [{"path": "A"}, {"text": "\ud800"}]}, "UTF-8", id="lone-surrogate"),
         pytest.param(
             {"parts": [{"path": "A"}], "extra": 1}, "an object value must", id="extra-key"
@@ -186,22 +257,40 @@ def test_a_malformed_parts_value_is_refused(value: dict[str, Any], match: str) -
 
 
 def test_a_template_is_refused_on_a_lookup_argument() -> None:
-    """A lookup statement built from inbound HL7 is an injection path; message values belong in
-    ``params=``. Refused whether it arrives as parts or as a templated ``expr``."""
+    """A lookup statement built from inbound HL7 is an injection path."""
     src = _one_row('row = db_lookup("MPI", "select 1", {"id": 1})')
-    for value in ({"parts": [{"path": "PID-3"}]}, {"expr": "f\"{msg['PID-3']}\""}):
+    for pname in ("connection", "statement"):
         with pytest.raises(LensRewriteError, match="injection path"):
-            _set(src, {"statement": value})
+            _set(src, {pname: {"parts": [{"path": "PID-3"}]}})
     assert "select 2" in _set(src, {"statement": "select 2"}), "a literal still edits"
 
 
 def test_a_template_is_refused_on_a_diagnostic_argument() -> None:
-    """``log_note`` redacts its operands, never its template, so a field read interpolated into the
-    template would reach the log unredacted (CLAUDE.md section 9)."""
-    src = _one_row('log_note("note {}", msg["PID-3"])')
-    for value in ({"parts": [{"path": "PID-3"}]}, {"expr": "f\"{msg['PID-3']}\""}):
-        with pytest.raises(LensRewriteError, match="unredacted"):
-            _set(src, {"template": value})
+    """``log_note`` redacts its operands, never its template, and ``checkpoint`` logs its label
+    verbatim, so a field read interpolated into either would reach the log unredacted (CLAUDE.md
+    section 9)."""
+    note = _one_row('log_note("note {}", msg["PID-3"])')
+    with pytest.raises(LensRewriteError, match="unredacted"):
+        _set(note, {"template": {"parts": [{"path": "PID-3"}]}})
+    label = _one_row('checkpoint(msg, "after")')
+    with pytest.raises(LensRewriteError, match="unredacted"):
+        _set(label, {"label": {"parts": [{"path": "PID-3"}]}})
+
+
+@pytest.mark.parametrize(
+    ("line", "pname"),
+    [
+        pytest.param('set_field(msg, "PID-5.1", "old")', "path", id="set-field-path"),
+        pytest.param('copy_field(msg, "PID-3", "PID-4")', "dst", id="copy-field-dst"),
+        pytest.param('pad_field(msg, "PID-3", 10)', "width", id="int-width"),
+        pytest.param('delete_segment(msg, "ZX1")', "segment_id", id="segment-id"),
+    ],
+)
+def test_a_template_is_refused_on_a_locator_or_setting(line: str, pname: str) -> None:
+    """A template in a path, segment id or setting lets the message choose which field is overwritten,
+    or puts a string where an int belongs. Only a value parameter takes one."""
+    with pytest.raises(LensRewriteError, match="only a value parameter takes a template"):
+        _set(_one_row(line), {pname: {"parts": [{"path": "PID-3"}]}})
 
 
 def test_a_parts_value_is_refused_on_a_send_row() -> None:
@@ -238,9 +327,9 @@ TEXT_ALPHABET = [
     "\x00",
     "\x7f",
     "\x85",
-    " ",
-    "‍",
-    "é",
+    "\u2028",
+    "\u200d",
+    "\u00e9",
     "\U0001f6f0",
     "%s",
 ]
@@ -338,14 +427,16 @@ def test_rendered_templates_are_ruff_format_clean() -> None:
     module = (
         PREAMBLE + '@handler("h")\ndef h(msg):\n' + "".join(lines) + '    return Send("OB", msg)\n'
     )
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "ruff", "format", "--diff", "-"],
-            input=module.encode("utf-8"),
-            capture_output=True,
-        )
-    except (OSError, ValueError) as exc:  # pragma: no cover - environment guard
-        pytest.skip(f"ruff not runnable: {exc}")
+    if importlib.util.find_spec("ruff") is None:  # pragma: no cover - environment guard
+        pytest.skip("ruff is not installed")
+    # The repository root as cwd, so ruff reads this project's config (line length 100) wherever
+    # pytest was started from; its default of 88 would fail the 89-100 column rows falsely.
+    proc = subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--diff", "-"],
+        input=module.encode("utf-8"),
+        capture_output=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
     assert proc.returncode == 0, proc.stdout.decode("utf-8", "replace")[:3000]
 
 
@@ -445,7 +536,7 @@ WIDE = (
     "    # leading comment\n"
     '    copy_field(msg, "PID-3.1", "PID-4.1")\n'
     "\n"
-    '    set_field(msg, "NTE-3", "café")  # trailing comment\n'
+    '    set_field(msg, "NTE-3", "caf\u00e9")  # trailing comment\n'
     '    if msg["MSH-9.1"] == "ADT":\n'
     '        set_field(msg, "PID-5.1", "old")\n'
     "    # between rows\n"
@@ -484,13 +575,19 @@ def test_a_template_edit_changes_only_its_own_argument(
     """AC-M6: the edited line differs only inside the argument's span, every other byte is identical,
     and the rows still partition the body. Run over LF and CRLF, with and without a BOM, because the
     splice works in UTF-8 byte space and each of those shifts a byte offset."""
-    source = ("﻿" if bom else "") + WIDE.replace("\n", newline)
-    before_rows = parse_source(source.removeprefix("﻿"), contract=CONTRACT_V2)[0]["rows"]
+    source = ("\ufeff" if bom else "") + WIDE.replace("\n", newline)
+    before_rows = parse_source(source.removeprefix("\ufeff"), contract=CONTRACT_V2)[0]["rows"]
     sample = [parts for parts in GENERATED[::397] if any("path" in p for p in parts)]
-    assert len(sample) > 20, len(sample)
+    written = 0
     for parts in sample:
-        out = _set(source, {param: {"parts": parts}}, line=line)
-        assert out.startswith("﻿") == bom
+        try:
+            out = _set(source, {param: {"parts": parts}}, line=line)
+        except LensRewriteError as exc:
+            # The one legitimate refusal in this alphabet: a long template past the column limit.
+            assert "column limit" in str(exc), exc
+            continue
+        written += 1
+        assert out.startswith("\ufeff") == bom
         old_lines = source.split(newline)
         new_lines = out.split(newline)
         assert len(new_lines) == len(old_lines), "a template edit must not change the line count"
@@ -502,7 +599,7 @@ def test_a_template_edit_changes_only_its_own_argument(
         assert new_line.startswith(prefix)
         suffix = old_line[old_line.rindex(")") :]
         assert new_line.endswith(suffix)
-        after = out.removeprefix("﻿")
+        after = out.removeprefix("\ufeff")
         _partition_holds(after)
         after_rows = parse_source(after, contract=CONTRACT_V2)[0]["rows"]
         assert [(r["line_start"], r["line_end"], r["kind"]) for r in after_rows] == [
@@ -510,3 +607,4 @@ def test_a_template_edit_changes_only_its_own_argument(
         ]
         edited = next(r for r in after_rows if r["line_start"] == line)
         assert edited["param_parts"][param] == _normalize_parts(parts)
+    assert written > 20, f"only {written} of {len(sample)} sampled templates were written"

@@ -482,10 +482,10 @@ def test_contract_v1_emits_no_param_modes_and_no_other_new_key(name: str, source
 
 def test_the_only_row_difference_between_the_contracts_is_the_added_map() -> None:
     """The strong half of AC-M7: over a corpus with no `note`/`route` content, stripping
-    Amendment E's two keys -- `param_modes` and `param_parts`, the read half of the templated edit
-    spec (BACKLOG #237) -- from the v2 rows must reproduce the v1 rows EXACTLY: not merely the same
-    kinds, the same rows, same order, same line ranges, same values."""
-    amendment_e = {"param_modes", "param_parts"}
+    Amendment E's three keys -- `param_modes`, plus `param_parts` and `template_params`, the read half
+    of the templated edit spec (BACKLOG #237) -- from the v2 rows must reproduce the v1 rows EXACTLY:
+    not merely the same kinds, the same rows, same order, same line ranges, same values."""
+    amendment_e = {"param_modes", "param_parts", "template_params"}
     v1 = _rows(VOCAB_CORPUS, contract=CONTRACT_V1)
     v2 = _rows(VOCAB_CORPUS, contract=CONTRACT_V2)
     stripped = [{k: v for k, v in row.items() if k not in amendment_e} for row in v2]
