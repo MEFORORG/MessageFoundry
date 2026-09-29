@@ -377,11 +377,19 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    `associated_data`, so **`v3` is cell-bound regardless of `aad_bind`**; and the audit-chain MAC is
    computed inside Transit. Missing config or an unreachable/unknown Transit key **fails closed** at
    `open_store` (`serve` refuses to start) — never an in-process fallback. Caveat worth knowing: the
-   Transit-backed audit MAC reaches **all three** backends. This bullet previously said SQLite-only — that
+   Transit-backed audit MAC reaches **all three** backends (`audit_mac_fn`). This bullet previously said SQLite-only — that
    was the PRE-#301 state stated as current, and it was wrong in the direction that flatters nothing:
    `TransitCipher.audit_mac_key()` returns `None` **by design**, so a server backend given only
-   `audit_mac_key` had no keying secret at all. #301 threads `audit_mac_fn` alongside it
-   (`store/base.py:1817`, forwarded at `:1826`/`:1836`), which is what closed it. `docs/ASVS-L2-PHASE0-CHANGES.md`
+   `audit_mac_key` had no keying secret at all. #301 threads `audit_mac_fn` alongside it, which is
+   what closed it: `open_store` in `store/base.py` hands both to `_open_backend`, and that function
+   forwards both to each backend's `open`. This claim is a row in the backend-reach registry in
+   `tests/test_phi_at_rest_inventory.py`. The test reads the path from the code: `_open_backend` must
+   pass `audit_mac_fn` to each backend's `open`, that `open` must pass it to the constructor, and the
+   constructor must store it as `self._audit_mac_fn`. It does not check that `open_store` passes a real
+   function rather than `None`, nor that the audit append path reads the attribute. **So it binds only
+   that the MAC is delivered to every backend.** What the GCM tag and the cell AAD protect, and what the
+   audit MAC detects, are per-column and audit-chain integrity claims. The registry cannot express them,
+   so it leaves them unbound. `docs/ASVS-L2-PHASE0-CHANGES.md`
    §"Audit chain" carries the accurate wording — the digest primitive is *"shared verbatim by all three
    backends"*. **What IS unkeyed is the KEYLESS posture, not a backend:** with no store key,
    `IdentityCipher.audit_mac_key()` in `store/crypto.py` returns `None` and the chain stays keyless
