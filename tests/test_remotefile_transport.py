@@ -2167,6 +2167,8 @@ class _ScriptedFtp:
 
         self.steps.append(name)
         if name == self._refuse_at:
+            if self._reply.startswith("4"):
+                raise _ftplib.error_temp(self._reply)
             raise _ftplib.error_perm(self._reply)
 
     def connect(self, host: str, port: int) -> None:
@@ -2312,8 +2314,25 @@ def test_a_tls_refusal_is_a_configuration_fault_not_a_credential_fault(
         "530 Too many connections; access refused for this account",
         "530 Too many connections; user blacklisted",
         "530 Too many unsuccessful login sessions",
-        # Names TLS and the credential: the credential words win over the TLS demand.
-        "530 Login incorrect; SSL/TLS required",
+        # Review of fix round 3. A trailing word boundary on "denied", and machine-style tokens with
+        # an underscore or run together, each let a lockout reply read as a busy server.
+        "530 Too many users; DeniedAccess",
+        "530 Too many users; denied_access",
+        "530 Too many users; LOGIN_FAILED",
+        "530 Too many users; loginfailed",
+        "530 Too many users; E_BADPASS",
+        "530 Too many users; ERR_WRONGPASS",
+        "530 Too many users; wrongpassword",
+        "530 Too many users; badpassword",
+        "530 Too many users; user_unknown",
+        "530 Too many users; USER_NOT_FOUND",
+        # Review of fix round 3. Account-refusal phrases the list did not have.
+        "530 Too many connections; login not permitted",
+        "530 Too many users; no such user",
+        "530 Too many connections; user does not exist",
+        "530 Too many users. Login not accepted.",
+        "530 Too many connections; account terminated",
+        "530 Too many users; pwd mismatch",
         # On FTPS the control channel is already TLS, so a TLS hint is no TLS demand.
         "530 Not logged in; SSL/TLS required",
     ],
@@ -2350,6 +2369,8 @@ _TLS_DEMANDS = [
     "534 Policy requires SSL.",  # IIS
     "530 TLSv1.2 required",
     "530 Sessions must be encrypted using AUTH TLS first",  # "AUTH TLS" is no credential word
+    "550 SSL/TLS required for authentication",  # "authentication" is TLS vocabulary here
+    "530 You must authenticate over TLS",
 ]
 
 
@@ -2382,8 +2403,25 @@ def test_a_tls_demand_at_the_login_is_a_configuration_fault(
     "reply",
     [
         "530 Not logged in; SSL/TLS required",  # RFC 959's own refusal text, with a TLS hint
+        # Names TLS and the credential: the credential words win over the TLS demand.
+        "530 Login incorrect; SSL/TLS required",
         "530 Login for SSL-VPN users only",  # refuses an account; "only" is no TLS demand
         "530 Only anonymous logins over TLS accepted",
+        # Review of fix round 3: a TLS demand beside an account refusal.
+        "530 TLS required; no such user",
+        "530 TLS required; user does not exist",
+        "530 Encrypted login required: user not recognised",
+        "530 TLS required for this login (PWD mismatch)",
+        "530 Mandatory SSL: login not accepted",
+        "530 User bob is not permitted; TLS mandatory",
+        "530 TLS required; account closed",
+        # Review of fix round 3: TLS names that are an account's group, path or VPN, not a demand.
+        "530 SSL-VPN users must log in through the portal",
+        "530 Access requires SSL-VPN membership",
+        "530 This account must connect over the SSL VPN",
+        "530 User must be a member of group ftps-users",
+        "530 Home directory must exist (sslhome)",
+        "530 Account must be reactivated at https://tlsportal.example",
     ],
 )
 def test_a_tls_hint_on_an_account_refusal_is_still_a_credential_fault(
@@ -2422,6 +2460,29 @@ async def test_a_tls_demand_dead_letters_and_does_not_stop_the_lane(
         await dest.send(_UPLOAD_BODY)
     assert caught.value.permanent is True
     assert caught.value.credential_fault is False
+
+
+@pytest.mark.parametrize(
+    ("reply", "credential_fault"),
+    [
+        ("430 Invalid username or password", True),
+        ("421 Too many connections (8) from this IP", False),  # CONTROL: a busy server
+    ],
+    ids=["430-credential", "421-busy-control"],
+)
+def test_a_4xx_login_refusal_naming_the_credential_is_a_credential_fault(
+    monkeypatch: pytest.MonkeyPatch, reply: str, credential_fault: bool
+) -> None:
+    """Review of fix round 3: ftplib raises ``error_temp`` for a 4xx, which was always transient.
+    A 4xx at the login that names the credential is a refused login, and retried it would lock the
+    partner account."""
+    _scripted_ftps(monkeypatch, refuse_at="login", reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _ftps_client().list_dir("/in")
+    assert caught.value.credential_fault is credential_fault
+    assert caught.value.permanent is credential_fault
+    (ftp,) = _ScriptedFtp.instances
+    assert ftp.closed
 
 
 def test_a_refused_greeting_is_permanent_but_not_a_credential_fault(
