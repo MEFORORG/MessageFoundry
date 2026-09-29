@@ -285,6 +285,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
+  encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
+  `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256
+  MAC. That MAC still derives its key from the passphrase through the PKCS#12 KDF. It is now
+  refused like any MAC that is not PBMAC1 at the PBKDF2 floor. **This includes OpenSSL's default
+  MAC and `cryptography`'s `NoEncryption` output**, which carries a SHA-256 MAC under an empty
+  passphrase. An unencrypted bundle with no MAC (`-nomac`) still loads with no passphrase, since
+  nothing in it comes from a password. A bundle with an approved MAC now needs `MEFOR_PFX_PASSWORD`
+  even when its bags are clear. The refusal gives the `openssl` re-export commands. (`BACKLOG #1352`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
@@ -692,6 +701,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   refuse include, for example, a CIFS or Samba share without POSIX extensions, WSL `/mnt/c`
   without `metadata`, a Docker Desktop bind mount of a Windows path, and FAT or exFAT. Setups on
   such a volume that backed up before may now refuse. (`BACKLOG #1174`)
+- **A trailing-slash path is now a 404, never a redirect to an `http://` URL.** The engine used to
+  answer `GET /health/` or `GET /ui/` with a 307 before authentication, and its absolute `Location`
+  kept the request's scheme. Behind a TLS-terminating proxy whose `X-Forwarded-Proto` is not
+  trusted or not sent, that scheme is `http`, so the redirect would point a client at plaintext.
+  `create_app` now sets `redirect_slashes=False`. Use `/ui`, not `/ui/`, in a bookmark or a proxy
+  rule. (`BACKLOG #1968`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

@@ -1956,6 +1956,10 @@ NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
 #: Bidirectional, like every inventory here, and the stale direction is again what lets it fail: a
 #: broken walk leaves these rows unbacked and reds rather than reporting a clean empty scan.
 NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # Not a security control: the Test Bench collection store (BACKLOG #1174) names its SecretStorage
+    # key with a SHA-256 of the workspace storage URI, so the key carries no local path. Truncated to
+    # 32 hex characters; it only has to tell two workspaces apart.
+    "ide/src/collectionStore.ts": frozenset({"hash:createHash[sha256]"}),
     # The single source of CSP nonces for every webview the extension builds (see the randomness
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),

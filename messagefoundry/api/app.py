@@ -678,7 +678,10 @@ def _cookie_secure(request: Request) -> bool:
     )
 
 
-def _get_engine(request: Request) -> Engine:
+async def _get_engine(request: Request) -> Engine:
+    # ``async`` so FastAPI runs this provider on the event loop instead of taking a thread from the
+    # shared AnyIO worker pool on every request (ASVS 15.4.4, BACKLOG #1195). It must stay
+    # non-blocking: a blocking call here would stall the loop instead.
     engine: Engine | None = getattr(request.app.state, "engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="engine not started")
@@ -695,9 +698,10 @@ def _executor_gauges(app: FastAPI) -> tuple[int | None, int | None]:
     return executor.queue_depth, executor.busy
 
 
-def _get_gate(request: Request) -> ApprovalGate | None:
+async def _get_gate(request: Request) -> ApprovalGate | None:
     """The dual-control approval gate (ASVS 2.3.5), or ``None`` when no engine is bound — then gated
-    endpoints execute inline and the ``/approvals`` routes report 503."""
+    endpoints execute inline and the ``/approvals`` routes report 503. ``async`` for the reason
+    :func:`_get_engine` gives."""
     return getattr(request.app.state, "approval_gate", None)
 
 
@@ -1678,6 +1682,12 @@ def create_app(
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
+    #
+    # redirect_slashes=False (BACKLOG #1968): Starlette otherwise answers a trailing-slash miss with a
+    # pre-auth 307 whose absolute Location carries the scope scheme. Behind a TLS-terminating proxy
+    # whose X-Forwarded-Proto is not trusted or not sent, that scheme is http, so the redirect would
+    # point the client at an http:// URL. A trailing-slash miss is now a 404.
+    # tests/test_api_redirect_slashes.py pins that no route ends in "/" and no mount redirects.
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -1685,6 +1695,7 @@ def create_app(
         docs_url="/docs" if expose_docs else None,
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
+        redirect_slashes=False,
     )
     if engine is not None:
         app.state.engine = engine
@@ -6830,10 +6841,23 @@ def create_app(
         # GUARDED import (Option B): the web console is an optional package, so the engine imports +
         # boots + serves the JSON API without it. It is required only when serve_ui is on, and a missing
         # install fails LOUD at startup here — never a mid-request 500. (The absent path is exercised by
-        # tests/test_webconsole_absent.py, which shadows the import.)
+        # tests/test_webconsole_absent.py, which shadows the import; the installed-but-broken path by
+        # tests/test_webconsole_import_failure.py.)
         try:
             from messagefoundry_webconsole import assert_engine_seam, mount_ui
-        except ImportError as exc:  # pragma: no cover
+        except ImportError as exc:
+            from messagefoundry.api._webconsole_import import (
+                console_import_failure,
+                console_is_absent,
+            )
+
+            # BACKLOG #1907: an INSTALLED console that fails to import (an old wheel missing a name
+            # this engine imports, or one whose own import chain breaks) is not "not installed". It
+            # raises here, before assert_engine_seam can name the mismatch, so name it instead.
+            if not console_is_absent(exc):
+                raise RuntimeError(
+                    f"serve_ui requires the web console, and {console_import_failure(exc)}"
+                ) from exc
             # ASVS 15.2.4: this string is an INSTALL INSTRUCTION the operator will paste, so what it
             # names has to be true. It once named a `webconsole` EXTRA that pyproject does not declare,
             # so the command simply failed. It now names the DISTRIBUTION, whose name has been

@@ -152,6 +152,7 @@ under Changed says why engine 0.4.0 does not work with this console.
   `[store].allow_unmarked_ciphertext` opt-out. Each refusal logs a WARNING with the file id and
   status only, never the filename. The `404` answers are unchanged, so a refused owner check still
   reads as a missing file.
+- **The audit pages state a cap only on a full window, and no longer call the audit export the complete record** (`BACKLOG #1743`). No seam change.
 
 ### Security
 - **The user page sets the notification address in its own field** (`BACKLOG #1139`, ADR 0182
