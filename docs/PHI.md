@@ -546,7 +546,11 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
   audit row naming the `surface` that asked. Opening a message, `GET /messages/{id}`, returns its
   metadata and no body, and writes `message_view` (BACKLOG #2345). The open returns `summary` and
   `metadata` masked, as the list does, unless the caller passes `reveal_summary=true`; the
-  `message_view` row lists in `revealed` the properties it returned complete (BACKLOG #2346). A detached document is the **same PHI**, so
+  `message_view` row lists in `revealed` the properties it returned complete (BACKLOG #2346). The
+  error text (`error`, each delivery's `last_error`, each event's `detail`) comes back as a fixed
+  `****` mask unless the caller passes `reveal_errors=true`, a separate act (BACKLOG #2436); the
+  scrubber that cleans that text is not de-identification. The message list and search mask
+  `error`, and `GET /dead-letters` masks `last_error`, the same way, with no reveal of their own. A detached document is the **same PHI**, so
   `GET /messages/{message_id}/attachments/{attachment_id}` rides the *same* `messages:view_raw` gate and
   channel scope, **plus a `message_attachment` linkage check** — a guessed content address that is not
   linked to an in-scope message is a 404 — and writes a `record_view` **and** an `attachment_download`
@@ -605,8 +609,8 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
 |---|---|---|---|
 | `messages.summary` | none (composed from parsed fields) | `messages:view_summary` via the field-level `redact_unauthorized` gate; summary displays are audited | nulled by `purge_message_bodies` |
 | `messages.metadata` | none | `messages:view_summary` (same gate) | **`[retention].messages_days`** — nulled by `purge_message_bodies` in the same statement as the body, on every backend ([§8](#8-retention--purge)) |
-| `messages.error`, `queue.last_error` | `safe_exc()` chokepoint | `messages:view_summary` | nulled by `purge_message_bodies` / `purge_dead_letters` |
-| `message_events.detail` | `safe_text()` | `GET /messages/{id}` (`messages:view_raw` + `require_phi_read`); the read itself writes a `viewed` event and a `message_view` audit row. `EventInfo.detail` is **additionally** nulled by `redact_unauthorized` for a caller lacking `messages:view_summary`, so a view_raw-without-view_summary role cannot read it | set to `NULL` by `purge_message_bodies` (inherits the body window) |
+| `messages.error`, `queue.last_error` | `safe_exc()` chokepoint | `messages:view_summary`; a holder gets a fixed `****` mask on at least the message open, the message list and search, and the dead-letter list, until the per-message `reveal_errors` act on `GET /messages/{id}` (`messages:view_raw`), which the `message_view` audit row records (BACKLOG #2436) | nulled by `purge_message_bodies` / `purge_dead_letters` |
+| `message_events.detail` | `safe_text()` | `GET /messages/{id}` (`messages:view_raw` + `require_phi_read`); the read itself writes a `viewed` event and a `message_view` audit row. `EventInfo.detail` is **additionally** nulled by `redact_unauthorized` for a caller lacking `messages:view_summary`, so a view_raw-without-view_summary role cannot read it; a holder gets it as a fixed `****` mask for every event kind until the `reveal_errors` act (BACKLOG #2436) | set to `NULL` by `purge_message_bodies` (inherits the body window) |
 | `response.detail` | `safe_text()`, 200-char bound | `GET /messages/{id}/responses` under `messages:read` + `require_phi_read`; nulled by `redact_unauthorized` for a caller lacking `messages:view_summary`; every read writes a `response.read` audit row | set to `NULL` in place by `purge_message_bodies` |
 | `response.resp_headers` | `safe_text()` | **no API surface** — it is not a field of `CapturedResponseInfo` and is never returned by `GET /messages/{id}/responses`; reachable only from a Handler via `response_get(destination)` (ADR 0013/0084) | set to `NULL` in place by `purge_message_bodies` |
 | `state.value` | none (Handler-authored JSON) | **no read API** — Handler-only via `state_get` | age purge on `[retention].state_max_age_days` (DELETE) |
@@ -982,11 +986,20 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   `routes.core.UI_MESSAGE_REVEALS`. The console's body helper refuses a route that does not
   declare `body`, and a source test fails if a route handler calls the engine's open or body
   fetch around those helpers. A detached attachment has its own audited download route and no
-  row in that table. A reveal is a request, never a setting, so it does not carry to the next page.
+  row in that table. The error text follows the same rule (BACKLOG #2436, owner ruling R12): the
+  message's error, each delivery's last error and each event's detail show as `****` with a
+  "Reveal" link to `/ui/messages/{id}/errors`, and the dead-letter list links each masked last
+  error to the same route. No other console route in that table declares it, the body reveal
+  included. The JSON plane is its own question: it masks the same text on the open and on the
+  message and dead-letter lists, and at least `GET /messages/{id}/responses` (the captured
+  reply's `detail`) and `GET /connections/{name}/events` (a lane's `reason`) can carry a similar
+  string unmasked, under their own gates.
+  A reveal is a request, never a setting, so it does not carry to the next page.
   The reveal addresses are ordinary GETs. Going back to one (history, a restored tab) is usually
   a new request, audited and charged like the first, but a browser may also redisplay the page
   from its back-forward cache without asking the engine, and then nothing is audited.
-  The test harness does the same with a Show body button.
+  The test harness does the same with a Show body button. It has no error-text reveal: it shows
+  the mask, and the error text is read in the web console.
 - **Attachments are neutralized at serve; the stored document is never rewritten.** A detached document (ADR 0105) is a
   verbatim clinical payload carrying its own attacker-influenced `OBX-5.2` MIME label, and the
   preserve-the-original invariant forbids editing the stored bytes — so the browser-safety control runs
