@@ -606,6 +606,8 @@ def test_the_regenerator_rewrites_a_drifted_sqlserver_closure(tmp_path: Path) ->
 # reads every component on those examples from a dated snapshot, in a section the generator renders.
 # Everything below is offline: the snapshot is a tracked file, and nothing here calls the network.
 
+_NOT_RISKY = "### Not risky on any of the three"
+_FIT = "### How this reading and the tiers fit together"
 #: Each ASVS example's subsection in the rendered section, and the subsection after it.
 _AXIS_SECTIONS = (
     ("maintenance", "### Poorly maintained", "### Unsupported or end of life"),
@@ -655,11 +657,13 @@ def _stated_facts_drift(page: str, data: dict[str, Any]) -> list[str]:
     counts = {
         axis: sum(r["risky"][axis] for r in readings.values()) for axis, _, _ in _AXIS_SECTIONS
     }
-    clean = sum(not any(r["risky"].values()) for r in readings.values())
+    clean = {n for n, r in readings.items() if not any(r["risky"].values())}
+    risky = size - len(clean)
     sentence = (
-        f"**{size - clean} of {size} are risky on at least one example: {counts['maintenance']} on "
-        f"maintenance, {counts['support']} on support, and {counts['advisory_history']} on "
-        f"vulnerability history. {clean} are not. {size - clean} plus {clean} is {size}.**"
+        f"**Risky on at least one example: {risky} of {size}. On maintenance: "
+        f"{counts['maintenance']}. On support: {counts['support']}. On vulnerability history: "
+        f"{counts['advisory_history']}. Not risky on any: {len(clean)}. "
+        f"{risky} plus {len(clean)} is {size}.**"
     )
     if sentence not in flat:
         problems.append(f"the page does not state {sentence!r}")
@@ -668,6 +672,9 @@ def _stated_facts_drift(page: str, data: dict[str, Any]) -> list[str]:
         flagged = {n for n, r in readings.items() if r["risky"][axis]}
         if named != flagged:
             problems.append(f"{axis}: page names {sorted(named)}, snapshot {sorted(flagged)}")
+    named = _table_names(_region(_NOT_RISKY, _FIT, page))
+    if named != clean:
+        problems.append(f"not risky: page names {sorted(named)}, snapshot {sorted(clean)}")
     return problems
 
 
@@ -682,8 +689,9 @@ def test_the_readings_snapshot_parses_and_is_not_empty() -> None:
     assert len(readings) >= 20, f"{_READINGS.name} parsed to {len(readings)} readings"
     assert {"hl7", "cryptography", "pyodbc"} <= readings.keys()
     dt.date.fromisoformat(data["snapshot_date"])
-    assert set(data["criteria"]) == set(component_readings.criteria()), (
-        "the snapshot records a different criterion set from the generator's"
+    assert data["criteria"] == component_readings.criteria(), (
+        "the snapshot records different criteria from the generator's; a changed threshold "
+        "needs a new run of scripts/security/component_readings.py"
     )
     assert all(set(r["risky"]) == set(component_readings.AXES) for r in readings.values())
 
@@ -766,9 +774,16 @@ def test_the_generator_reads_the_same_designation_as_this_guard() -> None:
     closure tests above use this module's. Two parsers of one page must agree, or the section and
     the tiers describe different pages.
     """
-    labels = component_readings.designation_labels(_DOC.read_text(encoding="utf-8"))
-    assert set(labels) == _designated()
-    assert labels["hl7"] == "tier 1" and labels["pyodbc"] == "the `sqlserver` extra"
+    page = _DOC.read_text(encoding="utf-8")
+    tiers = [ln for ln in page.splitlines() if re.match(r"## Tier \d+ ", ln)]
+    assert len(tiers) >= 3, "the page's tier headings moved; this test reads between them"
+    expected: dict[str, str] = {}
+    for heading, following in zip(tiers, [*tiers[1:], _CORE_SPLIT], strict=True):
+        tier = f"tier {heading.split()[2]}"
+        expected |= dict.fromkeys(_table_names(_region(heading, following)), tier)
+    expected |= dict.fromkeys(_sqlserver_designated_and_excluded()[0], "the `sqlserver` extra")
+    assert set(expected) == _designated()
+    assert component_readings.designation_labels(page) == expected
 
 
 def test_the_rendered_section_is_the_tracked_one() -> None:
@@ -808,29 +823,37 @@ def test_the_section_checks_can_fail() -> None:
     assert tracked == component_readings.render_section(data, labels)
     assert not _stated_facts_drift(page, data)
 
-    flagged = next(r for r in data["readings"] if r["risky"]["maintenance"])
+    # Whatever the first reading's verdict is, invert it, so this works on any future snapshot.
+    first = data["readings"][0]
     flipped = {
         **data,
         "readings": [
-            {**r, "risky": {**r["risky"], "maintenance": False}} if r is flagged else r
-            for r in data["readings"]
+            {
+                **first,
+                "risky": {**first["risky"], "maintenance": not first["risky"]["maintenance"]},
+            },
+            *data["readings"][1:],
         ],
     }
     moved = {**data, "reread_by": "2099-01-01"}
     for changed in (flipped, moved):
         assert component_readings.render_section(changed, labels) != tracked
         assert _stated_facts_drift(page, changed)
-    unlabelled = {k: v for k, v in labels.items() if k != flagged["name"]}
+    # Dropping a designation always shows: a risky row's column, or the not-risky grouping, moves.
+    unlabelled = {k: v for k, v in labels.items() if k != next(iter(labels))}
     assert component_readings.render_section(data, unlabelled) != tracked
-    row = next(ln for ln in tracked.splitlines() if ln.startswith(f"| `{flagged['name']}` |"))
+    # Any table row naming a component: a flagged one, or a not-risky group row.
+    row = next(ln for ln in tracked.splitlines() if ln.startswith("| `"))
     assert _stated_facts_drift(page.replace(row + "\n", ""), data)
 
 
 def test_the_generator_reads_a_component_from_fake_replies() -> None:
-    """RED when: the generator misreads PyPI or OSV, or double-counts an aliased advisory.
+    """RED when: the generator misreads PyPI or OSV, double-counts an aliased advisory, or keeps
+    a record whose GitHub twin is withdrawn.
 
-    Fake replies in the APIs' shapes, so this needs no network. The OSV reply carries one flaw twice,
-    as a GHSA and as its PYSEC twin, and a withdrawn record that must not count.
+    Fake replies in the APIs' shapes, so this needs no network. The OSV reply carries one flaw twice
+    (a GHSA and its PYSEC twin), a withdrawn record, a PYSEC record rated only by a CVSS 3 vector,
+    and a PYSEC record whose GHSA twin the package query did not return because it is withdrawn.
     """
     as_of = dt.date(2026, 1, 1)
 
@@ -854,12 +877,20 @@ def test_the_generator_reads_a_component_from_fake_replies() -> None:
         {"id": "PYSEC-1", "aliases": ["CVE-1"], "published": "2025-01-01T00:00:00Z"},
         {"id": "GHSA-gone", "published": "2025-01-01T00:00:00Z", "withdrawn": "2025-02-01",
          "database_specific": {"severity": "CRITICAL"}},
+        {"id": "PYSEC-2", "aliases": ["CVE-2"], "published": "2025-03-01T00:00:00Z",
+         "severity": [{"type": "CVSS_V3",
+                       "score": "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:C/C:H/I:H/A:H"}]},
+        {"id": "PYSEC-3", "aliases": ["GHSA-twin"], "published": "2025-04-01T00:00:00Z"},
     ]  # fmt: skip
+    replies[component_readings.OSV_VULN.format(id="GHSA-twin")] = {
+        "id": "GHSA-twin",
+        "withdrawn": "2025-04-02T00:00:00Z",
+    }
 
     def fetch(url: str, body: bytes | None) -> Any:
         if url == component_readings.OSV_QUERY:
             assert body is not None
-            return {"vulns": [] if "version" in json.loads(body) else osv}
+            return {"vulns": [osv[3]] if "version" in json.loads(body) else osv}
         return replies[url]
 
     reading = component_readings.read_component(
@@ -869,6 +900,31 @@ def test_the_generator_reads_a_component_from_fake_replies() -> None:
     assert reading["pinned_yanked"] is True
     assert reading["development_status"] == ["Development Status :: 7 - Inactive"]
     assert reading["advisories"] == [
-        {"id": "GHSA-aaaa", "severity": "HIGH", "published": "2025-01-01"}
+        {"id": "GHSA-aaaa", "severity": "HIGH", "rated_by": "github", "published": "2025-01-01"},
+        {"id": "PYSEC-2", "severity": "HIGH", "rated_by": "cvss3", "published": "2025-03-01"},
     ]
+    assert reading["advisories_dropped"] == [{"id": "PYSEC-3", "withdrawn": "GHSA-twin"}]
+    assert reading["advisories_affecting_pin"] == ["PYSEC-2"]
     assert reading["risky"] == {"maintenance": True, "support": True, "advisory_history": True}
+
+
+@pytest.mark.parametrize(
+    ("vector", "score"),
+    [
+        # The two in-window records the first cut of the generator left unrated, scored by hand.
+        ("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:C/C:H/I:H/A:H", 7.2),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", 7.5),
+        # FIRST's own reference points: unchanged and changed scope at the top of the scale.
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0),
+        ("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N", 0.0),
+        ("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", None),
+        ("CVSS:3.1/AV:N/AC:L", None),
+    ],
+)
+def test_the_cvss3_scorer_matches_the_specification(vector: str, score: float | None) -> None:
+    """RED when: the CVSS 3 base score drifts from the FIRST formula, or scores a non-3.x vector.
+
+    A record rated only by its vector reaches the vulnerability-history verdict through this.
+    """
+    assert component_readings.cvss3_score(vector) == score

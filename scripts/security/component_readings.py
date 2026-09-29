@@ -36,16 +36,18 @@ A full run needs the network and runs by hand, never in CI. Standard library onl
 
     python scripts/security/component_readings.py
 
-``--as-of YYYY-MM-DD`` fixes the snapshot date (default: today, UTC). The readings are dated to that
-day and to the pins the closure file held on it; a later lock bump does not change them until the
-next run. ``--render-only`` re-renders the page section from the tracked snapshot with no network,
-for when the tiers change and the readings do not.
+The snapshot date is always today, UTC: the APIs answer only with today's classifiers, statuses and
+yanks, so no earlier date can be read honestly. The readings are dated to that day and to the pins
+the closure file held on it; a later lock bump does not change them until the next run.
+``--render-only`` re-renders the page section from the tracked snapshot with no network, for when
+the tiers change and the readings do not.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import http.client
 import json
 import re
 import sys
@@ -75,9 +77,11 @@ PAGE = ROOT / "docs" / "RISKY-COMPONENTS.md"
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
 PYPI_SIMPLE = "https://pypi.org/simple/{name}/"
 OSV_QUERY = "https://api.osv.dev/v1/query"
+OSV_VULN = "https://api.osv.dev/v1/vulns/{id}"
 
-#: The windows and thresholds. They are recorded in the snapshot, and the guard re-derives every
-#: verdict from the recorded copy, so changing one here changes nothing until the next run.
+#: The windows and thresholds. The snapshot records them and the guard re-derives every verdict
+#: from the recorded copy. The guard also holds that copy, and the re-read date, to these constants,
+#: so changing one here turns the guard red until a new run records it.
 MAINTENANCE_WINDOW_DAYS = 730
 ADVISORY_WINDOW_DAYS = 1825
 REREAD_INTERVAL_DAYS = 90
@@ -89,6 +93,16 @@ INACTIVE_CLASSIFIER = "Development Status :: 7 - Inactive"
 
 #: The GitHub advisory database rates severity in these words; its MODERATE is the medium band.
 _SEVERITY_RANK = {"LOW": 1, "MODERATE": 2, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+#: CVSS 3.x base-metric weights, from the FIRST specification. ``PR`` weighs more when scope changes.
+_CVSS3_WEIGHTS: dict[str, dict[str, float]] = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "PR": {"N": 0.85, "L": 0.62, "H": 0.27},
+    "UI": {"N": 0.85, "R": 0.62},
+    "CIA": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+_CVSS3_PR_CHANGED = {"N": 0.85, "L": 0.68, "H": 0.5}
 
 _USER_AGENT = "messagefoundry-component-readings/1 (BACKLOG 1189)"
 _TIMEOUT_SECONDS = 30
@@ -114,11 +128,23 @@ READINGS_HEADING = "## Risky by ASVS's own examples, read from public data"
 
 
 class Advisory(TypedDict):
-    """One advisory, after the OSV records that alias each other are merged into one."""
+    """One advisory, after the OSV records that alias each other are merged into one.
+
+    ``rated_by`` says where ``severity`` came from: ``github`` (the GitHub advisory database's
+    word), ``cvss3`` (the CVSS 3 base score of a vector in the record) or ``none``.
+    """
 
     id: str
     severity: str
+    rated_by: str
     published: str
+
+
+class Dropped(TypedDict):
+    """An advisory left out because the GitHub advisory it mirrors has been withdrawn."""
+
+    id: str
+    withdrawn: str
 
 
 class Reading(TypedDict):
@@ -139,6 +165,7 @@ class Reading(TypedDict):
     pinned_yanked: bool
     requires_python_latest: str
     advisories: list[Advisory]
+    advisories_dropped: list[Dropped]
     advisories_affecting_pin: list[str]
     risky: dict[str, bool]
 
@@ -194,28 +221,117 @@ def _representative(group: list[dict[str, Any]]) -> str:
     return next((i for i in ids if i.startswith("GHSA-")), ids[0])
 
 
-def _group_severity(group: list[dict[str, Any]]) -> str:
-    """The highest qualitative severity any member records, or ``UNRATED`` when none does.
+def cvss3_score(vector: str) -> float | None:
+    """The CVSS 3.x base score of ``vector``, or None when it is not a complete 3.x vector.
 
-    Only the GitHub advisory database writes a word here. A group with no GHSA member and only a
-    CVSS vector stays ``UNRATED`` rather than being scored by this script.
+    The FIRST specification's formula, including its Roundup to one decimal place.
+    """
+    if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
+        return None
+    metrics = dict(part.split(":", 1) for part in vector.split("/")[1:] if ":" in part)
+    try:
+        changed = {"U": False, "C": True}[metrics["S"]]
+        pr = (_CVSS3_PR_CHANGED if changed else _CVSS3_WEIGHTS["PR"])[metrics["PR"]]
+        exploitability = (
+            8.22
+            * _CVSS3_WEIGHTS["AV"][metrics["AV"]]
+            * _CVSS3_WEIGHTS["AC"][metrics["AC"]]
+            * pr
+            * _CVSS3_WEIGHTS["UI"][metrics["UI"]]
+        )
+        c, i, a = (_CVSS3_WEIGHTS["CIA"][metrics[k]] for k in ("C", "I", "A"))
+    except KeyError:
+        return None
+    iss = 1 - (1 - c) * (1 - i) * (1 - a)
+    impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if changed else 6.42 * iss
+    if impact <= 0:
+        return 0.0
+    raw = min((1.08 if changed else 1.0) * (impact + exploitability), 10.0)
+    scaled = round(raw * 100_000)
+    return scaled / 100_000 if scaled % 10_000 == 0 else (scaled // 10_000 + 1) / 10.0
+
+
+def _cvss3_word(score: float) -> str:
+    """The CVSS 3 qualitative rating of a base score."""
+    if score >= 9.0:
+        return "CRITICAL"
+    if score >= 7.0:
+        return "HIGH"
+    if score >= 4.0:
+        return "MEDIUM"
+    return "LOW" if score > 0 else "NONE"
+
+
+def _group_severity(group: list[dict[str, Any]]) -> tuple[str, str]:
+    """The group's severity word and where it came from.
+
+    The GitHub advisory database's word wins where any member has one. Otherwise the highest CVSS 3
+    base score among the members' vectors is rated by the CVSS scale. A group with neither, such
+    as one carrying only a CVSS 4 vector, is ``UNRATED``.
     """
     rated = [str((r.get("database_specific") or {}).get("severity", "")).upper() for r in group]
     ranked = [s for s in rated if s in _SEVERITY_RANK]
-    return max(ranked, key=_SEVERITY_RANK.__getitem__) if ranked else "UNRATED"
-
-
-def advisories(vulns: Iterable[dict[str, Any]]) -> list[Advisory]:
-    """OSV records as merged advisories, sorted by id: one per flaw, dated by its first record."""
-    out: list[Advisory] = [
-        {
-            "id": _representative(group),
-            "severity": _group_severity(group),
-            "published": min(r["published"][:10] for r in group if r.get("published")),
-        }
-        for group in _merge_aliases(vulns)
-        if any(r.get("published") for r in group)
+    if ranked:
+        return max(ranked, key=_SEVERITY_RANK.__getitem__), "github"
+    scores = [
+        score
+        for r in group
+        for s in r.get("severity") or []
+        if (score := cvss3_score(str(s.get("score", "")))) is not None
     ]
+    return (_cvss3_word(max(scores)), "cvss3") if scores else ("UNRATED", "none")
+
+
+def _group_ids(group: list[dict[str, Any]]) -> set[str]:
+    """Every id a group's records carry: their own and their aliases."""
+    return {str(r["id"]) for r in group} | {str(x) for r in group for x in r.get("aliases") or []}
+
+
+def withdrawn_twins(vulns: list[dict[str, Any]], fetch: Fetch) -> dict[str, str]:
+    """Record id to the withdrawn GitHub advisory it mirrors, for each record that mirrors one.
+
+    OSV's package query leaves withdrawn records out, so a Python-advisory record whose GitHub twin
+    was withdrawn arrives alone and looks live. Each GitHub alias the query did not return is
+    fetched by id, and a withdrawn one takes its twin out. The fastapi record PYSEC-2024-38 is the
+    case this exists for: its GitHub twin was withdrawn because the flaw belongs to another package.
+    """
+    returned = {str(v["id"]) for v in vulns}
+    out: dict[str, str] = {}
+    for record in vulns:
+        for alias in record.get("aliases") or []:
+            if not str(alias).startswith("GHSA-") or alias in returned:
+                continue
+            try:
+                twin = fetch(OSV_VULN.format(id=urllib.parse.quote(str(alias), safe="")), None)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    continue
+                raise
+            if twin.get("withdrawn"):
+                out[str(record["id"])] = str(alias)
+    return out
+
+
+def advisories(
+    vulns: Iterable[dict[str, Any]], withdrawn: Mapping[str, str] | None = None
+) -> list[Advisory]:
+    """OSV records as merged advisories, sorted by id: one per flaw, dated by its first record.
+
+    A group any of whose records mirrors a withdrawn GitHub advisory (``withdrawn``) is left out.
+    """
+    out: list[Advisory] = []
+    for group in _merge_aliases(vulns):
+        if not any(r.get("published") for r in group) or _group_ids(group) & set(withdrawn or {}):
+            continue
+        severity, rated_by = _group_severity(group)
+        out.append(
+            {
+                "id": _representative(group),
+                "severity": severity,
+                "rated_by": rated_by,
+                "published": min(r["published"][:10] for r in group if r.get("published")),
+            }
+        )
     return sorted(out, key=lambda a: a["id"])
 
 
@@ -225,12 +341,16 @@ def _osv_all(name: str, version: str | None, fetch: Fetch) -> list[dict[str, Any
     if version is not None:
         query["version"] = version
     vulns: list[dict[str, Any]] = []
+    seen: set[str] = set()
     while True:
         reply = fetch(OSV_QUERY, json.dumps(query).encode("utf-8"))
         vulns += reply.get("vulns") or []
         token = reply.get("next_page_token")
         if not token:
             return vulns
+        if token in seen:
+            raise ValueError(f"{name}: OSV returned the page token {token!r} twice")
+        seen.add(token)
         query["page_token"] = token
 
 
@@ -239,7 +359,9 @@ def in_window(
 ) -> list[Mapping[str, Any]]:
     """The reading's advisories first published inside the advisory window ending ``as_of``."""
     floor = as_of - dt.timedelta(days=int(criteria["advisory_window_days"]))
-    return [a for a in reading["advisories"] if dt.date.fromisoformat(a["published"]) >= floor]
+    return [
+        a for a in reading["advisories"] if floor <= dt.date.fromisoformat(a["published"]) <= as_of
+    ]
 
 
 def significant_in_window(
@@ -303,6 +425,8 @@ def read_component(
         raise ValueError(f"{name}: PyPI has no release {pinned}, the version the closure pins")
     window_floor = as_of - dt.timedelta(days=MAINTENANCE_WINDOW_DAYS)
     pinned_files = releases[pinned]
+    records = _osv_all(name, None, fetch)
+    withdrawn = withdrawn_twins(records, fetch)
 
     reading: Reading = {
         "name": name,
@@ -317,8 +441,11 @@ def read_component(
         "project_status": str((simple.get("project-status") or {}).get("status", "absent")),
         "pinned_yanked": bool(pinned_files) and all(f.get("yanked") for f in pinned_files),
         "requires_python_latest": str(info.get("requires_python") or ""),
-        "advisories": advisories(_osv_all(name, None, fetch)),
-        "advisories_affecting_pin": [a["id"] for a in advisories(_osv_all(name, pinned, fetch))],
+        "advisories": advisories(records, withdrawn),
+        "advisories_dropped": [{"id": i, "withdrawn": w} for i, w in sorted(withdrawn.items())],
+        "advisories_affecting_pin": [
+            a["id"] for a in advisories(_osv_all(name, pinned, fetch), withdrawn)
+        ],
         "risky": {},
     }
     reading["risky"] = classify(reading, as_of, criteria())
@@ -352,31 +479,41 @@ def snapshot(as_of: dt.date, fetch: Fetch = fetch_json) -> dict[str, Any]:
 # --- The page ------------------------------------------------------------------------------------
 
 _TIER_HEADING = re.compile(r"^## Tier (\d+)\b")
+_EXTRA_HEADING = re.compile(r"^## The `([^`]+)` extra$")
 _FIRST_CELL_NAMES = re.compile(r"^\|\s*((?:`[a-z0-9][a-z0-9._-]*`,?\s*)+)\|")
 
 
 def designation_labels(page: str) -> dict[str, str]:
-    """Name to where the page's tiers designate it: ``tier N``, or the ``sqlserver`` extra.
+    """Name to where the page's tiers designate it: ``tier N``, or ``the `X` extra``.
 
-    Reads only the designated tables above the readings heading. A not-designated table, or any
-    heading other than a tier or the extra's ``### Designated``, ends the current label.
+    Reads only the designated tables above the readings heading: a tier's table, or the
+    ``### Designated`` table under an extra's own ``## The `X` extra`` heading. Any other heading
+    ends the current label, so a not-designated table is never read as a designation.
     """
     labels: dict[str, str] = {}
     label: str | None = None
+    extra: str | None = None
     for line in page.splitlines():
         if line == READINGS_HEADING:
             break
-        if line.startswith("#"):
-            tier = _TIER_HEADING.match(line)
+        if line.startswith("## "):
+            tier, named = _TIER_HEADING.match(line), _EXTRA_HEADING.match(line)
             label = f"tier {tier[1]}" if tier else None
-            if line == "### Designated":
-                label = "the `sqlserver` extra"
+            extra = named[1] if named else None
+            continue
+        if line.startswith("#"):
+            label = f"the `{extra}` extra" if extra and line == "### Designated" else None
             continue
         row = _FIRST_CELL_NAMES.match(line)
         if label and row:
             for cell in row[1].split(","):
                 labels[runtime_closure.canonical_name(cell.strip(" `"))] = label
     return labels
+
+
+def _count(n: int, one: str, many: str) -> str:
+    """``n`` with the noun phrase that agrees with it: "1 advisory carries", "2 advisories carry"."""
+    return f"{n} {one if n == 1 else many}"
 
 
 def _either(words: Iterable[str]) -> str:
@@ -400,8 +537,9 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
 
     out = [
         f"> **Snapshot date: {data['snapshot_date']}. Re-read by: {data['reread_by']}.** Every "
-        "reading below comes from public PyPI and OSV data on the snapshot date, for the versions "
-        "the closure files pinned that day. Support status and advisory history go stale. After the "
+        "reading below comes from public data on the snapshot date: PyPI, the Python Package "
+        "Index, and OSV, the Open Source Vulnerabilities database. It covers the versions the "
+        "closure files pinned that day. Support status and advisory history go stale. After the "
         "re-read date, treat this section as out of date until "
         "[`scripts/security/component_readings.py`](../scripts/security/component_readings.py) "
         "runs again.",
@@ -420,7 +558,8 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "|---|---|---|",
         "| Poorly maintained | it has uploaded no release to PyPI, pre-releases included, in the "
         f"{rules['maintenance_window_days']} days before the snapshot | PyPI JSON API |",
-        "| Unsupported or end of life | its PyPI project status (PEP 792) is "
+        "| Unsupported or end of life | its PyPI project status, the marker Python standard "
+        "PEP 792 defines, is "
         + _either(rules["unsupported_statuses"])
         + f", or its latest release is classified `{rules['inactive_classifier']}`, or the "
         "pinned version is yanked | PyPI JSON and Simple APIs |",
@@ -430,17 +569,21 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         f"{round(int(rules['advisory_window_days']) / 365)} years) before the snapshot | OSV API |",
         "",
         "OSV often records one flaw twice, once from the GitHub advisory database and once from the "
-        "Python advisory database. Records that name each other count once. The severity is the "
-        "GitHub advisory database's rating. An advisory with no rating does not count, and the "
-        "ones in the window are named below so a reader can judge them.",
+        "Python advisory database. Records that name each other count once. A record whose GitHub "
+        "twin has been withdrawn does not count at all.",
+        "",
+        "The severity is the GitHub advisory database's rating. Where it gives none, the record's "
+        "CVSS 3 vector is scored, CVSS being the Common Vulnerability Scoring System, and rated on "
+        "that system's scale. An advisory with neither does not count. The ones in the window are "
+        "named below so a reader can judge them.",
         "",
         "These tests are mechanical. A small library that is finished can trip the first one "
         "without being neglected. The reading says where to look; it does not say the library is "
         "broken.",
         "",
-        f"**{size - len(clean)} of {size} are risky on at least one example: "
-        f"{len(flagged['maintenance'])} on maintenance, {len(flagged['support'])} on support, "
-        f"and {len(flagged['advisory_history'])} on vulnerability history. {len(clean)} are not. "
+        f"**Risky on at least one example: {size - len(clean)} of {size}. On maintenance: "
+        f"{len(flagged['maintenance'])}. On support: {len(flagged['support'])}. On vulnerability "
+        f"history: {len(flagged['advisory_history'])}. Not risky on any: {len(clean)}. "
         f"{size - len(clean)} plus {len(clean)} is {size}.**",
         "",
         "### Poorly maintained",
@@ -485,9 +628,11 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
     open_hits = [(a, r["name"]) for r in readings for a in r["advisories_affecting_pin"]]
     if open_hits:
         out.append(
-            "On the snapshot date OSV listed these advisories against a pinned version: "
+            "On the snapshot date OSV listed "
+            + _count(len(open_hits), "advisory", "advisories")
+            + " against a pinned version: "
             + "; ".join(f"`{a}` against `{n}`" for a, n in open_hits)
-            + ". Each is handled through the process in `.github/SECURITY.md`."
+            + ". `.github/SECURITY.md` says how an advisory against a component is handled."
         )
     else:
         out.append(
@@ -503,24 +648,38 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
     out.append("")
     if unrated:
         out.append(
-            f"{len(unrated)} advisories in the window carry no severity rating, so the test above "
-            "does not count them: " + "; ".join(f"`{a}` against `{n}`" for a, n in unrated) + "."
+            _count(len(unrated), "advisory in the window carries", "advisories in the window carry")
+            + " no rating from either source, so the test above does not count "
+            + ("it" if len(unrated) == 1 else "them")
+            + ": "
+            + "; ".join(f"`{a}` against `{n}`" for a, n in unrated)
+            + "."
         )
     else:
-        out.append("Every advisory in the window carries a severity rating.")
+        out.append("Every advisory in the window carries a rating from one of the two sources.")
+    dropped = [
+        (d["id"], d["withdrawn"], r["name"]) for r in readings for d in r["advisories_dropped"]
+    ]
+    if dropped:
+        out += [
+            "",
+            _count(len(dropped), "record was", "records were")
+            + " left out because the GitHub advisory it mirrors is withdrawn: "
+            + "; ".join(f"`{i}` against `{n}`, twin of `{w}`" for i, w, n in dropped)
+            + ".",
+        ]
     out += ["", "### Not risky on any of the three", "", "| Components | Designated above |"]
     out.append("|---|---|")
     for yes in (True, False):
         names = [r["name"] for r in clean if (r["name"] in labels) == yes]
         if names:
             out.append(f"| {', '.join(f'`{n}`' for n in names)} | {'yes' if yes else 'no'} |")
-    both = [r for r in readings if any(r["risky"].values()) and r["name"] in labels]
-    only = [r for r in readings if any(r["risky"].values()) and r["name"] not in labels]
+    risky = [r for r in readings if any(r["risky"].values())]
+    both = [r for r in risky if r["name"] in labels]
+    only = [r for r in risky if r["name"] not in labels]
 
-    def why(r: Mapping[str, Any]) -> str:
-        where = [labels[r["name"]]] if r["name"] in labels else []
-        axes = " and ".join(_AXIS_WORDS[a] for a in AXES if r["risky"][a])
-        return f"`{r['name']}` ({', '.join([*where, axes])})"
+    def axes(r: Mapping[str, Any]) -> str:
+        return " and ".join(_AXIS_WORDS[a] for a in AXES if r["risky"][a])
 
     out += [
         "",
@@ -532,19 +691,24 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
     ]
     if both:
         out.append(
-            f"{len(both)} designated components are also risky on an ASVS example: "
-            + ", ".join(why(r) for r in both)
-            + "."
+            _count(len(both), "designated component is", "designated components are")
+            + " also risky on an ASVS example:"
         )
+        out += ["", "| Component | Designated above | Risky on |", "|---|---|---|"]
+        out += [f"| `{r['name']}` | {labels[r['name']]} | {axes(r)} |" for r in both]
     else:
         out.append("No designated component is risky on an ASVS example.")
     out.append("")
     if only:
         out.append(
-            f"{len(only)} are risky here and not designated above: "
-            + ", ".join(why(r) for r in only)
-            + ". None of them parses hostile input, holds a secret or terminates a protocol, which "
-            "is why the tiers left them out. The reading names them so that choice stays visible."
+            _count(len(only), "component is", "components are")
+            + " risky here and not designated above: "
+            + ", ".join(f"`{r['name']}` ({axes(r)})" for r in only)
+            + ". The tiers did not designate "
+            + ("it" if len(only) == 1 else "them")
+            + " under the exposure criterion. The reading names "
+            + ("it" if len(only) == 1 else "them")
+            + " so that choice stays visible, and a reviewer can revisit it."
         )
     else:
         out.append("Every component risky on an ASVS example is also designated above.")
@@ -604,12 +768,6 @@ def _write_text(path: Path, text: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
-        "--as-of",
-        type=dt.date.fromisoformat,
-        default=dt.datetime.now(dt.UTC).date(),
-        help="the snapshot date, YYYY-MM-DD (default: today, UTC)",
-    )
-    parser.add_argument(
         "--render-only",
         action="store_true",
         help="re-render the page section from the tracked snapshot; no network",
@@ -619,8 +777,10 @@ def main(argv: list[str] | None = None) -> int:
         data = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
     else:
         try:
-            data = snapshot(args.as_of)
-        except (urllib.error.URLError, ValueError, KeyError) as exc:
+            # Today, never a chosen date: PyPI and OSV answer only with today's classifiers,
+            # statuses and yanks, so an earlier date would label today's data with it.
+            data = snapshot(dt.datetime.now(dt.UTC).date())
+        except (OSError, http.client.HTTPException, ValueError, KeyError) as exc:
             # Nothing is written on a failed read, so a half-fetched snapshot never lands.
             print(f"component readings failed, nothing written: {exc}", file=sys.stderr)
             return 1
