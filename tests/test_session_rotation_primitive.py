@@ -37,6 +37,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -52,7 +53,8 @@ async def _service_and_token(engine: Engine) -> tuple[AuthService, str]:
     """An initialized service plus a live session token for a local user."""
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
     await service.initialize()
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username="rot",
         password=PW,
         display_name=None,
@@ -63,7 +65,10 @@ async def _service_and_token(engine: Engine) -> tuple[AuthService, str]:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     outcome = await service.login("rot", PW)
     assert outcome.ok and outcome.token is not None

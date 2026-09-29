@@ -892,6 +892,7 @@ async def test_auth_users_roles_sessions(store) -> None:
         email="a@example.org",
         password_hash="hash",
         now=1000.0,
+        password_generated=False,
     )
     assert await store.count_users() == 1
     user = await store.get_user_by_username("alice")
@@ -1127,7 +1128,13 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
     runs; with either left in place deleting the migration would still pass."""
     from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
 
-    await store.create_user(user_id="scope-src", username="scope-src", auth_provider="ad", now=1.0)
+    await store.create_user(
+        user_id="scope-src",
+        username="scope-src",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+    )
     await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
     got = await store.get_user("scope-src")
     assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
@@ -1164,7 +1171,9 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     paired with the write that does go through."""
     from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
 
-    await store.create_user(user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0)
+    await store.create_user(
+        user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0, password_generated=False
+    )
     cas = store.set_user_channel_scope_if_source
     assert (await store.get_user("cas-src")).channel_scope_source is None
     assert (
@@ -1220,6 +1229,7 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
         auth_provider="ad",
         directory_object_id=BOUND_GUID,
         now=1.0,
+        password_generated=False,
     )
     found = await store.get_user_by_directory_object_id(BOUND_GUID)
     assert found is not None and found.id == "dir-upgrade"
@@ -1246,6 +1256,7 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
         email=None,
         password_hash="h",
         now=1.0,
+        password_generated=False,
     )
     await store.create_session(
         token_hash="s1", user_id="u2", expires_at=9_999.0, client="10.1.1.1", now=1.0
@@ -1283,6 +1294,7 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
         email=None,
         password_hash="h0",
         now=1_000.0,
+        password_generated=False,
     )
     # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
     seeded = await store.get_user("u3")
@@ -1292,7 +1304,9 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
     await store.record_login_failure("u3", failed_attempts=3, locked_until=5_000.0, now=1_500.0)
 
     # must_change_password False = a credential the holder chose, so this call records the claim.
-    await store.set_password("u3", password_hash="h1", must_change_password=False, now=2_000.0)
+    await store.set_password(
+        "u3", password_hash="h1", must_change_password=False, now=2_000.0, password_generated=False
+    )
     claimed = await store.get_user("u3")
     assert claimed is not None
     assert claimed.password_claimed_at == 2_000.0
@@ -1304,7 +1318,9 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
 
     # Second rotation: COALESCE makes the claim write-once, so the stamp must NOT move. The other two
     # timestamps moving to 3000.0 is what makes that a real assertion — it proves this UPDATE ran.
-    await store.set_password("u3", password_hash="h2", must_change_password=False, now=3_000.0)
+    await store.set_password(
+        "u3", password_hash="h2", must_change_password=False, now=3_000.0, password_generated=False
+    )
     rotated = await store.get_user("u3")
     assert rotated is not None
     assert rotated.password_claimed_at == 2_000.0
@@ -1313,7 +1329,9 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
     # must_change_password True (an admin reset) takes the OTHER argument arity — the claim term is
     # empty, so the column is absent from the SET list and the statement can neither stamp nor clear
     # it. Both arities are hand-bound, and neither was executed on this leg before this test.
-    await store.set_password("u3", password_hash="h3", must_change_password=True, now=4_000.0)
+    await store.set_password(
+        "u3", password_hash="h3", must_change_password=True, now=4_000.0, password_generated=False
+    )
     reset = await store.get_user("u3")
     assert reset is not None
     assert reset.password_claimed_at == 2_000.0  # an admin reset leaves the claim alone
@@ -3778,7 +3796,9 @@ async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> 
         return {r["column_name"] for r in rows}
 
     for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
-        await store.create_user(user_id=uid, username=uname, auth_provider="local", now=1.0)
+        await store.create_user(
+            user_id=uid, username=uname, auth_provider="local", now=1.0, password_generated=False
+        )
     try:
         for pid, owner, name, now in (
             ("pa", "alice", "ACME ADT", None),

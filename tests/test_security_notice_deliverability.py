@@ -34,7 +34,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_admin
+from tests._admin_account import create_admin, create_local_user_chosen
 
 _ENFORCE = SecuritySettings(enforcement=SecurityEnforcement.ENFORCE)
 _WARN = SecuritySettings(enforcement=SecurityEnforcement.WARN)
@@ -160,7 +160,8 @@ async def test_a_NON_admin_with_an_address_does_not_count() -> None:
     store = await _store_with_admin(email=None)
     try:
         service = AuthService(store, AuthSettings())
-        viewer_id = await service.create_local_user(
+        viewer_id = await create_local_user_chosen(
+            service,
             username="viewer",
             password="another-long-passphrase",
             display_name=None,

@@ -37,7 +37,9 @@ async def _assert_federated_unbind_contract(store: Any) -> None:
     sessions and one already revoked; the second holds one live session.
     """
     for uid in ("fed-first", "fed-second", "fed-never"):
-        await store.create_user(user_id=uid, username=uid, auth_provider="ad", now=1_000.0)
+        await store.create_user(
+            user_id=uid, username=uid, auth_provider="ad", now=1_000.0, password_generated=False
+        )
     await store.set_user_federated_subject("fed-first", ISSUER, FIRST_SUB, now=1_000.0)
     await store.set_user_federated_subject("fed-second", ISSUER, SECOND_SUB, now=1_000.0)
     for token, uid in (("t-first-1", "fed-first"), ("t-first-2", "fed-first")):
@@ -219,7 +221,13 @@ async def _assert_session_binding_guard_contract(store: Any) -> None:
     itself is a backend-level lock property (the SQLite writer lock, ``FOR UPDATE`` on PostgreSQL,
     ``UPDLOCK, ROWLOCK`` on SQL Server) and is asserted in the per-backend suites.
     """
-    await store.create_user(user_id=GUARD_USER, username=GUARD_USER, auth_provider="ad", now=1.0)
+    await store.create_user(
+        user_id=GUARD_USER,
+        username=GUARD_USER,
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+    )
     await store.set_user_federated_subject(GUARD_USER, ISSUER, GUARD_SUB, now=1.0)
 
     # 1. Bound to the pair the caller verified: the row is written and the call says so.

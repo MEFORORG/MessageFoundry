@@ -25,6 +25,7 @@ import ast
 from pathlib import Path
 
 import httpx
+from _ui_clients import create_local_user_chosen
 
 import messagefoundry_webconsole
 from messagefoundry.api import create_app
@@ -177,8 +178,12 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
     """A must_change_password account is confined to /ui/account/password. The page now renders the
     Sign-out form, and POST /ui/logout — which has no Depends gate precisely so this works — really
     revokes the session."""
-    service = await _service(engine)
-    await service.create_local_user(
+    # require_mfa off: under it a no-factor account enrols before it rotates (ADR 0197 Amendment
+    # A) and lands on /ui/account instead. The rotate-first confinement is what this test is about.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    await create_local_user_chosen(
+        service,
         username="rotate",
         password=PW,
         display_name=None,

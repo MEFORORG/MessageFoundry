@@ -1021,6 +1021,8 @@ def test_every_open_store_in_verify_goes_through_the_gate() -> None:
     )
     # Positive control: an instrument that finds no open_store at all would pass vacuously.
     assert sorted(gated) == [
+        # ADR 0197 Amendment A, AC-A9: the lockable-account census, gated like the rest.
+        "checks.py::check_lockable_accounts",
         "smoke.py::check_smoke_disposition",
         "smoke.py::check_store_connectivity",
         "smoke.py::newest_message_id",
@@ -1227,3 +1229,67 @@ def test_settings_error_never_echoes_a_configured_value(tmp_path: Path) -> None:
     assert secret not in rendered
     load = [r for r in results if r.id == "config.load"]
     assert load and "api.port" in load[0].detail  # the FIELD is named; the value is not
+
+
+# ---- ADR 0197 Amendment A, AC-A9: the lockable-account census ------------------------------------
+
+
+def _store_with_accounts(path: Path, *, lockable: bool) -> StoreSettings:
+    """A real SQLite store holding one covered local account: lockable (a chosen password, no TOTP)
+    or not (an engine-generated credential)."""
+    from messagefoundry.auth.permissions import Role
+
+    settings = StoreSettings(path=str(path))
+
+    async def _seed() -> None:
+        handle = await open_store(settings, create=True, keyless_chain_refusal=None)
+        try:
+            await handle.create_user(
+                user_id="u-1",
+                username="operator-one",
+                auth_provider="local",
+                password_hash="h",
+                must_change_password=not lockable,
+                password_generated=not lockable,
+            )
+            await handle.upsert_role(role_id=Role.VIEWER.value, display_name="Viewer")
+            await handle.set_user_roles("u-1", [Role.VIEWER.value], assigned_by="test")
+        finally:
+            await handle.close()
+
+    asyncio.run(_seed())
+    return settings
+
+
+def test_the_verify_census_fails_naming_a_lockable_account(tmp_path: Path) -> None:
+    from messagefoundry.config.settings import AuthSettings
+
+    r = checks.check_lockable_accounts(
+        _store_with_accounts(tmp_path / "v.db", lockable=True), AuthSettings()
+    )
+    assert r.status is Status.FAIL, r.detail
+    assert "operator-one" in r.detail
+    # With the requirement off nothing is covered, so the same store passes: the check reads the
+    # posture, not only the rows.
+    off = checks.check_lockable_accounts(
+        StoreSettings(path=str(tmp_path / "v.db")), AuthSettings(require_mfa=False)
+    )
+    assert off.status is Status.PASS, off.detail
+
+
+def test_the_verify_census_passes_a_generated_credential(tmp_path: Path) -> None:
+    from messagefoundry.config.settings import AuthSettings
+
+    r = checks.check_lockable_accounts(
+        _store_with_accounts(tmp_path / "v.db", lockable=False), AuthSettings()
+    )
+    assert r.status is Status.PASS, r.detail
+
+
+def test_the_verify_census_skips_a_store_that_does_not_exist(tmp_path: Path) -> None:
+    from messagefoundry.config.settings import AuthSettings
+
+    missing = tmp_path / "absent.db"
+    r = checks.check_lockable_accounts(StoreSettings(path=str(missing)), AuthSettings())
+    assert r.status is Status.SKIP
+    assert not missing.exists()

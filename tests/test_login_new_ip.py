@@ -25,6 +25,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >= 15, no app/vendor terms: satisfies the ASVS policy (WP-3)
 
@@ -54,7 +55,8 @@ async def _service(
 
 
 async def _operator(service: AuthService, username: str = "oper") -> str:
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -66,7 +68,7 @@ async def _operator(service: AuthService, username: str = "oper") -> str:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     return uid
 

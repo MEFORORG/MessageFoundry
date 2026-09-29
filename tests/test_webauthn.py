@@ -640,10 +640,14 @@ async def test_last_factor_delete_refused_while_required() -> None:
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
+        # The passkey is registered with the requirement off: under it, wave 1 of ADR 0197
+        # Amendment A refuses a passkey as a covered account's first factor. This builds the
+        # passkey-only state an account can still hold from before the requirement covered it.
+        setup = await _service(store, notifier=notifier)
+        identity, token, _ = await login_admin(setup)
+        _, token = await _enroll(setup, identity, token)
         # require_mfa targets local Administrators — the test admin qualifies.
         service = await _service(store, notifier=notifier, require_mfa=True)
-        identity, token, _ = await login_admin(service)
-        _, token = await _enroll(service, identity, token)
         creds = await store.list_webauthn_credentials(identity.user_id)
         with pytest.raises(ValueError, match="enroll another factor first"):
             await service.delete_webauthn_credential(identity, creds[0].credential_id_hash)

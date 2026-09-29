@@ -347,6 +347,14 @@ def _build_body(event: SecurityEvent) -> str:
             else:
                 lines.append("The notification address for this account was changed.")
             lines.append("Notices about later changes go to the new address, not to this one.")
+    if event.event_type == MFA_ENABLED and event.detail.get("issued_credential"):
+        # ADR 0197 Amendment A: this account still held the password it was issued. An
+        # authenticator is now enrolled before that password is replaced, so an enrolment the
+        # holder did not make means someone else has the issued password.
+        lines.append(
+            "If you have not signed in to MessageFoundry yet, you did not do this. Contact your "
+            "MessageFoundry administrator."
+        )
     if event.event_type == ACCOUNT_CREATED:
         roles = event.detail.get("roles")
         if isinstance(roles, list) and roles:

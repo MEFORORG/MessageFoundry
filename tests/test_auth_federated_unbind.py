@@ -157,7 +157,9 @@ async def test_unbind_of_an_unbound_account_is_refused_and_revokes_nothing(
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
-        await store.create_user(user_id="u-ad", username="plain", auth_provider="ad", now=1.0)
+        await store.create_user(
+            user_id="u-ad", username="plain", auth_provider="ad", now=1.0, password_generated=False
+        )
         await store.create_session(token_hash="t-plain", user_id="u-ad", expires_at=9e9, now=1.0)
 
         with pytest.raises(ValueError, match="no federated binding"):
