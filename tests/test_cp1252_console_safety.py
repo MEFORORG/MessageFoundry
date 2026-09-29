@@ -779,14 +779,65 @@ def _printed_unencodable(text: str) -> list[tuple[int, str]]:
     return _console_hits(tree)
 
 
+#: THE FRAMEWORK-KEYWORD ARM (BACKLOG #1030, the first of its two named detector gaps). These calls
+#: print no argument themselves, so `_writes_to_a_console` rejects them by construction -- but the
+#: framework prints SOME of their arguments later, on a console this item is named for. argparse
+#: prints `help=`, `description=`, `epilog=` and friends on `--help`, to stdout, where a non-cp1252
+#: character RAISES. pytest prints a skip or xfail reason under `-rs`/`-rx`, also on real stdout;
+#: that is how the U+2265 in tests/test_benchmark_parser.py's `skipif(reason=)` stayed live after
+#: PR 1403 fixed the print beside it (fixed by hand there, because this arm did not exist).
+#:
+#: ONLY THE PRINTED ARGUMENTS ARE WALKED, never the whole call: `add_argument("--x", default=...)`
+#: and `skipif("sys.platform == 'win32'", ...)` carry strings that are compared or evaluated, not
+#: printed. Measured 2026-09-29 over every reach root: ZERO hits, so this lands as a ratchet at zero
+#: and changes no source file. Its planted controls are
+#: `test_the_framework_keyword_arm_sees_what_argparse_and_pytest_print` and its negative twin.
+_ARGPARSE_CALLS = frozenset(
+    {
+        "ArgumentParser",
+        "add_argument",
+        "add_argument_group",
+        "add_mutually_exclusive_group",
+        "add_parser",
+        "add_subparsers",
+    }
+)
+_ARGPARSE_PRINTED = frozenset({"description", "epilog", "help", "prog", "title", "usage"})
+
+
+def _framework_printed_args(call: ast.Call) -> list[ast.expr]:
+    """The arguments of an argparse or pytest call that the framework later PRINTS, else []."""
+    if not isinstance(call.func, (ast.Attribute, ast.Name)):
+        return []
+    parts = _dotted(call.func)
+    name = parts[-1] if parts else ""
+    if name in _ARGPARSE_CALLS:
+        return [kw.value for kw in call.keywords if kw.arg in _ARGPARSE_PRINTED]
+    if "pytest" not in parts:
+        return []
+    reason = [kw.value for kw in call.keywords if kw.arg in ("reason", "msg")]
+    # A positional argument is the printed reason for `pytest.skip/fail/xfail(...)` and for
+    # `pytest.mark.skip(...)`. For `pytest.mark.skipif/xfail(...)` it is the CONDITION, which is
+    # evaluated and never printed, so only the keyword counts there.
+    if name in ("skip", "fail") or (name == "xfail" and "mark" not in parts):
+        return list(call.args) + reason
+    if name in ("skipif", "xfail", "importorskip"):
+        return reason
+    return []
+
+
 def _console_hits(tree: ast.Module) -> list[tuple[int, str]]:
     """The tree-taking half of ``_printed_unencodable``, so a caller that has already parsed the
     file does not pay for a second parse. The controls below call the text-taking form."""
     hits: list[tuple[int, str]] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not _writes_to_a_console(node):
+        if not isinstance(node, ast.Call):
             continue
-        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+        if _writes_to_a_console(node):
+            printed = list(node.args) + [kw.value for kw in node.keywords]
+        else:
+            printed = _framework_printed_args(node)
+        for arg in printed:
             for sub in ast.walk(arg):
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                     for ch in _unencodable(sub.value):
@@ -898,6 +949,47 @@ def test_a_logger_is_matched_by_name_and_a_lookalike_is_not() -> None:
         assert _printed_unencodable(f'{good}.info("{glyph}")') == [(1, glyph)], good
     for other in ("self.catalog", "backlog", "dialog"):
         assert _printed_unencodable(f'{other}.info("{glyph}")') == [], other
+
+
+def test_the_framework_keyword_arm_sees_what_argparse_and_pytest_print() -> None:
+    """The planted positive control for the framework-keyword arm: every shape it claims to cover,
+    each of which must fire. A zero over the tree means nothing without this."""
+    g = chr(0x2265)
+    for printed in (
+        f'argparse.ArgumentParser(description="a {g} b")',
+        f'ArgumentParser(prog="x", epilog="a {g} b")',
+        f'parser.add_argument("--n", help="a {g} b")',
+        f'sub.add_parser("run", help="a {g} b")',
+        f'parser.add_argument_group(title="a {g} b")',
+        f'parser.add_subparsers(title="t", description="a {g} b")',
+        f'@pytest.mark.skipif(sys.flags.gil, reason="a {g} b")\ndef t(): pass',
+        f'@pytest.mark.xfail(True, reason="a {g} b")\ndef t(): pass',
+        f'@pytest.mark.skip("a {g} b")\ndef t(): pass',
+        f'pytest.skip("a {g} b")',
+        f'pytest.fail("a {g} b")',
+        f'pytest.xfail("a {g} b")',
+        f'pytest.importorskip("mod", reason="a {g} b")',
+    ):
+        assert _printed_unencodable(printed) == [(1, g)], printed
+
+
+def test_the_framework_keyword_arm_ignores_what_is_never_printed() -> None:
+    """The negative twin: strings those same calls carry but NEVER print. Walking the whole call
+    would fire on each of these and teach a reader to distrust the arm."""
+    g = chr(0x2265)
+    for silent in (
+        f'parser.add_argument("--n", default="a {g} b")',
+        f'parser.add_argument("--n", choices=["a {g} b"])',
+        f'parser.add_argument("--{g}")',
+        # A skipif / mark.xfail CONDITION is evaluated, not printed.
+        f'@pytest.mark.skipif("a {g} b", reason="ascii")\ndef t(): pass',
+        f'@pytest.mark.xfail("a {g} b", reason="ascii")\ndef t(): pass',
+        # A lookalike method on something that is not pytest is out of scope by construction.
+        f'self.skip("a {g} b")',
+        # Representable text never fires, on this arm as on the others.
+        'parser.add_argument("--n", help="an em dash ' + chr(0x2014) + '")',
+    ):
+        assert _printed_unencodable(silent) == [], silent
 
 
 def test_the_engine_gate_would_have_caught_the_alert_that_prompted_it() -> None:
