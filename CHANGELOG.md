@@ -268,7 +268,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
   its first byte, and the snapshot gets it once its copy completes. A server-DB store stages in
-  `.mefor-staging` under `[backup].destination`, where the engine applies no ACL. Staging is
+  `.mefor-staging` under `[backup].destination`, secured the same way (see Fixed). Staging is
   removed on success, on an exception and on cancellation. A directory left by a crash or `SIGKILL`
   is removed by the next backup, which goes by each directory's lock and never by its age, so a
   sibling engine shard's live run survives it; nothing is swept at `serve` start. When a good
@@ -593,8 +593,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   `FAIL` with a reason that says the volume, not the archive, is at fault. A volume whose free
   space cannot be read is not checked. The `cleanup` alert, raised when a good backup's staging
   cannot be cleared, now uses its own subject, `dr_backup:staging`. It shared `dr_backup` with a
-  failed backup, and so shared its realert throttle: one could silence the other.
-  (`BACKLOG #1174`)
+  failed backup, and so shared its realert throttle: one could silence the other. An alert rule
+  that matches the subject `dr_backup` exactly no longer catches cleanup alerts; match
+  `dr_backup:staging` too. A server-DB store's backup staging under `.mefor-staging` is now
+  secured like a SQLite store's: each run's directory must come out owner-only, and each staged
+  file gets the store's `_secure_file`. On a destination that will not keep a directory
+  owner-only, such as a share whose server sets modes or ACLs, the backup fails with a reason
+  naming the directory instead of staging plaintext there. (`BACKLOG #1174`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

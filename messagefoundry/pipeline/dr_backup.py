@@ -512,6 +512,9 @@ class BackupRunner:
             # and its directory would look live to every sweep for the life of the process.
             opening.add_done_callback(_release_when_opened)
             raise
+        except StagingNotPrivateError as exc:
+            # Its own text leads, whole: it names the directory and the fix, and holds no PHI.
+            raise BackupError("write", str(exc)) from exc
         except OSError as exc:
             raise BackupError(
                 "write",
@@ -1270,7 +1273,7 @@ def _verify_archive_blocking(
     OS temp dir, and first sweeps that dir of this account's own abandoned staging (see
     :func:`_standalone_staging_root` and the staging-location block above :class:`_Staging`).
     ``secure`` locks each staged file to its owner before its first byte,
-    which every case but ``.mefor-staging`` passes.
+    which every case passes.
 
     ``keys`` is the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys") — the
     archive is matched against the whole set so one taken under a now-retired key still verifies after a
@@ -1559,7 +1562,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 #   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes. What
 #   `_secure_file` leaves inside a temp directory's own DACL is not always owner-only (ADR 0163).
 # * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
-#   destination. The engine applies no ACL there; docs/PHI.md records that as a gap, not a control.
+#   destination, secured the same way: an owner-only per-run directory and `_secure_file` on each
+#   staged file. A share that will not keep the directory owner-only refuses the run (see
+#   `_open_staging`) rather than staging plaintext it cannot protect.
 # * A STANDALONE verify (`restore-verify`, the DR cold-seed activation) is neither. It stages in a
 #   private `mkdtemp` directory under the OS temp dir: mode 0700 on POSIX, and on Windows the
 #   protected DACL Python 3.13+ writes for that mode (SYSTEM, Administrators, OWNER RIGHTS), with
@@ -1774,14 +1779,56 @@ def _space_shortfall(needs: list[tuple[Path, int]]) -> str | None:
     return None
 
 
+class StagingNotPrivateError(OSError):
+    """A secured staging directory did not come out owner-only, so nothing was staged in it."""
+
+
+def _staging_is_private(path: Path) -> bool:
+    """Whether a staging directory admits only its own account.
+
+    POSIX: no group or other permission bits. Windows: a protected DACL whose allow entries name only
+    SYSTEM, Administrators, OWNER RIGHTS or the directory's own owner, which is what ``mkdtemp``
+    writes on Python 3.13+. A DACL that cannot be read or parsed is not private. Deny entries are
+    ignored: they only narrow access."""
+    if sys.platform != "win32":
+        try:
+            return stat.S_IMODE(os.stat(path).st_mode) & 0o077 == 0
+        except OSError:
+            return False
+    from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
+
+    sddl = _read_dacl_sddl(path, owner=True)
+    dacl = _parse_sddl_dacl(sddl) if sddl else None
+    if dacl is None or not dacl.protected or not dacl.aces:
+        return False
+    allowed = {"S-1-5-18", "S-1-5-32-544", "OW", "S-1-3-4"}
+    if dacl.owner:
+        allowed.add(dacl.owner)
+    return all(sid in allowed for kind, _f, _r, sid in dacl.aces if not kind.endswith("D"))
+
+
 def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
     """Create a staging directory under ``root`` and take its lock before anything is written there.
 
     The marker is created only AFTER the lock is held. A sweep that takes the lock and finds no marker
     cannot tell a crash in that instant from a run about to take its lock, so it leaves the directory
-    alone. Nothing in such a directory holds plaintext yet."""
+    alone. Nothing in such a directory holds plaintext yet.
+
+    With ``secure``, the new directory must be owner-only (BACKLOG #1174). ``mkdtemp`` asks for that,
+    but a share can ignore the request, for example an SMB or NFS mount whose modes or ACLs the
+    server sets. Then this removes the directory and raises :class:`StagingNotPrivateError`: the run
+    fails with a reason naming the directory, rather than staging plaintext the engine cannot
+    protect. Falling back to a local directory was the other choice, and was not taken: the run's
+    free-space check and its verify both name one staging root, and a second one would split them."""
     root.mkdir(parents=True, exist_ok=True)
     path = Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+    if secure and not _staging_is_private(path):
+        _remove_tree(path)
+        raise StagingNotPrivateError(
+            f"the staging directory {path} is not owner-only on this volume, so the engine will not "
+            "stage plaintext there; point the staging at a volume that keeps a directory's mode or "
+            "ACL (for a server-DB store, [backup].destination)"
+        )
     try:
         fd = os.open(
             path / _LOCK_NAME,
@@ -1839,12 +1886,13 @@ def _staging_root_for(
 ) -> tuple[Path, bool]:
     """Where to stage, and whether to lock the files with ``_secure_file``.
 
-    A SQLite store on disk stages in its own data directory, secured. Anything else stages in
-    ``.mefor-staging`` under ``destination``, unsecured: a server-DB store has no data directory, and
-    an in-memory store has none either."""
+    A SQLite store on disk stages in its own data directory. Anything else stages in
+    ``.mefor-staging`` under ``destination``: a server-DB store has no data directory, and an
+    in-memory store has none either. Both are secured (BACKLOG #1174): each run's directory must be
+    owner-only, which :func:`_open_staging` checks, and each staged file gets ``_secure_file``."""
     if not server_db and store_path and store_path != ":memory:":
         return Path(store_path).absolute().parent, True
-    return destination.absolute() / _SERVER_DB_STAGING_DIR, False
+    return destination.absolute() / _SERVER_DB_STAGING_DIR, True
 
 
 def _standalone_staging_root() -> Path:

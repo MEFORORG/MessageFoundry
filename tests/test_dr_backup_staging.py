@@ -161,20 +161,21 @@ async def test_backup_and_verify_stage_in_the_sqlite_data_dir_and_leave_nothing(
     assert _everything_under(iso) == []
 
 
-def test_a_server_db_store_stages_under_the_destination_unsecured(tmp_path) -> None:
+def test_a_server_db_store_stages_under_the_destination_secured(tmp_path) -> None:
     """A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
-    destination. The engine applies no ACL there, and docs/PHI.md records that as a gap."""
+    destination, secured like a SQLite store's data dir (BACKLOG #1174). It used to be unsecured,
+    which docs/PHI.md recorded as a gap."""
     dest = tmp_path / "dest"
     root, secure = dr_backup._staging_root_for(
         server_db=True, store_path=str(tmp_path / "ignored.db"), destination=dest
     )
     assert root == dest.absolute() / ".mefor-staging"
-    assert secure is False
+    assert secure is True
     # An in-memory SQLite store has no data directory either.
     root, secure = dr_backup._staging_root_for(
         server_db=False, store_path=":memory:", destination=dest
     )
-    assert root == dest.absolute() / ".mefor-staging" and secure is False
+    assert root == dest.absolute() / ".mefor-staging" and secure is True
     # A SQLite store on disk stages beside itself, secured.
     root, secure = dr_backup._staging_root_for(
         server_db=False, store_path=str(tmp_path / "data" / "msg.db"), destination=dest
@@ -1034,3 +1035,55 @@ def test_the_first_check_leaves_an_idle_wal_out(tmp_path, monkeypatch) -> None:
     )
     runner._space_shortfall(data_dir, tmp_path / "dest", config_only=False)
     assert [n for _p, n in needs[0]] == [2000, 1000]
+
+
+# --- server-DB staging is owner-only, or the run refuses ----------------------------------------
+
+
+def test_a_secured_staging_directory_is_private(tmp_path) -> None:
+    work = dr_backup._open_staging(tmp_path / ".mefor-staging", "mefor-backup-", secure=True)
+    try:
+        assert dr_backup._staging_is_private(work.path)
+    finally:
+        work.release()
+
+
+def test_a_directory_others_can_open_is_not_private(tmp_path) -> None:
+    """The control: the check can say no. A plain `mkdir` inherits its parent's access on Windows,
+    and a 0755 directory admits group and other on POSIX."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if os.name != "nt":
+        plain.chmod(0o755)
+    assert not dr_backup._staging_is_private(plain)
+
+
+def test_a_staging_directory_that_is_not_private_is_removed_and_refused(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / ".mefor-staging"
+    monkeypatch.setattr(dr_backup, "_staging_is_private", lambda _p: False)
+    with pytest.raises(dr_backup.StagingNotPrivateError, match="not owner-only"):
+        dr_backup._open_staging(root, "mefor-backup-", secure=True)
+    assert list(root.iterdir()) == []
+
+
+async def test_a_backup_on_a_volume_that_will_not_keep_staging_private_fails_cleanly(
+    tmp_path, monkeypatch
+) -> None:
+    """The run fails with a reason naming the directory, and nothing is staged or published."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    monkeypatch.setattr(dr_backup, "_staging_is_private", lambda _p: False)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, dest, key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "write"
+    assert "not owner-only" in str(caught.value)
+    assert _staging_dirs(data_dir) == [] and list(dest.iterdir()) == []
+    assert _everything_under(iso) == []
