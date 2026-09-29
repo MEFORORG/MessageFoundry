@@ -654,19 +654,29 @@ class BackupRunner:
             # The just-written archive is sealed under the active key, so the active key is the only
             # candidate the post-write verify needs (the retired-key keyring matters only for the
             # standalone restore-verify of an OLDER archive — run_restore_verify, AC-5).
-            verify = await asyncio.to_thread(
-                _verify_archive_blocking,
-                archive_path=str(staging_path),
-                keys=[key] if key is not None else [],
-                full=s.full_restore_verify,
-                allow_unencrypted=s.allow_unencrypted,
-                # The LIVE store settings, so a full verify opens the snapshot under this instance's
-                # real cipher/keyring/provider rather than a bare default (see _full_open_check).
-                store_settings=self._store_settings,
-                # The same staging root as the build, so the next backup's sweep covers both.
-                staging_root=staging_root,
-                secure=secure,
-            )
+            try:
+                verify = await asyncio.to_thread(
+                    _verify_archive_blocking,
+                    archive_path=str(staging_path),
+                    keys=[key] if key is not None else [],
+                    full=s.full_restore_verify,
+                    allow_unencrypted=s.allow_unencrypted,
+                    # The LIVE store settings, so a full verify opens the snapshot under this
+                    # instance's real cipher/keyring/provider rather than a bare default (see
+                    # _full_open_check).
+                    store_settings=self._store_settings,
+                    # The same staging root as the build, so the next backup's sweep covers both.
+                    staging_root=staging_root,
+                    secure=secure,
+                )
+            except StagingNotPrivateError as exc:
+                # Not a verdict on the archive: it stays at its staging name, unpublished and not
+                # quarantined, and the run fails naming both.
+                raise BackupError(
+                    "write",
+                    f"{exc}; the archive was written but not verified, and is left at "
+                    f"{staging_path.name}",
+                ) from exc
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
                 # (AC-6). Skipping only THIS run's prune — what this path used to do — does not
@@ -1302,6 +1312,7 @@ def _verify_archive_blocking(
     :func:`_discard_verify_staging`. When decrypted bytes survive that, the result says so: a ``PASS``
     becomes ``FAIL``, and any other verdict keeps its status and gains the directory in its reason. Its
     lock is released either way, so the next sweep of the same root removes what survived."""
+    standalone = staging_root is None
     try:
         # (1) Pre-decryption key check (only meaningful for an encrypted archive). For a plaintext
         # archive (no codec header) there is no key to mismatch.
@@ -1332,10 +1343,16 @@ def _verify_archive_blocking(
                     reason=f"no resolved key (active or retired) matches archive key_id={header_key_id}",
                 )
 
-        standalone = staging_root is None
         if staging_root is None:
             staging_root = _standalone_staging_root()
         work = _open_staging(staging_root, _VERIFY_STAGING_PREFIX, secure=secure)
+    except StagingNotPrivateError as exc:
+        if not standalone:
+            # A backup's own verify: the volume is at fault, not the archive, so this must not reach
+            # `_keep_failed_archive`, which would quarantine a good archive. The caller turns it into
+            # a `write` failure and leaves the archive unpublished.
+            raise
+        return VerifyResult("FAIL", reason=f"{exc} (not a fault in the archive)")
     except (BackupCodecError, OSError, tarfile.TarError) as exc:
         return _verify_failure(exc)
 
@@ -1789,13 +1806,19 @@ def _staging_is_private(path: Path) -> bool:
     POSIX: no group or other permission bits. Windows: a protected DACL whose allow entries name only
     SYSTEM, Administrators, OWNER RIGHTS or the directory's own owner, which is what ``mkdtemp``
     writes on Python 3.13+. A DACL that cannot be read or parsed is not private. Deny entries are
-    ignored: they only narrow access."""
+    ignored: they only narrow access.
+
+    What it does not see, stated rather than implied: it trusts the owner the file system reports,
+    so a share whose server sets the owner (a CIFS ``uid=`` mount, Samba ``force user``) can pass
+    while admitting that principal; and on POSIX it reads mode bits only, so an inherited macOS or
+    NFSv4 extended ACL, which applies whatever the mode says, is invisible to it. Linux POSIX ACLs
+    are covered, because their mask follows the group bits of mode ``0700``."""
     if sys.platform != "win32":
         try:
             return stat.S_IMODE(os.stat(path).st_mode) & 0o077 == 0
         except OSError:
             return False
-    from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
+    from messagefoundry.store.store import _SDDL_DENY_TYPES, _parse_sddl_dacl, _read_dacl_sddl
 
     sddl = _read_dacl_sddl(path, owner=True)
     dacl = _parse_sddl_dacl(sddl) if sddl else None
@@ -1804,7 +1827,7 @@ def _staging_is_private(path: Path) -> bool:
     allowed = {"S-1-5-18", "S-1-5-32-544", "OW", "S-1-3-4"}
     if dacl.owner:
         allowed.add(dacl.owner)
-    return all(sid in allowed for kind, _f, _r, sid in dacl.aces if not kind.endswith("D"))
+    return all(sid in allowed for kind, _f, _r, sid in dacl.aces if kind not in _SDDL_DENY_TYPES)
 
 
 def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
@@ -1823,11 +1846,15 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
     root.mkdir(parents=True, exist_ok=True)
     path = Path(tempfile.mkdtemp(prefix=prefix, dir=root))
     if secure and not _staging_is_private(path):
-        _remove_tree(path)
+        # Empty, so a leftover holds no plaintext; but it has no lock file, so no sweep will take it.
+        removed = _remove_tree(path)
         raise StagingNotPrivateError(
             f"the staging directory {path} is not owner-only on this volume, so the engine will not "
-            "stage plaintext there; point the staging at a volume that keeps a directory's mode or "
-            "ACL (for a server-DB store, [backup].destination)"
+            "stage plaintext there"
+            + ("" if removed else " (it is empty and could not be removed; delete it)")
+            + "; stage on a volume that keeps a directory's mode or ACL: move the SQLite store's "
+            "data directory, or [backup].destination for a server-DB store, or TMP, TEMP or TMPDIR "
+            "for a standalone restore-verify"
         )
     try:
         fd = os.open(

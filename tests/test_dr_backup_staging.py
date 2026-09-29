@@ -1087,3 +1087,46 @@ async def test_a_backup_on_a_volume_that_will_not_keep_staging_private_fails_cle
     assert "not owner-only" in str(caught.value)
     assert _staging_dirs(data_dir) == [] and list(dest.iterdir()) == []
     assert _everything_under(iso) == []
+
+
+def _verify_staging_not_private(path: Path) -> bool:
+    """Private for a build's staging, not for a verify's."""
+    return not path.name.startswith(dr_backup._VERIFY_STAGING_PREFIX)
+
+
+async def test_a_backups_own_verify_refused_for_privacy_does_not_quarantine_the_archive(
+    tmp_path, monkeypatch
+) -> None:
+    """The volume is at fault, not the archive: the run fails as `write`, the archive stays at its
+    staging name unpublished, and nothing is renamed `.failed`."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    monkeypatch.setattr(dr_backup, "_staging_is_private", _verify_staging_not_private)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, dest, key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "write"
+    assert "not verified" in str(caught.value)
+    names = [p.name for p in dest.iterdir()]
+    assert len(names) == 1 and names[0].endswith(dr_backup._STAGING_SUFFIX), names
+    assert not any(n.endswith(dr_backup._FAILED_SUFFIX) for n in names)
+    assert _staging_dirs(data_dir) == []
+    assert _everything_under(iso) == []
+
+
+async def test_a_standalone_verify_refused_for_privacy_blames_the_volume(
+    tmp_path, monkeypatch
+) -> None:
+    archive, key = await _archive(tmp_path, config_only=False)
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    monkeypatch.setattr(dr_backup, "_staging_is_private", lambda _p: False)
+    res = await run_restore_verify(str(archive), store_settings=StoreSettings(encryption_key=key))
+    assert res.status == "FAIL"
+    assert res.reason is not None and "not a fault in the archive" in res.reason
+    assert "TMPDIR" in res.reason
+    assert _everything_under(iso) == []

@@ -596,10 +596,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   failed backup, and so shared its realert throttle: one could silence the other. An alert rule
   that matches the subject `dr_backup` exactly no longer catches cleanup alerts; match
   `dr_backup:staging` too. A server-DB store's backup staging under `.mefor-staging` is now
-  secured like a SQLite store's: each run's directory must come out owner-only, and each staged
-  file gets the store's `_secure_file`. On a destination that will not keep a directory
-  owner-only, such as a share whose server sets modes or ACLs, the backup fails with a reason
-  naming the directory instead of staging plaintext there. (`BACKLOG #1174`)
+  secured like a SQLite store's: each staged file gets the store's `_secure_file`. Every staging
+  directory, in a SQLite data directory, in `.mefor-staging` and a standalone verify's under the
+  OS temp dir alike, must now come out owner-only. On a volume that will not keep a directory
+  owner-only, such as a CIFS or Samba share, WSL `/mnt/c` without `metadata`, a Docker Desktop
+  bind mount, or FAT and exFAT, a backup fails with a reason naming the directory, and a
+  standalone `restore-verify` returns `FAIL` saying the volume is at fault. Setups on such a
+  volume that backed up before now refuse. (`BACKLOG #1174`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
