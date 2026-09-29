@@ -603,6 +603,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A trailing-slash path is now a 404, never a redirect to an `http://` URL.** The engine used to
+  answer `GET /health/` or `GET /ui/` with a 307 before authentication, and its absolute `Location`
+  kept the request's scheme. Behind a TLS-terminating proxy whose `X-Forwarded-Proto` is not
+  trusted or not sent, that scheme is `http`, so the redirect would point a client at plaintext.
+  `create_app` now sets `redirect_slashes=False`. Use `/ui`, not `/ui/`, in a bookmark or a proxy
+  rule. (`BACKLOG #1968`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

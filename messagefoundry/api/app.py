@@ -1681,8 +1681,9 @@ def create_app(
     #
     # redirect_slashes=False (BACKLOG #1968): Starlette otherwise answers a trailing-slash miss with a
     # pre-auth 307 whose absolute Location carries the scope scheme. Behind a TLS-terminating proxy
-    # whose X-Forwarded-Proto is not trusted, that scheme is http, so the redirect would point the
-    # client at an http:// URL. No route here ends in "/" and no client calls one, so a miss is a 404.
+    # whose X-Forwarded-Proto is not trusted or not sent, that scheme is http, so the redirect would
+    # point the client at an http:// URL. A trailing-slash miss is now a 404.
+    # tests/test_api_redirect_slashes.py pins that no route ends in "/" and no mount redirects.
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
