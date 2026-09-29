@@ -29,7 +29,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _bash_resolver import explain_returncode, require_bash
+from _bash_resolver import explain_returncode, probe_env, require_bash
 
 from tests._spawn_lock import run_single
 from tests.test_worktree_gate import assert_denied, run_gate  # reuse the subprocess harness
@@ -250,6 +250,9 @@ def test_the_straddle_is_seen_after_a_construct_that_holds_a_stray_quote(
 def test_the_straddles_after_a_construct_really_run_their_middle_statement(tmp_path: Path) -> None:
     """Each AFTER_A_CONSTRUCT row's gated slot is live code (SDS-3.8). No git command is run."""
     bash = require_bash(tmp_path)
+    # The marker is `expr`, and some rows run `bash` by name: probe_env supplies the utilities
+    # and puts THIS bash ahead of any other, such as the WSL launcher in System32.
+    child_env = probe_env(Path(bash))
     for shape, (tool, template) in sorted(AFTER_A_CONSTRUCT.items()):
         if tool == "Bash":
             proc = subprocess.run(
@@ -258,6 +261,7 @@ def test_the_straddles_after_a_construct_really_run_their_middle_statement(tmp_p
                 text=True,
                 timeout=120,
                 cwd=tmp_path,
+                env=child_env,
             )
             why = explain_returncode(proc.returncode, shape)
         else:

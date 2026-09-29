@@ -4203,8 +4203,8 @@ def _serve(args: argparse.Namespace) -> int:
         # WP-13a: terminate TLS in-process. Build the context now so a bad cert/key/passphrase fails
         # fast (before uvicorn opens the socket); pass it via uvicorn's ssl_context_factory so the
         # tls_min_version floor is enforced exactly.
-        # #285: build_api_ssl_context preflights [api].tls_client_ca_file (pin + owner-only DACL) at
-        # construction; enforcing is the [security].enforcement refuse/warn dial.
+        # #285: build_api_ssl_context preflights [api].tls_client_ca_file (at least its pin, DACL
+        # and path) at construction; enforcing is the [security].enforcement refuse/warn dial.
         try:
             ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
         except KeyWrapRefused as exc:

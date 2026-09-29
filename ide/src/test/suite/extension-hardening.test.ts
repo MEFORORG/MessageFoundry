@@ -444,15 +444,18 @@ suite("webview message receivers check origin, source and the channel token", ()
   test("the shared rationale says what the checks are and what they rest on", () => {
     // Guards against the note decaying back into a bare marker. It must keep naming the delivery
     // measurement the checks are derived from — an opaque origin would make the origin arm vacuous,
-    // and `window.parent` is shadowed by the bridge, which is why the source arm is written against
-    // `window` — and it must keep saying the nonce CSP is the enforcement property, which is why the
-    // nonce being cryptographically random (the suite above) is load-bearing and not cosmetic.
+    // and `window.parent` differs by VS Code version (undefined at 1.95.0, `window` at 1.139.1, per
+    // the BACKLOG #1123 delivery probe), while a host message has `ev.source !== window.parent` on
+    // both, which is why the source arm is written against `window` — and it must keep saying the
+    // nonce CSP is the enforcement property, which is why the nonce being cryptographically random
+    // (the suite above) is load-bearing and not cosmetic.
     const text = fs.readFileSync(path.join(SRC, "webviewMessaging.ts"), "utf8");
     const claims = [
       "vscode-webview://",
       "nonce",
       "cspNonce.ts",
-      "window.parent = window",
+      "ev.source !== window.parent",
+      "1.95.0",
       "ev.origin === window.origin",
       "opaque",
     ];

@@ -116,6 +116,7 @@ from messagefoundry.auth.service import (
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     NotifyEmailAlreadySet,
+    TemporaryPasswordUnavailable,
     UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -535,9 +536,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window so it may perform highly sensitive operations for the configured
         period. Rate-limited like the password change; a failure is a 403 that counts against this
-        session's re-proof budget, and toward the account lockout unless a lock is already live. The
-        failure that exhausts the budget ends the session with a 401 (BACKLOG #1138). The account lock
-        does not refuse it.
+        session's re-proof budget, and toward the account lockout unless the sign-in lock is already
+        live. The failure that exhausts the budget ends the session with a 401 (BACKLOG #1138).
+        Neither account lock refuses it.
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -1148,6 +1149,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 else status.HTTP_400_BAD_REQUEST
             )
             raise HTTPException(code, detail) from exc
+        except TemporaryPasswordUnavailable as exc:
+            # A site setting, not a bad request, so a 503 like this module's other server-side
+            # refusals. It is mapped rather than left to the generic handler, which says only
+            # "internal error": the message names the setting to fix, and the web console renders
+            # this detail on the user page (with its own 400, as it does for every refusal here).
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
     @app.post("/users/{user_id}/reset-mfa", response_model=SimpleMessage)

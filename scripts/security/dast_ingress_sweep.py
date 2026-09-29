@@ -275,7 +275,7 @@ def mutation_cases(seed: int, count: int, cap: int, sentinel: str) -> list[Case]
     detector can see a mutated body. X12 mutations edit only what lies between the fixed-width ISA
     and the closing IEA: an edit inside the ISA moves the terminator and a lost IEA never closes the
     interchange, and either way the X12 ingress path would go unreached."""
-    rng = random.Random(seed)
+    rng = random.Random(seed)  # nosec B311 (reproducible fuzz cases, seeded)
     limit = cap // 2
     hl7_seeds = (*_HL7_SEEDS, _b(hl7("MUTATE", sentinel)))
     cases = []

@@ -15,8 +15,8 @@ the suite assertion checked (``tls_policy.assert_hvac_tls_suites``) are still th
 uses. The adapter subclasses ``HTTPAdapter``. Since BACKLOG #300 it also gives each new verifying
 https connection a fresh context from the factory that assertion returned, so every TLS handshake
 with Vault runs on a narrowed, asserted context; urllib3 still applies requests' ``verify`` to it.
-:func:`_narrowed_pool_classes` names the proxy hops it leaves alone. It also changes how the reply BODY
-is read:
+That includes the TLS leg to an ``https://`` proxy; :func:`_narrowed_pool_classes` says how, and
+which proxy shape is refused. It also changes how the reply BODY is read:
 
 * The body is read eagerly, in :meth:`StrictReplyAdapter.build_response`, from the
   ``http.client.HTTPResponse`` under ``urllib3``'s response, by
@@ -72,12 +72,15 @@ have the same gap.
 from __future__ import annotations
 
 import http.client
+import socket
 import ssl
+import urllib.parse
 from collections.abc import Callable
 from typing import Any
 
 import requests
 import requests.adapters
+import requests.utils
 import urllib3.connection
 import urllib3.connectionpool
 import urllib3.poolmanager
@@ -134,7 +137,7 @@ _NARROWED_POOL_MARK = "_mefor_narrowed_tls"
 
 
 def _narrowed_pool_classes(
-    factory: Callable[[], ssl.SSLContext],
+    factory: Callable[[], ssl.SSLContext], *, connector: str
 ) -> dict[str, type[urllib3.connectionpool.HTTPConnectionPool]]:
     """The pool classes one adapter's managers use, replacing ``urllib3``'s module-level map.
 
@@ -146,21 +149,89 @@ def _narrowed_pool_classes(
     ONCE per adapter and assigned whole, so a manager's classes are never briefly un-narrowed while
     another thread builds a pool from them.
 
-    **A connection that will not verify is left alone.** requests sets ``CERT_NONE`` on one case
-    only here, since the Vault clients refuse ``verify=False``: an ``http://`` Vault reached through
-    an ``https://`` proxy, where this connection's TLS is to the proxy. The factory's context
-    checks host names, so urllib3's ``CERT_NONE`` would raise on it. That hop keeps urllib3's own
-    context, as it did before, and it is not a hop to Vault.
+    **The TLS hop to an** ``https://`` **proxy gets its own fresh context from the same factory**
+    (BACKLOG #300, the proxy limb). requests honours ``HTTPS_PROXY``, ``ALL_PROXY`` and, on
+    Windows, the Internet Settings proxy by default, so an operator's proxy reaches this client with
+    no engine setting. An ``https://`` Vault through an ``https://`` proxy then has two TLS legs:
+    one to the proxy, and one to Vault inside the ``CONNECT`` tunnel. urllib3 builds the first from
+    the pool's ``ProxyConfig.ssl_context``, which requests leaves ``None``, and ``None`` means
+    urllib3's own unnarrowed context. So each connection replaces that field on its OWN copy of the
+    config with ``factory()``. The proxy leg verifies with requests' ``cert_reqs`` and CA file, as it
+    always did, which is the Vault hop's anchor, and ``server_hostname`` is the proxy's host.
+    requests forwards through an ``https://`` proxy only for an ``http://`` Vault, and that shape is
+    refused below. A forwarding connection that did verify would have one TLS leg, to the proxy, on
+    the connection's own ``ssl_context``, which is already the factory's.
 
-    **Not narrowed, at least: the TLS hop to an ``https://`` proxy in front of an ``https://``
-    Vault.** urllib3 builds that context itself, from the proxy settings. The hop to Vault inside
-    the tunnel is narrowed."""
+    **It is then CHECKED, not assumed.** The proxy leg's ``SSLSocket`` must hold exactly that
+    context, and urllib3 must report the proxy verified. The ``ProxyConfig`` field is urllib3's
+    documented one, but which object the proxy handshake reads is not, so a urllib3 that stopped
+    reading it would otherwise fall back to its own context with nothing reporting it. The check runs
+    in urllib3's ``_connect_tls_proxy`` hook, before ``CONNECT`` and any proxy credentials cross the
+    leg. That hook is private, so it runs again after ``connect``, which still refuses if a later
+    urllib3 renames the hook, though only after ``CONNECT``. That second check reads the proxy leg
+    through ``SSLTransport.socket``, also urllib3's own name. If that changes, every tunnelled
+    connection is refused: it fails closed, never open.
+
+    **A connection that will not verify is refused before its socket opens.** The Vault clients
+    refuse ``verify=False``, so requests sets ``CERT_NONE`` on one case only: an ``http://`` Vault
+    reached through an ``https://`` proxy, where requests clears the CA for the ``http://`` URL. That
+    connection's only TLS leg is to the proxy, and it carries the token. It used to keep urllib3's own
+    unverified context. The adapter refuses that case first, by name (:func:`_unverifiable_proxy_leg`);
+    this is the backstop."""
 
     class NarrowedHTTPSConnection(_StrictHeadHTTPSConnection):
+        #: The context this connection supplied for its proxy leg; ``None`` when it has none.
+        _mefor_proxy_context: ssl.SSLContext | None = None
+
         def connect(self) -> None:
-            if resolve_cert_reqs(self.cert_reqs) != ssl.CERT_NONE:
-                self.ssl_context = factory()
+            if resolve_cert_reqs(self.cert_reqs) == ssl.CERT_NONE:
+                raise EgressReplyError(
+                    f"{connector} would open a TLS session that verifies no peer; "
+                    "refusing to connect"
+                )
+            self._mefor_proxy_context = self._narrow_the_proxy_leg()
+            self.ssl_context = factory()
             super().connect()
+            if self._mefor_proxy_context is not None:
+                # Through a tunnel, urllib3 wraps the Vault leg in an SSLTransport over the proxy
+                # leg's SSLSocket, which it names `socket`.
+                self._check_the_proxy_leg(getattr(self.sock, "socket", None))
+
+        def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:
+            """Give the TLS leg to an https proxy its own context, or ``None`` if it has none."""
+            if (
+                self.proxy is None
+                or self.proxy.scheme != "https"
+                or not self.proxy_is_tunneling
+                or self.proxy_config is None
+            ):
+                return None
+            context = factory()
+            # _replace builds a new tuple, so the pool's shared config is never changed.
+            self.proxy_config = self.proxy_config._replace(ssl_context=context)
+            return context
+
+        def _connect_tls_proxy(self, hostname: str, sock: socket.socket) -> ssl.SSLSocket:
+            leg = super()._connect_tls_proxy(hostname, sock)
+            self._check_the_proxy_leg(leg)
+            return leg
+
+        def _check_the_proxy_leg(self, leg: object) -> None:
+            expected = self._mefor_proxy_context
+            if (
+                expected is not None
+                and isinstance(leg, ssl.SSLSocket)
+                and leg.context is expected
+                and self.proxy_is_verified is True
+            ):
+                return
+            if isinstance(leg, ssl.SSLSocket):
+                leg.close()
+            self.close()
+            raise EgressReplyError(
+                f"{connector}: the TLS leg to its https:// proxy did not run on the engine's "
+                "narrowed, verifying context; refusing to send"
+            )
 
     class NarrowedHTTPSConnectionPool(_StrictHeadHTTPSConnectionPool):
         ConnectionCls = NarrowedHTTPSConnection
@@ -230,7 +301,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
     ) -> None:
         # Set BEFORE super().__init__(), which builds the pool manager through init_poolmanager.
         self._ssl_context_factory = ssl_context_factory
-        self._pool_classes = _narrowed_pool_classes(ssl_context_factory)
+        self._pool_classes = _narrowed_pool_classes(ssl_context_factory, connector=connector)
         super().__init__()
         self._connector = connector
         self._limit = limit
@@ -279,6 +350,11 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
                 f"{self._connector} would handshake on a TLS context the engine did not narrow; "
                 "refusing to send"
             )
+        # BACKLOG #300: an https pool for an http:// request can only be an https proxy's, and
+        # requests will not verify it. Checked at construction too; this also catches a proxy
+        # setting that changed after the client was built.
+        if pool.scheme == "https" and _scheme_of(request.url) != "https":
+            raise EgressReplyError(_unverifiable_proxy_leg(self._connector))
         return pool
 
     def send(
@@ -350,6 +426,41 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         return body
 
 
+def _scheme_of(url: str | None) -> str:
+    return urllib.parse.urlsplit(url or "").scheme.lower()
+
+
+def _unverifiable_proxy_leg(connector: str) -> str:
+    return (
+        f"{connector}: an http:// Vault address would be reached through an https:// proxy "
+        "(from HTTP_PROXY, ALL_PROXY or the system proxy settings). requests does not verify that "
+        "proxy's certificate for an http:// address, so the TLS leg carrying the Vault token "
+        "would authenticate nobody. Use an https:// Vault address, which tunnels through the "
+        "proxy with both TLS legs verified and narrowed; refusing (BACKLOG #300)"
+    )
+
+
+def _refuse_an_unverifiable_proxy_leg(
+    session: requests.Session, url: object, *, connector: str
+) -> None:
+    """Refuse at construction the one proxy shape whose TLS leg cannot be verified (BACKLOG #300).
+
+    Asks requests which proxy it would pick for ``url``, with the same two calls
+    ``Session.request`` makes: the environment and, on Windows, the Internet Settings proxy, minus
+    ``NO_PROXY``, which override the session's own proxies. An ``https://`` proxy in front of an
+    ``http://`` Vault is refused, for the reason :func:`_unverifiable_proxy_leg` gives. An
+    ``https://`` Vault needs no check here; :func:`_narrowed_pool_classes` covers its proxy leg.
+
+    The proxy settings can change after this runs, so the adapter checks again before each send.
+    A ``url`` that is not a string is left to that check."""
+    if not isinstance(url, str) or _scheme_of(url) == "https":
+        return
+    settings = session.merge_environment_settings(url, {}, None, None, None)
+    proxy = requests.utils.select_proxy(url, settings["proxies"])
+    if proxy and _scheme_of(proxy) == "https":
+        raise ValueError(_unverifiable_proxy_leg(connector))
+
+
 def mount_strict_reply_adapter(
     client: Any,
     *,
@@ -370,6 +481,9 @@ def mount_strict_reply_adapter(
 
     ``limit`` is the reply ceiling. The Transit client passes :data:`MAX_VAULT_REPLY_BYTES`; the KV
     client reads small secrets and keeps the shared egress ceiling.
+
+    Also raises :class:`ValueError` when requests would send an ``http://`` Vault address through
+    an ``https://`` proxy, whose TLS leg requests would not verify (BACKLOG #300).
     """
     session = getattr(getattr(client, "adapter", None), "session", None)
     if not isinstance(session, requests.Session):
@@ -377,6 +491,9 @@ def mount_strict_reply_adapter(
             f"{connector}: cannot mount the strict reply reader, because the Vault client exposes "
             f"no requests session at client.adapter.session"
         )
+    _refuse_an_unverifiable_proxy_leg(
+        session, getattr(client.adapter, "base_uri", None), connector=connector
+    )
     adapter = StrictReplyAdapter(
         connector=connector, limit=limit, ssl_context_factory=ssl_context_factory
     )

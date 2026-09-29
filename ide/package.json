@@ -819,7 +819,7 @@
     "package": "vsce package",
     "vscode:prepublish": "node -e \"require('fs').copyFileSync('../LICENSE','LICENSE')\" && npm run compile",
     "pretest:unit": "npm run compile-tests",
-    "test:unit": "mocha \"out/test/suite/**/*.test.js\" --ui tdd --ignore \"out/test/suite/ai-policy.test.js\" --ignore \"out/test/suite/chat.test.js\" --ignore \"out/test/suite/editor-toolbar.test.js\" --ignore \"out/test/suite/extension.test.js\" --ignore \"out/test/suite/insert-element.test.js\" --ignore \"out/test/suite/live-debug.test.js\" --ignore \"out/test/suite/promote-target.test.js\" --ignore \"out/test/suite/pythonpath.test.js\""
+    "test:unit": "mocha \"out/test/suite/**/*.test.js\" --ui tdd --ignore \"out/test/suite/ai-policy.test.js\" --ignore \"out/test/suite/chat.test.js\" --ignore \"out/test/suite/editor-toolbar.test.js\" --ignore \"out/test/suite/extension.test.js\" --ignore \"out/test/suite/insert-element.test.js\" --ignore \"out/test/suite/live-debug.test.js\" --ignore \"out/test/suite/promote-target.test.js\" --ignore \"out/test/suite/pythonpath.test.js\" --ignore \"out/test/suite/webview-delivery-probe.test.js\""
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -835,7 +835,7 @@
   },
   "overrides": {
     "serialize-javascript": ">=7.0.5",
-    "undici": "^7.29.0",
+    "undici": "^7.29.1",
     "diff": ">=8.0.3",
     "fast-uri": "^3.1.5",
     "linkify-it": "^5.0.2",
