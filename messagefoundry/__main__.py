@@ -43,6 +43,7 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
     query_sntp_offset,
 )
+from messagefoundry.odbc_env import disable_driver_manager_pooling
 
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
@@ -91,6 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     # subcommands stay ASCII (json.dumps ensure_ascii=True), so this keeps the stream's codec. The
     # shared helper is the one chokepoint every console entry point calls (BACKLOG #1875).
     harden_console_streams()
+    # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
+    # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
+    disable_driver_manager_pooling()
 
     # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
     # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled

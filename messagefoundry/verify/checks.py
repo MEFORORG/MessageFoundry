@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path
 
 from messagefoundry import __version__
+from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.verify.model import CheckResult, Status
 
 
@@ -87,6 +88,8 @@ def check_sqlserver_odbc_driver() -> CheckResult:
     try:
         # Dynamic import keeps mypy --strict clean (pyodbc ships no type stubs).
         pyodbc = importlib.import_module("pyodbc")
+        # drivers() allocates pyodbc's ODBC environment, which fixes pooling for the process.
+        disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
         drivers = list(pyodbc.drivers())
     except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
         return CheckResult(

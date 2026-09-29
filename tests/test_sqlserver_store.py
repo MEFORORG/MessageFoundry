@@ -174,6 +174,231 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
     assert opened[0]._pool.closed, "the fixture left its pool open on the failure path"
 
 
+# BACKLOG #2049. The child below cancels a store read whose statement is blocked on the server, then
+# lets that statement return. Before the fix the cancellation closed the cursor and the connection on
+# other threads while the statement still ran, and pyodbc then read the result's column metadata from
+# freed handles. On a live server that could kill the process natively, so it runs in a CHILD: a crash
+# there fails this test as an assertion, which the leg's native-crash retry wrapper never re-runs.
+#
+# The store's statement takes its applock TRANSACTION-owned, as every applock the store takes is. The
+# first version took it SESSION-owned, and round 1's holder timed out on both legs. The reading that
+# fits is ODBC connection pooling. pyodbc turns it on by default, and it can keep a closed
+# connection's server session alive. A session-owned lock then outlives the close. pyodbc's close
+# rolls back first, so a transaction-owned lock does not. Each round now checks the server side
+# directly: once the close lands, the abandoned statement's session holds no lock and no open
+# transaction. A close that never ran fails by name.
+#
+# That check then failed on both legs: the session itself outlived the close, with one open
+# transaction. That is a product defect, not a test artefact, and the reading is pooling. The engine
+# now turns ODBC driver-manager pooling off (messagefoundry/odbc_env.py, ADR 0159 amendment
+# 2026-09-29), and test_a_closed_store_connection_ends_its_server_session checks the premise alone.
+# Keep the check exactly this strict.
+_CANCEL_CHILD = r"""
+import asyncio, os, sys
+from messagefoundry.config.settings import load_settings
+from messagefoundry.store.sqlserver import SqlServerStore, _call_gate
+
+RESOURCE, ROUNDS = sys.argv[1], int(sys.argv[2])
+GETLOCK = ("DECLARE @r int; EXEC @r = sp_getapplock @Resource = ?, @LockMode = 'Exclusive',"
+           " @LockOwner = '{owner}', @LockTimeout = 20000; ")
+# The holder is a separate session that releases its lock explicitly, so session-owned is right.
+TAKE = "SET NOCOUNT ON; " + GETLOCK.format(owner="Session") + "SELECT @r AS r;"
+RELEASE = "EXEC sp_releaseapplock @Resource = ?, @LockOwner = 'Session';"
+# A transaction-owned applock needs an open transaction. Open one only if none is, so the
+# statement never nests @@TRANCOUNT the way the store itself never does.
+BLOCKED = ("SET NOCOUNT ON; IF @@TRANCOUNT = 0 BEGIN TRANSACTION; " + GETLOCK.format(owner="Transaction")
+           + "SELECT @r AS r, CAST(N'x' AS NVARCHAR(40)) AS pad;")
+# The session waiting on THIS resource. The name stays under 32 characters, which is as much of an
+# applock name as resource_description shows.
+WAITER = ("SELECT TOP (1) request_session_id FROM sys.dm_tran_locks WHERE resource_type = 'APPLICATION'"
+          " AND request_status = 'WAIT' AND CHARINDEX(?, resource_description) > 0;")
+# What a session still holds: locks beyond the shared DATABASE lock every session has, and its open
+# transactions (NULL once the session is gone).
+HELD = ("SELECT (SELECT COUNT(*) FROM sys.dm_tran_locks WHERE request_session_id = ?"
+        " AND resource_type <> 'DATABASE'),"
+        " (SELECT open_transaction_count FROM sys.dm_exec_sessions WHERE session_id = ?"
+        " AND login_time = ?);")
+LOGIN = "SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = ?;"
+GRANTED = ("SELECT l.request_session_id, l.request_owner_type, s.status, s.open_transaction_count"
+           " FROM sys.dm_tran_locks l LEFT JOIN sys.dm_exec_sessions s ON s.session_id = l.request_session_id"
+           " WHERE l.resource_type = 'APPLICATION' AND l.request_status = 'GRANT'"
+           " AND CHARINDEX(?, l.resource_description) > 0;")
+
+
+def check(ok, message):
+    # Not `assert`: an inherited PYTHONOPTIMIZE would strip it, and the child would pass unchecked.
+    if not ok:
+        raise AssertionError(message)
+
+
+async def main() -> None:
+    store = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    quarantined = []
+    real_release_dirty = store._release_dirty
+
+    async def spy(conn):
+        quarantined.append((conn, getattr(conn, "_conn", None)))
+        await real_release_dirty(conn)
+
+    store._release_dirty = spy
+    try:
+        holder = await store._pool.acquire()
+        try:
+            hcur = await holder.cursor()
+
+            async def one(sql, *params):
+                await hcur.execute(sql, *params)
+                row = await hcur.fetchone()
+                await holder.commit()
+                return row
+
+            for n in range(ROUNDS):
+                try:
+                    got = (await one(TAKE, RESOURCE))[0]
+                except Exception as exc:
+                    got = exc
+                if not isinstance(got, int) or got < 0:
+                    await hcur.execute(GRANTED, RESOURCE)
+                    held_by = [tuple(r) for r in await hcur.fetchall()]
+                    await holder.commit()
+                    raise AssertionError(f"round {n}: the holder did not get the lock ({got!r});"
+                                         f" granted to (session, owner, status, open txns): {held_by}")
+                task = asyncio.create_task(store._fetchall(BLOCKED, (RESOURCE,)))
+                sid = None
+                for _ in range(200):  # until the store's statement is waiting on the server
+                    row = await one(WAITER, RESOURCE)
+                    if row is not None:
+                        sid = row[0]
+                        break
+                    await asyncio.sleep(0.05)
+                check(sid is not None and not task.done(), f"round {n}: the store call never blocked")
+                login = (await one(LOGIN, sid))[0]
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    check(len(quarantined) == n + 1, f"round {n}: the cancel did not quarantine")
+                    conn, raw = quarantined[-1]
+                    check(raw is not None, f"round {n}: the quarantined connection had no raw handle")
+                    gate = _call_gate(conn)
+                    # The statement is still blocked, so the close must have been handed to it.
+                    check(gate is not None and gate._deferred is raw,
+                          f"round {n}: the close was not handed to the running statement")
+                finally:
+                    # Release even when a check failed, so the abandoned statement is not left
+                    # parked for its whole lock timeout.
+                    await hcur.execute(RELEASE, RESOURCE)
+                    await holder.commit()
+                # The abandoned statement now gets the lock and returns: the crash window. Its call
+                # then closes the connection, and the close's rollback frees the session.
+                state = None
+                for _ in range(200):
+                    state = tuple(await one(HELD, sid, sid, login))
+                    if state[0] == 0 and not state[1]:
+                        break
+                    await asyncio.sleep(0.05)
+                check(state is not None and state[0] == 0 and not state[1],
+                      f"round {n}: session {sid} still holds (locks, open txns) {state} after the close")
+                check(raw.closed, f"round {n}: the quarantined raw connection never closed")
+            await hcur.close()
+        finally:
+            await store._pool.release(holder)
+    finally:
+        await store.close()
+    print("SURVIVED", flush=True)
+
+
+asyncio.run(main())
+"""
+
+
+def test_cancelled_statement_returning_later_does_not_crash_the_process() -> None:
+    """BACKLOG #2049, live. The offline twin that pins the ordering on every runner is
+    ``tests/test_backlog2049_sqlserver_cancel_handle_free.py``. Five rounds, because the source
+    measured the crash as intermittent: 4 of 4 in one run, and one of two legs in another."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "faulthandler",
+            "-c",
+            _CANCEL_CHILD,
+            f"t2049:{uuid4().hex[:16]}",
+            "5",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0 and "SURVIVED" in proc.stdout, (
+        f"the child exited {proc.returncode} after a cancelled statement returned. A negative code"
+        " is the POSIX signal that killed it; on Windows a native crash is a large NTSTATUS such"
+        f" as 3221225477. stderr tail: {proc.stderr[-4000:]}"
+    )
+
+
+async def test_a_closed_store_connection_ends_its_server_session(store) -> None:
+    """BACKLOG #2049, ADR 0159 amendment 2026-09-29: the quarantine relies on a close ending the
+    session. With ODBC driver-manager pooling on, the session outlived the close on these legs.
+    This measures the contract on its own, with no cancel involved. If it fails while
+    ``pyodbc.pooling`` reads False, the cause is not pyodbc's pooling request: look at the driver
+    manager's own configuration (unixODBC ``Pooling`` in odbcinst.ini) or at the disconnect."""
+    import pyodbc
+
+    from messagefoundry.store.sqlserver import connection_string
+
+    raw = pyodbc.connect(connection_string(store._settings), autocommit=False, timeout=15)
+    cur = raw.cursor()
+    cur.execute(
+        "SELECT @@SPID, (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID)"
+    )
+    spid, login_time = cur.fetchone()
+    cur.close()
+    raw.close()
+    alive = None
+    for _ in range(100):
+        rows = await store._fetchall(
+            "SELECT COUNT(*) AS n FROM sys.dm_exec_sessions WHERE session_id = ? AND login_time = ?",
+            (spid, login_time),
+        )
+        alive = rows[0]["n"]
+        if not alive:
+            break
+        await asyncio.sleep(0.1)
+    assert not alive, (
+        f"session {spid} is still alive 10s after its connection closed (pyodbc.pooling ="
+        f" {pyodbc.pooling!r}); a quarantine close would leave it open on the server"
+    )
+
+
+async def test_a_pooled_connection_runs_its_calls_through_the_call_gate(store) -> None:
+    """Pins the aioodbc shape the BACKLOG #2049 gate relies on. The gate wraps
+    ``Connection._execute`` and silently stands aside when that is not a bound method, so an aioodbc
+    that renamed it would bring the crash back with every offline test still green."""
+    import pyodbc
+
+    from messagefoundry.store.sqlserver import _call_gate
+
+    # BACKLOG #2049, ADR 0159 amendment 2026-09-29: the store turned driver-manager pooling off.
+    assert pyodbc.pooling is False, "a closed connection's server session would outlive the close"
+    async with store._acquire() as conn:
+        gate = _call_gate(conn)
+        assert gate is not None, "a real pooled connection did not get the call gate"
+        async with store._cursor(conn) as cur:
+            await cur.execute("SELECT 1 AS one")
+            rows = await cur.fetchall()
+            assert rows[0][0] == 1
+            # Attached is not enough: a cursor call must actually pass through the gate.
+            assert await cur._run_operation(lambda: gate._running) is True
+        await conn.commit()
+
+
 async def test_enqueue_creates_message_and_outbox(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], control_id="MSG1"

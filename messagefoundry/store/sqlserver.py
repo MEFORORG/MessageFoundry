@@ -36,6 +36,7 @@ import inspect
 import json
 import logging
 import queue
+import threading
 import time
 from collections.abc import (
     AsyncIterator,
@@ -48,6 +49,7 @@ from collections.abc import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from functools import partial
 from time import perf_counter
 from types import MappingProxyType
 from typing import Any, Final
@@ -64,6 +66,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -221,9 +224,9 @@ _RESET_LANE_CHUNK = 500
 # BACKLOG #348 / ADR 0159: how long the quarantine of a cancellation-poisoned pooled connection waits
 # for its off-loop close before giving up and leaving it to finish detached. A BOUND, not a deadline:
 # the connection is already out of the pool before this wait starts, so expiring it costs nothing but
-# a slower reclaim. It exists because the close runs on a worker thread that may still be occupied by
-# the abandoned statement, which is bounded only by command_timeout (default 30s) — without a cap here
-# an engine.stop()/demotion would block for that long, per lane.
+# a slower reclaim. Since BACKLOG #2049 a close whose connection still runs the abandoned statement is
+# handed to that statement's own call and not waited for at all. In a narrow race (a call dispatched
+# but not yet inside the gate) the close can still queue behind a call, and this bound caps that wait.
 _DIRTY_CLOSE_TIMEOUT = 5.0
 
 
@@ -239,6 +242,121 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
             " transaction and audit applock until the session ends: %s",
             fut.exception(),
         )
+
+
+class _CallGate:
+    """Runs one connection's pyodbc calls one at a time, and frees its handles only between calls.
+
+    BACKLOG #2049. aioodbc runs every call on an executor thread, and cancelling the awaiting task
+    does not stop that thread. Before this gate, the cancellation path closed the cursor and the
+    connection on OTHER threads while the statement was still running. When it returned, pyodbc
+    read the result's column metadata from freed handles, and a deploying SQL Server site would
+    have lost the whole engine process to a native crash (``SQLDescribeColW``,
+    ``SQLColAttributeW``). pyodbc declares DB-API ``threadsafety = 1``: threads may share the module
+    but not connections. aioodbc already moves each connection across executor threads, one call at
+    a time, and that is only sound while the calls really are one at a time. ``_lock`` restores
+    that after a cancellation; it does not make the store conform to level 1.
+
+    On the normal path each call waits for the previous one anyway, so the lock is never contended.
+    A quarantine that arrives while a call runs is handed to that call, which closes the connection
+    on its own thread as it returns: no extra thread waits, and the event loop never does.
+    """
+
+    __slots__ = ("_abandoned", "_deferred", "_lock", "_running", "_state")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()  # held for the whole of each pyodbc call
+        # Guards the two fields below. Held only for a few bytecodes, so the event loop may take it.
+        self._state = threading.Lock()
+        self._running = False
+        self._deferred: Any = None  # a raw connection to close when the running call returns
+        # Cursors whose owner was cancelled. The quarantine closes them before the connection, in
+        # the same locked step, so a later garbage collection never frees a statement beside it.
+        self._abandoned: list[Any] = []
+
+    def run(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            with self._state:
+                self._running = True
+            try:
+                return func(*args, **kwargs)
+            finally:
+                with self._state:
+                    self._running = False
+                    deferred, self._deferred = self._deferred, None
+                if deferred is not None:
+                    self._close_locked(deferred, reraise=False)
+
+    def abandon(self, raw_cursor: Any) -> None:
+        """Hand a cancelled owner's cursor to the quarantine. Never waits: it runs on the loop."""
+        self._abandoned.append(raw_cursor)
+
+    def close_after_running_call(self, raw_conn: Any) -> bool:
+        """If a call is running, have it close ``raw_conn`` as it returns, and say so. Never waits."""
+        with self._state:
+            if self._running:
+                self._deferred = raw_conn
+            return self._running
+
+    def close(self, raw_conn: Any) -> None:
+        """Close the abandoned cursors, then the connection, once no call is running on it."""
+        with self._lock:
+            self._close_locked(raw_conn, reraise=True)
+
+    def _close_locked(self, raw_conn: Any, *, reraise: bool) -> None:
+        while self._abandoned:
+            try:
+                self._abandoned.pop().close()
+            except Exception:  # noqa: BLE001 - the connection close below still has to run
+                log.debug("sqlserver: closing an abandoned cursor failed", exc_info=True)
+        try:
+            raw_conn.close()
+        except Exception as exc:  # noqa: BLE001 - inside a call, never replace that call's outcome
+            if reraise:  # a caller awaiting this close logs it in its own words
+                raise
+            log.warning(
+                "sqlserver: close of a quarantined connection failed; the server may hold its"
+                " transaction until the session ends: %s",
+                exc,
+            )
+
+
+def _install_call_gate(conn: Any) -> None:
+    """Route every pyodbc call an aioodbc connection makes through a :class:`_CallGate`. Idempotent.
+
+    aioodbc 0.5.0 sends every call through ``Connection._execute(func, *args, **kwargs)``: cursor
+    operations reach it through ``Cursor._run_operation``, and the connection's own ``cursor``,
+    ``commit``, ``rollback`` and ``close`` call it directly. Wrapping that one method covers them
+    those. A connection without a bound ``_execute`` (a test double) is left alone and keeps the
+    pre-gate behaviour. A real aioodbc connection that cannot be gated is logged at ERROR, because
+    it brings the native crash back; the live suite also pins that a pooled connection is gated.
+    """
+    if _call_gate(conn) is not None:
+        return
+    execute = getattr(conn, "_execute", None)
+    if not inspect.ismethod(execute):
+        if type(conn).__module__.startswith("aioodbc"):
+            log.error(
+                "sqlserver: aioodbc %s has no bound _execute to gate; a cancelled store call can"
+                " free ODBC handles under a running statement (BACKLOG #2049)",
+                type(conn).__qualname__,
+            )
+        return
+    gate = _CallGate()
+    conn._execute = partial(execute, gate.run)
+    conn._mefor_call_gate = gate
+
+
+def _call_gate(conn: Any) -> _CallGate | None:
+    gate = getattr(conn, "_mefor_call_gate", None)
+    return gate if isinstance(gate, _CallGate) else None
+
+
+def _raw_closer(conn: Any, raw: Any) -> Callable[[], None]:
+    """The blocking close for a discarded connection's raw handle: through its gate when it has one,
+    so the close runs only between pyodbc calls (BACKLOG #2049)."""
+    gate = _call_gate(conn)
+    return raw.close if gate is None else partial(gate.close, raw)
 
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
@@ -2685,6 +2803,9 @@ class SqlServerStore:
         function) and never beyond."""
         conn = await self._connect_claim_conn()
         try:
+            # BACKLOG #2049: a discard after a cancelled claim closes this cursor and connection;
+            # the gate makes both wait for a claim statement still running on an executor thread.
+            _install_call_gate(conn)
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit (STORE-3)
@@ -2722,6 +2843,7 @@ class SqlServerStore:
         transaction exactly as on the pooled path."""
         import aioodbc
 
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         return await aioodbc.connect(
             dsn=connection_string(self._settings, posture=self._posture),
             autocommit=False,
@@ -3365,6 +3487,7 @@ class SqlServerStore:
         partial result (exit 3) rather than trusting what happened here."""
         import aioodbc
 
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         db = settings.database
         remedy = _rcsi_remedy(db)
         dsn = connection_string(settings, posture=posture)
@@ -3831,6 +3954,7 @@ class SqlServerStore:
                 "SQL Server backend requires the 'sqlserver' extra: "
                 "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
             ) from exc
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         executor = _build_pool_executor(settings, maxsize)
         try:
             pool = await aioodbc.create_pool(
@@ -4040,6 +4164,7 @@ class SqlServerStore:
             raise ValueError(f"sync handoff pool size must be >= 1 (got {size})")
         import pyodbc
 
+        disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         dsn = connection_string(self._settings, posture=self._posture)
         login_timeout = self._settings.connect_timeout
 
@@ -4124,6 +4249,7 @@ class SqlServerStore:
         )
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
+            _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
@@ -4158,18 +4284,26 @@ class SqlServerStore:
         silently restores the bug. Ordering here is the guarantee; the close below is only hygiene.
 
         Closing the raw handle is then best-effort, off the event loop, and time-boxed. pyodbc's
-        ``close()`` rolls back uncommitted work (DBAPI), which is what actually frees the X locks —
-        but it runs on a worker thread that may still hold the abandoned statement, so it is never
-        awaited unbounded on a shutdown/demotion path. On expiry the close finishes detached; the
-        pool has already lost the connection and reopens on demand (``size`` is derived, so the pool
-        simply shrinks). This costs one reconnect per cancelled call — paid only on a path that was
-        previously corrupting the pool.
+        ``close()`` rolls back uncommitted work (DBAPI), which is what actually frees the X locks.
+        On expiry the close finishes detached; the pool has already lost the connection and reopens
+        on demand (``size`` is derived, so the pool simply shrinks). This costs one reconnect per
+        cancelled call — paid only on a path that was previously corrupting the pool.
+
+        **The close never frees a handle under a running statement (BACKLOG #2049).** The abandoned
+        statement may still be running on an executor thread. The :class:`_CallGate` makes the
+        close, and the close of any cursor :meth:`_cursor` abandoned, wait for that call to return.
+        When a call is running, this method hands it the close and does not wait at all: the close
+        could only land when the statement returns, and waiting here would stall a shutdown or
+        demotion for as long as the statement runs, which ADR 0159 rejected.
         """
         raw = getattr(conn, "_conn", None)
         if raw is None:  # already closed/quarantined — nothing lendable to contain
             return
         conn._conn = None  # ← MUST stay first, and MUST stay await-free
-        closer = asyncio.ensure_future(asyncio.to_thread(raw.close))
+        gate = _call_gate(conn)
+        if gate is not None and gate.close_after_running_call(raw):
+            return
+        closer = asyncio.ensure_future(asyncio.to_thread(_raw_closer(conn, raw)))
         try:
             await asyncio.wait_for(asyncio.shield(closer), _DIRTY_CLOSE_TIMEOUT)
         except (TimeoutError, asyncio.CancelledError):
@@ -4218,7 +4352,7 @@ class SqlServerStore:
                 return
             conn._conn = None  # unlendable at once, with no await in front; see _release_dirty
             try:
-                closer = asyncio.get_running_loop().run_in_executor(None, raw.close)
+                closer = asyncio.get_running_loop().run_in_executor(None, _raw_closer(conn, raw))
             except RuntimeError:  # the executor is shut down; see the docstring
                 log.warning(
                     "sqlserver: could not schedule the close of a discarded connection; it is out"
@@ -4286,15 +4420,31 @@ class SqlServerStore:
         exit (when the connection is not autocommit) and rolls back on the exception path — either
         would override each caller's own explicit ``commit``/``rollback``, so we close the cursor
         directly here and let the caller own the transaction. A close failure is swallowed
-        (best-effort) so it can never mask the real error already in flight."""
+        (best-effort) so it can never mask the real error already in flight.
+
+        **A cancellation hands the cursor to the quarantine instead (BACKLOG #2049).** On that path
+        the cancelled statement may still be running on an executor thread, and closing the cursor
+        beside it frees the handle the statement returns to. Every ``_cursor`` sits inside
+        :meth:`_acquire`, which quarantines the connection on the same exit, so the cursor is closed
+        there, after the statement returns. No await here, so the cancellation propagates at once."""
         cur = await conn.cursor()
+        abandoned = False
         try:
             yield cur
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                gate = _call_gate(conn)
+                raw_cur = getattr(cur, "_impl", None)
+                if gate is not None and raw_cur is not None:
+                    gate.abandon(raw_cur)
+                    abandoned = True
+            raise
         finally:
-            try:
-                await cur.close()
-            except Exception:  # noqa: BLE001 - a close failure must not mask the in-flight error
-                log.debug("cursor close on connection release failed", exc_info=True)
+            if not abandoned:
+                try:
+                    await cur.close()
+                except Exception:  # noqa: BLE001 - a close failure must not mask the in-flight error
+                    log.debug("cursor close on connection release failed", exc_info=True)
 
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         async with self._acquire() as conn, self._cursor(conn) as cur:

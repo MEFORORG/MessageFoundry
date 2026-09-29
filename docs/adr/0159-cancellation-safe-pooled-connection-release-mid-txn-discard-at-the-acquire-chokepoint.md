@@ -425,6 +425,108 @@ the next reader does not re-derive the wrong precedent from the same comment.
   server, and so does the lab that BACKLOG #1003 tracks. The self-hosted Windows workflow,
   `selfhosted-win2025-sql.yml`, leaves the failover test file out on purpose, because it hangs on
   that VM.
+- **AMENDED 2026-09-28. The quarantine close waits for the abandoned statement (BACKLOG #2049).**
+  As first built, this design closed the cursor in `_cursor` and the raw connection in
+  `_release_dirty` on other executor threads while the cancelled statement could still be running.
+  When the statement returned, pyodbc read its result metadata from the freed handles. Hosted CI saw
+  the process die natively in `SQLDescribeColW` and `SQLColAttributeW`, so a deploying site would
+  have lost the whole engine process on a cancel at shutdown or demotion.
+
+  - `_acquire` now routes every pyodbc call on a pooled connection through a per-connection lock,
+    `_CallGate`, by wrapping aioodbc's `Connection._execute`. Two threads never use one connection
+    at once. pyodbc declares DB-API `threadsafety = 1`, under which threads may not share a
+    connection at all; aioodbc already hands each connection across executor threads, and the gate
+    keeps those hand-offs one call at a time. That wrap is a second private
+    coupling beside `conn._conn`, pinned live by
+    `test_a_pooled_connection_runs_its_calls_through_the_call_gate`.
+  - On a cancellation, `_cursor` no longer closes its cursor. It hands it to the quarantine, and
+    `_release_dirty` closes that cursor and then the connection in one locked step, after the
+    running call returns.
+  - The synchronous `conn._conn = None` still comes first, with no await in front of it, so AC-1
+    and AC-2 are unchanged.
+  - When a call is still running, `_release_dirty` hands the close to that call and does not wait.
+    The call closes the connection on its own thread as it returns, so the quarantine parks no
+    extra thread. Waiting on the loop would be the demotion stall rejected above. With nothing
+    running, the 5 s bounded wait is unchanged.
+  - **A cleanup that makes its own call on the connection now waits for the running statement.**
+    That is the price of never using one connection from two threads. It reaches at least two
+    places: `claim_fifo_heads`' shielded `SET LOCK_TIMEOUT -1` reset, and the at-rest seal pass's
+    `except BaseException` rollback. Before the gate, such a call ran beside the statement on a
+    second thread.
+  - **This corrects the Consequences bullet above that says shutdown and demotion stay bounded by
+    `_DIRTY_CLOSE_TIMEOUT`.** The quarantine itself still does not wait on a running statement, but
+    such a cleanup call does, for as long as the statement runs. With `command_timeout = 0` that
+    has no bound.
+  - **So a claim cancelled mid-statement now usually commits.** The reset's `_commit` runs after
+    the claim statement returns, as ADR 0114 §2 designed. A further cancellation during the reset's
+    unshielded wait can still cancel it, and the quarantine close then rolls the claim back. ADR 0157 Inc 3 already read this case and
+    accepted it: the claim guard was checked inside the statement, and the stranded INFLIGHT rows
+    are cancellation residue that the next start or the successor's promotion reset collects. SQL
+    Server has no runtime lease reclaim, so after a cancel with no restart or promotion those FIFO
+    heads stay INFLIGHT until one happens.
+    Before the gate the reset raced the statement, and whether the claim then committed or
+    rolled back depended on that race. Nobody measured which.
+  - The statement is not cancelled on the server; no `SQLCancel` is sent. It runs to its own end,
+    bounded by `command_timeout`, as before.
+
+  Pinned offline by `tests/test_backlog2049_sqlserver_cancel_handle_free.py`, and live by
+  `test_cancelled_statement_returning_later_does_not_crash_the_process` in
+  `tests/test_sqlserver_store.py`.
+- **AMENDED 2026-09-29. A close did not end the server session, so this ADR's quarantine rested on
+  a false premise (BACKLOG #2049).** The quarantine above closes the raw connection and relies on
+  that close to end the session: *"a pyodbc close rolls back uncommitted work"*, and the session
+  goes with it. On both sqlserver-store CI legs (job 109279699623), the live #2049 test found a
+  quarantined connection's session still alive after the close, holding no lock but with one open
+  transaction.
+
+  The cause, by reading and not yet confirmed: pyodbc asks for ODBC driver-manager pooling by
+  default (`pyodbc.pooling = True`, pyodbc 5.3.0). With pooling on, `close()` rolls back and then
+  parks the physical connection in the driver manager's pool, so the session lives on until reuse
+  or timeout. aioodbc already pools, so that second layer only keeps closed sessions alive.
+  Session-scoped state would outlive the quarantine: `SET` options such as `LOCK_TIMEOUT` or
+  `NOCOUNT`, and session-owned applocks.
+
+  **The fix stops pyodbc asking for pooling, for the whole process.**
+  `messagefoundry/odbc_env.py` holds `disable_driver_manager_pooling()` and the reasoning. `pooling`
+  is read when pyodbc allocates its environment handle, at the first ODBC use in the process: a
+  connect, or `pyodbc.drivers()`. So the CLI entry point calls it before anything else. At least the
+  store's connect sites, the DATABASE connector's pool and the verifier's driver probe call it
+  again, for callers that embed the engine. `tests/test_odbc_pooling_off.py` fails if a site it can
+  find lacks the call.
+
+  **Two limits, stated so nobody reads this as proven.**
+
+  - pyodbc only *requests* pooling. A driver manager set to pool on its own, such as unixODBC with
+    `Pooling = Yes` in `odbcinst.ini`, is outside the engine's reach. Whether the CI legs' unixODBC
+    honours pyodbc's request was not measured. So
+    `test_a_closed_store_connection_ends_its_server_session` measures the contract directly: a closed
+    store-style connection's session must be gone within 10 s. If that test fails with pooling
+    off, the cause is elsewhere.
+  - It does not cover a close whose rollback fails. Per the ODBC spec, a disconnect with an
+    incomplete transaction fails, and pyodbc ignores both failures. That session can stay open with
+    pooling off too. This residual is open.
+
+  **An explicit rollback before every close was weighed and rejected.** pyodbc already rolls back
+  in `close()`, and the leg shows the session surviving anyway. A rollback clears the transaction
+  but not the session, its `SET` state or its session-owned locks.
+
+  **What it costs.** A close is now a real disconnect, and a new connection a real login with its
+  TLS handshake. That is paid in at least these places:
+
+  - when aioodbc grows or refills a pool;
+  - once per quarantined connection;
+  - on each short-lived connection at open time;
+  - when the fused-handoff sync pool or a claim holder discards a connection after a raise. The
+    replacement login runs on that worker before the error surfaces.
+
+  aioodbc and the sync pool keep their connections open between borrows, so the path with no
+  errors is unchanged. The DATABASE connector pays the same, against whatever server it points at.
+  The cluster coordinator opens no connections of its own; it borrows the store's.
+
+  The live cancel test's server-side check is unchanged: once the close lands, the abandoned
+  statement's session must hold no lock and no open transaction. A manual-commit session at rest
+  reads one open transaction and no locks (see *What was measured* above). So that check in effect
+  requires the session to be gone.
 
 ## Acceptance Criteria
 
