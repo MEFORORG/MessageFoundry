@@ -34,16 +34,15 @@ from pathlib import (
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from messagefoundry import __version__
-
-# The shared CLI shell and helpers (ADR 0201 slice 1). Each helper is imported under its own name
-# with `as`, which is what marks it re-exported: the handlers below use them, and tests reach them
-# as attributes of this module.
-from messagefoundry.cli_common import Dispatch, run_cli
-from messagefoundry.cli_common import _emit_error as _emit_error
-from messagefoundry.cli_common import _load_operator_json as _load_operator_json
-from messagefoundry.cli_common import _OperatorJsonError as _OperatorJsonError
-from messagefoundry.cli_common import _print_json as _print_json
-from messagefoundry.cli_common import _safe_print as _safe_print
+from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR 0201 slice 1)
+    Dispatch,
+    _emit_error,
+    _load_operator_json,
+    _OperatorJsonError,
+    _print_json,
+    _safe_print,
+    run_cli,
+)
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import (
     LOG_LEVELS,

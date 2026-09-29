@@ -11,7 +11,7 @@ import them:
   exception hooks, parsing, the redacting stderr log sink and the JSON error floor.
 * ``_safe_print``, ``_print_json``, ``_emit_error``, ``_load_operator_json`` and
   ``_OperatorJsonError`` are the output and input helpers the handlers share. They moved here
-  verbatim from ``__main__.py``, private names included, so no caller changed.
+  verbatim from ``__main__.py``, private names included, so its handlers call them unchanged.
 
 Process setup that one command needs and the other does not stays in that command's ``main()``,
 before it calls :func:`run_cli`. The engine's ODBC pooling switch is the example.
@@ -29,25 +29,24 @@ from typing import Any
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import configure_stderr_logging
 
-__all__ = ["Dispatch", "ParserBuilder", "run_cli"]
+__all__ = ["Dispatch", "run_cli"]
 
 #: A command's top-level subcommand names, each mapped to the handler that runs it.
 Dispatch = Mapping[str, Callable[[argparse.Namespace], int]]
 
-#: Builds a command's parser and returns it with its :data:`Dispatch` map.
-ParserBuilder = Callable[[], tuple[argparse.ArgumentParser, Dispatch]]
-
 
 def run_cli(
     argv: list[str] | None,
-    build_parser: ParserBuilder,
+    build_parser: Callable[[], tuple[argparse.ArgumentParser, Dispatch]],
     *,
     configures_own_logging: Collection[str] = frozenset(),
 ) -> int:
     """Run one command line: harden, install the hooks, parse, dispatch, and return the exit code.
 
     ``build_parser`` is called, not passed in built, so the parser is built after the hooks are in
-    place. That is the order the engine's ``main()`` always had. ``configures_own_logging`` names the
+    place. That is the order the engine's ``main()`` always had. Its parser must put the subcommand
+    in ``args.command``, as ``add_subparsers(dest="command", required=True)`` does, because the
+    dispatch and the log-sink choice both key on it. ``configures_own_logging`` names the
     subcommands that install their own redacting root handler, so this shell gives them none.
     """
     # Every console entry point hardens its streams first (BACKLOG #1875), and a caller's main()

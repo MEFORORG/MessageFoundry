@@ -107,8 +107,7 @@ def test_the_table_matches_the_parser_and_the_ruling(real_paths: dict[str, set[s
 
 
 def test_dispatch_keys_are_the_top_level_subcommands(real_paths: dict[str, set[str]]) -> None:
-    _parser, dispatch = cli_module._build_parser()
-    assert set(dispatch) == {p for p in real_paths if " " not in p}
+    assert set(cli_module._DISPATCH) == {p for p in real_paths if " " not in p}
 
 
 # --- The builder is what main() parses with, and building changes nothing. ---------------------
