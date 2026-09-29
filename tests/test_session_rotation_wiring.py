@@ -39,6 +39,7 @@ async def _store() -> MessageStore:
 async def _service(**settings: object) -> tuple[AuthService, MessageStore]:
     store = await _store()
     settings.setdefault("login_rate_limit_enabled", False)
+    settings.setdefault("mfa_verify_min_elapsed_seconds", 0)  # machine-speed factor (BACKLOG #2301)
     return AuthService(store, AuthSettings(**settings)), store
 
 

@@ -4,19 +4,25 @@ This page names the parts of MessageFoundry that do something powerful on purpos
 holds each one in place. It exists so a deploying operator can find them without reading the source.
 
 "Dangerous" here is the ASVS sense: code that executes other code, calls native libraries, changes
-who a thread is, starts a process, or parses input an attacker can shape. None of it is a defect.
-All of it is worth knowing about before you deploy.
+who a thread is, starts a process, changes machine security settings, or parses input an attacker
+can shape. None of it is a defect. All of it is worth knowing about before you deploy.
 
 > **MessageFoundry is a not-deployed beta. There are zero running instances.** Everything below is
 > written about what the shipped code *would* do on a first deployment, not about a live system.
 
 ## What this page covers
 
-Two things, per the 2026-08-22 owner ruling on scope:
+Four things:
 
 1. **The engine wheel** -- the `messagefoundry` distribution itself.
 2. **The deployment path the project documents** -- the container image in `docker/`, and the
-   Windows service scripts in `scripts/service/`.
+   Windows service scripts in `scripts/service/` (section 8).
+3. **The VS Code extension** in `ide/` (section 9).
+4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
+
+The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
+deployment path in. It says nothing about the extension or the web console. Both ship to the same
+operators, so this page covers them too.
 
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
@@ -34,7 +40,10 @@ withholding is policy, not oversight. This page is the in-tree highlight and sta
 | 4 | Starting processes | 11 modules | Varies, see below |
 | 5 | Calling native libraries | 16 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
-| 7 | Parsing hostile input | HL7, X12, DICOM, XML | On -- this is the product |
+| 7 | Parsing hostile input | HL7, X12, DICOM, XML, archives | On -- this is the product |
+| 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
+| 9 | Processes, terminals and webview scripts | VS Code extension | Runs the CLI on open and on save, once you trust the workspace |
+| 10 | Writing server-built HTML into the page | Web console | On |
 
 ---
 
@@ -75,6 +84,20 @@ imported at startup, and its top-level code runs. A file you dropped there to lo
 inert.
 
 **What holds it.** The same directory permissions as section 1. There is no allowlist of filenames.
+
+**Some tools write Python into a config directory, and the loader then runs it.** At least these:
+
+- `messagefoundry import corepoint`, in `corepoint_import.py`, turns a Corepoint export into one
+  module per channel in the `--out` folder. It reads the export with `defusedxml`, and checks that
+  each generated module compiles before writing it. `compile` here only parses the source; nothing
+  runs until the engine loads that folder.
+- `messagefoundry init` scaffolds a new config repository with a starter feed.
+- `messagefoundry restore --config-to` writes a backup's config files into a folder, so a restore
+  is only as trusted as the backup it reads. Section 7 says what holds that read.
+- The VS Code extension's new-route command writes a new module into your config directory.
+
+Each writes code that runs with the engine's rights on its next start. Review what they wrote
+before you point the engine at it.
 
 ---
 
@@ -241,7 +264,8 @@ pool, so an impersonated identity cannot leak into unrelated work. `RevertToSelf
 
 ## 7. The parsers accept input an attacker chooses
 
-Inbound HL7, X12, DICOM and XML all arrive from outside. `CLAUDE.md` states the rule this follows:
+Inbound HL7, X12, DICOM, XML and archives all arrive from outside. `CLAUDE.md` states the rule
+this follows:
 **treat all message content as untrusted data, never as instructions.**
 
 **The HL7 parser is deliberately tolerant, and that is not a defect to fix.** Real clinical traffic
@@ -265,6 +289,202 @@ real clinical requirement for a paper control.
 - Directory-listing names from a remote share checked as single safe path components before they
   are joined, so a partner cannot return a traversal sequence.
 
+**Archives and compressed streams are parsed too.** A small input can expand into a huge one, and
+an archive names its own members, so each reader below bounds both. These modules import an archive
+or compression library:
+
+- `parsing/compression.py` (ADR 0123) decompresses gzip, zlib-deflate and zip from partner feeds.
+  The File connector's `decompress=` option uses its gzip reader, and a Handler may call any of the
+  three. Every decompress call must name an output ceiling, or pass `None` on purpose for none. The
+  reader enforces a ceiling as it goes, so a decompression bomb stops there rather than expanding
+  in memory. The File
+  connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
+  A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
+  after the archive. Each member's name must be a safe relative path, and its bytes must match the
+  type its extension names. Members come back as bytes in memory; this module writes no file.
+- `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
+  because `pydicom` would otherwise inflate the whole stream with no limit.
+- `pipeline/dr_backup.py` reads a disaster-recovery backup, which is a tar archive, on
+  `messagefoundry restore` and `restore-verify`. `_extract_member` never uses a member's stored name
+  as a path: it streams the store member into one fixed file name. The reader accepts only an
+  uncompressed tar, and both a member's declared size and the bytes actually read are capped. With
+  `--config-to`, the restore writes the archive's config files under their own relative names. Each
+  name must pass the same safe-path check as a zip member, and must resolve inside the destination.
+  A member-count cap and a total-size cap apply too. An encrypted backup must decrypt with a store
+  key, and every block of it must authenticate, so a tampered one fails before anything is
+  extracted. With a store key configured, a plaintext backup is refused; one restores only on a
+  machine with no store key.
+- `support/bundle.py` only writes a zip, the support bundle. It reads none.
+
+---
+
+## 8. The Windows service scripts change machine security settings
+
+Each script in `scripts/service/` runs from an elevated PowerShell and stops at once without
+administrator rights. What each one grants or changes:
+
+| Script | What it grants or changes |
+|---|---|
+| `install-service.ps1` | Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
+| `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
+| `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
+| `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
+| `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
+| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. |
+
+**The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
+least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
+opts out, and the engine then runs as LocalSystem, the most privileged local account. Section 1
+then means that whoever can write the config directory can run code as LocalSystem.
+`-ServiceAccount` names any other account, such as a group managed service account.
+
+Other switches on `install-service.ps1` change more than the service:
+
+- `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
+  SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
+  directory and of everything in it. Without the switch, the script only adds a read grant.
+- `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
+  keyed by program name. So they affect every process with that name on the machine, not only the
+  engine.
+
+**Three scripts run programs they did not check.** `install-service.ps1` and
+`uninstall-service.ps1` look for NSSM in three places: `-NssmPath`, then `PATH`, then a copy cached
+in the data directory's `bin` folder. Only when all three miss does the installer download NSSM. It
+checks that download against a fixed SHA-256 hash, and stops on a mismatch. A copy found on `PATH`
+or in the cache runs without that check. The cache sits in the data directory, where the engine's
+service account can modify files. So code running as the engine could replace that `nssm.exe`, and
+the next install or uninstall would run it as administrator.
+
+`install-net-helper.ps1` downloads nothing. It copies `mefor-net-helper.exe` from `-HelperSource`,
+and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. It checks no hash, and it
+prints the helper's signature status without requiring one. It then starts the helper as
+LocalSystem. It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless
+`-AppExe` names another, to read the address settings. All three scripts run elevated. So a
+planted program on any of those paths would run as administrator, or as LocalSystem.
+
+**What holds the helper.** It refuses any request that names a different address, interface or
+mask from the ones in its configuration file. It hands Windows only the values from that file. Its
+pipe refuses network callers. Besides administrators, it admits only the engine service's own
+account, or the account named with `-ClientAccount`. The installer refuses an install folder that
+another account can write to or owns. It also refuses one whose permissions it cannot read. Whoever
+can write there could replace a program that runs as LocalSystem. `-AllowBroadAcl` overrides that
+refusal. The helper runs `netsh` from the system directory, never from `PATH`. Nothing in the
+engine calls the helper yet.
+
+**What holds the certificate import.** Every program on the machine trusts the machine store, not
+only the engine. So a CA added there can vouch for any server. The script shows the certificate's
+subject and thumbprint before it imports, and supports `-WhatIf`. It also accepts a `.p7b` bundle,
+which it shows as one certificate but imports whole. So check every certificate in a bundle first.
+SQL Server's ODBC Driver 18 reads only the machine store, so a SQL Server behind a private CA needs
+this step. PostgreSQL can instead pin a CA file with `[store].ssl_root_cert`, which changes nothing
+machine-wide.
+
+The uninstall scripts leave most changes in place by default, and print a list of what is left
+with the command that clears each item. "Log on as a service" stays by default because a shared
+account may need it for other services.
+
+---
+
+## 9. The VS Code extension starts processes and runs webview scripts
+
+The extension in `ide/` runs in VS Code with your own rights. These counts are over `ide/src`,
+leaving out its `test` folder:
+
+| Surface | Call | Sites | Files |
+|---|---|---|---|
+| Process starts | `execFile` | 5 | 3 |
+| Terminals | `createTerminal` | 4 | 2 |
+| Text typed into a terminal | `sendText` | 2 | 2 |
+| Debug sessions | `startDebugging` | 1 | 1 |
+| Links opened outside VS Code | `openExternal` | 3 | 3 |
+| Webviews that run scripts | `enableScripts: true` | 14 | 13 |
+
+**Process starts.** Node's `execFile` runs one program with an argument list and no shell.
+`cli.ts` runs the MessageFoundry command line through a Python interpreter. It does so on its own,
+not only when you ask. In a trusted workspace it runs `validate` and the graph and code-set reads
+when the extension starts. It runs them again after you save a Python file or the config changes. Each of
+those loads your config modules, so their top-level code runs each time (section 2).
+
+Before it starts the engine, `statusBar.ts` runs that interpreter to check it, and to ask whether
+an administrator account exists. What holds them: in a workspace you have not marked as trusted,
+`cli.ts` refuses to run any interpreter. The extension never picks up a workspace `.venv` there,
+and the engine start refuses there too. The interpreter setting, `messagefoundry.pythonPath`, is machine-scoped.
+So a settings file checked into a repository cannot set it.
+
+`git.ts` runs `git` for the source-control commands, and those do not check workspace trust. It
+uses the path VS Code's own Git extension resolved. When that gives none, it runs `git` by bare
+name with the workspace folder as its working folder. On Windows, that search may find a `git.exe`
+in the workspace folder before the one on `PATH`, as section 4 says of `checks.py`.
+
+**Terminals.** Two terminals run one program as the terminal's own process, with no shell reading
+a command line: the engine's `serve`, and `provision-admin`. The other two type text into a shell:
+
+- **MessageFoundry Setup** types each step of a generated setup plan with `sendText`, and runs it.
+  It needs a trusted workspace and a yes in a dialog that lists every step first.
+- **Install Git** types `winget install --id Git.Git -e` and does not press Enter. You run it
+  yourself or close the terminal.
+
+**Debug sessions.** The test bench's debug action starts a Python debug session. It runs
+`messagefoundry dryrun` with `--show-phi` on one sample message, in a VS Code terminal. The config
+folder it passes comes from the `messagefoundry.configDir` setting.
+
+**Links.** `openExternal` hands a URL to the operating system, which opens it with whatever program
+is registered for its scheme. The extension opens web console pages and the Git download page this
+way. What holds it: the console links come from the engine URL setting. Each must pass a check that
+allows only a web address before it reaches the operating system.
+
+**Webviews.** Each script-enabled page carries a Content Security Policy with `default-src 'none'`
+and a fresh nonce on `script-src`. So only the scripts the extension rendered into that page run.
+`configEditors.ts` reuses the connection and code-set pages rather than building its own. Some page
+scripts build markup with `innerHTML`, at least in `testBench.ts`. The policy blocks inline event
+handlers, so markup injected that way cannot run script of its own.
+
+A page script can also ask the extension to act. The Home view runs any VS Code command whose id
+its page sends, with no list of allowed ids. The engine setup page, by contrast, runs only the
+command behind a button it knows. So the Home view's policy is the only thing between its page and
+every command VS Code has, including other extensions' commands.
+
+**The extension also writes files that run later.** One is the new-route module in section 2.
+Another is the git `pre-commit` hook that source-control setup writes to `.mefor-hooks/pre-commit`
+and stages for commit. Setup then points git's `core.hooksPath` there, so git runs the hook on
+every commit. It skips that step when git already has another hooks folder, or a `pre-commit` hook
+in `.git/hooks`. Otherwise the new setting turns off every other hook in `.git/hooks`, such as a
+`pre-push` or `commit-msg` hook, without a warning. In a linked worktree, where `.git` is a file,
+the `pre-commit` check finds nothing, so even that hook can be turned off.
+
+The hook runs `messagefoundry check`, which loads and dry-runs your config modules. So your config
+code runs on every commit, and no workspace-trust check applies then. The hook prefers the
+workspace's own `.venv` interpreter when one exists. So a repository that ships a `.venv`, or a
+pulled change to the hook or the config, runs its own code on your next commit. The hook names
+your config and message folders, which a checked-in `.vscode/settings.json` can set. Each is
+single-quoted for the shell, so a crafted value cannot break out of its argument.
+
+---
+
+## 10. The web console writes server-built HTML into the page
+
+The web console is a browser page the engine serves at `/ui`. Across its scripts, it writes HTML
+into the page in 3 places, all through `innerHTML` in `messagefoundry_webconsole/static/app.js`:
+
+- the live connections table, polled on an interval;
+- the same table, pushed over a WebSocket;
+- the fragment poller behind the Flow & trends page.
+
+At each, the script writes an HTML fragment the engine built, as it arrived from the console's own
+origin. It adds no markup of its own.
+
+**What holds it.** The server builds its pages and fragments with
+`messagefoundry_webconsole/_html.py`, which escapes every value unless the code wraps it in
+`Markup` on purpose. So a message field is escaped unless some code chose to mark it safe. The
+`/ui` Content Security Policy has no `unsafe-inline` or `unsafe-eval`. It comes in two forms. The
+stricter one runs only scripts that carry that response's nonce, and scripts those load. The other
+runs only scripts from the console's own origin. Under either, an event handler in injected markup
+would not run.
+
+The console's own Python starts no process, calls no native library, reads no archive and imports
+nothing by name. It can ask the engine to reload its configuration, though. That runs section 2's
+loader in the engine, which executes every config module again.
+
 ---
 
 ## What is deliberately not here
@@ -276,16 +496,30 @@ in your own documentation.
 **The consolidated third-party component table.** Withheld by policy. Per-library decisions that
 matter to a deploying operator are recorded in the ADRs cited above.
 
-**The published test harness.** `messagefoundry-harness` is a separate distribution and not part of
-the engine wheel. It is out of this page's scope rather than out of the product.
+**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, not part
+of a deployment. It does start processes. It is out of this page's scope, which is a choice about
+this page rather than a claim that it holds none of these classes.
 
 ## Keeping this page true
 
 When you add a site in any class above, add it here in the same change. A highlight that has
 quietly gone stale is worse than none, because a reader takes its silence for absence.
 
-A test enforces two sections. `tests/test_dangerous_functionality_doc.py` reads the code and fails
-when the section 5 module list or the section 4 table no longer matches it. That covers a new
-`ctypes` import, a new process start, and a start that changes form, such as a new `shell=True`.
-It also checks both counts and that every library load names its library with a literal. The other
-sections are still prose that nothing checks, so keep them true by hand.
+A test checks the lists and counts in six sections. `tests/test_dangerous_functionality_doc.py`
+reads the code and fails when one of these no longer matches it:
+
+- the section 4 table: a new process start, or a start that changes form, such as a new
+  `shell=True`;
+- the section 5 module list: a new `ctypes` import, and every library load must name its library
+  with a literal;
+- the section 7 archive list: a new module that imports an archive or compression library;
+- the section 8 table: a script added to or removed from `scripts/service/`, or one with no
+  administrator check;
+- the section 9 table: each count in it. It also fails on any `child_process` call other than
+  `execFile`, any VS Code task, and any use of `cluster`, `worker_threads` or `process.dlopen`;
+- section 10: the count of HTML writes. It also checks that the console's Python starts no
+  process, imports no `ctypes` or archive library, and imports nothing by name.
+
+The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
+Nothing checks what a script grants, what holds a site, or sections 1, 2, 3 and 6. Keep that prose
+true by hand.

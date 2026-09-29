@@ -17,6 +17,7 @@ import http.client
 import ipaddress
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -45,6 +46,7 @@ from messagefoundry.auth.ldap import (
     LdapAuthenticator,
     LdapError,
     kerberos_principal,
+    normalise_object_guid,
 )
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
@@ -390,8 +392,14 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: account carries no ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5). Written into the
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`. Also the
 #: reason a federated login refuses an already-bound id-less row, and a reconciliation pass skips one
-#: (BACKLOG #2027). Deliberately absent from the browser layer's code map, so it shows as generic.
+#: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id and an AD step-up
+#: re-bind on a row with none. Deliberately absent from the browser layer's code map, so it shows as
+#: generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
+
+#: The closed-set reason a directory answer is refused with when it names another directory object
+#: than the row's own (BACKLOG #1471 at sign-in, #2027 at the step-up re-bind).
+DIRECTORY_IDENTITY_CONFLICT = "directory_identity_conflict"
 
 #: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
 #: tell that refusal from the other 409 on the federated-identity routes without matching prose.
@@ -413,6 +421,11 @@ DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
 STEP_UP_SUBJECT_MISMATCH = "step_up_subject_mismatch"
 FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
+
+#: The audit reason for a second step refused under its ASVS 2.4.2 minimum-elapsed floor (BACKLOG
+#: #2301): an MFA code or passkey too soon after sign-in, or an IdP callback too soon after its flow
+#: started. Audit only. The caller sees its leg's ordinary failure, which says nothing about timing.
+TOO_EARLY = "too_early"
 
 #: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
 #: A slug not listed here reads as the generic line in ``_step_up_refused``.
@@ -818,9 +831,9 @@ class DirectoryObjectIdMissing(ValueError):
     writes sits on a row carrying an id, and the id is written at the row's creation and never
     cleared, so both re-resolves above ask by the id for it. It does not reach at least these: a
     direct ``set_user_federated_subject`` call, which checks no id, and whose one caller is the
-    bind; the step-up re-proof, which binds by name; and a Windows SSO sign-in, which finds an
-    id-less row by its name whether or not the row is bound. For a binding already on an id-less
-    row, written before this refusal existed or planted through that setter, the two re-resolves
+    bind; and ``verify_mfa``'s directory check, which asks about an id-less UNBOUND row by its name.
+    The step-up re-proof and a Windows SSO sign-in no longer reach an id-less row at all: both refuse
+    it with this reason (BACKLOG #2027). For a binding already on an id-less row, written before this refusal existed or planted through that setter, the two re-resolves
     above no longer ask by name (BACKLOG #2027): the federated login refuses it with this same
     reason, and the reconciler skips it (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
@@ -1060,6 +1073,33 @@ class _Reproof:
     #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
     cycles: int = 0
     cleared: bool = False
+    #: A closed-set slug for an uncounted refusal the directory's identity decided (BACKLOG #2027):
+    #: the row has no id, or the directory answered about an entry that is not the row's own. Written
+    #: onto the ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _DirectoryRebind:
+    """The outcome of :meth:`AuthService._reauth_ad`.
+
+    ``verdict`` keeps the three answers that method documents. ``reason`` is set only when the
+    entry the directory answered about is not provably the row's own: its id is unreadable or
+    names another object (BACKLOG #2027). ``verdict`` is then ``None``, whether or not the bind
+    itself succeeded."""
+
+    verdict: bool | None
+    reason: str | None = None
+
+
+def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | None:
+    """Why ``principal`` is not provably the directory object ``object_id`` names, or ``None``."""
+    if not principal.directory_object_id:
+        return DIRECTORY_OBJECT_ID_MISSING
+    # Both sides canonical: the search parsed ``object_id`` leniently, so compare the same way.
+    if principal.directory_object_id != (normalise_object_guid(object_id) or object_id):
+        return DIRECTORY_IDENTITY_CONFLICT
+    return None
 
 
 @dataclass
@@ -1425,6 +1465,8 @@ class AuthService:
                 per_key=settings.admin_write_rate_limit_per_actor,
                 glob=0,
                 window_seconds=settings.admin_write_rate_limit_window_seconds,
+                # BACKLOG #2301: the per-actor gap floor, beside the count.
+                min_interval_seconds=settings.admin_write_min_interval_seconds,
             )
             if settings.admin_write_rate_limit_enabled
             else None
@@ -2864,6 +2906,10 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=FLOW_PURPOSE_MISMATCH
             )
+        # BACKLOG #2301: the callback's age is read as it arrives, so the engine's own round trip to
+        # the token endpoint below never counts as time the person spent. Whether the floor applies
+        # needs the verified auth_time, so the decision waits for the exchange.
+        arrived_too_early = self._oidc_callback_too_early(flow)
         try:
             try:
                 principal_claims = await asyncio.to_thread(
@@ -2920,6 +2966,24 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
+        # BACKLOG #2301 (ASVS 2.4.2): the minimum-elapsed floor, only when the person signed in at
+        # the IdP during THIS flow, which the verified auth_time says. An IdP holding a live single
+        # sign-on session answers with no human step, so there is nothing to floor, and flooring it
+        # would refuse that sign-in on every retry. auth_time is whole seconds, so it is compared
+        # with the flow's start rounded down: a sign-in in the same second as the start is the fast
+        # case this floor exists for. An IdP clock that runs ahead can make an older sign-on look
+        # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
+        signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
+        if signed_in_during_flow and arrived_too_early:
+            # With the client address, as the token_refused arm records it: a run of these is
+            # automation, and the operator needs to see where it comes from.
+            await self._audit(
+                "auth.login_failed",
+                actor="<oidc>",
+                detail=_json({"provider": "ad", "mech": "oidc", "reason": TOO_EARLY}),
+                client=client,
+            )
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason=TOO_EARLY)
 
         # The claimed username selects nothing. It is kept only as a hint in the not-bound refusal.
         username = principal_claims.username
@@ -3164,6 +3228,14 @@ class AuthService:
         )
         return flow_id, url
 
+    def _oidc_callback_too_early(self, flow: PendingFlow) -> bool:
+        """Whether ``flow``'s callback came back sooner than ``[auth].oidc_callback_min_elapsed_seconds``
+        after the flow started, on the flow cache's own clock (BACKLOG #2301). The caller decides
+        whether the floor applies."""
+        floor = self._settings.oidc_callback_min_elapsed_seconds
+        flows = self._oidc_flows
+        return floor > 0 and flows is not None and flows.age(flow) < floor
+
     def oidc_flow_is_step_up(self, flow_id: str) -> bool:
         """Whether the live flow behind this cookie is a step-up flow, WITHOUT consuming it.
 
@@ -3254,6 +3326,13 @@ class AuthService:
         token_hash = flow.step_up_session_hash
         if token_hash is None:
             return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
+        # BACKLOG #2301 (ASVS 2.4.2): max_age=0 and prompt=login make the person authenticate at the
+        # IdP, so a step-up callback faster than a person can do that is refused. Before the code is
+        # redeemed, so the refused flow spends nothing at the token endpoint.
+        if self._oidc_callback_too_early(flow):
+            return await self._step_up_refused(
+                TOO_EARLY, actor=actor, client=client, return_to=return_to
+            )
         try:
             principal_claims = await asyncio.to_thread(
                 self._exchange_and_validate, code, flow, self._oidc_redirect_uri(public_origin)
@@ -3486,6 +3565,37 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict")
+        if not principal.directory_object_id:
+            # BACKLOG #2027 (ADR 0184 AC-5), THE DIRECTORY HALF. A PRINCIPAL WITH NO IMMUTABLE ID
+            # SIGNS NOTHING IN. The only key left to join it to a row is the username, and a
+            # directory may reissue a freed name to another person, so resolving by it would hand
+            # that person the row, its ``user_id`` and, through the role resync below, their groups.
+            #
+            # First sight is refused too, not only a returning row. A row minted here would carry no
+            # id, and this branch would refuse its every later sign-in, so creating it buys one
+            # session and an account nothing can bind (``create_directory_account`` refuses the
+            # same entry as :class:`DirectoryObjectIdMissing`).
+            #
+            # ORDERED ABOVE THE #1471 CONFLICT BRANCH so the audit names the cause. A directory that
+            # stops returning ``objectGUID`` would otherwise file every returning account as a
+            # name-recycle conflict, whose remedy (remove the stale row) is the wrong one here.
+            #
+            # THE COST, STATED: a directory that returns no readable ``objectGUID`` to the service
+            # account signs nobody in through Windows SSO. The LDAP layer warns once per shape, and
+            # the remedy is to make the attribute readable. The caller sees the generic failure; the
+            # precise reason is on the ``auth.login_failed`` row. The federated leg re-resolves by
+            # the bound row's id, so it reaches this only if that entry's id is unreadable, and is
+            # then audited in its own shape.
+            if federated:
+                await self._directory_reject_audit(
+                    principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING
+                )
+                return LoginOutcome(
+                    ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
+                )
+            return await self._refuse_directory_row(
+                principal.username, DIRECTORY_OBJECT_ID_MISSING, client=client
+            )
         if existing is not None and existing.directory_object_id != principal.directory_object_id:
             # BACKLOG #1471. THE ROW HOLDING THIS NAME MUST AGREE WITH THE PRESENTED IDENTITY.
             #
@@ -3495,9 +3605,9 @@ class AuthService:
             # a new id misses the id lookup and gets its own row whether or not this branch exists.
             # What this branch does is narrower, and both halves are load-bearing:
             #
-            #   - it refuses an id-LESS login against a BOUND row, the one state where the name
-            #     fallback below could still adopt somebody else's account. An identity that cannot
-            #     be checked is not an identity that matches;
+            #   - it refuses an id-bearing login against an id-LESS row, and a login whose id is not
+            #     the row's. (An id-LESS login never gets here since BACKLOG #2027: the branch above
+            #     refuses it first.) An identity that cannot be checked is not one that matches;
             #   - it turns the ``UNIQUE(username)`` collision that a recycle would otherwise hit into
             #     an ordered, audited refusal instead of an integrity error surfacing as a 500 -- the
             #     same move the federated bind makes forty lines below.
@@ -3520,11 +3630,11 @@ class AuthService:
             await self._audit(
                 "auth.login_failed",
                 actor=principal.username,
-                detail=_json({"provider": "ad", "reason": "directory_identity_conflict"}),
+                detail=_json({"provider": "ad", "reason": DIRECTORY_IDENTITY_CONFLICT}),
                 client=client,
             )
             return LoginOutcome(
-                ok=False, error="account conflict", reason="directory_identity_conflict"
+                ok=False, error="account conflict", reason=DIRECTORY_IDENTITY_CONFLICT
             )
         # BACKLOG #1637 / #1638. IS THIS ROW ELIGIBLE TO SIGN IN AT ALL.
         #
@@ -3799,9 +3909,9 @@ class AuthService:
         then runs only when the name misses -- the directory-side RENAME, the one state a name-keyed
         read cannot answer.
 
-        A directory returning no id at all falls back to the name, which is the behaviour that shipped
-        before the column existed. The engine cannot key on an identifier it is not given; the LDAP
-        layer logs each such read.
+        A principal with no id never reaches this method: ``_complete_ad_login`` refuses it as
+        ``directory_object_id_missing`` (BACKLOG #2027). Before that, such a principal fell back to
+        the name here, which is the recycle this docstring's first paragraph exists to stop.
 
         **A DIRECTORY-SIDE RENAME IS PROPAGATED, ONTO A ROW THAT NEVER MOVES (BACKLOG #1532).** The id
         finds the account, and the directory's current ``sAMAccountName`` is then copied down onto the
@@ -3837,11 +3947,15 @@ class AuthService:
             # to remove, and a 500 on a misuse that no shipped path can reach is the cheap side of
             # that trade. Not reachable from ``_complete_ad_login``, which refuses first.
             raise ValueError("directory principal does not match the row holding its username")
-        existing = by_name
-        if existing is None and principal.directory_object_id is not None:
-            existing = await self._store.get_user_by_directory_object_id(
-                principal.directory_object_id
+        if not principal.directory_object_id:
+            # The same defensive raise, for BACKLOG #2027: with no id, the only key left is the name.
+            # Not reachable from ``_complete_ad_login``, which refuses such a principal first.
+            raise ValueError(
+                "a directory principal with no immutable id cannot be resolved to a row"
             )
+        existing = by_name or await self._store.get_user_by_directory_object_id(
+            principal.directory_object_id
+        )
         # BACKLOG #1637 / #1638. THE ELIGIBILITY GATE THAT ACTUALLY CLOSES THE DEFECT, and its
         # POSITION is the whole of it: immediately after the id-keyed read, BEFORE the first write.
         #
@@ -5654,14 +5768,25 @@ class AuthService:
             await self._revoke_for_budget(token_hash, time.time())
             return _Reproof(ok=False, session_gone=True, user=user)
         verdict: bool | None
+        reason: str | None = None
         if directory:
-            verdict = await self._reauth_ad(identity.username, password)
+            if not user.directory_object_id:
+                # BACKLOG #2027, ADR 0184 AC-5. The re-bind finds its entry by the row's id, and a
+                # row with none has only its name, which a directory may have reissued to someone
+                # else whose password would then step this session up. Refused before the directory
+                # is asked, so no password leaves the engine and nothing is charged -- the caller
+                # did not guess wrong.
+                return _Reproof(ok=False, user=user, reason=DIRECTORY_OBJECT_ID_MISSING)
+            rebind = await self._reauth_ad(
+                user.username, password, object_id=user.directory_object_id
+            )
+            verdict, reason = rebind.verdict, rebind.reason
         else:
             verdict = user.password_hash is not None and await self._argon2(
                 verify_password, user.password_hash, password
             )
         if verdict is None:
-            return _Reproof(ok=False, user=user)
+            return _Reproof(ok=False, user=user, reason=reason)
         charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
@@ -5828,6 +5953,9 @@ class AuthService:
                     # This failure spent the session's re-proof budget, so it is revoked
                     # (BACKLOG #1138). A session already gone reads session_lost alone.
                     "session_revoked": proof.session_revoked,
+                    # A refusal that judged no credential names itself (BACKLOG #2027). Only when
+                    # set, so every other row keeps its shape.
+                    **({"reason": proof.reason} if proof.reason is not None else {}),
                 }
             ),
             client=client,
@@ -6005,10 +6133,10 @@ class AuthService:
         deadline = self._action_step_up_grants.pop((hash_token(token), action), None)
         return deadline is not None and deadline > now
 
-    async def _reauth_ad(self, username: str, password: str) -> bool | None:
+    async def _reauth_ad(self, username: str, password: str, *, object_id: str) -> _DirectoryRebind:
         """Re-verify an AD credential via a live directory re-bind (no session adopted).
 
-        Three answers, because only one of the two refusals is a guess (BACKLOG #1138): ``True`` =
+        Three verdicts, because only one of the two refusals is a guess (BACKLOG #1138): ``True`` =
         bound; ``False`` = the directory REJECTED the password, which :meth:`_reproof` counts toward
         the engine lockout; ``None`` = it could not be asked (no directory, an :class:`LdapError`)
         or it has no such principal. Both refusals fail closed; only ``False`` is counted.
@@ -6017,23 +6145,46 @@ class AuthService:
         or disabled principal as well as for a wrong password. Counting that would lock the engine
         row of a user whose every re-bind fails whatever they type, and the lock is then enforced at
         their Kerberos and OIDC sign-in. The extra lookup runs only after a refusal. A correct
-        password the DC refuses as expired still counts, which nothing here can tell apart."""
+        password the DC refuses as expired still counts, which nothing here can tell apart.
+
+        **THE BIND IS KEYED BY THE ROW'S OWN OBJECT, NOT BY ITS NAME (BACKLOG #2027).** ``username``
+        is a label a directory may free and reissue, so ``object_id``, the row's stored
+        ``objectGUID``, picks both the entry the password is bound as and the entry the refusal arm
+        asks about. The typed password therefore never reaches whoever the directory has since given
+        the name to, a wrong guess is judged against this account and counted as before, and a
+        renamed account still steps up. **This costs no extra directory read:** each call is the
+        same one round trip it was, keyed on the id instead of the name.
+
+        Each answer is still checked against ``object_id``, because the entry's own id is read
+        separately from the search that found it. An answer carrying no readable id is ``None`` with
+        reason ``directory_object_id_missing``, and one about another object is ``None`` with
+        ``directory_identity_conflict``. Neither is counted. A refused bind is counted once the
+        id-keyed lookup finds the entry, because that bind was judged against this account. ``object_id`` is required, so no caller
+        can re-bind a row that has none; :meth:`_reproof_serialized` refuses that row first."""
         if self._ldap is None:
-            return None
+            return _DirectoryRebind(None)
         try:
-            principal = await asyncio.to_thread(self._ldap.authenticate, username, password)
+            principal = await asyncio.to_thread(
+                self._ldap.authenticate, username, password, object_id=object_id
+            )
         except LdapError:
-            return None
+            return _DirectoryRebind(None)
         if principal is not None:
-            return True
+            mismatch = _directory_answer_mismatch(principal, object_id)
+            return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
         try:
-            known = await asyncio.to_thread(self._ldap.resolve_principal, username)
+            known = await asyncio.to_thread(
+                self._ldap.resolve_principal, username, object_id=object_id
+            )
         except LdapError:
             # ``authenticate`` also answers None where no real bind was judged (an empty password, an
             # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
             # that then fails cannot show the password was checked. Not counted, like an outage.
-            return None
-        return False if known is not None else None
+            return _DirectoryRebind(None)
+        # Found by the row's own id, so the bind that failed was judged against this account: it
+        # counts, whatever id the entry reads back. Not counting an unreadable one would let a
+        # held session send the DC unlimited guesses past the per-session cap.
+        return _DirectoryRebind(None) if known is None else _DirectoryRebind(False)
 
     async def has_recent_step_up(self, token: str | None) -> bool:
         """Whether the caller's session re-verified its credential within
@@ -6485,8 +6636,12 @@ class AuthService:
 
         A success still rotates the session inside the queue, and the rotation waits for the
         account's re-proof lock, which a directory re-proof holds across its bind. So a slow
-        directory can still hold this queue through a concurrent re-proof, one success at a time."""
+        directory can still hold this queue through a concurrent re-proof, one success at a time.
+
+        **A code that completes an MFA-pending session too soon after sign-in is refused** (BACKLOG
+        #2301): see :meth:`_second_factor_too_early`."""
         arrived = totp.wall_clock()
+        arrived_at = time.time()  # the service's clock, for the floor; `arrived` is the TOTP clock
         if not token:
             return Elevation()
         session = await self._store.get_session(hash_token(token))
@@ -6497,6 +6652,10 @@ class AuthService:
             return Elevation()
         if await self._mfa_lock_refused(user, client=client):
             return Elevation(locked=True)
+        if await self._second_factor_too_early(
+            session, user, arrived_at, event="auth.mfa_failed", client=client
+        ):
+            return Elevation()
         if user.auth_provider == AuthProvider.AD.value:
             # BACKLOG #2023: a good code below renews the step-up window, so a DIRECTORY account must
             # still be in the directory before the code is even checked. Asked first, so a refusal
@@ -6555,6 +6714,42 @@ class AuthService:
             )
             return Elevation()
 
+    async def _second_factor_too_early(
+        self,
+        session: SessionRecord,
+        user: UserRecord,
+        now: float,
+        *,
+        event: str,
+        client: str | None,
+    ) -> bool:
+        """Whether a second factor arrived too soon after sign-in, auditing the refusal if so.
+
+        The ASVS 2.4.2 floor on the login-then-MFA pair (BACKLOG #2301). It applies only while the
+        session's factor is PENDING, measured from the session's mint, which is the sign-in. A
+        step-up on a session whose factor is already satisfied is not floored. The caller answers
+        with its leg's ordinary failure, so the refusal says nothing about timing, and nothing is
+        charged: no lockout count, no TOTP step, no recovery code, no passkey challenge. The floor
+        and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
+
+        Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the legs that prove an
+        ENROLLED factor. The two enrollment legs, :meth:`confirm_mfa_enrollment` and
+        :meth:`finish_webauthn_registration`, also satisfy a pending session and are NOT floored:
+        they bind a new factor, a different flow, and flooring them is left open (BACKLOG #2301).
+        A new leg that proves an enrolled factor calls this."""
+        floor = self._settings.mfa_verify_min_elapsed_seconds
+        if floor <= 0 or session.mfa_verified_at is not None:
+            return False
+        if now - session.created_at >= floor:
+            return False
+        await self._audit(
+            event,
+            actor=user.username,
+            detail=_json({"reason": TOO_EARLY}),
+            client=client,
+        )
+        return True
+
     async def _mfa_lock_refused(self, user: UserRecord, *, client: str | None) -> bool:
         """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal if so.
 
@@ -6593,9 +6788,10 @@ class AuthService:
 
         A row with a federated binding and no ``directory_object_id`` is refused unasked. ADR 0184
         AC-5 forbids asking the directory about a bound row by its name, and it has no other key.
-        An id-less row with no binding is still asked by name, as the reconciler and the Windows SSO
-        sign-in ask it. A name is the weaker key (BACKLOG #1532), but it is a stronger check than
-        the no lookup this path made before.
+        An id-less row with no binding is still asked by name, as the reconciler asks it; the Windows
+        SSO sign-in and the password step-up refuse such a row instead (BACKLOG #2027). A name is
+        the weaker key (BACKLOG #1532), but it is a stronger check than the no lookup this path made
+        before.
         """
         if self._ldap is None:
             return "not_configured"
@@ -7012,6 +7208,12 @@ class AuthService:
                 detail=LOCKED_REFUSAL_DETAIL,
                 client=client,
             )
+            return Elevation()
+        # BACKLOG #2301: the login-then-MFA floor, as on verify_mfa. Before the challenge is popped,
+        # so a refusal leaves the ceremony in flight rather than spending it.
+        if await self._second_factor_too_early(
+            session, user, now, event="auth.webauthn_failed", client=client
+        ):
             return Elevation()
         pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
         if pending is None or pending.user_id != user.id:

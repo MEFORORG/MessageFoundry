@@ -69,6 +69,6 @@ jobs:
         # REDUNDANT, which is a different finding: code scanning holds the same findings and is what
         # a human actually queries, and `publish_results: true` above additionally sends the score to
         # the public OpenSSF API. A third copy on a retention clock served neither reader.
-        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: results.sarif

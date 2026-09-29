@@ -264,3 +264,26 @@ async def test_provisioning_logs_rather_than_refuses(
     if row is not None:
         # The online snapshot step is still tried after the RCSI ALTER was denied.
         assert _ALTER_SNAPSHOT in cursor.executed
+
+
+async def test_the_pooled_start_gate_refuses_when_rcsi_went_off_after_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2090: ``require_rcsi_for_pooled`` is the only pooled start check left, and nothing
+    can downgrade its raise. So pin the raise branch on every leg, with the state read stubbed, and
+    pair it with an RCSI-on control so a check that never raises cannot pass."""
+    store = SqlServerStore.__new__(SqlServerStore)
+    store._settings = _settings()
+    state: dict[str, Any] = {"is_read_committed_snapshot_on": 0}
+
+    async def _fetchone(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        return state
+
+    monkeypatch.setattr(store, "_fetchone", _fetchone)
+    with pytest.raises(
+        RuntimeError, match="pooled claim mode requires READ_COMMITTED_SNAPSHOT"
+    ) as info:
+        await store.require_rcsi_for_pooled()
+    assert "alter database [mefor_test] SET READ_COMMITTED_SNAPSHOT on" in str(info.value)
+    state["is_read_committed_snapshot_on"] = 1
+    await store.require_rcsi_for_pooled()  # the control: RCSI on passes

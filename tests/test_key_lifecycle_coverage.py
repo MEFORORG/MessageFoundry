@@ -102,6 +102,13 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/dicom.py": frozenset({_CONN_SERVER, _MTLS_CLIENT}),
     "messagefoundry/logging_setup.py": frozenset({_LOG_FORWARD}),
     "messagefoundry/apiclient/client.py": frozenset({_API_CLIENT}),
+    # BACKLOG #1352 / #1171: every TLS private-key load goes through keywrap.load_checked_cert_chain,
+    # which checks the key's passphrase wrap and then calls load_cert_chain itself. So it LOADS the
+    # keys of each site that calls it; the modules above still name their own rows. The engine-minted
+    # placeholder is loaded directly in api/tls.py, not here.
+    "messagefoundry/keywrap.py": frozenset(
+        {_API_TLS, _CONN_SERVER, _MTLS_CLIENT, _LOG_FORWARD, _API_CLIENT}
+    ),
     "messagefoundry/pki.py": frozenset({_NONPROD}),
     "harness/load/tlsmat.py": frozenset({_NONPROD}),
     # Secret keys the engine holds or feeds.
@@ -143,6 +150,8 @@ _NO_KEY: dict[str, str] = {
     "client secret it presents is a credential governed by the rotation schedule, not key material",
     "messagefoundry/auth/oidc_http.py": _VERIFY_ONLY,
     "messagefoundry/config/fingerprint.py": _KEYLESS,
+    "messagefoundry/config/loaded_crls.py": "a weak registry of the CRL copies live TLS contexts "
+    "hold, for the expiry monitor (BACKLOG #299); it stores public CRL metadata and holds no key",
     "messagefoundry/config/wiring.py": _KEYLESS,
     "messagefoundry/config/tls_policy.py": "the TLS policy seam itself: it builds verifying contexts, "
     "floors and suite lists for its callers, and never loads, mints or holds a private key; each "

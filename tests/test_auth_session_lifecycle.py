@@ -210,7 +210,9 @@ async def test_password_only_sign_ins_leave_full_sessions_live(
     store = await _store()
     try:
         cap = 2
-        service = AuthService(store, AuthSettings(max_sessions_per_user=cap))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, max_sessions_per_user=cap)
+        )
         full_first, password, codes = await _enrolled_admin(service, monkeypatch)
         full_second = await _full_sign_in(service, password, codes[0])
         assert await _is_full(service, full_first) and await _is_full(service, full_second)
@@ -236,7 +238,9 @@ async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
     siblings; the oldest-completed sibling goes instead."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(max_sessions_per_user=2))
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, max_sessions_per_user=2)
+        )
         _first, password, codes = await _enrolled_admin(service, monkeypatch)
         # Signs in now, completes last: the oldest `created_at` among the survivors.
         waiting = (await service.login(ADMIN_USERNAME, password)).token
@@ -467,13 +471,14 @@ async def test_ad_role_change_on_relogin_revokes_other_sessions() -> None:
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
@@ -537,13 +542,14 @@ async def test_local_and_ad_session_expiry_is_unchanged_by_the_cap_seam() -> Non
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
@@ -579,13 +585,14 @@ async def test_ad_login_success_audit_detail_is_byte_identical() -> None:
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]

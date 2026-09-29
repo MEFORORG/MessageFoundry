@@ -54,6 +54,7 @@ from messagefoundry.config.models import (
     OutboundSigning,
     SignatureAlgorithm,
 )
+from messagefoundry.keywrap import key_wrap_refusal
 from messagefoundry.redaction import json_loads_or_refusal
 
 if (
@@ -203,6 +204,15 @@ def _load_private_key(setting: str, private_key: str, password: str | None) -> _
     ``setting`` is passed through to :func:`_read_key_material`, which states the rule."""
     material = _read_key_material(setting, private_key)
     pw = password.encode("utf-8") if password else None
+    # BACKLOG #1352 / #1171: read the passphrase wrap before cryptography derives a key through it.
+    refusal = key_wrap_refusal(
+        material,
+        setting=setting,
+        unlock_setting=f"{setting}_password",
+        passphrase_given=pw is not None,
+    )
+    if refusal is not None:
+        raise SigningError(refusal)
     # The raise sits OUTSIDE the handler on purpose: `raise ... from None` would leave the
     # deserialization error on `__context__`, where a chain-walking handler could still render the
     # detail this refusal exists to withhold. See `encode_wire_body` in transports/base.py.

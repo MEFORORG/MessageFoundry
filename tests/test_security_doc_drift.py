@@ -43,7 +43,7 @@ from messagefoundry.auth.permissions import (
 )
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from scripts.security.route_gates import gate_of, route_rows
-from tests._ast_sites import call_sites, callee_name, calls_to, named_func
+from tests._ast_sites import call_sites, callee_name, calls_to, find_funcs, named_func
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -338,6 +338,11 @@ _CONTEXTUAL_TOKENS = frozenset(
         "admin_write_rate_limit_per_actor",
         "admin_write_rate_limit_window_seconds",
         "admin_write_rate_limit_enabled",
+        # BACKLOG #2301: the minimum gap between two admin writes by one actor, a THROTTLE, and the
+        # two minimum-elapsed floors on a second step, each a DENY.
+        "admin_write_min_interval_seconds",
+        "mfa_verify_min_elapsed_seconds",
+        "oidc_callback_min_elapsed_seconds",
         "ad_session_recheck_seconds",
         "ad_session_recheck_strikes",
         "ad_session_recheck_max_users",
@@ -426,6 +431,10 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     # BACKLOG #287: a provisional human-timing floor, so pinned like min_dwell_seconds below. Anchored
     # on "per 15 s", because a bare "15 s" is also a substring of "115 s".
     ("auth", "admin_write_rate_limit_window_seconds", 15.0, "per 15 s"),
+    # BACKLOG #2301: the provisional minimum gap between two admin writes, pinned for the same reason.
+    ("auth", "admin_write_min_interval_seconds", 0.15, "0.15 s"),
+    ("auth", "mfa_verify_min_elapsed_seconds", 1.0, "less than 1 s"),
+    ("auth", "oidc_callback_min_elapsed_seconds", 1.0, "less than 1 s"),
     ("auth", "ad_session_recheck_strikes", 2, "**2 consecutive**"),
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),
@@ -529,8 +538,8 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: gate), so the counts are pinned too: removing ANY row reds CI.
 # -1 BACKLOG #1136 (ADR 0183 Amendment A, Wave 4): the first-run account's claim-state row went with
 # that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome; +1 BACKLOG #1957
-# (ADR 0198): the reconciler's scope re-diff.
-_CONTEXT_TABLE_A_ROWS = 40
+# (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors.
+_CONTEXT_TABLE_A_ROWS = 42
 _CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with
@@ -1275,8 +1284,20 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "test_docs_security_pathways.py",
         "test_the_console_dependency_of_the_browser_legs_is_stated",
     ): ("absence over text: a mention of serve_ui can only over-fire"),
+    (
+        "test_docs_security_pathways.py",
+        "test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double",
+    ): (
+        "absence of a retired mTLS remedy in two docs and a settings.py comment (BACKLOG #1133); "
+        "its code claims are pinned by AST and by calling the functions"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
+    ),
+    ("test_security_doc_drift.py", "test_retention_gate_reader_detects_a_planted_violation"): (
+        "two halves, both reading finding strings. The code plants mutate __main__.py and the "
+        "verdict is _retention_gate_findings' AST read. The doc plants mutate CONFIGURATION.md "
+        "prose and the verdict is _retention_doc_findings' text read, a prose claim (BACKLOG #1186)"
     ),
     ("test_security_doc_rate_limits.py", "_config_section"): "slices CONFIGURATION.md prose",
     ("test_security_doc_rate_limits.py", "test_ui_refusal_reader_can_fail"): (
@@ -2660,10 +2681,15 @@ def _arm_can_refuse(arm: ast.If) -> bool:
     (BACKLOG #1818). The ``else`` branch is not the arm and is not read. A refusal hidden inside a
     helper the arm calls is NOT seen: the guard reads the arm, not the functions it calls.
     """
+    return _stmts_can_refuse(arm.body)
+
+
+def _stmts_can_refuse(stmts: list[ast.stmt]) -> bool:
+    """Whether any of ``stmts`` can stop startup: any ``return``, any ``raise``, or an exit call."""
     return any(
         bool(calls_to(stmt, {"exit", "_exit", "abort"}))
         or any(isinstance(node, ast.Return | ast.Raise) for node in ast.walk(stmt))
-        for stmt in arm.body
+        for stmt in stmts
     )
 
 
@@ -2772,3 +2798,436 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     assert "handles_real_patient_data" not in _Sec.model_fields, (
         "the data-class lever is back; the refusing-arms row's 'every instance' clause is stale."
     )
+
+
+# --- the retention body-window gate, bound to docs/CONFIGURATION.md (BACKLOG #1186) -------------------
+
+#: Retention prose has drifted from the code twice. The startup gate was inverted while four documents
+#: still described a refusal. Then BACKLOG #1188 widened the dead-letter purge to every stage, and the
+#: `dead_letter_days` row kept saying "outbound rows". Both corrections landed by hand with no guard,
+#: so nothing could red on the next divergence. These tests bind the two gate facts the `[retention]`
+#: section's posture paragraph states to the gate in `_serve`, both ways: a gate change the reader
+#: can see reds against the doc, and rewriting the doc reds against the code.
+#:
+#: The reader is a SHAPE guard over one slice of `_serve`, and that is its bound. At least these are
+#: not seen: a refusal added elsewhere in the function, and a skip hidden in a helper the slice
+#: calls. The behavioural pins in `tests/test_cli.py`, which run `serve`, cover part of that. The test
+#: below checks only that each pin still EXISTS, not what it asserts, and none of them exercises
+#: `reference_snapshot_days`. The row's third claim, that the gate does not read a per-outbound
+#: override, is prose only: nothing here binds it to the code.
+
+_CONFIG_DOC = _ROOT / "docs" / "CONFIGURATION.md"
+_RETENTION_HEADING = "### `[retention]`"
+_DEAD_LETTER_WINDOW = "dead_letter_days"
+#: `tests/test_cli.py` tests that run `serve` and pin the two gate facts by behaviour.
+_RETENTION_GATE_BEHAVIOUR_PINS = (
+    "test_serve_auto_bounds_an_unset_body_window_in_prod",
+    "test_serve_refuses_an_explicitly_disabled_body_window_in_prod",
+    "test_serve_refuses_unbounded_dead_letter_retention_in_prod",
+    "test_serve_retention_auto_bounds_in_staging",
+)
+
+
+def _is_not_allow_unbounded(test: ast.expr) -> bool:
+    """Whether ``test`` is exactly ``not <...>.allow_unbounded_phi``, the opt-out read alone."""
+    return (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and isinstance(test.operand, ast.Attribute)
+        and test.operand.attr == "allow_unbounded_phi"
+    )
+
+
+def _retention_gate_slice(serve: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+    """``_serve``'s TOP-LEVEL statements from the body-window auto-bound arm through its refuse arm.
+
+    The slice starts at the one top-level ``if not settings.retention.allow_unbounded_phi:``, so an
+    arm moved under an enforcement test, or given an extra condition, is not found. It ends at the
+    top-level ``if refusable:``, BEFORE the BACKLOG #1967 per-tier acknowledgement block that follows.
+    That block has its own ``if enforcing:`` arm that returns 2. A read that ran on into it would
+    still find a refusal after the body-window refusal was deleted, so fact 2 could not fail.
+    Returns an empty list when either end is missing, repeated, or out of order.
+    """
+    body = serve.body
+    starts = [
+        i
+        for i, st in enumerate(body)
+        if isinstance(st, ast.If) and _is_not_allow_unbounded(st.test)
+    ]
+    ends = [
+        i
+        for i, st in enumerate(body)
+        if isinstance(st, ast.If) and isinstance(st.test, ast.Name) and st.test.id == "refusable"
+    ]
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        return []
+    return body[starts[0] : ends[0] + 1]
+
+
+def _retention_gate_findings(source: str) -> list[str]:
+    """What is wrong with the retention body-window gate in ``source``'s ``_serve``.
+
+    Empty means both documented facts hold. (1) An UNSET window is auto-bounded on both enforcement
+    dials. (2) An explicit 0 refuses to start under ``enforce``, by any spelling
+    ``_stmts_can_refuse`` sees. An AST read, so a comment or docstring that still describes the gate
+    cannot stand in for it.
+    """
+    gate = _retention_gate_slice(named_func(_parse(source), "_serve"))
+    if not gate:
+        return [
+            "no top-level `if not settings.retention.allow_unbounded_phi:` auto-bound arm followed by "
+            "a top-level `if refusable:` arm in _serve. The arm was moved under an enforcement test, "
+            "given another condition, renamed or deleted"
+        ]
+    findings: list[str] = []
+    auto, refuse = gate[0], gate[-1]
+    # The slice's two ends are both `if` statements by construction; this narrows the type.
+    assert isinstance(auto, ast.If) and isinstance(refuse, ast.If)
+    # Fact 1: an UNSET window takes its classified auto-bound, whatever the dial says.
+    auto_names = _referenced_names(auto)
+    if not ({"model_fields_set", "auto_bound_days"} <= auto_names and calls_to(auto, {"setattr"})):
+        findings.append(
+            "the auto-bound arm no longer sets an UNSET window (model_fields_set) to its "
+            "auto_bound_days"
+        )
+    # The posture dial and the production tier are the two conditions the gate's history has
+    # confused; neither may decide whether an unset window is bounded.
+    if auto_names & {"enforcing", "enforcement", "production"}:
+        findings.append(
+            "the auto-bound arm reads the enforcement dial or the production tier, so an unset "
+            "window is no longer auto-bounded on both dials on every instance"
+        )
+    # The selection is bound once and applied unfiltered: one `defaulted` binding, and a loop over
+    # it whose whole body is `setattr(..., <window>.auto_bound_days)`.
+    bindings = [
+        node
+        for node in ast.walk(auto)
+        if isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign | ast.NamedExpr)
+        and any(
+            isinstance(n, ast.Name) and n.id == "defaulted"
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            for n in ast.walk(t)
+        )
+    ]
+    loops = [
+        node
+        for node in ast.walk(auto)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Name)
+        and node.iter.id == "defaulted"
+    ]
+    applies = (
+        len(bindings) == 1
+        and len(loops) == 1
+        and len(loops[0].body) == 1
+        and isinstance(loops[0].body[0], ast.Expr)
+        and isinstance(call := loops[0].body[0].value, ast.Call)
+        and callee_name(call) == "setattr"
+        and len(call.args) == 3
+        and isinstance(call.args[2], ast.Attribute)
+        and call.args[2].attr == "auto_bound_days"
+    )
+    if not applies:
+        findings.append(
+            "the auto-bound arm no longer applies auto_bound_days to every selected window through "
+            "one unconditional `for window in defaulted: setattr(...)` loop"
+        )
+    # Every auto-bounded window, filtered only by "is it unset": no other condition may skip one.
+    selections = [
+        gen
+        for node in ast.walk(auto)
+        if isinstance(node, ast.ListComp)
+        for gen in node.generators
+        if isinstance(gen.iter, ast.Call)
+        and callee_name(gen.iter) == "auto_bounded_windows"
+        and not gen.iter.args
+    ]
+    if not (
+        len(selections) == 1
+        and len(selections[0].ifs) == 1
+        and isinstance(selections[0].ifs[0], ast.Compare)
+        and [type(op) for op in selections[0].ifs[0].ops] == [ast.NotIn]
+        and "model_fields_set" in _referenced_names(selections[0].ifs[0])
+    ):
+        findings.append(
+            "the auto-bound arm no longer selects every auto_bounded_windows() entry filtered only "
+            "by `not in model_fields_set`, so some unset window can skip its auto-bound"
+        )
+    # Nothing before the refuse arm may stop startup: an unset window must reach it auto-bounded.
+    if _stmts_can_refuse(gate[:-1]):
+        findings.append(
+            "a statement before the `if refusable:` arm can stop startup, so an unset window may "
+            "refuse before it is auto-bounded"
+        )
+    # Fact 2: a window still unbounded after the auto-bound (an explicit 0) refuses under enforce.
+    # `refusable` must be every auto-bounded window `_unbounded_windows` reports, filtered by
+    # nothing but `auto_bound_days is not None`.
+    sources = {
+        target.id
+        for st in gate
+        if isinstance(st, ast.Assign) and calls_to(st.value, {"_unbounded_windows"})
+        for target in st.targets
+        if isinstance(target, ast.Name)
+    }
+    derivations = [
+        st.value
+        for st in gate
+        if isinstance(st, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "refusable" for t in st.targets)
+    ]
+    derived = (
+        len(derivations) == 1
+        and isinstance(comp := derivations[0], ast.ListComp)
+        and len(comp.generators) == 1
+        and isinstance(comp.generators[0].iter, ast.Name)
+        and comp.generators[0].iter.id in sources
+        and len(comp.generators[0].ifs) == 1
+        and isinstance(test := comp.generators[0].ifs[0], ast.Compare)
+        and [type(op) for op in test.ops] == [ast.IsNot]
+        and isinstance(test.left, ast.Attribute)
+        and test.left.attr == "auto_bound_days"
+    )
+    if not derived:
+        findings.append(
+            "`refusable` is no longer every window _unbounded_windows reports with an auto-bound, "
+            "so an explicit 0 on some auto-bounded window may start under enforce"
+        )
+    refuses = any(
+        isinstance(opt_out, ast.If)
+        and _is_not_allow_unbounded(opt_out.test)
+        and any(
+            isinstance(arm, ast.If)
+            and isinstance(arm.test, ast.Name)
+            and arm.test.id == "enforcing"
+            and _stmts_can_refuse(arm.body)
+            for arm in opt_out.body
+        )
+        for opt_out in refuse.body
+    )
+    if not refuses:
+        findings.append(
+            "the `if refusable:` arm no longer stops startup under `if enforcing:` when the opt-out "
+            "is off, so an explicit 0 does not refuse to start under enforce"
+        )
+    return findings
+
+
+def _auto_bound() -> tuple[int, tuple[str, ...]]:
+    """The one bound the gate applies, and the settings it applies it to, from the classification.
+
+    The posture paragraph names every auto-bounded window and gives them ONE number, so a window
+    added or given a different bound must red here rather than leave that sentence quietly wrong.
+    """
+    from messagefoundry.config.retention_classification import auto_bounded_windows
+
+    windows = auto_bounded_windows()
+    bounds = {w.auto_bound_days for w in windows}
+    assert len(bounds) == 1, (
+        f"the auto-bounded windows no longer share one bound ({sorted(map(str, bounds))}); the "
+        "[retention] posture paragraph in docs/CONFIGURATION.md gives them one number"
+    )
+    (days,) = bounds
+    assert days is not None and _DEAD_LETTER_WINDOW in {w.field for w in windows}, (
+        f"{_DEAD_LETTER_WINDOW} is no longer auto-bounded; its row points at the posture gate"
+    )
+    return days, tuple(w.setting for w in windows)
+
+
+def _retention_section(text: str) -> str:
+    """The ``[retention]`` section of CONFIGURATION.md ``text``, asserting the heading first so a
+    missing heading names this document rather than ``_section``'s SECURITY.md message."""
+    lines = text.splitlines()
+    assert any(line.startswith(_RETENTION_HEADING) for line in lines), (
+        f"docs/CONFIGURATION.md has no {_RETENTION_HEADING!r} heading; update this guard with the doc"
+    )
+    return _section(text, _RETENTION_HEADING)
+
+
+def _retention_doc_findings(section: str, days: int, auto_bounded: tuple[str, ...]) -> list[str]:
+    """What the ``[retention]`` section of CONFIGURATION.md gets wrong about the gate and the purge.
+
+    Reads prose, so it is a text claim by design; the code half is ``_retention_gate_findings``. It
+    checks that the right sentences are PRESENT, plus one retired phrase's absence. A contradicting
+    sentence added beside the right ones is not caught.
+
+    The gate facts are stated once, in the posture paragraph above the tables, and the
+    ``dead_letter_days`` row points at that paragraph rather than restating it (SDS-3.5).
+    """
+    findings: list[str] = []
+    # The posture paragraph alone, so a setting named only in a table row cannot satisfy it.
+    paragraphs = [" ".join(block.split()) for block in section.split("\n\n")]
+    posture = [p for p in paragraphs if "posture gate" in p and "**defaulted to" in p]
+    if len(posture) != 1:
+        findings.append("expected one posture paragraph saying which windows are **defaulted to**")
+    for phrase in (
+        f"is **defaulted to {days} days** at startup, under **both** `[security].enforcement` dials",
+        "A window set **explicitly to `0`** is not defaulted: that **refuses to start (exit 2)** "
+        "under `enforce`",
+        *(f"`{setting}`" for setting in auto_bounded),
+    ):
+        if not any(phrase in p for p in posture):
+            findings.append(f"the section's posture paragraph no longer says {phrase!r}")
+    rows = [
+        row
+        for row in _table_with_header(section, "Key")
+        if row and row[0] == f"`{_DEAD_LETTER_WINDOW}`"
+    ]
+    if len(rows) != 1 or len(rows[0]) != 4:
+        return [*findings, f"expected one four-cell `{_DEAD_LETTER_WINDOW}` row in the Key table"]
+    notes = rows[0][3]
+    for phrase in (
+        "rows at **every stage**",
+        "Unset or `0`, this global window meets the startup posture gate described above this table",
+        "`0` = keep only where that gate allows it",
+        "The gate does not read that override",
+    ):
+        if phrase not in notes:
+            findings.append(f"the `{_DEAD_LETTER_WINDOW}` row no longer says {phrase!r}")
+    if "**dead-lettered** outbound rows" in notes:
+        findings.append(
+            f"the `{_DEAD_LETTER_WINDOW}` row scopes the purge to outbound rows again, which BACKLOG "
+            "#1188 made false"
+        )
+    return findings
+
+
+def test_retention_gate_behaviour_matches_the_configuration_doc() -> None:
+    """``docs/CONFIGURATION.md`` states two gate facts, and ``_serve`` must still implement both.
+
+    Unset, each auto-bounded PHI body window defaults to its classified bound on both dials. An
+    explicit 0 refuses to start under ``enforce``. The same section's ``dead_letter_days`` row must
+    also say the purge reaches dead rows at every stage. The code half of that claim is bound
+    elsewhere, by ``tests/test_retention.py``'s cross-backend stage-predicate guard (BACKLOG #1188).
+    """
+    days, auto_bounded = _auto_bound()
+    source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    code = _retention_gate_findings(source)
+    assert not code, (
+        f"the retention gate in messagefoundry/__main__.py no longer does what docs/CONFIGURATION.md "
+        f"says: {code}. Restore the gate, or correct the [retention] posture paragraph and "
+        "docs/PHI.md section 8 in the same change."
+    )
+    section = _retention_section(_CONFIG_DOC.read_text(encoding="utf-8"))
+    doc = _retention_doc_findings(section, days, auto_bounded)
+    assert not doc, f"docs/CONFIGURATION.md [retention] drifted from the gate: {doc}"
+    cli_tests = _parse((_ROOT / "tests" / "test_cli.py").read_text(encoding="utf-8"))
+    missing = [name for name in _RETENTION_GATE_BEHAVIOUR_PINS if not find_funcs(cli_tests, name)]
+    assert not missing, (
+        f"tests/test_cli.py no longer has {missing}. This guard reads one slice of _serve and relies "
+        "on those tests to pin the gate by behaviour; re-point _RETENTION_GATE_BEHAVIOUR_PINS."
+    )
+
+
+def test_retention_gate_reader_detects_a_planted_violation() -> None:
+    """Each reader fails on a planted wrong fact, so a clean result above means something.
+
+    The code plants mutate the real ``__main__.py`` source, and the doc plants the real
+    ``[retention]`` section. The refusal plant deletes only the body-window ``return 2`` and leaves
+    the BACKLOG #1967 block's own ``return 2`` in place, which proves the slice stops before that
+    block. Each plant checks that it changed its text, so a moved anchor fails loudly instead of
+    mutating nothing.
+    """
+    source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    assert not _retention_gate_findings(source), "the real gate must read clean before planting"
+    plants = {
+        # The pre-inversion shape: auto-bound only on a non-enforcing instance.
+        "re-inverted": (
+            "    if not settings.retention.allow_unbounded_phi:\n        defaulted = [",
+            "    if not enforcing and not settings.retention.allow_unbounded_phi:\n"
+            "        defaulted = [",
+            "no top-level",
+        ),
+        "dial-gated": (
+            "for w in auto_bounded_windows()",
+            "for w in (auto_bounded_windows() if not enforcing else ())",
+            "reads the enforcement dial",
+        ),
+        "refusal-deleted": (
+            '"[security].allow_keeping_phi_indefinitely=true (audited).",\n'
+            "                    file=sys.stderr,\n"
+            "                )\n"
+            "                return 2\n",
+            '"[security].allow_keeping_phi_indefinitely=true (audited).",\n'
+            "                    file=sys.stderr,\n"
+            "                )\n",
+            "no longer stops startup",
+        ),
+        # A skip in the loop that applies the bound.
+        "skip-in-loop": (
+            "        for window in defaulted:\n",
+            "        for window in defaulted:\n"
+            "            if window.field == 'dead_letter_days':\n"
+            "                continue\n",
+            "one unconditional",
+        ),
+        # A production-tier condition: the tier-versus-dial confusion.
+        "tier-gated": (
+            "        for window in defaulted:\n",
+            "        defaulted = defaulted if not production else []\n"
+            "        for window in defaulted:\n",
+            "production tier",
+        ),
+        # One auto-bounded window dropped from the refusal.
+        "narrowed-refusal": (
+            "refusable = [w for w in still_unbounded if w.auto_bound_days is not None]",
+            "refusable = [w for w in still_unbounded if w.auto_bound_days is not None "
+            "and w.field != 'dead_letter_days']",
+            "`refusable` is no longer",
+        ),
+        # A condition other than the dial that lets some unset window skip its auto-bound.
+        "extra-filter": (
+            "for w in auto_bounded_windows()\n",
+            "for w in auto_bounded_windows()\n            if not production\n",
+            "filtered only by",
+        ),
+        # A refusal between the two arms, reached before the refuse arm sees the auto-bounded window.
+        "early-refusal": (
+            "    still_unbounded = _unbounded_windows(settings)\n",
+            "    if enforcing and not settings.retention.allow_unbounded_phi:\n"
+            "        return 2\n"
+            "    still_unbounded = _unbounded_windows(settings)\n",
+            "can stop startup",
+        ),
+    }
+    for name, (old, new, expected) in plants.items():
+        mutated = source.replace(old, new, 1)
+        assert mutated != source, f"plant {name!r} matched nothing; re-point it at the gate"
+        found = _retention_gate_findings(mutated)
+        assert any(expected in f for f in found), f"plant {name!r} was not detected: {found}"
+
+    days, auto_bounded = _auto_bound()
+    section = _retention_section(_CONFIG_DOC.read_text(encoding="utf-8"))
+    assert not _retention_doc_findings(section, days, auto_bounded), (
+        "the real doc must read clean before planting"
+    )
+    doc_plants = {
+        # The pre-inversion paragraph: an unset window refused under enforce.
+        "inverted-gate": (
+            f"is **defaulted to {days} days** at startup",
+            "**refuses to start** at startup",
+            "defaulted to",
+        ),
+        # The retired row: the purge scoped to outbound rows only.
+        "retired-scope": (
+            "null the bodies of **dead-lettered** rows at **every stage**",
+            "null the bodies of **dead-lettered** outbound rows",
+            "scopes the purge to outbound rows again",
+        ),
+        # The row claiming the gate reads a per-outbound override.
+        "override-gated": (
+            "The gate does not read that override",
+            "The gate refuses on that override too",
+            "does not read that override",
+        ),
+        # A window dropped from the posture paragraph while a table row still names it.
+        "window-unnamed": (
+            "`[security].delete_message_bodies_after_days`, `[retention].dead_letter_days` and",
+            "`[retention].dead_letter_days` and",
+            "delete_message_bodies_after_days",
+        ),
+    }
+    for name, (old, new, expected) in doc_plants.items():
+        planted = section.replace(old, new, 1)
+        assert planted != section, f"doc plant {name!r} matched nothing; re-point it at the doc"
+        found = _retention_doc_findings(planted, days, auto_bounded)
+        assert any(expected in f for f in found), f"doc plant {name!r} was not detected: {found}"

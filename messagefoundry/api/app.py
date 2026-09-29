@@ -206,6 +206,7 @@ from messagefoundry.api.security import (
     require_step_up,
     ws_token,
 )
+from messagefoundry.api.svg_sanitize import SvgRejected, may_be_svg, sanitize_if_svg
 from messagefoundry.api.tls import GeneratedPairReplaced, record_generated_pair_replacements
 from messagefoundry.api.validation import (
     MAX_EVENT_KINDS,
@@ -266,6 +267,7 @@ from messagefoundry.config.secretprovider import (
 from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
+    ApiSettings,
     ApprovalsSettings,
     AuthSettings,
     BackupSettings,
@@ -411,7 +413,9 @@ _NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/upload
 #: reason they were missed: the control above is keyed to the PHI-read families, so sensitivity that
 #: arrives under a different permission falls outside it. ``connection_event.reason`` and
 #: ``alert_instance.reason`` are both **PL-2** free text (§2 of ``docs/PHI.md``), so these responses
-#: were served with no cache directive at all.
+#: were served with no cache directive at all. Not every member projects a stored column:
+#: ``/connections`` and its metadata route carry a live field ``docs/PHI.md`` rates in prose, and
+#: ``/security/posture`` is here for the reason its own comment gives.
 #:
 #: TEMPLATES, because ``/connections/{name}/events`` cannot be written as a prefix without blanketing
 #: the whole ``/connections`` dashboard family — most of which returns no classified column. The
@@ -434,6 +438,13 @@ _NO_STORE_ROUTE_PATHS = frozenset(
         "/alerts/{alert_id}/resolve",
         "/alerts/{alert_id}/suspend",
         "/alerts/{alert_id}/resume",
+        # The dashboard row and the metadata view both carry a live ``error`` string: why the
+        # connection failed to start (ADR 0031) or why the DR run-profile parked it (ADR 0048).
+        # docs/PHI.md section 2 rates both fields (BACKLOG #1185). EXACT templates on purpose: a
+        # ``/connections`` prefix would also stamp the start/stop/restart/flag POSTs, which return no
+        # rated field.
+        "/connections",
+        "/connections/{name}/metadata",
         # Not a PL-rated column: the static-credential inventory (BACKLOG #1182) names every backend
         # hop on a weak credential and its peer, a map worth keeping out of a browser or proxy cache.
         # Set here, not in the route, because the web console calls the route's handler directly.
@@ -1089,7 +1100,8 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     **Why downgrade rather than sanitize.** Attachment bytes are verbatim clinical payloads — ADR 0105
     Approach B stores the OBX-5.5 value untouched and the preserve-the-original invariant forbids
     rewriting them — so the control is *neutralize at serve* (inert MIME + attachment disposition +
-    nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document."""
+    nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document. An SVG's SERVED
+    copy is sanitized in the download route as well, beside this downgrade (see the comment there)."""
     ct = (content_type or "").strip()
     if len(ct) > _MAX_ATTACHMENT_MIME_LEN or not _SAFE_MIME_RE.match(ct):
         return _DEFAULT_ATTACHMENT_MIME
@@ -2167,6 +2179,10 @@ def create_app(
         secret_rotation_settings = (
             getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
         )
+        # BACKLOG #1179: [api] carries the plaintext upstream-hop acknowledgement. Read off the
+        # resolved settings serve stashed, the #1989 object; an app built without them (the
+        # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
+        api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
         # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
         # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
         # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
@@ -2213,6 +2229,7 @@ def create_app(
                 unverified_db_hops=db_hops,
                 attested_hops=attested_hops,
                 revocation_attested_hops=revocation_hops,
+                api=api_settings,
                 store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -3099,9 +3116,12 @@ def create_app(
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
     ) -> list[ConnectionEventInfo]:
-        """The Corepoint-style connection/transport event log (#46), newest first — **metadata only,
-        no PHI**, so it is gated by ``monitoring:read`` (not the PHI-read tier). Optionally filtered by
-        ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp."""
+        """The Corepoint-style connection/transport event log (#46), newest first. Optionally filtered
+        by ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp.
+
+        Not PHI-free: ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives it a
+        protection level. It is gated by ``monitoring:read`` rather than a PHI permission, and the
+        response is served ``no-store`` (``_NO_STORE_ROUTE_PATHS``)."""
         # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
         # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
         if connection is not None and not identity.can_access_channel(connection):
@@ -3165,9 +3185,11 @@ def create_app(
         identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
         limit: int = Query(200, ge=1, le=1000),
     ) -> AlertInstanceList:
-        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen`` first —
-        **metadata only, no PHI**. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the
-        ack/resolve tier), with the same per-channel RBAC scope as ``GET /events``.
+        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen``
+        first. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the ack/resolve tier),
+        with the same per-channel RBAC scope as ``GET /events``. Not PHI-free: ``reason`` is scrubbed
+        free text, ``docs/PHI.md`` section 2 gives it a protection level, and the response is served
+        ``no-store`` (``_NO_STORE_ROUTE_PATHS``).
 
         ``total``/``worst_severity`` aggregate EVERY active instance in that scope, not this page of
         them. One ``allowed_channels`` value feeds both reads, so the aggregate is scoped identically
@@ -4255,12 +4277,14 @@ def create_app(
         # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
         # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
-        # OPENING ONE MESSAGE IS THE REVEAL ACT (ASVS 14.2.6). The list and search surfaces mask the
-        # summary, because those are where complete identifiers could be read off a screen opened for
-        # another reason. This route is a deliberate, per-message, already-audited open — record_view
-        # above plus the tamper-evident audit chain — so it is the specific act that lifts the mask,
-        # and it lifts it for THIS message only. The reveal is a call argument with nowhere to live
-        # between calls, so it cannot become a session-wide toggle by accident.
+        # OPENING ONE MESSAGE IS NOT THE REVEAL ACT under the strict reading of ASVS 14.2.6 ("unless
+        # the user specifically views it"), which BACKLOG #1187 adopts. The list and search surfaces
+        # mask the summary; this route lifts that mask for THIS message on every open, and it also
+        # returns the raw body. Many opens are not aimed at the summary or the body at all: the
+        # dead-letter "view" link, the redirect after a replay, a direct URL. So this unmask is the
+        # shipped behaviour and a recorded gap, not the control the verb asks for. What it does keep:
+        # the unmask is a call argument with nowhere to live between calls, so it cannot become a
+        # session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
         detail = redact_unauthorized(
@@ -4278,6 +4302,10 @@ def create_app(
                 masked=masked,
             )
         return detail
+
+    # SVG sanitizing runs on the default thread pool, which the pipeline's router and transform
+    # workers share; two slots bound how many pool threads concurrent downloads can hold.
+    svg_sanitize_slots = asyncio.Semaphore(2)
 
     @app.get("/messages/{message_id}/attachments/{attachment_id}")
     async def download_attachment(
@@ -4300,7 +4328,8 @@ def create_app(
 
         Approach B stored the OBX-5.5 value VERBATIM (base64), so the bytes are reconstructed by
         concatenating the attachment's chunks and base64-decoding once (buffer-once, mirroring the
-        delivery buffer-once posture). Every download is audited (``record_view`` + an
+        delivery buffer-once posture); an SVG is then sanitized or refused (see the comment below).
+        Every download is audited (``record_view`` + an
         ``attachment_download`` row in the tamper-evident chain, docs/PHI.md §6) BEFORE the bytes leave.
         The document bytes/base64 are **never logged**."""
         row = await engine.store.get_message(message_id)
@@ -4330,6 +4359,27 @@ def create_app(
         except (binascii.Error, ValueError) as exc:
             # A stored value that isn't clean base64 is corruption — surface it, never the bytes.
             raise HTTPException(422, "attachment content is not decodable") from exc
+        # ASVS 1.3.4 (ADR 0105, amendment 2026-09-28): an SVG is served as its tag and attribute
+        # allow-listed copy. Only the SERVED bytes change; the stored OBX-5.5 value stays verbatim. An
+        # SVG the parser cannot vet is refused before the audit, since no byte of it leaves. The
+        # pre-check keeps a PDF or an image off the thread pool. The audit row says when the served
+        # bytes are a sanitized copy, so they are never mistaken for the stored document's.
+        audit_detail = {"message_id": message_id, "attachment_id": attachment_id}
+        if may_be_svg(body):
+            try:
+                async with svg_sanitize_slots:
+                    served = await asyncio.to_thread(sanitize_if_svg, match["content_type"], body)
+            except SvgRejected as exc:
+                _log.warning(
+                    "attachment download refused: SVG could not be sanitized "
+                    "(message=%s attachment=%s)",
+                    message_id,
+                    attachment_id,
+                )
+                raise HTTPException(422, "attachment is SVG that cannot be sanitized") from exc
+            if served is not body:
+                body = served
+                audit_detail["served"] = "sanitized-svg"
         # Audit the PHI access BEFORE the bytes leave: record_view for the per-message timeline +
         # attachment_download in the tamper-evident chain (with the acting user + the id pair, NO bytes).
         await engine.store.record_view(message_id, actor=identity.username)
@@ -4337,15 +4387,16 @@ def create_app(
             "attachment_download",
             actor=identity.username,
             channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id, "attachment_id": attachment_id}),
+            detail=json.dumps(audit_detail),
             client=client_ip(request),
         )
         # Neutralize at serve (ASVS 1.3.4): the sender-influenced OBX-5.2 label is declared only when it
         # names one of the inert types on the _INERT_ATTACHMENT_TYPES allow-list, so a browser-active
         # label (svg/html/hta/script and every type nobody listed) is declared as the inert binary type,
         # which also keeps a .svg/.html extension out of the download name; the response carries a
-        # sandbox CSP so no served representation can execute in the application origin. The stored bytes are NEVER rewritten (ADR 0105 Approach B keeps the
-        # OBX-5.5 value verbatim). AttachmentSecurityHeadersMiddleware re-asserts the CSP from outside
+        # sandbox CSP so no served representation can execute in the application origin. The stored
+        # bytes are NEVER rewritten (ADR 0105 Approach B keeps the OBX-5.5 value verbatim); only an
+        # SVG's served copy is, above. AttachmentSecurityHeadersMiddleware re-asserts the CSP from outside
         # the /ui CSP writers so the console delegate serves it too.
         content_type = _safe_attachment_content_type(match["content_type"])
         # Belt-and-braces MIME-vs-magic downgrade (ASVS 1.3.4/5.2.2): even a token-clean, stored MIME is
@@ -4760,11 +4811,9 @@ def create_app(
         principal whose id disagrees with the row holding its username is refused rather than handed
         the row. A recycled name therefore gets a new ``user_id``, which is what this check needs.
 
-        **The residual, stated because it is what a reader would otherwise assume away:** a directory
-        that returns no immutable identifier at all still resolves by name, because the engine cannot
-        key on an identifier it is not given. The LDAP layer warns once per distinct cause -- absent
-        as well as unreadable -- so a site on that path is told, rather than left to assume a control
-        is running for it.
+        **A directory that returns no immutable identifier signs nobody in** (BACKLOG #2027): a
+        principal with no id is refused rather than resolved by name. The LDAP layer warns once per
+        distinct cause -- absent as well as unreadable -- so a site on that path learns why.
 
         The channel axis is deliberately NOT used, and ONE of its two original reasons has since
         expired. The surviving one is decisive on its own: an uploaded file carries no channel at
@@ -5523,6 +5572,7 @@ def create_app(
             # BACKLOG #1270. getattr-with-default for the same reason the A1 counters below use it: an
             # older or alternative counter object reports 0 rather than 500ing the stats read.
             claim_lock_timeouts=getattr(ec, "claim_lock_timeouts", 0) if ec is not None else 0,
+            claim_head_skips=getattr(ec, "claim_head_skips", 0) if ec is not None else 0,
             executor_queue_depth=exec_depth,
             executor_busy=exec_busy,
             # A1 live cost counters (read-only, additive). getattr-with-default so a backend without them
@@ -7169,7 +7219,6 @@ def create_managed_app(
     pooled_sweep_interval: float = 0.25,
     pooled_claim_lane_chunk: int = 256,
     pooled_max_processing_lanes: int = 256,
-    require_rcsi_for_pooled: bool = True,
     infra_fault_policy: str = "stop",  # ADR 0070: "stop" (default) | "retry_forever"
     infra_fault_stop_after: int = 10,
     infra_fault_backoff_cap: float = 60.0,
@@ -7469,7 +7518,6 @@ def create_managed_app(
             pooled_sweep_interval=pooled_sweep_interval,
             pooled_claim_lane_chunk=pooled_claim_lane_chunk,
             pooled_max_processing_lanes=pooled_max_processing_lanes,
-            require_rcsi_for_pooled=require_rcsi_for_pooled,
             infra_fault_policy=infra_fault_policy,
             infra_fault_stop_after=infra_fault_stop_after,
             infra_fault_backoff_cap=infra_fault_backoff_cap,

@@ -336,7 +336,11 @@ async def test_promoting_to_administrator_raises_the_grant_alert(engine: Engine)
 
 async def test_account_created_notice_goes_to_the_new_accounts_address(engine: Engine) -> None:
     notifier = _FakeNotifier()
-    service = AuthService(engine.store, AuthSettings(require_mfa=False), security_notifier=notifier)
+    service = AuthService(
+        engine.store,
+        AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
+        security_notifier=notifier,
+    )
     await service.initialize()
     await service.create_local_user(
         username="newbie",

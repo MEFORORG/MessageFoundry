@@ -1121,13 +1121,6 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # only the failing phase (kind) + a PHI-free, safe_exc-scrubbed reason (no body, no key bytes).
         self._emit({"type": "backup_failed", "connection": name, "kind": kind, "detail": detail})
 
-    def rcsi_off_degraded(self, name: str, *, detail: str) -> None:
-        # ADR 0066: pooled claim mode started on SQL Server with RCSI OFF (require_rcsi_for_pooled=false
-        # downgraded the fail-closed gate). The source label ("pipeline") stands in for "connection" so
-        # the realert throttle + subject keying + rule matching work uniformly; the payload is a PHI-free
-        # reason only (no message content).
-        self._emit({"type": "rcsi_off_degraded", "connection": name, "detail": detail})
-
     def store_privilege_warning(
         self, name: str, *, finding: str, excess_count: int, detail: str
     ) -> None:

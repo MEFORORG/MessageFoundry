@@ -193,7 +193,6 @@ class Engine:
         pooled_sweep_interval: float = 0.25,
         pooled_claim_lane_chunk: int = 256,
         pooled_max_processing_lanes: int = 256,
-        require_rcsi_for_pooled: bool = True,
         infra_fault_policy: str = "stop",
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
@@ -321,7 +320,6 @@ class Engine:
         self._pooled_sweep_interval = pooled_sweep_interval
         self._pooled_claim_lane_chunk = pooled_claim_lane_chunk
         self._pooled_max_processing_lanes = pooled_max_processing_lanes
-        self._require_rcsi_for_pooled = require_rcsi_for_pooled
         # Pooled T17 infra-fault bound (ADR 0070); every runner this engine builds inherits it.
         self._infra_fault_policy = infra_fault_policy
         self._infra_fault_stop_after = infra_fault_stop_after
@@ -559,7 +557,6 @@ class Engine:
         pooled_sweep_interval: float = 0.25,
         pooled_claim_lane_chunk: int = 256,
         pooled_max_processing_lanes: int = 256,
-        require_rcsi_for_pooled: bool = True,
         infra_fault_policy: str = "stop",
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
@@ -624,7 +621,6 @@ class Engine:
             pooled_sweep_interval=pooled_sweep_interval,
             pooled_claim_lane_chunk=pooled_claim_lane_chunk,
             pooled_max_processing_lanes=pooled_max_processing_lanes,
-            require_rcsi_for_pooled=require_rcsi_for_pooled,
             infra_fault_policy=infra_fault_policy,
             infra_fault_stop_after=infra_fault_stop_after,
             infra_fault_backoff_cap=infra_fault_backoff_cap,
@@ -840,7 +836,6 @@ class Engine:
             pooled_sweep_interval=self._pooled_sweep_interval,
             pooled_claim_lane_chunk=self._pooled_claim_lane_chunk,
             pooled_max_processing_lanes=self._pooled_max_processing_lanes,
-            require_rcsi_for_pooled=self._require_rcsi_for_pooled,
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,
             infra_fault_backoff_cap=self._infra_fault_backoff_cap,
@@ -1341,6 +1336,8 @@ class Engine:
                 self._monitored_certs,
                 self._cert_monitor_settings,
                 alert_sink=self._alert_sink,
+                # BACKLOG #299: a CRL a live hop loaded from a path no row names still gets judged.
+                watch_unlisted_held_crls=True,
             )
             self._cert_expiry_runner.start()
         # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and

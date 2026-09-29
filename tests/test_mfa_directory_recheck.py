@@ -80,6 +80,7 @@ class _Enrolled:
 
 def _settings(**overrides: object) -> AuthSettings:
     return AuthSettings(
+        mfa_verify_min_elapsed_seconds=0,
         ad_enabled=True,
         ad_server="ldaps://dc.test.invalid",
         ad_user_search_base="OU=Staff,DC=test,DC=invalid",
@@ -199,15 +200,13 @@ async def test_a_bound_row_with_no_directory_id_is_refused_unasked(
 ) -> None:
     """ADR 0184 AC-5: a row carrying a federated binding and no ``directory_object_id`` may not be
     asked about by its name, and it has no other key. So the directory cannot confirm it."""
-    unkeyed = AdPrincipal(
-        username=_PRINCIPAL.username,
-        display_name=_PRINCIPAL.display_name,
-        email=_PRINCIPAL.email,
-        dn=_PRINCIPAL.dn,
-        groups=_PRINCIPAL.groups,
-        directory_object_id=None,
+    e = await _enrolled_directory_session(store, monkeypatch)
+    # No sign-in mints an id-less row since BACKLOG #2027, which refuses a principal with no id. So
+    # the legacy row is planted: the keyed row's column is cleared under its live session.
+    await store._db.execute(
+        "UPDATE users SET directory_object_id = NULL WHERE id = ?", (e.user_id,)
     )
-    e = await _enrolled_directory_session(store, monkeypatch, unkeyed)
+    await store._db.commit()
     await store.set_user_federated_subject(e.user_id, "https://idp.test.invalid", "synthetic-sub")
 
     refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
@@ -421,7 +420,7 @@ async def test_a_directory_account_with_no_directory_configured_is_refused(
     """An AD row left behind after the directory is unwired has nothing to confirm it, so it fails
     closed rather than renewing on the engine row alone."""
     e = await _enrolled_directory_session(store, monkeypatch)
-    unwired = AuthService(store, AuthSettings())
+    unwired = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
 
     refused = await unwired.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 

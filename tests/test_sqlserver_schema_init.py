@@ -480,3 +480,151 @@ async def test_external_open_refuses_a_marker_from_before_channel_scope_source()
 
     assert PROVISION_SCHEMA_COMMAND in str(info.value)
     assert all(_is_read(sql) for sql, _ in executed)
+
+
+# --- BACKLOG #1780: an auto open that must not build ---------------------------------------------
+
+
+async def test_auto_without_create_refuses_a_database_with_no_store_and_runs_no_ddl() -> None:
+    """``create=False`` under auto: a database with no ``schema_meta`` table is not a store, so a check
+    pointed at it is refused rather than having the whole batch built into it."""
+    from messagefoundry.store.base import StoreNotFoundError
+
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+
+    with pytest.raises(StoreNotFoundError, match="no schema_meta table"):
+        await store._ensure_schema(create=False)
+
+    assert executed, "the marker must actually have been read"
+    assert all(_is_read(sql) for sql, _ in executed), [sql for sql, _ in executed]
+    assert conn.rolledback == 1  # the probe's read txn is closed on the way out
+
+
+async def test_auto_without_create_still_upgrades_a_store_that_is_there() -> None:
+    """The control: the same ``create=False`` over a STALE marker is a store, and auto upgrades it."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _StaleCursor(executed)
+    store = _make_store(conn)
+
+    assert await store._ensure_schema(create=False) is True
+    assert any("CREATE TABLE" in sql for sql, _ in executed)
+
+
+@pytest.mark.parametrize("mode", [SchemaManagement.AUTO, SchemaManagement.EXTERNAL])
+async def test_read_only_opens_a_stale_marker_as_it_is_and_says_so(
+    mode: SchemaManagement, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A read-only open never upgrades, in either mode, and it does not refuse the inspection it was
+    asked for either: it opens the schema as it is, as the SQLite read-only open does."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _StaleCursor(executed)
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30, mode=mode)  # type: ignore[assignment]
+
+    with caplog.at_level("WARNING"):
+        assert await store._ensure_schema(read_only=True) is False
+
+    assert all(_is_read(sql) for sql, _ in executed)
+    assert "not current for this build; opened read-only" in caplog.text
+
+
+@pytest.mark.parametrize("mode", [SchemaManagement.AUTO, SchemaManagement.EXTERNAL])
+async def test_read_only_refuses_a_database_with_no_store(mode: SchemaManagement) -> None:
+    from messagefoundry.store.base import StoreNotFoundError
+
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30, mode=mode)  # type: ignore[assignment]
+
+    with pytest.raises(StoreNotFoundError, match="no schema_meta table"):
+        await store._ensure_schema(read_only=True)
+
+    assert all(_is_read(sql) for sql, _ in executed)
+
+
+async def test_read_only_opens_a_current_store_under_auto() -> None:
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed, marker_current=True)
+    store = _make_store(conn)
+
+    assert await store._ensure_schema(read_only=True) is False
+    assert all(_is_read(sql) for sql, _ in executed)
+
+
+class _Refused(Exception):
+    """Stops ``open()`` at the step under test, after recording that it was reached."""
+
+
+def _open_recorder(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stand ``aioodbc`` in and record the three pre-schema steps of ``SqlServerStore.open``.
+
+    The existence probe raises as it would on a database with no store; the pool raises too, so an
+    open that passes the probe stops there without dialling anything."""
+    import sys
+
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store.base import StoreNotFoundError
+
+    steps: list[str] = []
+    monkeypatch.setitem(sys.modules, "aioodbc", types.ModuleType("aioodbc"))
+
+    async def _probe(settings: object, *, posture: object) -> None:
+        steps.append("probe")
+        raise StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, "MessageFoundry")
+
+    async def _options(settings: object, *, posture: object) -> None:
+        steps.append("alter-database")
+
+    async def _pool(settings: object, *, posture: object, maxsize: int) -> object:
+        steps.append("pool")
+        raise _Refused
+
+    monkeypatch.setattr(SqlServerStore, "_refuse_a_database_with_no_store", _probe)
+    monkeypatch.setattr(SqlServerStore, "_ensure_database_options", _options)
+    monkeypatch.setattr(SqlServerStore, "_create_pool", _pool)
+    return steps
+
+
+def _auto_settings() -> object:
+    from messagefoundry.config.settings import StoreBackend, StoreSettings
+
+    return StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="localhost",
+        database="MessageFoundry",
+        username="mefor",
+        schema_management=SchemaManagement.AUTO,
+    )
+
+
+async def test_open_without_create_probes_before_it_alters_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ALTER DATABASE step runs before the pool, so the "is there a store here" answer has to come
+    first, or a check pointed at another application's database would still change that database."""
+    from messagefoundry.store.base import StoreNotFoundError
+
+    steps = _open_recorder(monkeypatch)
+    with pytest.raises(StoreNotFoundError):
+        await SqlServerStore.open(_auto_settings(), create=False)  # type: ignore[arg-type]
+    assert steps == ["probe"]
+
+
+async def test_open_that_builds_alters_without_probing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control: serve's first run (``create=True``) is the one caller the ALTER is for."""
+    steps = _open_recorder(monkeypatch)
+    with pytest.raises(_Refused):
+        await SqlServerStore.open(_auto_settings(), create=True)  # type: ignore[arg-type]
+    assert steps == ["alter-database", "pool"]
+
+
+async def test_read_only_open_never_alters_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    steps = _open_recorder(monkeypatch)
+    with pytest.raises(_Refused):
+        await SqlServerStore.open(_auto_settings(), read_only=True)  # type: ignore[arg-type]
+    assert steps == ["pool"]

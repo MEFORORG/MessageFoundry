@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,12 @@ class _FakeNotifier:
 
 
 def _no_mfa(**overrides: Any) -> AuthSettings:
-    return AuthSettings(require_mfa=False, login_rate_limit_enabled=False, **overrides)
+    return AuthSettings(
+        admin_write_min_interval_seconds=0,
+        require_mfa=False,
+        login_rate_limit_enabled=False,
+        **overrides,
+    )
 
 
 async def _add_local(service: AuthService, username: str, *, email: str | None = None) -> str:
@@ -139,6 +145,7 @@ async def test_a_directory_account_whose_directory_returns_no_mail_is_confined()
                 email=mail,
                 dn=f"CN={name},DC=x",
                 groups=frozenset(),
+                directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, name)),
             )
             # The shared completion tail that simple bind, Kerberos and OIDC all reach; its create
             # branch is `_upsert_ad_user` meeting a principal it has not seen.
@@ -176,7 +183,12 @@ def _ad_service(store: MessageStore, notifier: _FakeNotifier | None = None) -> A
 
 def _directory_principal(name: str, mail: str | None) -> AdPrincipal:
     return AdPrincipal(
-        username=name, display_name=name, email=mail, dn=f"CN={name},DC=x", groups=frozenset()
+        username=name,
+        display_name=name,
+        email=mail,
+        dn=f"CN={name},DC=x",
+        groups=frozenset(),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, name)),
     )
 
 
@@ -572,7 +584,9 @@ async def test_a_session_owing_its_factor_cannot_choose_the_address_and_nothing_
     choose where the account's notices go."""
     service = AuthService(
         engine.store,
-        AuthSettings(login_rate_limit_enabled=False),  # require_mfa on, the default
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),  # require_mfa on, the default
         security_notifier=_FakeNotifier(),
     )
     await service.initialize()

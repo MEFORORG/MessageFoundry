@@ -51,6 +51,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from typing import Any
 
 import pytest
@@ -72,15 +73,15 @@ from tests.test_adr0114_claim_fold import (
     _wire,
 )
 
-_CALL_CID = "{CALL dbo.mefor_claim_fifo_heads_cid_v1 (?,?,?,?,?,?,?,?,?)}"
-_CALL_DST = "{CALL dbo.mefor_claim_fifo_heads_dst_v1 (?,?,?,?,?,?,?,?,?)}"
+_CALL_CID = "{CALL dbo.mefor_claim_fifo_heads_cid_v2 (?,?,?,?,?,?,?,?,?)}"
+_CALL_DST = "{CALL dbo.mefor_claim_fifo_heads_dst_v2 (?,?,?,?,?,?,?,?,?)}"
 
 _FAKE_PINS = [(1, 0, 0)] * 9  # stands in for _claim_proc_param_pins() (pyodbc-free CI)
 
 # (proc name, lane column) for both lane families — the gate's two subjects.
 _PROCS = (
-    ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
-    ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
+    ("mefor_claim_fifo_heads_cid_v2", "channel_id"),
+    ("mefor_claim_fifo_heads_dst_v2", "destination_name"),
 )
 
 
@@ -144,8 +145,8 @@ async def test_lint_batch_renders_from_the_shared_fragments() -> None:
 @pytest.mark.parametrize(
     ("proc_name", "lane_col"),
     [
-        ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
-        ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
+        ("mefor_claim_fifo_heads_cid_v2", "channel_id"),
+        ("mefor_claim_fifo_heads_dst_v2", "destination_name"),
     ],
 )
 def test_lint_proc_body_is_header_plus_fragments_plus_tail(proc_name: str, lane_col: str) -> None:
@@ -172,8 +173,8 @@ def test_lint_proc_body_is_header_plus_fragments_plus_tail(proc_name: str, lane_
 
 
 def test_lint_lane_col_appears_at_exactly_the_two_predicate_sites() -> None:
-    cid = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v1", "channel_id")
-    dst = ss._claim_proc_body("mefor_claim_fifo_heads_dst_v1", "destination_name")
+    cid = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v2", "channel_id")
+    dst = ss._claim_proc_body("mefor_claim_fifo_heads_dst_v2", "destination_name")
     for body, col in ((cid, "channel_id"), (dst, "destination_name")):
         assert f"AND {col} = l.lane" in body  # STEP-1 discovery predicate
         assert f"qq.{col} = L.lane" in body  # STEP-3 probe predicate
@@ -185,16 +186,17 @@ def test_lint_lane_col_appears_at_exactly_the_two_predicate_sites() -> None:
     assert "AND channel_id = l.lane" not in dst
 
 
-def test_lint_epoch_guard_fixed_nullable_on_both_sites() -> None:
-    body = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v1", "channel_id")
-    assert body.count(ss._CLAIM_PROC_EPOCH_GUARD) == 2  # STEP-3 probe AND STEP-5 UPDATE
+def test_lint_epoch_guard_fixed_nullable_on_every_site() -> None:
+    body = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v2", "channel_id")
+    # STEP-3 probe, STEP-5 UPDATE, and the BACKLOG #1270 head-skip marker rows.
+    assert body.count(ss._CLAIM_PROC_EPOCH_GUARD) == 3
     assert "@leader_epoch IS NULL OR" in ss._CLAIM_PROC_EPOCH_GUARD
 
 
 def test_ac8_proc_body_hard_rules() -> None:
     for proc_name, lane_col in (
-        ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
-        ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
+        ("mefor_claim_fifo_heads_cid_v2", "channel_id"),
+        ("mefor_claim_fifo_heads_dst_v2", "destination_name"),
     ):
         body = ss._claim_proc_body(proc_name, lane_col)
         upper = body.upper()
@@ -234,8 +236,8 @@ def test_ac8_proc_body_hard_rules() -> None:
 
 
 def test_ac10_guarded_ddl_rides_schema() -> None:
-    cid_ddl = ss._claim_proc_ddl("mefor_claim_fifo_heads_cid_v1", "channel_id")
-    dst_ddl = ss._claim_proc_ddl("mefor_claim_fifo_heads_dst_v1", "destination_name")
+    cid_ddl = ss._claim_proc_ddl("mefor_claim_fifo_heads_cid_v2", "channel_id")
+    dst_ddl = ss._claim_proc_ddl("mefor_claim_fifo_heads_dst_v2", "destination_name")
     assert cid_ddl in ss._SCHEMA and dst_ddl in ss._SCHEMA  # rides the ADR 0064 content hash
     for ddl in (cid_ddl, dst_ddl):
         # Self-no-op'ing guard: compat floor + CREATE PROCEDURE permission + CREATE OR ALTER
@@ -332,11 +334,11 @@ def _gate_rows(
 
     return {
         "compat": {"compatibility_level": compat},
-        "dbo.mefor_claim_fifo_heads_cid_v1": answer(
-            cid_body, cid_oid, "mefor_claim_fifo_heads_cid_v1", "channel_id"
+        "dbo.mefor_claim_fifo_heads_cid_v2": answer(
+            cid_body, cid_oid, "mefor_claim_fifo_heads_cid_v2", "channel_id"
         ),
-        "dbo.mefor_claim_fifo_heads_dst_v1": answer(
-            dst_body, dst_oid, "mefor_claim_fifo_heads_dst_v1", "destination_name"
+        "dbo.mefor_claim_fifo_heads_dst_v2": answer(
+            dst_body, dst_oid, "mefor_claim_fifo_heads_dst_v2", "destination_name"
         ),
     }
 
@@ -392,7 +394,7 @@ async def test_ac7_gate_tolerates_whitespace_differences(monkeypatch: pytest.Mon
     # verbatim `CREATE OR ALTER` head reached the gate as a fake "deployed" body, and it kept the
     # tautology alive even after the default was fixed. Mangle the server form, not our own text.
     stored = _as_object_definition(
-        ss._claim_proc_body("mefor_claim_fifo_heads_cid_v1", "channel_id")
+        ss._claim_proc_body("mefor_claim_fifo_heads_cid_v2", "channel_id")
     )
     mangled = stored.replace(" SET LOCK_TIMEOUT 0;", "\r\n  SET  LOCK_TIMEOUT   0;\n")
     assert mangled != stored, "the mangle must actually perturb (non-vacuity)"
@@ -428,8 +430,8 @@ async def test_ac7_gate_accepts_the_body_as_sql_server_actually_stores_it(
     assert store.claim_proc_effective is True
     assert store.claim_proc_degraded_reason is None
     assert store._claim_proc_head_forms == {
-        "mefor_claim_fifo_heads_cid_v1": "rewritten",
-        "mefor_claim_fifo_heads_dst_v1": "rewritten",
+        "mefor_claim_fifo_heads_cid_v2": "rewritten",
+        "mefor_claim_fifo_heads_dst_v2": "rewritten",
     }
 
 
@@ -455,7 +457,7 @@ async def test_ac7_gate_rejects_head_forms_this_deploy_path_cannot_emit(
     server round-trip, and `_claim_proc_ddl` provably cannot emit them — so each is affirmative
     evidence of an out-of-band hand deploy, which IS the AC-7 event. A two-sided regex
     canonicalization accepts all three and launders exactly the signal the gate exists to raise."""
-    tail = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v1", "channel_id")[
+    tail = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v2", "channel_id")[
         len(ss._CLAIM_PROC_HEAD) :
     ]
     store = await _gate(_gate_rows(cid_body=head + tail), monkeypatch)
@@ -471,11 +473,11 @@ async def test_ac7_gate_rejects_the_cid_body_served_under_the_dst_name(
     (which does NOT rewrite sys.sql_modules.definition) or a botched blue/green swap — and silently
     swap the lane predicate, claiming zero rows forever. RED the moment anyone flattens it."""
     cid_stored = _as_object_definition(
-        ss._claim_proc_body("mefor_claim_fifo_heads_cid_v1", "channel_id")
+        ss._claim_proc_body("mefor_claim_fifo_heads_cid_v2", "channel_id")
     )
     store = await _gate(_gate_rows(dst_body=cid_stored), monkeypatch)
     assert store.claim_proc_effective is False
-    assert "mefor_claim_fifo_heads_dst_v1" in (store.claim_proc_degraded_reason or "")
+    assert "mefor_claim_fifo_heads_dst_v2" in (store.claim_proc_degraded_reason or "")
 
 
 @pytest.mark.parametrize("prefix", ["-- note\n", ";", "SET ANSI_NULLS ON; "])
@@ -504,7 +506,7 @@ async def test_ac7_gate_degrades_loudly_when_the_body_head_anchor_breaks(
         ({"dst_body": None}, "is missing"),
         (
             {
-                "cid_body": "CREATE OR ALTER PROCEDURE dbo.mefor_claim_fifo_heads_cid_v1 AS SELECT 1;"
+                "cid_body": "CREATE OR ALTER PROCEDURE dbo.mefor_claim_fifo_heads_cid_v2 AS SELECT 1;"
             },
             "matches no form this build deploys",
         ),
@@ -626,8 +628,17 @@ def test_ac9_result_processing_is_one_shared_path_after_the_pin_clear() -> None:
 # rewritten head, so this is NOT the OBJECT_DEFINITION text; see _as_object_definition): drift in the
 # shared fragments, the OPENJSON lane source, the fixed-nullable epoch guard, the signature, or
 # the @fold_reset tail fails here and must be a reviewed, deliberate change (re-pin + the ADR 0064
-# hash re-applies the DDL; the startup gate's expected hashes follow automatically).
+# hash re-applies the DDL; the startup gate's expected hashes follow automatically). BACKLOG #1270
+# added the head-skip marker arm as NEW _v2 procs, which are the ones this build calls; the retained
+# _v1 bodies are pinned separately below at the exact hashes they shipped with.
 _GOLDEN_PROC_BODY_SHA256 = {
+    "mefor_claim_fifo_heads_cid_v2": "4c2b233268f7d2f0117dfa0136dcecffad6a116fc40dec11a2f5504306424ecf",
+    "mefor_claim_fifo_heads_dst_v2": "79d6fc09e4d05bb751c016a63c25c706ed09f723a777d393ffd03f0484f36cbb",
+}
+# The retained _v1 bodies, pinned at their origin/main values (before BACKLOG #1270). ADR 0114: a
+# newer build's _v2 never touches _v1, because an older build sharing the store mid-upgrade still
+# calls it. These hashes must NOT move until a later change drops _v1 outright.
+_GOLDEN_RETAINED_V1_BODY_SHA256 = {
     "mefor_claim_fifo_heads_cid_v1": "9c685181b413be4936746312745f3c8e43830d7dc22e6ab2cfc8ba9443bb43e2",
     "mefor_claim_fifo_heads_dst_v1": "0eaf2de29ae5ca09764bdabd2d3c40bca7c7feef8f347e6bab0800e5a3a97052",
 }
@@ -636,8 +647,8 @@ _GOLDEN_PROC_BODY_SHA256 = {
 @pytest.mark.parametrize(
     ("proc_name", "lane_col"),
     [
-        ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
-        ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
+        ("mefor_claim_fifo_heads_cid_v2", "channel_id"),
+        ("mefor_claim_fifo_heads_dst_v2", "destination_name"),
     ],
 )
 def test_proc_body_golden_pin(proc_name: str, lane_col: str) -> None:
@@ -645,9 +656,40 @@ def test_proc_body_golden_pin(proc_name: str, lane_col: str) -> None:
 
     got = hashlib.sha256(ss._claim_proc_body(proc_name, lane_col).encode()).hexdigest()
     assert got == _GOLDEN_PROC_BODY_SHA256[proc_name], (
-        f"the shipped {proc_name} body drifted — if this change passed design review (the batch"
-        f" and the proc bodies are edited together, forever), re-pin to {got}"
+        f"the shipped {proc_name} body drifted to {got}. A called proc's body never changes under"
+        " its name: move this name into _RETAINED_CLAIM_PROCS with its old body and ship the next"
+        " version (ADR 0114 versioning; BACKLOG #1270). Re-pin only a change that never reaches a"
+        " deployed database"
     )
+
+
+def test_retained_v1_bodies_are_byte_identical_to_what_shipped() -> None:
+    """BACKLOG #1270 must not edit _v1 in place (why: the ``_CLAIM_PROC_CID`` comment in
+    sqlserver.py). Rendered by NAME, as every call site renders it."""
+    assert {name for name, _ in ss._RETAINED_CLAIM_PROCS} == set(_GOLDEN_RETAINED_V1_BODY_SHA256)
+    for proc_name, lane_col in ss._RETAINED_CLAIM_PROCS:
+        body = ss._claim_proc_body(proc_name, lane_col)
+        got = hashlib.sha256(body.encode()).hexdigest()
+        assert got == _GOLDEN_RETAINED_V1_BODY_SHA256[proc_name], (
+            f"the retained {proc_name} body drifted — _v1 must keep the bytes it shipped with"
+        )
+        assert "UNION ALL" not in body, f"{proc_name} carries the #1270 marker arm"
+
+
+def test_v2_is_called_and_v1_is_still_deployed_before_it() -> None:
+    """The _SCHEMA tail deploys the retained _v1 pair (shipped bytes) THEN the _v2 pair this build
+    calls. Neither _v1 statement may be dropped here: retirement is a later, separate change."""
+    assert ss._CLAIM_PROC_CID == "mefor_claim_fifo_heads_cid_v2"
+    assert ss._CLAIM_PROC_DST == "mefor_claim_fifo_heads_dst_v2"
+    v1 = [ss._claim_proc_ddl(n, c) for n, c in ss._RETAINED_CLAIM_PROCS]
+    v2 = [
+        ss._claim_proc_ddl(ss._CLAIM_PROC_CID, "channel_id"),
+        ss._claim_proc_ddl(ss._CLAIM_PROC_DST, "destination_name"),
+    ]
+    assert ss._SCHEMA[-4:] == [*v1, *v2]
+    assert all("UNION ALL" in ddl for ddl in v2)
+    drop = re.compile(r"\bDROP\s+PROC", re.IGNORECASE)  # PROC and PROCEDURE, any spacing
+    assert not any(drop.search(stmt) for stmt in ss._SCHEMA)
 
 
 # --- the {CALL} dispatch: fixed arity, lane JSON, fence, fold composition ------------------------

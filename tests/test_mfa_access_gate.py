@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -46,7 +47,10 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
-    service = AuthService(engine.store, settings or AuthSettings(login_rate_limit_enabled=False))
+    service = AuthService(
+        engine.store,
+        settings or AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False),
+    )
     await service.initialize()
     return service
 
@@ -140,6 +144,7 @@ def _principal(username: str = "aduser") -> AdPrincipal:
         email=None,
         dn=f"CN={username},DC=x",
         groups=frozenset(),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, username)),
     )
 
 

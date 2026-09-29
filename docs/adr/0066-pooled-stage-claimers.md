@@ -104,7 +104,7 @@ One store call, one transaction, one server round trip (SQL Server; PG/SQLite pa
 
 ### 3.3 SQL Server dialect (one parameterized T-SQL batch, one `cursor.execute`, one commit)
 
-The store already force-enables RCSI at open (`_ensure_database_options`, sqlserver.py:624–677) but **degrades to a warning** on locked-down DBs (**amended 2026-09-26, §12: it now refuses the open instead, in every claim mode**); **pooled mode adds a startup verify that FAILS CLOSED by default** (clear DBA remediation message) if `is_read_committed_snapshot_on = 0`, overridable via `[pipeline].require_rcsi_for_pooled=false` (which downgrades to a loud warning + a persistent `/stats` `rcsi_off_degraded` gauge and AlertSink event). **Note (corrected 2026-07-02):** the claim's non-blocking guarantee no longer *depends* on RCSI — both the claim and the `list_fifo_lanes` sweep prepend `SET LOCK_TIMEOUT 0` (a contended head raises native error 1222, mapped to the EMPTY-all contract), making the pooled path **structurally never-block independent of RCSI**. Fail-closed is retained on the correct grounds: the §3.2 correctness proofs and the §8 CI gates are scoped to RCSI-on snapshot visibility, and READ-COMMITTED discovery semantics are unverified. `{lane_col}` is the existing stage-aware code-controlled literal (`_lane_col`, :2635). `SET NOCOUNT ON` keeps the OUTPUT the sole result set (EF-6 `_cursor` close-before-release discipline unchanged; `fetchall` drains it).
+The store already force-enables RCSI at open (`_ensure_database_options`, sqlserver.py:624–677) but **degrades to a warning** on locked-down DBs (**amended 2026-09-26, §12: it now refuses the open instead, in every claim mode**); **pooled mode adds a startup verify that FAILS CLOSED by default** (clear DBA remediation message) if `is_read_committed_snapshot_on = 0`, overridable via `[pipeline].require_rcsi_for_pooled=false` (which downgrades to a loud warning + a persistent `/stats` `rcsi_off_degraded` gauge and AlertSink event). **Amended 2026-09-28 (§12, BACKLOG #2090): the override is retired and refused at load, and the gate is unconditional.** **Note (corrected 2026-07-02):** the claim's non-blocking guarantee no longer *depends* on RCSI — both the claim and the `list_fifo_lanes` sweep prepend `SET LOCK_TIMEOUT 0` (a contended head raises native error 1222, mapped to the EMPTY-all contract), making the pooled path **structurally never-block independent of RCSI**. Fail-closed is retained on the correct grounds: the §3.2 correctness proofs and the §8 CI gates are scoped to RCSI-on snapshot visibility, and READ-COMMITTED discovery semantics are unverified. `{lane_col}` is the existing stage-aware code-controlled literal (`_lane_col`, :2635). `SET NOCOUNT ON` keeps the OUTPUT the sole result set (EF-6 `_cursor` close-before-release discipline unchanged; `fetchall` drains it).
 
 ```sql
 SET NOCOUNT ON;
@@ -310,7 +310,7 @@ Pooled-only knobs under `[pipeline]`: `pooled_claimers_per_stage` (default 1; ha
 
 **Positive:** claim sessions collapse ~4,500 → ≤ K×4 (default 4); idle claim RT ~18k/s → ≤16 read-only RT/s; loaded claims self-coalesce into multi-lane statements from a handful of sessions; zero claimer lock-waits (no pinned pool connections); claimer-vs-claimer conflict structurally zero; bounded memory + store-visible backpressure; recovery/retry latency at or better than today; the primitive is shard-scoped and N-active-ready.
 
-**Negative / accepted:** (1) the one-consumer-per-lane invariant moves from "one task per lane" into the dispatcher state machine — a dispatcher bug re-opens FIFO breaks no SQL guard catches; mitigated by a small, exhaustively unit-tested state machine, T6-pooled tripwires, a debug assertion that a claimed lane had no in-process items, **and the §8 merge rider that the PR3 dispatcher tests + the T6/#285/fan-in pooled tests are green on the live SQL Server *and* Postgres CI legs (not SQLite-only) as the price of merging the PR that first builds the dispatcher**. (2) RCSI is **fail-closed by default** on SQL Server (overridable via `[pipeline].require_rcsi_for_pooled`) — retained not because the claim still needs it to avoid blocking (`SET LOCK_TIMEOUT 0` makes the claim *and* the sweep structurally never-block) but because the §3.2 correctness proofs + §8 CI gates are scoped to RCSI-on. (3) SQL Server fan-in lanes shift to PG visibility semantics (§3.2 disclosure; per-source order preserved; doctrine-sanctioned; **adjudicated accept, §11 item 5**). (4) With K=1 a claimer store-error backoff pauses a stage's claiming ~1 s (chunk-scoped handling + supervision + a starvation alert bound it; raise K to isolate). (5) Two claim architectures persist until a convergence decision — an **accepted, bounded, exit-defined cost, not a migration-in-progress**. **Update (2026-07-03, #744): the default was flipped to `pooled`** (rate-walk resilience GO + reinterpreted §8.12b + row-1b fan-in soak PASS; §11 item 10); `per_lane` is now the **byte-identical opt-out** (still enforced by the zero-pooled-construction sentinel), and pooled is documented + recommended to operators. Both code paths still ship until a convergence decision retires one — the double test surface is the remaining price. (6) The refactor touches the most reliability-critical file — contained by extract-only commits and the per_lane full-suite identity gate. (7) Known next walls, unblocked not caused: finalizer applock serialization; outbound connect-per-delivery TIME_WAIT — watched on the rate-walk so they are not misattributed. (8) A discovery/claim race with an admin op costs one wasted cycle (EMPTY), re-check-resolved — accepted, PG parity.
+**Negative / accepted:** (1) the one-consumer-per-lane invariant moves from "one task per lane" into the dispatcher state machine — a dispatcher bug re-opens FIFO breaks no SQL guard catches; mitigated by a small, exhaustively unit-tested state machine, T6-pooled tripwires, a debug assertion that a claimed lane had no in-process items, **and the §8 merge rider that the PR3 dispatcher tests + the T6/#285/fan-in pooled tests are green on the live SQL Server *and* Postgres CI legs (not SQLite-only) as the price of merging the PR that first builds the dispatcher**. (2) RCSI is **fail-closed by default** on SQL Server (overridable via `[pipeline].require_rcsi_for_pooled`; **amended 2026-09-28, §12: no longer overridable, the key is retired, BACKLOG #2090**) — retained not because the claim still needs it to avoid blocking (`SET LOCK_TIMEOUT 0` makes the claim *and* the sweep structurally never-block) but because the §3.2 correctness proofs + §8 CI gates are scoped to RCSI-on. (3) SQL Server fan-in lanes shift to PG visibility semantics (§3.2 disclosure; per-source order preserved; doctrine-sanctioned; **adjudicated accept, §11 item 5**). (4) With K=1 a claimer store-error backoff pauses a stage's claiming ~1 s (chunk-scoped handling + supervision + a starvation alert bound it; raise K to isolate). (5) Two claim architectures persist until a convergence decision — an **accepted, bounded, exit-defined cost, not a migration-in-progress**. **Update (2026-07-03, #744): the default was flipped to `pooled`** (rate-walk resilience GO + reinterpreted §8.12b + row-1b fan-in soak PASS; §11 item 10); `per_lane` is now the **byte-identical opt-out** (still enforced by the zero-pooled-construction sentinel), and pooled is documented + recommended to operators. Both code paths still ship until a convergence decision retires one — the double test surface is the remaining price. (6) The refactor touches the most reliability-critical file — contained by extract-only commits and the per_lane full-suite identity gate. (7) Known next walls, unblocked not caused: finalizer applock serialization; outbound connect-per-delivery TIME_WAIT — watched on the rate-walk so they are not misattributed. (8) A discovery/claim race with an admin op costs one wasted cycle (EMPTY), re-check-resolved — accepted, PG parity.
 
 ---
 
@@ -404,6 +404,8 @@ Gate 3 (interactions/perf): A1 → §4.2 + test 5; A2 single-round-trip fusion +
    **Amended 2026-09-26 (§12, BACKLOG #1628):** the store now refuses to OPEN with RCSI off when the
    login cannot enable it, in every claim mode, so `require_rcsi_for_pooled=false` no longer lets a
    store run without RCSI. Read §12 before relying on this item.
+   **Amended 2026-09-28 (§12, BACKLOG #2090):** the override is retired. The key is refused at
+   load, the pooled gate always fails closed, and the `rcsi_off_degraded` alert type is removed.
 7. **Phase-0 disposition:** **resolved** — the Phase-0 idle backstop + armed retry wake shipped as
    the ADR 0061 amendment (PR #732) ahead of this ADR; the two compose (Phase-0 relieves idle,
    pooled removes the loaded convoy).
@@ -472,7 +474,7 @@ sequences ADR 0075 pins. Refusing the mode keeps one invariant in one place, and
 correctness argument in the store already assumes RCSI on. P4-05 names refusal as the simpler
 correct end state. With no deployments (CLAUDE.md §0), refusing costs nothing to migrate.
 
-**What `[pipeline].require_rcsi_for_pooled` does now.** It is not quite dead. The gate runs only
+**What `[pipeline].require_rcsi_for_pooled` did on 2026-09-26** (superseded: the key was retired on 2026-09-28, see *Built* below). It is not quite dead. The gate runs only
 when a pooled `RegistryRunner` starts. The store can stay open across a runner start, for example
 an HA promotion, so the gate now fires only when RCSI was switched off **after** the store opened
 and **before** that start. A `reload()` of a running graph does not re-run it, and nothing
@@ -490,6 +492,22 @@ rejected: a key that loads cleanly and does nothing reads as a control that is n
 deployments nobody has it set, so the retirement is a plain removal. It touches settings, the
 engine and runner plumbing, the `rcsi_off_degraded` alert type and the tests that construct a
 runner with the knob, so it ships as its own change.
+
+**Built 2026-09-28 (BACKLOG #2090).** The retirement above now exists:
+
+1. `[pipeline].require_rcsi_for_pooled` is gone from `PipelineSettings`. `_REMOVED_KEYS` in
+   `config/settings.py` refuses it at load, in the file or as
+   `MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED`, at either value, with a message naming this section.
+2. The pooled start gate in `RegistryRunner._start_pooled_dispatchers` is unconditional. A raise
+   from `Store.require_rcsi_for_pooled` always unwinds the start. The private
+   `_rcsi_off_degraded` flag is gone with the branch that set it.
+3. The `rcsi_off_degraded` alert event type is **removed, on purpose**. With the downgrade gone,
+   nothing can raise it. An `[[alerts.rules]]` entry naming a type that can never fire reads as
+   coverage that is not there, so the validator now refuses it like any unknown event. The
+   AlertSink method went with it.
+4. The `/stats` `rcsi_off_degraded` gauge was never built. `docs/CONFIGURATION.md`, the settings
+   comment and the store docstrings no longer claim it, and §3.3, §7 and §11 item 6 above carry
+   dated notes rather than a silent rewrite.
 
 **Tests.** `tests/test_sqlserver_rcsi_fail_closed.py` drives the real `open()` against a recording
 `aioodbc` stand-in. Three of its tests fail on the pre-change behaviour: the denied `ALTER`, the

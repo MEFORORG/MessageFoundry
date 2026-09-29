@@ -69,6 +69,7 @@ from messagefoundry.transports.bounded_read import (
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
+    HttpAuthError,
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
@@ -161,6 +162,14 @@ def _read_token_reply(
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
+    except HttpAuthError as exc:
+        # BACKLOG #1171: this opener carries the web proxy's Digest handler, which refuses a 407 it will
+        # not answer (a hash other than SHA-256, or a challenge it cannot parse) with an HttpAuthError.
+        # That is a ValueError, and it escaped this function's DeliveryError contract. Fixed text: the
+        # refusal names the peer's own algorithm token, which stays on the cause only.
+        raise DeliveryError(
+            f"{endpoint} was not reached: the web proxy's authentication challenge was refused"
+        ) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
         # well (BACKLOG #2052). It is already a retryable DeliveryError with a fixed reason, so it

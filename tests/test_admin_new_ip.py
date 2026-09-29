@@ -313,7 +313,12 @@ async def _login_token(c: httpx.AsyncClient, username: str = "boss") -> str:
 async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine) -> None:
     # New-client-IP step-up test (admin route), not an MFA test: pin require_mfa=False so the admin's
     # step-up op isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
-    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True, require_mfa=False))
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, admin_new_ip_step_up=True, require_mfa=False
+        ),
+    )
     await service.initialize()
     await _add_admin(service, "boss")
     async with _client_at(engine, service, "10.0.0.1") as a:

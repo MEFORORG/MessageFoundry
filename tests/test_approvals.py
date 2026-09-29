@@ -59,7 +59,9 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _service(engine: Engine) -> AuthService:
     # Approvals is a step-up admin flow, not an MFA test: pin require_mfa=False so the BACKLOG #187
     # secure default (require_mfa now ON) doesn't 403 the request before the approval path is exercised.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     return service
 

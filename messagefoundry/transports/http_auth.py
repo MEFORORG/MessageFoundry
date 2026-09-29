@@ -49,7 +49,9 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.transports.rest import (
+    HttpAuthError,
     ProxyConfig,
+    _ApprovedDigestMixin,
     cleartext_acceptance_from_settings,
     enforce_outbound_length_limits,
     http_family_trust_anchor,
@@ -98,13 +100,6 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
 # Renew this many seconds before the server's stated expiry so a token never expires mid-flight.
 _DEFAULT_EXPIRY_SKEW = 60.0
 _DEFAULT_TOKEN_TIMEOUT = 30.0
-
-
-class HttpAuthError(ValueError):
-    """A generic outbound-HTTP-auth configuration is invalid (missing secret, a cleartext token endpoint,
-    two mutually-exclusive auth modes on one connection). Raised **loud at connector construction** — like
-    a bad TLS cert — so it fails at ``check`` / dry-run / start, never as a wire-time surprise. The message
-    never contains a secret value."""
 
 
 @runtime_checkable
@@ -332,40 +327,10 @@ def bearer_provider_from_settings(
     )
 
 
-#: Digest algorithms this engine will answer a challenge with (BACKLOG #1171, ASVS 11.4.1). The
-#: ``-sess`` variants are the same hash and are accepted by stripping the suffix.
-#:
-#: **The SERVER chooses, not us.** ``urllib``'s handler reads ``chal.get('algorithm', 'MD5')`` -- so an
-#: endpoint that simply OMITS the parameter, which is the common RFC 2617 case, gets answered with MD5.
-#: Appendix C marks MD5 **D**: disallowed for any cryptographic purpose, in a clause with no default-off
-#: escape. There is no way to dictate the algorithm to the peer, so the only honest options are refuse
-#: or remove, and refusing keeps the feature for endpoints that offer an approved hash.
-_APPROVED_DIGEST_ALGORITHMS = frozenset({"SHA-256", "SHA-512-256"})
-
-
-class _ApprovedDigestAuthHandler(urllib.request.HTTPDigestAuthHandler):
-    """Refuses a Digest challenge that names a disallowed hash, instead of silently answering it.
-
-    LOUD, not ``return None``. Returning ``None`` makes urllib skip the auth and the request fails as a
-    bare 401 -- an operator would read that as bad credentials and go looking in the wrong place. This
-    raises with the algorithm named, in the same ``HttpAuthError`` contract the rest of this seam uses
-    for a refused hop.
-    """
-
-    def get_authorization(self, req: Any, chal: Mapping[str, str]) -> Any:
-        # Mirrors urllib's own default EXACTLY: an absent parameter means MD5, which is the case that
-        # makes this reachable without a hostile server -- a plain RFC 2617 endpoint.
-        named = str(chal.get("algorithm", "MD5")).strip()
-        base = named.upper().removesuffix("-SESS")
-        if base not in _APPROVED_DIGEST_ALGORITHMS:
-            raise HttpAuthError(
-                f"the endpoint's HTTP Digest challenge names algorithm {named!r}, which is not an "
-                f"approved hash (ASVS 11.4.1; approved here: {sorted(_APPROVED_DIGEST_ALGORITHMS)}). "
-                "urllib defaults to MD5 when the challenge omits the parameter, so an endpoint that "
-                "names nothing lands here too. Use an endpoint offering SHA-256 Digest, or a different "
-                "http_auth mode (BACKLOG #1171)."
-            )
-        return super().get_authorization(req, chal)
+class _ApprovedDigestAuthHandler(_ApprovedDigestMixin, urllib.request.HTTPDigestAuthHandler):
+    """urllib's Digest handler, answering an endpoint's 401 with SHA-256 or refusing it (BACKLOG #1171,
+    ASVS 11.4.1). The check lives in :class:`~messagefoundry.transports.rest._ApprovedDigestMixin`,
+    which the proxy 407 handler shares, so the origin and proxy paths cannot drift apart."""
 
 
 def digest_handler_from_settings(

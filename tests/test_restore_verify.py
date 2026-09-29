@@ -362,6 +362,7 @@ def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> 
     codec_key = base64.b64decode(key_b64)
 
     keyless = _verify_archive_blocking(
+        staging_root=tmp_path / "staging",
         archive_path=archive,
         keys=[codec_key],
         full=True,
@@ -371,6 +372,7 @@ def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> 
     assert "keyless open" in (keyless.reason or ""), keyless.reason
 
     wrong = _verify_archive_blocking(
+        staging_root=tmp_path / "staging",
         archive_path=archive,
         keys=[codec_key],
         full=True,
@@ -380,7 +382,9 @@ def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> 
     assert "did not decrypt" in (wrong.reason or ""), wrong.reason
 
     # And with no settings at all the full verify refuses rather than falling back to a keyless open.
-    absent = _verify_archive_blocking(archive_path=archive, keys=[codec_key], full=True)
+    absent = _verify_archive_blocking(
+        staging_root=tmp_path / "staging", archive_path=archive, keys=[codec_key], full=True
+    )
     assert absent.status == "FAIL"
     assert "no live store settings" in (absent.reason or ""), absent.reason
 
@@ -496,6 +500,7 @@ def test_full_verify_passes_on_an_archive_written_under_a_since_retired_key(tmp_
     # Contrast arm. This split (archive key in hand, store settings without it) is the shipped defect's
     # shape, reached through the blocking call as in the keyless test above.
     without_a = _verify_archive_blocking(
+        staging_root=tmp_path / "staging",
         archive_path=archive,
         keys=[base64.b64decode(key_a)],
         full=True,
@@ -547,6 +552,7 @@ def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error
     iso = _isolate_tempdir(tmp_path, monkeypatch)
 
     res = _verify_archive_blocking(
+        staging_root=iso,
         archive_path=archive,
         keys=[
             base64.b64decode(key_b64)
@@ -619,9 +625,10 @@ def test_cumulative_ceiling_stays_above_the_per_member_ceiling() -> None:
 
 # --- BACKLOG #1721: the decrypted staging directory must not outlive the verify ---------------------
 #
-# The verify decrypts the whole archive into a `mefor-verify-*` directory under the OS temp dir. These
-# tests point the temp dir at `tmp_path` so what the verify leaves behind can be listed exactly, and
-# they measure what matters to PHI at rest: whether any file there still holds bytes.
+# The verify decrypts the whole archive into a `mefor-verify-*` directory under its staging root
+# (BACKLOG #1174). These tests pass a directory under `tmp_path` as that root, and point the OS temp
+# dir at the same place, so what the verify leaves behind can be listed exactly. They measure what
+# matters to PHI at rest: whether any file there still holds bytes.
 
 
 def _isolate_tempdir(tmp_path: Path, monkeypatch) -> Path:
@@ -693,7 +700,10 @@ def test_a_handle_held_at_teardown_leaves_no_plaintext(tmp_path, monkeypatch) ->
     held = _hold_the_extracted_store(monkeypatch)
     try:
         res = _verify_archive_blocking(
-            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+            staging_root=iso,
+            archive_path=archive,
+            keys=[base64.b64decode(key_b64)],
+            full=False,
         )
         assert held, "the holder never ran, so this measured nothing"
         assert res.status == "PASS", res.reason
@@ -724,7 +734,10 @@ def test_an_exception_after_extraction_with_a_held_handle_leaves_no_plaintext(
     try:
         with pytest.raises(RuntimeError, match="synthetic failure after extraction"):
             _verify_archive_blocking(
-                archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+                staging_root=iso,
+                archive_path=archive,
+                keys=[base64.b64decode(key_b64)],
+                full=False,
             )
         assert held, "the holder never ran, so this measured nothing"
         assert _non_empty_files(iso) == []
@@ -753,7 +766,10 @@ def test_a_briefly_held_handle_is_waited_out(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(dr_backup, "_count_tables", hold_then_schedule_release)
     try:
         res = _verify_archive_blocking(
-            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+            staging_root=iso,
+            archive_path=archive,
+            keys=[base64.b64decode(key_b64)],
+            full=False,
         )
         assert held, "the holder never ran, so this measured nothing"
         assert res.status == "PASS", res.reason
@@ -783,15 +799,23 @@ def test_an_undeletable_directory_is_emptied_and_the_verdict_stands(
     monkeypatch.setattr(dr_backup, "_remove_tree", refuse)
     with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
         res = _verify_archive_blocking(
-            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+            staging_root=iso,
+            archive_path=archive,
+            keys=[base64.b64decode(key_b64)],
+            full=False,
         )
     assert res.status == "PASS", res.reason
     # The first try, then one retry after emptying.
     assert len(attempts) == 2
     (leftover,) = _verify_leftovers(iso)
-    assert sorted(p.name for p in leftover.iterdir()) == ["archive.tar", "extracted_store.db"]
+    assert sorted(p.name for p in leftover.iterdir()) == [
+        ".lock",
+        ".lock-held",
+        "archive.tar",
+        "extracted_store.db",
+    ]
     assert _non_empty_files(iso) == []
-    assert any("no file in it holds decrypted bytes" in r.getMessage() for r in caplog.records)
+    assert any("no file in it holds plaintext" in r.getMessage() for r in caplog.records)
 
 
 def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
@@ -815,7 +839,10 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
     monkeypatch.setattr(dr_backup, "open", open_refusing_writes, raising=False)
     with caplog.at_level(logging.ERROR, logger=dr_backup.__name__):
         res = _verify_archive_blocking(
-            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+            staging_root=iso,
+            archive_path=archive,
+            keys=[base64.b64decode(key_b64)],
+            full=False,
         )
     (leftover,) = _verify_leftovers(iso)
     assert res.status == "FAIL", res.reason
@@ -840,7 +867,12 @@ def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, mon
 
     monkeypatch.setattr(dr_backup, "_count_tables", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        _verify_archive_blocking(archive_path=archive, keys=[base64.b64decode(key_b64)], full=False)
+        _verify_archive_blocking(
+            staging_root=iso,
+            archive_path=archive,
+            keys=[base64.b64decode(key_b64)],
+            full=False,
+        )
     assert _verify_leftovers(iso) == []
 
 
@@ -860,7 +892,12 @@ def test_an_exception_carries_the_directory_it_could_not_clear(tmp_path, monkeyp
 
     monkeypatch.setattr(dr_backup, "_count_tables", interrupted)
     with pytest.raises(KeyboardInterrupt) as caught:
-        _verify_archive_blocking(archive_path=archive, keys=[base64.b64decode(key_b64)], full=False)
+        _verify_archive_blocking(
+            staging_root=iso,
+            archive_path=archive,
+            keys=[base64.b64decode(key_b64)],
+            full=False,
+        )
     (leftover,) = _verify_leftovers(iso)
     notes = getattr(caught.value, "__notes__", [])
     assert len(notes) == 1 and str(leftover) in notes[0], notes
@@ -881,3 +918,46 @@ def test_a_directory_that_cannot_be_listed_is_not_reported_empty(tmp_path, monke
     monkeypatch.setattr(dr_backup, "_walk", walk_refusing)
     unproven = dr_backup._empty_files_in_place(staging)
     assert unproven == ["mefor-verify-x/ (not listed)"]
+
+
+# --- BACKLOG #2101: an archive this build cannot open gets a restore remedy, not the store's -------
+
+
+async def test_full_verify_of_an_incompatible_archive_names_the_version_to_restore_with(
+    tmp_path,
+) -> None:
+    """The snapshot's schema differs from this build's, so the full open refuses it (#1720). The store's
+    own remedy -- move the store aside, recreate it, and for a keyed store change the key -- is wrong
+    for an archive that decrypted and passed its checks. The verdict names the version that wrote it."""
+    key_b64 = generate_key()
+    db = tmp_path / "msg.db"
+    store = await MessageStore.open(db, cipher=make_cipher(key_b64))
+    # An index with the right name and the wrong columns: the shape an incompatible version leaves.
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            "DROP INDEX ix_messages_control; CREATE INDEX ix_messages_control ON messages(control_id);"
+        )
+    finally:
+        conn.close()
+    ss = StoreSettings(path=str(db), encryption_key=key_b64)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "b")),
+        store_settings=ss,
+        config_dir=None,
+        engine_version="0.3.2-test",
+    )
+    result = await runner.run_once(now=1.0)
+    assert result is not None
+    await store.close()
+
+    res = await run_restore_verify(result.archive_path, store_settings=ss, full=True)
+
+    assert res.status == "FAIL"
+    assert res.integrity_ok is True  # the archive is not damaged
+    reason = res.reason or ""
+    assert "restore it with engine '0.3.2-test'" in reason, reason
+    assert "index 'ix_messages_control'" in reason, reason
+    # None of the live store's remedy: it would send the operator to recreate a store or change a key.
+    assert "recreate" not in reason and "NEW store key" not in reason, reason

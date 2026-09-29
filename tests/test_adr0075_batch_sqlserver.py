@@ -16,8 +16,8 @@ positioning-safety proof depends on:
   ``messages.status`` was NOT advanced. The load-bearing guarantee: no unserialized write commits.
 * (c) SERIALIZATION — concurrent batched finalizers of the same message do not corrupt / lost-update
   the disposition (the applock discipline holds under batching).
-* (d) NOCOUNT PARITY — a ``cursor.rowcount``-dependent op (``reset_stale_inflight``) on the same pooled
-  connection returns the correct count after a batched handoff (``SET NOCOUNT ON`` doesn't corrupt it).
+* (d) NOCOUNT PARITY — a ``cursor.rowcount``-dependent op (``_execute``) returns the correct count after
+  a batched handoff. The pool is not pinned, so it may not run on the handoff's connection.
 * (e) A/B DISPOSITION PARITY — a full route→transform→deliver pass yields the identical disposition +
   row structure with the flag ON vs OFF, with zero lost/duplicate rows.
 
@@ -271,8 +271,11 @@ async def test_batched_concurrent_finalizers_do_not_corrupt_disposition(store: A
 
 async def test_rowcount_ops_correct_after_batched_handoff(store: Any) -> None:
     # After a batched handoff (which runs SET NOCOUNT ON in its render), a cursor.rowcount-dependent op
-    # on the SAME pooled connection must still return the correct count. reset_stale_inflight recovers
-    # INFLIGHT rows via rowcount; claim one row INFLIGHT and assert it recovers exactly it.
+    # must still return the correct count. The pool is not pinned, so the op may run on a different
+    # connection than the handoff did; the pinned reading is the BACKLOG-2097-NOCOUNT probe in
+    # test_sqlserver_store.py. The canary is _execute, which
+    # returns the driver's rowcount. reset_stale_inflight was the canary until BACKLOG #2097 moved its
+    # count to an OUTPUT rowset; it stays below only to re-pend the claimed row.
     store.set_batch_handoff_statements(True)
     mid, ing = await _ingress_and_claim(store)
     await _route(store, "IB", mid, ing, handlers=[("h", RAW)], disposition=MessageStatus.ROUTED)
@@ -284,9 +287,8 @@ async def test_rowcount_ops_correct_after_batched_handoff(store: Any) -> None:
     )
     ob = await store.claim_next_fifo("OB1", stage=Stage.OUTBOUND.value)  # -> INFLIGHT
     assert ob is not None
-    # rowcount-driven recovery must see exactly the one INFLIGHT row (NOCOUNT did not zero it).
-    recovered = await store.reset_stale_inflight()
-    assert recovered >= 1
+    assert await store._execute("UPDATE queue SET updated_at=updated_at WHERE id=?", (ob.id,)) == 1
+    assert await store.reset_stale_inflight() >= 1
 
 
 # ============================ (e) A/B DISPOSITION PARITY ============================

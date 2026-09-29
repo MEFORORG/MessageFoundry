@@ -262,6 +262,8 @@ class _EmptyClaimObserver(Protocol):
 
     def record_claim_lock_timeout(self) -> None: ...
 
+    def record_claim_head_skips(self, lanes: int) -> None: ...
+
 
 @dataclass
 class _LocalEmptyCounter:
@@ -276,6 +278,10 @@ class _LocalEmptyCounter:
     #: three above, which count lanes — one aborted 256-lane chunk is 256 there and 1 here, so the two
     #: are not a part and a whole and must never be divided.
     claim_lock_timeouts: int = 0
+    #: BACKLOG #1270. LANES whose due head the store's claim skipped past a lock (see
+    #: ``ClaimedHeads.head_skipped``). Counts lanes, like the three above: it names a CAUSE for
+    #: EMPTY lanes, and is not a separate event to add to them.
+    claim_head_skips: int = 0
 
     def record_empty(self, *, woken: bool) -> None:
         self.total += 1
@@ -286,6 +292,35 @@ class _LocalEmptyCounter:
 
     def record_claim_lock_timeout(self) -> None:
         self.claim_lock_timeouts += 1
+
+    def record_claim_head_skips(self, lanes: int) -> None:
+        self.claim_head_skips += lanes
+
+
+@dataclass
+class _WindowedCount:
+    """A count booked per event and reported at most once per window (BACKLOG #1270's log throttle).
+
+    BOOKING AND REPORTING ARE SEPARATE STEPS, and :meth:`take` runs on EVERY claim round-trip, not
+    only on one that booked. Gated behind the booking, the printed number was not the window's number
+    in either direction: a burst's suppressed events were flushed by nothing, and the next isolated
+    event inherited a total from a window long closed. An EMPTY window returns WITHOUT stamping the
+    clock (the rule ``LaneEpisodeTiming.maybe_emit`` states in full): stamping a nothing-to-say tick
+    would throttle the next real event for a whole window and consume the ``-inf`` start, which is
+    what lets the FIRST event of a process report at once."""
+
+    last_emit: float = float("-inf")
+    pending: int = 0
+
+    def book(self, n: int = 1) -> None:
+        self.pending += n
+
+    def take(self, now: float) -> int:
+        """The window's total when it is due to report (resetting it), else 0."""
+        if not self.pending or now - self.last_emit < _DELIVERY_PHASE_EMIT_INTERVAL:
+            return 0
+        n, self.pending, self.last_emit = self.pending, 0, now
+        return n
 
 
 class StageDispatcher:
@@ -399,14 +434,17 @@ class StageDispatcher:
         # silence this line exists to break. Aborts are counted into the window even when the line
         # is suppressed AND the window is flushed on any later round-trip, so the emitted number is
         # that window's true total and not a sample of it.
-        self._lock_timeout_last_emit = float("-inf")
-        self._lock_timeouts_since_emit = 0
+        self._lock_timeout_window = _WindowedCount()
         # The last-seen abort's attempt-scoped detail, for the emitted line's "most recent abort"
         # clause. Held here because the flush may land on a round-trip that did NOT abort, which has
         # no `lock_timeout` of its own to read. Only ever read when the window is non-empty, which
         # means an abort has set them; the initial values are never printed.
         self._lock_timeout_last_phase = ""
         self._lock_timeout_last_lanes = 0
+        # BACKLOG #1270, the head-of-line skip: the same throttle, its own window. Separate because
+        # the two lines report different routes; sharing one would let a burst on one route suppress
+        # the first line of the other.
+        self._head_skip_window = _WindowedCount()
         # Debug tripwire: the one-consumer-per-lane invariant. Must stay 0 (the 200-lane soak asserts).
         self._busy_violations = 0
         # BACKLOG #1609 claimer/sweep supervision, keyed by task name (see _Supervised).
@@ -1127,9 +1165,9 @@ class StageDispatcher:
         # sibling claimers at K>1 write the same operator's log. Safe to share because this whole
         # block is await-free, so a sibling can never interleave a partial update.
         # (5) BOOKING AND EMITTING ARE SEPARATE STEPS. An abort BOOKS into the open window; the
-        # window is evaluated on EVERY round-trip, aborted or not — the discipline
-        # `_emit_lane_episode()` states six lines below, for the same reason. Gated behind the abort
-        # branch the printed number was not the window's number, in either direction: a burst
+        # window is evaluated on EVERY round-trip, aborted or not (see `_WindowedCount`), the
+        # discipline `_emit_lane_episode()` states at the end of this method, for the same reason.
+        # Gated behind the abort branch the printed number was not the window's number, in either direction: a burst
         # under-reported (its suppressed aborts were counted and then flushed by nothing) and the
         # next isolated abort over-reported (inheriting a total from a window long closed).
         # `phase`/`lanes_in_claim` are ATTEMPT-scoped, so the clause below carries the LAST-SEEN
@@ -1137,18 +1175,10 @@ class StageDispatcher:
         # round-trip has no phase of its own to print.
         if lock_timeout is not None:
             self._empty.record_claim_lock_timeout()
-            self._lock_timeouts_since_emit += 1
+            self._lock_timeout_window.book()
             self._lock_timeout_last_phase = lock_timeout.phase.value
             self._lock_timeout_last_lanes = lock_timeout.lanes_in_claim
-        # An EMPTY window returns WITHOUT touching `_lock_timeout_last_emit` — the same rule, for the
-        # same reason, that `LaneEpisodeTiming.maybe_emit` states in full (phase_timing.py): this runs
-        # on every round-trip, so stamping the clock on a nothing-to-say tick would throttle the next
-        # REAL sample for a whole window. Here it would also consume the `-inf` start and delay the
-        # first abort of a process by five seconds — the exact silence this line exists to break.
-        if self._lock_timeouts_since_emit and (
-            now - self._lock_timeout_last_emit >= _DELIVERY_PHASE_EMIT_INTERVAL
-        ):
-            self._lock_timeout_last_emit = now
+        if aborts := self._lock_timeout_window.take(now):
             log.info(
                 "StageDispatcher %s: %d claim round-trip(s) in the last window aborted on a "
                 "store lock timeout (most recent abort: %s phase, %d lane(s) in the claim); "
@@ -1156,11 +1186,28 @@ class StageDispatcher:
                 "re-readies them. At least one row the claim needed was held — the claim rolled "
                 "back before reading a row, so the store cannot say which (BACKLOG #1270)",
                 self._stage.value,
-                self._lock_timeouts_since_emit,
+                aborts,
                 self._lock_timeout_last_phase,
                 self._lock_timeout_last_lanes,
             )
-            self._lock_timeouts_since_emit = 0
+        # BACKLOG #1270, the head-of-line skip. A LANE-level observation (the claim completed and read
+        # each discovered head), so the counter moves by the number of lanes the store named. Every
+        # one of them came back EMPTY in the loop above: this names the cause, it is not a second
+        # event. Rules (2) to (5) above apply unchanged: INFO, counts never lane names, throttled,
+        # booked and reported as separate steps.
+        if n_skipped := len(result.head_skipped):
+            self._empty.record_claim_head_skips(n_skipped)
+            self._head_skip_window.book(n_skipped)
+        if skipped := self._head_skip_window.take(now):
+            log.info(
+                "StageDispatcher %s: %d lane claim(s) in the last window came back EMPTY because"
+                " the store skipped a due head it could not lock (another transaction held it, or"
+                " it changed after discovery). Head-of-line order forbids claiming past it, so the"
+                " lane waits for its next claim (a wake or the sweep) rather than reading as a"
+                " lane with no work (BACKLOG #1270)",
+                self._stage.value,
+                skipped,
+            )
         # Flush the episode window on EVERY claim round-trip, exactly as the claim line already does. A
         # stage that has gone quiet still CLAIMS (empty claims keep firing while the sweep re-readies
         # lanes), so this is what guarantees a draining rung's FINAL window — the tail, where S_lane is
@@ -1744,6 +1791,13 @@ class StageDispatcher:
         A different unit from :attr:`empty_claims`, which counts LANES — one aborted 256-lane chunk is
         256 there and 1 here. Read defensively for the same reason as the triple above."""
         return int(getattr(self._empty, "claim_lock_timeouts", 0))
+
+    @property
+    def claim_head_skips(self) -> int:
+        """LANE claims that came back EMPTY because the store skipped a due head it could not lock
+        (BACKLOG #1270). Lanes, like :attr:`empty_claims`. Not quite a subset of that total: a lane an
+        operator paused mid-claim goes straight to PAUSED without an empty booking."""
+        return int(getattr(self._empty, "claim_head_skips", 0))
 
     def phase(self, key: str) -> _LanePhase | None:
         st = self._states.get(key)

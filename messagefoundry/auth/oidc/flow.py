@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from messagefoundry.redaction import json_loads_or_refusal
 
@@ -128,6 +128,9 @@ class PendingFlow:
     #: at or after this instant, less the clock skew; ``max_age=0`` asks the IdP for that, and this
     #: is how the engine checks it was honoured. ``0.0`` on a flow that predates the field.
     issued_at: float = 0.0
+    #: Stamped by :meth:`FlowCache.put` on the cache's own clock, so :meth:`FlowCache.age` reads the
+    #: same clock (BACKLOG #2301). ``0.0`` on a flow never staged, which reads as staged long ago.
+    started: float = 0.0
 
 
 class FlowCache:
@@ -160,8 +163,9 @@ class FlowCache:
         for k in [k for k, e in self._entries.items() if e.deadline <= now]:
             del self._entries[k]
 
-    def put(self, flow_id: str, flow: PendingFlow) -> None:
-        """Stage ``flow`` under ``sha256(flow_id)``, enforcing the global and per-IP caps."""
+    def put(self, flow_id: str, flow: PendingFlow) -> PendingFlow:
+        """Stage ``flow`` under ``sha256(flow_id)``, enforcing the global and per-IP caps, and return
+        the staged copy, stamped with the instant it was staged."""
         now = self._clock()
         self._prune(now)
         if len(self._entries) >= self._global_cap:
@@ -175,7 +179,13 @@ class FlowCache:
                 f"OIDC login refused: too many pending flows from {flow.client_ip} "
                 f"({self._per_ip_cap})."
             )
-        self._entries[self._key(flow_id)] = flow
+        staged = replace(flow, started=now)
+        self._entries[self._key(flow_id)] = staged
+        return staged
+
+    def age(self, flow: PendingFlow) -> float:
+        """Seconds since ``flow`` was staged, on this cache's clock (BACKLOG #2301)."""
+        return self._clock() - flow.started
 
     def peek(self, flow_id: str) -> PendingFlow | None:
         """The live flow for ``flow_id`` WITHOUT consuming it; None if absent or expired.
@@ -231,8 +241,7 @@ def start_flow(
         step_up_purpose=step_up_purpose,
         issued_at=wall_clock(),
     )
-    cache.put(flow_id, flow)
-    return flow_id, flow
+    return flow_id, cache.put(flow_id, flow)
 
 
 def state_matches(expected: str, received: str) -> bool:

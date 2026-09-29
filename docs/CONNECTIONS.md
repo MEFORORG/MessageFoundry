@@ -1074,7 +1074,10 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
 **Downloads are made safe at serve (ASVS 1.3.4).** The attachment download route (GET
 `/messages/{message_id}/attachments/{attachment_id}`, and its `/ui` delegate) serves the stored bytes
 **verbatim** (the preserve-the-original invariant forbids rewriting a clinical payload) but neutralizes
-them at the response. The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
+them at the response. An SVG is the exception: it is served as a copy rebuilt from a tag and attribute
+allow-list, or refused with HTTP 422 when it cannot be vetted, and the stored value stays verbatim. The
+rules are recorded once, in
+[ADR 0105's 2026-09-28 amendment](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md). The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
 which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
 reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
 `text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served
@@ -1135,6 +1138,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
 | `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying chain + hostname (#129, ADR 0094). Same contract, and the same unreported risk, as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate, no escape variable and no loosening register covers it**, so nothing but the per-build WARNING records that it is set — and the FTPS hop has **no revocation gate either**, so an expired *and* revoked partner certificate crosses here with nothing refusing it. Put the connection name and a removal date in your own risk register |
+| `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
 | `poll_seconds` | in | `5.0` | poll interval |
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; use `after_read`/the partner's own write-then-rename to avoid partial reads. |
@@ -1236,6 +1240,7 @@ one.
 | `timeout_seconds` | `30` | per-request timeout |
 | `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract and the same reporting gap as the [MLLP row](#mllp--mllp): **no posture gate, no escape variable, and `security_loosenings()` never reports it** |
+| `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `encoding` | `utf-8` | request-body charset |
 
 **Delivery semantics.** A **2xx** is delivered. **5xx / 408 / 429 / connection / DNS / TLS / timeout**
@@ -1643,6 +1648,7 @@ follow-on and is **not** built.
 | `timeout_seconds` | `30` | per-request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate, no escape variable, and it is never reported by `security_loosenings()`** — see the [MLLP row](#mllp--mllp) |
+| `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `encoding` | `utf-8` | envelope charset |
 
 **Fault & delivery semantics.** The response is inspected for a SOAP `Fault` (which can arrive as an HTTP
@@ -1957,6 +1963,7 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `timeout_seconds` | `30` | per-request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate, no escape variable, and it is never reported by `security_loosenings()`** — see the [MLLP row](#mllp--mllp) |
+| `tls_ca_file` | — | **(#1180)** pins this hop to one private CA; `FhirLookup()` takes it too. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `encoding` | `utf-8` | body charset |
 | `capture_response` | `false` | capture the server reply (assigned resource / `OperationOutcome`) as a response artifact (ADR 0013) |
 | `reingress_to` | — | route the captured reply into this `Loopback` inbound (implies capture) |
@@ -2288,6 +2295,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 | `headers` | `{}` | static extra headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `timeout_seconds` | `30.0` | request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default). **`DICOMweb()` has no `tls_allow_expired`** — it reuses the REST client but does not read that setting, so a DICOMweb hop always enforces certificate expiry |
+| `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `capture_response` | `false` | capture the STOW-RS `dicom+json` response as a reply (ADR 0013) |
 
 **Status classification.** A 2xx whose `dicom+json` body carries a per-instance **FailedSOPSequence**
@@ -2542,6 +2550,48 @@ suppress a refusal. Not every cell does: the database weakened-TLS audit line om
 `DatabaseRef` sync logs nothing. So those two reports are the complete record. The risk entry is in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). It does not reach a revocation refusal, which is
 `tls_revocation_attested`, or SMTP `AUTH` over cleartext, which is refused outright.
+
+## Pinning a private CA per connection (`tls_ca_file`)
+
+`tls_ca_file` names a PEM file holding the CA a partner's server certificate chains to. When it is set,
+the hop trusts **only** the CAs in that file. The OS trust store is not loaded, so no public CA can
+vouch for the partner's host name. Owner ruling R7 of 2026-09-24 made it a supported parameter on
+the HTTP-family factories and `Ftp()` (BACKLOG #1180).
+
+At least these factories take it with this meaning: `Rest()`, `FHIR()`, `Soap()`, `DICOMweb()`,
+`FhirLookup()` and `Ftp()`. `MLLP()`, `DICOM()`, `Email()` and `Direct()` already took it for an
+outbound hop. In `connections.toml` it goes in the connection's `settings` table. Use `env()` when the
+path differs per environment.
+
+```python
+from messagefoundry import outbound, FHIR, env
+
+outbound(
+    "FHIR-OUT_ACME_ORU",
+    FHIR(url=env("acme_fhir_base"), tls_ca_file=env("acme_ca_pem")),
+)
+```
+
+| Question | Answer |
+|---|---|
+| Does it beat the instance `[tls]` anchor? | Yes. The connection's own CA wins over `internal_ca_file` in every `trust_anchor_mode` ([ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)). |
+| Does it turn any check off? | No. Chain, host name and expiry checks stay on. It only chooses which CAs do the verifying. |
+| What about `[tls].crl_file`? | On a hop that reads the `[tls]` block, it still applies and turns on leaf revocation checking. That CRL file must then carry a CRL from this CA too, or every handshake on the hop fails. An inbound `Ftp()` poller does not read the `[tls]` block at all, so it checks no CRL. |
+| Does it reach a token endpoint? | Yes. Where a connection signs in through SMART or OAuth2, the token hop trusts the same file, even when `verify_tls = false`. If the authorization server chains to a different CA, put that CA in the same PEM file. That also widens the data hop to it, and no separate token-hop setting exists. |
+| What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop still reads it, as the row above says. |
+| Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
+| Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
+| What if the file is missing? | The build fails, and the error does not name the setting. `messagefoundry check` and a reload build every connection in one pass, so one missing file fails that whole pass. |
+| What if it is blank? | On these six factories a blank literal is refused at load. A blank `env()` value is not caught: the hop acts as if the setting were unset. Check each environment's value. |
+| When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
+| What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
+
+**It is opt-in.** Every default still trusts the OS store, so an internal hop without it is verified
+against every CA the OS trusts. **Protect the file from writes.** It is not a secret, but whoever can
+replace it chooses which CA the hop trusts.
+
+On an inbound listener the same key means something different. On `Http()`, and on an inbound
+`MLLP()` or `DICOM()`, it is the CA a **calling client's** certificate must chain to.
 
 ## Per-connection retention, document pruning & diagnostics overrides
 

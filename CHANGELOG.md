@@ -21,6 +21,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   the published list cannot hold it. A password holding a shipped term and a site term gets both
   refusals. Env: comma-separated or a JSON array, in `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`.
   (`BACKLOG #1132`)
+- **Six connection factories take a per-connection `tls_ca_file`.** `Rest()`, `FHIR()`, `Soap()`,
+  `DICOMweb()`, `FhirLookup()` and `Ftp()` (FTPS only) now accept a PEM path or an `env()`
+  reference. When it is set, that hop trusts only the CAs in that file, never the OS store. The
+  connectors already read the key; before this, no factory could write it. Unset, every hop is
+  built exactly as before, so defaults are unchanged. `docs/CONNECTIONS.md`, "Pinning a private CA
+  per connection", covers what is refused at load, the token hop, CRLs and failures.
+  (`BACKLOG #1180`, ASVS 12.3.4)
 - **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
   and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
   at the same width, with no salt, so two captured sides still match. The default rules apply it
@@ -248,6 +255,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **DR backup and restore-verify no longer stage plaintext in the OS temp dir.** On a SQLite store
+  the snapshot, its tar and the verify's decrypted copy now stage in the store's own data directory.
+  Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
+  its first byte, and the snapshot gets it once its copy completes. A server-DB store stages in
+  `.mefor-staging` under `[backup].destination`, where the engine applies no ACL. Staging is
+  removed on success, on an exception and on cancellation. A directory left by a crash or `SIGKILL`
+  is removed by the next backup, which goes by each directory's lock and never by its age, so a
+  sibling engine shard's live run survives it; nothing is swept at `serve` start. When a good
+  backup's staging cannot be cleared, the run still succeeds, raises a `backup_failed` alert of kind
+  `cleanup`, and names the directory in its audit row and in the `backup` command's output. Staging now needs free space on the data
+  volume (about twice the store while it runs), and a standalone `restore-verify` needs write access
+  to the data directory, or on a server-DB box to the archive's own directory. The archive key is
+  now picked by comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and
+  §8 state what is still unbounded. (`BACKLOG #1174`, `BACKLOG #1721`, `BACKLOG #1167`)
 - **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
   grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
   (`BACKLOG #1135`)
@@ -421,6 +442,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   kept a default-on console on the `/ui` exposure checks, which can refuse start, instead of dropping
   it. `serve` now reads whether `[security].serve_web_console` was provided directly, so that switch
   behaves as before. (`BACKLOG #2000`)
+- **BREAKING: `[pipeline].require_rcsi_for_pooled` is removed and refused at load, in the file and
+  as `MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED`, at either value.** A SQL Server store already
+  refuses to open with `READ_COMMITTED_SNAPSHOT` off (`BACKLOG #1628`). So `false` could only start
+  a pooled runner in the mode that deadlocks. The pooled start gate now always fails closed. The
+  `rcsi_off_degraded` alert event type is removed too, because nothing can raise it. An
+  `[[alerts.rules]]` entry naming it is now refused like any unknown event. Embedders lose the
+  `require_rcsi_for_pooled` parameter of `RegistryRunner`, `Engine` and `create_managed_app`. The
+  `AlertSink` protocol and both shipped sinks lose the `rcsi_off_degraded` method. See ADR 0066 §12.
+  (`BACKLOG #2090`)
 - **BREAKING: an administrator must give a notification address to create an account.**
   `POST /users` now requires `email`, and the web console's create-user form requires it too. The
   address becomes the account's notification address, so its holder is told about changes made
@@ -527,6 +557,29 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
+  The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
+  It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
+  account existed at the preset's last save, so a new account that reused a deleted user's name does
+  not inherit that user's presets. Every other preset is dropped, because no account could reach it.
+  That includes presets saved under the no-auth `system` identity. On PostgreSQL and SQL Server the
+  step runs in the schema batch, under `provision-schema` and `auto` alike. The 0.4.0 entry's advice
+  to drop the table first no longer applies from this release on. (`BACKLOG #1909`)
+- **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
+  whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
+  algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal
+  is an `HttpAuthError` naming the algorithm, raised before any hash uses the password. It is the
+  `__cause__` of the error a send, probe or token request reports. Before this, the proxy path used
+  urllib's own handler with no check. Endpoint Digest already refused MD5, and both paths now share
+  one check. `SHA-512-256` and every `-sess` form are refused too. urllib cannot compute them, so a
+  challenge naming one crashed with a bare `ValueError`. A challenge that is malformed, or leads with
+  another scheme such as NTLM, is refused the same way. A lowercase `sha-256` is answered as SHA-256.
+  Repeated refusals no longer leave the connection failing every later send as a `401`. A rejected
+  credential is answered once per request, not six times, so the peer's own status surfaces.
+  Separately, `proxy_auth_type = "digest"` never authenticated at all. urllib looked the proxy
+  credential up by the destination URL and found nothing, so every send failed as a bare `407`. For
+  an http destination it now finds the credential. It answers only a request that went through the
+  proxy, never one sent direct under a `no_proxy` match. (`BACKLOG #1171`, ASVS 11.4.1)
 - **The message for a group- or world-writable trust anchor now names its own fix.** It used to
   point at `docs/security/OFF-LOOPBACK-DEPLOYMENT.md`, which ships in neither a checkout nor a
   wheel. The same text is the refusal under `[security].enforcement = enforce` and the warning under
@@ -545,6 +598,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   unchanged, so a refused owner check still reads as a missing file. The console's own pacing and
   permission refusals are not covered.
   (`BACKLOG #1169`, PR 1506 follow-up A)
+- **Replacing a CRL file no longer clears its expiry alert while a running hop holds the old copy.**
+  A hop reads its CRL once, when it builds its TLS context, and keeps that copy until a restart. The
+  `[cert_monitor]` scan read only the file. So a replaced CRL looked fresh while the hop still held
+  one that would lapse and then refuse every peer. The engine now records each CRL load against the
+  context that holds it, and the scan judges those held copies as well as the file. The alert stays
+  up until the hop is rebuilt, which a restart does. A replaced file that is not near expiry logs a
+  warning on each scan, since the hop does not yet see the new revocations. A missing or unreadable
+  file no longer silences the scan while a hop holds a copy. A CRL a hop loaded from a path no setting
+  names gets its own `held-crl:` row. A CRL file that changes while it is being loaded now refuses,
+  so the copy checked is the copy loaded. `[store].ssl_crl_file` records no copy, because that hop
+  already re-reads the file for each new connection. (`BACKLOG #299`, ASVS 12.1.4)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now
@@ -1130,6 +1194,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   fuzz script. Each carries a per-line `# nosec B311` with its reason. Security values still come from
   `secrets` and `os.urandom`.
   ([BACKLOG #1173](docs/BACKLOG.md))
+- **`serve` now refuses to start when uvicorn lacks a hook the protocol header floor needs.**
+  `messagefoundry/api/protocol_headers.py` checks each uvicorn and websockets internal it overrides
+  when it builds its protocol classes. A missing one used to fall back to uvicorn's own protocol,
+  whose `400` and `500` carry no `nosniff`. Now `serve` prints the missing hook and the installed
+  versions, and exits with code 2, before it mints a certificate or opens the store. `supervise`
+  refuses the whole fleet the same way before it spawns a shard. There is no opt-out. A hook the
+  floor calls synchronously that became a coroutine is refused too. A WebSocket protocol without
+  the legacy server's `write_http_response`, such as the sans-I/O one or wsproto, is refused the
+  same way. `pyproject.toml` now bounds uvicorn below 0.50, and the DAST target serves the same
+  floored protocols and the same bannerless `Server` setting `serve` does. Steps on a single
+  response still degrade to uvicorn's own response and log a WARNING, and uvicorn's
+  `100 Continue` still carries no header. (`BACKLOG #1120`)
+- **BREAKING: a directory account with no directory id no longer signs in or steps up by its
+  username.** The engine now refuses a Windows SSO sign-in whose directory entry has no readable
+  `objectGUID`. It refuses whether or not an account already exists for that name, and it creates
+  no account. The web console shows the generic SSO failure, and the `auth.login_failed` audit row
+  carries `directory_object_id_missing`. The AD step-up re-bind (`POST /me/reauth`,
+  `POST /ui/reauth`) refuses an account with no directory id for the same reason. It refuses before
+  it sends the password anywhere. It also refuses an answer about a different directory object
+  (`directory_identity_conflict`) or one with no readable id. None of these refusals counts toward
+  the account lockout. The web console still shows these step-up refusals as a wrong password.
+  - **Why.** A username is the only key such an account has, and a directory can give a freed
+    username to a new person. That person's sign-in would then reach the old account and give it
+    their groups, and their password would step up the old account's session (ADR 0184 AC-5).
+  - **The cost.** A directory that does not return `objectGUID` to the service account signs nobody
+    in through Windows SSO. The engine logs a warning naming the cause once. The fix is to make the
+    attribute readable to the service account. For an account left with no directory id, an
+    administrator deletes it, and the person signs in again to create it with one.
+  - **The step-up re-bind now finds the account by its `objectGUID`, not its username.** The typed
+    password goes only to the account's own directory entry, and a renamed account can still step
+    up. This adds no directory read: each lookup is keyed on the id instead of the name.
+
+  (`BACKLOG #2027`, ADR 0184)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -1243,8 +1340,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer asks about such an account by its username either. It skips it and writes one
   `auth.ad_reconcile_binding_unkeyed` row with the same reason, once per account per process. That
   is a new audit action, separate from the outage's `auth.ad_reconcile_skipped`, because it is not
-  benign. On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds
-  such an account by its username, as it finds any account with no directory id there.
+  benign. A Windows SSO sign-in to such an account is refused as well, by the directory-id
+  entry at the top of this section; before it, that sign-in found the account by its username.
   - **Why.** The username is the only key such an account has. A directory can give a freed
     username to a new person, and the linked account would then take that person's groups (ADR
     0184 AC-5).
@@ -1472,7 +1569,7 @@ All notable changes to MessageFoundry are documented here. The format follows
     `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
   - **A link made before this change on such an account is left in place.** It can still be
     removed, and it cannot be moved to another `sub`. This change added no sign-in refusal for it;
-    the `BACKLOG #2027` entry at the top of this section does. On a directory that now
+    the `BACKLOG #2027` federated-link entry in this section does. On a directory that now
     returns `objectGUID`, its Windows SSO sign-in is refused as `directory_identity_conflict`, as
     it was before this change. Its federated sign-in is now refused as
     `directory_object_id_missing`, which that entry checks first.
@@ -2164,11 +2261,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   `nosniff` and `frame-ancestors 'none'` to responses uvicorn writes below the app. It never adds
   HSTS. It covers at least uvicorn's `400` for a request it cannot parse, and its `500` when the
   app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
-  websockets server's own handshake answers. Each step it adds fails open. On an error it logs a
+  websockets server's own handshake answers. A step on a single response that errors logs a
   WARNING, once per response family and step, and leaves uvicorn's own response as it was. Those
   steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 16.0,
-  the versions `requirements.lock` pins. `pyproject.toml` admits other versions, and on one of
-  them a step may fail open and leave its headers off. (`BACKLOG #1120`)
+  the versions `requirements.lock` pins. When one of those internals is missing, `serve` refuses
+  to start; see the Security entry on the protocol header floor. (`BACKLOG #1120`)
 - **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
   0.4.0's P-256 pin for ES256 let `true`, `1.0` and some other non-integer CBOR values stand in for
   an integer. So an ES256 key whose curve read `true` or `1.0` could enrol past the pin.

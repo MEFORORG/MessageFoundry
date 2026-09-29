@@ -343,15 +343,12 @@ def test_rule_rejects_bad_severity_and_bounds() -> None:
         AlertRule(extra_field="x")  # type: ignore[call-arg]  # extra="forbid"
 
 
-# --- ALERT-12: lane_stuck / rcsi_off_degraded are operator-rule-targetable -----
-# Both are _emit notification types (alert_sinks.py: lane_stuck ADR 0070, rcsi_off_degraded
-# ADR 0066) that later ADRs added but that were omitted from settings._ALERT_EVENT_TYPES, so
-# AlertRule._check_event_type rejected a targeted [[alerts.rules]] rule for either -- an operator
-# could not escalate them to critical, route them to a specific transport, or set a per-rule
-# cooldown; they fired only via the default (all transports, warning). These tests pin the
-# restored mirror invariant + end-to-end routing. They depend on the PAIRED settings.py edit that
-# adds both names to _ALERT_EVENT_TYPES; until that lands the AlertRule(event_type=...)
-# constructions raise ValidationError and the rule-validation cases fail.
+# --- ALERT-12: lane_stuck is operator-rule-targetable -----------------------------
+# lane_stuck (alert_sinks.py, ADR 0070) is an _emit notification type a later ADR added but that was
+# omitted from settings._ALERT_EVENT_TYPES, so AlertRule._check_event_type rejected a targeted
+# [[alerts.rules]] rule for it -- an operator could not escalate it to critical, route it to a
+# specific transport, or set a per-rule cooldown; it fired only via the default (all transports,
+# warning). These tests pin the restored mirror invariant + end-to-end routing.
 
 
 def test_rule_targets_lane_stuck_and_escalates() -> None:
@@ -367,15 +364,12 @@ def test_rule_targets_lane_stuck_and_escalates() -> None:
     )
 
 
-def test_rule_targets_rcsi_off_degraded_and_routes() -> None:
-    # ADR 0066: SQL Server started with RCSI OFF voids the pooled correctness proofs -- an operator
-    # would route this degraded-mode signal to a dedicated transport (and/or escalate).
-    rule = AlertRule(
-        event_type="rcsi_off_degraded", severity=AlertSeverity.CRITICAL, transports=["webhook"]
-    )
-    d = AlertRuleSet([rule]).decide({"type": "rcsi_off_degraded", "connection": "pipeline"})
-    assert d.severity == "critical"
-    assert d.transports == ("webhook",)  # decide() returns the rule's subset as a tuple
+def test_rule_refuses_the_retired_rcsi_off_degraded_event() -> None:
+    # BACKLOG #2090 (ADR 0066 section 12): the pooled RCSI gate fails closed with no override, so
+    # nothing emits rcsi_off_degraded. A rule naming it would never match, so it is refused like any
+    # unknown event -- an alert author must not route a signal that cannot fire.
+    with pytest.raises(ValidationError, match="event_type"):
+        AlertRule(event_type="rcsi_off_degraded")
 
 
 def test_rule_refuses_the_retired_bootstrap_admin_expiring_event() -> None:
@@ -385,17 +379,18 @@ def test_rule_refuses_the_retired_bootstrap_admin_expiring_event() -> None:
         AlertRule(event_type="bootstrap_admin_expiring")
 
 
-async def test_lane_stuck_and_rcsi_off_degraded_emit_and_route_end_to_end() -> None:
-    # End-to-end: a real NotifierAlertSink fans out both new event types through _emit, honoring
-    # per-rule severity escalation and transport routing -- the operator control the config gap denied.
+async def test_lane_stuck_and_backup_failed_emit_and_route_end_to_end() -> None:
+    # End-to-end: a real NotifierAlertSink fans out lane_stuck through _emit, honoring per-rule
+    # severity escalation and transport routing -- the operator control the config gap denied.
+    # backup_failed is the default-routing control.
     web, email = _RecordingTransport("webhook"), _RecordingTransport("email")
     rules = [
         AlertRule(event_type="lane_stuck", severity=AlertSeverity.CRITICAL, transports=["webhook"]),
-        AlertRule(event_type="rcsi_off_degraded", severity=AlertSeverity.CRITICAL),
+        AlertRule(event_type="backup_failed", severity=AlertSeverity.CRITICAL),
     ]
     sink = NotifierAlertSink([web, email], rules=rules)
     sink.lane_stuck("OB_STUCK", detail="delivery streak=42")
-    sink.rcsi_off_degraded("pipeline", detail="RCSI OFF")
+    sink.backup_failed("dr_backup", kind="snapshot", detail="disk full")
     await _drain(sink)
 
     # lane_stuck escalated + routed to webhook only (email never sees it)
@@ -407,9 +402,9 @@ async def test_lane_stuck_and_rcsi_off_degraded_emit_and_route_end_to_end() -> N
     assert "_transports" not in lane_web[0]  # internal routing key popped before send
     assert all(e["type"] != "lane_stuck" for e in email.events)
 
-    # rcsi_off_degraded escalated + default routing = every configured transport
+    # backup_failed escalated + default routing = every configured transport
     for t in (web, email):
-        rcsi = [e for e in t.events if e["type"] == "rcsi_off_degraded"]
-        assert len(rcsi) == 1
-        assert rcsi[0]["severity"] == "critical"
-        assert rcsi[0]["connection"] == "pipeline"
+        backup = [e for e in t.events if e["type"] == "backup_failed"]
+        assert len(backup) == 1
+        assert backup[0]["severity"] == "critical"
+        assert backup[0]["connection"] == "dr_backup"

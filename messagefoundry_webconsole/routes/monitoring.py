@@ -26,8 +26,9 @@ from ._common import (
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
-    """L1a: read-only monitoring pages (alerts + event log). Reuses the metadata-only JSON
-    handlers (no PHI, no step-up) — ADR 0065, BACKLOG #75 phase 1."""
+    """L1a: read-only monitoring pages (alerts + event log). Reuses the monitoring JSON handlers
+    (no step-up) — ADR 0065, BACKLOG #75 phase 1. Not PHI-free: both pages show a scrubbed free-text
+    ``reason`` that ``docs/PHI.md`` section 2 gives a protection level."""
     core = deps.core
 
     @app.get("/ui/alerts", response_class=HTMLResponse)

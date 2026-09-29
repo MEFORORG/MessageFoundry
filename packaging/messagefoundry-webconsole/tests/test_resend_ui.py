@@ -218,7 +218,11 @@ def test_the_confirm_page_holds_a_crafted_id_inside_its_path_segment() -> None:
 async def _service(engine: Engine, *, step_up_max_age: int = 300) -> AuthService:
     service = AuthService(
         engine.store,
-        AuthSettings(require_mfa=False, step_up_max_age_seconds=step_up_max_age),
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            require_mfa=False,
+            step_up_max_age_seconds=step_up_max_age,
+        ),
     )
     await service.initialize()
     return service
