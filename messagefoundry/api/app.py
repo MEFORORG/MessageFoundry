@@ -1678,6 +1678,11 @@ def create_app(
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
+    #
+    # redirect_slashes=False (BACKLOG #1968): Starlette otherwise answers a trailing-slash miss with a
+    # pre-auth 307 whose absolute Location carries the scope scheme. Behind a TLS-terminating proxy
+    # whose X-Forwarded-Proto is not trusted, that scheme is http, so the redirect would point the
+    # client at an http:// URL. No route here ends in "/" and no client calls one, so a miss is a 404.
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -1685,6 +1690,7 @@ def create_app(
         docs_url="/docs" if expose_docs else None,
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
+        redirect_slashes=False,
     )
     if engine is not None:
         app.state.engine = engine
