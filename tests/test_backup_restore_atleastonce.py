@@ -135,14 +135,20 @@ def test_verify_refuses_plaintext_archive_when_a_store_key_is_configured(tmp_pat
     _write_plain_tar(plain, {"manifest.json": b'{"config_only": false}'})
     key = base64.b64decode(generate_key())
 
-    refused = _verify_archive_blocking(archive_path=str(plain), keys=[key], full=False)
+    refused = _verify_archive_blocking(
+        staging_root=tmp_path / "staging", archive_path=str(plain), keys=[key], full=False
+    )
     assert refused.status == "KEY_MISMATCH"
     assert "plaintext" in (refused.reason or "")
 
     # allow_unencrypted lets it proceed past the refusal (it then FAILs for the ordinary reason: no
     # store.db member) — proving the guard is the ONLY thing the flag relaxes.
     allowed = _verify_archive_blocking(
-        archive_path=str(plain), keys=[key], full=False, allow_unencrypted=True
+        staging_root=tmp_path / "staging",
+        archive_path=str(plain),
+        keys=[key],
+        full=False,
+        allow_unencrypted=True,
     )
     assert allowed.status == "FAIL"
     assert "plaintext" not in (allowed.reason or "")

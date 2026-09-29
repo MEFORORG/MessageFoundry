@@ -409,6 +409,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
     # CRYPTO_SEAM_MODULES import, so that delegation is now a first-class inventory token.
+    # BACKLOG #1167: `_select_decrypt_key` walks the whole keyring and compares each key_id fingerprint
+    # to the archive header's with hmac.compare_digest, so the work does not depend on where the match
+    # sits. A comparison only; no key is derived or MACed here.
     # ADR 0049 AC-13 adds the store-cipher seam (store/crypto.py): the FULL restore-verify opens the
     # snapshot's cipher-covered cells through the store's own cipher, under the same cell-bound AAD the
     # store writes (cell_aad, ASVS 11.3.3), to prove the PHI is readable and not merely that a SQLite
@@ -416,7 +419,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # AEAD runs inside it; this module holds only the marker prefix and the fail-closed
     # CipherError/StoreKeylessError verdicts. The AAD comes from store/cipher_cells.py (BACKLOG #1719).
     "messagefoundry/pipeline/dr_backup.py": frozenset(
-        {"hashlib", "messagefoundry.store.backup_codec", "messagefoundry.store.crypto"}
+        {"hashlib", "hmac", "messagefoundry.store.backup_codec", "messagefoundry.store.crypto"}
     ),
     # ADR 0073: rendezvous (HRW) outbound-lane ownership for engine shards — sha256 as a STABLE,
     # process-independent hash (the salted builtin hash() differs per process, which would let two
@@ -1062,6 +1065,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "cipher:.decrypt()",
             "cipher:via messagefoundry.store.backup_codec",
+            "compare:hmac.compare_digest",
             "csprng:via messagefoundry.store.backup_codec",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.config.fingerprint",

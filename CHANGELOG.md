@@ -255,6 +255,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **DR backup and restore-verify no longer stage plaintext in the OS temp dir.** On a SQLite store
+  the snapshot, its tar and the verify's decrypted copy now stage in the store's own data directory.
+  Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
+  its first byte, and the snapshot gets it once its copy completes. A server-DB store stages in
+  `.mefor-staging` under `[backup].destination`, where the engine applies no ACL. Staging is
+  removed on success, on an exception and on cancellation. A directory left by a crash or `SIGKILL`
+  is removed by the next backup, which goes by each directory's lock and never by its age, so a
+  sibling engine shard's live run survives it; nothing is swept at `serve` start. When a good
+  backup's staging cannot be cleared, the run still succeeds, raises a `backup_failed` alert of kind
+  `cleanup`, and names the directory in its audit row and in the `backup` command's output. Staging now needs free space on the data
+  volume (about twice the store while it runs), and a standalone `restore-verify` needs write access
+  to the data directory, or on a server-DB box to the archive's own directory. The archive key is
+  now picked by comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and
+  §8 state what is still unbounded. (`BACKLOG #1174`, `BACKLOG #1721`, `BACKLOG #1167`)
 - **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
   grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
   (`BACKLOG #1135`)
