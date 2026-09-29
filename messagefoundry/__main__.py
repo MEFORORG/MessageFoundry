@@ -8213,17 +8213,18 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
     )
 
 
-#: The subcommands main() does NOT give a stderr log sink, because each installs its own root handler
-#: with the PHI filter chain (`configure_logging`). Every other entry in `_DISPATCH` gets the sink by
-#: default, so a new subcommand is covered without anyone remembering to add it (BACKLOG #1441).
+#: The subcommands the CLI shell (`run_cli`, which main() calls) does NOT give a stderr log sink,
+#: because each installs its own root handler with the PHI filter chain (`configure_logging`). Every
+#: other entry in `_DISPATCH` gets the sink by default, so a new subcommand is covered without anyone
+#: remembering to add it (BACKLOG #1441).
 #: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
 #: checks that each member really calls `configure_logging`.
 #:
 #: KNOWN RESIDUAL, NOT FIXED HERE: `serve` calls `configure_logging` only after its settings, key
 #: and egress gates run, and its WARNINGs in that window still go through the unfiltered
 #: `logging.lastResort`. The comments inside `_serve` rely on that path by name. `supervise` calls it
-#: on its first line, so it has no such window. Whether `serve` should take main()'s sink for that
-#: window is an open question, deliberately not decided by the change that added this set.
+#: on its first line, so it has no such window. Whether `serve` should take run_cli()'s sink for
+#: that window is an open question, deliberately not decided by the change that added this set.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 _DISPATCH = {

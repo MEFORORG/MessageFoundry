@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.__main__ as cli_module
+import messagefoundry.cli_common as cli_common
 import messagefoundry.cli_surface as cli_surface
 from messagefoundry.cli_common import Dispatch
 from messagefoundry.cli_surface import Tier
@@ -136,20 +137,34 @@ def test_main_parses_with_the_builder(monkeypatch: pytest.MonkeyPatch) -> None:
         return parser, {"only-in-the-plant": handler}
 
     # main() installs both process-wide exception hooks. Setting each to its current value makes
-    # the context put it back afterwards, so nothing leaks into later tests.
+    # the context put it back afterwards, so nothing leaks into later tests. The stream hardening
+    # cannot be undone, so it is skipped at both of its call sites, main() and run_cli().
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(cli_module, "harden_console_streams", lambda **_kw: None)
+    monkeypatch.setattr(cli_common, "harden_console_streams", lambda **_kw: None)
     monkeypatch.setattr(cli_module, "_build_parser", planted)
     assert cli_module.main(["only-in-the-plant"]) == 7
     assert ran == ["only-in-the-plant"]
 
 
 def test_building_the_parser_installs_nothing() -> None:
-    """Reading the surface must not change the process: the hooks and the root log handlers are
-    what ``main()`` sets, and the builder must leave all of them alone."""
-    before = (sys.excepthook, threading.excepthook, list(logging.getLogger().handlers))
+    """Reading the surface must not change the process: the hooks, the root log handlers and the
+    console streams are what ``main()`` sets, and the builder must leave all of them alone."""
+
+    def state() -> tuple[object, ...]:
+        streams = (sys.stdout, sys.stderr)
+        return (
+            sys.excepthook,
+            threading.excepthook,
+            list(logging.getLogger().handlers),
+            *streams,
+            *(getattr(s, "errors", None) for s in streams),
+        )
+
+    before = state()
     cli_module._build_parser()
-    assert (sys.excepthook, threading.excepthook, list(logging.getLogger().handlers)) == before
+    assert state() == before
 
 
 # --- Planted breaks. Each must be named by the same function the real test uses. ----------------
