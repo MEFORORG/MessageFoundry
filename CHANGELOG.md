@@ -234,6 +234,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **DR backup and restore-verify no longer stage plaintext in the OS temp dir.** On a SQLite store
+  the snapshot, its tar and the verify's decrypted copy now stage in the store's own data directory,
+  and each plaintext file gets the store's owner-only file ACL (SQLite store only, best-effort)
+  before its first byte. A server-DB store stages in `.mefor-staging` under
+  `[backup].destination`, where the engine applies no ACL. Staging is removed on success, on an
+  exception and on cancellation. A directory left by a crash or `SIGKILL` is removed by the next
+  backup, which goes by each directory's lock and never by its age, so a sibling engine shard's
+  live run survives it; nothing is swept at `serve` start. A backup whose staging cannot be cleared
+  now fails with kind `cleanup` after publishing its archive. The archive key is now picked by
+  comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and §8 state
+  what is still unbounded. (`BACKLOG #1174`, `BACKLOG #1721`, `BACKLOG #1167`)
 - **BREAKING: with `[auth].oidc_enabled` on, a config that sets `oidc_acr_values` while
   `oidc_required_acr_values` names no non-blank value now refuses to load.** `oidc_acr_values` only
   asks the identity provider for an assurance class. The sign-in gate checks the returned `acr`

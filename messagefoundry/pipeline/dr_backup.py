@@ -166,10 +166,10 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: so a lying header or stream cannot exhaust the extract temp dir — but it runs on ``archive.tar``,
 #: which the decrypt has already written to that same temp dir in full. So the member cap is reached
 #: only after the disk it protects is spent. This moves the bound to the first write — on the restore
-#: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted;
-#: it stages in the OS temp dir rather than beside the store, and giving it this bound means adding an
-#: escape arm to that function's ordered ``except`` block, which is a wider change than the one this
-#: constant documents.
+#: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted,
+#: though since BACKLOG #1174 it too stages beside a SQLite store. Its copy is no larger than the
+#: archive file it reads, and giving it this bound means adding an escape arm to that function's
+#: ordered ``except`` block, which is a wider change than the one this constant documents.
 #:
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
@@ -1331,7 +1331,7 @@ def _discard_verify_staging(staging: Path) -> str | None:
     Truncation rather than an overwrite with zeros: on an SSD or a copy-on-write volume an overwrite
     lands on new blocks and proves nothing, so the promise that can be kept is that the FILE no
     longer holds the plaintext. The blocks it freed still do until reused, and only full-disk
-    encryption on the temp volume covers them (docs/PHI.md section 10)."""
+    encryption on the staging volume covers them (docs/PHI.md section 10)."""
     unproven: list[str] = []
     try:
         if _remove_tree(staging):

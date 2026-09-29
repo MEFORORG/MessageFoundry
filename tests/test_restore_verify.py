@@ -625,9 +625,10 @@ def test_cumulative_ceiling_stays_above_the_per_member_ceiling() -> None:
 
 # --- BACKLOG #1721: the decrypted staging directory must not outlive the verify ---------------------
 #
-# The verify decrypts the whole archive into a `mefor-verify-*` directory under the OS temp dir. These
-# tests point the temp dir at `tmp_path` so what the verify leaves behind can be listed exactly, and
-# they measure what matters to PHI at rest: whether any file there still holds bytes.
+# The verify decrypts the whole archive into a `mefor-verify-*` directory under its staging root
+# (BACKLOG #1174). These tests pass a directory under `tmp_path` as that root, and point the OS temp
+# dir at the same place, so what the verify leaves behind can be listed exactly. They measure what
+# matters to PHI at rest: whether any file there still holds bytes.
 
 
 def _isolate_tempdir(tmp_path: Path, monkeypatch) -> Path:
