@@ -23,9 +23,11 @@ GET /ui/messages/search
 GET /ui/messages/search/layered
 GET /ui/messages/{message_id}
 GET /ui/messages/{message_id}/attachments/{attachment_id}
+GET /ui/messages/{message_id}/body
 GET /ui/messages/{message_id}/edit
 GET /ui/messages/{message_id}/parse-tree
 GET /ui/messages/{message_id}/resend-confirm
+GET /ui/messages/{message_id}/summary
 GET /ui/mfa
 GET /ui/monitoring
 GET /ui/monitoring/live

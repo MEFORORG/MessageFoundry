@@ -476,6 +476,36 @@ async def test_outbound_payloads_require_view_raw(engine: Engine) -> None:
         ).status_code == 403  # no view_raw
 
 
+async def test_the_body_fetch_requires_view_raw_and_channel_scope(engine: Engine) -> None:
+    """BACKLOG #2345: ``GET /messages/{id}/raw`` rides the same ``messages:view_raw`` gate and
+    per-channel 404 as the open. The OPERATOR arm is the control: it proves the route serves the body,
+    so the VIEWER's 403 and the out-of-scope 404 are the gate and not a broken route."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "vw", Role.VIEWER)
+    await _add(service, "far", Role.OPERATOR)
+    far = await service.store.get_user_by_username("far")
+    assert far is not None
+    await service.set_channel_scope(far.id, ["other"], actor="test")
+    mid = await engine.store.enqueue_message(channel_id="ch1", raw=ADT, deliveries=[])
+    async with _client(engine, service) as c:
+        op = _auth((await _login(c, "op")).json()["token"])
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        far_h = _auth((await _login(c, "far")).json()["token"])
+        ok = await c.get(f"/messages/{mid}/raw", headers=op)
+        assert ok.status_code == 200 and ok.json()["raw"] == ADT
+        denied = await c.get(f"/messages/{mid}/raw", headers=vw)
+        assert denied.status_code == 403 and "MSH|" not in denied.text  # no view_raw
+        hidden = await c.get(f"/messages/{mid}/raw", headers=far_h)
+        assert hidden.status_code == 404 and "MSH|" not in hidden.text  # outside channel scope
+    body_views = [
+        dict(a)
+        for a in await engine.store.list_audit(limit=50)
+        if dict(a)["action"] == "message_body_view"
+    ]
+    assert [a["actor"] for a in body_views] == ["op"]  # only the served read is a body view
+
+
 async def test_detail_disposition_text_visible_to_operator_and_audited(engine: Engine) -> None:
     # #120: get_message gates error/last_error/event-detail on view_summary and audits the view, but an
     # Operator (holds view_summary + view_raw) must still SEE them — the redaction must not strip an

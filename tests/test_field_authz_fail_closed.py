@@ -71,7 +71,7 @@ def _summary(**over: Any) -> MessageSummary:
 
 
 def _detail() -> MessageDetail:
-    return MessageDetail(**_summary().model_dump(), raw="MSH|^~\\&|S|F", outbox=[], events=[])
+    return MessageDetail(**_summary().model_dump(), outbox=[], events=[])
 
 
 # --- the default: constructed but not released -> serialized as null ----------------------------
@@ -167,7 +167,7 @@ async def test_a_route_that_forgets_redact_unauthorized_denies_rather_than_expos
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         forgotten = (await client.get("/test-forgot-the-call")).json()
-        assert forgotten["raw"], "the non-PHI half of the model must still be returned"
+        assert forgotten["id"], "the non-PHI half of the model must still be returned"
         leaked = {p: forgotten[p] for p in ("summary", "error", "metadata") if forgotten[p]}
         assert not leaked, f"a route with no redact_unauthorized call returned PHI: {leaked}"
         # Positive control on the SAME app and the SAME model: with the call, the holder sees it.
