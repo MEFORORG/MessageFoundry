@@ -1000,8 +1000,13 @@ def test_another_objects_id_warns_once_without_either_value(
 
 @pytest.mark.parametrize(
     ("guid", "found"),
-    [(_FakeAttr(GUID_B_TEXT), False), (None, False), (_FakeAttr(GUID_A_BRACED), True)],
-    ids=["another-object", "absent", "own-id-control"],
+    [
+        (_FakeAttr(GUID_B_TEXT), False),
+        (None, False),
+        (_FakeAttr("nonsense"), False),
+        (_FakeAttr(GUID_A_BRACED), True),
+    ],
+    ids=["another-object", "absent", "unreadable", "own-id-control"],
 )
 def test_authenticate_by_id_never_binds_the_password_as_an_entry_that_is_not_the_row(
     monkeypatch: pytest.MonkeyPatch, guid: _FakeAttr | None, found: bool
@@ -1012,14 +1017,15 @@ def test_authenticate_by_id_never_binds_the_password_as_an_entry_that_is_not_the
     binds: list[str] = []
     _install_directory(monkeypatch, _directory_entry(guid), binds)
     principal = _authenticator().authenticate("jsmith", "synthetic-user-pw", object_id=GUID_A_TEXT)
+    # The service connection auto-binds and never calls bind(), so these are the password binds.
     if found:
         assert principal is not None and principal.directory_object_id == GUID_A_TEXT
-        assert binds[-1] == "CN=jsmith,DC=x"
+        assert binds == ["CN=jsmith,DC=x"]
     else:
         assert principal is None
-        assert "CN=jsmith,DC=x" not in binds, "the password was bound as an unproven entry"
-        # The equalizing bind ran, so the refusal costs the same round trips.
-        assert any("mf-nonexistent-timing-equalizer" in b for b in binds)
+        # Exactly the equalizing bind: the refusal costs the same round trips, and the typed
+        # password goes to no real entry.
+        assert binds == ["CN=mf-nonexistent-timing-equalizer,DC=x"]
 
 
 def test_probe_by_id_answers_no_match_for_another_objects_entry(
@@ -1638,3 +1644,37 @@ async def test_the_reauth_route_says_the_directory_could_not_confirm_the_account
         assert said is (not keep_id)
     finally:
         await engine.stop()
+
+
+class _LookupFailsRebindDirectory(_RebindDirectory):
+    """The bind is refused, then the lookup that would judge it cannot reach the directory."""
+
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
+        raise LdapError("synthetic: LDAP socket closed")
+
+
+@pytest.mark.parametrize(
+    ("directory", "reason"),
+    [
+        (_RebindDirectory(None, None), "not_in_directory"),
+        (_LookupFailsRebindDirectory(None, None), "directory_unavailable"),
+    ],
+    ids=["no-enabled-entry", "lookup-unreachable"],
+)
+async def test_an_unjudged_re_bind_names_its_cause_on_the_audit_row(
+    directory: _RebindDirectory, reason: str
+) -> None:
+    """Every refusal that judged no password says why on ``auth.reauth``, so the row never reads
+    as a wrong guess. RED when either arm drops or swaps its slug."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, token = await _reauth_session(store, directory)
+        elevation = await service.reauth(identity, "synthetic-good", token=token)
+        assert not elevation.ok and elevation.directory_unconfirmed is True
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.failed_attempts == 0
+        assert any(f'"reason": "{reason}"' in d for d in await _reauth_rows(store))
+    finally:
+        await store.close()

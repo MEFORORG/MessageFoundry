@@ -1033,10 +1033,13 @@ class _DirectoryRebind:
 
     ``verdict`` keeps the three answers that method documents. ``reason`` is a closed-set slug set
     whenever ``verdict`` is ``None``, naming why the directory could not judge the password
-    (BACKLOG #2027): ``not_configured``, ``directory_unavailable``, ``not_in_directory`` (no entry
-    for the row's id, or one that does not read it back), or, from a directory implementation
-    that does not check the id itself, ``directory_object_id_missing`` or
-    ``directory_identity_conflict``. The last two are ``None`` whether or not the bind succeeded."""
+    (BACKLOG #2027): ``not_configured``, ``directory_unavailable`` or ``not_in_directory``, and,
+    from a directory implementation that does not check the id itself,
+    ``directory_object_id_missing`` or ``directory_identity_conflict`` (``None`` whether or not
+    the bind succeeded). ``not_in_directory`` means what the IdP step-up's same slug means: no
+    ENABLED entry for the row's id, so absent, disabled, an unreadable account state, or an entry
+    that does not read the id back. The TOTP leg's audit ``outcome`` tells those apart; this leg's
+    second lookup does not."""
 
     verdict: bool | None
     reason: str | None = None

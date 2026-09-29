@@ -224,17 +224,32 @@ def _principal_from(info: dict[str, Any], user_dn: str, groups: frozenset[str]) 
 _object_guid_shapes_warned: set[str] = set()
 
 
+def _warn_once(cause: str, message: str, *args: object) -> None:
+    """Log ``message`` at WARNING the first time ``cause`` is seen in this process, never again."""
+    if cause in _object_guid_shapes_warned:
+        return
+    _object_guid_shapes_warned.add(cause)
+    logger.warning(message, *args)
+
+
+#: What an id-keyed lookup does with an account whose entry is refused, stated once for both
+#: warnings below (BACKLOG #1471, #2027).
+_REFUSAL_EFFECT = (
+    "sign-ins and step-ups that need these accounts' ids are refused, and the directory recheck "
+    "reads an account found by its id as absent, so it ends that account's sessions after "
+    "[auth].ad_session_recheck_strikes passes"
+)
+
+
 def _warn_once_about_object_guid(shape: str) -> None:
     """Report an unusable ``objectGUID`` once per distinct ``shape`` (a type name, or ``absent``)."""
-    if shape in _object_guid_shapes_warned:
-        return
-    _object_guid_shapes_warned.add(shape)
-    logger.warning(
-        "AD %s is unusable (%s); Windows SSO sign-ins and step-up re-binds for these accounts are "
-        "refused, because a directory can recycle a name (BACKLOG #1471, #2027). Reported once "
-        "per shape.",
+    _warn_once(
+        shape,
+        "AD %s is unusable (%s); %s. A directory can recycle a name, so the engine will not fall "
+        "back to it (BACKLOG #1471, #2027). Reported once per shape.",
         _OBJECT_GUID_ATTR,
         shape,
+        _REFUSAL_EFFECT,
     )
 
 
@@ -243,17 +258,16 @@ def _warn_once_about_foreign_object_guid() -> None:
 
     Told apart from :func:`_warn_once_about_object_guid`: the attribute is readable here, so the
     cause is the directory answering the filter with the wrong entry, not the attribute's access or
-    shape. Neither value is logged; each identifies a directory account.
+    shape. Neither value is logged; each identifies a directory account. The cause key holds an
+    apostrophe, which no shape key (``absent``, ``unreadable <type name>``) can.
     """
-    if "foreign" in _object_guid_shapes_warned:
-        return
-    _object_guid_shapes_warned.add("foreign")
-    logger.warning(
-        "An AD search by %s returned an entry carrying a different %s; it is treated as no match, "
-        "so that account's step-ups and directory checks are refused (BACKLOG #2027). Reported "
-        "once.",
+    _warn_once(
+        "another object's id",
+        "An AD search by %s returned an entry carrying a different %s; it is treated as no match. "
+        "%s (BACKLOG #2027). Reported once.",
         _OBJECT_GUID_ATTR,
         _OBJECT_GUID_ATTR,
+        _REFUSAL_EFFECT,
     )
 
 
@@ -581,6 +595,7 @@ class LdapAuthenticator:
         if not conn.entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
         e = conn.entries[0]
+        own: str | None = None
         if expected_object_id is not None:
             own = _object_guid(e)
             if own != expected_object_id:
@@ -606,7 +621,8 @@ class LdapAuthenticator:
                 # BACKLOG #1471. Read through _object_guid, never _attr: that helper str()s whatever it
                 # is given, which would render the raw 16 bytes as a Python bytes repr and store a
                 # second, non-canonical spelling of the same identity.
-                "object_id": _object_guid(e),
+                # An id-keyed lookup has already read it, and proved it equal to the id asked for.
+                "object_id": own if expected_object_id is not None else _object_guid(e),
                 "display_name": _attr(e, "displayName"),
                 "email": _attr(e, "mail"),
                 "memberOf": _multi(e, "memberOf"),
@@ -643,11 +659,14 @@ class LdapAuthenticator:
         bind entry, and ``probe_principal`` and ``resolve_principal``, which serve the step-up legs,
         the federated re-resolve and the session reconciler. So ``authenticate`` never binds the
         typed password as such an entry, and the reconciler never reads another entry's name as a
-        rename. A directory-wide access change that hides ``objectGUID`` reads as a wave of absent
-        accounts, which the reconciler's mass-revocation abort stops rather than applies.
+        rename. **The cost:** a directory-wide change that hides ``objectGUID`` reads as a wave of
+        absent accounts. The reconciler's mass-revocation abort stops a large wave, but not one at
+        or below its absolute floor, so on a small estate those sessions end after the strike
+        threshold. The warnings above say so.
         """
         value = object_guid_filter_value(object_id)
-        if value is None:
+        expected = normalise_object_guid(object_id)
+        if value is None or expected is None:
             # A stored id the filter builder cannot parse. Refusing to search is the honest answer:
             # a search with no filter, or one falling back to the name, would report on a different
             # question than the one asked. The reconciler reads it as ABSENT (ADR 0195 rule item 1).
@@ -656,7 +675,8 @@ class LdapAuthenticator:
             conn,
             f"({_OBJECT_GUID_ATTR}={value})",
             fallback_username=fallback_username,
-            expected_object_id=normalise_object_guid(object_id),
+            # Never None here, so the read-back check cannot be skipped by the two parsers drifting.
+            expected_object_id=expected,
         )
 
     def _resolve_groups(self, conn: Any, user_dn: str, member_of: list[str]) -> frozenset[str]:

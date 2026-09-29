@@ -1217,7 +1217,10 @@ All notable changes to MessageFoundry are documented here. The format follows
     TOTP check and the directory recheck all refuse it, and the recheck no longer takes that entry's
     name as a rename. A federated sign-in or IdP step-up refused this way is audited
     `not_in_directory`, and so is the re-bind, where it was `directory_object_id_missing` or
-    `directory_identity_conflict`. The engine logs a warning once when the id differs.
+    `directory_identity_conflict`. The engine logs a warning once when the id differs. **The
+    cost:** a directory-wide change that hides `objectGUID` reads as absent accounts. The recheck's
+    mass-revocation abort stops a large wave, but at or below its floor the affected sessions end
+    after `[auth].ad_session_recheck_strikes` passes.
   - **What still asks by name:** at least the directory recheck, for an account with no directory
     id and no federated link.
 
