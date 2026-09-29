@@ -127,6 +127,13 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
 
+#: What ``/auth/mfa-verify`` and ``/me/reauth`` say when ``Elevation.directory_unconfirmed`` is set
+#: (BACKLOG #2023, #2027): the directory could not vouch for the account, so the proof was never
+#: checked. It names no directory internals; the precise reason is on the audit row.
+_DIRECTORY_UNCONFIRMED_DETAIL = (
+    "the directory could not confirm this account; try again later, or ask an administrator"
+)
+
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
     """Raise the ``administrator_granted`` alert (BACKLOG #315; why, and the key grammar, are on
@@ -560,7 +567,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         period. Rate-limited like the password change; a failure is a 403 that counts against this
         session's re-proof budget, and toward the account lockout unless the sign-in lock is already
         live. The failure that exhausts the budget ends the session with a 401 (BACKLOG #1138).
-        Neither account lock refuses it.
+        Neither account lock refuses it. A directory re-bind the directory could not judge is also a
+        403, saying so, and charges nothing (BACKLOG #2027).
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -595,6 +603,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     "this session was signed in through the identity provider; re-authenticate"
                     " there through the web console at /ui/reauth, not with a password",
                 )
+            if elevation.directory_unconfirmed:
+                # BACKLOG #2027: the directory could not judge the password, so "failed" would
+                # call a password wrong that was never checked. Same words as /auth/mfa-verify's
+                # directory refusal; the precise reason is on the audit row only.
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         return ElevatedResponse(detail="re-verified", token=elevation.token)
 
@@ -628,11 +641,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
                 # 403 rather than the 401 that would send the client back to sign-in.
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "the directory could not confirm this account; try again later, or ask an"
-                    " administrator",
-                )
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"

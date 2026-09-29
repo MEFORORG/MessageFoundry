@@ -195,11 +195,15 @@ async def test_a_present_enabled_directory_account_still_renews(
     assert await e.service.has_recent_step_up(verified.token) is True
 
 
-async def test_a_bound_row_with_no_directory_id_is_refused_unasked(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "unbound"])
+async def test_a_row_with_no_directory_id_is_refused_unasked(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, bound: bool
 ) -> None:
-    """ADR 0184 AC-5: a row carrying a federated binding and no ``directory_object_id`` may not be
-    asked about by its name, and it has no other key. So the directory cannot confirm it."""
+    """ADR 0184 AC-5, BACKLOG #2027: a row with no ``directory_object_id`` has only its name to be
+    asked by, and a directory may reissue a name. So it is refused without a lookup, bound or not.
+
+    RED when: the unbound arm probes the directory by name, as this leg did before #2027's
+    remainder, or a refusal spends the code or charges the lockout."""
     e = await _enrolled_directory_session(store, monkeypatch)
     # No sign-in mints an id-less row since BACKLOG #2027, which refuses a principal with no id. So
     # the legacy row is planted: the keyed row's column is cleared under its live session.
@@ -207,16 +211,32 @@ async def test_a_bound_row_with_no_directory_id_is_refused_unasked(
         "UPDATE users SET directory_object_id = NULL WHERE id = ?", (e.user_id,)
     )
     await store._db.commit()
-    await store.set_user_federated_subject(e.user_id, "https://idp.test.invalid", "synthetic-sub")
+    if bound:
+        await store.set_user_federated_subject(
+            e.user_id, "https://idp.test.invalid", "synthetic-sub"
+        )
+    code = totp.totp(e.secret, now=_T1)
 
-    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+    refused = await e.service.verify_mfa(e.token, code)
 
     assert refused.ok is False and refused.directory_unconfirmed is True
-    assert e.directory.probes == []  # never a name-only probe of a bound row
+    assert refused.session_lost is False
+    assert e.directory.probes == []  # never a name-only probe
     assert {
         "reason": DIRECTORY_UNCONFIRMED,
         "outcome": "directory_object_id_missing",
     } in await _audited_mfa_failures(store)
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.failed_attempts == 0
+    assert user.second_step_failed_attempts == 0
+
+    # The code was never checked, so its step was not spent: it verifies once the row has an id.
+    await store._db.execute(
+        "UPDATE users SET directory_object_id = ? WHERE id = ?",
+        (_PRINCIPAL.directory_object_id, e.user_id),
+    )
+    await store._db.commit()
+    assert (await e.service.verify_mfa(e.token, code)).ok is True
 
 
 async def test_a_confirmed_directory_accounts_wrong_code_still_feeds_the_lockout(
