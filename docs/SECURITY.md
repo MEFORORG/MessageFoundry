@@ -3027,12 +3027,16 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
 
 - **An undeliverable lock notice writes no per-event log line.** With no mail relay, no address on
   the account, a full queue or a failed send, the engine used to log a WARNING naming the
-  `account_locked` notice and the username, once per lock. It logs nothing for a lock notice now. The
-  failure is still recorded for administrators: the `auth.lock_notice` row says `mailed: false`, with
-  `reason: no_notifier` when no relay is wired. An instance with no relay at all is still reported at
-  startup by the serve gate. Every other notice kind keeps its per-event line (BACKLOG #1139); none
-  of them fires on a refused sign-in. The list is `LOG_SILENT_EVENT_TYPES` in
-  `messagefoundry/auth/notifications.py`.
+  `account_locked` notice and the username, once per lock. It logs nothing for a lock notice now.
+  Two of those cases are still recorded for administrators, on the `auth.lock_notice` row: no relay
+  (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`). **The other two are now
+  recorded nowhere:** that row is written when the notice is handed to the relay, as
+  `mailed: true`, so a full queue or a failed send of a lock notice leaves no record. A relay that is
+  down still shows, on every other notice kind. An instance with no relay at all is reported at
+  startup by the serve gate, except under `[security].enforcement = "warn"` with
+  `[alerts].security_notifications_required = false`. Every other notice kind keeps its per-event
+  line (BACKLOG #1139); none of them fires on a refused sign-in. The list is
+  `LOG_SILENT_EVENT_TYPES` in `messagefoundry/auth/notifications.py`.
 - **The audit copies in the log are withheld from a reader without `users:manage`.** The off-box
   tee writes every audit row into the application log, the lock rows included, each with its row
   number. `GET /logs/tail` drops all of those copies for such a reader before it pages, so
@@ -3040,16 +3044,24 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
   reader reads the trail, if it may, through `GET /audit`.
 
 **The visible row's timestamp does not separate them either.** A refused local sign-in's audit rows
-are written after the failure pad, on the same padded slot as the answer, so a refusal by a lock and
-a verified refusal land at the same offset from the request. The failure is still counted before the
-pad, and a caller who drops the request during the pad does not drop the rows.
+are written at a fixed point inside the failure pad, half a budget after the attempt's turn in the
+queue, so a refusal by a lock and a verified refusal land at the same offset from the request, and
+the answer still goes out on its padded slot. This holds while a branch's work fits in half a
+budget, the same condition the answer's slot already rests on. The failure is still counted before
+that point, and a caller who drops the request before it does not drop the rows.
 
-**What the ruling does not reach.** At least this channel still differs between a right and a
-wrong candidate, and is open:
+**What the ruling does not reach.** At least these channels still differ between a right and a
+wrong candidate, and are open:
 
 - **The owner's own later activity.** A live second-step lock refuses the owner's own sign-in, which
   then shows as a refusal where it would have shown as `auth.login_success`. That follows from the
   lock refusing the owner at all.
+- **The log directory's size.** `GET /status` reports the log directory's `size_bytes` to
+  `monitoring:read`, which the Auditor and the Operator hold. The tee's copies of the hidden rows are
+  in those bytes.
+- **Log lines on rarer paths.** A failed read in the lock-notice throttle logs the username; a broken
+  tee sink logs each failed row's action; and SMTP with `tls_verify = false` logs a warning on every
+  send, lock notices included. Each fires only when a lock lands.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via

@@ -1056,12 +1056,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   password is right. The cost, accepted by owner ruling 2026-09-28: the Auditor can no longer
   review lockouts. An account holder's own `/me/security-events` feed still shows their own lock.
   The general log no longer names lock events either: an undeliverable lock notice writes no
-  per-event log line, and is recorded instead as `mailed: false` on the administrator-only
-  `auth.lock_notice` row. `GET /logs/tail` no longer shows the audit-row copies the off-box tee
+  per-event log line. With no relay or no address it is recorded instead as `mailed: false` on the
+  administrator-only `auth.lock_notice` row; a full queue or a failed send of a lock notice is now
+  recorded nowhere. `GET /logs/tail` no longer shows the audit-row copies the off-box tee
   writes into the log to a reader without `users:manage`, the built-in Operator included; that
   reader loses those lines from the log viewer. A refused local sign-in's audit rows are now
-  written after the failure pad, so their timestamp no longer shows whether a lock or a checked
-  credential refused it. The channel still open is listed in `docs/SECURITY.md` under Audit.
+  written at a fixed point inside the failure pad, so their timestamp no longer shows whether a
+  lock or a checked credential refused it. The channel still open is listed in `docs/SECURITY.md` under Audit.
   (`BACKLOG #1131`, ASVS 6.1.1)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That

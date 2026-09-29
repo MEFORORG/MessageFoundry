@@ -44,8 +44,8 @@ no per-event line (``auth.notifications.LOG_SILENT_EVENT_TYPES``), and the tee's
 are withheld from such a reader (:func:`reads_audit_copies_in_the_log`).
 
 **The visible row's time is covered too:** :meth:`AuthService.login` writes a refused local
-sign-in's rows after its failure pad, so their ``ts`` lands on the padded slot whichever branch
-refused.
+sign-in's rows at a fixed point inside its failure pad, so their ``ts`` does not depend on which
+branch refused, and the answer still goes out on its slot.
 
 **Left open:** the owner's own later sign-in, which a live lock refuses. ``docs/SECURITY.md``
 (Audit) states it. The factor and directory lock refusals get
