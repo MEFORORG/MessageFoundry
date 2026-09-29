@@ -395,7 +395,11 @@ async def test_dead_letters_list_and_replay(engine: Engine, client: httpx.AsyncC
     assert row["message_id"] == mid
     assert row["destination_name"] == "archive"
     assert row["channel_id"] == "ch1"
-    assert row["attempts"] == 1 and row["last_error"] == "boom"
+    # The list masks the error text and has no reveal of its own (BACKLOG #2436) ...
+    assert row["attempts"] == 1 and row["last_error"] == "****"
+    # ... because the dead letter is one of the message's delivery rows, revealed with it.
+    opened = (await client.get(f"/messages/{mid}?reveal_errors=true")).json()
+    assert opened["outbox"][0]["last_error"] == "boom"
 
     r = await client.post("/dead-letters/replay", json={})
     assert r.status_code == 200
@@ -630,6 +634,42 @@ async def test_list_masks_the_summary_and_only_an_explicit_reveal_lifts_it(
     assert [v["revealed"] for v in views] == [[], ["summary"], []]
 
 
+async def test_the_error_text_is_masked_until_its_own_reveal_act(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """The message's own ``error`` arrives masked whole and only ``reveal_errors`` lifts it
+    (ASVS 14.2.6, BACKLOG #2436, owner ruling R12). The summary reveal is a different act and does
+    not lift it, and the error reveal does not lift the summary. The ``message_view`` row records
+    which it was, read from what the response carried."""
+    stored = "parse error: segment ZQX7 rejected"
+    mid = await engine.store.record_received(
+        channel_id="ch1",
+        raw=ADT,
+        status=MessageStatus.ERROR,
+        error=stored,
+        source_type="file",
+        summary="MRN 100001 · DOE, JANE",
+    )
+    opened = (await client.get(f"/messages/{mid}")).json()
+    assert opened["error"] == "****"
+    summary_only = (await client.get(f"/messages/{mid}?reveal_summary=true")).json()
+    assert summary_only["error"] == "****" and summary_only["summary"] == "MRN 100001 · DOE, JANE"
+    errors_only = (await client.get(f"/messages/{mid}?reveal_errors=true")).json()
+    assert errors_only["error"] == stored
+    assert errors_only["summary"] == "MRN ****0001 · D**, J**"
+    reopened = (await client.get(f"/messages/{mid}")).json()
+    assert reopened["error"] == "****"  # the reveal did not become a status
+
+    views = sorted(
+        (a["id"], json.loads(a["detail"])["revealed"])
+        for a in await engine.store.list_audit()
+        if a["action"] == "message_view"
+    )
+    # The error reveal also returned the earlier opens' `viewed` events whole: their `detail` is
+    # error-tier text too, and the audit records it under its list's name.
+    assert [v for _id, v in views] == [[], ["summary"], ["error", "events.detail"], []]
+
+
 async def test_summary_access_audited_server_side_and_coalesced(engine: Engine) -> None:
     # M-5: summary access is audited SERVER-SIDE (no client flag needed), coalesced into one
     # summary_access row per actor/hour carrying the running count.
@@ -669,7 +709,8 @@ async def test_the_audit_separates_a_masked_list_from_a_real_disclosure(engine: 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         listed = (await c.get("/messages")).json()["messages"][0]
-        await c.get(f"/messages/{listed['id']}?reveal_summary=true")  # the explicit reveal act
+        # Both explicit reveal acts, so every masked property on the open comes back complete.
+        await c.get(f"/messages/{listed['id']}?reveal_summary=true&reveal_errors=true")
         await app.state.summary_auditor.flush(engine.store)
 
     rows = [a for a in await engine.store.list_audit() if a["action"] == "summary_access"]
@@ -679,10 +720,10 @@ async def test_the_audit_separates_a_masked_list_from_a_real_disclosure(engine: 
     assert any('"count": 0' in d and '"masked": 1' in d for d in details)
 
     # The OPEN: a real disclosure, and nothing masked. The count is 3 rather than 1 because the
-    # detail route audits [detail, *outbox, *events] together -- the nested delivery and event rows
-    # carry their own `last_error` / `detail` PHI, which is NOT in MASKED_UNTIL_REVEALED and so was
-    # readable all along. Asserted exactly, because a looser "> 0" would pass if the summary reveal
-    # silently stopped counting and only the nested rows carried it.
+    # detail route audits [detail, *outbox, *events] together -- the nested event rows carry their
+    # own `detail` PHI, which the reveal_errors act unmasks (BACKLOG #2436). Asserted exactly,
+    # because a looser "> 0" would pass if the summary reveal silently stopped counting and only the
+    # nested rows carried it.
     assert any('"count": 3' in d and '"masked": 0' in d for d in details)
 
 

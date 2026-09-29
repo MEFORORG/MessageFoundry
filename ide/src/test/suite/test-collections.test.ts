@@ -7,6 +7,8 @@ import {
   compareMessages,
   DEFAULT_VOLATILE_FIELDS,
   isVolatile,
+  judgeCollectionRun,
+  pickCaseDetail,
   type ExpectedDelivery,
 } from "../../testCollections";
 
@@ -129,5 +131,77 @@ suite("testCollections.compareCase — delivery-set matching", () => {
     const d = res.deliveries[0];
     assert.strictEqual(d.status, "mismatch");
     assert.ok(d.differences.some((x) => x.seg === "PID"));
+  });
+});
+
+// ASVS 14.2.6 (BACKLOG #2437): the host posts every summary at once and one detail per click, so a
+// summary must carry no field value and no error text.
+suite("testCollections.judgeCollectionRun — summaries carry no values", () => {
+  const dl = (to: string, payload: string): ExpectedDelivery => ({ to, payload });
+  const pid = (v: string) => hl7(MSH("20200101010101", "C1"), `PID|1||${v}`);
+  const cases = [
+    { name: "same", input: pid("A"), expected: [dl("OB_A", pid("A"))] },
+    { name: "changed", input: pid("A"), expected: [dl("OB_A", pid("SMITH"))] },
+    { name: "no row", input: pid("A"), expected: [dl("OB_A", pid("A"))] },
+  ];
+  const run = judgeCollectionRun(cases, [
+    { disposition: "received", error: null, deliveries: [dl("OB_A", pid("A"))] },
+    { disposition: "received", error: "failed near JONES", deliveries: [dl("OB_A", pid("JONES"))] },
+    undefined,
+  ]);
+
+  test("each summary is name, pass and disposition, and nothing else", () => {
+    assert.deepStrictEqual(run.summaries, [
+      { name: "same", pass: true, disposition: "received" },
+      { name: "changed", pass: false, disposition: "received" },
+      { name: "no row", pass: false, disposition: "NO RESULT" },
+    ]);
+    const text = JSON.stringify(run.summaries);
+    for (const v of ["SMITH", "JONES"]) {
+      assert.ok(!text.includes(v), `a summary carries ${v}`);
+    }
+    assert.strictEqual(run.passed, 1);
+  });
+
+  test("each detail carries that case's differences and error, aligned by index", () => {
+    assert.strictEqual(run.details.length, 3);
+    assert.strictEqual(run.details[0].error, null);
+    assert.strictEqual(run.details[0].deliveries[0].status, "match");
+    assert.strictEqual(run.details[1].error, "failed near JONES");
+    const d = run.details[1].deliveries[0].differences[0];
+    assert.deepStrictEqual([d.before, d.after], ["SMITH", "JONES"]);
+    assert.strictEqual(run.details[2].error, "no dry-run row produced for this case");
+    assert.strictEqual(run.details[2].deliveries[0].status, "missing");
+  });
+});
+
+// The host half of ADR 0121 "Reveal on click": which detail, if any, a caseDetail request gets.
+suite("testCollections.pickCaseDetail — the host answers only a request for a held case", () => {
+  const details = [
+    { error: null, deliveries: [] },
+    { error: "boom", deliveries: [] },
+  ];
+  const held = { id: 4, details };
+
+  test("a request naming the held run and one of its cases gets that one case", () => {
+    assert.strictEqual(pickCaseDetail(held, 4, 1), details[1]);
+    assert.strictEqual(pickCaseDetail(held, 4, 0), details[0]);
+  });
+
+  test("anything else gets nothing", () => {
+    const refused: [string, unknown, unknown, typeof held | null][] = [
+      ["no run held", 4, 0, null],
+      ["another run", 3, 0, held],
+      ["a string run id", "4", 0, held],
+      ["an index past the end", 4, 2, held],
+      ["a negative index", 4, -1, held],
+      ["a fractional index", 4, 0.5, held],
+      ["a string index", 4, "0", held],
+      ["an inherited property as the index", 4, "length", held],
+      ["no index", 4, undefined, held],
+    ];
+    for (const [why, run, index, h] of refused) {
+      assert.strictEqual(pickCaseDetail(h, run, index), null, why);
+    }
   });
 });

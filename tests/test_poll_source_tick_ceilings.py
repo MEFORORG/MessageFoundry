@@ -371,6 +371,12 @@ def _remote_source(
     return src
 
 
+async def _settle_remote(src: RemoteFileSource) -> None:
+    """Take the remote settle poll (BACKLOG #2071). A file's first sighting only records its listed size
+    and charges nothing, so the poll after this one is the one these ceiling tests measure."""
+    await src._poll_once()
+
+
 def _remote_files(count: int) -> dict[str, bytes]:
     return {f"/in/m{n:03d}.hl7": _ADT.format(n=n).encode() for n in range(count)}
 
@@ -391,6 +397,7 @@ async def test_remote_poll_stops_at_the_ceiling_and_leaves_the_rest_on_the_share
     src = _remote_source(monkeypatch, client)  # no operator configuration — the shipped default
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle_remote(src)
     with caplog.at_level(logging.INFO, logger=_REMOTE_LOGGER):
         await src._poll_once()
     assert len(handler.bodies) == 3
@@ -412,6 +419,7 @@ async def test_remote_second_poll_drains_the_deferred_files(
     src = _remote_source(monkeypatch, client)
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle_remote(src)
     await src._poll_once()
     await src._poll_once()
     assert [b.decode() for b in handler.bodies] == [_ADT.format(n=n) for n in range(5)]
@@ -431,6 +439,7 @@ async def test_remote_poll_below_the_ceiling_is_unchanged(
     src = _remote_source(monkeypatch, client)
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle_remote(src)
     with caplog.at_level(logging.INFO, logger=_REMOTE_LOGGER):
         await src._poll_once()
     assert len(handler.bodies) == 3
@@ -479,6 +488,7 @@ async def test_remote_refused_listing_name_does_not_charge_the_ceiling(
     src = _remote_source(monkeypatch, client)
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle_remote(src)
     await src._poll_once()
     assert [b.decode() for b in handler.bodies] == [_ADT.format(n=0), _ADT.format(n=1)]
 

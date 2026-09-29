@@ -72,7 +72,12 @@ def _block_webui_import() -> Callable[..., Any]:
         level: int = 0,
     ) -> Any:
         if name == "messagefoundry_webconsole" or name.startswith("messagefoundry_webconsole."):
-            raise ImportError("simulated: messagefoundry_webconsole is absent")
+            # ModuleNotFoundError naming the package is what Python raises for an ABSENT package,
+            # and since BACKLOG #1907 it is what create_app keys "not installed" on. A bare
+            # ImportError now means installed-but-broken (tests/test_webconsole_import_failure.py).
+            raise ModuleNotFoundError(
+                "simulated: messagefoundry_webconsole is absent", name="messagefoundry_webconsole"
+            )
         return real_import(name, globals, locals, fromlist, level)
 
     return fake_import
@@ -120,8 +125,9 @@ async def test_serve_ui_on_raises_clear_error_when_webui_absent(
     service = await _service(engine)
     monkeypatch.setattr(builtins, "__import__", _block_webui_import())
 
-    with pytest.raises(RuntimeError, match=_CLEAR_ERROR):
+    with pytest.raises(RuntimeError, match=_CLEAR_ERROR) as info:
         create_app(engine, auth=service, serve_ui=True)
+    assert "which is not installed" in str(info.value)
 
 
 def test_engine_imports_and_boots_in_fresh_interpreter_without_webui() -> None:

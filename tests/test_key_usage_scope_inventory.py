@@ -69,6 +69,8 @@ _KEY_MATERIAL = frozenset(
         # BACKLOG #1929: an operator-supplied certificate both server-DB backends honor, with a
         # different meaning on each (a leaf pin on SQL Server, a CA bundle on PostgreSQL).
         "Store server-certificate trust",
+        # BACKLOG #1174: the per-process key sealing the state and reference caches.
+        "Sealed read-through caches",
     }
 )
 

@@ -116,7 +116,8 @@ Consolidate these before you install anything:
       cross-platform Python.
 - [ ] **Administrator/elevation** on the host if you will install the Windows service.
 - [ ] **Outbound network access** for the service installer to download the SHA-256-pinned NSSM
-      binary (or pre-stage NSSM on the host / on `PATH`).
+      binary. Offline, pass `-NssmPath` with the win64 `nssm.exe` from `nssm-2.24.zip`. A copy
+      on `PATH` counts only if it is that exact binary; a package manager's build is skipped.
 - [ ] **Firewall plan:** open your inbound MLLP listener port(s) (the samples use e.g. `2575`/`2600`)
       to senders, and decide who may reach the **API on `127.0.0.1:8765`** (default loopback —
       keep it that way; see §6).

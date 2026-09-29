@@ -2093,3 +2093,190 @@ def test_the_eighth_sweep_names_both_ways_past_the_intake_revocation_refusal(
             "a CRL file or on the revocation attestation, and the attestation is logged "
             "(BACKLOG #1133)."
         )
+
+
+_CONFIG_DOC = _ROOT / "docs" / "CONFIGURATION.md"
+_H_TABLE_A = "#### Table A — control plane (operator API + web console)"
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _table_a_row(attribute: str) -> str:
+    """One Table A row, whitespace-flattened, found by its Attribute cell."""
+    table = next(t for t in _tables(_heading_block(_H_TABLE_A)) if t[0][0] == "Attribute")
+    row = next(r for r in table[1:] if r[0] == attribute)
+    return _flat(" | ".join(row))
+
+
+def _config_row(key: str, kind: str) -> str:
+    """The CONFIGURATION.md table row for ``key`` whose Type cell is ``kind``, whitespace-flattened.
+    The type tells a live row from a retired alias row, which leaves its Type cell empty."""
+    text = _CONFIG_DOC.read_text(encoding="utf-8")
+    prefix = f"| `{key}` | {kind} |"
+    return _flat(next(line for line in text.splitlines() if line.startswith(prefix)))
+
+
+def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
+    """The code half of the ninth 6.1.3 re-read (BACKLOG #1133). Each probe is a fact the doc
+    sentences below state, so a change here reds before the prose can drift from it."""
+    from messagefoundry.auth.service import TOTP_REMOVAL_REFUSED, FactorEnrolmentRequired
+    from messagefoundry.store.store import MessageStore, WebAuthnCredential, lockout_arms
+
+    assert (
+        frozenset(
+            {
+                ("POST", "/me/reauth"),
+                ("GET", "/me/mfa"),
+                ("POST", "/me/mfa/enroll"),
+                ("POST", "/me/mfa/confirm"),
+            }
+        )
+        == api_security._ENROL_FIRST_ROUTES
+    ), "the enrol-first admitted set moved; restate Table A's must-change row to match"
+    assert (
+        frozenset({"/auth/logout", "/auth/me", "/auth/mfa-verify", "/me/password"})
+        == api_security._MUST_CHANGE_EXEMPT_PATHS
+    ), "the must-change exempt set moved; restate Table A's must-change row to match"
+    assert not lockout_arms("sign_in", password_generated=True)
+    assert lockout_arms("sign_in", password_generated=False)
+    assert lockout_arms("second_step", password_generated=True)
+    # Item 8: a combined sign-in owes nothing more. ``mfa_required = not combined and ...`` is read
+    # from the parsed code, so a comment or docstring cannot keep it green.
+    owes = [
+        node.value
+        for node in ast.walk(_service_func("_login_local"))
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "mfa_required" for t in node.targets)
+    ]
+    assert len(owes) == 1 and isinstance(owes[0], ast.BoolOp), owes
+    first = owes[0].values[0]
+    assert (
+        isinstance(owes[0].op, ast.And)
+        and isinstance(first, ast.UnaryOp)
+        and isinstance(first.op, ast.Not)
+        and isinstance(first.operand, ast.Name)
+        and first.operand.id == "combined"
+    ), "a combined sign-in no longer owes nothing more; restate item 8 in Table A"
+
+    async def probe() -> None:
+        store = await MessageStore.open(":memory:")
+        try:
+            service = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
+            await service.initialize()
+            created = await service.create_local_user(
+                username="holder",
+                display_name=None,
+                email="holder@example.org",
+                roles=["viewer"],
+                actor="test-admin",
+            )
+            out = await service.login("holder", created.credential.password)
+            assert out.ok and out.identity is not None and out.token is not None
+            identity = out.identity
+            # Items 1-3: a covered account with no TOTP enrols before it rotates.
+            with pytest.raises(FactorEnrolmentRequired):
+                await service.change_password(identity, "a-brand-new-chosen-passphrase")
+            # Items 2 and 5: its first factor may not be a passkey.
+            with pytest.raises(FactorEnrolmentRequired):
+                await service.begin_webauthn_registration(
+                    identity, token=out.token, rp_id="localhost", rp_name="t"
+                )
+            off = AuthService(store, AuthSettings(require_mfa=False))
+            assert not await off.must_enrol_before_rotating(identity), (
+                "with require_mfa off the account should rotate first"
+            )
+            # Item 6: once TOTP is on, a covered account cannot remove it, passkey or not ...
+            await store.enable_totp(identity.user_id, recovery_code_hashes=[])
+            await store.add_webauthn_credential(
+                WebAuthnCredential(
+                    credential_id_hash="ninth-sweep-hash",
+                    credential_id="ninth-sweep-id",
+                    user_id=identity.user_id,
+                    rp_id="localhost",
+                    public_key="cose-public-key-b64url",
+                    sign_count=0,
+                    transports=None,
+                    device_type="multi_device",
+                    backed_up=True,
+                    label="key",
+                    aaguid=None,
+                    created_at=1000.0,
+                )
+            )
+            with pytest.raises(ValueError) as refused:
+                await service.disable_mfa(identity)
+            assert str(refused.value) == TOTP_REMOVAL_REFUSED
+            # ... while the passkey, which is not its last factor, can go.
+            assert await service.delete_webauthn_credential(identity, "ninth-sweep-hash")
+            # A local account the requirement does not cover removes TOTP freely.
+            await off.disable_mfa(identity)
+            row = await store.get_user(identity.user_id)
+            assert row is not None and not row.totp_enabled
+        finally:
+            await store.close()
+
+    asyncio.run(probe())
+
+
+def test_the_ninth_sweep_states_the_local_pathway_after_amendment_a() -> None:
+    """ASVS 6.1.3 was held at partial a ninth time (BACKLOG #1133) on eight sentences left stale by
+    ADR 0197 Amendment A wave 1. Under the shipped ``require_mfa`` a covered local account with no
+    TOTP enrols TOTP before it may rotate, and a passkey cannot be its first factor. Each assertion
+    reds if one of the eight old sentences returns; the probes above pin the code they describe."""
+    doc = _flat(_doc_text())
+    config = _flat(_CONFIG_DOC.read_text(encoding="utf-8"))
+
+    # 1. The must-change CONFINE row names the enrol-first set and the new order.
+    confine = _table_a_row("Account state — credential rotation pending")
+    conditional = "With the requirement off, an account with no factor rotates first"
+    assert confine.count("no factor rotates first") == confine.count(conditional), (
+        "item 1: the must-change row says an account with no factor rotates first, unconditionally"
+    )
+    for route in ("`POST /me/reauth`", "`GET /me/mfa`", "`POST /me/mfa/enroll`"):
+        assert route in confine, f"item 1: the must-change row must name {route}"
+    assert "`_ENROL_FIRST_ROUTES`" in confine and "enrols TOTP" in confine
+
+    # 2. The factor-binding row no longer lets a no-factor account rotate from a pending session.
+    binding = _table_a_row("Binding a NEW second factor, ending sessions, or changing the password")
+    assert "ends its own sessions and changes its password from a password-only session" not in (
+        binding
+    ), "item 2: the factor-binding row says a no-factor account changes its password pending"
+    assert "first factor must be TOTP" in binding
+
+    # 3. A pending no-factor session cannot rotate, in any configuration.
+    assert "An account with no factor still changes its password from a pending session" not in doc
+    assert "it cannot rotate from a pending session either" in doc
+
+    # 4. A reset passkey-only account also enrols TOTP before it rotates.
+    assert "A passkey-only account has to do this on the console" not in doc
+    assert "must also enrol TOTP before it rotates" in doc and "`_has_way_past` counts TOTP" in doc
+
+    # 5. CONFIGURATION.md's require_mfa row: TOTP first for a covered local account.
+    assert "to enrol TOTP or a passkey." not in config, (
+        "item 5: the require_mfa row offers a passkey as a covered local account's first factor"
+    )
+    assert "enrols **TOTP first**" in _config_row("require_mfa", "bool")
+
+    # 6. TOTP removal refuses on its own condition, and the MFA section says so.
+    assert "the same refusal, on the same condition, as the passkey removal path" not in doc
+    assert "`DELETE /me/mfa` disables it; an administrator clears" not in doc
+    assert "no longer refuse on the same condition" in doc
+
+    # 7. The generated-credential exception, in all three lockout statements.
+    lockout = _table_a_row("Consecutive credential failures on one account")
+    assert "engine-generated" in lockout and "arm no sign-in lock" in lockout, (
+        "item 7: Table A's lockout row omits the generated-credential exception"
+    )
+    limit_row = _flat(
+        next(line for line in _doc_text().splitlines() if line.startswith("| Account lockout |"))
+    )
+    assert "engine-generated" in limit_row, "item 7: the limits table's lockout row omits it"
+    assert "engine-generated" in _config_row("lockout_threshold", "int"), (
+        "item 7: CONFIGURATION.md's lockout_threshold row omits it"
+    )
+
+    # 8. A combined sign-in is not the owes-a-factor path.
+    assert "this is the path every local sign-in takes" not in doc
+    assert "every password-only local sign-in takes" in doc

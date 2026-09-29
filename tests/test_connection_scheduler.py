@@ -14,6 +14,7 @@ import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, time
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -21,16 +22,20 @@ from messagefoundry.config.models import (
     ActiveWindow,
     ConnectorType,
     InternalErrorPolicy,
+    Priority,
     Schedule,
 )
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
+    Loopback,
     Registry,
     Send,
     build_inbound_connection,
     build_outbound_connection,
 )
+from messagefoundry.logging_guard import LogSinkEvent, LogSinkStatus
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -470,6 +475,559 @@ async def test_a_pooled_broadcast_that_re_arms_a_stopped_lane_ends_its_hold(
         assert ("outbound", "OB_SCHED") not in runner._stop_held
         await _wait_until(lambda: faulty.sends == 2)  # the broadcast really did re-arm it
     finally:
+        await runner.stop()
+
+
+async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # BACKLOG #2072. The pooled ADR 0070 T17 bound STOPs a lane whose dispatch keeps raising, and it
+    # decides that inside the dispatcher, so no runner STOP site recorded a hold. The window close
+    # then paused the STOPPED lane (a pooled pause overwrites STOPPED), and the next open resumed it:
+    # the fault the STOP was bounding was retried at every window.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB_FEED", MLLP(port=_free_port()), router="r"))
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB_SCHED", m))
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SCHED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+            schedule=schedule,
+        )
+    )
+    sink = _StopSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        claim_mode="pooled",
+        alert_sink=sink,
+        infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
+        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+    )
+    attempts = 0
+
+    async def _infra_fault(name: str, item: object) -> object:
+        # Raised from the delivery body, so it escapes the adapter: a T17 machinery fault, not a
+        # delivery failure the body resolves.
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("store handoff fault")
+
+    await runner.start()
+    try:
+        runner._process_delivery_item = _infra_fault  # type: ignore[method-assign,assignment]
+        await store.enqueue_ingress(channel_id="IB_FEED", raw=RAW)
+        runner.notify_work()
+        out = runner._dispatchers[Stage.OUTBOUND]
+        await _wait_until(lambda: out.stopped("OB_SCHED"))
+        assert attempts == 1
+        assert ("outbound", "OB_SCHED") in runner._stop_held
+
+        clock.set(_OUT_OF_WINDOW)  # the window closes...
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        clock.set(_NEXT_WINDOW)  # ...and the next one opens
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        await asyncio.sleep(0.3)  # time for a re-armed lane to claim the re-pended head
+
+        assert attempts == 1  # the lane was not re-armed, so the fault was not retried
+        assert out.stopped("OB_SCHED")
+
+        # Control: a real re-arm (the pooled broadcast a reload or replay sends) lifts the hold and
+        # the head is claimed again. Without this arm, "one attempt" could mean a lane that never
+        # re-claims anything.
+        runner.notify_work()
+        assert ("outbound", "OB_SCHED") not in runner._stop_held
+        await _wait_until(lambda: attempts == 2)
+    finally:
+        await runner.stop()
+
+
+async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_window(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR 1811 review, on BACKLOG #2072. The T17 bound can STOP a pooled RESPONSE lane (a loopback's
+    # re-ingress), and _HOLD_DIRECTION had no entry for RESPONSE, so that STOP was not held. A window
+    # open can re-arm it: a #122 log halt pauses the loopback's internal lanes, which turns STOPPED
+    # into PAUSED, and once another connection's restart clears the halt latch, the window open's
+    # start_inbound resumes every PAUSED lane of that loopback. The fault was then retried.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB_LOOP", Loopback(), router="r", schedule=schedule))
+    reg.add_inbound(build_inbound_connection("IB_TWO", MLLP(port=_free_port()), router="r"))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        claim_mode="pooled",
+        alert_sink=_LogPageSink(),
+        infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
+        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+    )
+    attempts = 0
+
+    async def _infra_fault(name: str, item: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("store handoff fault")
+
+    await runner.start()
+    try:
+        runner._process_response_item = _infra_fault  # type: ignore[method-assign,assignment]
+        # A reply captured on some other hop and owed to the loopback: one RESPONSE-stage row.
+        await store.enqueue_message(channel_id="IB_REAL", raw=RAW, deliveries=[("OB_X", RAW)])
+        item = (await store.claim_ready(destination_name="OB_X"))[0]
+        await store.complete_with_response(
+            item.id, body=RAW, outcome="accepted", reingress_to="IB_LOOP"
+        )
+        runner.notify_work()
+        response = runner._dispatchers[Stage.RESPONSE]
+        await _wait_until(lambda: response.stopped("IB_LOOP"))
+        assert attempts == 1
+
+        guard = _DeadLogGuard()
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        assert response.paused("IB_LOOP")  # the halt overwrote STOPPED
+        guard.writable = True
+        await runner.restart_inbound("IB_TWO")  # clears the process-wide latch
+        assert not runner._delivery_halted
+
+        await runner._reconcile_schedule("IB_LOOP", "inbound", schedule)  # still in window
+        await asyncio.sleep(0.3)  # time for a re-armed lane to claim the re-pended head
+
+        assert attempts == 1  # the lane was not re-armed, so the fault was not retried
+        assert not runner.inbound_running("IB_LOOP")
+
+        # Control: the operator restarts the loopback, a real re-arm. It lifts the hold and the head
+        # is claimed again. Without this arm, "one attempt" could mean a lane that never re-claims.
+        await runner.restart_inbound("IB_LOOP")
+        assert ("inbound", "IB_LOOP") not in runner._stop_held
+        await _wait_until(lambda: attempts == 2)
+    finally:
+        await runner.stop()
+
+
+async def test_a_dr_filtered_inbound_is_not_started_by_its_window(store: MessageStore) -> None:
+    # BACKLOG #2067. A DR run-profile parks a below-threshold inbound (status "filtered"). The window
+    # open called start_inbound, which reads its caller as an operator overriding the profile: it
+    # bound the listener and cleared the marker. Scheduled or not, the profile decides this run.
+    schedule = _weekday_window()
+    clock = _Clock(_OUT_OF_WINDOW)
+    port = _free_port()
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_LOW", MLLP(port=port), router="r", schedule=schedule, priority=Priority.LOW
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, schedule_clock=clock.now, dr_threshold=Priority.CRITICAL
+    )
+    await runner.start()
+    try:
+        assert runner.inbound_filtered("IB_LOW") is not None
+        assert not runner.inbound_running("IB_LOW")
+
+        clock.set(_NEXT_WINDOW)  # the window opens
+        await runner._reconcile_schedule("IB_LOW", "inbound", schedule)
+
+        assert not runner.inbound_running("IB_LOW")  # the listener stayed down
+        assert runner.inbound_filtered("IB_LOW") is not None  # and the marker is still the DR's
+
+        # Control: an operator start is the override the profile allows. It clears the marker, and
+        # the calendar owns the connection from then on, so the next close parks it.
+        await runner.start_inbound("IB_LOW")
+        assert runner.inbound_filtered("IB_LOW") is None
+        clock.set(_utc(2026, 7, 14, 18))
+        await runner._reconcile_schedule("IB_LOW", "inbound", schedule)
+        assert not runner.inbound_running("IB_LOW")
+    finally:
+        await runner.stop()
+
+
+class _DeadLogGuard:
+    """A stand-in for the #122 log-write guard whose sinks stay dead until ``writable`` is set. It counts the
+    re-validation probes, which WRITE to the sinks."""
+
+    def __init__(self) -> None:
+        self.writable = False
+        self.probes = 0
+
+    def revalidate(self) -> bool:
+        self.probes += 1
+        return self.writable
+
+    def can_log(self) -> bool:
+        return self.writable
+
+    def status(self) -> list[LogSinkStatus]:
+        state: Literal["healthy", "unwritable"] = "healthy" if self.writable else "unwritable"
+        return [LogSinkStatus(sink="file", state=state, rollovers=0)]
+
+    def set_escalation(self, callback: object) -> None:
+        pass
+
+    def clear_escalation(self, callback: object) -> None:
+        pass
+
+
+class _LogPageSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.pages: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        pass
+
+    def log_write_failed(
+        self, name: str, *, stage: str, reason: str, stopped: int | None = None
+    ) -> None:
+        self.pages.append(reason)
+
+
+async def test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2066. After a #122 log-write halt, a scheduled connection reads as not running, so
+    # every in-window tick called start. An inbound bound its listener, probed the dead sinks, paged
+    # and unbound again; an outbound probed and paged. Each tick, for as long as the disk stayed
+    # broken. The halt already paged once, and only an operator restart may lift it.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection("IB_SCHED", MLLP(port=_free_port()), router="r", schedule=schedule)
+    )
+    reg.add_inbound(
+        build_inbound_connection("IB_TWO", MLLP(port=_free_port()), router="r", schedule=schedule)
+    )
+    reg.add_router("r", lambda m: [])
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SCHED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+            schedule=schedule,
+        )
+    )
+    guard = _DeadLogGuard()
+    sink = _LogPageSink()
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, schedule_clock=clock.now, alert_sink=sink
+    )
+    await runner.start()
+    try:
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        assert len(sink.pages) == 1  # the halt's own page
+        assert not runner.inbound_running("IB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
+
+        binds = 0
+        real_start = runner._start_inbound_unsafe
+
+        async def _counting_start(name: str) -> None:
+            nonlocal binds
+            binds += 1
+            await real_start(name)
+
+        monkeypatch.setattr(runner, "_start_inbound_unsafe", _counting_start)
+        for _ in range(3):  # three in-window ticks
+            await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+            await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+
+        assert binds == 0  # no bind-and-unbind of the partner port per tick
+        assert guard.probes == 0  # no sink write per tick
+        assert len(sink.pages) == 1  # and no page per tick
+        assert not runner.inbound_running("IB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
+
+        # Control: the operator repairs the disk and restarts. One probe lifts the halt, and the
+        # calendar owns both connections again: the next close parks both.
+        guard.writable = True
+        await runner.restart_inbound("IB_SCHED")
+        await runner.start_outbound("OB_SCHED")
+        assert guard.probes == 1  # one probe lifted the process-wide latch
+        assert runner.inbound_running("IB_SCHED")
+        assert runner.outbound_running("OB_SCHED")
+        # IB_TWO was never restarted, so it is still halted. With the latch clear, its start costs no
+        # probe and no page, so the calendar brings it back rather than leaving it down in silence.
+        assert "IB_TWO" in runner._log_halted
+        await runner._reconcile_schedule("IB_TWO", "inbound", schedule)
+        assert runner.inbound_running("IB_TWO")
+        assert "IB_TWO" not in runner._log_halted
+        assert guard.probes == 1
+        assert len(sink.pages) == 1
+        clock.set(_OUT_OF_WINDOW)
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        assert not runner.inbound_running("IB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
+    finally:
+        await runner.stop()
+
+
+# === reload keeps the calendars in step with the graph (BACKLOG #2069) =====
+#
+# A scheduler task binds its Schedule when it is spawned, and only start() spawned one. So a reload
+# that added a schedule never ran it, an edited one kept its old calendar, and a removed connection's
+# task reconciled a name the graph no longer declared, with a traceback every tick. The reload also
+# re-bound a schedule-parked listener until the next tick parked it again.
+
+
+def _scheduled_inbound_graph(
+    port: int, schedule: Schedule | None, *, present: bool = True
+) -> Registry:
+    reg = Registry()
+    if present:
+        reg.add_inbound(
+            build_inbound_connection("IB_SCHED", MLLP(port=port), router="r", schedule=schedule)
+        )
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+async def test_a_reload_that_adds_a_schedule_starts_its_calendar(store: MessageStore) -> None:
+    port = _free_port()
+    clock = _Clock(_OUT_OF_WINDOW)
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, None),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+    )
+    await runner.start()
+    try:
+        assert runner._schedule_workers == {}
+        assert runner.inbound_running("IB_SCHED")  # always-on until the reload
+
+        await runner.reload(_scheduled_inbound_graph(port, _weekday_window()))
+
+        assert set(runner._schedule_workers) == {("inbound", "IB_SCHED")}
+        assert not runner.inbound_running("IB_SCHED")  # out of window: not re-bound
+        clock.set(_NEXT_WINDOW)  # and the new calendar really runs
+        await _wait_until(lambda: runner.inbound_running("IB_SCHED"))
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_that_edits_a_schedule_replaces_its_calendar(store: MessageStore) -> None:
+    port = _free_port()
+    clock = _Clock(_OUT_OF_WINDOW)  # Mon 18:00: outside 08:00-17:00, inside 17:00-20:00
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, _weekday_window()),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+    )
+    await runner.start()
+    try:
+        await _wait_until(lambda: not runner.inbound_running("IB_SCHED"))  # parked by the old one
+        old_task = runner._schedule_workers[("inbound", "IB_SCHED")]
+        evening = Schedule(
+            windows=[ActiveWindow(days=_WEEKDAYS, start=time(17), end=time(20), timezone="UTC")]
+        )
+
+        await runner.reload(_scheduled_inbound_graph(port, evening))
+
+        assert old_task.done()  # the old calendar is gone...
+        assert runner._schedule_workers[("inbound", "IB_SCHED")] is not old_task
+        await _wait_until(lambda: runner.inbound_running("IB_SCHED"))  # ...and the new one runs
+
+        # Control: the replacement keeps the calendar, it does not merely exist. Past 20:00 the new
+        # schedule closes and parks the listener; the old one would have left it parked all along.
+        clock.set(_utc(2026, 7, 13, 21))
+        await _wait_until(lambda: not runner.inbound_running("IB_SCHED"))
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_that_removes_a_scheduled_connection_cancels_its_calendar(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    port = _free_port()
+    clock = _Clock(_IN_WINDOW)
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, _weekday_window()),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+    )
+    await runner.start()
+    try:
+        task = runner._schedule_workers[("inbound", "IB_SCHED")]
+
+        await runner.reload(_scheduled_inbound_graph(port, None, present=False))
+
+        assert task.done()
+        assert runner._schedule_workers == {}
+        caplog.clear()
+        await asyncio.sleep(0.2)  # ten ticks of the old task's cadence
+        assert not [r for r in caplog.records if "reconcile failed" in r.getMessage()]
+    finally:
+        await runner.stop()
+
+
+def _scheduled_outbound_graph(outdir: Path, schedule: Schedule | None) -> Registry:
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SCHED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(outdir), "filename": "x.hl7"}),
+            schedule=schedule,
+        )
+    )
+    return reg
+
+
+async def test_a_reload_that_drops_a_schedule_resumes_the_lane_its_calendar_parked(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # A schedule park goes through stop_outbound, so it reads as an operator pause that no reload
+    # lifts. Once the schedule is gone nothing would resume the lane: always-on in config, paused in
+    # fact, with its queue growing.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    runner = RegistryRunner(
+        _scheduled_outbound_graph(tmp_path, schedule),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+    )
+    await runner.start()
+    try:
+        clock.set(_OUT_OF_WINDOW)
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        assert not runner.outbound_running("OB_SCHED")  # the calendar parked it
+
+        await runner.reload(_scheduled_outbound_graph(tmp_path, None))
+        assert runner.outbound_running("OB_SCHED")  # always-on now, so up
+
+        # Control: an OPERATOR pause survives the same reload, as a reload never undoes an operator.
+        # The new scheduler task may park the lane before or after the operator's stop below. Either
+        # order ends with the operator's stop, which drops the calendar's claim on the pause.
+        await runner.reload(_scheduled_outbound_graph(tmp_path, schedule))
+        await runner.stop_outbound("OB_SCHED")
+        await runner.reload(_scheduled_outbound_graph(tmp_path, None))
+        assert not runner.outbound_running("OB_SCHED")
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_does_not_re_bind_a_schedule_parked_inbound(store: MessageStore) -> None:
+    port = _free_port()
+    clock = _Clock(_IN_WINDOW)
+    schedule = _weekday_window()
+    # The default 30 s tick, so no scheduler tick can park the listener between the reload and the
+    # assertion: whatever state the reload leaves is what the assertion reads.
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, schedule),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+    )
+    await runner.start()
+    try:
+        clock.set(_OUT_OF_WINDOW)
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+        assert not runner.inbound_running("IB_SCHED")
+
+        await runner.reload(_scheduled_inbound_graph(port, schedule))
+        assert not runner.inbound_running("IB_SCHED")  # the port stayed closed
+
+        # Control: in window, the same reload binds it.
+        clock.set(_NEXT_WINDOW)
+        await runner.reload(_scheduled_inbound_graph(port, schedule))
+        assert runner.inbound_running("IB_SCHED")
+    finally:
+        await runner.stop()
+
+
+def _hold_port(port: int) -> socket.socket:
+    """Bind and listen on ``port`` the way another process would, so the engine's own bind fails."""
+    s = socket.socket()
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)  # Windows only
+    if exclusive is not None:
+        s.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+    s.bind(("127.0.0.1", port))
+    s.listen()
+    return s
+
+
+async def test_a_window_open_that_cannot_bind_is_recorded_and_alerted_once(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # PR 1811 review, on BACKLOG #2069. A reload leaves an out-of-window scheduled inbound unbound, so
+    # it no longer finds out that another process has taken the port, and it no longer rolls back.
+    # The bind now fails at the window open. The scheduler logged that as "reconcile failed" with a
+    # traceback every tick, and recorded no failed status and sent no alert. It must fail the way an
+    # engine start does: one failed record, one alert, one traceback, then quiet retries.
+    port = _free_port()
+    schedule = _weekday_window()
+    clock = _Clock(_OUT_OF_WINDOW)
+    sink = _StopSink()
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, schedule),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+        alert_sink=sink,
+    )
+    await runner.start()
+    holder: socket.socket | None = None
+    try:
+        await _wait_until(lambda: not runner.inbound_running("IB_SCHED"))  # parked by the calendar
+        holder = _hold_port(port)
+
+        await runner.reload(_scheduled_inbound_graph(port, schedule))  # commits: nothing to bind
+        assert runner.inbound_failed("IB_SCHED") is None
+
+        caplog.clear()
+        clock.set(_NEXT_WINDOW)  # the window opens onto a port another process holds
+        await _wait_until(lambda: runner.inbound_failed("IB_SCHED") is not None)
+        await asyncio.sleep(0.2)  # ten more ticks, each retrying the bind
+
+        assert not runner.inbound_running("IB_SCHED")
+        assert sink.stopped == ["IB_SCHED"]  # one alert, not one per tick
+        tracebacks = [
+            r for r in caplog.records if r.exc_info is not None and "IB_SCHED" in r.getMessage()
+        ]
+        assert len(tracebacks) == 1, [r.getMessage() for r in tracebacks]
+        assert not [r for r in caplog.records if "reconcile failed" in r.getMessage()]
+
+        # A reload outside the window is the recovery the alert names. With no bind to clear the
+        # record, it drops it, and the next open finds the port still held and alerts again.
+        clock.set(_utc(2026, 7, 14, 18))
+        await runner.reload(_scheduled_inbound_graph(port, schedule))
+        assert runner.inbound_failed("IB_SCHED") is None
+        clock.set(_utc(2026, 7, 15, 9))
+        await _wait_until(lambda: runner.inbound_failed("IB_SCHED") is not None)
+        assert sink.stopped == ["IB_SCHED", "IB_SCHED"]
+
+        # Control: the other process lets the port go, and the next tick binds it and clears the
+        # failed status. Without this arm, "one alert" could mean a scheduler that stopped trying.
+        holder.close()
+        holder = None
+        await _wait_until(lambda: runner.inbound_running("IB_SCHED"))
+        assert runner.inbound_failed("IB_SCHED") is None
+    finally:
+        if holder is not None:
+            holder.close()
         await runner.stop()
 
 
