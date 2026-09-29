@@ -142,7 +142,7 @@ def positive_cap[NumT: (int, float)](
     *,
     knob: str,
     transport: str,
-    off_hint: str = " (use None or 0 to disable it)",
+    off_hint: str = "use None or 0 to disable it",
 ) -> NumT | None:
     """:func:`cap_setting`, then refuse at build whatever is left that is not above zero (BACKLOG #1872).
 
@@ -165,7 +165,7 @@ def positive_cap[NumT: (int, float)](
             f"{transport} {knob}={value!r} is not a valid {convert.__name__} value"
         ) from exc
     if cap is not None and not cap > 0:
-        raise ValueError(f"{transport} {knob}={value!r} must be above zero{off_hint}")
+        raise ValueError(f"{transport} {knob}={value!r} must be above zero ({off_hint})")
     return cap
 
 

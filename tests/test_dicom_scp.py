@@ -12,6 +12,7 @@ import datetime
 import ipaddress
 import logging
 import ssl
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -269,35 +270,28 @@ async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
         await scp.stop()
 
 
-def test_scp_commit_on_a_closed_loop_answers_out_of_resources() -> None:
-    # BACKLOG #2103: when the engine's loop has closed under a live association, scheduling the commit
-    # raises. Nothing was committed and a re-send after a restart would be, so the answer is Out of
-    # Resources. It used to escape _commit and reach the last-resort handler's final 0xC000.
+@pytest.mark.parametrize("closed", [True, False], ids=["closed", "stopped"])
+def test_scp_commit_on_a_loop_that_is_not_running_answers_out_of_resources(closed: bool) -> None:
+    # BACKLOG #2103: when the engine's loop has stopped under a live association, nothing is committed
+    # and a re-send after a restart would be, so the answer is Out of Resources, at once. A closed loop
+    # used to raise out of _commit to the last-resort handler's final 0xC000. A stopped one used to
+    # schedule a commit that never ran and hold the association for the whole timeout.
     async def handler(data: bytes) -> str | None:
         return "mid"
 
     scp = _build_scp([])
-    closed = asyncio.new_event_loop()
-    closed.close()
-    scp._loop, scp._handler = closed, handler
-    status = scp._commit(b"x", peer_ip="127.0.0.1", sop_instance="1.2", sop_class="1.2")
+    scp._timeout = 5.0
+    loop = asyncio.new_event_loop()
+    if closed:
+        loop.close()
+    scp._loop, scp._handler = loop, handler
+    started = time.monotonic()
+    try:
+        status = scp._commit(b"x", peer_ip="127.0.0.1", sop_instance="1.2", sop_class="1.2")
+    finally:
+        loop.close()
     assert status == 0xA700
-
-
-class _OutOfMemoryStoreEvent(_FakeStoreEvent):
-    """Passes both pre-decode guards, then runs out of memory decoding."""
-
-    @property
-    def dataset(self) -> object:
-        raise MemoryError
-
-
-def test_scp_out_of_memory_decoding_answers_out_of_resources() -> None:
-    # BACKLOG #2103: a MemoryError is the host running short, not a fault in the object, so a re-send
-    # may succeed. It must not get the final Cannot Understand a decode failure gets.
-    scp = _build_scp([])
-    event = _OutOfMemoryStoreEvent(transfer_syntax="1.2.840.10008.1.2.1", data_set=b"\x00" * 32)
-    assert scp._on_c_store(event) == 0xA700
+    assert time.monotonic() - started < 2.0, "the SCP must not wait out the commit timeout"
 
 
 async def test_scp_handler_refusal_returns_dimse_failure_not_success() -> None:

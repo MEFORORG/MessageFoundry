@@ -84,9 +84,9 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
+from messagefoundry.parsing.dicom import _inflate as _dicom_inflate
 from messagefoundry.parsing.dicom._deps import load_dcmread, load_header_readers
 from messagefoundry.parsing.dicom._inflate import (
-    DEFAULT_MAX_INFLATED_BYTES,
     DEFLATED_EXPLICIT_VR_LE,
     bounded_inflate_or_error,
     guard_part10_deflate,
@@ -147,10 +147,11 @@ DEFAULT_MAX_ASSOCIATIONS_PER_SECOND: float | None = None
 # (BACKLOG #2103). PS3.4 has no "too large" status. Out of Resources (A7xx) says the SCP cannot take
 # the object NOW, and senders, this engine's own SCU among them, retry it. Cannot Understand (Cxxx)
 # says the SCP will not take this object at all, and senders treat it as final. So a refusal that
-# would repeat on a re-send answers Cxxx, and only a failure that may clear answers A7xx.
+# would repeat on a re-send answers Cxxx, and only a failure that may clear answers A7xx. Which path
+# answers which is stated once, in docs/DICOM.md section 3.
 _STATUS_SUCCESS = 0x0000
-_STATUS_OUT_OF_RESOURCES = 0xA700  # transient: a commit timeout or a commit that raised (re-send)
-_STATUS_CANNOT_UNDERSTAND = 0xC000  # final: would not decode/re-encode, or ingress refused it
+_STATUS_OUT_OF_RESOURCES = 0xA700  # transient: the commit may succeed on a re-send
+_STATUS_CANNOT_UNDERSTAND = 0xC000  # final: this object will not be taken as sent
 #: Final, and the same class as Cannot Understand: the object is over the SCP's object cap or inflates
 #: past its inflate bound. Both limits are fixed, so a re-send is refused again. The low byte, which
 #: PS3.4 leaves to the SCP, tells this refusal apart from a decode failure in a sender's log. It stays
@@ -229,7 +230,7 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
 #: either value resolves to the ingress ceiling. Following that advice would leave the SCP at 16 MiB
 #: while the operator believed it uncapped.
 _SCP_OBJECT_CAP_OFF_HINT = (
-    ". None or 0 does not disable the SCP's object cap: either one resolves to the engine's binary "
+    "None or 0 does not disable the SCP's object cap: either one resolves to the engine's binary "
     f"ingress ceiling of {_ENGINE_INGRESS_CEILING_BYTES} bytes, and no setting raises the cap above it"
 )
 
@@ -274,12 +275,6 @@ class DicomScpSource(SourceConnector):
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
         )
-        # BACKLOG #2104: the pre-decode inflate bound is the lesser of the object cap and the codec's
-        # fixed inflate ceiling. The ingress ceiling above measures the re-encoded bytes, which stay
-        # deflated, so it cannot stand in for this bound. But DicomPeek and DicomDataset refuse any
-        # object that inflates past DEFAULT_MAX_INFLATED_BYTES when the router parses it after
-        # commit, so an SCP that let one through would answer Success for an object recorded ERROR.
-        self._max_inflated_bytes: int = min(self._max_object_bytes, DEFAULT_MAX_INFLATED_BYTES)
         self._max_associations = int(s.get("max_associations", 10))
         self._max_pdu_size = int(s.get("max_pdu_size", 16384))
         self._timeout = float(s.get("timeout_seconds", 30.0))
@@ -371,6 +366,17 @@ class DicomScpSource(SourceConnector):
                 self._max_object_bytes,
                 self._max_inflated_bytes,
             )
+
+    @property
+    def _max_inflated_bytes(self) -> int:
+        """The pre-decode inflate bound: the lesser of the object cap and the codec's inflate ceiling
+        (BACKLOG #2104). The ingress ceiling behind ``_max_object_bytes`` measures the re-encoded bytes,
+        which stay deflated, so it cannot stand in for this bound. But ``DicomPeek`` and
+        ``DicomDataset`` refuse any object that inflates past the codec's ceiling when the router parses
+        it after commit, so an SCP that let one through would answer Success for an object recorded
+        ``ERROR``. The ceiling is read from its module on each call, as ``guard_part10_deflate`` reads
+        it, so the two cannot drift apart."""
+        return min(self._max_object_bytes, _dicom_inflate.DEFAULT_MAX_INFLATED_BYTES)
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -617,14 +623,6 @@ class DicomScpSource(SourceConnector):
                 buffer = BytesIO()
                 dataset.save_as(buffer, enforce_file_format=True)
                 object_bytes = buffer.getvalue()
-            except MemoryError:
-                # Not the object's fault: the host ran short. A re-send may succeed (BACKLOG #2103).
-                logger.error(
-                    "DICOM C-STORE from %s (AE %r): out of memory decoding/encoding the object",
-                    peer_ip,
-                    calling_ae,
-                )
-                return _STATUS_OUT_OF_RESOURCES
             except Exception as exc:  # noqa: BLE001 - untrusted object; never crash the association
                 logger.error(
                     "DICOM C-STORE from %s (AE %r): object could not be decoded/encoded: %s",
@@ -649,11 +647,6 @@ class DicomScpSource(SourceConnector):
                     self._max_object_bytes,
                 )
                 return _STATUS_REFUSED_OVER_CAP
-            inflate_refusal = self._reencoded_over_codec_ceiling(
-                object_bytes, peer_ip=peer_ip, calling_ae=calling_ae, sop_instance=sop_instance
-            )
-            if inflate_refusal is not None:
-                return inflate_refusal
             return self._commit(
                 object_bytes, peer_ip=peer_ip, sop_instance=sop_instance, sop_class=sop_class
             )
@@ -713,40 +706,6 @@ class DicomScpSource(SourceConnector):
             return _STATUS_REFUSED_OVER_CAP
         return None
 
-    def _reencoded_over_codec_ceiling(
-        self, object_bytes: bytes, *, peer_ip: str, calling_ae: str, sop_instance: str
-    ) -> int | None:
-        """BACKLOG #2104: run the codec's own deflate guard over the re-encoded Part-10 bytes, exactly as
-        ``DicomPeek.parse`` will after commit, and refuse before commit what it would refuse then.
-
-        The pre-decode guard bounds the Data Set as it arrived on the wire, but the store holds what
-        ``save_as`` wrote, and the two inflate to sizes that need not match: a re-encode can change an
-        element header. It also bounds at a value read at build, while the codec reads its ceiling at
-        call time. Running the same function on the same bytes closes both gaps. A no-op, apart from a
-        header read, for any transfer syntax but Deflated Explicit VR LE. PHI-safe: logs routing
-        identifiers only."""
-        try:
-            guard_part10_deflate(object_bytes, force=False)  # the same call DicomPeek.parse makes
-        except DicomBombError:
-            logger.warning(
-                "DICOM C-STORE from %s (AE %r, SOP %s): re-encoded object inflates past the codec's "
-                "inflate ceiling; refusing before commit",
-                peer_ip,
-                calling_ae,
-                sop_instance,
-            )
-            return _STATUS_REFUSED_OVER_CAP
-        except Exception as exc:  # noqa: BLE001 - the codec would fail on these bytes too
-            logger.error(
-                "DICOM C-STORE from %s (AE %r, SOP %s): re-encoded object header unreadable: %s",
-                peer_ip,
-                calling_ae,
-                sop_instance,
-                safe_exc(exc),
-            )
-            return _STATUS_CANNOT_UNDERSTAND
-        return None
-
     def _commit(
         self, object_bytes: bytes, *, peer_ip: str, sop_instance: str, sop_class: str
     ) -> int:
@@ -764,15 +723,24 @@ class DicomScpSource(SourceConnector):
         loop, handler = self._loop, self._handler
         if loop is None or handler is None:  # never started
             return _STATUS_OUT_OF_RESOURCES
+        if loop.is_closed() or not loop.is_running():
+            # The engine's loop has stopped under a live association. A callback scheduled now would
+            # never run, and this thread would wait out timeout_seconds for nothing. Nothing was
+            # committed and a re-send after a restart would be, so answer Out of Resources at once
+            # (BACKLOG #2103).
+            logger.error(
+                "DICOM C-STORE from %s (SOP %s): the engine loop is not running",
+                peer_ip,
+                sop_instance,
+            )
+            return _STATUS_OUT_OF_RESOURCES
         # The runner's receipt handler is an async def (a Coroutine), but InboundHandler is typed as the
         # Awaitable; run_coroutine_threadsafe needs a Coroutine, so narrow it.
         coro = cast("Coroutine[Any, Any, str | None]", handler(object_bytes))
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError as exc:
-            # The engine's loop has closed under a live association. Nothing was committed and a
-            # re-send after a restart would be, so this is Out of Resources, not the final Cannot
-            # Understand the last-resort handler would answer (BACKLOG #2103).
+            # The loop closed between the check above and this call. Same answer, same reason.
             coro.close()  # never scheduled; close it so it is not reported as never awaited
             logger.error(
                 "DICOM C-STORE from %s (SOP %s): the engine loop is not running: %s",

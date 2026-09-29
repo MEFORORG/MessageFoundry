@@ -195,16 +195,13 @@ async def test_a_small_deflated_object_that_inflates_past_the_parse_ceiling_is_r
     assert await _rows(store) == [], "a refused object must not also be recorded as received"
 
 
-async def test_the_scp_refuses_what_the_codec_would_refuse_on_the_re_encoded_bytes(
+async def test_the_scp_inflate_bound_reads_the_codec_ceiling_when_it_runs(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #2104: the pre-decode guard bounds the Data Set as it arrived, at a value read at build.
-    The codec bounds the re-encoded bytes the store holds, at a value read when it runs. The SCP runs
-    the codec's own guard on the re-encoded bytes before commit, so the two cannot disagree.
-
-    Lowering the codec's ceiling after the SCP module has read it isolates that second check: the
-    pre-decode guard still allows 16 MiB, so only the re-encode check can refuse this 2 MiB inflate.
-    Without it the object is answered Success and then refused by the router's parse."""
+    """BACKLOG #2104: the codec reads its inflate ceiling each time it parses. The SCP must read the
+    same value then too, not a copy taken when its module was imported or the connection was built,
+    or the two drift apart and the SCP answers Success for an object the router's parse refuses.
+    Lowering the ceiling after import is that drift: a 2 MiB inflate is now over it."""
     from messagefoundry.parsing.dicom import _inflate
 
     monkeypatch.setattr(_inflate, "DEFAULT_MAX_INFLATED_BYTES", _MIB)

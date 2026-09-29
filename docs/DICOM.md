@@ -68,9 +68,9 @@ The SCP answers at least these statuses:
 | Status | Class | When the SCP answers it |
 |---|---|---|
 | `0x0000` | Success | the object is durably committed to the ingress stage |
-| `0xC010` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, checked on the Data Set as received and again, with the codec's own guard, on the re-encoded bytes the store would hold (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
-| `0xC000` | Cannot Understand, final | the object would not decode or re-encode, the engine's ingress refused it and recorded `ERROR`, or the SCP hit an error it did not expect |
-| `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down; the commit did not finish within `timeout_seconds`; the engine's loop is not running; or the host ran out of memory decoding the object |
+| `0xC010` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
+| `0xC000` | Cannot Understand, final | the object would not decode or re-encode, the engine's ingress refused it and recorded `ERROR`, or the SCP hit an error it did not expect, including running out of memory |
+| `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down; the commit did not finish within `timeout_seconds`; or the engine's loop is not running |
 | `0x0124` | Refused: Not Authorized | the peer IP is not in `source_ip_allowlist` |
 
 The low byte of `0xC010` is the SCP's own choice, which PS3.4 allows inside `0xCxxx`. It separates an

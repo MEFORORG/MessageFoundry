@@ -591,7 +591,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   over the object or inflate cap was answered Out of Resources (`0xA700`), which senders retry, though
   a re-send is refused again. It is now Cannot Understand `0xC010`, a final refusal. A commit that
   raised was answered Cannot Understand (`0xC000`), though a store that is down may recover. It is now
-  Out of Resources (`0xA700`). A negative `max_object_bytes` is still refused at build, but the message
+  Out of Resources (`0xA700`), as is a C-STORE that arrives after the engine's loop has stopped. A
+  negative `max_object_bytes` is still refused at build, but the message
   no longer says `0` or `None` disables the cap; on the SCP both resolve to 16 MiB. See
   `docs/DICOM.md` section 3 for the statuses. (`BACKLOG #2103`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
