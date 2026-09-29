@@ -27,6 +27,13 @@ and the section 10 count of HTML writes in the web console's scripts, plus the c
 the console's Python holds none of the engine's classes. The TypeScript and JavaScript checks read
 by pattern, not by parser, and skip whole-line comments only.
 
+Section 7's two parser tables are held to a scan too (BACKLOG #1190): every parse site the four
+patterns the page names find, over the engine and the web console's Python, must sit in exactly one
+table, and neither table may name a site the scan does not find. The patterns the page states must be
+the ones the detector uses. Which table a site belongs in is a
+judgement about where its input comes from, and no check here reads that. Section 9's claim about
+which extension file builds markup with ``innerHTML`` is pinned to a file that exists and does.
+
 The start detector covers at least the names in ``_SUBPROCESS_FUNCS``, ``_START_FORMS``,
 ``_OS_EXEC_RE`` and ``_ATTRIBUTE_STARTS``. Its known limits: it cannot see a start hidden behind
 ``getattr`` with a computed name, or one made inside a third-party library; it takes a ``subprocess``
@@ -49,6 +56,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.redaction import json_loads_or_refusal
 from tests.test_threat_model_doc_drift import _ALLOWED_SUBPROCESS_SITES
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -140,16 +148,24 @@ def _parse(source: str) -> ast.Module:
 @functools.cache
 def _imports_any(source: str, libs: tuple[str, ...], attr: str | None = None) -> bool:
     """Whether a module imports one of ``libs`` or a submodule of one, at any depth, or reads an
-    attribute named ``attr``. A source that never spells any of those names is not parsed."""
-    if not any(name in source for name in (*libs, *(() if attr is None else (attr,)))):
+    attribute named ``attr``. A source that never spells the first part of any of those names, or
+    ``attr``, is not parsed."""
+    roots = (lib.partition(".")[0] for lib in libs)
+    if not any(name in source for name in (*roots, *(() if attr is None else (attr,)))):
         return False
-    for node in ast.walk(_parse(source)):
+    return _tree_imports_any(_parse(source), libs, attr)
+
+
+def _tree_imports_any(tree: ast.Module, libs: tuple[str, ...], attr: str | None = None) -> bool:
+    """:func:`_imports_any` over a tree already parsed, for a caller that walks it again."""
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module is not None:
             if attr is not None and any(alias.name == attr for alias in node.names):
                 return True
-            names = [node.module]
+            # ``from email import parser`` imports ``email.parser``, so a dotted lib must see it.
+            names = [node.module, *(f"{node.module}.{alias.name}" for alias in node.names)]
         elif attr is not None and isinstance(node, ast.Attribute) and node.attr == attr:
             return True
         else:
@@ -978,3 +994,279 @@ def test_later_section_drift_is_reported() -> None:
     claim = f"into the page in {sinks} places"
     assert _console_drift(_replace_once(text, claim, f"into the page in {sinks + 1} places"), sinks)
     assert _console_drift(text, sinks + 1)
+
+
+# --- section 7: the parser tables, and section 9's innerHTML file (BACKLOG #1190) ------------------
+
+#: Pattern 1 on the page: format libraries whose import, at any depth, makes a module a parse site.
+_PARSER_LIBS = (
+    "hl7",
+    "hl7apy",
+    "lxml",
+    "defusedxml",
+    "xml",
+    "xmlschema",
+    "signxml",
+    "pydicom",
+    "pynetdicom",
+    "pyx12",
+    "fhir.resources",
+    "fhirpathpy",
+    "cbor2",
+    "webauthn",
+    "csv",
+    "email.parser",
+    "email.feedparser",
+)
+
+#: Pattern 2: JSON decodes, by resolved name. The engine's helper and a no-argument ``.json()`` are
+#: matched by the called name instead, because the object in front of them varies.
+_JSON_DECODES = frozenset({"json.loads", "json.load"})
+_JSON_HELPER = json_loads_or_refusal.__name__
+_JSON_METHOD = ".json()"
+
+#: Pattern 3: form decodes, by the called name.
+_FORM_DECODES = frozenset({"parse_qs", "parse_qsl"})
+
+#: Patterns 2 and 3 matched by the called name alone.
+_DECODES_BY_NAME = frozenset({_JSON_HELPER, *_FORM_DECODES})
+
+#: Pattern 4: a bytes method that tokenizes, when its first argument is a bytes literal, and any
+#: ``unpack`` family call. ``startswith`` and ``endswith`` test bytes without splitting them, so they
+#: are left out.
+_BYTE_TOKENIZERS = frozenset(
+    {"split", "rsplit", "partition", "rpartition", "find", "rfind", "index", "rindex"}
+)
+_UNPACKS = frozenset({"unpack", "unpack_from", "iter_unpack"})
+
+_CONSOLE_PREFIX = "messagefoundry_webconsole/"
+_OUTSIDE_HEADER = "| Input | Where it comes from | Modules |"
+_LEFT_OUT_HEADER = "| Why it is left out | Modules |"
+_UNIT_RE = re.compile(r"`([\w/]+(?:\.py|/))`")
+
+
+def _is_parse_call(node: ast.Call, aliases: Mapping[str, str]) -> bool:
+    """Whether one call matches pattern 2, 3 or 4."""
+    name = _called_name(node)
+    if name in _DECODES_BY_NAME or _dotted(node.func, aliases) in _JSON_DECODES:
+        return True
+    if not isinstance(node.func, ast.Attribute):
+        return False
+    if f".{name}()" == _JSON_METHOD and not node.args and not node.keywords:
+        return True
+    if name in _UNPACKS:
+        return True
+    first = node.args[0] if node.args else None
+    return (
+        name in _BYTE_TOKENIZERS
+        and isinstance(first, ast.Constant)
+        and isinstance(first.value, bytes)
+    )
+
+
+@functools.cache
+def _is_parse_site(source: str) -> bool:
+    """Whether a module matches any of the four patterns section 7 names. One parse feeds both the
+    import check and the call walk."""
+    tree = _parse(source)
+    if _tree_imports_any(tree, _PARSER_LIBS):
+        return True
+    aliases = _aliases(tree)
+    return any(
+        isinstance(node, ast.Call) and _is_parse_call(node, aliases) for node in ast.walk(tree)
+    )
+
+
+def _parse_unit(rel: str) -> str:
+    """A hit inside a codec package under ``parsing/`` counts for the whole package."""
+    parts = rel.split("/")
+    return f"parsing/{parts[1]}/" if len(parts) > 2 and parts[0] == "parsing" else rel
+
+
+def _parse_sites(sources: Mapping[str, str]) -> set[str]:
+    return {_parse_unit(rel) for rel, source in sources.items() if _is_parse_site(source)}
+
+
+def _parser_scan_sources() -> dict[str, str]:
+    """The engine's modules, and the web console's under their package name, as the page writes them."""
+    console = {f"{_CONSOLE_PREFIX}{rel}": source for rel, source in _console_python().items()}
+    return {**_package_sources(), **console}
+
+
+def _table_units(section: str, header: str) -> set[str]:
+    """Every module or package the table under ``header`` names in its last cell."""
+    lines = section.splitlines()
+    assert header in lines, f"section 7 has no table headed {header!r}"
+    units: set[str] = set()
+    for line in lines[lines.index(header) + 2 :]:
+        if not line.startswith("|"):
+            break
+        units.update(_UNIT_RE.findall(line.rstrip().rstrip("|").rpartition("|")[2]))
+    return units
+
+
+def _parser_drift(text: str, live: set[str]) -> list[str]:
+    section = _section(text, 7)
+    outside = _table_units(section, _OUTSIDE_HEADER)
+    left_out = _table_units(section, _LEFT_OUT_HEADER)
+    problems = _set_drift("section 7's parser tables", outside | left_out, live)
+    if both := outside & left_out:
+        problems.append(f"section 7 puts {sorted(both)} in both parser tables")
+    return problems
+
+
+_PATTERNS_LEAD = "**How the parser list is found.**"
+_PATTERN_ITEM_RE = re.compile(r"^(\d+)\. ")
+
+
+def _page_patterns(text: str) -> list[set[str]]:
+    """The backticked names in each numbered pattern section 7 states, in order."""
+    region = _section(text, 7).partition(_PATTERNS_LEAD)[2].partition("A hit inside")[0]
+    assert region, f"section 7 has no {_PATTERNS_LEAD!r} paragraph"
+    items: list[list[str]] = []
+    for line in region.splitlines():
+        if _PATTERN_ITEM_RE.match(line):
+            items.append([line])
+        elif items and line.startswith("   "):
+            items[-1].append(line)
+    return [set(re.findall(r"`([^`]+)`", " ".join(item))) for item in items]
+
+
+#: What the detector matches, pattern by pattern, as the page must state it.
+_DETECTOR_PATTERNS = [
+    set(_PARSER_LIBS),
+    {*_JSON_DECODES, _JSON_HELPER, _JSON_METHOD},
+    set(_FORM_DECODES),
+    {*_BYTE_TOKENIZERS, *_UNPACKS},
+]
+
+
+def _innerhtml_file_problems(text: str, sources: Mapping[str, str]) -> list[str]:
+    """Each file section 9 names as building markup with ``innerHTML`` must exist under ``ide/src``
+    and write HTML into its page, by the sink pattern section 10 uses."""
+    claim = re.search(r"markup with `innerHTML`, at least in (.+?)\.\s", _section(text, 9), re.S)
+    assert claim is not None, "section 9 no longer names the files that build markup with innerHTML"
+    names = re.findall(r"`([\w/]+\.ts)`", claim.group(1))
+    if not names:
+        return ["section 9's innerHTML sentence names no file"]
+    problems: list[str] = []
+    for name in names:
+        source = sources.get(name)
+        if source is None:
+            problems.append(f"section 9 names {name}, which is not in ide/src")
+        elif not _console_sink_count({name: source}):
+            problems.append(f"section 9 names {name}, which writes no HTML into its page")
+    return problems
+
+
+def test_the_parser_tables_match_the_code() -> None:
+    _assert_no_drift(7, _parser_drift(_doc_text(), _parse_sites(_parser_scan_sources())))
+
+
+def test_the_page_states_the_patterns_the_detector_uses() -> None:
+    """The page tells a reader how to re-run the scan, so its patterns must be the detector's."""
+    assert _page_patterns(_doc_text()) == _DETECTOR_PATTERNS
+
+
+def test_the_parse_site_scan_reaches_the_sites_it_must() -> None:
+    # The multipart parser is the site that first showed the page's list was not derived. It is
+    # hand-written, so only pattern 4 reaches it, and it anchors that the pattern still does.
+    live = _parse_sites(_parser_scan_sources())
+    assert {"api/multipart.py", "parsing/fhir/", f"{_CONSOLE_PREFIX}routes/core.py"} <= live, (
+        "the parse-site scan no longer finds a site it must: the scan is dead or a pattern broke"
+    )
+
+
+def test_the_innerhtml_file_section_9_names_holds_the_sink() -> None:
+    _assert_no_drift(9, _innerhtml_file_problems(_doc_text(), _ide_sources()))
+
+
+_PARSE_SITE_CONTROLS = [
+    "import hl7\n",
+    "from defusedxml.ElementTree import fromstring\n",
+    "from email import parser\n",
+    "import email.parser\n",
+    "from fhir.resources import get_fhir_model_class\n",
+    "def f():\n    import pyx12.x12n_document\n",
+    "import json\njson.loads(x)\n",
+    "import json as j\nj.load(fh)\n",
+    "from json import loads\nloads(x)\n",
+    "value, refused = json_loads_or_refusal(raw)\n",
+    "async def f(request):\n    return await request.json()\n",
+    "from urllib.parse import parse_qsl\nparse_qsl(body)\n",
+    "head, _, rest = body.partition(b'\\r\\n\\r\\n')\n",
+    "at = data.find(b'-->', 4)\n",
+    "(length,) = struct.unpack('>I', data[:4])\n",
+]
+
+
+@pytest.mark.parametrize("source", _PARSE_SITE_CONTROLS)
+def test_the_parse_site_detector_fires_on_each_pattern(source: str) -> None:
+    assert _is_parse_site(source)
+
+
+def test_the_parse_site_detector_ignores_mentions_and_non_parses() -> None:
+    quiet = (
+        '"""import hl7, json.loads(x), parse_qsl(body) and data.find(b"x")."""\n'
+        "# import lxml\n"
+        "import json\n"
+        "from email.message import EmailMessage\n"
+        "text = json.dumps(value)\n"
+        "ok = data.startswith(b'MSH') and data.endswith(b'\\r')\n"
+        "parts = text.split(',')\n"
+        "response.json(strict=True)\n"
+    )
+    assert not _is_parse_site(quiet)
+    assert _parse_sites(
+        {"parsing/xml/_deps.py": "import lxml\n", "parsing/peek.py": "import hl7\n"}
+    ) == {
+        "parsing/xml/",
+        "parsing/peek.py",
+    }
+
+
+def test_parser_table_drift_is_reported() -> None:
+    """Break the page and the tree in memory, one way at a time, and each break must be reported."""
+    text = _doc_text()
+    sources = _parser_scan_sources()
+    live = _parse_sites(sources)
+    assert not _parser_drift(text, live)
+    # A pattern the page states that the detector does not use, or one it drops.
+    assert _page_patterns(_replace_once(text, "`cbor2`, ", "`cbor2`, `msgpack`, ")) != (
+        _DETECTOR_PATTERNS
+    )
+    assert _page_patterns(_replace_once(text, "`parse_qs` or `parse_qsl`", "`parse_qs`")) != (
+        _DETECTOR_PATTERNS
+    )
+
+    # An omitted site: the page drops one the scan finds.
+    assert _parser_drift(_replace_once(text, "| `api/multipart.py` |", "| |"), live)
+    # An orphaned listing: the page names a module the scan does not find.
+    assert _parser_drift(
+        _replace_once(text, "| `corepoint_import.py` |", "| `corepoint_import.py`, `nope.py` |"),
+        live,
+    )
+    # One site in both tables.
+    assert _parser_drift(
+        _replace_once(text, "`redaction.py` |", "`redaction.py`, `api/multipart.py` |"), live
+    )
+    # A planted parser the page does not name.
+    sources["pipeline/new_parser.py"] = (
+        "import json\n\ndef read(raw):\n    return json.loads(raw)\n"
+    )
+    assert _parser_drift(text, _parse_sites(sources))
+    # A table the reader can no longer find is an error, not an empty set.
+    with pytest.raises(AssertionError):
+        _parser_drift(_replace_once(text, _LEFT_OUT_HEADER, "| Why | Modules |"), live)
+
+
+def test_innerhtml_file_drift_is_reported() -> None:
+    text = _doc_text()
+    sources = _ide_sources()
+    assert not _innerhtml_file_problems(text, sources)
+    named = "at least in `testBenchWebview.ts`."
+    # The file the sentence named before BACKLOG #1190 exists and holds no innerHTML write.
+    assert _innerhtml_file_problems(
+        _replace_once(text, named, "at least in `testBench.ts`."), sources
+    )
+    assert _innerhtml_file_problems(_replace_once(text, named, "at least in `nope.ts`."), sources)
