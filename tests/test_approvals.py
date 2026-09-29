@@ -9,12 +9,13 @@ The replay endpoint stands in for a gated high-value action (it needs no configu
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -1466,8 +1467,13 @@ async def test_a_cancel_during_the_status_write_still_records_the_resolution(
 
 # --- BACKLOG #2087: a shielded outcome write logs once, is per gate, and is drained at shutdown ---
 # asyncio.shield reported a write that raised after its caller was cancelled through the loop's
-# exception handler, which logs to the 'asyncio' logger, and the gate logged the same failure again.
-# So these count records from BOTH loggers.
+# exception handler, and the gate logged the same failure again. So these count the gate's log
+# records AND every call to the loop's exception handler.
+#
+# Which handler is installed depends on test order. The tests share one session loop, and any
+# create_managed_app lifespan earlier on it installs the engine's last-resort handler
+# (install_loop_exception_handler) and never removes it. That handler logs to its own logger, not
+# 'asyncio'. So each test installs a capturing handler of its own rather than trusting a logger name.
 
 _REPORTING_LOGGERS = ("messagefoundry.api.approvals", "asyncio")
 
@@ -1478,12 +1484,23 @@ def _reports(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     ]
 
 
+@contextlib.contextmanager
+def _loop_reports() -> Iterator[list[dict[str, Any]]]:
+    """Capture every call to the running loop's exception handler, then restore the previous one."""
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    seen: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: seen.append(context))
+    try:
+        yield seen
+    finally:
+        loop.set_exception_handler(previous)
+
+
 async def _reported_after(caplog: pytest.LogCaptureFixture, text: str) -> list[logging.LogRecord]:
     """Wait for the gate's own line naming ``text``, then a little longer, so a SECOND report of the
-    same failure would have had time to arrive before the caller counts them."""
-    # Control: the default handler is the one that logs to 'asyncio'. With another handler installed
-    # a shield's report would go elsewhere, and a count of one would prove nothing.
-    assert asyncio.get_running_loop().get_exception_handler() is None
+    same failure would have had time to arrive before the caller counts them. Run it inside
+    :func:`_loop_reports`, so a report through the loop's exception handler is captured too."""
     deadline = time.monotonic() + _WAIT_S
     while not any(text in r.getMessage() for r in _reports(caplog)):
         assert time.monotonic() < deadline, f"no report naming {text!r}"
@@ -1514,9 +1531,10 @@ async def test_a_cancelled_claim_that_fails_is_logged_once(
                 raise OSError("store unreachable")
             return bool(await self._store.decide_pending_approval(approval_id, **kw))
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
         approval_id, ran = await _cancel_inside(_ClaimFails(engine.store), _runs)
         reports = await _reported_after(caplog, "its claim failed")
+    assert [c.get("message") for c in loop_reports] == []
     assert len(reports) == 1, [f"{r.name}: {r.getMessage()}" for r in reports]
     assert reports[0].levelno == logging.ERROR and approval_id in reports[0].getMessage()
     assert ran == []
@@ -1534,7 +1552,7 @@ async def test_a_cancelled_resolve_that_loses_the_race_logs_one_warning(
     approval_id = await _interrupted_row(engine, "maker", "maker-id")
     store = _held_store(engine, "decide:resolved_applied")
     gate = ApprovalGate(store, ON, resolve_identity=_resolve)
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
         task = asyncio.create_task(
             gate.resolve_interrupted(
                 approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
@@ -1554,6 +1572,7 @@ async def test_a_cancelled_resolve_that_loses_the_race_logs_one_warning(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, _WAIT_S)
         reports = await _reported_after(caplog, "another operator resolved it first")
+    assert [c.get("message") for c in loop_reports] == []
     assert len(reports) == 1, [f"{r.name}: {r.getMessage()}" for r in reports]
     assert reports[0].levelno == logging.WARNING and approval_id in reports[0].getMessage()
     assert reports[0].exc_info is None
@@ -1572,14 +1591,17 @@ async def test_a_cancelled_claim_that_loses_the_race_settles_nothing(
             approval_id, status="rejected", approver="other", decided_at=time.time()
         )
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
         # approve() waits for the settle before it re-raises, so the settle is done on return.
         approval_id, ran = await _cancel_inside(store, _runs, while_held=_reject)
         await asyncio.sleep(0.1)
+        gc.collect()
+        await asyncio.sleep(0)
     assert ran == []
     assert await _status_of(engine, approval_id) == "rejected"
     assert await engine.store.list_audit(action="approval.failed") == []
     assert _reports(caplog) == []
+    assert [c.get("message") for c in loop_reports] == []
 
 
 async def _orphan_a_held_approved_write(engine: Engine) -> tuple[ApprovalGate, Any, str]:
