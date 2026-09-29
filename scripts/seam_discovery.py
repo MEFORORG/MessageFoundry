@@ -79,7 +79,8 @@ class DiscoveredSurface:
     security_symbols: tuple[str, ...]
     #: Every name the console imports from ``messagefoundry.auth.service``, ``AuthService`` included
     #: (BACKLOG #2015). ``auth_service_methods`` below covers the class's MEMBERS; this covers the
-    #: module's other names, such as step-up action constants, exceptions and result dataclasses.
+    #: module's other names, such as step-up action constants, exceptions and result dataclasses,
+    #: plus any ``auth.service`` class reached through a recorded class's fields.
     auth_service_symbols: tuple[str, ...]
     auth_service_methods: tuple[str, ...]
     app_state_attrs: tuple[str, ...]
@@ -382,16 +383,20 @@ def _auth_service_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
     renaming a step-up constant or an exception the console imports moved nothing, and the pair
     failed at import instead.
 
-    Two idioms that ``_security_symbols`` never had to face fail loud here:
+    Idioms that ``_security_symbols`` never had to face:
 
-    * Binding the module itself (``import messagefoundry.auth.service`` or
-      ``from messagefoundry.auth import service``). Names read through that binding are not in any
+    * Binding the module itself fails loud: ``import messagefoundry.auth.service``,
+      ``from messagefoundry.auth import service``, or ``.service`` read off a binding of
+      ``messagefoundry`` or ``messagefoundry.auth``. Names read through such a binding are in no
       import statement, so the walk could not claim to have found them all.
     * A RE-EXPORT through another ``messagefoundry`` module is resolved rather than refused. The walk
       imports the module the statement names and reads the object there. A class or function carries
       its defining module, so it is recorded exactly, under its name in ``auth.service``. A plain
-      constant carries none, so a re-exported constant is the one case this cannot see; it measures
+      constant carries none, so at least a re-exported constant is invisible here; that measures
       zero today.
+    * A name the console imports that ``auth.service`` does not define fails loud, naming the file.
+    * A class reached only as a FIELD of a recorded result class is recorded too (see
+      :func:`_with_nested_auth_service_types`), so its fields do not depend on a sibling import.
 
     The re-export check reads the SOURCE module, never ``auth.service`` by the imported name. The
     console imports ``CustomRoleInfo`` from ``api.auth_models``, and ``auth.service`` defines a
@@ -399,9 +404,11 @@ def _auth_service_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
     """
     import importlib
 
+    service = importlib.import_module(AUTH_SERVICE_MODULE)
     parent, _, leaf = AUTH_SERVICE_MODULE.rpartition(".")
-    found: set[str] = set()
+    found: dict[str, tuple[Path, ast.AST]] = {}
     for path, tree in trees:
+        _refuse_auth_service_through_a_package(path, tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 if any(alias.name == AUTH_SERVICE_MODULE for alias in node.names):
@@ -411,7 +418,7 @@ def _auth_service_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
                     for alias in node.names:
                         if alias.name == "*":
                             _fail(path, node, "star import from auth.service cannot be enumerated")
-                        found.add(alias.name)
+                        found.setdefault(alias.name, (path, node))
                 elif node.module == parent and any(a.name == leaf for a in node.names):
                     _fail(path, node, "module import of auth.service cannot be enumerated")
                 elif node.module.startswith("messagefoundry."):
@@ -422,8 +429,93 @@ def _auth_service_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
                         if (isinstance(obj, type) or inspect.isfunction(obj)) and (
                             obj.__module__ == AUTH_SERVICE_MODULE
                         ):
-                            found.add(obj.__name__)
-    return found
+                            found.setdefault(obj.__name__, (path, node))
+    for name, (path, node) in sorted(found.items()):
+        if not hasattr(service, name):
+            _fail(path, node, f"{name!r} is imported from auth.service but is not defined there")
+    return _with_nested_auth_service_types(service, set(found))
+
+
+def _refuse_auth_service_through_a_package(path: Path, tree: ast.Module) -> None:
+    """Fail loud on ``.service`` read off a binding of ``messagefoundry`` or ``messagefoundry.auth``.
+
+    ``from messagefoundry import auth`` then ``auth.service.X`` reaches a name through no import
+    statement. So do ``import messagefoundry.auth`` and ``import messagefoundry`` followed by the
+    dotted path. Measured zero in the console today.
+    """
+    root, pkg, leaf = AUTH_SERVICE_MODULE.split(".")
+    parent = f"{root}.{pkg}"
+    root_names: set[str] = set()
+    pkg_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname is None and alias.name.split(".")[0] == root:
+                    root_names.add(root)
+                elif alias.name == root and alias.asname:
+                    root_names.add(alias.asname)
+                elif alias.name == parent and alias.asname:
+                    pkg_names.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == root:
+            for alias in node.names:
+                if alias.name == pkg:
+                    pkg_names.add(alias.asname or pkg)
+    if not (root_names or pkg_names):
+        return
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute) and node.attr == leaf):
+            continue
+        base = node.value
+        via_pkg = isinstance(base, ast.Name) and base.id in pkg_names
+        via_root = (
+            isinstance(base, ast.Attribute)
+            and base.attr == pkg
+            and isinstance(base.value, ast.Name)
+            and base.value.id in root_names
+        )
+        if via_pkg or via_root:
+            _fail(path, node, "auth.service reached through a package binding cannot be enumerated")
+
+
+def _with_nested_auth_service_types(service: ModuleType, names: set[str]) -> set[str]:
+    """``names`` plus every ``auth.service`` class reached through a recorded class's fields.
+
+    The console reads ``outcome.elevation.token`` through ``OidcStepUp.elevation``. Without this,
+    ``Elevation``'s fields would be in the seam only because another route happens to import it.
+    Stdlib dataclasses here hold their annotations as strings, so they are resolved with
+    ``typing.get_type_hints``; one that cannot be resolved fails loud rather than being skipped.
+    """
+    out = set(names)
+    queue = [getattr(service, n) for n in sorted(names)]
+    while queue:
+        cls = queue.pop()
+        if isinstance(cls, type) and issubclass(cls, BaseModel):
+            annotations = _field_annotations(cls)
+        elif isinstance(cls, type) and dataclasses.is_dataclass(cls):
+            try:
+                annotations = list(typing.get_type_hints(cls).values())
+            except Exception as exc:  # NameError on an unresolvable string annotation, typically
+                raise SeamDiscoveryError(
+                    f"{AUTH_SERVICE_MODULE}.{cls.__qualname__}: field annotations are "
+                    f"unresolvable ({exc}), so a nested class could be missed"
+                ) from exc
+        else:
+            continue
+        stack: list[object] = list(annotations)
+        while stack:
+            current = stack.pop()
+            if isinstance(current, type) and current.__module__ == AUTH_SERVICE_MODULE:
+                name = current.__name__
+                if getattr(service, name, None) is not current:
+                    raise SeamDiscoveryError(
+                        f"{AUTH_SERVICE_MODULE}.{current.__qualname__} is reached through a field "
+                        "but is not bound under its own name, so it cannot be recorded"
+                    )
+                if name not in out:
+                    out.add(name)
+                    queue.append(current)
+            stack.extend(typing.get_args(current))
+    return out
 
 
 def _auth_service_receivers(tree: ast.Module) -> set[str]:

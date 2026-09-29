@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-3cdb350a7babe130
+f14a7edc65ae7e58
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -116,11 +116,11 @@ pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float
 
 ## auth.service names imported by the console
 AuthService: class; its members are the AuthService section
-Elevation: dataclass: directory_unconfirmed, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
+Elevation: required: none; optional: directory_unconfirmed, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
 FEDERATED_BINDING_CHANGED: attribute: str
-MfaStatus: dataclass: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
+MfaStatus: required: enabled, enrolled_at, recovery_codes_remaining, required; optional: webauthn_enrolled; properties: none
 NotifyEmailAlreadySet: exception (RuntimeError)
-OidcStepUp: dataclass: elevation, error, reason, return_to; properties: ok
+OidcStepUp: required: elevation; optional: error, reason, return_to; properties: ok
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_MFA: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_PASSWORD: attribute: str

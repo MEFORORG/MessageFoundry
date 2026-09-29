@@ -363,15 +363,26 @@ def test_auth_service_from_import_records_the_original_name() -> None:
     assert _auth_service_names(src) == {"NotifyEmailAlreadySet", "Elevation"}
 
 
-def test_a_planted_rename_moves_the_discovered_auth_service_names() -> None:
+def test_a_planted_rename_moves_the_discovered_auth_service_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """BACKLOG #2015's closing condition, at the discovery level. The digest-level twin is in
     ``tests/test_webconsole_seam_snapshot.py``. Neither asserts an end-to-end ``UiSeamMismatch``:
     the console's route modules import these names eagerly, so a skewed pair fails at import
-    before the handshake runs (BACKLOG #1907)."""
+    before the handshake runs (BACKLOG #1907).
+
+    The rename is planted on both sides, as the one commit making it would. A console that did NOT
+    follow it fails loud instead, which is the last assertion."""
+    from messagefoundry.auth import service
+
     before = _auth_service_names("from messagefoundry.auth.service import NotifyEmailAlreadySet\n")
+    monkeypatch.setattr(service, "NotifyEmailTaken", service.NotifyEmailAlreadySet, raising=False)
+    monkeypatch.delattr(service, "NotifyEmailAlreadySet")
     after = _auth_service_names("from messagefoundry.auth.service import NotifyEmailTaken\n")
     assert before == {"NotifyEmailAlreadySet"}
     assert after == {"NotifyEmailTaken"}
+    with pytest.raises(sd.SeamDiscoveryError, match="not defined there"):
+        _auth_service_names("from messagefoundry.auth.service import NotifyEmailAlreadySet\n")
 
 
 def test_auth_service_star_import_fails_loud() -> None:
@@ -393,6 +404,43 @@ def test_binding_the_auth_service_module_fails_loud(src: str) -> None:
     claim to have found them all."""
     with pytest.raises(sd.SeamDiscoveryError, match="module import of auth.service"):
         _auth_service_names(src)
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "from messagefoundry import auth\nx = auth.service.Elevation\n",
+        "from messagefoundry import auth as a\nx = a.service\n",
+        "import messagefoundry.auth\nx = messagefoundry.auth.service.Elevation\n",
+        "import messagefoundry.auth as a\nx = a.service.Elevation\n",
+        "import messagefoundry\nx = messagefoundry.auth.service.Elevation\n",
+    ],
+)
+def test_reaching_auth_service_through_a_package_binding_fails_loud(src: str) -> None:
+    with pytest.raises(sd.SeamDiscoveryError, match="through a package binding"):
+        _auth_service_names(src)
+
+
+def test_an_unrelated_service_attribute_is_not_refused() -> None:
+    """The control for the package-binding refusal: ``.service`` on anything else is not it."""
+    src = "from messagefoundry import auth\nimport messagefoundry\nx = app.service\ny = auth.identity\n"
+    assert _auth_service_names(src) == set()
+
+
+def test_a_name_auth_service_does_not_define_fails_loud() -> None:
+    """Otherwise the generator dies later with a bare AttributeError that names no console file."""
+    with pytest.raises(sd.SeamDiscoveryError, match="synthetic.py.*not defined there"):
+        _auth_service_names("from messagefoundry.auth.service import NoSuchName\n")
+
+
+def test_a_class_reached_only_through_a_field_is_recorded() -> None:
+    """``OidcStepUp.elevation`` is an ``Elevation``, and the console reads its fields through it.
+    Importing ``OidcStepUp`` alone must bring ``Elevation`` into the seam, so its fields do not
+    depend on some other route importing it."""
+    assert _auth_service_names("from messagefoundry.auth.service import OidcStepUp\n") == {
+        "OidcStepUp",
+        "Elevation",
+    }
 
 
 def test_a_re_exported_auth_service_class_is_resolved_through_its_source() -> None:

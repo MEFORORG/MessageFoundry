@@ -248,17 +248,23 @@ def test_the_digest_moves_when_an_imported_auth_service_name_is_renamed(
 
     from messagefoundry.auth import service
 
+    # Loading the script inserts the repo root on sys.path and registers a module; undo both.
+    monkeypatch.setattr(sys, "path", list(sys.path))
     spec = importlib.util.spec_from_file_location("_seam_gen_rename", _SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules["_seam_gen_rename"] = module
+    monkeypatch.setitem(sys.modules, "_seam_gen_rename", module)
     spec.loader.exec_module(module)
+
+    def _not_source(directory: str, names: list[str]) -> set[str]:
+        # Discovery reads only .py files, so the static assets need not be copied.
+        return {n for n in names if not n.endswith(".py") and not Path(directory, n).is_dir()} | {
+            "__pycache__"
+        }
 
     before = module.contract_digest()
     copy = tmp_path / "messagefoundry_webconsole"
-    shutil.copytree(
-        module._CONSOLE_DIR, copy, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
-    )
+    shutil.copytree(module._CONSOLE_DIR, copy, ignore=_not_source)
     monkeypatch.setattr(module, "_CONSOLE_DIR", copy)
     assert module.contract_digest() == before  # the control: copying alone moves nothing
 
@@ -272,6 +278,46 @@ def test_the_digest_moves_when_an_imported_auth_service_name_is_renamed(
     monkeypatch.delattr(service, "NotifyEmailAlreadySet")
 
     assert module.contract_digest() != before
+
+
+def test_auth_service_classes_render_required_fields_and_refuse_unknown_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The console builds ``Elevation()`` with no arguments, so a field LOSING ITS DEFAULT must
+    change the rendering, not only a renamed field. And a class shape the renderer does not know
+    must raise rather than render as a bare word that no change to the class could move."""
+    import dataclasses
+    import enum
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    spec = importlib.util.spec_from_file_location("_seam_gen_render", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "_seam_gen_render", module)
+    spec.loader.exec_module(module)
+
+    @dataclasses.dataclass
+    class Defaulted:
+        token: str | None = None
+
+    @dataclasses.dataclass
+    class Required:
+        token: str | None
+
+    rendered = module._auth_service_symbol(Defaulted)
+    assert rendered == "required: none; optional: token; properties: none"
+    assert module._auth_service_symbol(Required) != rendered
+
+    class Colour(enum.Enum):
+        RED = 1
+
+    assert module._auth_service_symbol(Colour) == "enum: RED"
+
+    class Plain:
+        pass
+
+    with pytest.raises(TypeError, match="cannot be rendered exactly"):
+        module._auth_service_symbol(Plain)
 
 
 def _digest_by_path(env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

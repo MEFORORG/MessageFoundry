@@ -55,6 +55,7 @@ redirect for anyone not on 5.1 -- the failure it was warning against.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import hashlib
 import importlib.util
 import inspect
@@ -62,6 +63,8 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONSOLE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
@@ -146,8 +149,6 @@ def _dto_fields(dto: type) -> list[str]:
     ``model_computed_fields`` is unioned in because a computed field is rendered exactly like a
     declared one; omitting it would be the same class of blind spot as the curated tuples.
     """
-    from pydantic import BaseModel
-
     if isinstance(dto, type) and issubclass(dto, BaseModel):
         return sorted(set(dto.model_fields) | set(dto.model_computed_fields))
     if dataclasses.is_dataclass(dto):
@@ -177,30 +178,50 @@ def _auth_service_symbol(obj: Any) -> str:
 
     Classes need their own rules, because :func:`_member` renders a class by its constructor
     signature. That RAISES on an exception class with no ``__init__`` of its own, such as
-    ``NotifyEmailAlreadySet``. On a dataclass it records the constructor, while the console only
-    reads the fields and properties. A rename moves the digest either way, since the name is the key.
+    ``NotifyEmailAlreadySet``. A result class renders as its fields, split into required and
+    optional, and its public properties. The console reads those, and it also builds ``Elevation()``
+    with no arguments, so a field losing its default must move the digest too. A class none of these
+    rules covers RAISES, like every other idiom this gate cannot render exactly.
 
     A constant renders by its type, not its value. The console imports the value from the installed
-    engine, so both sides always agree on it; a digest that moved on a value change would move for a
-    change that cannot break the pair.
+    engine, so both sides agree on it; a digest that moved on a value change would move for a change
+    that cannot break the pair. A value the console HARD-CODES instead of importing is outside this
+    section: it is not an import, so discovery never sees it.
     """
     if obj is AuthService:
         # Its constructor is the engine's to call, never the console's. Its members have their own
         # section, so rendering the signature here would move the seam for nothing the console uses.
         return "class; its members are the AuthService section"
-    if isinstance(obj, type):
-        if issubclass(obj, BaseException):
-            return f"exception ({', '.join(b.__name__ for b in obj.__bases__)})"
-        if dataclasses.is_dataclass(obj):
-            props = sorted(
-                n
-                for n in dir(obj)
-                if not n.startswith("_") and isinstance(inspect.getattr_static(obj, n), property)
-            )
-            rendered = f"dataclass: {', '.join(_dto_fields(obj))}"
-            return f"{rendered}; properties: {', '.join(props)}" if props else rendered
-        return "class"
-    return _member(obj)
+    if not isinstance(obj, type):
+        return _member(obj)
+    if issubclass(obj, BaseException):
+        return f"exception ({', '.join(b.__name__ for b in obj.__bases__)})"
+    if issubclass(obj, enum.Enum):
+        return f"enum: {', '.join(sorted(m.name for m in obj))}"
+    if issubclass(obj, BaseModel):
+        required = sorted(n for n, f in obj.model_fields.items() if f.is_required())
+    elif dataclasses.is_dataclass(obj):
+        missing = dataclasses.MISSING
+        required = sorted(
+            f.name
+            for f in dataclasses.fields(obj)
+            if f.default is missing and f.default_factory is missing
+        )
+    else:
+        raise TypeError(
+            f"auth.service.{obj.__name__}: a class that is not an exception, enum, dataclass or "
+            "pydantic model cannot be rendered exactly; teach _auth_service_symbol its shape"
+        )
+    optional = sorted(set(_dto_fields(obj)) - set(required))
+    props = sorted(
+        n
+        for n in dir(obj)
+        if not n.startswith("_") and isinstance(inspect.getattr_static(obj, n), property)
+    )
+    return "; ".join(
+        f"{label}: {', '.join(names) or 'none'}"
+        for label, names in (("required", required), ("optional", optional), ("properties", props))
+    )
 
 
 def contract_sections() -> list[tuple[str, list[tuple[str, str]]]]:
