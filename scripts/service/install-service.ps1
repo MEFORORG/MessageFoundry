@@ -77,22 +77,120 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Pinned NSSM release, auto-downloaded if not already present (so end users need no manual setup).
+# $NssmSha256 is the hash of the ARCHIVE, so it can check a download and nothing else. The hash of the
+# nssm.exe inside it is $NssmExeSha256, in the pinned-hash block below, and that is the one every
+# copy is checked against before it runs.
 $NssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
 $NssmSha256 = "727D1E42275C605E0F04ABA98095C38A8E1E46DEF453CDFFCE42869428AA6743"
 
+# BEGIN pinned-hash check (kept byte-identical in install-service.ps1, uninstall-service.ps1,
+# install-net-helper.ps1 and uninstall-net-helper.ps1; guarded by tests/test_nssm_pin.py, which fails
+# if the four copies drift)
+#
+# The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
+# pins as $NssmSha256. Every script checks the copy it is about to run against this value, whichever
+# source the copy came from - -NssmPath, PATH, a cache, or a download (BACKLOG #2364). Only the
+# download used to be checked, so a copy found anywhere else ran unchecked, as administrator.
+$NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
+
+function Get-FilePinProblem {
+    <#
+      Why the file at $Path does not match the pinned SHA-256 $Expected, or "" when it does.
+
+      RETURNED, NOT THROWN, so each caller decides what a mismatch means: refuse to go on, or skip to
+      another source. The message names both hashes, so an operator can compare them against the
+      channel the pin came from. A file that cannot be hashed is a mismatch, never a pass.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    try {
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+    } catch {
+        return ("'$Path' could not be hashed ($($_.Exception.Message)), so nothing checked it " +
+            "against the pinned SHA-256 $Expected")
+    }
+    if ($actual -ne $Expected) { return "'$Path' has SHA-256 $actual, not the pinned $Expected" }
+    return ""
+}
+
+function Lock-PinnedFile {
+    <#
+      Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
+      return the open handle. Throws, with the handle closed, when the file cannot be opened that
+      way or does not match.
+
+      A check alone leaves a gap: the script hashes a copy and runs it later, and a file in a folder
+      another account can write could be swapped in between. While this handle is open it cannot
+      be. Measured 2026-09-29 on Windows 11 under PowerShell 7.6: holding a FileShare.Read handle,
+      this process could still hash the file and run it, and another process's write, rename and
+      delete of it, and a rename of its folder, were all refused. A process already holding the
+      file open for writing makes the open itself fail, which is a refusal too. Dispose the handle
+      when the script no longer runs the file.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $problem = Get-FilePinProblem -Path $Path -Expected $Expected
+    if ($problem) {
+        $handle.Dispose()
+        throw $problem
+    }
+    return $handle
+}
+# END pinned-hash check
+
 function Resolve-Nssm {
+    <#
+      The nssm.exe this install runs, and registers the service with. Each source is checked against
+      $NssmExeSha256 before it is used (BACKLOG #2364).
+
+      The search order is -NssmPath, then PATH, then the copy cached in <DataDir>\bin, then a
+      download. The cache sits in the data directory, where the engine's own account has modify
+      rights. So without a check there, code running as the engine could plant an nssm.exe for the
+      next install to run as administrator.
+
+      Each source fails in its own way, on purpose:
+        -NssmPath  refused. The operator named that file, so running another would surprise them.
+        PATH       skipped with a warning, and the search goes on. A package manager's nssm is a
+                   different build with a different hash, which is ordinary and not an attack.
+        cache      refused. Only this function writes that file, from a checked download, so a
+                   mismatch means something changed it afterwards.
+        download   the archive is checked against $NssmSha256, and the nssm.exe taken out of it
+                   against $NssmExeSha256, before it is cached.
+
+      THIS CHECK CHOOSES THE COPY; Lock-PinnedFile, at the call site, is what binds it. The binary
+      runs later in this script, so the caller opens it against change and checks it again under
+      that handle, which it holds until the last nssm call.
+    #>
     param([string]$Provided, [string]$DataDir)
 
     if ($Provided) {
-        if (-not (Test-Path $Provided)) { throw "NSSM not found at: $Provided" }
-        return (Resolve-Path $Provided).Path
+        if (-not (Test-Path -LiteralPath $Provided)) { throw "NSSM not found at: $Provided" }
+        $resolved = (Resolve-Path -LiteralPath $Provided).Path
+        $problem = Get-FilePinProblem -Path $resolved -Expected $NssmExeSha256
+        if ($problem) {
+            throw ("Refusing -NssmPath: $problem. Pass the win64 nssm.exe from the NSSM 2.24 " +
+                "release, or leave -NssmPath out and this script downloads and checks it.")
+        }
+        return $resolved
     }
-    $onPath = Get-Command nssm -ErrorAction SilentlyContinue
-    if ($onPath) { return $onPath.Source }
+    $onPath = Get-Command nssm -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($onPath) {
+        $problem = Get-FilePinProblem -Path $onPath.Source -Expected $NssmExeSha256
+        if (-not $problem) { return $onPath.Source }
+        Write-Warning "Not using the nssm on PATH: $problem. Using the pinned release instead."
+    }
 
     $binDir = Join-Path $DataDir "bin"
     $cached = Join-Path $binDir "nssm.exe"
-    if (Test-Path $cached) { return $cached }
+    if (Test-Path -LiteralPath $cached) {
+        $problem = Get-FilePinProblem -Path $cached -Expected $NssmExeSha256
+        if ($problem) {
+            throw ("Refusing the cached NSSM: $problem. Only this installer writes that file, from a " +
+                "checked download, so something has changed it since. Find out what, then delete " +
+                "it and re-run to download the pinned release again.")
+        }
+        return $cached
+    }
 
     Write-Host "NSSM not found - downloading $NssmUrl ..."
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
@@ -114,6 +212,13 @@ function Resolve-Nssm {
     Copy-Item $exe.FullName $cached -Force
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+    # The archive passed, so a mismatch here means the two pins disagree: a binary pin that does not
+    # match the binary in the pinned archive is a pin somebody got wrong.
+    $problem = Get-FilePinProblem -Path $cached -Expected $NssmExeSha256
+    if ($problem) {
+        Remove-Item $cached -Force -ErrorAction SilentlyContinue
+        throw "The nssm.exe from the checked NSSM archive failed its own check: $problem."
+    }
     Write-Host "NSSM installed to $cached"
     return $cached
 }
@@ -572,6 +677,16 @@ else { $DbPath = Resolve-AbsolutePath $DbPath }
 # relative -DataDir here would download the binary to one directory and register a service pointing at
 # another.
 $NssmPath = Resolve-Nssm -Provided $NssmPath -DataDir $DataDir
+# HELD OPEN UNTIL THE LAST nssm CALL (BACKLOG #2364). Resolve-Nssm checked the copy, but it runs
+# later, and the cache sits where the engine's account can write. While this handle is open no other
+# process can change, rename or delete the file, and the hash is taken again under it.
+try {
+    $NssmLock = Lock-PinnedFile -Path $NssmPath -Expected $NssmExeSha256
+} catch {
+    throw ("Refusing '$NssmPath': it could not be held against change and checked " +
+        "($($_.Exception.Message)). Something else has it open or has changed it; find out what " +
+        "before you re-run.")
+}
 
 if (-not (Test-Path $AppExe)) {
     throw "Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, or pass -AppExe."
@@ -903,6 +1018,10 @@ if ($SuppressCrashDumps) {
         "configured, a crash dump of the engine would contain plaintext PHI (docs/PHI.md).")
 }
 
+# The last nssm call is above. An operator who ran this in an open shell would otherwise keep the
+# file locked until that shell closed.
+$NssmLock.Dispose()
+
 Write-Host ""
 Write-Host "Installed '$ServiceName'." -ForegroundColor Green
 Write-Host "  Engine : $AppExe $AppParams"
@@ -910,7 +1029,9 @@ Write-Host "  Logs   : $StdoutLog"
 Write-Host "           $StderrLog"
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  $NssmPath start $ServiceName"
+# Start-Service, not the nssm.exe this script just used: that copy may sit where the engine's own
+# account can write, and nothing checks it when an operator runs it by hand (BACKLOG #2364).
+Write-Host "  Start-Service '$ServiceName'"
 # The engine ALWAYS serves TLS (BACKLOG #1276 part A, ADR 0172): with no [api].tls_cert_file
 # configured it mints a self-signed pair beside the store database on first start. So the health
 # probe is https, and it must trust that certificate - printing the old plaintext `curl http://...`
@@ -920,5 +1041,5 @@ Write-Host "  curl.exe --cacert `"$GeneratedCert`" https://${ListenHost}:${Port}
 Write-Host ("           (that PEM is the placeholder pair the engine mints on first start. With your " +
     "own [api].tls_cert_file configured, verify against THAT chain instead - the generated pair is " +
     "never created.)")
-Write-Host "  Stop:      $NssmPath stop $ServiceName"
+Write-Host "  Stop:      Stop-Service '$ServiceName'"
 Write-Host "  Uninstall: .\uninstall-service.ps1"

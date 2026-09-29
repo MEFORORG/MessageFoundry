@@ -35,8 +35,13 @@ venv interpreter) and the per-connection firewall openings the service needs.
    `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
 2. **NSSM** — provisioned automatically. If `nssm.exe` isn't on `PATH` (or passed via
    `-NssmPath`), `install-service.ps1` downloads the pinned, SHA‑256‑verified release into
-   `<DataDir>\bin\nssm.exe` and uses it. No manual install needed. (You can still pre-install it
-   — `choco install nssm` or a download from <https://nssm.cc> — and it'll be used if found.)
+   `<DataDir>\bin\nssm.exe` and uses it. No manual install needed.
+   A copy you already have is used only if its SHA-256 matches the pinned win64 `nssm.exe`
+   from NSSM 2.24. The installer and the uninstaller check every copy before they run it, whichever
+   source it came from. The installer refuses a `-NssmPath` copy or a cached copy that does not
+   match, and names both hashes. A copy on `PATH` that does not match is skipped with a warning, and
+   the installer downloads the pinned release instead. A package manager's `nssm` may be a
+   different build, so it may be skipped this way, and the install still goes on.
 3. **An elevated PowerShell** (Run as Administrator) — required to register a service.
    `messagefoundry service install --env <name>` elevates for you (a UAC prompt) and runs the
    install script below in a visible window so you can read its output.
@@ -155,7 +160,7 @@ service keeps the code it loaded **at process start**. To pick up new code (a pu
 switch, a merge), just **restart** it (elevated):
 
 ```powershell
-& C:\ProgramData\MessageFoundry\bin\nssm.exe restart MessageFoundry
+Restart-Service MessageFoundry
 curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
@@ -166,7 +171,7 @@ definition drifted — the install script is idempotent (it stops and reconfigur
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod   # elevated; re-points the exe + AppParameters
-& C:\ProgramData\MessageFoundry\bin\nssm.exe start MessageFoundry
+Start-Service MessageFoundry
 ```
 
 If the package was installed **non-editable** (a plain `pip install .`), the venv holds a
@@ -194,6 +199,12 @@ nssm restart MessageFoundry
 If `nssm` isn't on `PATH`, it's the auto-downloaded copy at `<DataDir>\bin\nssm.exe`
 (e.g. `C:\ProgramData\MessageFoundry\bin\nssm.exe`). You can also use the built-in
 `sc.exe` / Services.msc once installed.
+
+Prefer `Start-Service`, `Stop-Service` and `Restart-Service` from an elevated prompt. They ask
+Windows to do the same thing, and the service still gets the same graceful stop. The cached
+`nssm.exe` sits where the engine's own account can write, and nothing checks its hash when you run
+it by hand as administrator. The install and uninstall scripts do check it
+([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8).
 
 For a one-click desktop alternative to these commands — engine status at a glance plus
 start/stop/restart, the console, and the log from the notification area — run the

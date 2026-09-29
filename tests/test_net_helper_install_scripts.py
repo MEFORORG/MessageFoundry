@@ -9,9 +9,10 @@ test -- it is nobody.
 
 Three of the four are decisions that a later edit would flip without anything noticing:
 
-1. **The installer carries no second NSSM pin.** install-service.ps1 owns the archive URL and its
-   SHA-256, and ``test_service_install_manifest.py`` guards that one. A copy here would be a second
-   thing to keep current, and a stale copy of a supply-chain pin is worse than no copy.
+1. **The installer downloads nothing and carries no copy of the ARCHIVE pin.** install-service.ps1
+   owns the archive URL and its SHA-256, and ``test_service_install_manifest.py`` guards that one.
+   The one 64-hex literal it may hold is the pin of the ``nssm.exe`` binary, in the shared block
+   ``tests/test_nssm_pin.py`` keeps identical across four scripts (BACKLOG #2364).
 2. **The installer reads [cluster.vip] through the engine, not by parsing TOML.** That is the whole
    of #1523's constraint: the helper refuses any request naming values other than its .conf's, so
    the installer's three values and the engine's three values must be the same three values, and a
@@ -154,12 +155,12 @@ $report | ConvertTo-Json -Depth 5 -Compress
     return parsed
 
 
-# A pinned NSSM release hash is 64 hex characters in a quoted literal. Matched case-insensitively so
-# a re-pin written in lower case is still found.
-_SHA256 = re.compile(r"""["'][0-9a-fA-F]{64}["']""")
+# A pinned hash is 64 hex characters in a quoted literal. Matched case-insensitively so a re-pin
+# written in lower case is still found.
+_SHA256 = re.compile(r"""["']([0-9a-fA-F]{64})["']""")
 
 
-def test_the_installer_carries_no_second_nssm_pin() -> None:
+def test_the_installer_carries_no_copy_of_the_archive_pin() -> None:
     install_service = _text(_INSTALL_SERVICE)
     # THE CONTROL FIRST. install-service.ps1 holds both, so a search that cannot find them there
     # proves nothing by finding none in the new script.
@@ -167,21 +168,29 @@ def test_the_installer_carries_no_second_nssm_pin() -> None:
         "CONTROL FAILED: install-service.ps1 no longer holds the NSSM archive URL, so the search "
         "below is aimed at nothing -- re-aim this guard at wherever the pin moved"
     )
-    assert _SHA256.search(install_service), (
-        "CONTROL FAILED: install-service.ps1 no longer holds a 64-hex pin; re-aim this guard"
+    archive = re.search(r'\$NssmSha256\s*=\s*"([0-9a-fA-F]{64})"', install_service)
+    assert archive is not None, (
+        "CONTROL FAILED: install-service.ps1 no longer holds the $NssmSha256 archive pin; re-aim"
     )
+    binary = re.search(r'\$NssmExeSha256\s*=\s*"([0-9a-fA-F]{64})"', install_service)
+    assert binary is not None, "CONTROL FAILED: install-service.ps1 no longer pins nssm.exe"
 
     helper_installer = _text(_INSTALL)
     assert "nssm.cc/release" not in helper_installer, (
-        "install-net-helper.ps1 names an NSSM download URL. The pin belongs in install-service.ps1 "
-        "alone; a second copy goes stale quietly and a stale supply-chain pin is worse than none. "
-        "Take -NssmPath, or find nssm on PATH."
+        "install-net-helper.ps1 names an NSSM download URL. The archive pin belongs in "
+        "install-service.ps1 alone; take -NssmPath, or find nssm on PATH."
     )
-    found = _SHA256.search(helper_installer)
-    assert found is None, (
-        f"install-net-helper.ps1 carries what looks like a pinned hash ({found.group()}). "
-        "See the previous assertion."
+    # Every 64-hex literal here must be the binary pin, which test_nssm_pin.py keeps equal to
+    # install-service.ps1's. Anything else is an unguarded second pin.
+    stray = {
+        h.upper() for h in _SHA256.findall(helper_installer) if h.upper() != binary.group(1).upper()
+    }
+    assert not stray, (
+        f"install-net-helper.ps1 carries hash literals other than the nssm.exe pin: {sorted(stray)}. "
+        "The archive pin lives in install-service.ps1 only, and the helper binary's hash is "
+        "-HelperSha256, supplied per build."
     )
+    assert archive.group(1).upper() not in helper_installer.upper()
 
 
 def test_the_installer_reads_cluster_vip_through_the_engine() -> None:

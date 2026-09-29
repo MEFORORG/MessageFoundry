@@ -2130,10 +2130,18 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # supply-chain verification of a binary that then runs as a service. The download hop ADDS TLS
     # 1.2 to the enabled protocol set with `-bor`; that is not a floor, so anything the machine
     # already enables stays enabled, and under pwsh 7 ServicePointManager does not govern
-    # Invoke-WebRequest at all. The pinned hash is the control that holds either way.
+    # Invoke-WebRequest at all. The pinned hash is the control that holds either way. A second pin,
+    # on nssm.exe itself, is checked on every copy it runs, whether downloaded, cached or found.
     "scripts/service/install-service.ps1": frozenset(
         {"tls_context:SecurityProtocolType[TLS12]", "hash:Get-FileHash[SHA256]"}
     ),
+    # The same pinned-hash check, one byte-identical copy per script (BACKLOG #2364): each hashes the
+    # nssm.exe it is about to run as administrator against the pin of the win64 binary, whatever the
+    # copy's source. The helper installer also checks mefor-net-helper.exe against -HelperSha256
+    # before starting it as LocalSystem.
+    "scripts/service/uninstall-service.ps1": frozenset({"hash:Get-FileHash[SHA256]"}),
+    "scripts/service/install-net-helper.ps1": frozenset({"hash:Get-FileHash[SHA256]"}),
+    "scripts/service/uninstall-net-helper.ps1": frozenset({"hash:Get-FileHash[SHA256]"}),
     # CI-only measurement (ADR 0183 Wave 0, BACKLOG #1136), run by windows-service-smoke. It draws a
     # synthetic per-run administrator password from the CSPRNG, which provision-admin and then a real
     # sign-in use against a throwaway store. The CSPRNG, not Get-Random, because the account it

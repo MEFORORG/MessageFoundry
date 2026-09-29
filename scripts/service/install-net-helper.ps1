@@ -18,25 +18,36 @@
     of that block rather than a second reader of it (BACKLOG #1523).
 
     IT DOES NOT DOWNLOAD NSSM, and that is deliberate. install-service.ps1 pins the archive URL and
-    its SHA-256 in $NssmUrl / $NssmSha256, and tests/test_service_install_manifest.py guards that
-    pin. A second pin here would be a second thing to keep current, and it would go stale quietly.
-    So pass -NssmPath, or have nssm on PATH; net-helper/README.md "Prepare the files once" is the
-    download-and-check procedure, and it names that same pin.
+    its SHA-256 in $NssmUrl / $NssmSha256, and this script does not repeat them. So pass -NssmPath,
+    or have nssm on PATH; net-helper/README.md "Prepare the files once" is the download-and-check
+    procedure, and it names that same pin.
+
+    IT DOES CHECK BOTH BINARIES IT STARTS, because both run as SYSTEM (BACKLOG #2364). nssm.exe must
+    hash to $NssmExeSha256, the pin of the binary inside that archive, which this script carries as
+    one of four copies that tests/test_nssm_pin.py keeps identical. mefor-net-helper.exe must hash
+    to -HelperSha256. That value has no pin in this repository: the helper is built per release and
+    per machine, so the hash comes from the build that made the binary - the net-helper workflow's
+    job summary, or Get-FileHash over your own `dotnet publish` output before it leaves your hands.
 
     Run from an elevated (Administrator) PowerShell prompt, on each cluster node, AFTER the engine's
     own service exists (its account is what the helper's pipe ACL is built from).
 
 .EXAMPLE
-    .\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -NssmPath C:\tools\nssm.exe
+    .\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -HelperSha256 <SHA-256> -NssmPath C:\tools\nssm.exe
 
 .EXAMPLE
-    .\install-net-helper.ps1 -HelperSource D:\build\net-helper -ServiceConfig C:\ProgramData\MessageFoundry\messagefoundry.toml
+    .\install-net-helper.ps1 -HelperSource D:\build\net-helper -HelperSha256 <SHA-256> -ServiceConfig C:\ProgramData\MessageFoundry\messagefoundry.toml
 #>
 [CmdletBinding()]
 param(
     # The `dotnet publish` output folder holding mefor-net-helper.exe. See net-helper/README.md
     # "Build it" - `dotnet build` output is NOT installable, it needs the .NET runtime.
     [Parameter(Mandatory)][string]$HelperSource,
+    # The SHA-256 of that mefor-net-helper.exe, from the build that produced it (BACKLOG #2364). The
+    # script refuses a binary that does not match, before it stops a running helper and again after
+    # the copy, because it starts that binary as LocalSystem. REQUIRED, with no default: this
+    # repository cannot pin a binary that each release and each machine builds for itself.
+    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$HelperSha256,
     # Administrator-only by default, and the README explains why it is not under ProgramData: the
     # engine's account has modify rights there, so it could replace the binary that runs as SYSTEM.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",
@@ -90,6 +101,60 @@ $ErrorActionPreference = "Stop"
 # for the measurements behind it; set explicitly rather than relied on.
 $PSNativeCommandUseErrorActionPreference = $false
 
+# BEGIN pinned-hash check (kept byte-identical in install-service.ps1, uninstall-service.ps1,
+# install-net-helper.ps1 and uninstall-net-helper.ps1; guarded by tests/test_nssm_pin.py, which fails
+# if the four copies drift)
+#
+# The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
+# pins as $NssmSha256. Every script checks the copy it is about to run against this value, whichever
+# source the copy came from - -NssmPath, PATH, a cache, or a download (BACKLOG #2364). Only the
+# download used to be checked, so a copy found anywhere else ran unchecked, as administrator.
+$NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
+
+function Get-FilePinProblem {
+    <#
+      Why the file at $Path does not match the pinned SHA-256 $Expected, or "" when it does.
+
+      RETURNED, NOT THROWN, so each caller decides what a mismatch means: refuse to go on, or skip to
+      another source. The message names both hashes, so an operator can compare them against the
+      channel the pin came from. A file that cannot be hashed is a mismatch, never a pass.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    try {
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+    } catch {
+        return ("'$Path' could not be hashed ($($_.Exception.Message)), so nothing checked it " +
+            "against the pinned SHA-256 $Expected")
+    }
+    if ($actual -ne $Expected) { return "'$Path' has SHA-256 $actual, not the pinned $Expected" }
+    return ""
+}
+
+function Lock-PinnedFile {
+    <#
+      Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
+      return the open handle. Throws, with the handle closed, when the file cannot be opened that
+      way or does not match.
+
+      A check alone leaves a gap: the script hashes a copy and runs it later, and a file in a folder
+      another account can write could be swapped in between. While this handle is open it cannot
+      be. Measured 2026-09-29 on Windows 11 under PowerShell 7.6: holding a FileShare.Read handle,
+      this process could still hash the file and run it, and another process's write, rename and
+      delete of it, and a rename of its folder, were all refused. A process already holding the
+      file open for writing makes the open itself fail, which is a refusal too. Dispose the handle
+      when the script no longer runs the file.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $problem = Get-FilePinProblem -Path $Path -Expected $Expected
+    if ($problem) {
+        $handle.Dispose()
+        throw $problem
+    }
+    return $handle
+}
+# END pinned-hash check
+
 $principal = [Security.Principal.WindowsPrincipal]::new(
     [Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -118,6 +183,14 @@ if (-not (Test-Path $SourceExe)) {
         "dotnet publish net-helper\MeforNetHelper.csproj --configuration Release --output " +
         "net-helper\out  (net-helper/README.md 'Build it').")
 }
+# CHECKED HERE, BEFORE ANYTHING IS STOPPED OR COPIED, so a wrong binary costs the operator a message and
+# not a stopped helper. The installed copy is checked again after the copy, because that is the file
+# the service starts as LocalSystem.
+$helperProblem = Get-FilePinProblem -Path $SourceExe -Expected $HelperSha256
+if ($helperProblem) {
+    throw ("Refusing mefor-net-helper.exe: $helperProblem (-HelperSha256). Take the hash from the " +
+        "build that produced this binary, and do not install one you cannot match to it.")
+}
 if (-not (Test-Path $AppExe)) {
     throw ("Engine executable not found at: $AppExe`nPass -AppExe. It is run once, read-only, to " +
         "resolve [cluster.vip]; it does not have to be the copy the service runs.")
@@ -132,20 +205,34 @@ function Resolve-HelperNssm {
       write, beside the helper. net-helper/README.md is explicit that the engine's cached copy under
       ProgramData is NOT such a place: the engine's own account has modify rights there.
 
-      Nothing is downloaded and nothing is hash-checked here; see this script's header.
+      Nothing is downloaded here; see this script's header. What is found is checked against
+      $NssmExeSha256 and REFUSED on a mismatch, from either source (BACKLOG #2364). There is no
+      next source to fall back to, unlike install-service.ps1's search, so a PATH copy that fails
+      is a refusal too rather than a skip. This is the copy's first check; the installed copy gets
+      its own after the copy, because that one is what the service runs.
     #>
     param([string]$Provided)
     if ($Provided) {
-        $resolved = Resolve-AbsolutePath $Provided
-        if (-not (Test-Path $resolved)) { throw "NSSM not found at: $resolved" }
-        return $resolved
+        $found = Resolve-AbsolutePath $Provided
+        if (-not (Test-Path -LiteralPath $found)) { throw "NSSM not found at: $found" }
+        $where = "-NssmPath"
+    } else {
+        $onPath = Get-Command nssm -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $onPath) {
+            throw ("nssm.exe not found. Pass -NssmPath, or put nssm on PATH. net-helper/README.md " +
+                "'Prepare the files once' has the download and the hash check; the pinned archive " +
+                "and its SHA-256 are `$NssmUrl and `$NssmSha256 in install-service.ps1.")
+        }
+        $found = $onPath.Source
+        $where = "the nssm on PATH"
     }
-    $onPath = Get-Command nssm -ErrorAction SilentlyContinue
-    if ($onPath) { return $onPath.Source }
-    throw ("nssm.exe not found. Pass -NssmPath, or put nssm on PATH. net-helper/README.md " +
-        "'Prepare the files once' has the download and the hash check; the pinned archive and its " +
-        "SHA-256 are `$NssmUrl and `$NssmSha256 in install-service.ps1, which is the only place " +
-        "this repository states them.")
+    $problem = Get-FilePinProblem -Path $found -Expected $NssmExeSha256
+    if ($problem) {
+        throw ("Refusing $($where): $problem. Use the win64 nssm.exe from the archive " +
+            "install-service.ps1 pins; net-helper/README.md 'Prepare the files once' has the steps.")
+    }
+    return $found
 }
 
 function Get-VipSettings {
@@ -514,6 +601,18 @@ if (-not $sameFile) {
 # reason and makes confirming it its own numbered step.
 $NssmPath = $TargetNssm
 
+# THE INSTALLED COPIES ARE CHECKED, NOT ONLY THEIR SOURCES (BACKLOG #2364). They are the files the SCM
+# starts as SYSTEM, and a source can change between its check and the copy. The folder check above is
+# what keeps them from changing after this.
+$problem = (@(
+    (Get-FilePinProblem -Path $TargetExe -Expected $HelperSha256),
+    (Get-FilePinProblem -Path $TargetNssm -Expected $NssmExeSha256)
+) -ne "") -join "; "
+if ($problem) {
+    throw ("An installed copy failed its check: $problem. Nothing was started. Remove " +
+        "'$InstallDir' and re-run from files you can match to their hashes.")
+}
+
 # The helper reads this with a strict UTF-8 decoder. Written with an explicit BOM-less UTF-8 encoder
 # rather than Set-Content, whose default encoding differs between PowerShell 7 and Windows
 # PowerShell 5.1 - and this script is reachable from both.
@@ -601,7 +700,9 @@ if (-not $NoStart) {
 Write-Host ""
 Write-Host "Installed '$ServiceName'." -ForegroundColor Green
 Write-Host "  Helper   : $TargetExe ($signature)"
+Write-Host "             SHA-256 $($HelperSha256.ToUpperInvariant()), checked against -HelperSha256"
 Write-Host "  NSSM     : $TargetNssm"
+Write-Host "             SHA-256 $NssmExeSha256, checked against the pin"
 Write-Host "  Config   : $ConfPath"
 Write-Host "  Log      : $LogPath"
 Write-Host "  Address  : $($vip.address)/$($vip.mask) on '$confInterface'"
