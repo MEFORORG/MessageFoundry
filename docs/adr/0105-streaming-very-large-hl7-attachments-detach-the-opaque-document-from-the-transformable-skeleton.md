@@ -441,9 +441,11 @@ permission), and **API + web console only** (the PySide6 desktop console is depr
   what scopes access — a guessed content address unlinked to an in-scope message is a 404). Then
   `read_attachment` reconstructs the **verbatim base64** (Approach B — buffer-once, mirroring the delivery
   buffer-once posture) and **base64-decodes once** to the original document bytes (round-trips byte-for-byte
-  to what the sender sent). Returns a `Response` with a **validated** `Content-Type` (the stored
+  to what the sender sent; *amended 2026-09-28: an SVG is served as a sanitized copy, see the
+  amendment at the end*). Returns a `Response` with a **validated** `Content-Type` (the stored
   `content_type` only when it is a clean `type/subtype` MIME, else `application/octet-stream` — an
-  attacker-influenced OBX-5.2 label can never inject/split the header) + a header-safe
+  attacker-influenced OBX-5.2 label can never inject/split the header; *amended 2026-09-28: the type
+  now comes from the inert-type allow-list, see the amendment at the end*) + a header-safe
   `Content-Disposition: attachment; filename="attachment-<sha16><ext>"`. Every download is **audited before
   the bytes leave**: `record_view` (the per-message PHI timeline) + a tamper-evident `attachment_download`
   audit row (actor + the id pair, docs/PHI.md §6). **The bytes/base64 are never logged at any level.**
@@ -536,3 +538,68 @@ permission), and **API + web console only** (the PySide6 desktop console is depr
       surface → **5.4.1 / 5.4.2 Pass-B**. **Posture A stays Partial (dormant)**: the threshold is **not**
       flipped on by default (byte-identical ingress). DOC + runbook reconcile only — **no product-code
       change**.
+
+## Amendment 2026-09-28: the download serves a sanitized copy of an SVG (ASVS 1.3.4, BACKLOG #2299)
+
+**The download route may now serve a changed copy of one kind of document: an SVG.** The stored bytes
+do not change. Owner ruling 3 (Approach B) still keeps the stored `OBX-5.5` value verbatim, byte for
+byte, and delivery still splices that verbatim value back into the outbound frame. This amendment
+changes only what `download_attachment` hands to a browser.
+
+**Why.** ASVS 1.3.4 asks that user-supplied SVG be validated or sanitized to safe tags and attributes,
+with no scripts and no `foreignObject`. An HL7 sender can label an `OBX-5` attachment
+`image/svg+xml`, so the requirement applies. The serve-time controls already stop an SVG from running
+in the application origin. They do not perform the tag and attribute check the requirement names, and
+the Phase 3b spec above forbade a changed served copy, so there was no place to put one. Owner ruling
+R10 of 2026-09-23 graded the cell `partial` on exactly that gap.
+
+**What the Phase 3b download spec says now.** Two clauses of the Phase 3b bullet are replaced:
+
+1. *"base64-decodes once to the original document bytes (round-trips byte-for-byte to what the sender
+   sent)"* now reads: base64-decodes once to the original document bytes. Every document except an
+   SVG is served as those bytes. An SVG is served as its allow-listed copy, and one the parser cannot
+   vet is refused with HTTP 422 and served in no form.
+2. *"a validated `Content-Type` (the stored `content_type` only when it is a clean `type/subtype`
+   MIME, else `application/octet-stream`)"* now reads: a `Content-Type` taken from the inert-type
+   allow-list `_INERT_ATTACHMENT_TYPES`, else `application/octet-stream`. Engine PR 948 made that change
+   in code without amending this ADR; this sentence records it. An SVG label is not on the list, so a
+   sanitized SVG is still declared `application/octet-stream` with a `.bin` download name.
+
+**How an SVG is recognised.** By its stored label, when the label contains `svg` in any case, or by its
+root element, when the document's first start tag is `svg`. The label is sender-influenced, so a check
+on the label alone would let an SVG labelled `text/xml` pass untouched. The root check reads no further
+than the first start tag, so a large non-SVG document costs almost nothing.
+
+**What the sanitizer keeps.** `messagefoundry/api/svg_sanitize.py` parses through `defusedxml` and
+rebuilds the document from an allow-list:
+
+- Drawing, text, gradient, pattern, clip, mask, marker and filter-primitive elements in the SVG
+  namespace. Any other element is dropped with its whole subtree, including at least `script`,
+  `foreignObject`, `style`, `a`, `image`, `feImage`, the animation elements and every foreign
+  namespace.
+- Geometry and presentation attributes. No `on*` attribute is on the list. `href` and `xlink:href`
+  survive only on the elements that point at another part of the drawing, and only as a `#fragment`.
+- A value is dropped if it holds a backslash, `javascript:`, `vbscript:`, `data:`, `expression(`,
+  `@import`, or a `url(` that is not a `#fragment` reference.
+- A `style` attribute is never copied. Each declaration whose property is an allow-listed
+  presentation attribute, and whose value passes the check above, is written out as that attribute.
+  Copying CSS through would need a CSS parser to vet it, and dropping it whole would lose the colours
+  most editors store there.
+
+Comments, processing instructions and any `<!DOCTYPE>` do not reach the output.
+
+**Fail closed, by refusal.** A document that is not well-formed, declares an entity, references an
+external entity, has no `svg` root, or nests past 256 elements is refused with HTTP 422, before the
+download is audited, because no byte leaves. Serving the original bytes instead would hand an
+unvetted SVG to exactly the case the parser could not check: a browser honours an internal DTD that
+`defusedxml` refuses. A `<!DOCTYPE>` with no entity declaration is accepted, since common editors
+still write the SVG 1.1 one. This is the one case where the route refuses a linked attachment it can
+decode; `_safe_attachment_content_type` still decides only the declared type.
+
+**Unchanged.** The stored value, delivery, the inert-type allow-list, `Content-Disposition:
+attachment`, `nosniff` and the sandbox CSP. The sanitizer sits beside those controls, not in place of
+them.
+
+**What this leaves open.** The declared type stays `application/octet-stream`, so a browser still
+downloads rather than previews an SVG. Whether a sanitized SVG may be declared `image/svg+xml` is a
+separate decision, and nothing here makes it. No real browser has been run against the download.
