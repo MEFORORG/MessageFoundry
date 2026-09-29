@@ -591,6 +591,32 @@ class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
 
+class TemporaryPasswordUnavailable(RuntimeError):
+    """No generated temporary password cleared the active policy. It points at the site's context
+    words, the one setting that can make a random string fail the screen nearly every time."""
+
+
+#: How many random tokens the temporary-password generator tries before it refuses. A 32-character
+#: token misses the shipped list about 99.96% of the time, and misses 200 three-character site terms
+#: about 86% of the time (both measured 2026-09-28, 20,000 tokens each). Even a list refusing half of
+#: all tokens fails 64 tries about once in 10**19. Those rates are for 32 characters, the length
+#: at the shipped ``min_length``. A longer token meets more terms: the generator cuts each one to
+#: ``_temporary_password_chars``, which removes the ``token_urlsafe`` overshoot, but above 32 the
+#: length still follows ``min_length``. So the refusal means the site's list refuses nearly every
+#: random string as long as the passphrase a user must type: a setting to fix, not bad luck.
+#: The refusal logs this constant, and CodeQL's clear-text-logging rule flags a logged value by its
+#: NAME (alert 227, BACKLOG #1132). So keep every word its sensitive-data heuristics match out of
+#: the name: at least "password", "passphrase", "secret", "token", "account" and "cert".
+_RESET_GENERATION_ATTEMPTS = 64
+
+
+def _temporary_password_chars(min_length: int) -> int:
+    """The generated password's length: the policy minimum, but never under 32 characters.
+    ``token_urlsafe`` carries 6 bits per character, so 32 characters keep the 192-bit floor of BACKLOG
+    #1172, and any longer minimum carries more."""
+    return max(32, min_length)
+
+
 # Characters that let one address field name more than one mailbox, or smuggle a display name or a
 # header, when ``send_plain_email`` joins the recipients into ``To``. Checked by hand, not by a regex.
 _ADDRESS_FORBIDDEN_CHARS = frozenset(',;<>"()[]:\\')
@@ -1780,21 +1806,43 @@ class AuthService:
                 role_id=role.value, display_name=label, description=description, builtin=True
             )
 
-    def _generate_policy_password(self) -> str:
+    def _generate_policy_password(self, username: str | None = None) -> str:
         """A random password that satisfies the active policy — so an administrator-issued temporary
-        credential is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
-        guaranteed ≥ ``min_length``); the loop covers the astronomically-unlikely context hit or an
-        opt-in character-class requirement a given token happens to miss.
+        credential is held to the same bar operators are. ``token_urlsafe(n)`` yields about 1.33 times
+        n characters, cut to :func:`_temporary_password_chars`, so the length is at least
+        ``min_length``. The loop covers a context hit or an opt-in character-class requirement a given
+        token happens to miss.
 
         Every clause except the breach screen, which is suppressed per-call for the reason stated at
-        the call below (BACKLOG #1447)."""
-        # 24 BYTES (192 bits), not 16. token_urlsafe's argument is a byte count, and the floor is
-        # raised here rather than left at the policy minimum because min_length is a CHARACTER count
-        # -- passing it as bytes happens to be safe but ties an entropy floor to a legibility knob an
-        # operator may lower (BACKLOG #1172).
-        length = max(24, self._policy.min_length)
-        for _ in range(16):
-            candidate = secrets.token_urlsafe(length)
+        the call below (BACKLOG #1447).
+
+        ``username`` is the account the password is for, so the own-username clause applies too.
+
+        Raises :class:`TemporaryPasswordUnavailable` when no candidate clears the policy. It never
+        returns an unscreened password. The old last-resort return appended ``aA1!`` without a screen,
+        so a site context word inside it would have issued a credential the policy refuses (BACKLOG
+        #1132)."""
+        # At least 32 CHARACTERS (192 bits). token_urlsafe's argument is a byte count and min_length
+        # is a CHARACTER count, so the bytes are derived from the characters: 3 bytes make 4
+        # characters, and the cut below never pads, so a short byte count would silently lower the
+        # entropy floor (BACKLOG #1172).
+        policy = self._policy
+        chars = _temporary_password_chars(policy.min_length)
+        length = -(-chars * 3 // 4)  # ceiling: enough bytes for `chars` characters
+        # The suffixed form exists only for an opt-in character class the bare token happens to miss.
+        # With every class rule off it cannot help: the bare token then fails only on a context word
+        # or the username, and the suffix keeps either one.
+        class_rules = (
+            policy.require_uppercase
+            or policy.require_lowercase
+            or policy.require_digit
+            or policy.require_symbol
+        )
+        for _ in range(_RESET_GENERATION_ATTEMPTS):
+            token = secrets.token_urlsafe(length)[:chars]
+            # The bare token first. The suffixed form is screened like the token: a site term can sit
+            # inside it too.
+            candidates = (token, token + "aA1!") if class_rules else (token,)
             # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
             # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
             # contain it -- the breach clause is inert on this input by construction. Honouring
@@ -1806,9 +1854,20 @@ class AuthService:
             # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
             # operator- or user-supplied password, where the corpus is the whole point and refusing is
             # right -- so do NOT widen this to the policy field or the `[auth]` setting.
-            if not self._policy.violations(candidate, suppress_breach_check=True):
-                return candidate
-        return secrets.token_urlsafe(length) + "aA1!"  # defensive: satisfies any class requirement
+            for candidate in candidates:
+                if not policy.violations(candidate, username=username, suppress_breach_check=True):
+                    return candidate
+        _log.error(
+            "no temporary password cleared the password policy in %d tries; the likely cause is "
+            "[auth].password_extra_context_words holding so many short terms that nearly every "
+            "random string contains one, which would refuse most passphrases too",
+            _RESET_GENERATION_ATTEMPTS,
+        )
+        raise TemporaryPasswordUnavailable(
+            "could not generate a temporary password that clears the password policy; check "
+            "[auth].password_extra_context_words for short or very common terms, then restart the "
+            "engine, which reads [auth] only at start"
+        )
 
     async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:
         """True iff some enabled administrator other than ``exclude_id`` exists.
@@ -6951,7 +7010,7 @@ class AuthService:
         issued: IssuedCredential | None = None
         temp_hash: str | None = None
         if user.auth_provider == AuthProvider.LOCAL.value:
-            temp = self._generate_policy_password()
+            temp = self._generate_policy_password(username=user.username)
             temp_hash = await self._argon2(hash_password, temp)
             await self._store.set_password(
                 user_id,
@@ -7487,7 +7546,7 @@ class AuthService:
                 )
             email = _require_single_mailbox(email)
         user_id = uuid4().hex
-        temp = self._generate_policy_password()
+        temp = self._generate_policy_password(username=username)
         # Hashed before the insert so the handler below covers the store call alone.
         password_hash = await self._argon2(hash_password, temp)
         try:
@@ -7794,7 +7853,7 @@ class AuthService:
             raise ValueError("no such user")
         if user.auth_provider != AuthProvider.LOCAL.value:
             raise ValueError("only local users have a password to reset")
-        temp = self._generate_policy_password()
+        temp = self._generate_policy_password(username=user.username)
         await self._store.set_password(
             user_id,
             password_hash=await self._argon2(hash_password, temp),

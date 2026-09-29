@@ -493,6 +493,72 @@ async def test_detail_disposition_text_visible_to_operator_and_audited(engine: E
     assert "message_view" in actions  # opening the detail (raw) view is audited
 
 
+async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> None:
+    # BACKLOG #1132: a site's own context words reach POST /users, not only the service method.
+    settings = AuthSettings(require_mfa=False, password_extra_context_words=["globex"])
+    service = await _service(engine, settings)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    from messagefoundry.auth import service as service_module
+
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+        body = {"username": "siteterm", "roles": ["viewer"], "email": "s@x.org"}
+        # ADR 0197 Amendment A: POST /users takes no password, so a chosen one is refused as an
+        # unknown field, and the screen applies to the credential the engine generates instead.
+        chosen = await c.post("/users", headers=h, json={**body, "password": "my-GLOBEX-" + PW})
+        assert chosen.status_code == 422
+        # A generator that can only produce the site's term cannot issue a credential: the create
+        # answers 503 naming the setting, and writes no account.
+        real_secrets = service_module.secrets
+        service_module.secrets = SimpleNamespace(  # type: ignore[assignment]
+            token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40
+        )
+        try:
+            refused = await c.post("/users", headers=h, json=body)
+        finally:
+            service_module.secrets = real_secrets  # type: ignore[assignment]
+        assert refused.status_code == 503
+        assert "password_extra_context_words" in refused.json()["detail"]
+        assert await service.store.get_user_by_username("siteterm") is None
+        # Control: with the real generator the same request is created, and its credential clears
+        # the site's term.
+        created = await c.post("/users", headers=h, json=body)
+        assert created.status_code == 201
+        assert "globex" not in created.json()["temp_password"].lower()
+
+
+async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #1132: when no generated password clears the site's context words, the reset refuses.
+    # The route maps that refusal, so the administrator reads the setting to fix rather than the
+    # generic "internal error". Only the service module's token source is faked; session tokens
+    # still come from the real one.
+    from messagefoundry.auth import service as service_module
+
+    settings = AuthSettings(require_mfa=False, password_extra_context_words=["globex"])
+    service = await _service(engine, settings)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    carol_id = await create_local_user_with_password(
+        service,
+        username="carol",
+        password=PW,
+        display_name=None,
+        email="carol@example.org",
+        roles=["viewer"],
+        actor="root",
+    )
+    async with _client(engine, service) as c:
+        admin_token = (await _login(c, "root")).json()["token"]
+        _r, admin_token = await _reauth(c, admin_token, purpose="admin_reset_password")
+        assert _r.status_code == 200
+        fake = SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40)
+        monkeypatch.setattr(service_module, "secrets", fake)
+        refused = await c.post(f"/users/{carol_id}/reset-password", headers=_auth(admin_token))
+        assert refused.status_code == 503
+        assert "password_extra_context_words" in refused.json()["detail"]
+
+
 async def test_admin_user_crud_and_audit(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)

@@ -88,6 +88,7 @@ from messagefoundry.config.tls_policy import (
     validate_tls_ciphers,
 )
 from messagefoundry.logging_setup import LOG_LEVELS
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.service_status import is_safe_service_name
 
 __all__ = [
@@ -2437,6 +2438,15 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
     return service, hostname
 
 
+#: The shortest site context term ``[auth].password_extra_context_words`` accepts. The context screen
+#: is a case-insensitive SUBSTRING test, so a one- or two-letter term would refuse a large share of
+#: ordinary passphrases. Three is the length of the shortest shipped term (``hl7``) and admits the
+#: three-letter organization acronyms ASVS 6.1.2 has in mind. A COPY of
+#: ``auth.policy.EXTRA_CONTEXT_WORD_MIN_LENGTH``, which derives it; this module does not import auth,
+#: and ``tests/test_site_context_words.py`` holds the two equal.
+EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
 
@@ -2545,10 +2555,20 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
-    password_check_username: bool = (
-        True  # reject passwords containing the user's own username (6.2.11)
-    )
+    # Reject passwords containing a context word: a shipped CONTEXT_WORDS term or a site term from
+    # password_extra_context_words below. One switch for both lists.
+    password_check_context: bool = True
+    # A site's OWN context words (ASVS 6.1.2 / 6.2.11): organization, product, project, department or
+    # role names that a shipped constant cannot know. ADDITIVE ONLY -- they join CONTEXT_WORDS in the
+    # same screen and can never remove a shipped term. Validated at load by
+    # `_check_extra_context_words`: lower-cased the way the screen compares, each at least
+    # EXTRA_CONTEXT_WORD_MIN_LENGTH characters, and a blank entry refuses rather than being dropped.
+    # Env: MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS="acme,globex" (comma-separated). An empty piece,
+    # a trailing comma included, refuses the load, unlike the OIDC and egress lists.
+    password_extra_context_words: list[str] = Field(default_factory=list)
+    # Reject passwords containing the user's own username. No ASVS 5.0 requirement names this screen:
+    # 6.2.11 grades the documented context-word list, and a username is not on it.
+    password_check_username: bool = True
     # Optional path to a larger offline breach corpus that augments the bundled one (6.2.12): a
     # plaintext list OR an HIBP-style SHA-1-hash export (HASH[:count] lines, auto-detected). Fully
     # offline — no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (loaded into
@@ -2824,6 +2844,74 @@ class AuthSettings(_Section):
             raise ValueError(
                 f"lockout_max_minutes ({self.lockout_max_minutes}) must be at least lockout_minutes "
                 f"({self.lockout_minutes}): it is the ceiling an escalating lock doubles up to"
+            )
+        return self
+
+    @field_validator("password_extra_context_words", mode="before")
+    @classmethod
+    def _split_extra_context_words(cls, v: object) -> object:
+        # The environment carries a list as one comma-separated string, as the OIDC lists do. Unlike
+        # them, an empty piece is KEPT so the check below can refuse it: "acme,,globex" is a typo,
+        # and silently dropping the gap would hide it. A wholly blank value means "no site terms".
+        # A JSON array is read as one, because split on commas it would load terms that still carry
+        # the brackets and quotes, and those match nothing.
+        if isinstance(v, str):
+            text = v.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                # The helper returns rather than raises, so this refusal has no decode error on its
+                # chain (BACKLOG #2085). It also turns json's RecursionError on a deeply nested value
+                # into a refusal. It hides nothing else: pydantic's error still quotes the raw value
+                # as input_value.
+                parsed, refusal = json_loads_or_refusal(text)
+                if refusal is not None:
+                    raise ValueError(
+                        "[auth].password_extra_context_words looks like a JSON array but does not "
+                        f"parse ({refusal}); check its brackets, quotes and commas"
+                    )
+                return parsed
+            return v.split(",")
+        return v
+
+    @field_validator("password_extra_context_words")
+    @classmethod
+    def _check_extra_context_words(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            stripped = raw.strip()
+            if not stripped:
+                raise ValueError(
+                    "[auth].password_extra_context_words holds an empty or whitespace-only entry; "
+                    "remove it (an empty term would match every password)"
+                )
+            if any(c.isspace() for c in stripped):
+                # "acme health" would never refuse "AcmeHealth2026". Make the operator choose the
+                # spellings rather than guess one for them.
+                raise ValueError(
+                    f"[auth].password_extra_context_words entry {stripped!r} contains whitespace; "
+                    "list each spelling as its own term, for example 'acmehealth' and 'acme'"
+                )
+            term = stripped.lower()
+            # Measured before lower-casing: lower() can lengthen a non-ASCII letter.
+            if len(stripped) < EXTRA_CONTEXT_WORD_MIN_LENGTH:
+                raise ValueError(
+                    f"[auth].password_extra_context_words entry {term!r} is shorter than "
+                    f"{EXTRA_CONTEXT_WORD_MIN_LENGTH} characters; the screen is a substring test, "
+                    "so a term that short would refuse a large share of ordinary passphrases"
+                )
+            if term not in out:
+                out.append(term)
+        return out
+
+    @model_validator(mode="after")
+    def _check_extra_context_words_are_screened(self) -> AuthSettings:
+        # Site terms only act through the context screen. With it off they would load and do
+        # nothing, which reads as a working control. Refused rather than silently ignored.
+        if self.password_extra_context_words and not self.password_check_context:
+            raise ValueError(
+                "[auth].password_extra_context_words is set but password_check_context is false, "
+                "so no site term would be screened; turn the check on or remove the terms"
             )
         return self
 

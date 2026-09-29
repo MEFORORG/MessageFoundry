@@ -120,6 +120,7 @@ from messagefoundry.auth.service import (
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     NotifyEmailAlreadySet,
+    TemporaryPasswordUnavailable,
     UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -946,6 +947,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # BACKLOG #2018: raised before any write, as on PATCH /users/{id}. The message names the
             # rule and never echoes the value.
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except TemporaryPasswordUnavailable as exc:
+            # ADR 0197 Amendment A: the credential is generated now, so the reset's 503 applies here
+            # too -- a site setting no generated candidate clears, raised before any write.
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
         if Role.ADMINISTRATOR.value in body.roles:
             _alert_administrator_granted(
@@ -1158,6 +1163,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 else status.HTTP_400_BAD_REQUEST
             )
             raise HTTPException(code, detail) from exc
+        except TemporaryPasswordUnavailable as exc:
+            # A site setting, not a bad request, so a 503 like this module's other server-side
+            # refusals. It is mapped rather than left to the generic handler, which says only
+            # "internal error": the message names the setting to fix, and the web console renders
+            # this detail on the user page (with its own 400, as it does for every refusal here).
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
     @app.post("/users/{user_id}/reset-mfa", response_model=MfaResetResponse)
@@ -1200,6 +1211,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         try:
             issued = await service.admin_reset_mfa(user_id, actor=identity.username)
+        except TemporaryPasswordUnavailable as exc:
+            # As on the password reset: raised before any write, so the factors are untouched.
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except ValueError as exc:
             detail = str(exc)
             code = (

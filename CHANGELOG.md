@@ -24,6 +24,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   TOTP, and every TOTP key it cannot decrypt; `messagefoundry verify` reports the same as
   `auth.lockable_accounts`. The `users.password_generated` column is added on all three backends.
   (`BACKLOG #1131`, ASVS 6.1.1)
+- **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
+  lists terms such as an organization, product, project or department name. They join the shipped
+  `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`
+  switches as a whole. They are screened at least on user create, password change,
+  first-administrator provisioning and an administrator's password reset, which the tests cover.
+  The reset screens each generated password, the own-username clause included. If none clears the
+  policy, it answers 503 with a detail naming the setting, and the account keeps its password. The
+  setting can only add; no setting removes a shipped term. Each term is trimmed and lower-cased at
+  load. It must be one word, no shorter than the floor `docs/CONFIGURATION.md` states. The load refuses a blank entry, a trailing
+  comma in the environment form, a term with a space inside, and terms set while
+  `password_check_context` is off. A site term's refusal says it is one of the site's additions, since
+  the published list cannot hold it. A password holding a shipped term and a site term gets both
+  refusals. Env: comma-separated or a JSON array, in `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`.
+  (`BACKLOG #1132`)
 - **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
   and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
   at the same width, with no salt, so two captured sides still match. The default rules apply it
@@ -251,6 +265,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
+  grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
+  (`BACKLOG #1135`)
 - **BREAKING: with `[auth].oidc_enabled` on, a config that sets `oidc_acr_values` while
   `oidc_required_acr_values` names no non-blank value now refuses to load.** `oidc_acr_values` only
   asks the identity provider for an assurance class. The sign-in gate checks the returned `acr`
@@ -1091,6 +1108,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   `auth.login_locked`) still tell the two outcomes apart at `lockout_threshold` requests per
   candidate; removing them touches the AC-10 lock record, so it is left for an owner/ADR decision.
   (`BACKLOG #1131`, ASVS 6.1.1)
+- **BREAKING: XML signature checks now refuse an RSA signing key under 2048 bits.** Before, the
+  XML-DSig `verify()` accepted a signature made with an RSA-1024 key, on both the `x509_cert` and
+  the `ca_pem_file` paths. Now it returns `verified=False` with the reason `WeakSigningKey`, even
+  when the signature itself is valid. A partner that signs XML with an RSA key under 2048 bits
+  will now be refused and must move to a key of at least 2048 bits. A key the check cannot read
+  is refused too, with the reason `UnreadableSigningKey`. The floor is 2048, not 3072, by owner
+  ruling: partner keys keep the 2048-bit floor. EC and DSA keys are not changed by this.
+  (`BACKLOG #1166`, ASVS 11.2.3)
+- **The Python security scan now flags new calls into the `random` module.** Bandit check B311 was
+  skipped in both the CI scan and the pre-commit hook, so nothing would have caught a weak generator
+  returning to shipped code. Both now run it. B311 matches a fixed list of calls, such as
+  `random.random()` and `random.choice()`, and misses a few, such as `random.shuffle()`. The five
+  existing uses are seeded on purpose, for pseudonym picking, synthetic HL7 and PDF fixtures, and one
+  fuzz script. Each carries a per-line `# nosec B311` with its reason. Security values still come from
+  `secrets` and `os.urandom`.
+  ([BACKLOG #1173](docs/BACKLOG.md))
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that

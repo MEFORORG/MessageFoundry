@@ -93,7 +93,7 @@ def test_password_policy_screens_breached_and_context() -> None:
 
 def test_password_policy_rejects_username_in_password() -> None:
     policy = PasswordPolicy()  # check_username on by default
-    # The user's own username inside an otherwise-fine password is rejected (6.2.11) — including the
+    # The user's own username inside an otherwise-fine password is rejected — including the
     # common "username + suffix" pattern, which exact-equality would miss.
     assert "not contain your username" in policy.violations(
         "jsmith-favorite-passphrase", username="jsmith"

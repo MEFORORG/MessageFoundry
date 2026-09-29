@@ -58,7 +58,9 @@ file rests on is that its numbers come from the shipped policy object. Asking ho
 
 RE-SCORE TRIGGER. The selection depends on ``password_min_length`` **and** ``password_check_context``.
 Moving either shipped default changes the corpus this script produces and the counts it records, so
-both are printed in the block and both belong in the ASVS 6.2.4 re-score trigger.
+both are printed in the block and both belong in the ASVS 6.2.4 re-score trigger. A third input,
+``password_extra_context_words`` (BACKLOG #1132), ships EMPTY, so it moves nothing today; giving it a
+non-empty shipped default would make it a trigger too.
 
 THE BLOCK REPORTS THE BAR AND THE MEASUREMENT, AND STATES NO VERDICT. Whether ASVS 6.2.4 passes is a
 graded cell in the vaulted scorecard (CLAUDE.md section 12), so a shipped file asserting MET would be

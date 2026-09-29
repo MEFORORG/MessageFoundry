@@ -12,8 +12,8 @@ The signed document is parsed through **our** hardened lxml parser
 (:mod:`messagefoundry.parsing.xml.harden`), so an untrusted signed body still goes through the
 XXE/DTD lockdown before any signature processing.
 
-**PHI rule:** a verification failure is reported by *reason category* only (signxml's exception type),
-never the document content.
+**PHI rule:** a verification failure is reported by *reason category* only (signxml's exception type,
+or one of this module's fixed names such as :data:`WEAK_SIGNING_KEY`), never the document content.
 
 Pure: no engine imports.
 """
@@ -29,14 +29,14 @@ from messagefoundry.parsing.xml._deps import load_signxml
 from messagefoundry.parsing.xml.errors import XmlError
 from messagefoundry.parsing.xml.harden import parse_bytes
 
-__all__ = ["XmlSignatureResult", "verify"]
+__all__ = ["UNREADABLE_SIGNING_KEY", "WEAK_SIGNING_KEY", "XmlSignatureResult", "verify"]
 
 
 @dataclass(frozen=True)
 class XmlSignatureResult:
     """The outcome of an XML-DSig verification. ``verified`` is True iff the signature is valid against
-    the supplied certificate/CA; ``reason`` is a PHI-safe failure category when not (``None`` on
-    success)."""
+    the supplied certificate/CA AND its key clears the strength floor; ``reason`` is a PHI-safe
+    failure category when not (``None`` on success)."""
 
     verified: bool
     reason: str | None = None
@@ -73,6 +73,56 @@ def _approved_signature_config(signxml: Any) -> Any:
     )
 
 
+#: The smallest RSA modulus whose signature ``verify`` will accept (BACKLOG #1166, ASVS 11.2.3).
+#: 2048, not 3072, by owner ruling R6 (2026-09-23): a partner signing key is counterparty material,
+#: and RSA-2048 is what healthcare partners and public CAs issue today. That is about 112 bits, so
+#: this floor closes the unbounded case and does NOT meet the 128-bit verb; the cell stays a recorded
+#: partial. The RSA number matches ``transports/direct.py``'s partner-key floor; Direct also refuses
+#: EC curves outside an allow-list, and this module does not.
+_MIN_RSA_BITS = 2048
+
+#: Fixed, PHI-safe ``reason`` values. Each names a category, never key or document content.
+WEAK_SIGNING_KEY = "WeakSigningKey"
+UNREADABLE_SIGNING_KEY = "UnreadableSigningKey"
+
+
+def _signing_key_refusal(result: Any) -> str | None:
+    """Return a refusal reason if the key that verified ``result`` is below the floor, else ``None``.
+
+    MEASURED BEFORE THIS CHECK EXISTED: an RSA-1024 signer returned ``verified=True`` on BOTH anchor
+    paths -- pinned via ``x509_cert``, and chained to a partner CA via ``ca_pem_file``. signxml's
+    chain verifier refuses a 1024-bit CA key, but it never inspects the LEAF key that actually signs.
+
+    It reads the key signxml reports it USED (``VerifyResult.signature_key``), not the anchor the
+    caller passed. On the ``ca_pem_file`` path the signing key comes from the document's own
+    certificate chain, so the anchor alone cannot answer the question.
+
+    RSA ONLY, deliberately. EC and DSA keys pass through unchanged. Measured 2026-09-28 on signxml
+    5.1.0, a P-192 key and a 1024-bit DSA key both still verify; whether to floor them is a separate
+    call this change does not make.
+
+    A key this cannot read is REFUSED rather than passed, and so is a result that names no key at
+    all: a floor that cannot see the key and returns success anyway would report success forever.
+    """
+    # Imported here, not at module top: importing the xml package must stay free until a verify
+    # path runs (see the package docstring).
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+    results = result if isinstance(result, list) else [result]
+    if not results:
+        return UNREADABLE_SIGNING_KEY
+    for one in results:
+        try:
+            key = load_pem_public_key(one.signature_key)
+        except (AttributeError, TypeError, ValueError, UnsupportedAlgorithm):
+            return UNREADABLE_SIGNING_KEY
+        if isinstance(key, rsa.RSAPublicKey) and key.key_size < _MIN_RSA_BITS:
+            return WEAK_SIGNING_KEY
+    return None
+
+
 def verify(
     document: str | bytes,
     *,
@@ -86,7 +136,10 @@ def verify(
     signxml's default would otherwise trust **any** signature whose embedded certificate chains to the
     host's system CA store, so anyone with a public domain-validated certificate could forge a
     signature this returns ``verified=True`` for (DELTA-03). Returns an :class:`XmlSignatureResult` (a
-    failed verification is **data**, not an exception, so a Handler can route the message). Raises
+    failed verification is **data**, not an exception, so a Handler can route the message). A
+    signature made with an RSA key under 2048 bits fails with ``reason`` :data:`WEAK_SIGNING_KEY`
+    even when the cryptography checks out, and one whose key cannot be read fails with
+    :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166). Raises
     :class:`ValueError` if no anchor is supplied,
     :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is unparseable, and
     :class:`RuntimeError` if the ``[xml]`` extra is absent."""
@@ -101,7 +154,7 @@ def verify(
     root = parse_bytes(document)
     verifier = signxml.XMLVerifier()
     try:
-        verifier.verify(
+        result = verifier.verify(
             root,
             x509_cert=x509_cert,
             ca_pem_file=ca_pem_file,
@@ -114,4 +167,7 @@ def verify(
         raise XmlError(
             f"document is not a verifiable XML-DSig payload: {type(exc).__name__}"
         ) from exc
+    refusal = _signing_key_refusal(result)
+    if refusal is not None:
+        return XmlSignatureResult(verified=False, reason=refusal)
     return XmlSignatureResult(verified=True)

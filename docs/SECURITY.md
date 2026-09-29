@@ -209,6 +209,12 @@ be the first factor, and TOTP cannot be removed while the requirement covers the
 password write carries the TOTP check itself, so a factor reset racing it makes it refuse. With the
 requirement off the order is as before: rotate, then enrol if you choose.
 
+The reset can refuse, with a 503 whose detail names `password_extra_context_words`. It does so when
+no generated password clears the policy after repeated tries. That means the site's context words
+refuse nearly every random string, and so nearly every passphrase too. The account keeps its
+password. Remove the site's short or common terms, or replace them with longer ones. Then restart
+the engine and retry, because it reads `[auth]` only at start and a `/config/reload` does not.
+
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per
 actor** (`allow_admin_write`, keyed on the acting user). On the JSON API its only caller is
@@ -2502,7 +2508,8 @@ MFA step-up is now built (WP-14 native TOTP); a web console banner for the feed 
 Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**, **no mandatory
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
 mandatory composition), plus **offline breached/common-password screening** (a bundled offline
-corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
+corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below, which a
+site may extend with its own terms. Enforced
 identically on create-user and change-password; tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
 
@@ -2518,26 +2525,43 @@ twelve as examples. That description was wrong in a way a reader could act on: f
 `changeme`, `bootstrap`, `admin`, `administrator`, `password` — are generic credential words with no
 connection to this application, to a vendor, or to HL7, so a passphrase chosen on the strength of the
 old sentence could still be refused with no indication of which rule fired. The list above is the
-whole of it, mirrored from `CONTEXT_WORDS` in
+whole of the shipped list, mirrored from `CONTEXT_WORDS` in
 [`auth/policy.py`](../messagefoundry/auth/policy.py).
 `tests/test_security_doc_context_words.py` pins this
 list to `CONTEXT_WORDS`, so a term added to or dropped from either one without the other fails the
 build rather than leaving the two to diverge.
 
 **What a deploying site can and cannot tune here.** `password_check_context` is a whole-list on/off
-switch, on by default. There is **no** setting that adds a site's own terms — its hospital
-abbreviation, a partner or product name, the local domain — and none that removes a member whose
-substring collides with a legitimate local word. A site that wants wider coverage supplies it through
-`password_breach_corpus_file` below, which answers a different question: that corpus is matched
-against the **whole** password, so a term added there is refused only when it *is* the password, never
-when it appears inside a longer passphrase.
+switch, on by default, and it covers the site's terms too. The shipped terms are fixed: no setting
+removes one, even a member whose substring collides with a legitimate local word. A site **can add**
+its own terms with `password_extra_context_words`: its hospital abbreviation, a partner or product
+name, a project codename. Those are the kinds of word ASVS 6.1.2 names, and a vendor list cannot
+know them.
 
-Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline:
+Site terms join the same screen, and it is a plain one. It lower-cases the password and the term,
+then asks whether the term appears anywhere in the password. Nothing else is normalised. A dotted or
+hyphenated term such as `acme.org` or `st-mary` matches only that exact text, and misses `acmeorg`
+or `StMary`. So prefer distinctive bare words, and list each spelling a user might type: `acme` alone
+already catches `acme.org`, `AcmeHealth` and `acme-2026`.
 
-- **Username-in-password rejection** (`password_check_username`) — a password that *contains* the
-  user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected, catching the common
-  `jsmith2026`-style choice that the corpus can't.
-- **Larger operator breach corpus** (`password_breach_corpus_file`) — point this at an offline list to
+A site term's refusal says the word is one of the site's additions, so a user does not search the
+list above for it. Each term must be one word with no whitespace, and short terms are refused at
+load. [CONFIGURATION.md](CONFIGURATION.md) has the length floor and the full rules. The site's added
+terms are the site's to publish, in its own documentation; this page can list only the shipped ones.
+This differs from `password_breach_corpus_file` below. That corpus is matched against the **whole**
+password, so a term added there is refused only when it *is* the password, never inside a longer
+passphrase.
+
+Two further screens, both fully offline. The context-word list above is what ASVS 6.2.11 grades;
+neither of these is part of it:
+
+- **Username-in-password rejection** (`password_check_username`, on by default) — a password that
+  *contains* the user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected,
+  catching the common `jsmith2026`-style choice that the corpus can't. No ASVS 5.0 requirement names
+  this screen. 6.2.11 asks that the *documented list* of context-specific words be used, and a
+  user's own name is not on that list. Earlier revisions labelled this screen 6.2.11.
+- **Larger operator breach corpus** (`password_breach_corpus_file`, ASVS 6.2.12, off until a path is
+  set) — point this at an offline list to
   augment the bundled corpus: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
   (`HASH[:count]` lines, auto-detected), checked locally with no network call. Use a curated subset
   (it's loaded into memory), not the full ~40 GB HIBP set; a configured-but-unreadable path is warned

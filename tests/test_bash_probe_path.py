@@ -45,6 +45,7 @@ from pathlib import Path
 
 import pytest
 from _bash_resolver import (
+    _SHIM_PREFIX,
     BASH_HARNESS_FAILURE,
     bash_sees,
     probe_env,
@@ -122,6 +123,100 @@ def test_the_interpreters_directory_is_appended_to_an_empty_path(real_bash: Path
     """An empty PATH must not become a leading separator, which some shells read as the cwd."""
     env = probe_env(real_bash, {"PATH": ""})
     assert env["PATH"] == str(real_bash.parent), f"got {env['PATH']!r}"
+
+
+def _decoy_bash(tmp_path: Path, name: str = "bash") -> Path:
+    """A directory holding a DIFFERENT `bash`, standing in for System32's WSL launcher."""
+    decoy = tmp_path / "decoybash"
+    decoy.mkdir()
+    fake = decoy / name
+    fake.write_text("#!/bin/sh\necho DECOY\n", encoding="utf-8", newline="\n")
+    fake.chmod(0o755)
+    return decoy
+
+
+def _shim_index(entries: list[str]) -> int:
+    hits = [i for i, e in enumerate(entries) if Path(e).name.startswith(_SHIM_PREFIX)]
+    assert len(hits) == 1, f"expected exactly one bash shim on PATH: {entries!r}"
+    return hits[0]
+
+
+@pytest.mark.parametrize("decoy_name", ["bash", "bash.exe"] if os.name == "nt" else ["bash"])
+def test_a_different_bash_earlier_on_path_is_outranked_by_a_shim_and_the_stub_still_wins(
+    real_bash: Path, tmp_path: Path, decoy_name: str
+) -> None:
+    """A GRANDCHILD THAT RUNS `bash` BY NAME MUST GET THIS BASH (owner instruction 2026-09-28).
+
+    Measured 2026-09-28 on a box with WSL: System32 holds `bash.exe` and sits ahead of any appended
+    entry, so a `#!/usr/bin/env bash` gh stub exited 127 and a nested `bash -c` ran nothing. So a shim
+    answering only `bash` goes just before the other bash, and the caller's stub keeps the head. The
+    interpreter's own directory stays APPENDED, so no other tool is re-ranked. `bash.exe` is the
+    System32 spelling and answers `bash` only on Windows, so it is checked there.
+    """
+    stub = tmp_path / "stubdir"
+    stub.mkdir()
+    decoy = _decoy_bash(tmp_path, decoy_name)
+    env = probe_env(real_bash, {"PATH": os.pathsep.join([str(stub), str(decoy)])})
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[0] == str(stub), f"the caller's stub lost the head of PATH: {entries!r}"
+    assert _shim_index(entries) < entries.index(str(decoy)), (
+        f"the other bash still outranks the shim: {entries!r}"
+    )
+    assert entries[-1] == str(real_bash.parent), (
+        f"the interpreter's own directory must stay APPENDED, re-ranking no other tool: {entries!r}"
+    )
+
+
+def test_a_child_running_bash_by_name_reaches_the_resolved_bash(
+    real_bash: Path, tmp_path: Path
+) -> None:
+    """The behavioural half: the child's `bash` runs a real shell, not the decoy."""
+    decoy = _decoy_bash(tmp_path)
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [str(real_bash), "-c", "bash -c 'echo SHIM-OK'"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=probe_env(real_bash, {"PATH": str(decoy)}),
+    )
+    assert proc.stdout.strip() == "SHIM-OK", (
+        f"a child's `bash` did not reach a real shell: {proc!r}"
+    )
+
+
+def test_the_decoy_answers_when_nothing_outranks_it(real_bash: Path, tmp_path: Path) -> None:
+    """ANTI-VACUITY for the arm above: without probe_env the child DOES reach the decoy, so that
+    arm can fail and its pass means something."""
+    decoy = _decoy_bash(tmp_path)
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [str(real_bash), "-c", "bash -c 'echo SHIM-OK'"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={"PATH": os.pathsep.join([str(decoy), str(real_bash.parent)])},
+    )
+    assert proc.stdout.strip() == "DECOY", (
+        f"the decoy did not answer, so the arm is vacuous: {proc!r}"
+    )
+
+
+def test_no_shim_when_our_bash_already_leads(real_bash: Path, tmp_path: Path) -> None:
+    """No insertion when the interpreter's directory already precedes the other bash."""
+    decoy = _decoy_bash(tmp_path)
+    env = probe_env(real_bash, {"PATH": os.pathsep.join([str(real_bash.parent), str(decoy)])})
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[:2] == [str(real_bash.parent), str(decoy)], entries
+    assert not any(Path(e).name.startswith(_SHIM_PREFIX) for e in entries), entries
+
+
+def test_probe_env_applied_twice_adds_one_shim(real_bash: Path, tmp_path: Path) -> None:
+    """A caller that passes a probe_env result back in must not stack shims."""
+    decoy = _decoy_bash(tmp_path)
+    once = probe_env(real_bash, {"PATH": str(decoy)})
+    twice = probe_env(real_bash, once)
+    _shim_index(twice["PATH"].split(os.pathsep))
 
 
 # --- the negative control --------------------------------------------------------------------------

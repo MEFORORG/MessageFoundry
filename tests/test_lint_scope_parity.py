@@ -998,6 +998,17 @@ def test_bandit_skips_match() -> None:
     )
 
 
+def test_bandit_does_not_skip_the_weak_rng_check() -> None:
+    """B311 flags the `random` module. It was a wholesale skip until BACKLOG #1173, which left
+    nothing to catch a weak generator returning to shipped code. Each seeded, non-security use is
+    now a per-line `# nosec B311`, so a skip here would silently drop that guard on BOTH sides
+    (the parity test above only checks that the two lists agree, not what they contain)."""
+    hook_args = " ".join(_hooks()["bandit"].get("args") or [])
+    ci = _ci_step_run(_SECURITY, "Scan source for insecure patterns")
+    for side, text in (("pre-commit hook", hook_args), ("CI bandit step", ci)):
+        assert "B311" not in _bandit_skips(text), f"the {side} skips B311 again"
+
+
 def test_bandit_excludes_match() -> None:
     """The hook excludes by regex, CI by comma-separated paths. Compare the PATHS they name.
 
