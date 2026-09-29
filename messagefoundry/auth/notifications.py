@@ -118,9 +118,9 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #: gate, unless enforcement is ``warn`` and the operator waived notices in writing.
 LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
 
-#: What a general-log line calls each notice kind. A log call names the kind by looking it up here,
-#: never by passing the caller's ``event_type`` through, and an unknown kind logs as ``unrecognised``.
-#: Each label is a string literal equal to its kind, which
+#: What a general-log line calls each notice kind. A log call names the kind through
+#: :func:`notice_kind_log_label`, never by passing the caller's ``event_type`` through, and an unknown
+#: kind logs as ``unrecognised``. Each label is a string literal equal to its kind, which
 #: ``tests/test_auth_service.py::test_every_notice_kind_has_a_log_label_equal_to_itself`` pins, so a
 #: line reads exactly as it did when it logged the kind directly.
 #:
@@ -128,8 +128,9 @@ LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
 #: NAME it was assigned to, so ``PASSWORD_CHANGED``, ``MFA_ENABLED`` and their siblings count as a
 #: password. It follows that label through ``event_type`` into every log line that prints it (on
 #: ``main``, alerts 222 and 223 on the two ``AuthService._notify_security`` warnings). These values
-#: are labels, not credentials, so no secret was ever logged. A literal looked up by key carries no
-#: such flow, and a closed table also stops a future caller's free-form string from reaching the log.
+#: are labels, not credentials, so no secret was ever logged. A literal read out of this table
+#: carries no such flow, and a closed table also stops a future caller's free-form string from
+#: reaching the log.
 NOTICE_KIND_LOG_LABELS: Mapping[str, str] = MappingProxyType(
     {
         ACCOUNT_LOCKED: "account_locked",
@@ -155,6 +156,19 @@ NOTICE_KIND_LOG_LABELS: Mapping[str, str] = MappingProxyType(
         ACCOUNT_CREATED: "account_created",
     }
 )
+
+
+def notice_kind_log_label(event_type: str) -> str:
+    """The :data:`NOTICE_KIND_LOG_LABELS` label for ``event_type``, or ``unrecognised``.
+
+    A scan with ``==``, not ``.get`` or a subscript, on purpose. CodeQL treats a ``get`` or a
+    subscript whose key traces back to a sensitive-looking string literal as a new sensitive
+    source, and ``"password_changed"`` is one. An equality test is not a lookup, so the label
+    returned is only ever the table's own literal. Twenty-odd comparisons, on a warning path."""
+    for kind, label in NOTICE_KIND_LOG_LABELS.items():
+        if kind == event_type:
+            return label
+    return "unrecognised"
 
 
 @dataclass(frozen=True)

@@ -650,8 +650,14 @@ async def test_the_two_notice_warnings_escape_a_line_break_in_the_username(
         with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
             await service._notify_security(PASSWORD_CHANGED, username="bob\r\nforged", email=None)
             await service._notify_security("free-form kind", username="bob", email=None)
-        lines = [r.getMessage() for r in caplog.records if r.name == _AUTH_LOGGER]
-        assert len(lines) == 2
+        records = [r for r in caplog.records if r.name == _AUTH_LOGGER]
+        # The ARGS, not only the rendered line: a scrub filter left on a root handler by another
+        # test would clean the rendered message even with the call-site scrub removed.
+        assert [r.args[:2] if isinstance(r.args, tuple) else r.args for r in records] == [
+            (PASSWORD_CHANGED, "bob\\r\\nforged"),
+            ("unrecognised", "bob"),
+        ]
+        lines = [r.getMessage() for r in records]
         assert f"{PASSWORD_CHANGED} for bob\\r\\nforged" in lines[0]
         assert "\r" not in lines[0] and "\n" not in lines[0]
         assert "unrecognised for bob" in lines[1]
@@ -672,6 +678,9 @@ def test_every_notice_kind_has_a_log_label_equal_to_itself() -> None:
     }
     assert len(kinds) >= 8, f"the notice-kind set collapsed to {sorted(kinds)}"
     assert dict(NOTICE_KIND_LOG_LABELS) == {kind: kind for kind in kinds}
+    assert {kind: notifications.notice_kind_log_label(kind) for kind in kinds} == {
+        kind: kind for kind in kinds
+    }
 
 
 async def test_missing_notifier_reports_the_drop_rather_than_swallowing_it(
