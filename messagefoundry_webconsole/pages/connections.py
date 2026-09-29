@@ -370,7 +370,9 @@ def dashboard(rows: list[ConnectionRow], *, unprovisioned: bool = False) -> Mark
 
 def connection_details(row: ConnectionRow, events: list[ConnectionEventInfo]) -> Markup:
     """Read-only detail view for one connection (#4a): transport/status, live stats, and recent
-    connection/transport events — all metadata (no PHI), composed from existing monitoring handlers."""
+    connection/transport events, composed from existing monitoring handlers. Not PHI-free: the row's
+    ``error`` and each event's ``reason`` are scrubbed free text that ``docs/PHI.md`` section 2 gives
+    a protection level."""
     peer = row.peer or "—"
     if row.port:
         peer = f"{peer}:{row.port}"

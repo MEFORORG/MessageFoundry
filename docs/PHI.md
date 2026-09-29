@@ -114,7 +114,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `connection_event.reason` (#46 transport/lifecycle log, **default on**) | all three | **Possibly** — a free-text diagnostic fragment | **Yes, when a key is set** — store cipher; AAD `("connection_event","reason",connection,ts,kind)`; store DEK | **PL-2** | Defended twice: the emit site passes a `safe_exc()`-scrubbed string and the store re-applies `safe_text(reason)[:200]`. IDENTITY `id`, so its own composite pass. Every other column is bounded engine/config metadata **except `peer_host`** (its own PL-4 row below) — the table carries no frame, body or HL7 field value. Read under `monitoring:read`, **not** a PHI permission ([§7](#7-logging--phi-redaction)) | `` `[retention].connection_event_retention_hours` `` |
 | `connection_event.peer_host` | all three | **No** — a network address; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The connecting peer's IP, taken from the socket; `NULL` for outbound/unknown. Personal data, not PHI — the **same class and the same decision** as `audit_log.client` / `sessions.client`: plaintext so it stays greppable for incident response. Returned to operators by `GET /events` under `monitoring:read`. Purged with its row by `[retention].connection_event_retention_hours` | ``rides `[retention].connection_event_retention_hours` `` |
 | `alert_instance.reason` (ADR 0044 operator alerts) | all three | **Possibly** — the alert's `detail`/`reason`/`label` free text | **Yes, when a key is set** — store cipher; AAD `("alert_instance","reason",event_type,connection)`; store DEK | **PL-2** | `safe_text(reason)[:200]` before the cipher. The AAD binds the de-dup grain, so the same AAD covers both the INSERT and the re-fire upsert UPDATE that never sees the `id`. Read under `monitoring:diagnose` ([§7](#7-logging--phi-redaction)) | ``rides `[retention].connection_event_retention_hours` `` |
-| `users.totp_secret` | all three | **No** — not PHI | **Yes, when a key is set** — store cipher; AAD `("users","totp_secret",id)`; store DEK | **PL-3** | The base32 TOTP MFA seed. Never returned by any API response model. Its siblings `users.password_hash` and `users.totp_recovery_codes` are **argon2id one-way hashes** and are deliberately **not** ciphered | `keep-forever by design` — it lives and dies with the user row |
+| `users.totp_secret` | all three | **No** — not PHI | **Yes, when a key is set** — store cipher; AAD `("users","totp_secret",id)`; store DEK | **PL-3** | The base32 TOTP MFA seed. It is returned **once**, when enrollment stages it. §3's PL-3 block says how. **This cell said "Never returned by any API response model" until BACKLOG #1185 corrected it.** Its siblings `users.password_hash` and `users.totp_recovery_codes` are **argon2id one-way hashes** and are deliberately **not** ciphered | `keep-forever by design` — it lives and dies with the user row |
 | `queue.handler_name` / `destination_name` / `channel_id` | all three | No — names, not bodies | No (metadata, deliberately not ciphered) | **PL-4** | The handler the transform worker runs; the destination the delivery worker drains | `n/a — not PHI` |
 | `messages.control_id`, `messages.message_type` | all three | Low (MSH-10/MSH-9) | **No** — plaintext by design | **PL-4** | Needed plaintext for dedup/routing/indexes (`ix_messages_control`). Covered only by the whole-DB / volume layer | `keep-forever by design` — dedup/routing keys that live and die with the message row |
 | `audit_log.detail` | all three | Low — exposed IDs/counts, not bodies | **No** — plaintext by design | **PL-4** | JSON metadata about PHI *access*, not the PHI itself. Its writers only ever store filter shapes, counts and ids | `keep-forever by design` — 45 CFR 164.316(b)(2)(i) six-year documentation retention. **Not** chain-breakage: which rows a delete removes decides that, and the reasoning is stated once, in the `audit_days` row of [CONFIGURATION.md](CONFIGURATION.md#retention) |
@@ -153,6 +153,16 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 > Machine-readable by construction: the form keyword is **un-backticked** and the setting is
 > **backticked**, so one pattern extracts the window from every bounded form, and the three prose forms
 > contain no backticked setting at all.
+
+**Two live fields take a stored column's rating (BACKLOG #1185).** `ConnectionRow.error` (on
+`GET /connections`) and `ConnectionMetadata.error` (on `GET /connections/{name}/metadata`) are not
+stored columns, so neither has a row in the table above. Each carries a live string: why a connection
+failed to start (ADR 0031), or why the DR run-profile parked it (ADR 0048). The start-failure string
+is `safe_exc()` text. The runner stores it through the `connection_stopped` alert, so its stored
+copy is `alert_instance.reason`. **Both fields are rated PL-2, the level of `alert_instance.reason`.**
+The rating is on the FIELD, not only on the start-failure string. So both routes are served
+`Cache-Control: no-store`. `tests/test_no_store_phi_coverage.py` binds each field to
+`alert_instance.reason` and reads the level out of that column's row above.
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written
@@ -613,7 +623,9 @@ Encrypted with the store cipher (AAD `("users","totp_secret",id)`); integrity fr
 **Access.** The staged secret is returned **exactly once, to its own owner**, by `POST /me/mfa/enroll`
 (`MfaEnrollResponse.secret`, plus the `otpauth://` QR URI that embeds the same base32 value) — behind a
 fresh **password** step-up bound to that action (ADR 0077,
-`require_reauth_only_action(STEP_UP_ACTION_MFA_ENROLL)`) and audited `auth.mfa_enroll_started`. It is
+`require_reauth_only_action(STEP_UP_ACTION_MFA_ENROLL)`) and audited `auth.mfa_enroll_started`. That
+reply is served `Cache-Control: no-store`. The web console's `POST /ui/account/mfa/enroll` calls the
+same handler and renders the seed once into a `/ui` page, which is `no-store` too. It is
 **never returned again**: no read route, no admin route, and the server-side TOTP verifier is the only
 other consumer. **Logging:** never logged at any level.
 
@@ -932,9 +944,18 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
 - **No caching.** Every `/ui` HTML response and every PHI JSON read is served `Cache-Control: no-store`,
   so a browser/proxy never retains a message body on disk. The covered set is the PHI-read route
   families — `/messages*`, `/dead-letters*`, `/search*`, `/logs*`, `/uploads*` (`_NO_STORE_PREFIXES` in
-  `api/app.py`) — and a test walks every registered route and fails if a PHI read ever lands outside
-  them, so a new PHI surface cannot ship header-free the way `/search/layered`, `/logs/tail` and
-  `/uploads/{file_id}/messages` each did.
+  `api/app.py`) — plus exact route templates in `_NO_STORE_ROUTE_PATHS`. Those are mostly responses
+  that carry a rated field under a monitoring permission. At least these: the event log, the alert
+  list and its four mutation replies, `GET /connections` and `GET /connections/{name}/metadata`.
+  `tests/test_no_store_phi_coverage.py` walks every registered route. It fails when a PHI-gated route,
+  or one whose response projects a PL-1/PL-2/PL-3 column, lands outside that set. That is what keeps
+  a new PHI surface from shipping header-free, the way `/search/layered`, `/logs/tail` and
+  `/uploads/{file_id}/messages` each did. Credential-bearing replies are served `no-store` by the
+  auth routes themselves: a session token, a staged TOTP seed, recovery codes, a temporary password.
+  `tests/test_credential_reply_no_store.py` drives each of those routes. **What the two tests cannot
+  see.** The route test reads a field only when its name is a rated column's name. The credential
+  test reads only the credential field names it lists. A route outside the prefix families with no
+  response model is outside both. Those shapes rest on review.
 - **Audited raw view only.** A raw message body is shown only via the same audited `GET /messages/{id}`
   path as the desktop console (record_view + tamper-evident `message_view` audit); there is no second,
   unaudited PHI render path (no server-side parse-tree endpoint in M1).

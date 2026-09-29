@@ -1193,8 +1193,9 @@ class EngineClient:
         kind: str | None = None,
         limit: int = 200,
     ) -> list[ConnectionEventInfo]:
-        """The Corepoint-style connection/transport event log (#46), newest first — metadata only (no
-        PHI), so it needs only ``monitoring:read``."""
+        """The Corepoint-style connection/transport event log (#46), newest first. It needs only
+        ``monitoring:read``, but it is not PHI-free: ``reason`` is scrubbed free text that
+        ``docs/PHI.md`` section 2 gives a protection level."""
         response = self._get("/events", connection=connection, kind=kind, limit=limit)
         return [ConnectionEventInfo.model_validate(e) for e in response.json()]
 
