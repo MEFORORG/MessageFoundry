@@ -460,7 +460,7 @@ class StoreSettings(_Section):
         default=False,
         description=(
             "Execute the pooled claim via the two lane-family versioned procs "
-            "(dbo.mefor_claim_fifo_heads_cid_v1/_dst_v1; fixed-arity CALL) instead of the ~3KB ad-hoc "
+            "(dbo.mefor_claim_fifo_heads_cid_v2/_dst_v2; fixed-arity CALL) instead of the ~3KB ad-hoc "
             "batch. Fails safe to the batch (loud) whenever the startup gate cannot verify both "
             "deployed bodies against this build — at least: a missing proc, a body matching no form "
             "this build deploys, a definition this principal cannot read (no VIEW DEFINITION, or "

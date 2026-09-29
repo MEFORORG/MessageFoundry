@@ -666,7 +666,7 @@ async def test_ac13_gate_superseded_by_green_proc_gate(
     await rig.claim()
     kind, sql, params = rig.ops[0]
     assert kind == "execute-batch@pool"
-    assert sql.startswith("{CALL dbo.mefor_claim_fifo_heads_cid_v1")
+    assert sql.startswith("{CALL dbo.mefor_claim_fifo_heads_cid_v2")
     assert len(params) == 9
     assert rig.conns == []
 

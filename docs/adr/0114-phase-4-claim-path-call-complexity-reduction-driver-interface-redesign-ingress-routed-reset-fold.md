@@ -500,6 +500,9 @@ outage; the hot path contains **no error-2812 handling**. Out-of-band drift is c
 N processes against ONE unified store (ADR 0037/0063), so a rolling upgrade briefly runs two builds against one
 database — each build calls exactly the body it shipped; a newer build's `_v2` never touches `_v1`. A retired
 version is dropped only by an explicit later `_SCHEMA` statement, one release after nothing ships it.
+*(Note 2026-09-29, BACKLOG #1270: the first bump under this rule. `mefor_claim_fifo_heads_cid_v2` /
+`_dst_v2` add head-skip marker rows to the sole result set and are the procs the engine now calls.
+`_v1` stays deployed with its shipped bytes, and a later change drops it.)*
 **Downgrade** to a pre-0114 build leaves the version-named procs **orphaned and inert** (nothing calls or drops
 them; re-upgrade reclaims them via `CREATE OR ALTER`); mixed-vintage schema-marker thrash on restarts is
 pre-existing ADR 0064 behavior — applock-serialized and idempotent — recorded here so an operator seeing

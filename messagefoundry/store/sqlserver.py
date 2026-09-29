@@ -930,12 +930,18 @@ class _SyncHandoffPool:
 # the text they document.
 
 
-def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> str:
+def _fifo_heads_steps(
+    *, lane_col: str, lane_source: str, epoch_guard: str, head_skip_markers: bool = True
+) -> str:
     """The shared claim body (ADR 0066 §3.2 probe-then-claim, #285 inversion). ``lane_col`` is the
     code-controlled lane-column literal (``channel_id``/``destination_name``); ``lane_source`` the
     parenthesized derived table producing one ``lane`` column (``(VALUES (?),...)`` on the batch,
     the OPENJSON decode on the proc); ``epoch_guard`` the H1 fence predicate applied to the STEP-3
-    probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc)."""
+    probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc).
+
+    ``head_skip_markers=False`` renders the body WITHOUT the BACKLOG #1270 marker arm, byte for byte
+    the body the ``_v1`` procs shipped. It exists only so a retained ``_v1`` keeps its own bytes
+    (ADR 0114: a newer build's ``_v2`` never touches ``_v1``); everything this build CALLS has it."""
     return (
         " DECLARE @heads TABLE (lane NVARCHAR(256) NOT NULL,"
         " id NVARCHAR(64) NOT NULL PRIMARY KEY,"
@@ -1004,6 +1010,13 @@ def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> s
         " SELECT kp.id AS keep_id, c.id, c.message_id, c.channel_id, c.destination_name,"
         " c.handler_name, c.payload, c.attempts, c.seq, c.created_at"
         " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id"
+        + (_head_skip_marker_arm(lane_col, epoch_guard) if head_skip_markers else ";")
+    )
+
+
+def _head_skip_marker_arm(lane_col: str, epoch_guard: str) -> str:
+    """The sole result set's BACKLOG #1270 arm, appended by :func:`_fifo_heads_steps`."""
+    return (
         # BACKLOG #1270, the head-of-line skip: one marker row per lane whose DUE head (rn=1; STEP 2
         # already removed a not-due head) the STEP-3 probe could not lock. STEP 4 emptied that lane,
         # and without this row the EMPTY is indistinguishable from "no work". A NULL keep_id is the
@@ -1020,11 +1033,22 @@ def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> s
 # The two lane-family, name-versioned claim procedures (ADR 0114 §4). TWO procs, not one: the lane
 # column is a code-controlled literal baked into the statement text (_lane_col), and a column name
 # cannot be a T-SQL parameter; dynamic SQL is rejected (per-call parse + an injection surface at
-# the reliability core). Name-versioned (_v1): engine sharding runs N builds against ONE unified
-# store (ADR 0037/0063), so a rolling upgrade briefly runs two builds — each calls exactly the body
-# it shipped; a retired version is dropped only by an explicit later _SCHEMA statement.
-_CLAIM_PROC_CID = "mefor_claim_fifo_heads_cid_v1"  # channel_id lanes: ingress / routed / response
-_CLAIM_PROC_DST = "mefor_claim_fifo_heads_dst_v1"  # destination_name lanes: outbound
+# the reliability core). Name-versioned: engine sharding runs N builds against ONE unified store
+# (ADR 0037/0063), so a rolling upgrade briefly runs two builds — each calls exactly the body it
+# shipped; a retired version is dropped only by an explicit later _SCHEMA statement.
+#
+# _v2 (BACKLOG #1270) adds the head-skip marker arm to the sole result set. It is a NEW name, not an
+# edit to _v1, because an older build still calling _v1 cannot parse a marker row: it would read the
+# NULL id as kept != claimed and roll the whole claim back. These two are the procs this build CALLS.
+_CLAIM_PROC_CID = "mefor_claim_fifo_heads_cid_v2"  # channel_id lanes: ingress / routed / response
+_CLAIM_PROC_DST = "mefor_claim_fifo_heads_dst_v2"  # destination_name lanes: outbound
+# RETAINED, never called by this build: still deployed, byte for byte as they shipped, for any older
+# build sharing the store mid-upgrade. Dropped only by a later explicit _SCHEMA statement, one release
+# after nothing ships them (ADR 0114). Do NOT drop them in the change that adds _v2.
+_RETAINED_CLAIM_PROCS: Final[tuple[tuple[str, str], ...]] = (
+    ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
+    ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
+)
 
 # The OPENJSON lane decode (compat >= 130): one NVARCHAR(MAX) JSON-array parameter, so no delimiter
 # contract is ever imposed on connection names (lane names are data, never concatenated into SQL).
@@ -1095,7 +1119,7 @@ class _FencedWrite(Exception):
 _CLAIM_PROC_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE dbo."
 
 
-def _claim_proc_body(proc_name: str, lane_col: str) -> str:
+def _claim_proc_body(proc_name: str, lane_col: str, *, head_skip_markers: bool = True) -> str:
     """The full ``CREATE OR ALTER PROCEDURE`` statement for one lane family — the text inside the
     guarded ``EXEC(N'...')``. This is the text SUBMITTED, which is NOT the text
     ``OBJECT_DEFINITION()`` returns: the engine deletes the ``OR`` and ``ALTER`` tokens from the
@@ -1131,12 +1155,13 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
             lane_col=lane_col,
             lane_source=_CLAIM_PROC_LANE_SOURCE,
             epoch_guard=_CLAIM_PROC_EPOCH_GUARD,
+            head_skip_markers=head_skip_markers,
         )
         + " IF @fold_reset = 1 SET LOCK_TIMEOUT -1;"
     )
 
 
-def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
+def _claim_proc_ddl(proc_name: str, lane_col: str, *, head_skip_markers: bool = True) -> str:
     """The guarded, self-no-op'ing ``_SCHEMA`` statement deploying one claim proc (AC-10).
 
     ``_ensure_schema`` executes every ``_SCHEMA`` statement inside one must-succeed transaction, so
@@ -1149,7 +1174,9 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
     parses) and satisfies CREATE OR ALTER's batch-initial rule. Riding ``_SCHEMA`` means the
     ADR 0064 content hash versions the body for free: ANY edit changes ``_schema_hash()`` and
     forces one guarded, applock-serialized re-apply — a forgotten version bump is impossible."""
-    body = _claim_proc_body(proc_name, lane_col).replace("'", "''")
+    body = _claim_proc_body(proc_name, lane_col, head_skip_markers=head_skip_markers).replace(
+        "'", "''"
+    )
     version_check = (
         "CAST(SERVERPROPERTY('EngineEdition') AS INT) >= 5"
         " OR TRY_CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), 4)"
@@ -1947,6 +1974,13 @@ _SCHEMA: list[str] = [
     # content hash re-applies them on any body edit (no version constant to forget).
     # #305: the cluster coordinator's tables (see CLUSTER_SCHEMA), before the procs that name one.
     *CLUSTER_SCHEMA,
+    # The retained _v1 pair first, rendered WITHOUT the #1270 marker arm so each statement is byte
+    # for byte what it shipped as (a mid-upgrade older build keeps calling it), then the _v2 pair
+    # this build calls.
+    *(
+        _claim_proc_ddl(proc_name, lane_col, head_skip_markers=False)
+        for proc_name, lane_col in _RETAINED_CLAIM_PROCS
+    ),
     _claim_proc_ddl(_CLAIM_PROC_CID, "channel_id"),
     _claim_proc_ddl(_CLAIM_PROC_DST, "destination_name"),
 ]
@@ -2435,7 +2469,7 @@ class SqlServerStore:
                             " deploys — an out-of-band edit, a hand deploy (a head spelling this"
                             " code cannot emit, e.g. create proc or a differing case), a renamed"
                             " proc (sp_rename does not rewrite the stored definition), or a build"
-                            " whose body was changed without bumping the _v1 proc name. The"
+                            " whose body was changed without bumping the proc version. The"
                             " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
                             f"{proc_name}')) against this build's own definition to see the drift"
                         )
