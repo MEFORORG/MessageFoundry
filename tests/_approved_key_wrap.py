@@ -212,30 +212,24 @@ def without_mac(pfx: bytes) -> bytes:
     return seq(head)
 
 
-#: Hashes a PKCS#12-KDF MAC is written over here, by name: (DigestInfo OID, hash, block bytes).
-PKCS12_MAC_HASH: dict[str, tuple[str, hashes.HashAlgorithm, int]] = {
-    "md5": ("1.2.840.113549.2.5", hashes.MD5(), 64),
-    "sha1": ("1.3.14.3.2.26", hashes.SHA1(), 64),
-    "sha256": ("2.16.840.1.101.3.4.2.1", hashes.SHA256(), 64),
+#: Hashes a PKCS#12-KDF MAC is written over here, by name: (DigestInfo OID, hash).
+_PKCS12_MAC_HASH: dict[str, tuple[str, hashes.HashAlgorithm]] = {
+    "md5": ("1.2.840.113549.2.5", hashes.MD5()),
+    "sha1": ("1.3.14.3.2.26", hashes.SHA1()),
+    "sha256": ("2.16.840.1.101.3.4.2.1", hashes.SHA256()),
 }
-
-
-def _digest(algorithm: hashes.HashAlgorithm, data: bytes) -> bytes:
-    h = hashes.Hash(algorithm)
-    h.update(data)
-    return h.finalize()
 
 
 def with_pkcs12_kdf_mac(pfx: bytes, passphrase: bytes, *, mac_hash: str, iterations: int) -> bytes:
     """``pfx`` with its MacData replaced by a legacy one: HMAC keyed by the PKCS#12 KDF.
 
-    RFC 7292 Appendix B.2 with ID 3, the MAC key. This is what ``openssl pkcs12 -macalg`` writes,
-    built here so a test can pick MD5 or SHA-1 without ``cryptography``'s writer, which refuses
-    both. The passphrase is a BMPString with a two-byte terminator. Real bundles: the loaders' own
-    tests open them through ``cryptography``, so a wrong derivation would fail there."""
+    RFC 7292 Appendix B.2 with ID 3, the MAC key. This is what ``openssl pkcs12 -macalg`` writes.
+    It is built here because ``cryptography``'s writer always encrypts the bags, so it cannot write
+    a MAC over clear ones. The passphrase is a BMPString with a two-byte terminator. The bundles are
+    real: the cert CLI tests open them through ``cryptography``, which checks the MAC."""
     head, content = _pfx_parts(pfx)
-    oid_dotted, algorithm, block = PKCS12_MAC_HASH[mac_hash]
-    size = algorithm.digest_size
+    oid_dotted, algorithm = _PKCS12_MAC_HASH[mac_hash]
+    block = 64  # the hash's input block size: 64 bytes for MD5, SHA-1 and SHA-256
     salt = os.urandom(8)
 
     def fill(data: bytes) -> bytes:
@@ -243,16 +237,28 @@ def with_pkcs12_kdf_mac(pfx: bytes, passphrase: bytes, *, mac_hash: str, iterati
         length = block * -(-len(data) // block)
         return (data * (length // len(data) + 1))[:length]
 
-    diversifier = bytes([3]) * block
     secret = passphrase.decode("utf-8").encode("utf-16-be") + b"\x00\x00"
-    derived = diversifier + fill(salt) + fill(secret)
+    derived = bytes([3]) * block + fill(salt) + fill(secret)
     for _ in range(iterations):
-        derived = _digest(algorithm, derived)
-    mac_key = derived[:size]  # one block of output is the whole HMAC key: size <= digest size
-    signer = hmac.HMAC(mac_key, algorithm)
+        h = hashes.Hash(algorithm)
+        h.update(derived)
+        derived = h.finalize()
+    # One round of output is the whole HMAC key, because the key is one digest long.
+    signer = hmac.HMAC(derived, algorithm)
     signer.update(content)
     digest_info = seq(seq(oid(oid_dotted), NULL), octets(signer.finalize()))
     return seq(head, seq(digest_info, octets(salt), integer(iterations)))
+
+
+def clear_pfx_with_mac(
+    key: PKCS12PrivateKeyTypes, cert: x509.Certificate, passphrase: bytes, mac: str
+) -> bytes:
+    """Unencrypted bags, as ``openssl pkcs12 -keypbe NONE -certpbe NONE`` writes them, with ``mac``:
+    ``"pbmac1"`` for PBMAC1 at the floor, else a PKCS#12-KDF MAC over that hash at 2048 rounds."""
+    clear = clear_pfx(key, cert)
+    if mac == "pbmac1":
+        return with_pbmac1(clear, passphrase, iterations=600_000)
+    return with_pkcs12_kdf_mac(clear, passphrase, mac_hash=mac, iterations=2048)
 
 
 def with_pbmac1(pfx: bytes, passphrase: bytes, *, iterations: int, prf: str = "sha256") -> bytes:

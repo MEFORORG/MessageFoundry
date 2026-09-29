@@ -470,9 +470,8 @@ _MAX_BAG_DEPTH: Final = 4
 _REEXPORT: Final = (
     "Re-export it with OpenSSL 3.4 or later: openssl pkcs12 -export -keypbe AES-256-CBC "
     f"-certpbe AES-256-CBC -iter {_SHA256_FLOOR} -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 "
-    "-in <cert> -inkey <key> -out <new pfx>. A bundle with unencrypted bags is held to the same MAC "
-    "rule: a PBMAC1 MAC at that floor, or none. Or skip PKCS#12: give the certificate and an unencrypted or approved-wrap PKCS#8 "
-    "key as PEM files"
+    "-in <cert> -inkey <key> -out <new pfx>. Or skip PKCS#12: give the certificate and an "
+    "unencrypted or approved-wrap PKCS#8 key as PEM files"
 )
 
 
@@ -615,6 +614,11 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
     # no derivation to judge, as with an unencrypted PEM key. An encrypted one without a MAC fails.
     if len(parts) == 3:
         problem = _mac_problem(der, parts[2])
+        if problem is not None and not encrypted:
+            problem += (
+                ". That holds when no bag is encrypted: such a bundle passes with a PBMAC1 MAC at "
+                "the floor, or with no MAC"
+            )
         if problem is not None:
             return True, problem
     elif encrypted:

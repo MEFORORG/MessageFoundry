@@ -29,9 +29,8 @@ from messagefoundry.__main__ import main
 from tests._approved_key_wrap import (
     approved_pfx,
     clear_pfx,
+    clear_pfx_with_mac,
     pkcs12_bundle,
-    with_pbmac1,
-    with_pkcs12_kdf_mac,
 )
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
@@ -245,17 +244,7 @@ _CLEAR_PASS = "synthetic-clear-pass"
 _CLEAR_WEAK_MACS = {"md5": "MAC over MD5", "sha1": "MAC over SHA-1", "sha256": "rather than PBMAC1"}
 
 
-def _clear_bags_with_mac(key: PKCS12PrivateKeyTypes, cert: x509.Certificate, mac: str) -> bytes:
-    """Unencrypted bags, as ``openssl pkcs12 -keypbe NONE -certpbe NONE`` writes them, with ``mac``."""
-    clear = pkcs12.serialize_key_and_certificates(
-        b"x", key, cert, None, serialization.NoEncryption()
-    )
-    pw = _CLEAR_PASS.encode()
-    if mac == "pbmac1":
-        return with_pbmac1(clear, pw, iterations=600_000)
-    return with_pkcs12_kdf_mac(clear, pw, mac_hash=mac, iterations=2048)
-
-
+@pytest.mark.parametrize("armed", [True, False], ids=["checked", "check-disarmed"])
 @pytest.mark.parametrize(("mac", "why"), sorted(_CLEAR_WEAK_MACS.items()))
 def test_import_refuses_a_weak_mac_over_unencrypted_bags(
     tmp_path: Path,
@@ -263,41 +252,29 @@ def test_import_refuses_a_weak_mac_over_unencrypted_bags(
     monkeypatch: pytest.MonkeyPatch,
     mac: str,
     why: str,
+    armed: bool,
 ) -> None:
     # BACKLOG #1352. Nothing in these bundles is encrypted, but the MAC derives its key from the
-    # passphrase through the PKCS#12 KDF, so an MD5 or SHA-1 one ran on import before this.
+    # passphrase through the PKCS#12 KDF, so an MD5 or SHA-1 one ran on import before this. The
+    # disarmed arm is the control: each bundle is real and opens with its passphrase, so the check
+    # is the only thing that stops the import.
+    if not armed:
+        monkeypatch.setattr("messagefoundry.pki.refuse_weak_pkcs12", lambda *a, **k: None)
     key, cert = _make_cert()
     pfx_path = tmp_path / "clear.pfx"
-    pfx_path.write_bytes(_clear_bags_with_mac(key, cert, mac))
+    pfx_path.write_bytes(clear_pfx_with_mac(key, cert, _CLEAR_PASS.encode(), mac))
     monkeypatch.setenv("MEFOR_PFX_PASSWORD", _CLEAR_PASS)
     out = tmp_path / "o"
 
-    assert main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out)]) == 2
+    rc = main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out)])
     err = capsys.readouterr().err
+    if not armed:
+        assert rc == 0 and (out / "key.pem").exists()
+        return
+    assert rc == 2
     assert why in err and "-pbmac1_pbkdf2" in err
     assert _CLEAR_PASS not in err
     assert not (out / "key.pem").exists()
-
-
-@pytest.mark.parametrize("mac", sorted(_CLEAR_WEAK_MACS))
-def test_the_weak_clear_bundles_load_when_the_check_is_disarmed(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-    mac: str,
-) -> None:
-    # The control that makes the refusals above mean something: each bundle is real and opens with
-    # its passphrase, so the check is the only thing that stops the import.
-    monkeypatch.setattr("messagefoundry.pki.refuse_weak_pkcs12", lambda *a, **k: None)
-    key, cert = _make_cert()
-    pfx_path = tmp_path / "clear.pfx"
-    pfx_path.write_bytes(_clear_bags_with_mac(key, cert, mac))
-    monkeypatch.setenv("MEFOR_PFX_PASSWORD", _CLEAR_PASS)
-    out = tmp_path / "o"
-
-    assert main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out)]) == 0
-    capsys.readouterr()
-    assert (out / "key.pem").exists()
 
 
 def test_import_accepts_unencrypted_bags_under_an_approved_mac_or_none(
@@ -308,7 +285,7 @@ def test_import_accepts_unencrypted_bags_under_an_approved_mac_or_none(
     key, cert = _make_cert()
     monkeypatch.setenv("MEFOR_PFX_PASSWORD", _CLEAR_PASS)
     pbmac1 = tmp_path / "pbmac1.pfx"
-    pbmac1.write_bytes(_clear_bags_with_mac(key, cert, "pbmac1"))
+    pbmac1.write_bytes(clear_pfx_with_mac(key, cert, _CLEAR_PASS.encode(), "pbmac1"))
     assert main(["cert", "import", "--pfx", str(pbmac1), "--out-dir", str(tmp_path / "a")]) == 0
     monkeypatch.delenv("MEFOR_PFX_PASSWORD")
     no_mac = tmp_path / "nomac.pfx"
