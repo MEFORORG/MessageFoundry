@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
+    LOCKOUT_THRESHOLD_CEILING,
     AlertsSettings,
     ApiSettings,
     AuthSettings,
@@ -238,17 +239,22 @@ def test_new_ip_step_up_off_with_auth_off_is_NOT_a_loosening() -> None:
 # Owner ruling 2026-09-27 (#2006): a silent weakening of the sign-in anti-automation controls keeps
 # ASVS 6.1.1 at partial. Each value the limiter or the lockout rule reads as OFF must be named.
 
-#: (field, value that turns it off). Zero is the documented off value; the negative arms are the
-#: other values the code reads as off (a window that prunes every hit, a lock that ends before now).
+#: (field, value that turns it off). Zero is the documented off value; the other arms are the values
+#: the code also reads as off (a window that prunes every hit, a lock that ends before now, a
+#: threshold past NIST's ceiling, which never arms in practice).
 _SIGN_IN_OFF_VALUES = [
     ("login_rate_limit_enabled", False),
     ("login_rate_limit_per_ip", 0),
     ("login_rate_limit_global", 0),
     ("login_rate_limit_window_seconds", 0.0),
     ("login_rate_limit_window_seconds", -1.0),
+    ("login_rate_limit_window_seconds", float("-inf")),
     ("lockout_minutes", 0),
     ("lockout_minutes", -5),
+    ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING + 1),
+    ("lockout_threshold", 1_000_000),
 ]
+_SIGN_IN_FIELDS = {field for field, _ in _SIGN_IN_OFF_VALUES}
 
 
 def _risk(auth: AuthSettings, switch: str) -> str | None:
@@ -280,9 +286,8 @@ def test_sign_in_limiter_and_lockout_defaults_are_not_loosenings() -> None:
     assert auth.login_rate_limit_global == 60
     assert auth.login_rate_limit_window_seconds == 60.0
     assert auth.lockout_minutes == 15
-    named = _names()
-    for field, _ in _SIGN_IN_OFF_VALUES:
-        assert field not in named
+    assert auth.lockout_threshold == 5
+    assert not _SIGN_IN_FIELDS & set(_names())
 
 
 @pytest.mark.parametrize(("field", "value"), _SIGN_IN_OFF_VALUES)
@@ -305,71 +310,118 @@ def test_each_sign_in_off_value_is_a_named_loosening(field: str, value: object) 
         ("login_rate_limit_window_seconds", float("inf")),
         ("login_rate_limit_window_seconds", float("nan")),
         ("login_rate_limit_per_ip", 1),
-        ("login_rate_limit_window_seconds", 0.5),
         ("lockout_minutes", 1),
-        # No threshold turns the lockout off: 0 or less locks on the first failure.
+        # 0 or less locks on the FIRST failure, and NIST's ceiling itself is allowed.
         ("lockout_threshold", 0),
         ("lockout_threshold", -1),
-        ("lockout_threshold", 1000),
+        ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING),
     ],
 )
 def test_a_value_that_keeps_the_control_on_is_not_a_loosening(field: str, value: object) -> None:
     assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
 
 
-def test_a_zero_limiter_value_proves_the_limiter_off() -> None:
-    """Ground the entries in the limiter itself, so a change to what it reads as off reds here.
-
-    Each configuration the registry names must admit far more than the default budget, and the
-    default must refuse inside it."""
-    from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
-
-    def admitted(per_key: int, glob: int, window: float, keys: int) -> int:
-        limiter = SlidingWindowRateLimiter(per_key=per_key, glob=glob, window_seconds=window)
-        return sum(limiter.allow(f"10.0.0.{i % keys}") for i in range(200))
-
-    assert admitted(10, 60, 60.0, keys=1) == 10  # default, one address: the per-address limit
-    assert admitted(10, 60, 60.0, keys=50) == 60  # default, many addresses: the global limit
-    assert admitted(0, 60, 60.0, keys=1) == 60  # per_ip 0: only the global limit holds
-    assert admitted(10, 0, 60.0, keys=50) == 200  # global 0: a spread spray is never refused
-    assert admitted(10, 60, 0.0, keys=1) == 200  # window 0: nothing holds
-    assert admitted(10, 60, -1.0, keys=1) == 200  # window below 0: nothing holds
+def test_the_threshold_ceiling_is_nists() -> None:
+    """NIST SP 800-63B (rev. 3, 5.2.2) caps consecutive failed attempts on one account at 100."""
+    assert LOCKOUT_THRESHOLD_CEILING == 100
 
 
-def test_a_zero_lockout_proves_the_lock_expires_at_once() -> None:
-    """Ground the lockout entry in next_lockout_state: at 0 or less, the attempt after a lock is
-    not refused by it, and the count restarts."""
+async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine) -> None:
+    """Ground the entries in AuthService's own wiring rather than in literal limiter arguments, so a
+    change to how these settings reach the sign-in and ceremony limiters reds here.
+
+    Each value the registry names must let far more than the default budget through the limiter it
+    names, and the default must refuse inside that budget."""
+    from messagefoundry.auth.service import AuthService
+
+    def admitted(settings: AuthSettings, *, addresses: int, ceremony: bool = False) -> int:
+        service = AuthService(engine.store, settings)
+        if ceremony:
+            return sum(service.allow_reauth_attempt("user-1") for _ in range(200))
+        return sum(service.allow_login_attempt(f"10.0.0.{i % addresses}") for i in range(200))
+
+    default = AuthSettings()
+    assert admitted(default, addresses=1) == 10  # the per-address limit
+    assert admitted(default, addresses=50) == 60  # the all-clients limit
+    assert admitted(default, addresses=1, ceremony=True) == 10  # the per-user ceremony limit
+
+    off = AuthSettings(login_rate_limit_enabled=False)
+    assert admitted(off, addresses=1) == 200
+    assert admitted(off, addresses=1, ceremony=True) == 200
+
+    for window in (0.0, -1.0, float("-inf")):
+        no_window = AuthSettings(login_rate_limit_window_seconds=window)
+        assert admitted(no_window, addresses=1) == 200
+        assert admitted(no_window, addresses=1, ceremony=True) == 200
+
+    no_per_ip = AuthSettings(login_rate_limit_per_ip=0)
+    assert admitted(no_per_ip, addresses=1) == 60  # only the all-clients limit holds
+    assert admitted(no_per_ip, addresses=1, ceremony=True) == 200  # "the same number sets" it
+
+    no_global = AuthSettings(login_rate_limit_global=0)
+    assert admitted(no_global, addresses=50) == 200  # a spread spray is never refused
+
+
+@pytest.mark.parametrize("escalate", [True, False])
+@pytest.mark.parametrize("minutes", [0, -5])
+def test_a_zero_lockout_never_refuses_the_next_attempt(minutes: int, escalate: bool) -> None:
+    """Ground the lockout entry in next_lockout_state: at 0 or less the lock is set, and the very
+    next attempt finds it already lapsed, so the count restarts and no lock is live."""
     from messagefoundry.store.store import next_lockout_state
 
-    for minutes in (0, -5):
-        locked = next_lockout_state(
-            failed_attempts=4,
-            locked_until=None,
-            lock_cycles=0,
-            now=1000.0,
-            threshold=5,
-            lockout_seconds=minutes * 60,
-            max_lockout_seconds=1440 * 60,
-            escalate=True,
-            lockable=True,
-        )
-        assert locked.just_locked
-        assert locked.locked_until is not None and locked.locked_until <= 1000.0
+    locked = next_lockout_state(
+        failed_attempts=4,
+        locked_until=None,
+        lock_cycles=0,
+        now=1000.0,
+        threshold=5,
+        lockout_seconds=minutes * 60,
+        max_lockout_seconds=1440 * 60,
+        escalate=escalate,
+        lockable=True,
+    )
+    assert locked.just_locked
+    assert locked.locked_until is not None
+    after = next_lockout_state(
+        failed_attempts=locked.attempts,
+        locked_until=locked.locked_until,
+        lock_cycles=locked.cycles,
+        now=1000.001,
+        threshold=5,
+        lockout_seconds=minutes * 60,
+        max_lockout_seconds=1440 * 60,
+        escalate=escalate,
+        lockable=True,
+    )
+    # A live lock would keep counting past the threshold; a lapsed one restarts the count.
+    assert after.attempts == 1
+    assert after.locked_until is None
+    assert not after.just_locked
 
 
-def test_sign_in_limiter_and_lockout_off_with_auth_off_are_NOT_loosenings() -> None:
-    """CONDITIONAL on sign-in, like admin_new_ip_step_up: with auth off there is no sign-in to limit,
-    and the auth-off posture is reported by its own gate."""
+def test_sign_in_limiter_and_lockout_off_with_sign_in_off_are_NOT_loosenings() -> None:
+    """CONDITIONAL on sign-in: with it off there is no sign-in to limit, and the sign-in-off posture
+    is reported under its own switch."""
     named = _names(
+        sec=SecuritySettings(require_sign_in=False),
         auth=AuthSettings(
             enabled=False,
             login_rate_limit_enabled=False,
-            login_rate_limit_global=0,
             lockout_minutes=0,
-        )
+            lockout_threshold=1_000_000,
+        ),
     )
-    for field, _ in _SIGN_IN_OFF_VALUES:
-        assert field not in named
+    assert "require_sign_in" in named
+    assert not _SIGN_IN_FIELDS & set(named)
+
+
+def test_gated_on_the_security_switch_not_a_stale_auth_section() -> None:
+    """`security set` passes the NEW [security] beside the [auth] it read before the edit, so
+    turning sign-in on there must show these entries at once."""
+    stale = AuthSettings(enabled=False, login_rate_limit_enabled=False, lockout_minutes=0)
+    named = _names(sec=SecuritySettings(require_sign_in=True), auth=stale)
+    assert "login_rate_limit_enabled" in named
+    assert "lockout_minutes" in named
 
 
 def test_a_disabled_limiter_does_not_also_report_its_zeroed_parts() -> None:
@@ -383,15 +435,12 @@ def test_a_disabled_limiter_does_not_also_report_its_zeroed_parts() -> None:
             login_rate_limit_window_seconds=0.0,
         )
     )
-    assert "login_rate_limit_enabled" in named
-    assert not {"login_rate_limit_per_ip", "login_rate_limit_global"} & set(named)
-    assert "login_rate_limit_window_seconds" not in named
+    assert named == ["login_rate_limit_enabled"]
 
 
 def test_both_zero_counts_are_each_named() -> None:
     named = _names(auth=AuthSettings(login_rate_limit_per_ip=0, login_rate_limit_global=0))
-    assert "login_rate_limit_per_ip" in named
-    assert "login_rate_limit_global" in named
+    assert named == ["login_rate_limit_per_ip", "login_rate_limit_global"]
 
 
 # --- [api].plaintext_upstream_hop_acknowledged (BACKLOG #1179) --------------------------------

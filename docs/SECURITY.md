@@ -3208,18 +3208,20 @@ Read the two together: the table above is the operator-surface half, and that se
 picture including the ingest plane. That document is maintainer-internal;
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
-**No limiter has a validator floor.** None of the eleven `*_rate_limit_*` fields, nor
-`lockout_threshold` / `lockout_minutes`, carries a Pydantic validator. So a `per_key` or `glob` of `0`
-silently disables that dimension, and a `*_window_seconds` of `0` ages every recorded hit out
+**Almost no limiter has a validator floor.** None of the eleven `*_rate_limit_*` fields carries a
+Pydantic validator except `admin_write_rate_limit_window_seconds`, which must be above `0`, and
+neither `lockout_threshold` nor `lockout_minutes` carries one. So a `per_key` or `glob` of `0` disables that
+dimension, and a sign-in or PHI-read `*_window_seconds` of `0` ages every recorded hit out
 immediately — disabling enforcement while the limiter still reports as "enabled". Treat these as
 security-relevant values, not tuning knobs. **The sign-in limiter and the lockout are no longer
 silent about it** ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). While sign-in is on,
 `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a `login_rate_limit_per_ip`
-or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds` of `0` or less, and a
-`lockout_minutes` of `0` or less. Each then reaches the `serve` loosening warning, `messagefoundry
-security show` and `GET /security/posture`; see
-[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). The PHI-read and admin-write limiters are not named
-there yet, so a zeroed value on either is still silent.
+or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds` of `0` or less, a
+`lockout_minutes` of `0` or less, and a `lockout_threshold` above the 100 that NIST SP 800-63B
+allows. Each then reaches the `serve` loosening warning, `messagefoundry security show` and
+`GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). A weak but non-zero
+count or window is still not named. Neither are the PHI-read and admin-write limiters, so turning
+either off, or zeroing one of its counts, is still silent.
 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained

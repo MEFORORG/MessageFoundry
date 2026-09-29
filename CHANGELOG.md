@@ -10,9 +10,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **Turning the sign-in limiter or the account lockout off is now warned, not silent.** While
   sign-in is on, `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a
   `login_rate_limit_per_ip` or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds`
-  of `0` or less, and a `lockout_minutes` of `0` or less, so each reaches the `serve` loosening
-  warning, `messagefoundry security show` and `GET /security/posture`. The shipped defaults report
-  nothing new. (`BACKLOG #1131`, ASVS 6.1.1)
+  of `0` or less, a `lockout_minutes` of `0` or less, and a `lockout_threshold` above the 100 that
+  NIST SP 800-63B allows, so each reaches the `serve` loosening warning, `messagefoundry security
+  show` and `GET /security/posture`. The shipped defaults report nothing new. (`BACKLOG #1131`,
+  ASVS 6.1.1)
 - **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
   before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
   off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and

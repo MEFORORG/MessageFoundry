@@ -2614,7 +2614,8 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     # 0 or less expires every lock the moment it is set, a LOOSENING `security_loosenings()` names
-    # (BACKLOG #1131). No threshold turns the lockout off: 0 or less locks on the first failure.
+    # (BACKLOG #1131). A threshold of 0 or less locks on the first failure; one above
+    # LOCKOUT_THRESHOLD_CEILING (100, NIST SP 800-63B) is named as a loosening too.
     lockout_minutes: int = 15
     # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
     # doubles per cycle only where the owner has a way past it (the second-step lock on a local
@@ -6087,6 +6088,13 @@ def _reconcile_effective_bind(settings: ServiceSettings) -> None:
     settings.security.listen_address = settings.api.host
 
 
+#: The most consecutive failed attempts NIST SP 800-63B lets a verifier allow on one account before
+#: it acts (rev. 3, section 5.2.2, "Rate Limiting (Throttling)"). A ``[auth].lockout_threshold``
+#: above it is named by :func:`security_loosenings` (BACKLOG #1131): a large enough threshold never
+#: arms, which is the lockout turned off in all but name.
+LOCKOUT_THRESHOLD_CEILING = 100
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -6112,8 +6120,8 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288), the
-    ``[auth]`` sign-in limiter switched off or zeroed and ``[auth].lockout_minutes`` at 0 or less
-    (#1131),
+    ``[auth]`` sign-in limiter switched off or zeroed, ``[auth].lockout_minutes`` at 0 or less and
+    ``[auth].lockout_threshold`` above ``LOCKOUT_THRESHOLD_CEILING`` (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
@@ -6419,24 +6427,35 @@ def security_loosenings(
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of the sign-in
     # anti-automation controls keeps ASVS 6.1.1 at partial, so each value the code reads as OFF is
     # named here. Found by reading the code, not the setting names: SlidingWindowRateLimiter treats a
-    # falsy per_key or glob as "no limit on that dimension", and a window of 0 or less prunes every
-    # hit before it is counted, so the limiter admits everything while it still reads as enabled.
-    # next_lockout_state sets a lock that ends at now + lockout_seconds, so 0 or less expires it at
-    # once. NOT reported, because each refuses MORE rather than less: a negative count, a NaN or
-    # infinite window (never pruned), and any lockout_threshold (0 or less locks on the first
-    # failure). Conditional on auth, like admin_new_ip_step_up above: with sign-in off there is no
-    # sign-in to limit. The part-off entries sit under the enabled check, as email_tls_verify sits
-    # under email_use_tls: with the limiter unbuilt they would only repeat it.
-    if auth.enabled:
+    # falsy per_key or glob as "no limit on that dimension", and a window of 0 or less (-inf
+    # included) prunes every hit before it is counted, so the limiter admits everything while it
+    # still reads as enabled. next_lockout_state sets a lock that ends at now + lockout_seconds, so 0
+    # or less expires it at once. No lockout_threshold is read as off (0 or less locks on the FIRST
+    # failure), but a large one never arms in practice -- scripts/security/dast_target.py sets
+    # 1_000_000 for exactly that -- so one above NIST's ceiling of 100 is named too. NOT reported,
+    # because each refuses MORE rather than less: a negative count, and a NaN or +inf window (never
+    # pruned). Also NOT reported, a residual the docs state: a count or window that is merely weak
+    # (a huge count, a tiny window) has no published cutoff to judge it by. Gated on
+    # [security].require_sign_in rather than [auth].enabled (the desugar makes them equal on every
+    # loaded path): `security set` passes the NEW [security] beside the [auth] it read before the
+    # edit, so turning sign-in on there must show these at once. The part-off entries sit under the
+    # enabled check, as email_tls_verify sits under email_use_tls: with the limiter unbuilt they
+    # would only repeat it.
+    if sec.require_sign_in:
+        # "Credential ceremonies" is the per-user limiter the same keys build (_reauth_limiter): it
+        # paces re-auth, password change and MFA enrolment, and the console's second-factor step at
+        # sign-in (POST /ui/mfa).
+        ceremonies = (
+            "the per-user limit on credential ceremonies (re-auth, password change, MFA enrolment "
+            "and the console's second-factor step at sign-in)"
+        )
         if not auth.login_rate_limit_enabled:
             out.append(
                 (
                     "login_rate_limit_enabled",
                     "sign-in has NO rate limit -- neither the per-address nor the all-clients "
-                    "sign-in limiter is built, and nor is the per-account limit on re-auth, password "
-                    "change and MFA confirm, so the engine applies no attempt-rate limit to a "
-                    "password spray across many usernames; the per-account lockout still counts "
-                    "guesses against any one account",
+                    f"sign-in limiter is built, and nor is {ceremonies}, so the engine applies no "
+                    "attempt-rate limit to a password spray across many usernames",
                 )
             )
         elif auth.login_rate_limit_window_seconds <= 0:
@@ -6445,8 +6464,8 @@ def security_loosenings(
                     "login_rate_limit_window_seconds",
                     "the sign-in rate-limit window is zero or negative, which ages every attempt out "
                     "before it is counted -- neither the per-address nor the all-clients sign-in "
-                    "limit holds, and nor does the per-account limit on re-auth, password change and "
-                    "MFA confirm, although login_rate_limit_enabled still reads as on",
+                    f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
+                    "still reads as on",
                 )
             )
         else:
@@ -6454,18 +6473,18 @@ def security_loosenings(
                 out.append(
                     (
                         "login_rate_limit_per_ip",
-                        "one client address may make unlimited sign-in attempts, held back only by "
-                        "the all-clients limit; the per-account limit on re-auth, password change "
-                        "and MFA confirm reads the same number, so it is off too",
+                        "there is no per-address sign-in limit, so one client address may make as "
+                        "many attempts as the all-clients limit allows; the same number sets "
+                        f"{ceremonies}, so that is off too",
                     )
                 )
             if auth.login_rate_limit_global == 0:
                 out.append(
                     (
                         "login_rate_limit_global",
-                        "there is no all-clients sign-in limit -- a password spray spread across "
-                        "many client addresses is bounded only per address, so its total rate grows "
-                        "with the number of addresses the attacker controls",
+                        "there is no all-clients sign-in limit, so the total rate of a password "
+                        "spray spread across many client addresses grows with the number of "
+                        "addresses the attacker controls",
                     )
                 )
         if auth.lockout_minutes <= 0:
@@ -6476,6 +6495,17 @@ def security_loosenings(
                     "the moment it is set, on the sign-in and the second-step counter alike, so no "
                     "run of wrong guesses at one account's password or second factor is ever "
                     "refused by a lock",
+                )
+            )
+        if auth.lockout_threshold > LOCKOUT_THRESHOLD_CEILING:
+            out.append(
+                (
+                    "lockout_threshold",
+                    f"an account locks only after {auth.lockout_threshold} consecutive failures, "
+                    f"above the {LOCKOUT_THRESHOLD_CEILING} that NIST SP 800-63B allows -- that "
+                    "many wrong guesses at one account's password or second factor are checked "
+                    "before any lock is set, and a session may fail that many re-proofs before it "
+                    "is revoked",
                 )
             )
     # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS
