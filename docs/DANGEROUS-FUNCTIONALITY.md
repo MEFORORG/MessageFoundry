@@ -485,7 +485,7 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
 | `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
@@ -507,20 +507,45 @@ Other switches on `install-service.ps1` change more than the service:
   keyed by program name. So they affect every process with that name on the machine, not only the
   engine.
 
-**Three scripts run programs they did not check.** `install-service.ps1` and
-`uninstall-service.ps1` look for NSSM in three places: `-NssmPath`, then `PATH`, then a copy cached
-in the data directory's `bin` folder. Only when all three miss does the installer download NSSM. It
-checks that download against a fixed SHA-256 hash, and stops on a mismatch. A copy found on `PATH`
-or in the cache runs without that check. The cache sits in the data directory, where the engine's
-service account can modify files. So code running as the engine could replace that `nssm.exe`, and
-the next install or uninstall would run it as administrator.
+**The installers run NSSM only from a folder administrators alone can write, and only a checked
+copy.** `install-service.ps1` keeps the service's `nssm.exe` in `-NssmDir`,
+`C:\Program Files\MessageFoundry\nssm` by default. It makes any folder it creates there
+administrator-only. It then reads the owner and permissions of the file, its folder and each folder
+above it, stopping below the drive root. It refuses when anyone else can write to or rename any of
+them. It
+fills the folder from `-NssmPath`, from `PATH`, or by downloading NSSM. It checks a download against
+a fixed SHA-256 hash of the archive. Every copy, from any of those places, must also match a fixed
+SHA-256 hash of `nssm.exe` itself before it is copied in. The installer refuses a `-NssmPath` copy
+that does not match, and a copy already in the folder that does not match. It skips a `PATH` copy
+that does not match, and downloads instead. Each message names both hashes. It then points the
+service's registration at that copy, quoted, and reads it back. On a reinstall that replaces
+whatever `nssm.exe` an earlier registration named. If it cannot, it disables the service.
+
+The copy used to be cached in the data directory, where the engine's service account can modify
+files. From there, code running as the engine could have replaced it, planted a library beside it,
+or redirected the folder, and the next install would have run the result as administrator. A hash
+check alone would have caught only the first of those three.
+
+**The uninstall scripts run no NSSM at all.** Windows stops the service, and `sc.exe` removes it.
 
 `install-net-helper.ps1` downloads nothing. It copies `mefor-net-helper.exe` from `-HelperSource`,
-and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. It checks no hash, and it
-prints the helper's signature status without requiring one. It then starts the helper as
-LocalSystem. It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless
-`-AppExe` names another, to read the address settings. All three scripts run elevated. So a
-planted program on any of those paths would run as administrator, or as LocalSystem.
+and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. `nssm.exe` must match the same
+fixed hash. `mefor-net-helper.exe` must match `-HelperSha256`, a hash the operator has to pass.
+This repository pins none for it, because each release builds the helper again. The script checks
+each file before the copy. It checks the installed copies again, and deletes both if either fails,
+or disables the service when it cannot delete them. It points the registration at the checked
+`nssm.exe`, quoted, and reads it back. It prints the helper's signature status without requiring
+one. It then starts the helper as LocalSystem.
+
+**At least these gaps remain.** An administrator who runs some other `nssm.exe` by hand, such as
+one on `PATH`, runs a copy nothing checked. `Start-Service` and `Restart-Service` need no NSSM.
+`-HelperSha256` is only as good as the channel the operator took it from. With `-AllowBroadAcl`,
+whoever can write the helper's folder can swap a binary, plant a library beside it, or edit its
+configuration file, both between runs and during one.
+
+It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless `-AppExe`
+names another, to read the address settings. It checks no hash on that program, and it runs it
+elevated. So a planted `messagefoundry.exe` on that path would run as administrator.
 
 **What holds the helper.** It refuses any request that names a different address, interface or
 mask from the ones in its configuration file. It hands Windows only the values from that file. Its
