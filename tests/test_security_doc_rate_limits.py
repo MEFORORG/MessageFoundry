@@ -478,13 +478,22 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
             "ad_bind_dn says the reconciler reads an unreadable userAccountControl as absent again; "
             "ADR 0195 maps it to UNDETERMINED"
         )
-    if "**undetermined**" not in bind_dn or "nothing readable beside it, are held" not in bind_dn:
-        problems.append("ad_bind_dn does not say which undetermined answers are held")
+    for clause in (
+        "**undetermined**",
+        "only when it is the only one the reconciler knows of across its rotation",
+        "Two or more known at once latch the hold",
+    ):
+        if clause not in bind_dn:
+            problems.append(f"ad_bind_dn no longer states {clause!r} (ADR 0195 hold and latch)")
 
     ad_enabled = _row(section, "ad_enabled")
     if "turn on Active Directory login" in ad_enabled:
         problems.append("ad_enabled says it turns on AD login again; that sign-in is retired")
-    if "retired" not in ad_enabled or "**directory bind capability**" not in ad_enabled:
+    if (
+        "does **not** turn on a directory-password sign-in: that pathway is retired"
+        not in ad_enabled
+        or "**directory bind capability**" not in ad_enabled
+    ):
         problems.append(
             "ad_enabled does not say it is a bind capability and the sign-in is retired"
         )
@@ -495,8 +504,15 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
             "step_up_max_age_seconds states the local-login seed unconditionally again; a "
             "first-seen address is born with no window (BACKLOG #288)"
         )
-    if "first-seen address" not in step_up or "BACKLOG #288" not in step_up:
-        problems.append("step_up_max_age_seconds does not name the first-seen address exception")
+    for clause in (
+        "not among its recent completed sign-ins (the newest 200 of each kind, at most 90 days "
+        "back)",
+        "first-seen address challenge (BACKLOG #288)",
+        "The check fails open",
+        "counts from any address (ADR 0197)",
+    ):
+        if clause not in step_up:
+            problems.append(f"step_up_max_age_seconds no longer states {clause!r}")
 
     action = _row(section, "require_action_step_up")
     if "the durable-takeover JSON routes — TOTP enroll/confirm and disable-MFA —" in action:
@@ -534,6 +550,11 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
             "admin_write_min_interval_seconds states its load refusal unconditionally; it fires "
             "only while admin_write_rate_limit_enabled is on"
         )
+    pacing = _row(section, "admin_write_rate_limit_enabled")
+    if "`require_step_up`, `require_step_up_action` and `require_paced`" not in pacing:
+        problems.append(
+            "admin_write_rate_limit_enabled no longer names all three chargers of the bucket"
+        )
     new_ip = _row(section, "admin_new_ip_step_up")
     if "once per (session, new address)" in new_ip:
         problems.append(
@@ -542,12 +563,12 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
         )
 
     intake = _row(connections_text, "intake_auth")
-    if "`403`" not in intake:
+    if "is not in `intake_client_subjects` is refused `403`" not in intake:
         problems.append(
             "CONNECTIONS.md intake_auth says every refusal is 401; an unlisted mTLS subject is 403"
         )
     health = _row(connections_text, "intake_auth_health")
-    if "`mtls_subject`" not in health:
+    if "It applies under `api_key` and `bearer` only" not in health:
         problems.append(
             "CONNECTIONS.md intake_auth_health does not say `allow` exempts nothing under "
             "mtls_subject, where the certificate is checked at accept"
@@ -601,6 +622,17 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
         is reconcile.ProbeOutcome.UNDETERMINED
     )
     assert reconcile.hold_engaged(undetermined=2, readable=5, latched=False)
+    # A lone one beside a readable answer strikes; with nothing readable, or once latched, it is held.
+    assert not reconcile.hold_engaged(undetermined=1, readable=1, latched=False)
+    assert reconcile.hold_engaged(undetermined=1, readable=0, latched=False)
+    assert reconcile.hold_engaged(undetermined=1, readable=1, latched=True)
+    assert reconcile.hold_latches(undetermined=2, latched=False)
+    assert not reconcile.hold_latches(undetermined=1, latched=False)
+    assert not reconcile.hold_latches(undetermined=0, latched=True)
+
+    # The first-seen address baseline: 200 rows of each kind, 90 days back.
+    assert auth_service._LOGIN_ADDRESS_HISTORY_ROWS == 200
+    assert auth_service._LOGIN_ADDRESS_LOOKBACK_SECONDS == 90 * 86400
 
     # The directory-password sign-in is refused, not dispatched.
     assert source_has_literal(
@@ -641,6 +673,20 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
         if call.args and isinstance(call.args[0], ast.Constant)
     }
     assert statuses == {401, 403}
+    # The health-probe exemption lives only in the header-mode check, which returns first for any
+    # mode but api_key and bearer.
+    head = ast.parse(textwrap.dedent(inspect.getsource(HttpSource._authorize_head)))
+    first = next(
+        st for st in named_func(head, "_authorize_head").body if not isinstance(st, ast.Expr)
+    )
+    assert isinstance(first, ast.If) and isinstance(first.body[0], ast.Return)
+    assert ast.unparse(first.test) == "self.intake_auth not in ('api_key', 'bearer')"
+
+    # The admin-write bucket is charged by the action-bound gate too.
+    security_tree = ast.parse(_SECURITY.read_text(encoding="utf-8"))
+    assert calls_to(
+        named_func(security_tree, "require_step_up_action"), {"_enforce_admin_write_pacing"}
+    )
 
 
 def test_business_logic_limit_table_states_both_dimensions_for_every_row() -> None:
