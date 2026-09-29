@@ -1909,6 +1909,21 @@ _SCHEMA: list[str] = [
         id NVARCHAR(64) NOT NULL PRIMARY KEY, owner_user_id NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
         criteria NVARCHAR(MAX) NULL, created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
         last_used_at FLOAT NULL)""",
+    # BACKLOG #1909: a 0.3.2 table keys presets on the owner's USERNAME in a column named `owner`. Map
+    # each value to its account id, drop a row whose username matches no account (nobody can reach
+    # it), then rename; sp_rename carries the unique index. See the SQLite _migrate_preset_owner for
+    # the reasoning. The two row statements are EXEC'd because T-SQL compiles a whole batch first, and
+    # a column the table lacks fails that compile even inside a false IF. The explicit BIN2 collation
+    # matches users.username's own and avoids a collation conflict with the column's database default.
+    """IF COL_LENGTH('search_presets','owner') IS NOT NULL
+        AND COL_LENGTH('search_presets','owner_user_id') IS NULL
+    BEGIN
+        EXEC(N'DELETE p FROM search_presets p WHERE NOT EXISTS (SELECT 1 FROM users u
+            WHERE u.username = p.owner COLLATE Latin1_General_100_BIN2)');
+        EXEC(N'UPDATE p SET p.owner = u.id FROM search_presets p
+            JOIN users u ON u.username = p.owner COLLATE Latin1_General_100_BIN2');
+        EXEC sp_rename 'search_presets.owner', 'owner_user_id', 'COLUMN';
+    END""",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
     # only last-edited. COL_LENGTH-gated ADD for a pre-existing (from #151) search_presets table; a
     # no-op on a fresh DB (the CREATE above has it). NULLable with NO default = metadata-only (no table
@@ -3756,7 +3771,8 @@ class SqlServerStore:
         """Apply the DDL batch and the two database options as the CURRENT login — the body of
         ``messagefoundry store provision-schema`` (#305).
 
-        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        A one-connection pool and the identity cipher: this reads no sealed cell, so it needs no
+        store key.
         The batch keeps its applock and marker double-check, so two provisioning runs cannot race. The
         options step does NOT share that safety: when RCSI is OFF its ``WITH ROLLBACK IMMEDIATE`` ends
         every other session's open transaction, so run this with the engines stopped.

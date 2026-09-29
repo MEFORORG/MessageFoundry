@@ -749,6 +749,22 @@ _SCHEMA: list[str] = [
         updated_at DOUBLE PRECISION NOT NULL,
         last_used_at DOUBLE PRECISION
     )""",
+    # BACKLOG #1909: a 0.3.2 table keys presets on the owner's USERNAME in a column named `owner`. Map
+    # each value to its account id, drop a row whose username matches no account (nobody can reach
+    # it), then rename; the rename carries the unique index. See the SQLite _migrate_preset_owner for
+    # the reasoning. plpgsql plans each statement on first execution, so the branch that names `owner`
+    # never fails on a table without it. In _SCHEMA, so it runs under provision-schema (ADR 0192) and
+    # `auto` alike, and adding it moved _schema_hash(): an already-opened 0.3.2 DB runs the batch again.
+    "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns"
+    " WHERE table_schema = current_schema() AND table_name = 'search_presets'"
+    " AND column_name = 'owner') AND NOT EXISTS (SELECT 1 FROM information_schema.columns"
+    " WHERE table_schema = current_schema() AND table_name = 'search_presets'"
+    " AND column_name = 'owner_user_id') THEN"
+    " DELETE FROM search_presets p WHERE NOT EXISTS"
+    " (SELECT 1 FROM users u WHERE u.username = p.owner);"
+    " UPDATE search_presets p SET owner = u.id FROM users u WHERE u.username = p.owner;"
+    " ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id;"
+    " END IF; END $$",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
     # only last-edited. ADD COLUMN IF NOT EXISTS for a pre-existing (from #151) search_presets table; a
     # no-op on a fresh DB (the CREATE above has it). Nullable with NO default: NULL on every existing
@@ -1363,7 +1379,8 @@ class PostgresStore:
         """Apply the DDL batch as the CURRENT role — the body of ``messagefoundry store
         provision-schema`` (#305).
 
-        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        A one-connection pool and the identity cipher: this reads no sealed cell, so it needs no
+        store key.
         The batch keeps its advisory lock and marker double-check, so two provisioning runs cannot
         race, but a batch that has to run takes table locks and rebuilds indexes: run it with the
         engines stopped. The objects it creates are OWNED by this role, which is what lets the runtime

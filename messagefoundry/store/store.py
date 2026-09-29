@@ -6013,6 +6013,8 @@ class MessageStore:
         preset_cols = {row["name"] for row in await cur.fetchall()}
         if preset_cols and "last_used_at" not in preset_cols:
             await db.execute("ALTER TABLE search_presets ADD COLUMN last_used_at REAL")
+        if "owner" in preset_cols and "owner_user_id" not in preset_cols:
+            await MessageStore._migrate_preset_owner(db)
         # BACKLOG #1540: a pre-existing pending_approvals table predates requester_user_id — ALTER it
         # in, nullable (an ALTER cannot add NOT NULL without a default, and there is no name-to-id
         # backfill that is CORRECT: after a rename the stored name may belong to somebody else, so
@@ -6023,6 +6025,30 @@ class MessageStore:
         if "requester_user_id" not in approval_cols:
             await db.execute("ALTER TABLE pending_approvals ADD COLUMN requester_user_id TEXT")
         await MessageStore._migrate_outbox_to_queue(db)
+
+    @staticmethod
+    async def _migrate_preset_owner(db: aiosqlite.Connection) -> None:
+        """Move a 0.3.2 ``search_presets.owner`` column to ``owner_user_id`` (BACKLOG #1909).
+
+        0.3.2 keyed a preset on the owner's USERNAME; this version keys it on ``Identity.user_id``
+        (#1225) under the renamed column (#1232). So a bare rename would keep every row and still
+        orphan it: listing by id finds nothing and ``delete_user`` leaves it behind. Each value is
+        mapped to its account's id first. A row whose username matches no account belongs to a user
+        0.3.2 deleted without its presets; nobody can list, recall or delete it, so it is dropped
+        rather than left holding a username in an id column. ``criteria`` is sealed against the
+        preset ``id``, which does not change, so no cell is re-encrypted. The rename carries the
+        unique index along with the column. Runs in the open's migration transaction."""
+        cur = await db.execute(
+            "DELETE FROM search_presets"
+            " WHERE NOT EXISTS (SELECT 1 FROM users WHERE users.username = search_presets.owner)"
+        )
+        if cur.rowcount > 0:
+            log.info("search_presets: dropped %d preset(s) owned by no account", cur.rowcount)
+        await db.execute(
+            "UPDATE search_presets"
+            " SET owner = (SELECT id FROM users WHERE users.username = search_presets.owner)"
+        )
+        await db.execute("ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id")
 
     @staticmethod
     async def _migrate_outbox_to_queue(db: aiosqlite.Connection) -> None:

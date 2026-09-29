@@ -1458,6 +1458,60 @@ async def test_search_preset_retention_keys_on_last_used_ss(store) -> None:
             await store._commit(conn)
 
 
+async def test_a_v032_preset_table_is_migrated_ss(store) -> None:
+    """BACKLOG #1909 on SQL Server: a 0.3.2 ``search_presets`` table keeps its presets across the
+    upgrade, keyed on user ids, so listing and ``delete_user`` work.
+
+    Renaming the column back to ``owner`` and writing usernames into it gives exactly the 0.3.2
+    table: the DDL is otherwise the same, and the unique index follows the column. The marker row goes
+    too, so the batch really runs. ``provisioning=True`` is the batch ``provision_schema`` runs (ADR
+    0192), without the database-options step, which could end other sessions' transactions. ``auto``
+    runs the same batch. ``ghost`` matches no account."""
+
+    async def _has(column: str) -> bool:
+        row = await store._fetchone(f"SELECT COL_LENGTH('search_presets','{column}') AS n")
+        return row is not None and row["n"] is not None
+
+    await store.create_user(user_id="u-alice", username="alice", auth_provider="local", now=1.0)
+    await store.create_user(user_id="u-bob", username="bob", auth_provider="local", now=1.0)
+    try:
+        for pid, owner, name in (
+            ("pa", "alice", "ACME ADT"),
+            ("pb", "bob", "ACME ADT"),
+            ("pg", "ghost", "orphan"),
+        ):
+            await store.upsert_search_preset(
+                preset_id=pid, owner_user_id=owner, name=name, criteria='{"target": "raw"}'
+            )
+        await store._execute("EXEC sp_rename 'search_presets.owner_user_id', 'owner', 'COLUMN'")
+        await store._execute("DELETE FROM schema_meta")
+        assert not await _has("owner_user_id")  # positive control
+
+        assert await store._ensure_schema(provisioning=True) is True
+        assert await _has("owner_user_id") and not await _has("owner")
+
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+        assert [p["id"] for p in await store.list_search_presets("u-bob")] == ["pb"]
+        got = await store.get_search_preset(preset_id="pa", owner_user_id="u-alice")
+        assert got is not None and json.loads(got["criteria"]) == {"target": "raw"}
+        rows = await store._fetchall("SELECT id FROM search_presets ORDER BY id")
+        assert [r["id"] for r in rows] == ["pa", "pb"]  # the orphan is gone, nothing else is
+
+        await store.delete_user("u-bob")
+        assert await store.list_search_presets("u-bob") == []
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+
+        await store._execute("DELETE FROM schema_meta")
+        assert await store._ensure_schema() is True  # a second full run finds nothing to move
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+    finally:
+        # Put the column back whatever happened, or every later preset test fails on it. A pyodbc
+        # native crash re-runs this whole file against the same DB, so this matters here.
+        await store._execute("DELETE FROM search_presets")
+        if not await _has("owner_user_id"):
+            await store._execute("EXEC sp_rename 'search_presets.owner', 'owner_user_id', 'COLUMN'")
+
+
 async def test_purge_sweeps_pre_upgrade_metadata_via_the_temp_eligible_table(store) -> None:
     """The upgrade case, and the proof the widened statement still reads connection-scoped #eligible.
 

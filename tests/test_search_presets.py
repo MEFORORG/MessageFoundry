@@ -114,3 +114,85 @@ def test_the_queue_lease_column_is_still_named_owner() -> None:
     # asserting a state that predates the change.
     assert "owner_user_id TEXT NOT NULL" in pg
     assert "owner_user_id NVARCHAR(256) NOT NULL" in ms
+
+
+# The search_presets DDL as release v0.3.2 shipped it on SQLite, copied from `git show
+# v0.3.2:messagefoundry/store/store.py` (the table and its index; comments trimmed). Embedded rather
+# than read from the tag at test time: a shallow CI clone carries no tags. 0.3.2 wrote the owner's
+# USERNAME into `owner`; this version keys on the user id in `owner_user_id`.
+V032_SEARCH_PRESETS = """
+CREATE TABLE search_presets (
+    id         TEXT PRIMARY KEY,
+    owner      TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    criteria   TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_used_at REAL
+);
+CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner, name);
+"""
+
+
+async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
+    """BACKLOG #1909: a 0.3.2 ``search_presets`` table opens, keeps its presets, and lists and
+    deletes by user id.
+
+    The presets are sealed by this version first and then moved into the 0.3.2 table under their
+    owners' usernames, so the test also shows the sealed criteria still open after the move: they
+    are bound to the preset id, which the migration leaves alone. ``ghost`` matches no account."""
+    import sqlite3
+
+    db = tmp_path / "v032.db"
+    cipher = make_cipher(generate_key(), write_v2=True)
+    s = await MessageStore.open(db, cipher=cipher)
+    try:
+        await s.create_user(user_id="u-alice", username="alice", auth_provider="local", now=1.0)
+        await s.create_user(user_id="u-bob", username="bob", auth_provider="local", now=1.0)
+        for pid, owner, name in (
+            ("pa", "alice", "ACME ADT"),
+            ("pb", "bob", "ACME ADT"),
+            ("pg", "ghost", "orphan"),
+        ):
+            await s.upsert_search_preset(
+                preset_id=pid, owner_user_id=owner, name=name, criteria=CRIT
+            )
+    finally:
+        await s.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT id, owner_user_id, name, criteria, created_at, updated_at, last_used_at"
+            " FROM search_presets"
+        ).fetchall()
+        conn.executescript("DROP TABLE search_presets;" + V032_SEARCH_PRESETS)
+        conn.executemany("INSERT INTO search_presets VALUES (?,?,?,?,?,?,?)", rows)
+        conn.commit()
+        # Positive control: the table really is in the 0.3.2 shape before the open.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(search_presets)")}
+        assert "owner" in cols and "owner_user_id" not in cols
+    finally:
+        conn.close()
+
+    for _ in range(2):  # the second open finds nothing to move
+        s = await MessageStore.open(db, cipher=cipher)
+        try:
+            listed = await s.list_search_presets("u-alice")
+            assert [p["id"] for p in listed] == ["pa"]
+            got = await s.get_search_preset(preset_id="pa", owner_user_id="u-alice")
+            assert got is not None and json.loads(got["criteria"]) == json.loads(CRIT)
+            assert [p["id"] for p in await s.list_search_presets("u-bob")] == ["pb"]
+            async with s._read() as rdb:
+                cur = await rdb.execute("SELECT id FROM search_presets ORDER BY id")
+                assert [r["id"] for r in await cur.fetchall()] == ["pa", "pb"]
+        finally:
+            await s.close()
+
+    s = await MessageStore.open(db, cipher=cipher)
+    try:
+        await s.delete_user("u-bob")
+        assert await s.list_search_presets("u-bob") == []
+        assert [p["id"] for p in await s.list_search_presets("u-alice")] == ["pa"]
+    finally:
+        await s.close()
