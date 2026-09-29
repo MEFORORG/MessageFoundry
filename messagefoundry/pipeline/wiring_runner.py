@@ -2878,9 +2878,18 @@ class RegistryRunner:
             # its calendar and closes the window cleanly.
             if not self._auto_start_enabled(name, kind):
                 return
-            log.info("schedule: %s connection %r entering active window — starting", kind, name)
+            # A retry of a start already recorded failed says so once, in _record_failed, not per tick.
+            log.log(
+                logging.DEBUG if (kind, name) in self._failed else logging.INFO,
+                "schedule: %s connection %r entering active window — starting",
+                kind,
+                name,
+            )
             if kind == "inbound":
-                await self.start_inbound(name)
+                try:
+                    await self.start_inbound(name)
+                except Exception as exc:
+                    self._record_window_open_failure(name, exc)
             else:
                 await self.start_outbound(name)
         elif not active and running:
@@ -2895,6 +2904,23 @@ class RegistryRunner:
                 await self.stop_outbound(name)
                 # After the stop, which drops the entry, and with no await between them.
                 self._schedule_parked.add(name)
+
+    def _record_window_open_failure(self, name: str, exc: Exception) -> None:
+        """Isolate an inbound its window open could not start, the way :meth:`start` isolates one
+        (ADR 0031): a failed status, one alert and one traceback, through :meth:`_record_failed`.
+
+        A reload no longer binds a scheduled inbound outside its window (BACKLOG #2069), so a port
+        another process took meanwhile is first found here, after the reload has committed. Before
+        this, the error reached :meth:`_schedule_worker`, which logged a traceback every tick and
+        recorded nothing an operator reads as status. The next tick still retries, and a bind that
+        succeeds clears the record. A retry that fails the same way is logged at DEBUG only; a
+        different reason is recorded and alerted afresh."""
+        if self._failed.get(("inbound", name)) == safe_exc(exc):
+            log.debug(
+                "schedule: inbound connection %r still cannot start; retrying next tick", name
+            )
+            return
+        self._record_failed(name, exc, kind="inbound")
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
         """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109

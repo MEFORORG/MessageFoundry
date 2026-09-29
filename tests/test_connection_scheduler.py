@@ -874,6 +874,69 @@ async def test_a_reload_does_not_re_bind_a_schedule_parked_inbound(store: Messag
         await runner.stop()
 
 
+def _hold_port(port: int) -> socket.socket:
+    """Bind and listen on ``port`` the way another process would, so the engine's own bind fails."""
+    s = socket.socket()
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)  # Windows only
+    if exclusive is not None:
+        s.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+    s.bind(("127.0.0.1", port))
+    s.listen()
+    return s
+
+
+async def test_a_window_open_that_cannot_bind_is_recorded_and_alerted_once(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # PR 1811 review, on BACKLOG #2069. A reload leaves an out-of-window scheduled inbound unbound, so
+    # it no longer finds out that another process has taken the port, and it no longer rolls back.
+    # The bind now fails at the window open. The scheduler logged that as "reconcile failed" with a
+    # traceback every tick, and recorded no failed status and sent no alert. It must fail the way an
+    # engine start does: one failed record, one alert, one traceback, then quiet retries.
+    port = _free_port()
+    schedule = _weekday_window()
+    clock = _Clock(_OUT_OF_WINDOW)
+    sink = _StopSink()
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, schedule),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+        alert_sink=sink,
+    )
+    await runner.start()
+    holder: socket.socket | None = None
+    try:
+        await _wait_until(lambda: not runner.inbound_running("IB_SCHED"))  # parked by the calendar
+        holder = _hold_port(port)
+
+        await runner.reload(_scheduled_inbound_graph(port, schedule))  # commits: nothing to bind
+        assert runner.inbound_failed("IB_SCHED") is None
+
+        caplog.clear()
+        clock.set(_NEXT_WINDOW)  # the window opens onto a port another process holds
+        await _wait_until(lambda: runner.inbound_failed("IB_SCHED") is not None)
+        await asyncio.sleep(0.2)  # ten more ticks, each retrying the bind
+
+        assert not runner.inbound_running("IB_SCHED")
+        assert sink.stopped == ["IB_SCHED"]  # one alert, not one per tick
+        tracebacks = [r for r in caplog.records if r.exc_info is not None]
+        assert len(tracebacks) == 1, [r.getMessage() for r in tracebacks]
+        assert not [r for r in caplog.records if "reconcile failed" in r.getMessage()]
+
+        # Control: the other process lets the port go, and the next tick binds it and clears the
+        # failed status. Without this arm, "one alert" could mean a scheduler that stopped trying.
+        holder.close()
+        holder = None
+        await _wait_until(lambda: runner.inbound_running("IB_SCHED"))
+        assert runner.inbound_failed("IB_SCHED") is None
+    finally:
+        if holder is not None:
+            holder.close()
+        await runner.stop()
+
+
 def _raising_router(m: object) -> list[str]:
     raise RuntimeError("router bug")
 

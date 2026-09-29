@@ -635,7 +635,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   traceback every tick. The reload also opened a schedule-parked listener's port until the next
   tick closed it. A committed reload now replaces every scheduler task from the new config, and
   leaves a scheduled inbound unbound outside its window. An outbound whose schedule is removed is
-  resumed if the calendar had parked it, since nothing else would. (`BACKLOG #2069`)
+  resumed if the calendar had parked it, since nothing else would. Because the reload no longer
+  binds that inbound, a port another process holds is first found at the window open. The window
+  open now records that inbound as failed and alerts once, as an engine start does, then retries
+  quietly each tick. (`BACKLOG #2069`)
 - **The SFTP and FTP source now waits for a file to stop growing before it reads it.** A file is
   read only once it lists at the same size on two polls in a row, as the local File source has done
   since `BACKLOG #1811`, so a partner that pauses between writes for less than `poll_seconds` is
