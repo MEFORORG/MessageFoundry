@@ -1012,7 +1012,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
     # BACKLOG #1352 / #1171: the private-key wrap check every loader calls before it decrypts. It
-    # parses the wrap with a stdlib DER reader and imports no crypto module, so it has no import row.
+    # parses the wrap with a stdlib DER reader, then makes the one load_cert_chain call every TLS
+    # key site goes through (its import row above is ssl, for that call).
     "messagefoundry/keywrap.py": frozenset(
         {
             "key_cert:messagefoundry.keywrap.key_wrap_refusal",

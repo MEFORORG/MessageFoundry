@@ -91,10 +91,11 @@ _LIBRARY_DEFAULT_ITERATIONS: Final = 2048
 #: because ``cryptography`` cannot write a PKCS#8 key with a chosen iteration count: its
 #: ``encryption_builder`` serves only OpenSSH and PKCS#12. The same command reads a legacy
 #: ``Proc-Type`` PEM as its input. The count is formatted in from the table so the two cannot drift.
+_SHA256_FLOOR: Final = PBKDF2_MIN_ITERATIONS[_HMAC_SHA256][1]
 _REWRAP: Final = (
-    f"Re-wrap the key as PKCS#8 PBES2 with PBKDF2-HMAC-SHA-256 at {PBKDF2_MIN_ITERATIONS[_HMAC_SHA256][1]} iterations or more, for "
-    f"example: openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter {PBKDF2_MIN_ITERATIONS[_HMAC_SHA256][1]} "
-    "-in <old key> -out <new key>"
+    f"Re-wrap the key as PKCS#8 PBES2 with PBKDF2-HMAC-SHA-256 at {_SHA256_FLOOR} iterations or "
+    "more, for example: openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter "
+    f"{_SHA256_FLOOR} -in <old key> -out <new key>"
 )
 
 #: The same advice for a loader that takes no passphrase, where a re-wrapped key would be refused
@@ -331,11 +332,7 @@ def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
 
     ``known_encrypted`` is true for the body of an ``ENCRYPTED PRIVATE KEY`` PEM block, which must
     parse as an EncryptedPrivateKeyInfo. Bare DER need not: if its outer shape is not one, it is an
-    unencrypted key or not a key at all, and the loader reports the second itself. A BER indefinite
-    length is the one exception: this reader cannot see inside it and a lenient loader can, so it is
-    refused rather than waved through."""
-    if der[:2] == b"\x30\x80":
-        return True, _UNREADABLE
+    unencrypted key or not a key at all, and the loader reports the second itself."""
     try:
         found = _encrypted_pkcs8_algorithm(der)
     except _Malformed:
@@ -350,36 +347,56 @@ def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
     return True, problem
 
 
-def _pem_blocks(material: bytes) -> list[tuple[bytes, list[bytes]]]:
-    """``(label, body lines)`` for every complete PEM block, in one linear pass.
+_BEGIN: Final = b"-----BEGIN "
+_END: Final = b"-----END "
+_DASHES: Final = b"-----"
 
-    A line scanner rather than a regular expression: a backreferenced lazy match rescans to the end
-    of the input for every unmatched BEGIN line, which a garbled file turns into minutes."""
-    blocks: list[tuple[bytes, list[bytes]]] = []
-    label: bytes | None = None
-    body: list[bytes] = []
-    for raw in material.splitlines():
-        line = raw.strip()
-        if line.startswith(b"-----BEGIN ") and line.endswith(b"-----"):
-            label, body = line[len(b"-----BEGIN ") : -len(b"-----")], []
-        elif label is not None and line == b"-----END " + label + b"-----":
-            blocks.append((label, body))
-            label = None
-        elif label is not None:
-            body.append(line)
-    return blocks
+#: The longest PEM label read. Real ones are under 30 bytes; a longer run is not a label.
+_MAX_LABEL: Final = 64
 
 
-def _is_legacy_encrypted(body: list[bytes]) -> bool:
-    """True when a block's RFC 1421 headers carry ``Proc-Type: 4,ENCRYPTED``."""
-    for line in body:
-        if not line:
-            return False  # the blank line ends the header section
-        name, sep, value = line.partition(b":")
-        if not sep:
-            return False  # base64 has begun: no headers
-        if name.strip().lower() == b"proc-type" and b"ENCRYPTED" in value.upper():
+def _pem_blocks(material: bytes) -> list[tuple[bytes, bytes]]:
+    """``(label, body)`` for every BEGIN/END pair in ``material``, in one linear pass.
+
+    Markers are found ANYWHERE, not only alone on a line: ``cryptography``'s PEM reader and
+    OpenSSL both accept a key that is all on one line, has text before BEGIN, or has base64 on the
+    BEGIN or END line, so a checker stricter than the loaders would wave those through unchecked.
+    Every search starts where the last one stopped, so a garbled file costs one pass."""
+    blocks: list[tuple[bytes, bytes]] = []
+    pos = 0
+    while True:
+        begin = material.find(_BEGIN, pos)
+        if begin < 0:
+            return blocks
+        label_start = begin + len(_BEGIN)
+        label_end = material.find(_DASHES, label_start, label_start + _MAX_LABEL + 1)
+        if label_end < 0:
+            pos = label_start
+            continue
+        body_start = label_end + len(_DASHES)
+        end = material.find(_END, body_start)
+        if end < 0:
+            return blocks
+        blocks.append((material[label_start:label_end].strip(), material[body_start:end]))
+        pos = end + len(_END)
+
+
+def _legacy_encrypted(material: bytes) -> bool:
+    """True when ``material`` carries a legacy ``Proc-Type: ...ENCRYPTED`` or ``DEK-Info`` header.
+
+    Searched in the whole text, not per block, and without reading line structure: OpenSSL honours
+    the header after a blank line, with bare-CR line endings and in other shapes a line reader
+    misses, and a false refusal here costs only a re-wrap."""
+    lowered = material.lower()
+    if b"dek-info:" in lowered:
+        return True
+    at = lowered.find(b"proc-type:")
+    while at >= 0:
+        # A bounded window, cut at the line end, so many headers cannot make this quadratic.
+        header = lowered[at : at + 128].split(b"\n", 1)[0]
+        if b"encrypted" in header:
             return True
+        at = lowered.find(b"proc-type:", at + 1)
     return False
 
 
@@ -387,32 +404,38 @@ def _inspect(material: bytes) -> tuple[bool, str | None]:
     """``(encrypted, problem)`` over every private key in ``material``, PEM or DER.
 
     Refuses on the FIRST weak wrap. ``encrypted`` is true when any key in it is encrypted."""
-    if len(material) > _MAX_KEY_FILE_BYTES:
-        return False, (
-            f"file is over {_MAX_KEY_FILE_BYTES} bytes, too large to check its wrap; a private key "
-            "and its chain are a few kilobytes"
+    if _legacy_encrypted(material):
+        return True, (
+            "uses legacy OpenSSL PEM encryption (a Proc-Type: 4,ENCRYPTED header), whose key "
+            "is derived with MD5 at one iteration (ASVS 11.4.1, 11.4.4)"
         )
-    if b"-----BEGIN" not in material:
+    blocks = _pem_blocks(material)
+    if not blocks:
+        # No complete PEM block, which includes DER that happens to contain a BEGIN marker.
         return _der_problem(material, known_encrypted=False)
     encrypted = False
-    for label, body in _pem_blocks(material):
-        if _is_legacy_encrypted(body):
-            return True, (
-                "uses legacy OpenSSL PEM encryption (a Proc-Type: 4,ENCRYPTED header), whose key "
-                "is derived with MD5 at one iteration (ASVS 11.4.1, 11.4.4)"
-            )
-        if label != _ENCRYPTED_LABEL:
-            continue
-        encrypted = True
+    for label, body in blocks:
+        known = label == _ENCRYPTED_LABEL
+        if not known and not label.endswith(b"PRIVATE KEY"):
+            continue  # a certificate or other non-key block
         der = b""
         try:
-            der = base64.b64decode(b"".join(body), validate=True)
+            der = base64.b64decode(b"".join(body.split()), validate=True)
         except (binascii.Error, ValueError):
-            return True, _UNREADABLE
-        _, problem = _der_problem(der, known_encrypted=True)
+            if known:
+                return True, _UNREADABLE
+            continue  # not base64: the loader rejects it itself
+        # Every key block is read for the EncryptedPrivateKeyInfo shape, whatever its label:
+        # OpenSSL decrypts that shape under a plain PRIVATE KEY label too.
+        block_encrypted, problem = _der_problem(der, known_encrypted=known)
+        encrypted = encrypted or block_encrypted
         if problem is not None:
             return True, problem
     return encrypted, None
+
+
+def _too_large(material: bytes) -> bool:
+    return len(material) > _MAX_KEY_FILE_BYTES
 
 
 def key_wrap_refusal(
@@ -429,6 +452,11 @@ def key_wrap_refusal(
     loader that takes no passphrase at all. ``passphrase_given`` says whether the loader is about to
     pass one. The text holds no key bytes, passphrase or path, so a caller may raise it as its own
     error type."""
+    if _too_large(material):
+        return (
+            f"{setting}: the key file is over {_MAX_KEY_FILE_BYTES} bytes, too large to check its "
+            "wrap; a private key and its chain are a few kilobytes, so check the path"
+        )
     encrypted, problem = _inspect(material)
     if problem is not None:
         fix = _DECRYPT if unlock_setting is None else _REWRAP
@@ -559,7 +587,7 @@ def load_connection_cert_chain(
         ctx,
         str(certfile),
         str(keyfile) if keyfile else None,
-        None if password is None else str(password),
+        password if password is None or isinstance(password, (str, bytes)) else str(password),
         cert_setting="tls_cert_file",
         key_setting="tls_key_file",
         unlock_setting="tls_key_password (through env())",

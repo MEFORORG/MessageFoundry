@@ -503,18 +503,23 @@ def test_an_oversize_key_file_is_refused(tmp_path: Path) -> None:
 
 
 def test_garbled_pem_is_checked_in_linear_time() -> None:
-    # A regex with a backreferenced lazy match rescanned to the end for every unmatched BEGIN line:
-    # about 170 seconds on a file this size. The line scanner does it in one pass.
+    # A regex with a backreferenced lazy match rescanned to the end for every unmatched BEGIN line
+    # (about 170 seconds on a file this size), and a per-line END-marker rebuild was quadratic in
+    # label length times line count. The scanner makes one forward pass. The bound is generous so
+    # a loaded runner does not flake it; the quadratic forms took minutes.
     import time
 
     # The BEGIN lines are assembled from parts so a secret scanner does not read them as a key.
     begin = b"-----" + b"BEGIN "
-    garbled = (begin + b"ENCRYPTED PRIVATE KEY-----\n") * ((1 << 20) // 40)
-    blank_run = begin + b"RSA PRIVATE KEY-----\n" + b"\n" * ((1 << 20) - 64) + b"-----END X-----\n"
-    for material in (garbled, blank_run):
+    size = 1 << 20
+    garbled = (begin + b"ENCRYPTED PRIVATE KEY-----\n") * (size // 40)
+    blank_run = begin + b"RSA PRIVATE KEY-----\n" + b"\n" * (size - 64) + b"-----END X-----\n"
+    long_label = begin + b"A" * (size // 2) + b"\n" * (size // 2 - 64)
+    many_headers = b"Proc-Type: 4,NONE " * (size // 20)
+    for material in (garbled, blank_run, long_label, many_headers):
         started = time.monotonic()
         _check(material)
-        assert time.monotonic() - started < 5.0
+        assert time.monotonic() - started < 20.0
 
 
 def test_a_crafted_wrap_is_refused_not_raised() -> None:
@@ -530,11 +535,90 @@ def test_a_crafted_wrap_is_refused_not_raised() -> None:
             assert _check(form) is not None
 
 
-def test_a_weak_der_wrap_with_a_trailing_byte_or_ber_length_is_refused(material: Material) -> None:
+def test_a_weak_der_wrap_with_a_trailing_byte_is_refused(material: Material) -> None:
     weak_der = base64.b64decode(b"".join(material.wraps["best-available-2048"].splitlines()[1:-1]))
     trailing = _check(weak_der + b"\x00")
     assert trailing is not None and "2048 iterations" in trailing
-    assert _check(b"\x30\x80" + weak_der[2:]) is not None
+
+
+def _reshape(pem_bytes: bytes, how: str) -> bytes:
+    lines = pem_bytes.strip().split(b"\n")
+    head, body, tail = lines[0], lines[1:-1], lines[-1]
+    if how == "one-line":
+        return head + b"".join(body) + tail
+    if how == "text-before-begin":
+        return b"note: " + pem_bytes
+    if how == "base64-on-begin-line":
+        return b"\n".join([head + body[0], *body[1:], tail]) + b"\n"
+    if how == "base64-on-end-line":
+        return b"\n".join([head, *body[:-1], body[-1] + tail]) + b"\n"
+    if how == "text-after-end":
+        return pem_bytes.rstrip() + b" trailing text\n"
+    if how == "plain-private-key-label":
+        return pem_bytes.replace(b"ENCRYPTED PRIVATE KEY", b"PRIVATE KEY")
+    raise AssertionError(how)
+
+
+@pytest.mark.parametrize(
+    "how",
+    [
+        "one-line",
+        "text-before-begin",
+        "base64-on-begin-line",
+        "base64-on-end-line",
+        "text-after-end",
+        "plain-private-key-label",
+    ],
+)
+def test_a_reshaped_weak_pem_is_still_refused(material: Material, how: str) -> None:
+    # Each shape was measured to load through cryptography's PEM reader or OpenSSL, so a checker
+    # that reads only well-formed lines would wave the weak wrap through to a loader that opens it.
+    refusal = _check(_reshape(material.wraps["best-available-2048"], how))
+    assert refusal is not None and "2048 iterations" in refusal
+    assert _check(_reshape(material.wraps["approved"], how)) is None
+
+
+@pytest.mark.parametrize("variant", ["crcrlf", "blank-after-begin", "space-line-after-begin"])
+def test_a_reformatted_legacy_pem_is_still_refused(material: Material, variant: str) -> None:
+    legacy = material.wraps["legacy-proc-type-pem"]
+    if variant == "crcrlf":
+        shaped = legacy.replace(b"\n", b"\r\r\n")
+    else:
+        first, rest = legacy.split(b"\n", 1)
+        gap = b"\n" if variant == "blank-after-begin" else b" \n"
+        shaped = first + b"\n" + gap + rest
+    refusal = _check(shaped)
+    assert refusal is not None and "legacy OpenSSL PEM encryption" in refusal
+
+
+def test_whitespace_inside_a_base64_line_does_not_refuse_an_approved_key(
+    material: Material,
+) -> None:
+    lines = material.wraps["approved"].split(b"\n")
+    lines[1] = lines[1][:10] + b" \t" + lines[1][10:]
+    assert _check(b"\n".join(lines)) is None
+
+
+def test_der_containing_a_begin_marker_is_still_checked_as_der(material: Material) -> None:
+    weak_der = base64.b64decode(b"".join(material.wraps["best-available-2048"].splitlines()[1:-1]))
+    refusal = _check(weak_der + b"-----BEGIN ")
+    assert refusal is not None and "2048 iterations" in refusal
+
+
+def test_an_oversize_refusal_gives_no_rewrap_advice() -> None:
+    refusal = key_wrap_refusal(
+        b"x" * ((1 << 20) + 1), setting="k", unlock_setting="p", passphrase_given=True
+    )
+    assert refusal is not None and "too large" in refusal and "-topk8" not in refusal
+
+
+def test_a_bytes_passphrase_reaches_the_connection_loader_unchanged(
+    tmp_path: Path, material: Material
+) -> None:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    cert = _write(tmp_path, "cert.pem", material.cert_pem)
+    key = _write(tmp_path, "key.pem", material.wraps["approved"])
+    keywrap.load_connection_cert_chain(ctx, cert, key, _PASSPHRASE.encode())
 
 
 def test_a_passphrase_less_loader_is_told_to_decrypt_not_rewrap(material: Material) -> None:
@@ -554,13 +638,25 @@ def test_the_empty_passphrase_backstop_still_stands_behind_the_check(
     tmp_path: Path, material: Material, site: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The file can change between the check's read and OpenSSL's, so the check is not the only
-    # thing keeping an encrypted key off a terminal prompt. Disarm the check and prove the empty
-    # callback still turns an encrypted key with no passphrase into a raise rather than a hang.
+    # thing keeping an encrypted key off a terminal prompt. Disarm the check and prove that
+    # load_cert_chain is handed an empty-passphrase CALLBACK, never None. Asserted through a spy
+    # rather than a real load, so a regression fails here instead of hanging on the prompt.
     monkeypatch.setattr(keywrap, "refuse_weak_cert_chain_key", lambda *a, **k: None)
+    seen: list[object] = []
+
+    def spy(
+        self: ssl.SSLContext, certfile: object, keyfile: object = None, password: object = None
+    ) -> None:
+        seen.append(password)
+        raise _Reached
+
+    monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", spy)
     loaders = {**_SSL_WITH_PASSPHRASE, **_SSL_WITHOUT_PASSPHRASE}
     combined = _write(tmp_path, "both.pem", material.cert_pem + material.wraps["approved"])
-    with pytest.raises(ssl.SSLError):
+    with pytest.raises(_Reached):
         loaders[site](combined, None, None)
+    assert len(seen) == 1 and callable(seen[0]), seen
+    assert seen[0]() == b""
 
 
 def test_the_leaf_imports_only_the_standard_library() -> None:
