@@ -20,6 +20,7 @@ the two ``pooled`` rows of P3-03's measured table as failure-injection tests:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -37,6 +38,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 
@@ -88,6 +90,8 @@ def _registry(tmp_path: Path) -> Registry:
 
 
 async def _ingress_inflight(store: MessageStore) -> int:
+    """Counted with its own SQL, not through ``inflight_by_lane``, so a broken read cannot make a
+    stranded row look recovered."""
     cur = await store._db.execute(
         "SELECT COUNT(*) AS c FROM queue WHERE stage=? AND channel_id=? AND status=?",
         (Stage.INGRESS.value, "IB", "inflight"),
@@ -225,6 +229,156 @@ async def test_watch_reads_nothing_while_every_age_is_off(
 
     monkeypatch.setattr(store, "inflight_by_lane", boom)
     await runner._check_inflight_strands(now=10_000.0)
+
+
+class _Follower(NullCoordinator):
+    """A node that is not the cluster leader."""
+
+    def is_leader(self) -> bool:
+        return False
+
+
+@pytest.mark.parametrize("leader", [True, False])
+async def test_only_the_leader_pages(store: MessageStore, tmp_path: Path, leader: bool) -> None:
+    """Under active-passive HA the graph runs on the leader alone, so a node that is not the leader
+    pages nothing. The leader arm is the control: the same strand does page there."""
+    sink = _RecordingSink()
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_oldest_seconds=60.0),
+        coordinator=None if leader else _Follower(),
+    )
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    await store.claim_next_fifo("IB", now=100.0, stage=Stage.INGRESS.value)
+    await runner._check_inflight_strands(now=200.0)
+    assert sink.buildup == ([("IB", 1, 100.0)] if leader else [])
+
+
+async def test_watch_skips_the_response_read_without_a_loopback_inbound(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-ingress tokens drain only on a loopback lane, so a graph with none reads no RESPONSE rows.
+    The other three stages are still read."""
+    runner = RegistryRunner(_registry(tmp_path), store, alert_sink=_RecordingSink())
+    read: list[str] = []
+    real = store.inflight_by_lane
+
+    async def spy(*, stage: str) -> dict[str, tuple[int, float]]:
+        read.append(stage)
+        return await real(stage=stage)
+
+    monkeypatch.setattr(store, "inflight_by_lane", spy)
+    await runner._check_inflight_strands(now=10_000.0)
+    assert read == [Stage.OUTBOUND.value, Stage.INGRESS.value, Stage.ROUTED.value]
+
+
+async def test_watch_reads_and_pages_response_rows_on_loopback_lanes_only(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a loopback inbound the RESPONSE stage is read, and a RESPONSE hold pages on a loopback
+    lane. The same hold keyed on a non-loopback inbound is the control: the RESPONSE lane set is the
+    loopback inbounds, as the dispatcher's is, so it does not page."""
+    reg = _registry(tmp_path)
+    reg.add_inbound(InboundConnection("LB", ConnectionSpec(ConnectorType.LOOPBACK, {}), router="r"))
+    sink = _RecordingSink()
+    runner = RegistryRunner(
+        reg, store, alert_sink=sink, buildup_default=BuildupThreshold(max_oldest_seconds=60.0)
+    )
+    read: list[str] = []
+
+    async def fake(*, stage: str) -> dict[str, tuple[int, float]]:
+        read.append(stage)
+        return {"LB": (1, 0.0), "IB": (2, 0.0)} if stage == Stage.RESPONSE.value else {}
+
+    monkeypatch.setattr(store, "inflight_by_lane", fake)
+    await runner._check_inflight_strands(now=100.0)
+    assert Stage.RESPONSE.value in read
+    assert sink.buildup == [("LB", 1, 100.0)]
+
+
+async def test_a_pending_check_and_the_watch_page_a_lane_once_per_window(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pending buildup check passes its throttle, then awaits its store read. If the in-flight
+    watch fires the same ``(stage, lane)`` key inside that await, the pending check must not page
+    again when it resumes."""
+    sink = _RecordingSink()
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_oldest_seconds=60.0),
+    )
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "a")], now=1.0)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "b")], now=1.0)
+    await store.claim_next_fifo("OB", now=1.0)  # 'a' held in flight; 'b' pending
+    real = store.pending_depth
+
+    async def racing(name: str, *, stage: str = Stage.OUTBOUND.value) -> tuple[int, float | None]:
+        await runner._check_inflight_strands()  # the watch ticks inside the pending read
+        return await real(name, stage=stage)
+
+    monkeypatch.setattr(store, "pending_depth", racing)
+    await runner._maybe_alert_buildup("OB")
+    assert len(sink.buildup) == 1, sink.buildup
+    assert sink.buildup[0][1] == 1  # the in-flight page won; the pending one was throttled
+
+
+async def test_an_outbound_hold_past_both_thresholds_logs_once(
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Past both its buildup and its stall age, an outbound hold fires both alerts and writes one log
+    line, not two identical ones."""
+    sink = _RecordingSink()
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_oldest_seconds=300.0),
+        stall_default=StallThreshold(max_oldest_seconds=120.0),
+    )
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0)
+    await store.claim_next_fifo("OB", now=100.0)
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        await runner._check_inflight_strands(now=500.0)
+    assert sink.buildup == [("OB", 1, 400.0)]
+    assert sink.stall == [("OB", 400.0)]
+    assert caplog.text.count("held in flight on outbound lane 'OB'") == 1
+
+
+@pytest.mark.parametrize("stage", [Stage.OUTBOUND.value, Stage.INGRESS.value])
+async def test_sqlite_read_seeks_the_ready_index(
+    store: MessageStore, stage: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The planner has no statistics here and, left alone, prefers the FIFO index that also covers
+    the GROUP BY, seeking on ``stage`` only and walking every row at the stage. The statement
+    ``inflight_by_lane`` actually runs must seek ``(stage, status)`` on ``ix_queue_ready``, so its
+    cost follows the in-flight rows, not the queue."""
+    seen: list[tuple[str, Any]] = []
+    real_read = store._read
+
+    class _Recorder:
+        def __init__(self, db: Any) -> None:
+            self._db = db
+
+        async def execute(self, sql: str, params: Any = ()) -> Any:
+            seen.append((sql, params))
+            return await self._db.execute(sql, params)
+
+    @contextlib.asynccontextmanager
+    async def recording_read() -> AsyncIterator[Any]:
+        async with real_read() as db:
+            yield _Recorder(db)
+
+    monkeypatch.setattr(store, "_read", recording_read)
+    await store.inflight_by_lane(stage=stage)
+    assert len(seen) == 1
+    sql, params = seen[0]
+    cur = await store._db.execute("EXPLAIN QUERY PLAN " + sql, params)
+    plan = " ".join(str(r[3]) for r in await cur.fetchall())
+    assert "ix_queue_ready (stage=? AND status=?)" in plan, plan
 
 
 # --- P3-03's two pooled rows, end to end ------------------------------------------------------------

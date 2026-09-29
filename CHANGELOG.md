@@ -260,8 +260,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   on every store backend. It fires `queue_buildup` when a row has been held longer than the lane's
   buildup `max_oldest_seconds`, which is on by default at 300 s. An outbound lane also fires
   `message_stall` on its stall threshold, when one is set. The age runs from the claim, so a row
-  being worked right now does not page. The log line names the stage. Nothing re-pends the row;
-  a restart still does. (`BACKLOG #1611`)
+  being worked right now does not page. The log line names the stage. This change re-pends
+  nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,

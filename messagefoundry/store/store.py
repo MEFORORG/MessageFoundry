@@ -8861,6 +8861,17 @@ class MessageStore:
 
         await self._run_grouped(_body)
 
+    @staticmethod
+    def _lane_col(stage: str) -> str:
+        """The lane column for a stage (code-controlled literal): ``channel_id`` for
+        ingress/routed/response, ``destination_name`` for outbound. The server backends' helper of
+        the same name."""
+        return (
+            "channel_id"
+            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
+            else "destination_name"
+        )
+
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
     ) -> tuple[int, float | None]:
@@ -8869,11 +8880,7 @@ class MessageStore:
         Lane key is stage-aware (mirrors :meth:`claim_next_fifo`): outbound lanes key on
         ``destination_name``; ingress and routed lanes on ``channel_id`` (their ``destination_name``
         is NULL)."""
-        lane_col = (
-            "channel_id"
-            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
-            else "destination_name"
-        )
+        lane_col = self._lane_col(stage)
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM queue"
@@ -8886,17 +8893,17 @@ class MessageStore:
         return count, (float(oldest) if oldest is not None else None)
 
     async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
-        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol). The
-        ``(stage, status)`` pair seeks ``ix_queue_ready``, as :meth:`reset_stale_inflight` does."""
-        lane_col = (
-            "channel_id"
-            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
-            else "destination_name"
-        )
+        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol).
+
+        The ``+`` on the GROUP BY term is load-bearing. Without it the planner, which has no
+        statistics here, picks the FIFO index that also covers the grouping and seeks on ``stage``
+        alone, walking every row at the stage. With it the ``(stage, status)`` pair seeks
+        ``ix_queue_ready``, as :meth:`reset_stale_inflight` does, and reads only the in-flight rows."""
+        lane_col = self._lane_col(stage)
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT {lane_col} AS lane, COUNT(*) AS n, MIN(updated_at) AS oldest FROM queue"
-                f" WHERE stage=? AND status=? GROUP BY {lane_col}",
+                f" WHERE stage=? AND status=? GROUP BY +{lane_col}",
                 (stage, OutboxStatus.INFLIGHT.value),
             )
             rows = await cur.fetchall()
