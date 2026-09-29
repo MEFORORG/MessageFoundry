@@ -198,6 +198,9 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
  * an {@link HttpError} (carrying the status) on any non-2xx response — surfacing FastAPI's
  * `{"detail": ...}` when present — and a plain Error when the engine is unreachable, so a caller's
  * try/catch shows a useful message and can special-case 401/403.
+ *
+ * Every 2xx decodes as `T`. A route dual control can hold answers 202 with a different body, so
+ * call such a route through {@link postApprovable} instead.
  */
 export function postJson<T>(
   baseUrl: string,
@@ -205,7 +208,102 @@ export function postJson<T>(
   body: unknown,
   token?: string,
 ): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
+  return postReply(baseUrl, route, body, token).then((reply) => reply.body as T);
+}
+
+/**
+ * The status the engine answers when dual control holds an action instead of running it (ADR 0041
+ * D2, ASVS 2.3.5). The Python client keys on the same number (`_HTTP_PENDING_APPROVAL` in
+ * `messagefoundry/apiclient/client.py`).
+ */
+export const HTTP_PENDING_APPROVAL = 202;
+
+/** Mirrors `messagefoundry/api/models.py:PendingApprovalResponse`, the body of that 202. */
+export interface PendingApproval {
+  approval_id: string;
+  operation: string;
+  status: "pending_approval";
+  detail: string;
+}
+
+/**
+ * The outcome of a route dual control may hold: the finished result, or the hold. A tagged union,
+ * so a caller has to check `kind` before it can read a result, and a hold can never be read as one.
+ */
+export type Approvable<T> = { kind: "done"; body: T } | { kind: "held"; pending: PendingApproval };
+
+/**
+ * Sort a decoded 2xx reply into done or held (BACKLOG #1981).
+ *
+ * The status is the discriminator, as it is in the Python client, because it is what the engine
+ * varies. A 202 must also carry the pending-approval body: a 202 without one is neither a result nor
+ * a hold the user can act on, so it throws rather than being read as success. The body's strings
+ * are server text headed for a notification, so they are bounded like an error detail.
+ */
+export function classifyApprovable<T>(status: number, body: unknown): Approvable<T> {
+  if (status !== HTTP_PENDING_APPROVAL) {
+    return { kind: "done", body: body as T };
+  }
+  if (!isPendingApproval(body)) {
+    throw new Error(
+      `engine answered HTTP ${status} without a pending-approval body, so the outcome is unknown`,
+    );
+  }
+  return {
+    kind: "held",
+    pending: {
+      approval_id: clamp(body.approval_id),
+      operation: clamp(body.operation),
+      status: body.status,
+      detail: clamp(body.detail),
+    },
+  };
+}
+
+function isPendingApproval(body: unknown): body is PendingApproval {
+  if (body === null || typeof body !== "object") {
+    return false;
+  }
+  const b = body as Record<string, unknown>;
+  return (
+    b.status === "pending_approval" &&
+    typeof b.approval_id === "string" &&
+    b.approval_id.length > 0 &&
+    typeof b.operation === "string" &&
+    typeof b.detail === "string"
+  );
+}
+
+/**
+ * POST to a route dual control may hold, and report whether it ran or was held.
+ *
+ * Same transport, errors and auth as {@link postJson}; only the 2xx handling differs. The engine's
+ * holdable routes are `/config/reload`, `/dead-letters/replay` and `/connections/{name}/purge`.
+ */
+export function postApprovable<T>(
+  baseUrl: string,
+  route: string,
+  body: unknown,
+  token?: string,
+): Promise<Approvable<T>> {
+  return postReply(baseUrl, route, body, token).then((reply) =>
+    classifyApprovable<T>(reply.status, reply.body),
+  );
+}
+
+/** A decoded 2xx POST reply. The status is kept so {@link postApprovable} can tell a hold apart. */
+interface PostReply {
+  status: number;
+  body: unknown;
+}
+
+function postReply(
+  baseUrl: string,
+  route: string,
+  body: unknown,
+  token?: string,
+): Promise<PostReply> {
+  return new Promise<PostReply>((resolve, reject) => {
     let url: URL;
     try {
       // Concatenate (not URL-resolve) so a base URL with a path prefix (e.g. a reverse-proxy
@@ -233,7 +331,7 @@ export function postJson<T>(
         const status = res.statusCode ?? 0;
         if (status >= 200 && status < 300) {
           try {
-            resolve((text ? JSON.parse(text) : {}) as T);
+            resolve({ status, body: text ? (JSON.parse(text) as unknown) : {} });
           } catch {
             reject(new Error(`engine returned a non-JSON response (HTTP ${status})`));
           }
