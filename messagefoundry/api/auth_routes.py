@@ -951,7 +951,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             permissions=sorted(p.value for p in resolved.permissions),
         )
 
-    @app.post("/users", response_model=UserCreatedResponse, status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/users",
+        response_model=UserCreatedResponse,
+        status_code=status.HTTP_201_CREATED,
+        # ADR 0197 Amendment A (AC-A2): the reply carries the generated credential (ASVS 14.2.2).
+        dependencies=[Depends(_no_store_reply)],
+    )
     async def create_user(
         body: UserCreateRequest,
         request: Request,
@@ -1214,7 +1220,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
-    @app.post("/users/{user_id}/reset-mfa", response_model=MfaResetResponse)
+    @app.post(
+        "/users/{user_id}/reset-mfa",
+        response_model=MfaResetResponse,
+        # ADR 0197 Amendment A (AC-A4): a local account's reply carries the generated credential.
+        dependencies=[Depends(_no_store_reply)],
+    )
     async def reset_user_mfa(
         user_id: ResourceId,
         service: AuthService = Depends(_service),
