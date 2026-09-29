@@ -21,8 +21,8 @@ CLAUDE.md section 5 governs and carries both notes.
 
 ## What it must not do
 
-- **Merge a diff it has not read.** No check now asks whether you did, and that asymmetry is the
-  point: a label records that a step happened, not that anybody looked.
+- **Merge with no proof that code review ran** (owner, 2026-09-29). A QA line or review tag is
+  proof, so skip the diff. None: send it to `code-review` at `xhigh`.
 - **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
   the branch stays alive, and nothing reports a problem.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
