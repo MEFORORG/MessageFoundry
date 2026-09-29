@@ -57,14 +57,14 @@ _GREEN = ClaimProcStatus(
     effective=True,
     degraded_reason=None,
     head_forms={
-        "mefor_claim_fifo_heads_cid_v1": "rewritten",
-        "mefor_claim_fifo_heads_dst_v1": "rewritten",
+        "mefor_claim_fifo_heads_cid_v2": "rewritten",
+        "mefor_claim_fifo_heads_dst_v2": "rewritten",
     },
 )
 _DEGRADED = ClaimProcStatus(
     effective=False,
     degraded_reason=(
-        "stored procedure dbo.mefor_claim_fifo_heads_cid_v1 is DEPLOYED but its definition is"
+        "stored procedure dbo.mefor_claim_fifo_heads_cid_v2 is DEPLOYED but its definition is"
         " unreadable — GRANT VIEW DEFINITION"
     ),
     head_forms={},
@@ -73,8 +73,8 @@ _VERBATIM = ClaimProcStatus(
     effective=True,
     degraded_reason=None,
     head_forms={
-        "mefor_claim_fifo_heads_cid_v1": "verbatim",
-        "mefor_claim_fifo_heads_dst_v1": "rewritten",
+        "mefor_claim_fifo_heads_cid_v2": "verbatim",
+        "mefor_claim_fifo_heads_dst_v2": "rewritten",
     },
 )
 
@@ -177,7 +177,7 @@ async def test_status_carries_the_matched_head_forms_when_green(
     claim_proc = (await client.get("/status")).json()["claim_proc"]
     assert claim_proc["effective"] is True
     assert claim_proc["degraded_reason"] is None
-    assert claim_proc["head_forms"]["mefor_claim_fifo_heads_cid_v1"] == "verbatim"
+    assert claim_proc["head_forms"]["mefor_claim_fifo_heads_cid_v2"] == "verbatim"
 
 
 async def test_status_omits_the_field_when_the_lever_was_never_requested(
@@ -241,9 +241,9 @@ def test_console_store_panel_shows_the_degrade_and_its_reason() -> None:
 
 
 def test_console_store_panel_shows_the_matched_head_forms_when_green() -> None:
-    html = _page({"effective": True, "head_forms": {"mefor_claim_fifo_heads_cid_v1": "verbatim"}})
+    html = _page({"effective": True, "head_forms": {"mefor_claim_fifo_heads_cid_v2": "verbatim"}})
     assert "DEGRADED" not in html
-    assert "mefor_claim_fifo_heads_cid_v1: verbatim" in html
+    assert "mefor_claim_fifo_heads_cid_v2: verbatim" in html
 
 
 def test_console_store_panel_is_absent_when_the_lever_was_never_requested() -> None:

@@ -51,6 +51,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from typing import Any
 
 import pytest
@@ -655,19 +656,19 @@ def test_proc_body_golden_pin(proc_name: str, lane_col: str) -> None:
 
     got = hashlib.sha256(ss._claim_proc_body(proc_name, lane_col).encode()).hexdigest()
     assert got == _GOLDEN_PROC_BODY_SHA256[proc_name], (
-        f"the shipped {proc_name} body drifted — if this change passed design review (the batch"
-        f" and the proc bodies are edited together, forever), re-pin to {got}"
+        f"the shipped {proc_name} body drifted to {got}. A called proc's body never changes under"
+        " its name: move this name into _RETAINED_CLAIM_PROCS with its old body and ship the next"
+        " version (ADR 0114 versioning; BACKLOG #1270). Re-pin only a change that never reaches a"
+        " deployed database"
     )
 
 
 def test_retained_v1_bodies_are_byte_identical_to_what_shipped() -> None:
-    """BACKLOG #1270 must not edit _v1 in place. An older build calling _v1 cannot parse the
-    head-skip marker rows: it reads their NULL id as kept != claimed and rolls the claim back."""
-    import hashlib
-
+    """BACKLOG #1270 must not edit _v1 in place (why: the ``_CLAIM_PROC_CID`` comment in
+    sqlserver.py). Rendered by NAME, as every call site renders it."""
     assert {name for name, _ in ss._RETAINED_CLAIM_PROCS} == set(_GOLDEN_RETAINED_V1_BODY_SHA256)
     for proc_name, lane_col in ss._RETAINED_CLAIM_PROCS:
-        body = ss._claim_proc_body(proc_name, lane_col, head_skip_markers=False)
+        body = ss._claim_proc_body(proc_name, lane_col)
         got = hashlib.sha256(body.encode()).hexdigest()
         assert got == _GOLDEN_RETAINED_V1_BODY_SHA256[proc_name], (
             f"the retained {proc_name} body drifted — _v1 must keep the bytes it shipped with"
@@ -680,14 +681,15 @@ def test_v2_is_called_and_v1_is_still_deployed_before_it() -> None:
     calls. Neither _v1 statement may be dropped here: retirement is a later, separate change."""
     assert ss._CLAIM_PROC_CID == "mefor_claim_fifo_heads_cid_v2"
     assert ss._CLAIM_PROC_DST == "mefor_claim_fifo_heads_dst_v2"
-    v1 = [ss._claim_proc_ddl(n, c, head_skip_markers=False) for n, c in ss._RETAINED_CLAIM_PROCS]
+    v1 = [ss._claim_proc_ddl(n, c) for n, c in ss._RETAINED_CLAIM_PROCS]
     v2 = [
         ss._claim_proc_ddl(ss._CLAIM_PROC_CID, "channel_id"),
         ss._claim_proc_ddl(ss._CLAIM_PROC_DST, "destination_name"),
     ]
     assert ss._SCHEMA[-4:] == [*v1, *v2]
     assert all("UNION ALL" in ddl for ddl in v2)
-    assert not any("DROP PROCEDURE" in stmt.upper() for stmt in ss._SCHEMA)
+    drop = re.compile(r"\bDROP\s+PROC", re.IGNORECASE)  # PROC and PROCEDURE, any spacing
+    assert not any(drop.search(stmt) for stmt in ss._SCHEMA)
 
 
 # --- the {CALL} dispatch: fixed arity, lane JSON, fence, fold composition ------------------------
