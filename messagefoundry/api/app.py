@@ -205,6 +205,7 @@ from messagefoundry.api.security import (
     require_step_up,
     ws_token,
 )
+from messagefoundry.api.svg_sanitize import SvgRejected, may_be_svg, sanitize_if_svg
 from messagefoundry.api.tls import GeneratedPairReplaced, record_generated_pair_replacements
 from messagefoundry.api.validation import (
     MAX_EVENT_KINDS,
@@ -1088,7 +1089,8 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     **Why downgrade rather than sanitize.** Attachment bytes are verbatim clinical payloads — ADR 0105
     Approach B stores the OBX-5.5 value untouched and the preserve-the-original invariant forbids
     rewriting them — so the control is *neutralize at serve* (inert MIME + attachment disposition +
-    nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document."""
+    nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document. An SVG's SERVED
+    copy is sanitized in the download route as well, beside this downgrade (see the comment there)."""
     ct = (content_type or "").strip()
     if len(ct) > _MAX_ATTACHMENT_MIME_LEN or not _SAFE_MIME_RE.match(ct):
         return _DEFAULT_ATTACHMENT_MIME
@@ -4290,6 +4292,10 @@ def create_app(
             )
         return detail
 
+    # SVG sanitizing runs on the default thread pool, which the pipeline's router and transform
+    # workers share; two slots bound how many pool threads concurrent downloads can hold.
+    svg_sanitize_slots = asyncio.Semaphore(2)
+
     @app.get("/messages/{message_id}/attachments/{attachment_id}")
     async def download_attachment(
         message_id: ResourceId,
@@ -4311,7 +4317,8 @@ def create_app(
 
         Approach B stored the OBX-5.5 value VERBATIM (base64), so the bytes are reconstructed by
         concatenating the attachment's chunks and base64-decoding once (buffer-once, mirroring the
-        delivery buffer-once posture). Every download is audited (``record_view`` + an
+        delivery buffer-once posture); an SVG is then sanitized or refused (see the comment below).
+        Every download is audited (``record_view`` + an
         ``attachment_download`` row in the tamper-evident chain, docs/PHI.md §6) BEFORE the bytes leave.
         The document bytes/base64 are **never logged**."""
         row = await engine.store.get_message(message_id)
@@ -4341,6 +4348,27 @@ def create_app(
         except (binascii.Error, ValueError) as exc:
             # A stored value that isn't clean base64 is corruption — surface it, never the bytes.
             raise HTTPException(422, "attachment content is not decodable") from exc
+        # ASVS 1.3.4 (ADR 0105, amendment 2026-09-28): an SVG is served as its tag and attribute
+        # allow-listed copy. Only the SERVED bytes change; the stored OBX-5.5 value stays verbatim. An
+        # SVG the parser cannot vet is refused before the audit, since no byte of it leaves. The
+        # pre-check keeps a PDF or an image off the thread pool. The audit row says when the served
+        # bytes are a sanitized copy, so they are never mistaken for the stored document's.
+        audit_detail = {"message_id": message_id, "attachment_id": attachment_id}
+        if may_be_svg(body):
+            try:
+                async with svg_sanitize_slots:
+                    served = await asyncio.to_thread(sanitize_if_svg, match["content_type"], body)
+            except SvgRejected as exc:
+                _log.warning(
+                    "attachment download refused: SVG could not be sanitized "
+                    "(message=%s attachment=%s)",
+                    message_id,
+                    attachment_id,
+                )
+                raise HTTPException(422, "attachment is SVG that cannot be sanitized") from exc
+            if served is not body:
+                body = served
+                audit_detail["served"] = "sanitized-svg"
         # Audit the PHI access BEFORE the bytes leave: record_view for the per-message timeline +
         # attachment_download in the tamper-evident chain (with the acting user + the id pair, NO bytes).
         await engine.store.record_view(message_id, actor=identity.username)
@@ -4348,15 +4376,16 @@ def create_app(
             "attachment_download",
             actor=identity.username,
             channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id, "attachment_id": attachment_id}),
+            detail=json.dumps(audit_detail),
             client=client_ip(request),
         )
         # Neutralize at serve (ASVS 1.3.4): the sender-influenced OBX-5.2 label is declared only when it
         # names one of the inert types on the _INERT_ATTACHMENT_TYPES allow-list, so a browser-active
         # label (svg/html/hta/script and every type nobody listed) is declared as the inert binary type,
         # which also keeps a .svg/.html extension out of the download name; the response carries a
-        # sandbox CSP so no served representation can execute in the application origin. The stored bytes are NEVER rewritten (ADR 0105 Approach B keeps the
-        # OBX-5.5 value verbatim). AttachmentSecurityHeadersMiddleware re-asserts the CSP from outside
+        # sandbox CSP so no served representation can execute in the application origin. The stored
+        # bytes are NEVER rewritten (ADR 0105 Approach B keeps the OBX-5.5 value verbatim); only an
+        # SVG's served copy is, above. AttachmentSecurityHeadersMiddleware re-asserts the CSP from outside
         # the /ui CSP writers so the console delegate serves it too.
         content_type = _safe_attachment_content_type(match["content_type"])
         # Belt-and-braces MIME-vs-magic downgrade (ASVS 1.3.4/5.2.2): even a token-clean, stored MIME is
