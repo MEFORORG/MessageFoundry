@@ -5578,15 +5578,18 @@ def _open_terminal() -> int:
 
     try:
         return os.open(_controlling_terminal_path(), os.O_WRONLY)
-    except OSError as exc:
+    except OSError:
         if sys.platform == "win32" or not sys.stdin.isatty():
             raise
-        try:
-            return os.open(os.ttyname(sys.stdin.fileno()), os.O_WRONLY)
-        except (OSError, ValueError):
-            # stdin names no terminal device after all (``fileno`` raises on a replaced stream):
-            # report the controlling-terminal failure, which is the one the operator can act on.
-            raise exc from None
+        import contextlib
+
+        stdin_tty: str | None = None
+        # stdin may name no device: ``fileno`` raises on a replaced stream.
+        with contextlib.suppress(OSError, ValueError):
+            stdin_tty = os.ttyname(sys.stdin.fileno())
+        if stdin_tty is None:
+            raise  # the controlling-terminal failure, which is the one the operator can act on
+        return os.open(stdin_tty, os.O_WRONLY)
 
 
 def _show_on_terminal(text: str) -> None:
