@@ -109,9 +109,7 @@ from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.parsing import (
     HL7PeekError,
     Peek,
-    RawMessage,
     encode_batch,
-    normalize,
     summarize,
     validate,
 )
@@ -124,9 +122,8 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES, PEEK_READ_FAULTS
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS
 from messagefoundry.parsing.sniff import (
-    _content_matches_declared,
     attachment_mime_agrees,
     b64_head,
     text_sniff_head,
@@ -136,7 +133,17 @@ from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
+    IngressGuardError,
+    IngressNulRejected,
+    carry_binary_ingress,
+    check_binary_size,
+    check_declared_type,
+    check_decoded,
+    decode_body,
+    listener_encoding,
+    peek_max_bytes,
     reingress_size_error,
+    store_safe_raw,
     streaming_over_threshold,
     strict_validate_timeout,
 )
@@ -549,40 +556,10 @@ _STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
 _strict_validate_timeout = strict_validate_timeout
 
 
-# Engine-level ingress size ceiling for NON-HL7 content types (SEC-017, CWE-770). The HL7 path already
-# enforces this via Peek.parse → enforce_size_limits; the binary/text branches had only the per-transport
-# frame cap (each individually disable-able with max_frame_bytes=0). Mirroring the HL7 cap here makes the
-# 16 MiB ceiling an engine-level invariant (belt-and-suspenders) rather than a per-transport one, so an
-# operator who disabled a transport cap (or a future transport that ships without one) still can't buffer
-# a multi-GB body whole. Measured on the raw BYTES pre-base64-inflation (binary) / the decoded str (text,
-# matching enforce_size_limits' len(norm) convention).
-_INGRESS_MAX_BYTES = DEFAULT_MAX_MESSAGE_BYTES
-
 # The generic MIME a detached document's stored content_type is downgraded to when the sender-declared
 # OBX-5.2 label contradicts the document's magic bytes (ASVS 1.3.4/5.2.2). Matches the download route's
 # _DEFAULT_ATTACHMENT_MIME so a mislabelled active-content payload is served as inert bytes either way.
 _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
-
-
-def _nul_safe_error_raw(raw: bytes, content_type: str, *, text: str | None = None) -> str:
-    """Return a store-bindable ``str`` for a failed-ingress ``raw`` (INGEST-4 / ADR 0028 §168).
-
-    The ERROR/dead-letter paths store a byte view of the rejected body. A latin-1 (or decoded) view
-    that carries a NUL (U+0000) is store-hostile: Postgres REJECTS it at bind (the raise is uncaught,
-    unwinds out of ``_handle_inbound`` into the transport's ``except`` and drops the whole TCP
-    connection with NO ERROR row — a count-and-log violation, CLAUDE.md §2), and SQLite/SQL Server
-    truncate the stored value at the first NUL. U+0000 is the ONLY store-hostile latin-1 codepoint
-    (U+0001..U+00FF ride TEXT/NVARCHAR intact), so we keep the faithful, human-readable view when it
-    is NUL-free and escalate to the ADR 0028 ``mfb64:v1:`` byte-carriage only when a NUL is present —
-    the exact original bytes are then recoverable via ``RawMessage.raw_bytes``. Because ``b"\\x00" in
-    raw`` and ``"\\x00" in raw.decode("latin-1")`` are bijective, the NUL check on the view is exact.
-
-    ``text`` supplies an already-decoded view (the post-decode NUL guard reuses this helper); when
-    omitted the pre-decode ERROR paths get the lossless ``latin-1`` view of the raw bytes."""
-    view = text if text is not None else raw.decode("latin-1")
-    if "\x00" not in view:
-        return view
-    return RawMessage.from_bytes(raw, content_type).raw
 
 
 class _StreamBudgetExceeded(Exception):
@@ -5381,8 +5358,9 @@ class RegistryRunner:
         5.2.2, BACKLOG #1109). ``True`` means the body was dead-lettered here and the caller must stop;
         ``False`` means it matched (or the type carries no reliable signature) and ingress continues.
 
-        The file sources have run this same :func:`_content_matches_declared` since the 5.2.2 hardening,
-        quarantining a mismatch to their ``.error`` directory. A socket has no ``.error`` directory, so
+        The rule is :func:`~messagefoundry.pipeline.ingress_guards.check_declared_type`, which the
+        operator resend calls too. The file sources have run the same magic-byte sniff since the
+        5.2.2 hardening, quarantining a mismatch to their ``.error`` directory. A socket has no ``.error`` directory, so
         the disposition that fits here is the one the decode/NUL/size guards beside this already use: a
         persisted ``ERROR`` row. That keeps the count-and-log invariant (CLAUDE.md section 2) — the body
         is recorded, never accepted-and-dropped — and it makes the check *decide* rather than merely
@@ -5397,22 +5375,20 @@ class RegistryRunner:
         ``text`` is the decoded body for a text content type; passing it selects the encoding-independent
         head (see :func:`text_sniff_head`) and stores the readable decoded view in the ERROR row, exactly
         as the size guard beside it does. Omit it for a binary content type, whose bytes are the body."""
-        head = raw if text is None else text_sniff_head(text)
-        if _content_matches_declared(ic.content_type, head):
-            return False
-        # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
-        await self.store.record_received(
-            channel_id=ic.name,
-            raw=text if text is not None else _nul_safe_error_raw(raw, ic.content_type.value),
-            status=MessageStatus.ERROR,
-            error=(
-                f"ingress body does not match its declared content type "
-                f"{ic.content_type.value!r} (no matching magic bytes)"
-            ),
-            source_type=ic.spec.type.value,
-            message_type=ic.content_type.value,
-        )
-        return True
+        try:
+            check_declared_type(ic, raw if text is None else text_sniff_head(text))
+        except IngressGuardError as exc:
+            # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=text if text is not None else store_safe_raw(raw, ic.content_type.value),
+                status=MessageStatus.ERROR,
+                error=exc.reason,
+                source_type=ic.spec.type.value,
+                message_type=ic.content_type.value,
+            )
+            return True
+        return False
 
     async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> str | None:
         """Commit a POSTed HTTP body to the ingress stage and return the engine ``message_id`` (the
@@ -5433,14 +5409,16 @@ class RegistryRunner:
         hl7v2 = ic.content_type is ContentType.HL7V2
 
         if not hl7v2 and ic.content_type.is_binary:
-            # Binary ingress (ADR 0028) — base64-carry at the boundary; never text-decode. Engine size
-            # ceiling on the RAW bytes (SEC-017), mirroring _handle_inbound. ERROR + None on overrun.
-            if len(raw) > _INGRESS_MAX_BYTES:
+            # Binary ingress (ADR 0028) — base64-carry at the boundary; never text-decode. The shared
+            # guard bounds the RAW bytes (SEC-017), as _handle_inbound does. ERROR + None on overrun.
+            try:
+                check_binary_size(raw)
+            except IngressGuardError as exc:
                 await self.store.record_received(
                     channel_id=ic.name,
-                    raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                    raw=store_safe_raw(raw, ic.content_type.value),
                     status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
+                    error=exc.reason,
                     source_type=src,
                     message_type=ic.content_type.value,
                 )
@@ -5449,7 +5427,7 @@ class RegistryRunner:
                 return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
-                raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
+                raw=carry_binary_ingress(raw, ic),
                 control_id=None,
                 message_type=ic.content_type.value,
                 source_type=src,
@@ -5458,51 +5436,49 @@ class RegistryRunner:
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return mid
 
-        encoding = ic.spec.settings.get("encoding", "utf-8")
+        # The same decode and post-decode guards as _handle_inbound, from ingress_guards (#1689).
+        encoding = listener_encoding(ic)
         try:
-            text = (
-                normalize(raw, encoding=encoding, errors="strict")
-                if hl7v2
-                else raw.decode(encoding)
-            )
-        except UnicodeDecodeError as exc:
+            text = decode_body(raw, ic, encoding=encoding)
+        except IngressGuardError as exc:
             await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                raw=store_safe_raw(raw, ic.content_type.value),
                 status=MessageStatus.ERROR,
-                error=f"decode error ({encoding}): {safe_exc(exc)}",
+                error=exc.reason,
                 source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             return None
 
-        if "\x00" in text:
-            # INGEST-4: the body decoded cleanly but carries a NUL (U+0000) — invalid in every text
-            # payload we accept (HL7 v2 field data, JSON, XML 1.0, X12) and store-hostile (Postgres
-            # rejects it at bind → dropped connection; SQLite/SQL Server truncate). Dead-letter it here,
-            # BEFORE Peek.parse and any store write, so text (and every value derived from it) is
-            # NUL-free for the rest of this handler. HTTP owns its own 202/4xx response — no HL7 ACK.
+        try:
+            check_decoded(text, ic)
+        except IngressNulRejected as exc:
+            # INGEST-4: dead-letter a NUL-bearing body BEFORE Peek.parse and any store write, so text
+            # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
+            # own 202/4xx response — no HL7 ACK.
             await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value, text=text),
+                raw=store_safe_raw(raw, ic.content_type.value, text=text),
                 status=MessageStatus.ERROR,
-                error="ingress body contains a NUL (U+0000), invalid in a text/HL7 payload",
+                error=exc.reason,
                 source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
+            )
+            return None
+        except IngressGuardError as exc:
+            # The engine ceiling on a NON-HL7 body (SEC-017); check_decoded never raises it for HL7.
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=text,
+                status=MessageStatus.ERROR,
+                error=exc.reason,
+                source_type=src,
+                message_type=ic.content_type.value,
             )
             return None
 
         if not hl7v2:
-            if len(text) > _INGRESS_MAX_BYTES:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=text,
-                    status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(text)} > {_INGRESS_MAX_BYTES} bytes)",
-                    source_type=src,
-                    message_type=ic.content_type.value,
-                )
-                return None
             if await self._declared_content_mismatch(ic, raw, text=text):
                 return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
@@ -5521,10 +5497,9 @@ class RegistryRunner:
         # not an HL7 ACK frame (the HL7-ACK-over-HTTP / SOAP-reply path is the deferred ADR 0013 seam).
         # #149 (ADR 0105 Phase 1a): mirror the MLLP path — a streaming inbound raises the peek ceiling to
         # its max_message_bytes and downgrades whole-body strict validation to header-only over threshold.
-        peek_max_bytes = ic.max_message_bytes or DEFAULT_MAX_MESSAGE_BYTES
         streaming_over = self._streaming_over_threshold(ic, text)
         try:
-            peek = Peek.parse(text, max_bytes=peek_max_bytes)
+            peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             await self.store.record_received(
@@ -5670,17 +5645,17 @@ class RegistryRunner:
         hl7v2 = ic.content_type is ContentType.HL7V2
 
         if not hl7v2 and ic.content_type.is_binary:
-            # Engine-level ingress size guard (SEC-017, CWE-770): the HL7 path enforces a 16 MiB ceiling
-            # via Peek.parse → enforce_size_limits; mirror it here for binary ingress so the cap is an
-            # engine invariant, not just a per-transport frame cap (which is disable-able). Measure on the
-            # RAW bytes (pre-base64-inflation) so the carriage codec can't blow past the ceiling. Record
-            # ERROR + return None (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
-            if len(raw) > _INGRESS_MAX_BYTES:
+            # Engine-level ingress size guard (SEC-017, CWE-770) on the RAW bytes, so the cap is an engine
+            # invariant and not only a per-transport frame cap (which is disable-able). Record ERROR +
+            # return None (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
+            try:
+                check_binary_size(raw)
+            except IngressGuardError as exc:
                 await self.store.record_received(
                     channel_id=ic.name,
-                    raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                    raw=store_safe_raw(raw, ic.content_type.value),
                     status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
+                    error=exc.reason,
                     source_type=src,
                     message_type=ic.content_type.value,
                 )
@@ -5689,12 +5664,12 @@ class RegistryRunner:
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Binary ingress (ADR 0028): a byte-oriented content type carries raw bytes that cannot
             # ride the str/TEXT store as text — a NUL/non-UTF-8 body is rejected (Postgres) or
-            # truncated (SQLite/SQL Server). Base64-carry them at the source boundary via
-            # RawMessage.from_bytes (the one encode); never attempt a text decode. The router/transform
-            # workers route the carriage form as a RawMessage and a codec recovers bytes via .raw_bytes.
+            # truncated (SQLite/SQL Server). Base64-carry them at the source boundary (the one encode);
+            # never attempt a text decode. The router/transform workers route the carriage form as a
+            # RawMessage and a codec recovers bytes via .raw_bytes.
             await self.store.enqueue_ingress(
                 channel_id=ic.name,
-                raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
+                raw=carry_binary_ingress(raw, ic),
                 control_id=None,
                 message_type=ic.content_type.value,
                 source_type=src,
@@ -5708,18 +5683,17 @@ class RegistryRunner:
         # lossless latin-1 view) and NAK, rather than silently substituting U+FFFD into the stored
         # raw and the delivered copy (review H-3). HL7 also normalizes line endings to \r; a non-HL7
         # body (JSON/XML/text) is decoded verbatim — \r-normalizing it would corrupt it (ADR 0004).
-        encoding = ic.spec.settings.get("encoding", "utf-8")
+        # The decode and the post-decode guards below are ingress_guards' (#1689), the same two calls
+        # the dry-run makes. The encoding setting reaches decode_body unresolved on purpose;
+        # listener_encoding says why.
+        encoding = listener_encoding(ic)
         try:
-            text = (
-                normalize(raw, encoding=encoding, errors="strict")
-                if hl7v2
-                else raw.decode(encoding)
-            )
-        except UnicodeDecodeError as exc:
-            decode_err = f"decode error ({encoding}): {safe_exc(exc)}"
+            text = decode_body(raw, ic, encoding=encoding)
+        except IngressGuardError as exc:
+            decode_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value),
+                raw=store_safe_raw(raw, ic.content_type.value),
                 status=MessageStatus.ERROR,
                 error=decode_err,
                 source_type=src,
@@ -5741,7 +5715,9 @@ class RegistryRunner:
                 )
             return ack
 
-        if "\x00" in text:
+        try:
+            check_decoded(text, ic)
+        except IngressNulRejected as exc:
             # INGEST-4: the body decoded cleanly but carries a NUL (U+0000) — invalid in every text
             # payload we accept (HL7 v2 field data, JSON, XML 1.0, X12) and store-hostile (Postgres
             # rejects it at bind, which would unwind out of this handler into the transport and drop the
@@ -5749,10 +5725,10 @@ class RegistryRunner:
             # at the first NUL). Dead-letter it here, BEFORE Peek.parse and any store write, so text (and
             # control_id/summary/strict-fail errors derived from it) is NUL-free for the rest of this
             # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body.
-            nul_err = "ingress body contains a NUL (U+0000), invalid in a text/HL7 payload"
+            nul_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
-                raw=_nul_safe_error_raw(raw, ic.content_type.value, text=text),
+                raw=store_safe_raw(raw, ic.content_type.value, text=text),
                 status=MessageStatus.ERROR,
                 error=nul_err,
                 source_type=src,
@@ -5773,22 +5749,22 @@ class RegistryRunner:
                     detail=nul_err,
                 )
             return ack
+        except IngressGuardError as exc:
+            # Engine-level ingress size guard (SEC-017, CWE-770) on a NON-HL7 body, measured on the
+            # decoded text as the HL7 path's enforce_size_limits measures len(norm); check_decoded never
+            # raises it for HL7. Record ERROR + return None (no HL7 ACK for non-HL7) — count-and-log,
+            # never crash the connection.
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=text,
+                status=MessageStatus.ERROR,
+                error=exc.reason,
+                source_type=src,
+                message_type=ic.content_type.value,
+            )
+            return None
 
         if not hl7v2:
-            # Engine-level ingress size guard (SEC-017, CWE-770), mirroring the HL7 path's
-            # enforce_size_limits (which measures len(norm) on the decoded str). Measure on the decoded
-            # text the same way so the engine ceiling matches the HL7 path. Record ERROR + return None
-            # (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
-            if len(text) > _INGRESS_MAX_BYTES:
-                await self.store.record_received(
-                    channel_id=ic.name,
-                    raw=text,
-                    status=MessageStatus.ERROR,
-                    error=f"ingress exceeds max size ({len(text)} > {_INGRESS_MAX_BYTES} bytes)",
-                    source_type=src,
-                    message_type=ic.content_type.value,
-                )
-                return None
             if await self._declared_content_mismatch(ic, raw, text=text):
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Payload-agnostic ingress (ADR 0004): a non-HL7 inbound skips HL7 peek/validate and the
@@ -5809,10 +5785,9 @@ class RegistryRunner:
         # per-connection max_message_bytes so a large document is admitted (then detached under the cap);
         # a non-streaming inbound keeps the engine 16 MiB default. A body over the resolved cap raises
         # HL7PeekError here → recorded ERROR + NAK AR (the max_message_bytes rejection).
-        peek_max_bytes = ic.max_message_bytes or DEFAULT_MAX_MESSAGE_BYTES
         streaming_over = self._streaming_over_threshold(ic, text)
         try:
-            peek = Peek.parse(text, max_bytes=peek_max_bytes)
+            peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             # Every peek read the ingress commit needs, taken inside this guard (BACKLOG #1594).
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
