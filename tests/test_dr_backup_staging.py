@@ -97,6 +97,21 @@ class _SnapshotSpy:
         await self._real(dest_path, method=method)
 
 
+def _record_secured(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record every path the store's ``_secure_file`` is applied to, still applying it."""
+    from messagefoundry.store import store as store_mod
+
+    secured: list[Path] = []
+    real_secure = store_mod._secure_file
+
+    def secure(path: Path, **kw: object) -> None:
+        secured.append(Path(path))
+        real_secure(path, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store_mod, "_secure_file", secure)
+    return secured
+
+
 # --- location: the data dir, never the OS temp dir -----------------------------
 
 
@@ -120,16 +135,7 @@ async def test_backup_and_verify_stage_in_the_sqlite_data_dir_and_leave_nothing(
         return real_count(db_path)
 
     monkeypatch.setattr(dr_backup, "_count_tables", count)
-    from messagefoundry.store import store as store_mod
-
-    secured: list[Path] = []
-    real_secure = store_mod._secure_file
-
-    def secure(path: Path, **kw: object) -> None:
-        secured.append(Path(path))
-        real_secure(path, **kw)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(store_mod, "_secure_file", secure)
+    secured = _record_secured(monkeypatch)
 
     result = await _runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0)
     await store.close()
@@ -267,6 +273,7 @@ async def test_a_server_db_verify_passes_against_a_read_only_archive_directory(
 
     assert res.status == "PASS", res.reason
     assert share.refused == []
+    # The seam refuses creates; this also catches a delete or rename on the share.
     assert _everything_under(archive_dir) == before
     assert _everything_under(iso) == []
 
@@ -301,23 +308,14 @@ async def test_a_standalone_verify_writes_nothing_beside_the_archive_or_the_stor
         return real(staging, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(dr_backup, "_verify_in_staging", spy)
-    from messagefoundry.store import store as store_mod
-
-    secured: list[Path] = []
-    real_secure = store_mod._secure_file
-
-    def secure(path: Path, **kw: object) -> None:
-        secured.append(Path(path))
-        real_secure(path, **kw)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(store_mod, "_secure_file", secure)
+    secured = _record_secured(monkeypatch)
 
     res = await run_restore_verify(str(archive), store_settings=settings)
 
     assert res.status == "PASS", res.reason
     ((staging, mode_ok, seen),) = during
     assert staging.parent == iso.absolute(), staging
-    assert staging.name.startswith("mefor-verify-")
+    assert staging.name.startswith(dr_backup._VERIFY_STAGING_PREFIX)
     assert mode_ok, "the staging directory is not owner-only"
     assert seen == watched
     assert {p.parent for p in secured} == {staging}
@@ -336,8 +334,8 @@ async def test_a_standalone_verify_sweeps_what_a_dead_verify_left_in_the_os_temp
     cwd.mkdir()
     monkeypatch.chdir(cwd)
     iso = _isolate_os_temp(tmp_path, monkeypatch)
-    dead = _abandoned(iso, "mefor-verify-")
-    live = dr_backup._open_staging(iso, "mefor-verify-", secure=False)
+    dead = _abandoned(iso, dr_backup._VERIFY_STAGING_PREFIX)
+    live = dr_backup._open_staging(iso, dr_backup._VERIFY_STAGING_PREFIX, secure=False)
     try:
         res = await run_restore_verify(
             str(archive), store_settings=StoreSettings(encryption_key=key)

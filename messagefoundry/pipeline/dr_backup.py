@@ -1188,8 +1188,8 @@ def _verify_archive_blocking(
 
     ``staging_root`` is where the decrypted archive is staged (BACKLOG #1174). A backup's own verify
     passes its build's root, a SQLite store's data directory or ``.mefor-staging`` under the backup
-    destination (see :func:`_staging_root_for`). A standalone verify passes the OS temp dir (see
-    :func:`run_restore_verify`). ``secure`` locks each staged file to its owner before its first byte,
+    destination (see :func:`_staging_root_for`). A standalone verify passes the OS temp dir (see the
+    staging-location block above :class:`_Staging`). ``secure`` locks each staged file to its owner before its first byte,
     which every case but ``.mefor-staging`` passes.
 
     ``keys`` is the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys") — the
@@ -1689,7 +1689,7 @@ def _sweep_abandoned_staging(root: Path) -> int:
     except FileNotFoundError:
         return 0
     except OSError as exc:
-        log.warning("DR backup: could not list staging root %s: %s", root, safe_exc(exc))
+        log.warning("DR staging: could not list staging root %s: %s", root, safe_exc(exc))
         return 0
     for entry in entries:
         if not entry.name.startswith(_SWEPT_PREFIXES):
@@ -1708,7 +1708,7 @@ def _sweep_abandoned_staging(root: Path) -> int:
             # Most often a directory another account made -- an interactive `backup` run as an
             # administrator -- which this account cannot open. Said, not skipped silently.
             log.warning(
-                "DR backup: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
+                "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
                 path,
                 safe_exc(exc),
             )
@@ -1720,7 +1720,7 @@ def _sweep_abandoned_staging(root: Path) -> int:
                 continue  # locked by nobody, but no marker: not proven abandoned
         except OSError as exc:
             log.warning(
-                "DR backup: could not test the lock of staging directory %s: %s",
+                "DR staging: could not test the lock of staging directory %s: %s",
                 path,
                 safe_exc(exc),
             )
@@ -1729,16 +1729,16 @@ def _sweep_abandoned_staging(root: Path) -> int:
             _unlock_and_close(fd)
         leftover = _teardown_staging(path)
         if leftover is not None:
-            log.error("DR backup: an abandoned staging directory survived the sweep: %s", leftover)
+            log.error("DR staging: an abandoned staging directory survived the sweep: %s", leftover)
         elif os.path.lexists(path):
             log.warning(
-                "DR backup: emptied abandoned staging directory %s but could not remove it; the next "
-                "backup retries it",
+                "DR staging: emptied abandoned staging directory %s but could not remove it; the "
+                "next sweep of this root retries it",
                 path,
             )
         else:
             swept += 1
-            log.info("DR backup: removed abandoned staging directory %s", path)
+            log.info("DR staging: removed abandoned staging directory %s", path)
     return swept
 
 
@@ -1884,12 +1884,12 @@ async def run_restore_verify(
         base64.b64decode(k)
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
-    # A standalone verify stages in a private directory under the OS temp dir, never where the backup
-    # runner stages (BACKLOG #1174). Beside `[store].path` is the current directory under the default
-    # relative path, and beside the archive is a DR share that may be read-only and has no engine ACL.
+    # A private directory under the OS temp dir, never where the backup runner stages: see the
+    # staging-location block above `_Staging` (BACKLOG #1174).
     staging_root = Path(tempfile.gettempdir()).absolute()
-    # What a killed standalone verify left there. Only this account's own runs stage in its temp dir,
-    # so only a later standalone verify can sweep it; the backup runner's sweep never looks here.
+    # What a killed standalone verify left there. The backup runner's sweep never looks here, so only
+    # a later standalone verify can remove it. On a shared POSIX `/tmp` another account's directory
+    # is 0700 and cannot be opened, so the sweep logs it and leaves it for that account.
     await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
     return await asyncio.to_thread(
         _verify_archive_blocking,
