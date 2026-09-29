@@ -678,7 +678,10 @@ def _cookie_secure(request: Request) -> bool:
     )
 
 
-def _get_engine(request: Request) -> Engine:
+async def _get_engine(request: Request) -> Engine:
+    # ``async`` so FastAPI runs this provider on the event loop instead of taking a thread from the
+    # shared AnyIO worker pool on every request (ASVS 15.4.4, BACKLOG #1195). It must stay
+    # non-blocking: a blocking call here would stall the loop instead.
     engine: Engine | None = getattr(request.app.state, "engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="engine not started")
@@ -695,9 +698,10 @@ def _executor_gauges(app: FastAPI) -> tuple[int | None, int | None]:
     return executor.queue_depth, executor.busy
 
 
-def _get_gate(request: Request) -> ApprovalGate | None:
+async def _get_gate(request: Request) -> ApprovalGate | None:
     """The dual-control approval gate (ASVS 2.3.5), or ``None`` when no engine is bound — then gated
-    endpoints execute inline and the ``/approvals`` routes report 503."""
+    endpoints execute inline and the ``/approvals`` routes report 503. ``async`` for the reason
+    :func:`_get_engine` gives."""
     return getattr(request.app.state, "approval_gate", None)
 
 

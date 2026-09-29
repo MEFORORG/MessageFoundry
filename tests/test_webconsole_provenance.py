@@ -303,7 +303,7 @@ def test_editable_source_roots_degrades_on_a_recursion_error(
     contract is "no candidate", and this keeps that total.
 
     Why the sibling names cannot reach it, and why the trigger below is manufactured rather than real
-    nesting: `_load_operator_json` in `messagefoundry/__main__.py`. The type facts are pinned once, by
+    nesting: `_load_operator_json` in `messagefoundry/cli_common.py`. The type facts are pinned once, by
     `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
 
     RED when: `RecursionError` is dropped from that arm's except-tuple -- the call then raises."""
