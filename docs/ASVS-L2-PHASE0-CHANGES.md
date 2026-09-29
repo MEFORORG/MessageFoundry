@@ -388,10 +388,9 @@ Once an operator chain is configured the engine serves that chain instead, but i
 the placeholder pair stays in the state directory. Retiring it means deleting both files there.
 
 **Named standard.** The NIST SP 800-57 alignment in the heading above is claimed for the store DEK
-alone. That claim is older than the mapping below. The read behind the mapping did not re-check the
-DEK bullets against the standard, and it touches the DEK only in the escrow paragraph. The next
-subsection maps the keys in this one. It does not claim that any key's lifecycle follows the
-standard in whole.
+alone. The claim is older than either mapping below. The next subsection maps the keys in this one.
+The subsection after it maps the DEK clause by clause and names where it departs (BACKLOG #1162).
+Neither claims that any key's lifecycle follows the standard in whole.
 
 ### NIST SP 800-57 mapping for the other keys
 
@@ -469,8 +468,8 @@ key (type 9), because `store/crypto.py` derives the v4 data sub-key and the audi
 it with HKDF. Table 7 allows backup of both types. B.3.4 says a data-encryption key should be backed
 up while data encrypted under it may need decrypting. And 8.1.5.2.2 says a key used only for storage
 shall not be distributed, except for backup or to other authorized entities that need the data. So
-one escrow copy is what the standard expects. Any copy beyond it needs a reason of its own. (This
-read did not assess the DEK's two roles against the one-purpose rule in 5.2.)
+one escrow copy is what the standard expects. Any copy beyond it needs a reason of its own. (The
+DEK's two roles against the one-purpose rule in 5.2 are in the DEK mapping below.)
 
 For the private keys in the first table, the answer runs the other way. Table 7 answers "No (in
 general)" to backing up a signature key. It adds that a key which is backed up shall be stored under
@@ -482,6 +481,60 @@ Section 8.3.4 adds the bookkeeping. When copies are made, plan for their destruc
 recording who shares the key. For the TOTP secret, the audit rows in its mapping row name the account
 that holds the second copy. For every operator-supplied key the engine keeps no such record, so the
 site must.
+
+### NIST SP 800-57 mapping for the store DEK
+
+**Source.** The same SP 800-57 Part 1 Rev. 5 as the mapping above, read again on 2026-09-29 from the
+PDF NIST publishes (BACKLOG #1162). This read covered 5.1.1 items 6, 7 and 9; 5.2; 5.3.6 items 6 and 9
+with its Table 1; 7.4 and 7.5; 8.1.5.2.1, 8.1.5.2.2 and 8.1.5.2.2.1; 8.2.4; Table 7; Table 9; 8.3.4;
+B.3.4; and B.3.7. The rows below cite no section outside that list and the list above.
+
+**How to read it.** The key is one, so the rows are clauses, not keys. The columns split at the same
+custody line: the third is a claim about the engine, cited by code symbol, and the fourth is what
+the standard asks of the site. This document makes **no** claim that any site meets the fourth
+column. Shared points 1 to 4 before the other-keys table hold here too, and points 1 and 3 are two
+of the departures named below. Points 5 and 6 do not carry over. This key has two purposes (the
+5.2 row), and some of its state changes are recorded (the paragraph after the table).
+
+**Scope.** This maps the local DEK the default `aesgcm` cipher runs on (`[store].cipher_provider`).
+Under `[store].key_provider = vault` the active DEK arrives wrapped and is unwrapped in memory, and
+the table applies from that point on. Under `cipher_provider = vault_transit` the store's values are
+sealed inside Transit, not under this key. **A local DEK still matters there:** when one is set,
+the DR backup seals every `.mfbak` under it directly (`_resolve_key` and `_store_salt` in
+[`pipeline/dr_backup.py`](../messagefoundry/pipeline/dr_backup.py)). For that key only part of the
+table holds. It is a type 6 key only, because it derives nothing there. The rows on the keyring,
+the audit chain and the wipe do not apply. And the start-time age check does not run on it:
+`enforce_store_key_expiry` in `pipeline/secret_rotation.py` returns when the cipher reports no key id.
+
+| Clause | What it asks of this key | What the engine does (claim) | What a deploying site must do (precondition) |
+|---|---|---|---|
+| 5.1.1 key type | Name the type, because the rest of the standard is keyed by it | The DEK is two types at once. It is a symmetric data-encryption key (type 6) and a symmetric key-derivation key (type 9). As type 9 it is the HKDF-SHA256 parent of the v4 data sub-key (`derive_store_data_key` and `_SubkeyDeriver` in [`store/crypto.py`](../messagefoundry/store/crypto.py)) and of the audit-chain MAC key (`_derive_audit_mac_key`). The rotation-fingerprint MAC key is derived from that audit key in turn (`rotation_fingerprint_key`) | Nothing: the type follows from how the engine uses the key |
+| 5.2 one purpose | In general a key shall be used for only one purpose. B.3.7 is firmer for type 9: a key-derivation key shall not be used for any other purpose | **Departure**, against B.3.7's "shall not" as well as 5.2. The DEK derives keys, and it also encrypts and decrypts data itself. It decrypts legacy `mfenc:v1` and `mfenc:v2` values and version-1 DR archives ([`store/backup_codec.py`](../messagefoundry/store/backup_codec.py)). It seals new values itself when `[store].aad_bind = false` (`_WriteKey` with no salt in `store/crypto.py`). And it seals new DR archives itself whenever the store has no salt: under `aad_bind = false`, and under `vault_transit` (`ArchiveHeader.frame_key`) | Leave `[store].aad_bind` on, and run `rotate-key`, which re-encrypts every ciphered store value under the active key's sub-key. It does not re-seal a `.mfbak`. The engine does not report when the last legacy value is gone |
+| 8.1.5.2.1 generation | Generate symmetric keys by an approved method, such as an approved RBG under SP 800-133 | Two commands mint a DEK from `os.urandom` (`generate_key` in `store/crypto.py`): `gen-key`, and `protect-key --generate`. **Departure as claimed**, under shared point 1: the engine claims no FIPS 140-validated module for this key. Whether the platform generator behind `os.urandom` is validated on a given host was not assessed | To meet the clause, mint the DEK in a validated module and supply it by one of the routes in the Storage bullet above |
+| 8.1.5.2.2 distribution | A key used only for storage shall not be distributed, except for backup or to other entities that need the stored data | The engine sends the DEK to no other party that this read found. It reports the one-way `key_id` fingerprint (`CipherInfo`), not the key. It copies data sealed under the DEK into every `.mfbak`, as the Destruction bullet says. It also copies every regular file in the config directory into each archive (shared point 4), so a key file kept there travels with it | Give the DEK to the escrow holder and to a DR site that must restore, and to no one else. Keep the DPAPI key file, and any TOML that holds a key, outside the config directory |
+| 8.1.5.2.2.1 manual distribution | Secret keys distributed by hand shall be wrapped, or moved under physical security procedures | Both mint commands print the DEK once in plaintext base64: `gen-key` to stdout, `protect-key --generate` to stderr. At least two routes keep the ACTIVE key wrapped at rest: the DPAPI file `protect-key` writes, and the Transit-wrapped DEK under `key_provider = vault`. **Departure for the retired keys:** they are plaintext on every route, because each provider reads them from `[store].encryption_keys_retired`, set by `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` or the TOML file. This row maps storage at rest against a distribution clause, and it does not assess DPAPI as an approved key-wrapping scheme | Move the printed value by a wrapped or physically secured path, and clear it from anything that captured stdout or stderr. Protect the retired-key variable as plaintext key material |
+| 8.2.4 key derivation | Keys derived from a key-derivation key shall use one of the KDFs in SP 800-108. The derivation shall be one-way, and no derived key may reveal another | Derives with HKDF-SHA256 (RFC 5869), each child under its own `info` label, so each is one-way and separate from its siblings. **Departure as written:** HKDF is the extract-then-expand method of SP 800-56C, and 8.2.4 case 2 names SP 800-108. HKDF-Expand may fit SP 800-108's feedback mode, but this read did not assess that, and SP 800-108 is outside its list. Treat this as open, not as settled either way | Nothing the site can change: the KDF is fixed in code |
+| 5.3.6 cryptoperiod | Type 6: an originator-usage period on the order of a day or a week for large volumes of data, and up to two years for smaller volumes. A recipient-usage period no more than three years past it. Type 9: about one year, and only an originator-usage period | **A start-time check, not a bound on use.** The rotation schedule below calls this a hard expiry, and it is one at engine start only. Under `[security].enforcement = enforce`, a DEK the store has tracked for more than `store_key_max_age_days` (365) plus `enforce_grace_days` (30) aborts engine start. `[secret_rotation].enforce_store_key_expiry = false` keeps the alert and drops that refusal. **Departure:** an engine that stays up keeps using the key past that age, and the clock starts when a store first sees the key's id, not when the key was minted, unless the site sets `[secret_rotation].store_key_last_rotated`. By the volume guide above, a key near the invocation bound in the rotation table is a large-volume key, so even 365 days is past the day-or-week period. **Departure on the retired side:** a key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` decrypts, and derives sub-keys to do so, for as long as it is listed. The engine sets no limit, by design, because the list is the recovery path (the comment in `pipeline/secret_rotation.py` records why). As type 9 that is use past the only period 5.3.6 gives it | Set `[secret_rotation].store_key_last_rotated` to the date the DEK was minted. Restart often enough for the start check to run. Run `rotate-key` promptly after each new DEK. Drop the retired key once no store value and no DR archive you keep needs it, and inside three years of its last use to encrypt |
+| 7.4 deactivated | A deactivated key shall not apply protection, but may process protected data | `encrypt` seals only under the active key, and the retired keys join the keyring for decrypt. **Departure until `rotate-key` runs:** after a key change the audit chain's current range stays under the retired key's audit sub-key, so new audit rows are MAC'd under it (`settle_audit_ranges` in [`store/store.py`](../messagefoundry/store/store.py)) | Run `rotate-key` straight after setting a new active key. That closes the retired key's audit range |
+| 7.5 compromised | A compromised key shall not apply protection. It may process protected data only under highly controlled conditions | **Departure.** The engine has no compromised state. A compromised DEK moved to the retired list decrypts exactly as an ordinary retired one does, and MACs audit rows until `rotate-key` runs | On suspected compromise, mint a new DEK and run `rotate-key` at once. Then remove the old key and treat every DR archive sealed under it as exposed |
+| Table 7 backup | Backup is OK for types 6 and 9 | The engine backs up no key. The one escrow copy is the site's, as the Distribution bullet says | Escrow every active and retired DEK under the owner's control, and nowhere else |
+| Table 9 archive | Type 6: OK, until no longer needed to decrypt. Type 9: OK, if needed to derive keys for archived data | The engine keeps no key archive. A DR archive holds data, and names its DEK only by `key_id` | Keep an archived DEK as long as any archive sealed under it is kept, and no longer |
+| B.3.4 data-encryption key backup | Keep the key available while any data under it may need decrypting. Wrap it when it is archived | No engine command backs up or archives the DEK | Wrap the escrowed copy under a key-wrapping key or an archive-encryption key. Keep it until the last store row and DR archive it sealed is gone |
+| 8.3.4 destruction | Destroy every copy when no longer needed, leaving no trace | Wipes some of its own mutable copies best-effort (`_secure_zero`, with `_lock_memory` where the OS allows). **Departure** under shared point 3. At least these stay in the process for its life and are never wiped: the base64 key strings in the loaded settings and in the environment, each keyring DEK's `AESGCM` object, its derived audit-MAC key, and its `_SubkeyDeriver` context, which is keyed by the HKDF extract output and can derive every sub-key. The key bytes the DR backup resolves live for one run and are not wiped either. The engine never destroys the operator's copy | Destroy the environment value, the DPAPI file, the escrow copy and any Vault-wrapped copy once the key's data is gone. Destroying the DEK is the crypto-erase the Destruction bullet describes |
+
+**Section 7 recording, for this key.** On a store whose audit chain is keyed, `rotate-key` appends an
+`audit.key_epoch` row, MAC'd under the new key's audit sub-key. That records the move to a new active
+key. On a keyless audit chain it writes no such row. In both cases `rotate-key` and the start-time
+reconcile stamp the new key's id and date in the secret-rotation metadata, which records the change
+without auditing it. A key leaving the retired list is never recorded, because the engine sees only
+the setting.
+
+**Found by this read, outside the mapping.** The rotation-fingerprint MAC key hangs off the active
+DEK, so a DEK rotation changes every stored secret fingerprint. At the next engine start the
+reconcile would read each tracked secret as freshly rotated and reset its clock, which would also
+lift an overdue refusal under `enforce_secret_expiry_classes`. That is a code
+question, not a mapping one. It is read from the code, not measured by a run, and it is reported
+rather than fixed here.
 
 ### Rotation schedule (ASVS 13.1.4 / 13.3.4)
 
