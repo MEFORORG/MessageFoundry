@@ -23,12 +23,20 @@ from messagefoundry.transports import build_source
 from messagefoundry.transports.timer import TimerSource, _CronSchedule
 
 
-class _FastCron:
+class _FastCron(_CronSchedule):
     """A stand-in schedule whose next fire is always ~20 ms out, so the cron loop can be exercised
-    end-to-end in a test without waiting a real wall-clock minute."""
+    end-to-end in a test without waiting a real wall-clock minute. Build it with ``_fast_cron()``."""
+
+    __slots__ = ()
 
     def next_after(self, dt: datetime) -> datetime:
         return dt + timedelta(milliseconds=20)
+
+
+def _fast_cron() -> _FastCron:
+    sched = _FastCron.parse("* * * * *")
+    assert isinstance(sched, _FastCron)
+    return sched
 
 
 def _timer(**settings: object) -> TimerSource:
@@ -445,7 +453,7 @@ async def test_timer_cron_fires_when_due() -> None:
         fired.append(raw)
 
     src = _timer(body="TICK", cron_expression="* * * * *")
-    src._cron = _FastCron()  # next fire is always ~20 ms out
+    src._cron = _fast_cron()  # next fire is always ~20 ms out
     await src.start(handler)
     try:
         await _until(lambda: len(fired) >= 2)
@@ -462,7 +470,7 @@ async def test_timer_cron_respects_leader_gate() -> None:
         fired.append(raw)
 
     src = _timer(body="X", cron_expression="* * * * *")
-    src._cron = _FastCron()
+    src._cron = _fast_cron()
     await src.start(handler, leader_gate=lambda: False)
     try:
         await asyncio.sleep(0.15)  # many fast ticks
@@ -476,7 +484,7 @@ async def test_timer_cron_stop_joins_promptly() -> None:
         return None
 
     src = _timer(body="X", cron_expression="* * * * *")
-    src._cron = _FastCron()
+    src._cron = _fast_cron()
     await src.start(handler)
     await _until(lambda: src._task is not None)
     await asyncio.wait_for(src.stop(), timeout=2.0)

@@ -24,7 +24,7 @@ def test_n_inbound_graph_scales_with_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert len(reg.routers) == 7
     assert len(reg.handlers) == 7
     # Each inbound binds base_port + i and its own router; a flat graph wired by name (no bundling).
-    ports = sorted(c.spec.settings.get("port") for c in reg.inbound.values())
+    ports = sorted(c.spec.settings["port"] for c in reg.inbound.values())
     assert ports == list(range(2600, 2607))
 
 

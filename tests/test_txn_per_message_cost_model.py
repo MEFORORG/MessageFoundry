@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import pytest
 
+from messagefoundry.store import MessageStatus
 from tests.adr0075_batch_harness import AsyncRecCursor, RecConn, bare_store, drive_async
 
 pytestmark = pytest.mark.asyncio
@@ -71,7 +72,6 @@ async def test_route_handoff_commits_once_regardless_of_handler_count(handlers: 
 
     `H = 20` is the reference estate's ADT hub — the single hottest, highest-fan-out feed measured.
     """
-    import messagefoundry.store.sqlserver as ss
 
     commits, statements = await _drive(
         "route_handoff",
@@ -79,7 +79,7 @@ async def test_route_handoff_commits_once_regardless_of_handler_count(handlers: 
         message_id="m-1",
         channel_id="IB",
         handlers=[(f"H{i}", f"p{i}") for i in range(handlers)],
-        disposition=ss.MessageStatus.ROUTED,
+        disposition=MessageStatus.ROUTED,
         now=100.0,
     )
     assert commits == 1
@@ -111,7 +111,6 @@ async def test_every_staged_queue_method_commits_exactly_once() -> None:
     """No method in the staged queue commits twice, and none commits zero times. A method that committed
     twice would double the term it sits in; one that committed zero times would mean the handoff is not
     durable and the at-least-once invariant is broken."""
-    import messagefoundry.store.sqlserver as ss
 
     assert await _commits("enqueue_ingress", channel_id="IB", raw="MSH|...", now=100.0) == 1
     assert await _commits("mark_done", outbox_id="ob-1", now=100.0) == 1
@@ -122,7 +121,7 @@ async def test_every_staged_queue_method_commits_exactly_once() -> None:
             message_id="m-1",
             channel_id="IB",
             handlers=[("H1", "p1")],
-            disposition=ss.MessageStatus.ROUTED,
+            disposition=MessageStatus.ROUTED,
             now=100.0,
         )
         == 1
@@ -194,7 +193,6 @@ async def test_accepts_declines_before_routed_row() -> None:
     never reach the store is `tests/test_accepts_seam.py::test_accepts_declines_before_a_routed_row_exists`;
     this closes the loop on the cost model.
     """
-    import messagefoundry.store.sqlserver as ss
 
     selects, accepts, delivers = 20, 4, 4
 
@@ -205,7 +203,7 @@ async def test_accepts_declines_before_routed_row() -> None:
         message_id="m-1",
         channel_id="IB",
         handlers=[(f"H{i}", f"p{i}") for i in range(accepts)],
-        disposition=ss.MessageStatus.ROUTED,
+        disposition=MessageStatus.ROUTED,
         now=100.0,
     )
     assert commits == 1

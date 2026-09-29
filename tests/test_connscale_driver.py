@@ -37,11 +37,11 @@ def _driver_with_fakes(count: int) -> tuple[ConnScaleDriver, list[list]]:
         def __init__(self, idx: int) -> None:
             self._idx = idx
 
-        def submit_nowait(self, out, on_done=None):  # type: ignore[no-untyped-def]
+        def submit_nowait(self, out, on_done=None):
             sent_per_conn[self._idx].append(out.seq)
             return True
 
-    driver._conns = [_FakeConn(i) for i in range(count)]  # type: ignore[assignment]
+    driver._conns = [_FakeConn(i) for i in range(count)]  # type: ignore[misc]  # a duck-typed fake
     return driver, sent_per_conn
 
 

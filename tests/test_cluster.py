@@ -737,8 +737,11 @@ async def _run_one_claim(coordinator: ClusterCoordinator, worker: str) -> list[t
     # poll_interval=0 so the post-claim _wait_for_work returns instantly (the spy already set _stop, so
     # the loop exits on the next guard) — keeps the test fast and deterministic.
     runner = RegistryRunner(
-        Registry(), store=_NullStore(), coordinator=coordinator, poll_interval=0.0
-    )  # type: ignore[arg-type]
+        Registry(),
+        store=_NullStore(),  # type: ignore[arg-type]  # the runner only holds the reference here
+        coordinator=coordinator,
+        poll_interval=0.0,
+    )
     spy = _FifoClaimSpyStore(runner._stop)
     runner.store = spy  # type: ignore[assignment]
     await getattr(runner, worker)("LANE")
@@ -824,11 +827,12 @@ async def test_sqlite_converge_state_cache_is_noop(tmp_path: Path) -> None:
     # [] and enable_state_convergence() is a harmless no-op (no cross-node convergence on this backend).
     store = await MessageStore.open(tmp_path / "state-conv.db")
     try:
-        assert store.enable_state_convergence() is None  # harmless no-op
+        store.enable_state_convergence()  # harmless no-op: returns, raises nothing
         assert await store.converge_state_cache() == []
         # A write still keeps the cache current the single-node way; converge stays a no-op.
         mid = await store.enqueue_ingress(channel_id="IB", raw="MSH|^~\\&|x\r", now=100.0)
         ingress = await store.claim_next_fifo("IB", now=110.0, stage=Stage.INGRESS.value)
+        assert ingress is not None
         await store.route_handoff(
             ingress_id=ingress.id,
             message_id=mid,
@@ -838,6 +842,7 @@ async def test_sqlite_converge_state_cache_is_noop(tmp_path: Path) -> None:
             now=120.0,
         )
         routed = await store.claim_next_fifo("IB", now=130.0, stage=Stage.ROUTED.value)
+        assert routed is not None
         await store.transform_handoff(
             routed_id=routed.id,
             message_id=mid,
@@ -1197,7 +1202,9 @@ def test_sqlserver_lease_identity_ignores_db_schema() -> None:
     ]
     assert all(isinstance(c, SqlServerCoordinator) for c in coords)
     assert {c.lease_key() for c in coords} == {"mefor_cluster_leader"}
-    assert {c._lock_key for c in coords} == {"mefor_cluster_nodes"}
+    assert {c._lock_key for c in coords if isinstance(c, SqlServerCoordinator)} == {
+        "mefor_cluster_nodes"
+    }
 
 
 # --- ADR 0096: SqlServerCoordinator leader preference (DB-free unit) ---------

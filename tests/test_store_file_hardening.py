@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -58,7 +59,7 @@ def test_connection_string_neutralizes_password_injection() -> None:
 # --- BACKLOG #100: AOAG multi-subnet fast failover ---------------------------
 
 
-def _sqlserver_settings(**over: object) -> StoreSettings:
+def _sqlserver_settings(**over: Any) -> StoreSettings:
     return StoreSettings(
         backend=StoreBackend.SQLSERVER,
         server="db",

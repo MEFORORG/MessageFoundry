@@ -97,8 +97,8 @@ class _FakeResp:
     def __enter__(self) -> _FakeResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _FakeOpener:
@@ -530,7 +530,7 @@ def _smart_fhir(pem: str) -> FhirDestination:
 
 async def test_fhir_injects_smart_bearer_per_request(rsa_pem: str) -> None:
     dest = _smart_fhir(rsa_pem)
-    dest._token_provider._opener = _token_opener()  # type: ignore[union-attr,assignment]
+    dest._token_provider._opener = _token_opener()  # type: ignore[union-attr]
     fhir_opener = _FakeOpener(body=b"", status=201)
     dest._opener = fhir_opener  # type: ignore[assignment]
     await dest.send(PATIENT)
@@ -552,7 +552,7 @@ def test_cleartext_data_url_with_smart_refused(rsa_pem: str) -> None:
 
 async def test_fhir_401_invalidates_token(rsa_pem: str) -> None:
     dest = _smart_fhir(rsa_pem)
-    dest._token_provider._opener = _token_opener()  # type: ignore[union-attr,assignment]
+    dest._token_provider._opener = _token_opener()  # type: ignore[union-attr]
     dest._opener = _FakeOpener(exc=_http_error(401))  # type: ignore[assignment]
     with pytest.raises(DeliveryError, match="refreshing SMART token"):
         await dest.send(PATIENT)
@@ -567,7 +567,7 @@ async def test_rest_injects_smart_bearer(rsa_pem: str) -> None:
         Destination(name="OB", type=ConnectorType.REST, settings=spec.settings)
     )
     assert isinstance(dest, RestDestination)
-    dest._token_provider._opener = _token_opener()  # type: ignore[union-attr,assignment]
+    dest._token_provider._opener = _token_opener()  # type: ignore[union-attr]
     rest_opener = _FakeOpener(body=b"", status=200)
     dest._opener = rest_opener  # type: ignore[assignment]
     await dest.send("{}")

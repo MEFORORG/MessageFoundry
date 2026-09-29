@@ -81,7 +81,7 @@ zero_loss = true
     # every port in both ranges is probed.
     api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)
     report = await run_connscale(
-        profile,  # type: ignore[arg-type]
+        profile,
         engine_api_port_base=api_port,
         sink_host="127.0.0.1",
         sink_port=sink_port,

@@ -58,7 +58,9 @@ def _storage_scp(
     server = ae.start_server(
         ("127.0.0.1", 0), block=False, evt_handlers=[(evt.EVT_C_STORE, handle_store)]
     )
+    assert server is not None  # block=False returns the running server
     try:
+        assert server.socket is not None
         yield int(server.socket.getsockname()[1])
     finally:
         server.shutdown()

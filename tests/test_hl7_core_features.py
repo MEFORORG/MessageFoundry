@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
+    Payload,
     Registry,
     Send,
 )
@@ -41,6 +43,7 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.timezone import convert_hl7_timestamp, to_zone
+from messagefoundry.transports.base import DestinationConnector
 from messagefoundry.transports.mllp import build_ack
 
 ADT = "MSH|^~\\&|SND|FAC|RCV|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -163,27 +166,27 @@ def test_build_ack_propagates_custom_field_separator() -> None:
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()
 
 
-class _RejectingDestination:
+class _RejectingDestination(DestinationConnector):
     """A destination that always fails — paired with max_attempts=1 it dead-letters on the first try."""
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         raise RuntimeError("destination unavailable")
 
     async def aclose(self) -> None:
         return None
 
 
-def _route(msg: Message) -> list[str]:
+def _route(msg: Payload) -> list[str]:
     return ["fan"]
 
 
-def _fan(msg: Message) -> list[Send]:
+def _fan(msg: Payload) -> list[Send]:
     return [Send("OB_GOOD", msg), Send("OB_BAD", msg)]  # one message → two destinations
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -487,7 +488,7 @@ def test_unknown_kind_is_rejected(tmp_path: Path) -> None:
 # --- CLI surface (messagefoundry impact) -------------------------------------
 
 
-def _run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, object]]:
+def _run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
     rc = main(args)
     out = capsys.readouterr().out
     return rc, json.loads(out)

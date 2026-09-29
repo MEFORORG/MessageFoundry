@@ -1010,12 +1010,15 @@ def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
     from types import SimpleNamespace
 
     service = AuthService.__new__(AuthService)
-    service._settings = AuthSettings()  # type: ignore[attr-defined]
+    service._settings = AuthSettings()
     for provider in ("saml-from-the-future", "ad", "local"):
         rogue = SimpleNamespace(auth_provider=provider)
         assert (
-            service._mfa_required_for(  # type: ignore[arg-type]
-                rogue, frozenset({Role.VIEWER}), second_factor_enrolled=False
+            service._mfa_required_for(
+                # A duck with no UserRecord behind it IS the input under test.
+                rogue,  # type: ignore[arg-type]
+                frozenset({Role.VIEWER}),
+                second_factor_enrolled=False,
             )
             is True
         ), f"provider {provider!r} must not change the answer"

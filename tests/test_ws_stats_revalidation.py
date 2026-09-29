@@ -92,7 +92,9 @@ class _WSHarness:
             self.frames.append(json.loads(message["text"]))  # type: ignore[arg-type]
             return
         if kind == "websocket.close":
-            self.close_code = int(message.get("code", 1000))  # type: ignore[arg-type]
+            code = message.get("code", 1000)
+            assert isinstance(code, int)
+            self.close_code = code
             return
 
     async def run(self, timeout: float) -> None:
@@ -112,7 +114,9 @@ class _WSHarness:
 
 
 async def _login_token(service: AuthService, username: str) -> str:
-    return (await service.login(username, PW)).token
+    token = (await service.login(username, PW)).token
+    assert token is not None
+    return token
 
 
 #: Bound on waiting for the server's FIRST stats frame. Generous on purpose: this is a scheduling wait

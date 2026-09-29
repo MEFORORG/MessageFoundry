@@ -13,7 +13,6 @@ from typing import Any
 
 import pytest
 
-import messagefoundry.transports.email as email_mod
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
 from messagefoundry.config.tls_policy import (
@@ -130,8 +129,9 @@ def _install_fake(
     ) -> _FakeSMTP:
         return _FakeSMTP(host, port, timeout, fail_at=fail_at, context=context)
 
-    monkeypatch.setattr(email_mod.smtplib, "SMTP", factory)
-    monkeypatch.setattr(email_mod.smtplib, "SMTP_SSL", factory)
+    # smtplib is the module object email.py calls, so the patch lands where it is read.
+    monkeypatch.setattr(smtplib, "SMTP", factory)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", factory)
     return _FakeSMTP
 
 
@@ -215,8 +215,8 @@ async def test_port_465_uses_implicit_tls_not_starttls(monkeypatch: pytest.Monke
         return _FakeSMTP(host, port, timeout, context=context)
 
     _FakeSMTP.instances = []
-    monkeypatch.setattr(email_mod.smtplib, "SMTP_SSL", ssl_factory)
-    monkeypatch.setattr(email_mod.smtplib, "SMTP", plain_factory)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", ssl_factory)
+    monkeypatch.setattr(smtplib, "SMTP", plain_factory)
     d = EmailDestination(_dest(port=465))
     await d.send("body")
     assert captured["which"] == "SMTP_SSL"
@@ -643,7 +643,9 @@ async def test_tls_ca_file_pins_that_ca_only(
     assert len(loaded) == 1, (
         "a per-connection CA must pin to ONLY that CA, not augment system roots"
     )
-    assert dict(x[0] for x in loaded[0]["subject"])["commonName"] == "Test Relay CA"
+    subject = loaded[0]["subject"]
+    assert isinstance(subject, tuple)
+    assert {rdn[0][0]: rdn[0][1] for rdn in subject}["commonName"] == "Test Relay CA"
 
 
 def test_tls_ca_file_that_does_not_exist_fails_loudly(tmp_path: Any) -> None:

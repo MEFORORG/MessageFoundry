@@ -185,7 +185,7 @@ def test_the_deadline_sits_inside_the_network_gate_and_outside_everything_else()
     from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 
     app = create_app()
-    registered = [m.cls for m in app.user_middleware]
+    registered: list[object] = [m.cls for m in app.user_middleware]
     assert registered[0] is SecurityHeaderFloorMiddleware, (
         "only the response-header floor may sit outside the network gate; "
         f"the stack is {registered}"

@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import _build_pool_executor
 
 
@@ -33,7 +33,7 @@ def _settings(pool_size: int) -> StoreSettings:
     # The sqlserver backend validates server/database/username at construction, so they are supplied
     # even though the helper reads only pool_size. Values are placeholders: nothing here connects.
     return StoreSettings(
-        backend="sqlserver",
+        backend=StoreBackend.SQLSERVER,
         pool_size=pool_size,
         server="localhost",
         database="mefor_test",
@@ -84,6 +84,7 @@ def test_the_helper_needs_no_driver_and_no_server() -> None:
     ex = _build_pool_executor(_settings(4))
     try:
         assert isinstance(ex, ThreadPoolExecutor)
+        assert ex._thread_name_prefix is not None
         assert ex._thread_name_prefix.startswith("mefor-sqlserver")
     finally:
         ex.shutdown(wait=False)

@@ -24,6 +24,7 @@ from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import (
     DatabaseRef,
     FileRef,
+    Payload,
     Reference,
     ReferenceSpec,
     Registry,
@@ -31,6 +32,7 @@ from messagefoundry.config.wiring import (
     env,
 )
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dryrun import route_message
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
@@ -449,7 +451,7 @@ def test_databaseref_factory_shape() -> None:
 # --- wiring declaration + end-to-end dryrun ---------------------------------
 
 
-class _CapturingAlerts:
+class _CapturingAlerts(LoggingAlertSink):
     """Minimal AlertSink that records connection_stopped details (for the PHI-in-alert check)."""
 
     def __init__(self) -> None:
@@ -567,10 +569,11 @@ def test_dryrun_resolves_file_reference(tmp_path: Path) -> None:
         name="provider_npi", source=FileRef(path=str(csv))
     )
 
-    def route(msg: Message) -> list[str]:
+    def route(msg: Payload) -> list[str]:
         return ["enrich"]
 
-    def enrich(msg: Message) -> Send:
+    def enrich(msg: Payload) -> Send:
+        assert isinstance(msg, Message)  # no accepts= on this handler, so the runner parses
         npi = reference("provider_npi").get(msg["PV1-7.1"] or "")
         if npi:
             msg.set("PV1-7.13", npi)
@@ -689,8 +692,8 @@ async def test_reference_backend_gate_refuses_declared_sets_on_unsupporting_back
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "gate.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     try:
         with pytest.raises(WiringError) as exc:
             check_reference_backend_supported(_ref_graph(csv), store)
@@ -709,8 +712,8 @@ async def test_reference_backend_gate_is_a_noop_without_declared_sets(tmp_path: 
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "gate.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     try:
         check_reference_backend_supported(_ref_graph(csv, with_reference=False), store)  # no raise
     finally:
@@ -737,8 +740,8 @@ async def test_engine_start_refuses_graph_with_reference_set_on_unsupporting_bac
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "start.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     engine = Engine(store)
     engine.add_registry(_ref_graph(csv))
     try:
@@ -764,8 +767,8 @@ async def test_reload_refuses_adding_a_reference_set_on_unsupporting_backend(
 
     csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
     store = await MessageStore.open(tmp_path / "reload.db")
-    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
-    store.supports_reference_sets = False  # type: ignore[assignment]
+    store.backend = StoreBackend.SQLSERVER
+    store.supports_reference_sets = False
     engine = Engine(store)
     engine.add_registry(_ref_graph(csv, with_reference=False))
     try:
@@ -810,7 +813,7 @@ async def test_sync_does_not_retry_a_backend_that_cannot_materialize(
         attempts.append(name)
         raise NotImplementedError("this backend has no reference tables")
 
-    store.write_reference_snapshot = raising_write  # type: ignore[assignment,method-assign]
+    store.write_reference_snapshot = raising_write  # type: ignore[method-assign]
     alerts = _CapturingAlerts()
     runner = ReferenceSyncRunner(
         store, lambda: [_spec("provider_npi", csv)], REF, alert_sink=alerts
@@ -970,6 +973,7 @@ async def test_purge_is_idempotent_and_does_not_double_prefix(tmp_path: Path) ->
         row = await (
             await store._db.execute("SELECT version FROM reference_version WHERE name = 'orphan'")
         ).fetchone()
+        assert row is not None
         assert row["version"] == "purged:v1"
     finally:
         await store.close()
@@ -1001,7 +1005,7 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
         real_execute = store._db.execute
         fired = False
 
-        async def racing_execute(sql: str, params: Any = None):  # type: ignore[no-untyped-def]
+        async def racing_execute(sql: str, params: Any = None):
             nonlocal fired
             if not fired and sql.lstrip().upper().startswith("DELETE FROM REFERENCE"):
                 # The reload lands HERE: after eligibility was decided, before the rows are removed.
@@ -1013,7 +1017,7 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
                 await real_execute(sql, params) if params is not None else await real_execute(sql)
             )
 
-        store._db.execute = racing_execute  # type: ignore[method-assign]
+        store._db.execute = racing_execute  # type: ignore[method-assign, assignment]
         try:
             deleted = await store.purge_reference_snapshots(older_than=1000.0, declared={"keep"})
         finally:

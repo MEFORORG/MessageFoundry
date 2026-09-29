@@ -350,7 +350,7 @@ async def test_partial_migration_converges_and_stays_correct(tmp_path: Path) -> 
     and verify both properties. This is the honest replacement for a transactional-rollback assertion:
     the safety guarantee is convergence + correctness-neutrality, not atomicity."""
     path = tmp_path / "partial.db"
-    s = await MessageStore.open(path)
+    s: Any = await MessageStore.open(path)  # carries the _test_* tags the helpers read
     s._test_backend = "sqlite"
     s._test_path = path
     ch = "IB_PART"
@@ -368,7 +368,7 @@ async def test_partial_migration_converges_and_stays_correct(tmp_path: Path) -> 
     await s.close()
 
     # (b) a clean reopen's idempotent _migrate converges to the seq-trailing pair, old gone.
-    s2 = await MessageStore.open(path)
+    s2: Any = await MessageStore.open(path)  # carries the _test_* tags the helpers read
     s2._test_backend = "sqlite"
     try:
         assert await _fifo_index_names(s2) == _NEW_NAMES
@@ -383,9 +383,9 @@ async def test_claim_is_index_independent(tmp_path: Path) -> None:
     order. Seed identical backward-clock rows into three fresh DBs, put each in a different index state,
     and assert the drained order matches."""
 
-    async def _seed_and_drain(index_state: str) -> list[str]:
+    async def _seed_and_drain(index_state: str) -> list[int]:
         path = tmp_path / f"indep_{index_state}.db"
-        s = await MessageStore.open(path)
+        s: Any = await MessageStore.open(path)  # carries the _test_* tags the helpers read
         s._test_backend = "sqlite"
         ch = "IB_IND"
         mids = [
@@ -415,7 +415,7 @@ async def test_mixed_version_stale_index_reappears(tmp_path: Path) -> None:
     the old-named CREATE IF NOT EXISTS. This pins WHY shared-DB upgrades must be stop-the-world; it is a
     regression that motivates the runbook note, not behaviour we support."""
     path = tmp_path / "mixed.db"
-    s = await MessageStore.open(path)  # B10 migrates → new-only
+    s: Any = await MessageStore.open(path)  # B10 migrates → new-only; carries the _test_* tags
     s._test_backend = "sqlite"
     assert await _fifo_index_names(s) == _NEW_NAMES
     # Simulate an OLD (pre-B10) binary's schema-init: it would run the old-named CREATE IF NOT EXISTS.

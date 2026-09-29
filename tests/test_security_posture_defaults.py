@@ -645,7 +645,7 @@ async def _posture_body(engine: Engine, **state: object) -> dict[str, object]:
 
 
 @pytest.fixture
-async def engine(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def engine(tmp_path: Path):
     eng = await Engine.create(tmp_path / "posture.db", poll_interval=0.02)
     yield eng
     await eng.stop()
@@ -1085,9 +1085,9 @@ async def test_posture_route_reports_declared_cleartext_hops(engine: Engine) -> 
     entry = next(
         e
         for e in body["loosenings"]  # type: ignore[union-attr]
-        if e["switch"] == "cleartext_accepted"  # type: ignore[index]
+        if e["switch"] == "cleartext_accepted"
     )
-    assert "OB_LEGACY" in entry["risk"]  # type: ignore[index]
+    assert "OB_LEGACY" in entry["risk"]
 
 
 def test_declared_fhir_lookup_read_hops_are_named_too() -> None:

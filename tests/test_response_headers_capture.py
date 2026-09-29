@@ -81,8 +81,8 @@ class _FakeResp:
     def __enter__(self) -> _FakeResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _FakeOpener:
@@ -168,7 +168,9 @@ async def test_no_headers_stores_null_and_reads_empty(store: MessageStore) -> No
     mid, item = await _enqueue_and_claim(store)
     await store.complete_with_response(item.id, body="{}", outcome="accepted", now=101.0)
     cur = await store._db.execute("SELECT resp_headers FROM response WHERE message_id=?", (mid,))
-    assert (await cur.fetchone())["resp_headers"] is None  # NULL, byte-identical to pre-#154
+    row = await cur.fetchone()
+    assert row is not None
+    assert row["resp_headers"] is None  # NULL, byte-identical to pre-#154
     caps = await store.correlate_response(mid)
     assert caps[0].headers == {}
 
@@ -188,7 +190,9 @@ async def test_captured_headers_encrypted_at_rest(tmp_path: Any) -> None:
             now=101.0,
         )
         cur = await s._db.execute("SELECT resp_headers FROM response WHERE message_id=?", (mid,))
-        raw = (await cur.fetchone())["resp_headers"]
+        row = await cur.fetchone()
+        assert row is not None
+        raw = row["resp_headers"]
         assert raw is not None and "SECRET-MRN" not in raw  # encrypted at rest
         assert (await s.correlate_response(mid))[0].headers == {"Location": "/Patient/SECRET-MRN"}
     finally:
