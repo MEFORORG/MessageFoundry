@@ -3104,10 +3104,8 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
   the account, a full queue or a failed send, the engine used to log a WARNING naming the
   `account_locked` notice and the username, once per lock. It logs nothing for a lock notice now.
   Two of those cases are still recorded for administrators, on the `auth.lock_notice` row: no relay
-  (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`). **The other two are now
-  recorded nowhere:** that row is written when the notice is handed to the relay, as
-  `mailed: true`, so a full queue or a failed send of a lock notice leaves no record. A relay that is
-  down still shows, on every other notice kind. An instance with no relay at all is reported at
+  (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`). The other two are a
+  residual, below. A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
   startup by the serve gate, except under `[security].enforcement = "warn"` with
   `[alerts].security_notifications_required = false`. Every other notice kind keeps its per-event
   line (BACKLOG #1139); none of them fires on a refused sign-in. The list is
@@ -3131,12 +3129,21 @@ wrong candidate, and are open:
 - **The owner's own later activity.** A live second-step lock refuses the owner's own sign-in, which
   then shows as a refusal where it would have shown as `auth.login_success`. That follows from the
   lock refusing the owner at all.
-- **The log directory's size.** `GET /status` reports the log directory's `size_bytes` to
-  `monitoring:read`, which the Auditor and the Operator hold. The tee's copies of the hidden rows are
-  in those bytes.
-- **Log lines on rarer paths.** A failed read in the lock-notice throttle logs the username; a broken
-  tee sink logs each failed row's action; and SMTP with `tls_verify = false` logs a warning on every
-  send, lock notices included. Each fires only when a lock lands.
+- **Coarser byte counts.** `GET /status` still reports the database's `size_bytes` and the
+  log volume's `disk_free_bytes` to `monitoring:read`. Both move when a hidden row is written, but in
+  whole pages or clusters, and with every other write on the same file or volume.
+
+**Closed on the same channel (Manager decisions 2026-09-28).** `GET /status` returns the log
+directory's `size_bytes` as null to a caller without `users:manage`, since it counted the tee's
+copies of the hidden rows. Three rarer log lines no longer carry the bit: a failed lock-notice
+throttle read names neither the account nor the notice, a broken tee sink is logged once per
+process without the row's action, and SMTP with `tls_verify = false` is logged once per process for
+each relay, by the security notifier when it is built rather than at its first send.
+
+**Residual: a lost lock notice leaves no record** (BACKLOG #1139 deliverability, not the oracle).
+The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So
+when the relay's queue is full, or the send fails, a lock notice is lost with no audit row and, now,
+no log line. The account holder is not told, and nothing says so.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via

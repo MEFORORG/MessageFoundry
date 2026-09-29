@@ -8331,8 +8331,11 @@ class AuthService:
                 actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
             )
         except Exception:
+            # Names neither the account nor the notice kind (BACKLOG #1131): this line runs only
+            # when a lock lands, and ``GET /logs/tail`` serves the log to ``logs:view``. It still
+            # tells an operator the store read failed and that a notice went unthrottled.
             _log.exception(
-                "lock-notice throttle read failed for %s; sending the notice", user.username
+                "a security-notice throttle read failed; the notice was sent unthrottled"
             )
             rows = []
         for row in rows:

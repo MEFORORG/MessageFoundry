@@ -863,7 +863,9 @@ class LogInfo(BaseModel):
     path: str
     # None = unmeasurable (see DbStatus.disk_free_bytes). The two halves fail independently: a
     # readable directory on an unstattable mount yields a size with no free space, and vice versa.
-    size_bytes: int | None  # total bytes of regular files under the log directory (one level)
+    # Total bytes of regular files under the log directory (one level). Also None for a caller
+    # without users:manage (BACKLOG #1131): the total counts the audit copies of hidden lock rows.
+    size_bytes: int | None
     disk_free_bytes: int | None  # free space on the log directory's filesystem
 
 

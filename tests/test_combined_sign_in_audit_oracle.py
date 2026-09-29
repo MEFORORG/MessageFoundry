@@ -945,3 +945,134 @@ async def test_a_cancelled_refusal_still_writes_its_rows(monkeypatch: pytest.Mon
         assert len(rows) == before + 1, "a cancelled refusal lost its audit row"
     finally:
         await store.close()
+
+
+# --- Round 3 (Manager decisions 2026-09-28): the status meter and three rarer log lines ------------
+
+
+async def test_the_status_log_size_is_withheld_from_a_reader_without_users_manage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /status`` reports the log directory's byte total to ``monitoring:read``, which the
+    Auditor and the Operator hold. That total counts the tee's copy of every hidden lock row, so it
+    grows by one line when a lock lands. It is null for them now; an Administrator still reads it,
+    and everyone keeps the free-space half the console's disk check reads."""
+    world = await _open_world(tmp_path, monkeypatch)
+    try:
+        await _add_reader(world.service, "test-operator", Role.OPERATOR)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "service.log").write_text(_tee_line("auth.login_failed", "x") + "\n")
+        app = create_app(world.engine, auth=world.service, log_dir=str(log_dir))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=_PEER), base_url="http://t"
+        ) as c:
+            logs: dict[str, dict[str, Any]] = {}
+            for reader in (_AUDITOR, "test-operator", _SECOND_ADMIN):
+                r = await c.get("/status", headers=await _bearer(c, reader))
+                assert r.status_code == 200, r.text
+                logs[reader] = r.json()["logs"]
+        assert logs[_AUDITOR]["size_bytes"] is None, logs[_AUDITOR]
+        assert logs["test-operator"]["size_bytes"] is None, logs["test-operator"]
+        assert (
+            isinstance(logs[_SECOND_ADMIN]["size_bytes"], int) and logs[_SECOND_ADMIN]["size_bytes"]
+        )
+        for reader in logs:
+            assert logs[reader]["disk_free_bytes"] is not None, (reader, logs[reader])
+    finally:
+        await world.engine.stop()
+
+
+async def test_a_failed_throttle_read_names_neither_the_account_nor_the_lock(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The lock-notice throttle read runs only when a lock lands. When it fails, the line still
+    tells an operator the read failed (the control), but names neither the account nor the notice."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings(), security_notifier=_FakeNotifier())
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        await store.set_user_notify_email(identity.user_id, email="owner@example.test")
+        await _set_sign_in_lock(store, identity.user_id)
+        real_list = store.list_audit
+
+        async def failing_list(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("action") == "auth.lock_notice":
+                raise RuntimeError("store read failed")
+            return await real_list(*args, **kwargs)
+
+        monkeypatch.setattr(store, "list_audit", failing_list)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            for _ in range(_LOCK_THRESHOLD):
+                steps.next_code()
+                sent = await service.login(ADMIN_USERNAME, password, totp_code=steps.wrong_code())
+                assert not sent.ok
+        assert [r for r in caplog.records if "throttle read failed" in r.getMessage()], (
+            "the control: the failed read was not reported at all"
+        )
+        leaks = _leaking(caplog, ADMIN_USERNAME, "account_locked", "lock-notice", "lock_notice")
+        assert leaks == [], leaks
+    finally:
+        await store.close()
+
+
+def test_a_broken_tee_sink_logs_once_and_names_no_action(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A line per failed tee row named the row's action, and the line count tracked the rows, the
+    hidden lock rows included. The failure is now logged once per process, naming no action. The
+    control is that first line: a broken sink is still reported."""
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(audit_tee, "_TEE_FAILURE_LOGGED", False, raising=False)
+
+    def broken(*_: Any, **__: Any) -> None:
+        raise OSError("sink down")
+
+    monkeypatch.setattr(audit_tee.audit_logger, "info", broken)
+    with caplog.at_level(logging.WARNING, logger=audit_tee.log.name):
+        for n, action in enumerate(
+            ("auth.login_failed", "auth.account_locked", "auth.lock_notice")
+        ):
+            audit_tee.emit_audit_tee(
+                action=action,
+                actor=ADMIN_USERNAME,
+                channel_id=None,
+                detail=None,
+                ts=1.0,
+                row_id=n,
+                row_hash="h",
+            )
+    lines = [r.getMessage() for r in caplog.records if r.name == audit_tee.log.name]
+    assert len(lines) == 1, lines
+    assert "tee failed" in lines[0]
+    assert "account_locked" not in lines[0] and "auth." not in lines[0], lines[0]
+
+
+def test_smtp_verification_off_is_logged_once_and_before_the_first_notice(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``tls_verify=false`` logged a WARNING on every SMTP send, lock notices included. It is
+    logged once per process for each relay. The security notifier logs it when it is built, so the
+    first send, which may be a lock notice, adds no line. The control is that one line."""
+    from messagefoundry.config import tls_policy
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    monkeypatch.setattr(tls_policy, "_SMTP_VERIFY_OFF_WARNED", set(), raising=False)
+    with caplog.at_level(logging.WARNING, logger=tls_policy.logger.name):
+        SecurityEventNotifier(
+            host="smtp.example.test",
+            port=25,
+            sender="mf@example.test",
+            use_tls=True,
+            tls_verify=False,
+        )
+        built = [r for r in caplog.records if "DISABLED" in r.getMessage()]
+        assert len(built) == 1, "the control: verification-off was not reported at all"
+        for _ in range(3):
+            tls_policy.build_smtp_tls_context(
+                host="smtp.example.test", cell="alerts SMTP transport", verify=False
+            )
+    lines = [r for r in caplog.records if "DISABLED" in r.getMessage()]
+    assert len(lines) == 1, [r.getMessage() for r in lines]

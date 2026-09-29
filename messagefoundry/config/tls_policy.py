@@ -91,6 +91,7 @@ __all__ = [
     "build_anchored_https_handler",
     "build_asserted_https_handler",
     "build_smtp_tls_context",
+    "warn_smtp_verification_off",
     "smtp_login_approved",
     "build_verifying_client_context",
     "cleartext_acceptance_audit_sink",
@@ -2386,6 +2387,28 @@ def vault_client_verify_kwargs(
     return {} if verify is None else {"verify": verify}
 
 
+#: The ``(cell, host)`` pairs whose ``tls_verify=false`` warning this process has logged.
+_SMTP_VERIFY_OFF_WARNED: set[tuple[str, str]] = set()
+
+
+def warn_smtp_verification_off(*, cell: str, host: str) -> None:
+    """Log, once per process for each ``(cell, host)``, that an SMTP hop does not verify its peer.
+
+    Once, not per send (BACKLOG #1131): a line per send is a line per mail, and a lock notice is a
+    mail sent only when a lock lands, which ``GET /logs/tail`` would show a ``logs:view`` reader. The
+    setting does not change while the process runs, so one line says all there is to say."""
+    if (cell, host) in _SMTP_VERIFY_OFF_WARNED:
+        return
+    _SMTP_VERIFY_OFF_WARNED.add((cell, host))
+    logger.warning(
+        "%s TLS certificate verification is DISABLED (tls_verify=false) — the SMTP session to %s "
+        "is encrypted but UNAUTHENTICATED and MITM-able; trusted-network dev/test only. Logged once "
+        "per process.",
+        cell,
+        host,
+    )
+
+
 def build_smtp_tls_context(
     *,
     host: str,
@@ -2428,12 +2451,7 @@ def build_smtp_tls_context(
     if verify:
         ctx.check_hostname = check_hostname
     else:
-        logger.warning(
-            "%s TLS certificate verification is DISABLED (tls_verify=false) — the SMTP session to %s "
-            "is encrypted but UNAUTHENTICATED and MITM-able; trusted-network dev/test only.",
-            cell,
-            host,
-        )
+        warn_smtp_verification_off(cell=cell, host=host)
         # Order is load-bearing: check_hostname must go False BEFORE verify_mode, or ssl raises.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE

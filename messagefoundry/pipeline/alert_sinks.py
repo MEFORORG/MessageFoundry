@@ -433,6 +433,11 @@ class WebhookTransport:
             drain_bounded(resp, connector=f"alert webhook {host}")
 
 
+#: The name the alerts SMTP hop logs under. The security notifier registers its verification-off
+#: warning under the same name at construction (BACKLOG #1131), so the two must not drift.
+ALERTS_SMTP_CELL = "alerts SMTP transport"
+
+
 def send_plain_email(
     *,
     host: str,
@@ -506,7 +511,7 @@ def send_plain_email(
     tls_context = (
         build_smtp_tls_context(
             host=host,
-            cell="alerts SMTP transport",
+            cell=ALERTS_SMTP_CELL,
             verify=tls_verify,
             ca_file=tls_ca_file,
             trust_anchor_policy=trust_anchor_policy,
@@ -536,7 +541,7 @@ def send_plain_email(
                 username,
                 password or "",
                 channel_encrypted=use_tls,
-                cell="alerts SMTP transport",
+                cell=ALERTS_SMTP_CELL,
             )
         smtp.send_message(msg)
 

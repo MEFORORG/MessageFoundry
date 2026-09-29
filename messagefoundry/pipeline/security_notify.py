@@ -46,8 +46,12 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
-from messagefoundry.config.tls_policy import TrustAnchorPolicy
-from messagefoundry.pipeline.alert_sinks import _BackgroundDispatcher, send_plain_email
+from messagefoundry.config.tls_policy import TrustAnchorPolicy, warn_smtp_verification_off
+from messagefoundry.pipeline.alert_sinks import (
+    ALERTS_SMTP_CELL,
+    _BackgroundDispatcher,
+    send_plain_email,
+)
 
 log = logging.getLogger(__name__)
 
@@ -420,6 +424,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._tls_verify = tls_verify
         self._tls_ca_file = tls_ca_file
         self._trust_anchor_policy = trust_anchor_policy
+        # Logged now, once, rather than at the first send (BACKLOG #1131): the first send may be a
+        # lock notice, and a line appearing then would show a logs:view reader that a lock landed.
+        if use_tls and not tls_verify:
+            warn_smtp_verification_off(cell=ALERTS_SMTP_CELL, host=host)
 
     async def notify(self, event: SecurityEvent) -> None:
         # No deliverable address means nothing to email. The caller has audited the event; which

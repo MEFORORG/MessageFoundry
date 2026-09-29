@@ -5903,6 +5903,14 @@ def create_app(
         # loop; it never raises, so /status does not either. `None` means stdout-only and NOTHING
         # else -- see LogInfo for the three states (BACKLOG #1563).
         logs = await asyncio.to_thread(_log_storage, getattr(request.app.state, "log_dir", None))
+        # BACKLOG #1131 (Manager decision 2026-09-28, under the owner's lock-rows ruling): the log
+        # directory's byte total counts the off-box tee's copy of every audit row, the hidden lock
+        # rows included, so on a quiet instance it grows by exactly one line when a lock lands.
+        # ``monitoring:read`` reaches this route and is held by the Auditor and the Operator, so the
+        # total goes only to a caller who may read those copies. The free-space half stays: the
+        # console's disk-full check reads it.
+        if logs is not None and not reads_audit_copies_in_the_log(_user):
+            logs = logs.model_copy(update={"size_bytes": None})
         # No-network version-update signal (#30, ADR 0026): the engine's latest local diff (version
         # strings only, no PHI). None when [update_check] is disabled / no pass has run — additive, so
         # the existing payload is unchanged when off.

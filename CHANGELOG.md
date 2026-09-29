@@ -1106,7 +1106,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   administrator-only `auth.lock_notice` row; a full queue or a failed send of a lock notice is now
   recorded nowhere. `GET /logs/tail` no longer shows the audit-row copies the off-box tee
   writes into the log to a reader without `users:manage`, the built-in Operator included; that
-  reader loses those lines from the log viewer. A refused local sign-in's audit rows are now
+  reader loses those lines from the log viewer. `GET /status` returns the log directory's
+  `size_bytes` as null to the same readers. A failed lock-notice throttle read, a broken audit tee
+  sink, and SMTP with `tls_verify = false` each log without naming a lock: the last two once per
+  process. A refused local sign-in's audit rows are now
   written at a fixed point inside the failure pad, so their timestamp no longer shows whether a
   lock or a checked credential refused it. The channel still open is listed in `docs/SECURITY.md` under Audit.
   (`BACKLOG #1131`, ASVS 6.1.1)
