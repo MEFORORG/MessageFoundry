@@ -238,9 +238,9 @@ async def test_inline_happy_path_fuses_handoff_and_processes(
         "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.ROUTED.value),
     )
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
 
 
 # --- matrix #1/#3: eligibility fallbacks -------------------------------------
@@ -524,9 +524,9 @@ async def test_inline_g6_dead_letters_at_finite_attempts_ceiling(
         "SELECT attempts FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.INGRESS.value),
     )
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["attempts"] == 3  # at the cap before the worker's next claim
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["attempts"] == 3  # at the cap before the worker's next claim
 
     reg = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
     runner = await _run(reg, store, delivery_defaults=RetryPolicy(max_attempts=3))

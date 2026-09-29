@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -64,7 +65,7 @@ class _FakeLeaseDB:
     def __init__(self, db_clock: _Clock) -> None:
         self._db_clock = db_clock
         # {"owner": str, "lease_expires_at": float, "leader_epoch": int}
-        self.row: dict[str, object] | None = None
+        self.row: dict[str, Any] | None = None
 
     def claim(self, owner: object, ttl: float, delay: float) -> dict[str, object] | None:
         """Acquire-or-renew, returning the ``(owner, leader_epoch)`` the statement would OUTPUT, or
@@ -79,10 +80,10 @@ class _FakeLeaseDB:
         if row is None:
             self.row = {"owner": owner, "lease_expires_at": now + ttl, "leader_epoch": 1}
             return {"owner": owner, "leader_epoch": 1}
-        expired = float(row["lease_expires_at"]) + delay < now  # type: ignore[arg-type]
+        expired = float(row["lease_expires_at"]) + delay < now
         if row["owner"] == owner or expired:
             if row["owner"] != owner:
-                row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
+                row["leader_epoch"] = int(row["leader_epoch"]) + 1
             row["owner"] = owner
             row["lease_expires_at"] = now + ttl
             return {"owner": owner, "leader_epoch": row["leader_epoch"]}
@@ -546,7 +547,9 @@ async def test_a_handicapped_sibling_takes_over_after_a_stepdown() -> None:
     b = _coord(_FakeLeasePool(db), mono_b, node="B", heartbeat=10.0, acquire_delay_seconds=60.0)
     await a._maintain_leadership()
     assert a.is_leader() is True
-    assert await a.step_down_leadership() == (True, pytest.approx(time.time(), abs=60), True)
+    outcome = await a.step_down_leadership()
+    assert outcome.was_leader is True and outcome.lease_released is True
+    assert outcome.released_at == pytest.approx(time.time(), abs=60)
 
     # One heartbeat later, still inside A's 20 s pause and far inside B's 60 s handicap.
     for clock in (db_clock, mono_a, mono_b):
@@ -695,7 +698,8 @@ async def test_step_down_pauses_this_node_so_a_standby_wins_the_expired_lease() 
     # The standby's tick inside the same window wins the expired lease and bumps the epoch (H1).
     await b._maintain_leadership()
     assert b.is_leader() is True
-    assert db.row["owner"] == "B" and db.row["leader_epoch"] == 2
+    lease = db.row  # a fresh name: mypy still holds db.row["owner"] narrowed to "A" from above
+    assert lease is not None and lease["owner"] == "B" and lease["leader_epoch"] == 2
 
     # And the pause is bounded: past it, A contends normally again (it just cannot beat a live lease).
     mono_a.t = 21.0

@@ -120,7 +120,7 @@ def _executor(
     ex = FhirLookupExecutor(conn or _CONN)
     opener = _FakeOpener(exc=exc, body=body, status=status)
     for name in ex.connections:  # swap the per-connection opener for the fake
-        ex._opener[name] = opener  # type: ignore[attr-defined]
+        ex._opener[name] = opener  # type: ignore[assignment]
     return ex, opener
 
 
@@ -653,7 +653,7 @@ async def test_smart_bearer_applied_and_reminted_on_401() -> None:  # AC-5
     # On a 401 the provider is invalidated so the next read re-mints.
     ex2 = FhirLookupExecutor(_CONN)
     opener2 = _FakeOpener(exc=_http_error(401))
-    ex2._opener["epic"] = opener2  # type: ignore[attr-defined]
+    ex2._opener["epic"] = opener2  # type: ignore[assignment]
     prov2 = _FakeProvider()
     ex2._token["epic"] = prov2
     with pytest.raises(FhirLookupError, match="401"):

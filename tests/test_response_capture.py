@@ -11,6 +11,7 @@ wiring-time validation, and the fail-closed runner-start capture-support gate.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -73,10 +74,11 @@ async def test_complete_with_response_persists_and_marks_done(store: MessageStor
     # The outbound row is DONE and the message finalized PROCESSED (the response table is invisible to
     # _maybe_finalize_message, which scans `queue` only).
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["status"] == OutboxStatus.DONE.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.DONE.value
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["status"] == MessageStatus.PROCESSED.value
     # correlate_response returns the decrypted reply.
     caps = await store.correlate_response(mid)
@@ -125,18 +127,18 @@ async def test_replay_resend_after_capture_appends_response_and_reseeds_ledger(
     requeued = await store.replay(mid, now=102.0)  # re-send → ledger entry dropped
     assert requeued == 1
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM delivered_keys")
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0  # ledger cleared for the re-sent row (NOT deduped)
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # ledger cleared for the re-sent row (NOT deduped)
     again = await store.claim_next_fifo("OB_Q", now=103.0)
     assert again is not None and again.id == item.id  # claimed normally, not skip-and-completed
     await store.complete_with_response(again.id, body="R2", outcome="accepted", now=104.0)
     caps = await store.correlate_response(mid)
     assert [(c.response_seq, c.body) for c in caps] == [(1, "R1"), (2, "R2")]
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM delivered_keys")
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 1  # one fresh ledger row for the re-delivery
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 1  # one fresh ledger row for the re-delivery
 
 
 async def test_response_seq_is_replay_stable(store: MessageStore) -> None:
@@ -188,9 +190,9 @@ async def test_crash_between_send_and_commit_leaves_no_partial(
         await store.complete_with_response(item.id, body="R1", outcome="accepted", now=101.0)
     # Rolled back: the row is still INFLIGHT and there is NO partial response row.
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["status"] == OutboxStatus.INFLIGHT.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.INFLIGHT.value
     assert await store.correlate_response(mid) == []
     # Recovery: reset_stale_inflight → pending; re-claim; re-send commits exactly one response (seq=1).
     await store.reset_stale_inflight(now=102.0)
@@ -289,8 +291,8 @@ def test_mllp_unparseable_reply_capture_vs_retry() -> None:
 async def test_mllp_read_failure_is_delivery_error_not_capture() -> None:
     # A failure to READ a reply frame (peer closed) is a delivery failure that retries — never captured,
     # even for a capturing outbound.
-    class _EmptyReader:
-        async def read(self, _n: int) -> bytes:
+    class _EmptyReader(asyncio.StreamReader):
+        async def read(self, n: int = -1) -> bytes:
             return b""
 
     with pytest.raises(DeliveryError):

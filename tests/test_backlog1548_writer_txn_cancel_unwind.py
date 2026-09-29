@@ -200,9 +200,9 @@ async def _assert_unwound_and_recovered(
         "SELECT COUNT(*) AS n FROM queue WHERE stage=? AND message_id=?",
         (Stage.ROUTED.value, mid),
     )
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.RECEIVED.value
@@ -315,9 +315,9 @@ async def test_standalone_dead_letter_writer_unwinds(tmp_path: Path, arm: str) -
         # And it re-runs: the row really does go DEAD on the second attempt.
         await _dead()
         cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched["status"] == OutboxStatus.DEAD.value
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["status"] == OutboxStatus.DEAD.value
     finally:
         await store.close()
 
@@ -358,7 +358,9 @@ async def _reingress(store: MessageStore, work_id: str, *, now: float = 110.0) -
 
 async def _message_count(store: MessageStore) -> int:
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    return int((await cur.fetchone())["n"])
+    row = await cur.fetchone()
+    assert row is not None
+    return int(row["n"])
 
 
 async def _assert_reingress_unwound_and_recovered(

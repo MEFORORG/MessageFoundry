@@ -292,9 +292,9 @@ async def test_ingress_detach_creates_join_row_and_refcount(store: MessageStore)
     cur = await store._db.execute(
         "SELECT attachment_id FROM message_attachment WHERE message_id=?", (mid,)
     )
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["attachment_id"] == ref
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["attachment_id"] == ref
 
 
 async def test_purge_decrefs_and_deletes_linkage_atomically(store: MessageStore) -> None:

@@ -33,18 +33,18 @@ async def test_open_uses_wal_and_normal_synchronous(store: MessageStore) -> None
     cur = await store._db.execute("PRAGMA journal_mode")
     assert str((await cur.fetchone())[0]).lower() == "wal"
     cur = await store._db.execute("PRAGMA synchronous")
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched[0] == 1  # NORMAL — crash-safe under WAL, faster than FULL
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row[0] == 1  # NORMAL — crash-safe under WAL, faster than FULL
 
 
 async def test_open_honors_full_synchronous(tmp_path) -> None:
     s = await MessageStore.open(tmp_path / "full.db", synchronous="FULL")
     try:
         cur = await s._db.execute("PRAGMA synchronous")
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched[0] == 2  # FULL
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row[0] == 2  # FULL
     finally:
         await s.close()
 

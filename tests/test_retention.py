@@ -338,9 +338,9 @@ async def test_purge_dead_letters_reaches_a_dead_ingress_row(store: MessageStore
     assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # idempotent
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (ingress_id,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["status"] == OutboxStatus.DEAD.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.DEAD.value
 
 
 async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore) -> None:
@@ -353,9 +353,9 @@ async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore)
     assert await store.purge_dead_letters(older_than=10 * DAY) == 0
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (routed_id,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["status"] == OutboxStatus.DEAD.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.DEAD.value
 
 
 async def test_dead_ingress_row_does_not_pin_a_streaming_attachment_forever(

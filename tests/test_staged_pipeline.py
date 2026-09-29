@@ -567,9 +567,9 @@ async def test_route_handoff_no_handlers_sets_unrouted(store: MessageStore) -> N
     assert fetched is not None
     assert fetched["status"] == MessageStatus.UNROUTED.value
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0  # ingress consumed, no routed rows
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # ingress consumed, no routed rows
 
 
 async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Path) -> None:
@@ -619,9 +619,9 @@ async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Pa
     # Terminal: the ingress row was consumed in the handoff and no routed row was ever created — the
     # 2 transactions per declining handler are simply never spent (ADR 0051's 2H term).
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
     # Listable + logged (never accepted-and-dropped), and the disposition is a real logged event.
     assert mid in {m["id"] for m in await store.list_messages(status=MessageStatus.UNROUTED.value)}
     assert "unrouted" in [e["event"] for e in await store.events_for(mid)]
@@ -657,9 +657,9 @@ async def test_route_handoff_idempotent_against_restart(store: MessageStore) -> 
         "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.ROUTED.value),
     )
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 1
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 1
 
 
 async def test_route_handoff_atomic_rolls_back_leaving_ingress_recoverable(
@@ -685,9 +685,9 @@ async def test_route_handoff_atomic_rolls_back_leaving_ingress_recoverable(
         "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.ROUTED.value),
     )
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0  # no routed rows leaked
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # no routed rows leaked
     monkeypatch.undo()
     assert await store.reset_stale_inflight(stage=Stage.INGRESS.value) == 1
     again = await _claim_ingress(store, "IB")
@@ -742,9 +742,9 @@ async def test_single_handler_filters_collapses_to_filtered(store: MessageStore)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.FILTERED.value
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0  # no rows linger
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # no rows linger
 
 
 async def test_two_handlers_both_filter_collapses_to_filtered(store: MessageStore) -> None:

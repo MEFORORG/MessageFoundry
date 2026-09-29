@@ -244,9 +244,9 @@ async def test_router_worker_recovers_claimed_row_after_handoff_fault_without_re
                 "SELECT COUNT(*) AS c FROM queue WHERE stage=? AND channel_id=? AND status=?",
                 (Stage.INGRESS.value, "IB", "inflight"),
             )
-            fetched = await cur.fetchone()
-            assert fetched is not None
-            assert fetched["c"] == 0
+            fetched_row = await cur.fetchone()
+            assert fetched_row is not None
+            assert fetched_row["c"] == 0
         finally:
             runner._stop.set()
             runner._ingress_work.set()

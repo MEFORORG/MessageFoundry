@@ -29,6 +29,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,9 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.phase_timing import (
     LANE_EPISODE_TIMING_ENV,
+    DeliveryPhaseTiming,
     LaneEpisodeTiming,
+    delivery_phase_timing_enabled,
 )
 from messagefoundry.pipeline.stage_dispatcher import (
     LaneItemResult,
@@ -54,9 +57,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
 from messagefoundry.pipeline.wiring_runner import (
     _DELIVERY_PHASE_EMIT_INTERVAL,
     DELIVERY_PHASE_TIMING_ENV,
-    DeliveryPhaseTiming,
     RegistryRunner,
-    delivery_phase_timing_enabled,
 )
 from messagefoundry.store import (
     ClaimedHeads,
@@ -66,6 +67,7 @@ from messagefoundry.store import (
     OutboxStatus,
     Stage,
 )
+from messagefoundry.transports.base import DestinationConnector
 
 _LOGGER = "messagefoundry.pipeline.wiring_runner"
 _DISPATCHER_LOGGER = "messagefoundry.pipeline.stage_dispatcher"
@@ -151,13 +153,13 @@ def test_accumulator_emit_interval_is_five_seconds() -> None:
 # --- end-to-end through a real pooled delivery ------------------------------------------------------
 
 
-class _Collector:
+class _Collector(DestinationConnector):
     """Non-capturing outbound (returns None → the mark_done phase). Records deliveries."""
 
     def __init__(self) -> None:
         self.deliveries: list[str] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.deliveries.append(payload)
         return None
 

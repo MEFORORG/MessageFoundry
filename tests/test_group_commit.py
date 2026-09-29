@@ -211,9 +211,9 @@ async def test_poisoned_member_does_not_reject_its_siblings_via_store_api(
     assert fetched is not None
     assert fetched["status"] == MessageStatus.RECEIVED.value
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (items[1].id,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["status"] == OutboxStatus.INFLIGHT.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.INFLIGHT.value
 
     # Recover just that row and re-run cleanly — it routes (the re-run its rejection licenses), and no
     # sibling had to be re-run to get there.
@@ -276,9 +276,9 @@ async def test_commit_failure_still_rejects_every_member(tmp_path: Path) -> None
         assert all("injected COMMIT failure" in str(r) for r in results), results
         # And nothing landed: the whole batch really did roll back.
         cur = await s._db.execute("SELECT COUNT(*) AS n FROM gc_marker")
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched["n"] == 0
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 0
     finally:
         await s.close()
 
@@ -330,9 +330,9 @@ async def test_unwind_failure_rejects_every_member_and_keeps_each_cause(tmp_path
             assert isinstance(sibling, Exception) and "savepoint unwind failed" in str(sibling)
         # Nothing landed: the whole batch went back through _writer_txn's rollback.
         cur = await s._db.execute("SELECT COUNT(*) AS n FROM gc_marker")
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched["n"] == 0
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 0
         # And the writer is healthy afterwards: the next batch commits.
         assert await gc.submit(lambda: write(4, boom=False)) == 4
     finally:
@@ -416,9 +416,9 @@ async def test_claim_poisonguard_standalone(store: MessageStore) -> None:
     again = await _claim_ingress(store, "IB")
     assert again is not None and again.id == item.id
     cur = await store._db.execute("SELECT attempts FROM queue WHERE id=?", (item.id,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["attempts"] == 2  # advanced — no infinite loop at attempts=1
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["attempts"] == 2  # advanced — no infinite loop at attempts=1
 
 
 async def test_claim_never_enrolls_in_committer(store: MessageStore) -> None:
@@ -488,13 +488,13 @@ async def test_ack_gate_rejected_on_group_rollback(store: MessageStore) -> None:
         await store.enqueue_ingress(channel_id="IB", raw=RAW)
     # Nothing persisted — no message row, no ingress queue row (the rollback took it all).
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
 
 
 # --- AC-4: cache delta published ONLY on commit success -----------------------------------------
@@ -559,9 +559,9 @@ async def test_cache_publish_only_on_success(store: MessageStore) -> None:
     assert ("ns", "k_rolledback") not in store.state_view()
     # ...and absent from the durable state table (the whole member rolled back).
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM state WHERE key=?", ("k_rolledback",))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
     # The earlier committed value is unaffected.
     assert store.state_view()[("ns", "k_ok")] == "committed-value"
 
@@ -648,9 +648,9 @@ async def test_at_least_once_idempotent_handoff_under_group_commit(store: Messag
         "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.ROUTED.value),
     )
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    assert fetched["n"] == 1  # exactly one routed row — no double-produce
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 1  # exactly one routed row — no double-produce
 
 
 # --- committer unit behaviours backing the ACs (deterministic batch membership) -----------------
@@ -706,9 +706,9 @@ async def test_burst_larger_than_max_batch_drains_fully(tmp_path: Path) -> None:
         cur = await s._db.execute(
             "SELECT COUNT(*) AS n FROM queue WHERE stage=?", (Stage.INGRESS.value,)
         )
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched["n"] == 100  # all durable
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 100  # all durable
     finally:
         await s.close()
 
@@ -732,9 +732,9 @@ async def test_close_drains_remainder_no_deadlock(tmp_path: Path) -> None:
         cur = await s2._db.execute(
             "SELECT COUNT(*) AS n FROM queue WHERE stage=?", (Stage.INGRESS.value,)
         )
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched["n"] == 11
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 11
     finally:
         await s2.close()
 
@@ -775,9 +775,9 @@ async def test_cancelled_transform_still_publishes_committed_state(tmp_path: Pat
         # durable write AND the cache carry the value — no divergence.
         await asyncio.sleep(0.6)
         cur = await s._db.execute("SELECT COUNT(*) AS n FROM state WHERE key=?", ("k_cancel",))
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched["n"] == 1  # committed durably
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 1  # committed durably
         assert s.state_view()[("ns", "k_cancel")] == "committed-value"  # AND visible in the cache
     finally:
         await s.close()

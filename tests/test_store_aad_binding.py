@@ -261,9 +261,9 @@ async def test_v1_rows_still_read_under_aad_bind(tmp_path: Path) -> None:
     )
     async with v1._read() as conn:
         cur = await conn.execute("SELECT raw FROM messages WHERE id=?", (mid,))
-        fetched = await cur.fetchone()
-        assert fetched is not None
-        assert fetched["raw"].startswith(PREFIX)  # frozen v1 marker
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["raw"].startswith(PREFIX)  # frozen v1 marker
     await v1.close()
     bound = await _open_bound(db, key)
     try:

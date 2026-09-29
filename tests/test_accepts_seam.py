@@ -255,7 +255,9 @@ def test_accepts_raise_propagates_out_of_route_only(tmp_path: Path) -> None:
 
 async def _router_stage_state(store: MessageStore, mid: str) -> tuple[str, list[tuple[str, str]]]:
     """(messages.status, [(stage, status)]) — the full router-stage outcome of one message."""
-    status = (await store.get_message(mid))["status"]
+    msg = await store.get_message(mid)
+    assert msg is not None
+    status = msg["status"]
     cur = await store._db.execute(
         "SELECT stage, status FROM queue WHERE message_id=? ORDER BY rowid", (mid,)
     )
@@ -659,7 +661,7 @@ def test_predicates_share_the_routers_payload_and_cannot_reach_a_handler(tmp_pat
         seen.append(id(msg))
         return True
 
-    delivered: list[str] = []
+    delivered: list[str | None] = []
 
     def _h(msg: Message) -> Send:
         delivered.append(msg["MSH-3"])

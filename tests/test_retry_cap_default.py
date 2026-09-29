@@ -37,6 +37,7 @@ from messagefoundry.config.models import ContentType, OrderingMode, RetryPolicy
 from messagefoundry.config.settings import DeliverySettings
 from messagefoundry.config.wiring import (
     Http,
+    InboundConnection,
     Registry,
     Rest,
     WiringError,
@@ -122,6 +123,7 @@ async def test_a_long_outage_burns_the_cap_on_the_head_not_the_backlog(store: Me
     ]
 
     t = 0.0
+    assert retry.max_attempts is not None
     for _ in range(retry.max_attempts):
         head = await store.claim_next_fifo("d1", now=t)
         assert head is not None, f"the FIFO head was not claimable at t={t}"
@@ -177,7 +179,7 @@ async def test_a_dead_lettered_row_stays_replayable(store: MessageStore) -> None
     assert await store.claim_next_fifo("d1", now=t) is not None
 
 
-def _sync_reply_graph() -> tuple[Registry, object]:
+def _sync_reply_graph() -> tuple[Registry, InboundConnection]:
     """A ``reply_from`` graph that declares NO retry policy — the shape whose effective cap comes
     entirely from ``[delivery]``, which is what the startup refusal reads."""
     reg = Registry()
