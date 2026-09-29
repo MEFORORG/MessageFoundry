@@ -2477,16 +2477,18 @@ class AuthSettings(_Section):
     # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
     # that owes no second factor counts as the first verification (sudo-timestamp model) unless it
     # comes from an address the account has not signed in from before (BACKLOG #288; see the
-    # seed_reauth argument in AuthService._login_local). A directory login (Kerberos, OIDC) never
-    # does (BACKLOG #1144). Default 5 minutes.
+    # seed_reauth argument in AuthService._login_local); a combined password-plus-TOTP sign-in
+    # counts from any address (ADR 0197). A directory login (Kerberos, OIDC) never does (BACKLOG
+    # #1144). Default 5 minutes.
     step_up_max_age_seconds: int = 300
-    # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
-    # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to
-    # that specific action (POST /me/reauth with a matching `purpose`), single-use, instead of riding
-    # the session-wide step-up window. This closes the most-exploitable default: a session hijacked
-    # inside the 300s login-seeded window could otherwise bind an attacker's authenticator with no
-    # fresh proof. It changes ONLY those factor-binding routes; the broad admin/replay/config/purge
-    # routes keep the session-window step-up (7.5.3). Default True is secure-by-default and does not
+    # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), a fixed set of routes
+    # requires a fresh proof BOUND to that specific action (POST /me/reauth with a matching
+    # `purpose`), single-use, instead of riding the session-wide step-up window: the self-service
+    # factor and session-terminate routes, and the admin user-update, reset-password, reset-mfa and
+    # federated-identity routes (the STEP_UP_ACTION_* constants in auth/service.py; the route list is
+    # in docs/CONFIGURATION.md). This closes the most-exploitable default: a session hijacked inside
+    # the 300s login-seeded window could otherwise bind an attacker's authenticator with no fresh
+    # proof. Every other step-up route keeps the session-window step-up (7.5.3). Default True is secure-by-default and does not
     # touch the loopback bind, TLS, or any collector path. Set False to revert to the legacy
     # session-window behaviour (0.2.x semantics) — the documented org opt-out.
     require_action_step_up: bool = True

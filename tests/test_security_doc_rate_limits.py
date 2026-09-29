@@ -458,7 +458,8 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
     problems: list[str] = []
 
     login = _row(section, "login_rate_limit_enabled")
-    if "`GET /ui/sso`, `GET /ui/oidc/start`, `GET /ui/oidc/callback`" in login:
+    entry = re.search(r"console entry routes \(([^)]*)\)", login)
+    if entry is None or "`GET /ui/oidc/start`" in entry.group(1):
         problems.append(
             "login_rate_limit_enabled lists `GET /ui/oidc/start` as an unconditional sign-in entry "
             "route again; the start leg that always charges is the POST"
@@ -472,13 +473,13 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
         )
 
     bind_dn = _row(section, "ad_bind_dn")
-    if "read as absent" in bind_dn:
+    if re.search(r"\breads? as absent\b", bind_dn):
         problems.append(
             "ad_bind_dn says the reconciler reads an unreadable userAccountControl as absent again; "
             "ADR 0195 maps it to UNDETERMINED"
         )
-    if "**undetermined**" not in bind_dn or "held" not in bind_dn:
-        problems.append("ad_bind_dn does not say an undetermined wave is held")
+    if "**undetermined**" not in bind_dn or "nothing readable beside it, are held" not in bind_dn:
+        problems.append("ad_bind_dn does not say which undetermined answers are held")
 
     ad_enabled = _row(section, "ad_enabled")
     if "turn on Active Directory login" in ad_enabled:
@@ -527,10 +528,29 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
     if "Browser passkeys for local users" in flat:
         problems.append("the [api] WebAuthn note scopes passkeys to local users again")
 
+    interval = _row(section, "admin_write_min_interval_seconds")
+    if "While `admin_write_rate_limit_enabled` is on" not in interval:
+        problems.append(
+            "admin_write_min_interval_seconds states its load refusal unconditionally; it fires "
+            "only while admin_write_rate_limit_enabled is on"
+        )
+    new_ip = _row(section, "admin_new_ip_step_up")
+    if "once per (session, new address)" in new_ip:
+        problems.append(
+            "admin_new_ip_step_up claims a once-per-(session, address) notice again; the dedupe "
+            "keeps only the last address per session, per process"
+        )
+
     intake = _row(connections_text, "intake_auth")
     if "`403`" not in intake:
         problems.append(
             "CONNECTIONS.md intake_auth says every refusal is 401; an unlisted mTLS subject is 403"
+        )
+    health = _row(connections_text, "intake_auth_health")
+    if "`mtls_subject`" not in health:
+        problems.append(
+            "CONNECTIONS.md intake_auth_health does not say `allow` exempts nothing under "
+            "mtls_subject, where the certificate is checked at accept"
         )
     return problems
 
@@ -562,6 +582,14 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
     assert security.external_link_interstitial is True
     assert security.organization_domains == []
     assert security.external_link_allowlist == []
+    from messagefoundry_webconsole._external import is_external
+
+    assert is_external("https://idp.example/", security.organization_domains)
+
+    # The admin-write gap is refused against its window only while the limiter is on.
+    AuthSettings(admin_write_rate_limit_enabled=False, admin_write_min_interval_seconds=20.0)
+    with pytest.raises(ValueError, match="admin_write_min_interval_seconds must be shorter"):
+        AuthSettings(admin_write_min_interval_seconds=20.0)
 
     # An unreadable userAccountControl is UNDETERMINED to the reconciler, and a wave of two is held.
     from messagefoundry.auth import reconcile
