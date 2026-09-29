@@ -1074,10 +1074,10 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
 **Downloads are made safe at serve (ASVS 1.3.4).** The attachment download route (GET
 `/messages/{message_id}/attachments/{attachment_id}`, and its `/ui` delegate) serves the stored bytes
 **verbatim** (the preserve-the-original invariant forbids rewriting a clinical payload) but neutralizes
-them at the response. An SVG is the one exception: it is served as a copy rebuilt from a tag and
-attribute allow-list, with no script, `foreignObject`, event handler or external reference, and one that
-cannot be parsed safely is refused with HTTP 422 (ADR 0105 amendment 2026-09-28). The stored value stays
-verbatim. The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
+them at the response. An SVG is the exception: it is served as a copy rebuilt from a tag and attribute
+allow-list, or refused with HTTP 422 when it cannot be vetted, and the stored value stays verbatim. The
+rules are recorded once, in
+[ADR 0105's 2026-09-28 amendment](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md). The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
 which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
 reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
 `text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served

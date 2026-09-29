@@ -742,6 +742,9 @@ async def test_svg_served_copy_is_sanitized_and_stored_value_is_untouched(
     after = await _stored_value(engine, ref)
     assert after == before
     assert base64.b64decode(after).startswith(_HOSTILE_SVG)
+    # The audit row says the served bytes were a sanitized copy, not the stored document.
+    (row,) = [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    assert '"served": "sanitized-svg"' in (row["detail"] or "")
 
 
 @pytest.mark.parametrize(

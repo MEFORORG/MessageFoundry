@@ -969,6 +969,13 @@ _XML_PARSER_ALLOWLIST = {
         "TYPE_CHECKING-only Element hint. A Corepoint <Package> export is untrusted operator-supplied "
         "data (ADR 0086 §2(a'))"
     ),
+    "messagefoundry/api/svg_sanitize.py": (
+        "defusedxml with forbid_entities/forbid_external (forbid_dtd OFF, so an entity-free SVG 1.1 "
+        "DOCTYPE parses) over an SVG attachment's bytes, for the download route's served copy only "
+        "(ASVS 1.3.4, ADR 0105 amendment 2026-09-28); the xml.etree import beside it is the "
+        "ParseError type plus the Element hint. tests/test_svg_sanitize.py drives the shared hostile "
+        "corpus of tests/test_xml_parser_consistency.py through it and records the one accepted entry"
+    ),
     "messagefoundry/parsing/xml/_deps.py": (
         "the single lazy loader for the [xml] extra (lxml, xmlschema, signxml) — every consumer in "
         "parsing/xml/ goes through it, and lxml parsing is hardened once in harden.py"

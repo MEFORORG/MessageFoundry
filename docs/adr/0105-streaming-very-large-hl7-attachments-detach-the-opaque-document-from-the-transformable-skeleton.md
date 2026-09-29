@@ -565,10 +565,15 @@ R10 of 2026-09-23 graded the cell `partial` on exactly that gap.
    in code without amending this ADR; this sentence records it. An SVG label is not on the list, so a
    sanitized SVG is still declared `application/octet-stream` with a `.bin` download name.
 
-**How an SVG is recognised.** By its stored label, when the label contains `svg` in any case, or by its
-root element, when the document's first start tag is `svg`. The label is sender-influenced, so a check
-on the label alone would let an SVG labelled `text/xml` pass untouched. The root check reads no further
-than the first start tag, so a large non-SVG document costs almost nothing.
+**How an SVG is recognised.** Only markup can be SVG: bytes whose first byte after any whitespace, NUL
+or byte-order mark is `<`. Markup is SVG when its stored label contains `svg` in any case, or when its
+root element is `svg`. The label is sender-influenced, so a check on the label alone would let an SVG
+labelled `text/xml` pass untouched. The root check reads no further than the first start tag. When the
+parser cannot reach the root (an unsupported or false encoding declaration, an entity in the prolog, a
+syntax error), the first 64 KiB are searched for an `svg` start tag instead, because a browser may
+still read that document as SVG. A PDF or an image under an SVG label is not markup, no SVG reader
+renders it, and it is served as before. A gzip stream under an SVG label is refused, since a viewer
+may inflate it as SVGZ.
 
 **What the sanitizer keeps.** `messagefoundry/api/svg_sanitize.py` parses through `defusedxml` and
 rebuilds the document from an allow-list:
@@ -579,27 +584,41 @@ rebuilds the document from an allow-list:
   namespace.
 - Geometry and presentation attributes. No `on*` attribute is on the list. `href` and `xlink:href`
   survive only on the elements that point at another part of the drawing, and only as a `#fragment`.
-- A value is dropped if it holds a backslash, `javascript:`, `vbscript:`, `data:`, `expression(`,
-  `@import`, or a `url(` that is not a `#fragment` reference.
+- A value may call only colour, transform and `calc` functions, and `url()` only with a `#fragment`,
+  so `image-set()`, `src()` and any later CSS function are dropped by default. A value holding a
+  backslash, `javascript:`, `vbscript:`, `data:` or `@import` is dropped too.
 - A `style` attribute is never copied. Each declaration whose property is an allow-listed
   presentation attribute, and whose value passes the check above, is written out as that attribute.
+  `transform` and `transform-origin` are left out, because their CSS grammar is not the attribute's.
   Copying CSS through would need a CSS parser to vet it, and dropping it whole would lose the colours
   most editors store there.
 
 Comments, processing instructions and any `<!DOCTYPE>` do not reach the output.
 
-**Fail closed, by refusal.** A document that is not well-formed, declares an entity, references an
-external entity, has no `svg` root, or nests past 256 elements is refused with HTTP 422, before the
-download is audited, because no byte leaves. Serving the original bytes instead would hand an
-unvetted SVG to exactly the case the parser could not check: a browser honours an internal DTD that
-`defusedxml` refuses. A `<!DOCTYPE>` with no entity declaration is accepted, since common editors
-still write the SVG 1.1 one. This is the one case where the route refuses a linked attachment it can
-decode; `_safe_attachment_content_type` still decides only the declared type.
+**Fail closed, by refusal.** An SVG that is not well-formed, declares an entity, references an external
+entity, has no `svg` root, nests past 256 elements, or is larger than 8 MiB is refused with HTTP 422.
+The refusal comes before the download is audited, because no byte leaves. Serving the original bytes
+instead would hand an unvetted SVG to exactly the case the parser could not check: a browser honours
+an internal DTD that `defusedxml` refuses. A `<!DOCTYPE>` with no entity declaration is accepted, since
+common editors still write the SVG 1.1 one; Illustrator files that declare entities are refused. The
+size bound exists because the work runs on the thread pool the pipeline's router and transform workers
+share. These are the only cases where the route refuses a linked attachment it can decode, and each is
+an SVG by the rule above; `_safe_attachment_content_type` still decides only the declared type.
+
+**Audited.** When the served bytes are a sanitized copy, the `attachment_download` audit row carries
+`"served": "sanitized-svg"`, so the row is never read as a download of the stored document's bytes.
 
 **Unchanged.** The stored value, delivery, the inert-type allow-list, `Content-Disposition:
 attachment`, `nosniff` and the sandbox CSP. The sanitizer sits beside those controls, not in place of
 them.
 
-**What this leaves open.** The declared type stays `application/octet-stream`, so a browser still
-downloads rather than previews an SVG. Whether a sanitized SVG may be declared `image/svg+xml` is a
-separate decision, and nothing here makes it. No real browser has been run against the download.
+**What this leaves open.**
+
+- The declared type stays `application/octet-stream`, so a browser still downloads rather than
+  previews an SVG. Whether a sanitized SVG may be declared `image/svg+xml` is a separate decision, and
+  nothing here makes it.
+- SVG content inside a document whose root is not `svg`, such as XHTML or another XML document that
+  embeds an `<svg>` element, is not sanitized. It is served as before, under the inert-type downgrade
+  and the sandbox CSP. That is the same exposure any other active XML or HTML attachment has, and it
+  sits outside 1.3.4's SVG scope.
+- No real browser has been run against the download.

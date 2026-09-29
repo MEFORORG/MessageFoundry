@@ -952,10 +952,10 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   none can be framed -- `frame-ancestors` is named in that policy rather than left to the API's
   header floor because it takes no fallback from `default-src` (ASVS 3.4.6). Trade-off: `svg`/`html` attachments no
   longer preview in the browser; the bytes are unchanged and still downloadable, since the allow-list
-  governs the declared type and never whether the file is served. The one exception is an SVG, found by
-  its label or its root element: the route serves a copy rebuilt from a tag and attribute allow-list
-  (`api/svg_sanitize.py`, ADR 0105 amendment 2026-09-28), and refuses with HTTP 422 an SVG it cannot
-  parse safely; the stored value stays verbatim either way.
+  governs the declared type and never whether the file is served. An SVG is the exception: the route
+  serves a copy rebuilt from a tag and attribute allow-list, or refuses with HTTP 422 one it cannot
+  vet, and the stored value stays verbatim either way. What counts as an SVG, and what is kept or
+  refused, is recorded once, in ADR 0105's 2026-09-28 amendment.
 - **XSS-safe rendering.** All HL7/message content is escaped by an autoescape-by-default renderer and a
   strict CSP (`script-src 'self'`, no `unsafe-*`); attacker-influenced HL7 cannot execute in the DOM.
 - **Residual (documented, not a claimed control):** a shared clinical workstation, browser devtools, or a

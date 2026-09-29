@@ -4325,10 +4325,12 @@ def create_app(
         # ASVS 1.3.4 (ADR 0105, amendment 2026-09-28): an SVG is served as its tag and attribute
         # allow-listed copy. Only the SERVED bytes change; the stored OBX-5.5 value stays verbatim. An
         # SVG the parser cannot vet is refused before the audit, since no byte of it leaves. The
-        # pre-check keeps a PDF or an image off the thread pool.
+        # pre-check keeps a PDF or an image off the thread pool. The audit row says when the served
+        # bytes are a sanitized copy, so they are never mistaken for the stored document's.
+        audit_detail = {"message_id": message_id, "attachment_id": attachment_id}
         if may_be_svg(match["content_type"], body):
             try:
-                body = await asyncio.to_thread(sanitize_if_svg, match["content_type"], body)
+                served = await asyncio.to_thread(sanitize_if_svg, match["content_type"], body)
             except SvgRejected as exc:
                 _log.warning(
                     "attachment download refused: SVG could not be sanitized "
@@ -4337,6 +4339,9 @@ def create_app(
                     attachment_id,
                 )
                 raise HTTPException(422, "attachment is SVG that cannot be sanitized") from exc
+            if served is not body:
+                body = served
+                audit_detail["served"] = "sanitized-svg"
         # Audit the PHI access BEFORE the bytes leave: record_view for the per-message timeline +
         # attachment_download in the tamper-evident chain (with the acting user + the id pair, NO bytes).
         await engine.store.record_view(message_id, actor=identity.username)
@@ -4344,7 +4349,7 @@ def create_app(
             "attachment_download",
             actor=identity.username,
             channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id, "attachment_id": attachment_id}),
+            detail=json.dumps(audit_detail),
             client=client_ip(request),
         )
         # Neutralize at serve (ASVS 1.3.4): the sender-influenced OBX-5.2 label is declared only when it
