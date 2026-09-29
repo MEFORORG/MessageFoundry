@@ -241,7 +241,7 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import config_fingerprint_detail
+from messagefoundry.config.fingerprint import config_fingerprint_detail, fingerprint_matches
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -5764,7 +5764,8 @@ def create_app(
         if target is not None:
             try:
                 current = await asyncio.to_thread(config_fingerprint_detail, target)
-                drift = current.get("fingerprint") != fp
+                # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift.
+                drift = not fingerprint_matches(current.get("fingerprint"), fp)
             except OSError:  # dir unreadable now — report clean rather than a false DRIFT alarm
                 drift = False
         git_head = loaded.get("git_head") if loaded else None

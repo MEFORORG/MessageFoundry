@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import http.client
 import ipaddress
 import json
@@ -7017,7 +7018,17 @@ class AuthService:
         if user is None:
             return False
         creds = await self._store.list_webauthn_credentials(identity.user_id)
-        target = next((c for c in creds if c.credential_id_hash == credential_id_hash), None)
+        # ASVS 11.2.4 (BACKLOG #1167). Every credential is compared, and each compare is constant-time
+        # over bytes: a `next(... == ...)` search stopped at the matching slot and its `==` stopped at
+        # the first differing character. `surrogatepass` keeps the encode total on a caller's string.
+        wanted = credential_id_hash.encode("utf-8", "surrogatepass")
+        target: WebAuthnCredential | None = None
+        for cred in creds:
+            same = hmac.compare_digest(
+                cred.credential_id_hash.encode("utf-8", "surrogatepass"), wanted
+            )
+            if same and target is None:
+                target = cred  # recorded, NOT returned -- the walk runs to the end
         if target is None:
             return False
         last_second_factor = len(creds) == 1 and not user.totp_enabled

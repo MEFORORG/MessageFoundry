@@ -26,6 +26,7 @@ set (:data:`SUPPORTED_COSE_ALGS`), and the key type and curve each algorithm mus
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
 import logging
 import secrets
@@ -358,7 +359,14 @@ class ChallengeCache:
         knowing this cache is a dict keyed by tuples, and an attribute-level reach would break
         silently the day that changes.
         """
-        moved = [(k, e) for k, e in self._entries.items() if k[0] == old_token_hash]
+        # Constant-time over bytes (ASVS 11.2.4, BACKLOG #1167): the key is a session token hash, and
+        # `==` stops at the first differing character. The comprehension already visits every entry.
+        old = old_token_hash.encode("utf-8", "surrogatepass")
+        moved = [
+            (k, e)
+            for k, e in self._entries.items()
+            if hmac.compare_digest(k[0].encode("utf-8", "surrogatepass"), old)
+        ]
         for key, entry in moved:
             del self._entries[key]
             self._entries[(new_token_hash, key[1])] = entry
