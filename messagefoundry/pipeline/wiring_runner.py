@@ -2765,6 +2765,16 @@ class RegistryRunner:
         # NotDeployedError and the scheduler would log an exception EVERY tick.
         if not self._deployed(name, kind):
             return
+        # PARKED BY THE DR RUN-PROFILE (#61, ADR 0048): a below-threshold connection is deliberately
+        # not up this run, and the run-profile, not the calendar, decides that. The start branch is
+        # the #115 flaw class again: a scheduler tick is the ENGINE, and `start_inbound` treats its
+        # caller as an operator overriding the profile, so an in-window tick bound the listener and
+        # cleared the `filtered` marker (BACKLOG #2067). Gated above BOTH branches, as the deployed
+        # gate is: an outbound DR park is connector-less and unpaused, and pausing and resuming it on
+        # the calendar drives nothing. An operator start of an INBOUND clears its marker, and from then
+        # the calendar owns it again; a reload re-evaluates the profile for both directions.
+        if (kind, name) in self._filtered:
+            return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
         # An operator-required STOP (#109 credential fault, or the internal-error STOP policy) outranks

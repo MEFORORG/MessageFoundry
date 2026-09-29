@@ -588,6 +588,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   pause the stopped lane and the next open resume it, retrying the fault every window. The
   dispatcher now reports every STOP to the runner, which holds the lane until a real re-arm.
   (`BACKLOG #2072`)
+- **The scheduler no longer starts a connection the DR run-profile parked.** A window open called
+  the same start an operator uses, which reads as overriding the profile. On a DR box it would have
+  bound a below-threshold listener and cleared its `filtered` status. The scheduler now leaves a
+  filtered connection alone in both directions. An operator start still overrides the profile, and
+  the calendar owns the connection from then on. (`BACKLOG #2067`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

@@ -21,6 +21,7 @@ from messagefoundry.config.models import (
     ActiveWindow,
     ConnectorType,
     InternalErrorPolicy,
+    Priority,
     Schedule,
 )
 from messagefoundry.config.wiring import (
@@ -526,6 +527,45 @@ async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
         runner.notify_work()
         assert ("outbound", "OB_SCHED") not in runner._stop_held
         await _wait_until(lambda: attempts == 2)
+    finally:
+        await runner.stop()
+
+
+async def test_a_dr_filtered_inbound_is_not_started_by_its_window(store: MessageStore) -> None:
+    # BACKLOG #2067. A DR run-profile parks a below-threshold inbound (status "filtered"). The window
+    # open called start_inbound, which reads its caller as an operator overriding the profile: it
+    # bound the listener and cleared the marker. Scheduled or not, the profile decides this run.
+    schedule = _weekday_window()
+    clock = _Clock(_OUT_OF_WINDOW)
+    port = _free_port()
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_LOW", MLLP(port=port), router="r", schedule=schedule, priority=Priority.LOW
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, schedule_clock=clock.now, dr_threshold=Priority.CRITICAL
+    )
+    await runner.start()
+    try:
+        assert runner.inbound_filtered("IB_LOW") is not None
+        assert not runner.inbound_running("IB_LOW")
+
+        clock.set(_NEXT_WINDOW)  # the window opens
+        await runner._reconcile_schedule("IB_LOW", "inbound", schedule)
+
+        assert not runner.inbound_running("IB_LOW")  # the listener stayed down
+        assert runner.inbound_filtered("IB_LOW") is not None  # and the marker is still the DR's
+
+        # Control: an operator start is the override the profile allows. It clears the marker, and
+        # the calendar owns the connection from then on, so the next close parks it.
+        await runner.start_inbound("IB_LOW")
+        assert runner.inbound_filtered("IB_LOW") is None
+        clock.set(_utc(2026, 7, 14, 18))
+        await runner._reconcile_schedule("IB_LOW", "inbound", schedule)
+        assert not runner.inbound_running("IB_LOW")
     finally:
         await runner.stop()
 
