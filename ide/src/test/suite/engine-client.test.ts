@@ -5,7 +5,19 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Socket } from "node:net";
 
-import { GET_TIMEOUT_MS, HttpError, NetworkError, TIMEOUT_CODE, getJson } from "../../engineClient";
+import {
+  GET_TIMEOUT_MS,
+  HTTP_PENDING_APPROVAL,
+  HeldError,
+  HttpError,
+  NetworkError,
+  TIMEOUT_CODE,
+  approvalText,
+  classifyApprovable,
+  getJson,
+  postApprovable,
+  postJson,
+} from "../../engineClient";
 import { classifyHealth, resolveEngineStatusTarget } from "../../engineStatusModel";
 
 // F2: a hung engine (accepts the socket but never answers) must not leave the status probe pending
@@ -126,5 +138,117 @@ suite("engineClient — getJson sends the bearer only when given one (BACKLOG #3
     await getJson(url, "/ai/policy");
     assert.strictEqual(seen, undefined);
     assert.strictEqual(sawHeader, false, "the header key must not be present");
+  });
+});
+
+// BACKLOG #1981 — a route dual control may hold answers 202 with a PendingApprovalResponse body
+// (messagefoundry/api/models.py). postJson used to read every 2xx as the expected type, so a held action
+// came back as a "result" with undefined fields. postApprovable keeps the status and tags the outcome.
+suite("engineClient — postApprovable tells a hold from a result (BACKLOG #1981)", () => {
+  let server: http.Server;
+  let url: string;
+  let replyStatus = 200;
+  let replyBody: unknown = {};
+
+  const pendingBody = {
+    approval_id: "0f3c9a4e5b6d47e8a1b2c3d4e5f60718",
+    operation: "config_reload",
+    status: "pending_approval",
+    detail: "held for a second approver (dual-control)",
+  };
+
+  setup(async () => {
+    replyStatus = 200;
+    replyBody = {};
+    server = http.createServer((_req, res) => {
+      res.writeHead(replyStatus, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(replyBody));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${addr.port}`;
+  });
+
+  teardown(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test("the hold status is the engine's 202", () => {
+    assert.strictEqual(HTTP_PENDING_APPROVAL, 202);
+  });
+
+  test("a 202 with a pending-approval body is HELD, carrying the approval id", async () => {
+    replyStatus = 202;
+    replyBody = pendingBody;
+    const out = await postApprovable<{ inbound: number }>(url, "/config/reload", {}, "tok");
+    assert.deepStrictEqual(out, { kind: "held", hold: { approvalId: pendingBody.approval_id } });
+  });
+
+  test("control: a 200 with a result body is DONE, with the body as sent", async () => {
+    replyStatus = 200;
+    replyBody = { inbound: 3 };
+    const out = await postApprovable<{ inbound: number }>(url, "/config/reload", {}, "tok");
+    assert.deepStrictEqual(out, { kind: "done", body: { inbound: 3 } });
+  });
+
+  test("a 202 with an odd body is still HELD, never success and never a failure", async () => {
+    // A failure would invite a retry, and each retry leaves another pending approval.
+    replyStatus = 202;
+    replyBody = { inbound: 3 };
+    const out = await postApprovable<{ inbound: number }>(url, "/config/reload", {}, "tok");
+    assert.deepStrictEqual(out, { kind: "held", hold: { approvalId: undefined } });
+  });
+
+  test("a non-2xx still rejects with HttpError, exactly as postJson does", async () => {
+    replyStatus = 403;
+    replyBody = { detail: "forbidden" };
+    await assert.rejects(
+      () => postApprovable(url, "/config/reload", {}, "tok"),
+      (e: unknown) => e instanceof HttpError && e.status === 403 && e.message === "forbidden",
+    );
+  });
+
+  test("postJson REJECTS a hold with a typed HeldError rather than reading it as a result", async () => {
+    for (const body of [pendingBody, {}]) {
+      replyStatus = 202;
+      replyBody = body;
+      await assert.rejects(
+        () => postJson(url, "/dead-letters/replay", {}, "tok"),
+        (e: unknown) =>
+          e instanceof HeldError &&
+          !(e instanceof HttpError) &&
+          e.approvalId === (body === pendingBody ? pendingBody.approval_id : undefined) &&
+          e.message.includes("held this action for a second approver"),
+      );
+    }
+  });
+
+  test("control: postJson still decodes an ordinary 2xx body as before", async () => {
+    replyStatus = 200;
+    replyBody = { ok: true };
+    assert.deepStrictEqual(await postJson(url, "/auth/logout", {}, "tok"), { ok: true });
+  });
+
+  test("a 202 id that is not a short token is dropped, never cut short or shown", () => {
+    for (const approval_id of ["", "   ", "a".repeat(129), "id with spaces", "abc.def", 42]) {
+      const out = classifyApprovable(202, { ...pendingBody, approval_id });
+      assert.deepStrictEqual(out, { kind: "held", hold: { approvalId: undefined } }, String(approval_id));
+    }
+    for (const body of [null, "pending_approval", [pendingBody]]) {
+      assert.deepStrictEqual(classifyApprovable(202, body), {
+        kind: "held",
+        hold: { approvalId: undefined },
+      });
+    }
+  });
+
+  test("a missing id is named as missing in the text, not printed as blank", () => {
+    assert.strictEqual(approvalText("abc"), "approval abc");
+    assert.ok(approvalText(undefined).includes("did not report an approval id"));
+  });
+
+  test("the status decides, not the body: a 200 carrying a pending shape is DONE", () => {
+    // The Python client (`_decode_approvable`) keys on the status the same way.
+    assert.strictEqual(classifyApprovable(200, pendingBody).kind, "done");
   });
 });
