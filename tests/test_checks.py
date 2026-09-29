@@ -567,6 +567,21 @@ def _run_dryrun(cfg: Path, msgs: Path) -> checks.CheckResult:
     return next(r for r in results if r.name == "dryrun")
 
 
+def _assert_the_gate_blocks_on_dryrun(cfg: Path, msgs: Path) -> checks.CheckResult:
+    """Assert the WHOLE GATE fails because of the dryrun check, and return that check.
+
+    Asserting only the dryrun check's own ``ok`` flag proves the check noticed, not that the gate
+    blocked: with ``CheckResult.blocking`` stubbed to ``False`` both ``.expect`` failure tests below
+    stayed green (Fable packet 10, part 6, control C; BACKLOG #1746 limb 1). ``blocking`` and the
+    report verdict are what ``messagefoundry check`` turns into its exit code.
+    """
+    report = run_checks(cfg, messages_dir=msgs, run_lint=False)
+    dr = next(r for r in report.results if r.name == "dryrun")
+    assert dr.blocking, dr
+    assert report.ok is False, [r.name for r in report.results if r.blocking]
+    return dr
+
+
 def _feed_fixture(tmp_path: Path, body: bytes, expect: str | None) -> Path:
     msgs = tmp_path / "messages" / "IB_X"
     msgs.mkdir(parents=True)
@@ -587,7 +602,7 @@ def test_expect_received_matches_delivering_fixture(tmp_path: Path) -> None:
 def test_expect_mismatch_fails(tmp_path: Path) -> None:
     cfg = _delivering_config(tmp_path)  # actually RECEIVED
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "FILTERED\n")
-    dr = _run_dryrun(cfg, msgs)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required
     assert "expected FILTERED" in dr.detail and "RECEIVED" in dr.detail
 
@@ -617,7 +632,7 @@ def test_expect_processed_aliases_received(tmp_path: Path) -> None:
 def test_expect_invalid_value_fails(tmp_path: Path) -> None:
     cfg = _delivering_config(tmp_path)
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "BOGUS")
-    dr = _run_dryrun(cfg, msgs)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required
     assert "invalid .expect" in dr.detail
 
