@@ -723,10 +723,13 @@ tuple: they act only on the caller's own account.
 > principal whose identifier disagrees with the row holding its username is refused rather than handed
 > that row. A recycled name gets a new account with a new `user_id`.
 >
-> **One residual, and it is the honest limit of the control.** A directory that returns no immutable
-> identifier at all still resolves by username; the engine cannot key on an identifier it is never
-> given. The engine warns once per distinct cause -- the attribute absent, or present in a shape it
-> cannot read -- so a site on that path is told rather than left to assume the control is running.
+> **A directory that returns no immutable identifier signs nobody in (BACKLOG #2027).** It used to
+> resolve by username, which left the recycle open on that path. A Windows SSO sign-in whose
+> principal carries no `objectGUID` is now refused as `directory_object_id_missing`, and so is an AD
+> step-up re-bind on a row with none. A re-bind that binds a different directory object than the
+> row's own is refused too, and neither refusal counts toward the lockout. The engine warns once per
+> distinct cause -- the attribute absent, or present in a shape it cannot read -- so a site on that
+> path learns why its sign-ins fail.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is

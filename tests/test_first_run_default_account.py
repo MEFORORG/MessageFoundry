@@ -58,6 +58,7 @@ async def _directory_signed_in(store: Store) -> str:
         email="dana@example.invalid",
         dn="cn=dana,ou=people,dc=example,dc=invalid",
         groups=frozenset({"cn=everyone,ou=groups,dc=example,dc=invalid"}),
+        directory_object_id="a79c897c-1793-5458-bd1b-b3ae0642c0e3",
     )
     outcome = await AuthService(store, AuthSettings())._complete_ad_login(
         principal, None, mfa_verified=True

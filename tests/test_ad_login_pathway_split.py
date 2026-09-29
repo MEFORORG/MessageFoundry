@@ -27,6 +27,8 @@ All directory data here is synthetic.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from messagefoundry.auth.identity import AuthProvider
@@ -48,6 +50,11 @@ def _ad_settings(**over: object) -> AuthSettings:
     return AuthSettings(**base)  # type: ignore[arg-type]
 
 
+def _oid(username: str) -> str:
+    """The synthetic ``objectGUID`` the fake directory gives ``username`` (BACKLOG #2027)."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, username))
+
+
 def _principal(username: str) -> AdPrincipal:
     return AdPrincipal(
         username=username,
@@ -55,6 +62,7 @@ def _principal(username: str) -> AdPrincipal:
         email=f"{username}@test.invalid",
         dn=f"CN={username},OU=Staff,DC=test,DC=invalid",
         groups=frozenset({"CN=mf-operators,OU=Groups,DC=test,DC=invalid"}),
+        directory_object_id=_oid(username),
     )
 
 
@@ -170,7 +178,9 @@ async def test_the_refusal_is_the_retirement_and_not_a_broken_fixture() -> None:
         assert ldap.binds == []  # never reached the directory
 
         # CONTROL: the identical credential still binds on the surviving path.
-        assert await service._reauth_ad("ad-user", "synthetic-good") is True
+        assert (
+            await service._reauth_ad("ad-user", "synthetic-good", object_id=_oid("ad-user"))
+        ).verdict is True
         assert ldap.binds == ["ad-user"]
     finally:
         await store.close()
@@ -202,7 +212,9 @@ async def test_step_up_re_bind_survives_the_login_pathway_being_retired() -> Non
         ldap = _FakeLdap()
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
         await service.initialize()
-        assert await service._reauth_ad("sso-user", "synthetic-good") is True
+        assert (
+            await service._reauth_ad("sso-user", "synthetic-good", object_id=_oid("sso-user"))
+        ).verdict is True
         assert ldap.binds == ["sso-user"]
     finally:
         await store.close()
@@ -218,7 +230,9 @@ async def test_step_up_re_bind_still_rejects_a_bad_credential() -> None:
             ldap=_FakeLdap(),  # type: ignore[arg-type]
         )
         await service.initialize()
-        assert await service._reauth_ad("sso-user", "synthetic-wrong") is False
+        assert (
+            await service._reauth_ad("sso-user", "synthetic-wrong", object_id=_oid("sso-user"))
+        ).verdict is False
     finally:
         await store.close()
 
@@ -240,6 +254,8 @@ async def test_step_up_re_bind_treats_a_directory_outage_as_a_refusal() -> None:
         await service.initialize()
         # None, not False (BACKLOG #1138): a refusal either way, but an outage is not a guess, so the
         # caller must not count it toward the engine lockout.
-        assert await service._reauth_ad("sso-user", "synthetic-good") is None
+        assert (
+            await service._reauth_ad("sso-user", "synthetic-good", object_id=_oid("sso-user"))
+        ).verdict is None
     finally:
         await store.close()

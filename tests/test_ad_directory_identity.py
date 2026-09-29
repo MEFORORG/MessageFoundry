@@ -27,7 +27,7 @@ import pytest
 
 from messagefoundry.auth import Role
 from messagefoundry.auth import ldap as ldap_module
-from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.auth.identity import AuthProvider, Identity
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     LdapAuthenticator,
@@ -36,7 +36,7 @@ from messagefoundry.auth.ldap import (
     object_guid_filter_value,
 )
 from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 
@@ -703,23 +703,70 @@ async def test_an_unbound_row_is_never_adopted_by_name() -> None:
         await store.close()
 
 
-async def test_a_directory_that_returns_no_identity_still_resolves_by_name() -> None:
-    """The fallback, pinned so it is a decision rather than an accident: with no id on either side
-    the behaviour is what shipped before the column existed. The engine cannot key on an identifier
-    it is never given."""
+async def test_a_directory_that_returns_no_identity_signs_nobody_in() -> None:
+    """BACKLOG #2027 REVERSED what this test used to pin. It was named
+    ``..._still_resolves_by_name`` and asserted that a principal with no id signed in by its name,
+    twice, onto one row. That name fallback is the recycle ADR 0184 AC-5 forbids, so a principal
+    with no id is now refused, on first sight as well as against a row, and no row is minted."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
-        first = await service._complete_ad_login(
-            _principal("jsmith", None), None, mfa_verified=True
+        out = await service._complete_ad_login(_principal("jsmith", None), None, mfa_verified=True)
+        assert not out.ok and out.reason == DIRECTORY_OBJECT_ID_MISSING
+        assert out.token is None and out.identity is None
+        assert await store.get_user_by_username("jsmith") is None, "the refusal minted a row"
+        rows = await store.list_audit(action="auth.login_failed", actor="jsmith")
+        assert [str(dict(r)["detail"]) for r in rows] == [
+            '{"provider": "ad", "reason": "directory_object_id_missing"}'
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_reissued_name_cannot_reach_an_id_less_row() -> None:
+    """BACKLOG #2027, THE ATTACK. A row with no id, planted or made before #1471, and a directory
+    that returns no readable ``objectGUID``: the name is the only key, and the directory has reissued
+    it to a new person. That person's sign-in must not reach the row, keep its ``user_id``, or write
+    their groups onto it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        await store.create_user(
+            user_id="legacy-row",
+            username="jsmith",
+            auth_provider=AuthProvider.AD.value,
+            display_name="J Smith",
+            email="jsmith@example.org",
         )
-        second = await service._complete_ad_login(
-            _principal("jsmith", None), None, mfa_verified=True
-        )
-        assert first.ok and second.ok
-        assert first.identity is not None and second.identity is not None
-        assert first.identity.user_id == second.identity.user_id
-        assert first.identity.roles == frozenset({Role.OPERATOR})
+        roles_before = set(await store.get_user_role_ids("legacy-row"))
+        out = await service._complete_ad_login(_principal("jsmith", None), None, mfa_verified=True)
+        assert not out.ok and out.reason == DIRECTORY_OBJECT_ID_MISSING
+        assert out.token is None and out.identity is None
+        assert set(await store.get_user_role_ids("legacy-row")) == roles_before
+        row = await store.get_user_by_username("jsmith")
+        assert row is not None and row.id == "legacy-row" and row.directory_object_id is None
+        assert await store.list_audit(action="auth.login_success") == []
+    finally:
+        await store.close()
+
+
+async def test_a_kerberos_sign_in_with_no_directory_id_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same refusal through the real Kerberos entry point, which passes no mechanism slug. The
+    caller gets the generic failure; the reason is on the audit row and the outcome only."""
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+    monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "jsmith")
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _kerberos_service(store, _principal("jsmith", None))
+        out = await service.authenticate_kerberos(b"spnego-token")
+        assert not out.ok and out.reason == DIRECTORY_OBJECT_ID_MISSING
+        assert out.error == "invalid credentials"
+        assert await store.get_user_by_username("jsmith") is None
+        failures = await store.list_audit(action="auth.login_failed", actor="jsmith")
+        assert len(failures) == 1
+        assert '"reason": "directory_object_id_missing"' in str(dict(failures[0])["detail"])
     finally:
         await store.close()
 
@@ -1253,5 +1300,140 @@ async def test_a_locked_mirror_row_does_not_complete_a_kerberos_login(
         assert row is not None
         assert row.locked_until == pytest.approx(locked_until), "the Kerberos re-login unlocked it"
         assert row.failed_attempts == 5
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2027: the step-up re-bind must prove the row's OWN directory object ------------------
+#
+# ``_reauth_ad`` finds its bind entry by the stored username, a label a directory may reissue. These
+# drive ``reauth`` itself, so the refusal is read where a caller meets it: the outcome, the directory
+# round trips, the engine lockout counter and the ``auth.reauth`` audit row.
+
+
+class _RebindDirectory:
+    """A directory whose re-bind answer the test sets. ``bound`` is who a good password binds as;
+    ``named`` is who the name resolves to after a refusal. ``binds`` counts password binds."""
+
+    def __init__(self, bound: AdPrincipal | None, named: AdPrincipal | None) -> None:
+        self.bound = bound
+        self.named = named
+        self.binds = 0
+
+    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        self.binds += 1
+        return self.bound if password == "synthetic-good" else None
+
+    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
+        return self.named
+
+
+async def _reauth_session(
+    store: MessageStore, directory: _RebindDirectory, *, keep_id: bool = True
+) -> tuple[AuthService, Identity, str]:
+    """A signed-in directory account keyed to ``GUID_A_TEXT``; ``keep_id=False`` then clears the
+    column, which is the legacy row no sign-in can mint since BACKLOG #2027."""
+    settings = AuthSettings(
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+        require_mfa=False,
+    )
+    service = AuthService(store, settings, ldap=directory)  # type: ignore[arg-type]
+    await service.initialize()
+    await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+    out = await service._complete_ad_login(
+        _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+    )
+    assert out.ok and out.identity is not None and out.token is not None, out.error
+    if not keep_id:
+        await store._db.execute(
+            "UPDATE users SET directory_object_id = NULL WHERE id = ?", (out.identity.user_id,)
+        )
+        await store._db.commit()
+    return service, out.identity, out.token
+
+
+async def _reauth_rows(store: MessageStore) -> list[str]:
+    return [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.reauth")]
+
+
+async def test_a_re_bind_on_a_row_with_no_directory_id_is_refused_unasked() -> None:
+    """No id to check the bind against, so the password never leaves the engine, and nothing counts:
+    the caller did not guess wrong."""
+    store = await MessageStore.open(":memory:")
+    try:
+        directory = _RebindDirectory(_principal("jsmith", GUID_A_TEXT), None)
+        service, identity, token = await _reauth_session(store, directory, keep_id=False)
+        elevation = await service.reauth(identity, "synthetic-good", token=token)
+        assert not elevation.ok and elevation.token is None
+        assert directory.binds == 0, "the password was sent to the directory for an id-less row"
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.failed_attempts == 0
+        assert any(
+            '"reason": "directory_object_id_missing"' in d for d in await _reauth_rows(store)
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("bound_id", [GUID_B_TEXT, None], ids=["another-object", "no-id"])
+async def test_a_re_bind_that_binds_another_directory_object_is_refused(
+    bound_id: str | None,
+) -> None:
+    """The name now binds a DIFFERENT object, or one whose id cannot be read: a good password for
+    that entry proves nothing about this row's holder. Refused, and not counted."""
+    store = await MessageStore.open(":memory:")
+    try:
+        directory = _RebindDirectory(_principal("jsmith", bound_id), None)
+        service, identity, token = await _reauth_session(store, directory)
+        elevation = await service.reauth(identity, "synthetic-good", token=token)
+        assert not elevation.ok and elevation.token is None
+        assert directory.binds == 1
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.failed_attempts == 0
+        assert any(
+            '"reason": "directory_identity_conflict"' in d for d in await _reauth_rows(store)
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_refused_re_bind_against_another_object_is_not_counted() -> None:
+    """A wrong password judged against the name's NEW holder is nobody's guess at this row, so it
+    must not feed this row's lockout."""
+    store = await MessageStore.open(":memory:")
+    try:
+        directory = _RebindDirectory(None, _principal("jsmith", GUID_B_TEXT))
+        service, identity, token = await _reauth_session(store, directory)
+        elevation = await service.reauth(identity, "synthetic-wrong", token=token)
+        assert not elevation.ok
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.failed_attempts == 0
+        assert any(
+            '"reason": "directory_identity_conflict"' in d for d in await _reauth_rows(store)
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts() -> None:
+    """THE CONTROL for the three refusals above: the same fixtures with the row's own id count a
+    wrong password and elevate on a good one, so the refusals are the id check and not a broken
+    fake."""
+    store = await MessageStore.open(":memory:")
+    try:
+        own = _principal("jsmith", GUID_A_TEXT)
+        directory = _RebindDirectory(own, own)
+        service, identity, token = await _reauth_session(store, directory)
+        wrong = await service.reauth(identity, "synthetic-wrong", token=token)
+        assert not wrong.ok
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.failed_attempts == 1
+        good = await service.reauth(identity, "synthetic-good", token=token)
+        assert good.ok and good.token is not None
+        assert not any('"reason"' in d for d in await _reauth_rows(store))
     finally:
         await store.close()

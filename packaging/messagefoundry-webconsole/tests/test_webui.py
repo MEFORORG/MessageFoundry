@@ -5393,6 +5393,7 @@ def _ad_service(engine: Engine) -> AuthService:
         email="j@x",
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-admins,dc=x"}),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
     class _FakeLdap:
@@ -5588,6 +5589,7 @@ def _sso_service(engine: Engine) -> AuthService:
         email="j@x",
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-admins,dc=x"}),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
     class _FakeLdap:

@@ -1029,6 +1029,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a directory account with no directory id no longer signs in or steps up by its
+  username.** A Windows SSO sign-in whose directory entry carries no readable `objectGUID` is now
+  refused, whether or not an account already exists for that name, and no account is created. The
+  web console shows the generic SSO failure, and the `auth.login_failed` audit row carries
+  `directory_object_id_missing`. The AD step-up re-bind (`POST /me/reauth`, `POST /ui/reauth`) is
+  refused with the same reason on an account with no directory id, before the password is sent to
+  the directory. It is also refused when the bind reaches a different directory object than the
+  account's own, or one with no readable id; that `auth.reauth` row carries
+  `directory_identity_conflict`. None of these refusals counts toward the account lockout.
+  - **Why.** A username is the only key such an account has, and a directory can give a freed
+    username to a new person. That person's sign-in would then reach the old account and give it
+    their groups, and their password would step up the old account's session (ADR 0184 AC-5).
+  - **The cost.** A directory that does not return `objectGUID` to the service account signs nobody
+    in through Windows SSO. The engine logs a warning naming the cause once. The fix is to make the
+    attribute readable to the service account. An account left with no directory id is removed, and
+    the person signs in again to create it with one.
+  - **The step-up check needs no extra directory read.** The bind already returns the bound
+    entry's `objectGUID`, and a refused bind reuses the lookup it already made.
+
+  (`BACKLOG #2027`, ADR 0184)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -1142,8 +1162,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer asks about such an account by its username either. It skips it and writes one
   `auth.ad_reconcile_binding_unkeyed` row with the same reason, once per account per process. That
   is a new audit action, separate from the outage's `auth.ad_reconcile_skipped`, because it is not
-  benign. On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds
-  such an account by its username, as it finds any account with no directory id there.
+  benign. A Windows SSO sign-in to such an account is refused as well, by the entry at the top of
+  this section; before that entry it still found the account by its username.
   - **Why.** The username is the only key such an account has. A directory can give a freed
     username to a new person, and the linked account would then take that person's groups (ADR
     0184 AC-5).

@@ -164,6 +164,7 @@ async def test_ad_user_reauth_uses_a_live_rebind(engine: Engine) -> None:
         email=None,
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-admins,dc=x"}),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
     class _FakeLdap:
@@ -440,6 +441,7 @@ async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> N
         email=None,
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-admins,dc=x"}),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
     class _FakeLdap:

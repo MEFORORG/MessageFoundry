@@ -308,6 +308,7 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-admins,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:

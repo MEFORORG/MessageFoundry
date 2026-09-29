@@ -467,6 +467,7 @@ async def test_ad_role_change_on_relogin_revokes_other_sessions() -> None:
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
@@ -537,6 +538,7 @@ async def test_local_and_ad_session_expiry_is_unchanged_by_the_cap_seam() -> Non
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:
@@ -579,6 +581,7 @@ async def test_ad_login_success_audit_detail_is_byte_identical() -> None:
             email="j@x",
             dn="CN=jdoe,DC=x",
             groups=frozenset({"cn=mf-ops,dc=x"}),
+            directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
         )
 
         class _FakeLdap:

@@ -18,6 +18,7 @@ import ast
 import base64
 import inspect
 import textwrap
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -57,6 +58,7 @@ def _principal(username: str = "jdoe") -> AdPrincipal:
         email=None,
         dn=f"CN={username},DC=x",
         groups=frozenset({ADMINS}),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, username)),
     )
 
 

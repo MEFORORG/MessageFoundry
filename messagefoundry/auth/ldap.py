@@ -231,8 +231,9 @@ def _warn_once_about_object_guid(shape: str) -> None:
         return
     _object_guid_shapes_warned.add(shape)
     logger.warning(
-        "AD %s is unusable (%s); these logins resolve by sAMAccountName, which a directory-side "
-        "name recycle can redirect (BACKLOG #1471). Reported once per shape.",
+        "AD %s is unusable (%s); Windows SSO sign-ins and step-up re-binds for these accounts are "
+        "refused, because a directory can recycle a name (BACKLOG #1471, #2027). Reported once "
+        "per shape.",
         _OBJECT_GUID_ATTR,
         shape,
     )
@@ -245,9 +246,9 @@ def _object_guid(entry: Any) -> str | None:
     formatter ``ldap3`` has registered for this attribute has had an opinion about them.
     """
     if _OBJECT_GUID_ATTR not in entry:
-        # AN ATTRIBUTE THE DIRECTORY NEVER RETURNS IS THE QUIETEST WAY TO BE ON THE OLD PATH, so it
-        # is reported too. Every account at such a site resolves by name, and an operator who is told
-        # nothing has no way to learn that the control they read about is not running for them.
+        # AN ATTRIBUTE THE DIRECTORY NEVER RETURNS IS THE QUIETEST WAY TO FAIL, so it is reported
+        # too. Every Windows SSO sign-in at such a site is refused (BACKLOG #2027), and an operator
+        # who is told nothing sees only refusals, with no hint that the attribute is the cause.
         _warn_once_about_object_guid("absent")
         return None
     attr = entry[_OBJECT_GUID_ATTR]

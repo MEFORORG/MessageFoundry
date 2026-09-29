@@ -612,6 +612,7 @@ def _principal() -> AdPrincipal:
         email="dana@test.invalid",
         dn="CN=dana,OU=Staff,DC=test,DC=invalid",
         groups=frozenset({"CN=mf-operators,OU=Groups,DC=test,DC=invalid"}),
+        directory_object_id="a79c897c-1793-5458-bd1b-b3ae0642c0e3",
     )
 
 
