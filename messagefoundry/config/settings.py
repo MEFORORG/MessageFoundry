@@ -2475,8 +2475,10 @@ class AuthSettings(_Section):
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at
     # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
-    # that owes no second factor counts as the first verification (sudo-timestamp model); a
-    # directory login (Kerberos, OIDC) does not (BACKLOG #1144). Default 5 minutes.
+    # that owes no second factor counts as the first verification (sudo-timestamp model) unless it
+    # comes from an address the account has not signed in from before (BACKLOG #288; see the
+    # seed_reauth argument in AuthService._login_local). A directory login (Kerberos, OIDC) never
+    # does (BACKLOG #1144). Default 5 minutes.
     step_up_max_age_seconds: int = 300
     # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
     # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to
@@ -2627,13 +2629,10 @@ class AuthSettings(_Section):
     # `ad_enabled` means DIRECTORY BIND CAPABILITY -- this engine can reach AD and resolve principals.
     # It is what Kerberos SSO, federated OIDC and the session reconciler each depend on, and it is why
     # they all validate against it rather than against the login pathway below (BACKLOG #1137).
+    # There is no switch for a directory-PASSWORD sign-in: that pathway is retired (BACKLOG #1137),
+    # and AuthService._dispatch_login refuses `provider=ad`. A bind as the user survives only as the
+    # step-up re-bind (`_reauth_ad`).
     ad_enabled: bool = False
-    # Whether a user may present an AD password to OUR login form, which we verify by SIMPLE-binding as
-    # them. Split out of `ad_enabled` because the two are different decisions that happened to share a
-    # switch: wanting federated login (which needs the bind) forced you to also expose this
-    # credential-accepting surface, since `oidc_enabled` refuses to validate without `ad_enabled`.
-    # Defaults True so the split alone changes nothing; whether this pathway should survive at all is a
-    # separate question and deliberately not decided here.
     ad_server: str | None = None  # e.g. ldaps://dc1.example.com:636
     ad_domain: str | None = None  # e.g. example.com (UPN suffix)
     ad_user_search_base: str | None = None
@@ -2721,7 +2720,7 @@ class AuthSettings(_Section):
     ad_session_revoke_max_fraction: float = 0.34  # proportional: ...nor more than this share
 
     # Windows SSO (Kerberos/SPNEGO) — passwordless login from a domain-joined client.
-    # Experimental; off by default. Not a supported v0.1 feature — hardening targeted for 0.2.
+    # Experimental; off by default. Needs ad_enabled.
     kerberos_enabled: bool = False
     # Exactly SERVICE/host, e.g. HTTP/host.example.com; no realm suffix. Refused at load otherwise.
     # Unset or empty calls spnego.server() bare: GSSAPI then uses the default keytab, but SSPI

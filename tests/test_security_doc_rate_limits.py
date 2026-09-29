@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import textwrap
 import tokenize
 from io import StringIO
 from pathlib import Path
@@ -38,7 +39,7 @@ from messagefoundry.config import wiring
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import lockout_escalates
-from tests._ast_sites import call_sites, callee_name, calls_to, named_func
+from tests._ast_sites import call_sites, callee_name, calls_to, named_func, source_has_literal
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -389,6 +390,229 @@ def test_configuration_reference_does_not_repeat_the_retired_falsehoods() -> Non
             f"docs/CONFIGURATION.md's `{field}` row must state that the same value is also the "
             "per-actor credential-ceremony limiter's budget/window — one number, two limiters."
         )
+
+
+_CONNECTIONS_DOC = _ROOT / "docs" / "CONNECTIONS.md"
+_OIDC_ROUTES = _CONSOLE_ROUTES / "oidc.py"
+_ACTION_BOUND_GATES = frozenset({"require_step_up_action", "require_reauth_only_action"})
+_ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete"})
+
+
+def _row(text: str, key: str) -> str:
+    """The table row whose first cell is ``key``, whitespace-collapsed."""
+    return " ".join(
+        next(line for line in text.splitlines() if line.strip().startswith(f"| `{key}`")).split()
+    )
+
+
+def _action_bound_json_routes() -> set[str]:
+    """Every ``METHOD path`` on the JSON auth routes whose handler takes an action-bound step-up.
+
+    Derived from the decorators and the ``Depends`` defaults, so a route that joins or leaves the set
+    changes this answer and the ``require_action_step_up`` row has to follow it.
+    """
+    tree = ast.parse(_AUTH_ROUTES.read_text(encoding="utf-8"))
+    return {
+        route
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and calls_to(node.args, _ACTION_BOUND_GATES)
+        and (route := _route_of(node)) is not None
+    }
+
+
+def _route_of(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """``METHOD path`` from a ``@app.<verb>("<path>", ...)`` decorator, or ``None``."""
+    for deco in func.decorator_list:
+        if (
+            isinstance(deco, ast.Call)
+            and isinstance(deco.func, ast.Attribute)
+            and deco.func.attr in _ROUTE_VERBS
+            and deco.args
+            and isinstance(deco.args[0], ast.Constant)
+            and isinstance(deco.args[0].value, str)
+        ):
+            return f"{deco.func.attr.upper()} {deco.args[0].value}"
+    return None
+
+
+def _seed_reauth_arguments() -> set[str]:
+    """The ``seed_reauth=`` expression at every ``_issue_session`` call in the auth service."""
+    tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
+    return {
+        ast.unparse(keyword.value)
+        for call in call_sites(tree, "_issue_session")
+        for keyword in call.keywords
+        if keyword.arg == "seed_reauth"
+    }
+
+
+def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
+    """Each false statement the ninth 6.1.3 sweep removed, reported if it is back (BACKLOG #1133).
+
+    A function over the two texts, not a read of the files, so the same checks run against any
+    revision of the documents. The vault held 6.1.3 at partial eight times, each time on sentences
+    the previous fix had not reached; these are the rows the ninth whole-table sweep corrected.
+    """
+    section = _config_section(config_text)
+    problems: list[str] = []
+
+    login = _row(section, "login_rate_limit_enabled")
+    if "`GET /ui/sso`, `GET /ui/oidc/start`, `GET /ui/oidc/callback`" in login:
+        problems.append(
+            "login_rate_limit_enabled lists `GET /ui/oidc/start` as an unconditional sign-in entry "
+            "route again; the start leg that always charges is the POST"
+        )
+    if "`POST /ui/oidc/start`" not in login:
+        problems.append("login_rate_limit_enabled does not name `POST /ui/oidc/start`")
+    if "only when" not in login or "the GET charges nothing" not in login:
+        problems.append(
+            "login_rate_limit_enabled does not say `GET /ui/oidc/start` charges only when its "
+            "interstitial is skipped, and nothing on shipped defaults"
+        )
+
+    bind_dn = _row(section, "ad_bind_dn")
+    if "read as absent" in bind_dn:
+        problems.append(
+            "ad_bind_dn says the reconciler reads an unreadable userAccountControl as absent again; "
+            "ADR 0195 maps it to UNDETERMINED"
+        )
+    if "**undetermined**" not in bind_dn or "held" not in bind_dn:
+        problems.append("ad_bind_dn does not say an undetermined wave is held")
+
+    ad_enabled = _row(section, "ad_enabled")
+    if "turn on Active Directory login" in ad_enabled:
+        problems.append("ad_enabled says it turns on AD login again; that sign-in is retired")
+    if "retired" not in ad_enabled or "**directory bind capability**" not in ad_enabled:
+        problems.append(
+            "ad_enabled does not say it is a bind capability and the sign-in is retired"
+        )
+
+    step_up = _row(section, "step_up_max_age_seconds")
+    if "owes no second factor counts as the first verification" in step_up:
+        problems.append(
+            "step_up_max_age_seconds states the local-login seed unconditionally again; a "
+            "first-seen address is born with no window (BACKLOG #288)"
+        )
+    if "first-seen address" not in step_up or "BACKLOG #288" not in step_up:
+        problems.append("step_up_max_age_seconds does not name the first-seen address exception")
+
+    action = _row(section, "require_action_step_up")
+    if "the durable-takeover JSON routes — TOTP enroll/confirm and disable-MFA —" in action:
+        problems.append(
+            "require_action_step_up scopes the action-bound set to the factor routes again"
+        )
+    if "It changes **only** those factor-binding routes" in action:
+        problems.append("require_action_step_up says only the factor-binding routes are bound")
+    for route in sorted(_action_bound_json_routes()):
+        if f"`{route}`" not in action:
+            problems.append(f"require_action_step_up does not name the action-bound `{route}`")
+
+    kerberos = _row(section, "kerberos_enabled")
+    if "0.2 target" in kerberos or "v0.1" in kerberos:
+        problems.append("kerberos_enabled carries the stale 0.2/v0.1 release wording again")
+
+    domains = _row(section, "oidc_allowed_username_domains")
+    if "with neither set while stripping is on" not in domains:
+        problems.append(
+            "oidc_allowed_username_domains states the load refusal without its condition; it "
+            "fires only while oidc_username_strip_domain is on"
+        )
+
+    # Two [api]-section notes that scoped MFA and passkeys to local accounts, which BACKLOG #1144
+    # ended: the MFA gate is provider-blind and a directory account enrols the same factors.
+    flat = " ".join(line.lstrip("> ") for line in config_text.splitlines())
+    if "(`[security].require_mfa`, local accounts" in flat:
+        problems.append("the [api] MFA note scopes require_mfa to local accounts again")
+    if "Browser passkeys for local users" in flat:
+        problems.append("the [api] WebAuthn note scopes passkeys to local users again")
+
+    intake = _row(connections_text, "intake_auth")
+    if "`403`" not in intake:
+        problems.append(
+            "CONNECTIONS.md intake_auth says every refusal is 401; an unlisted mTLS subject is 403"
+        )
+    return problems
+
+
+def test_the_ninth_sweep_config_rows_match_the_code() -> None:
+    """ASVS 6.1.3, ninth re-read (BACKLOG #1133, vault PR 2077): the ``[auth]`` rows stay true."""
+    problems = _ninth_sweep_problems(
+        _CONFIG_DOC.read_text(encoding="utf-8"), _CONNECTIONS_DOC.read_text(encoding="utf-8")
+    )
+    assert not problems, "\n".join(problems)
+
+
+def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
+    """Probe the code each corrected row describes, so a change to it reds here first."""
+    # The OIDC start leg: POST charges the sign-in window; the GET first asks whether its interstitial
+    # is needed, and the shipped [security] defaults make it needed, so the GET charges nothing.
+    oidc = ast.parse(_OIDC_ROUTES.read_text(encoding="utf-8"))
+    start = named_func(oidc, "ui_oidc_start")
+    interstitial = named_func(oidc, "ui_oidc_interstitial")
+    assert _route_of(start) == "POST /ui/oidc/start"
+    assert _route_of(interstitial) == "GET /ui/oidc/start"
+    assert calls_to(start, {"allow_login_attempt"})
+    assert not calls_to(interstitial, {"allow_login_attempt"})
+    assert calls_to(interstitial, {"_interstitial_needed", "ui_oidc_start"}) == {
+        "_interstitial_needed",
+        "ui_oidc_start",
+    }
+    security = ServiceSettings().security
+    assert security.external_link_interstitial is True
+    assert security.organization_domains == []
+    assert security.external_link_allowlist == []
+
+    # An unreadable userAccountControl is UNDETERMINED to the reconciler, and a wave of two is held.
+    from messagefoundry.auth import reconcile
+    from messagefoundry.auth import service as auth_service
+    from messagefoundry.auth.ldap import DirectoryAnswer
+
+    assert (
+        auth_service._REFUSED_OUTCOMES[DirectoryAnswer.UNDETERMINED]
+        is reconcile.ProbeOutcome.UNDETERMINED
+    )
+    assert reconcile.hold_engaged(undetermined=2, readable=5, latched=False)
+
+    # The directory-password sign-in is refused, not dispatched.
+    assert source_has_literal(
+        textwrap.dedent(inspect.getsource(AuthService._dispatch_login)), "pathway_retired"
+    )
+
+    # The local leg withholds the window from a first-seen address; every directory login seeds none.
+    assert _seed_reauth_arguments() == {
+        "combined or (not mfa_required and address is not _LoginAddress.NEW)",
+        "False",
+    }
+
+    # Kerberos needs the directory bind.
+    with pytest.raises(ValueError, match="kerberos_enabled requires ad_enabled"):
+        AuthSettings(kerberos_enabled=True)
+
+    # The action-bound JSON set the require_action_step_up row names.
+    assert _action_bound_json_routes() == {
+        "POST /me/mfa/enroll",
+        "POST /me/mfa/confirm",
+        "DELETE /me/mfa",
+        "DELETE /me/sessions",
+        "DELETE /me/sessions/{session_id}",
+        "PATCH /users/{user_id}",
+        "POST /users/{user_id}/reset-password",
+        "POST /users/{user_id}/reset-mfa",
+        "PUT /users/{user_id}/federated-identity",
+        "DELETE /users/{user_id}/federated-identity",
+    }
+
+    # HTTP intake: an unlisted mTLS subject is an AUTHORIZATION failure, answered 403.
+    from messagefoundry.transports.http_listener import HttpSource
+
+    peer_cert = ast.parse(textwrap.dedent(inspect.getsource(HttpSource._authorize_peer_cert)))
+    statuses = {
+        call.args[0].value
+        for call in call_sites(peer_cert, "HttpRequestError")
+        if call.args and isinstance(call.args[0], ast.Constant)
+    }
+    assert statuses == {401, 403}
 
 
 def test_business_logic_limit_table_states_both_dimensions_for_every_row() -> None:
