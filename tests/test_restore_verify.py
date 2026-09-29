@@ -815,7 +815,7 @@ def test_an_undeletable_directory_is_emptied_and_the_verdict_stands(
         "extracted_store.db",
     ]
     assert _non_empty_files(iso) == []
-    assert any("no file in it holds decrypted bytes" in r.getMessage() for r in caplog.records)
+    assert any("no file in it holds plaintext" in r.getMessage() for r in caplog.records)
 
 
 def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(

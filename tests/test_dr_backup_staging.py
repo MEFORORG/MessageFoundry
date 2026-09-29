@@ -276,24 +276,29 @@ async def test_a_run_cancelled_during_the_build_is_cleaned_up_by_its_worker(
         return real_build(self, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(BackupRunner, "_build_archive_blocking", slow_build)
-    task = asyncio.create_task(_runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0))
-    assert await asyncio.to_thread(entered.wait, 30)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        task = asyncio.create_task(
+            _runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0)
+        )
+        assert await asyncio.to_thread(entered.wait, 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    # The worker still holds the directory, and a sweep proves it live rather than abandoned.
-    (live,) = _staging_dirs(data_dir)
-    assert await asyncio.to_thread(dr_backup._sweep_abandoned_staging, data_dir.absolute()) == 0
-    assert live.is_dir()
+        # The worker still holds the directory, and a sweep proves it live rather than abandoned.
+        (live,) = _staging_dirs(data_dir)
+        assert await asyncio.to_thread(dr_backup._sweep_abandoned_staging, data_dir.absolute()) == 0
+        assert live.is_dir()
 
-    release.set()
-    deadline = time.monotonic() + 30
-    while live.exists() and time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
-    await store.close()
-    assert not live.exists(), "the worker did not remove its staging directory"
-    assert _everything_under(iso) == []
+        release.set()
+        deadline = time.monotonic() + 30
+        while live.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert not live.exists(), "the worker did not remove its staging directory"
+        assert _everything_under(iso) == []
+    finally:
+        release.set()
+        await store.close()
 
 
 # --- the orphan sweep: by lock, never by age, and never at serve start ------------------
@@ -393,14 +398,144 @@ async def test_the_sweep_runs_at_the_next_backup_never_at_serve_start(
         instance="dev",
     )
     monkeypatch.setattr(runner, "_backup_due", lambda _now: False)
-    runner.start()
-    await asyncio.sleep(0.05)
-    await runner.stop()
-    assert dead.is_dir(), "serve start swept a staging directory"
+    try:
+        runner.start()
+        await asyncio.sleep(0.05)
+        await runner.stop()
+        assert dead.is_dir(), "serve start swept a staging directory"
 
-    await runner.run_once(now=1.0)
-    await store.close()
-    assert not dead.exists(), "the next backup did not sweep the abandoned directory"
+        await runner.run_once(now=1.0)
+        assert not dead.exists(), "the next backup did not sweep the abandoned directory"
+    finally:
+        await store.close()
+
+
+def test_a_teardown_that_half_fails_leaves_proof_for_the_next_sweep(tmp_path, monkeypatch) -> None:
+    """A refused removal can take the lock file and marker with it (on NTFS the dot-names list first)
+    and stop at a file something holds. The teardown puts both back, so the next sweep can still prove
+    the directory abandoned rather than skipping it for good."""
+    root = tmp_path / "data"
+    work = dr_backup._open_staging(root, "mefor-verify-", secure=False)
+    (work.path / "extracted_store.db").write_bytes(b"synthetic plaintext")
+    real_remove = dr_backup._remove_tree
+
+    def remove_the_dot_names_then_fail(path: Path) -> bool:
+        for name in (".lock", ".lock-held"):
+            (path / name).unlink(missing_ok=True)
+        return False
+
+    monkeypatch.setattr(dr_backup, "_remove_tree", remove_the_dot_names_then_fail)
+    monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", (0.0,))
+    assert work.release() is None  # emptied in place, so no plaintext is reported
+    assert work.path.is_dir()
+    assert (work.path / ".lock").exists() and (work.path / ".lock-held").exists()
+
+    monkeypatch.setattr(dr_backup, "_remove_tree", real_remove)
+    assert dr_backup._sweep_abandoned_staging(root) == 1
+    assert not work.path.exists()
+
+
+def test_the_fail_safe_never_truncates_a_hard_linked_file(tmp_path) -> None:
+    """The sweep runs the truncate fail-safe on directories it did not make this run. A file there with
+    a second link shares its bytes with a name outside, so it is reported, never truncated."""
+    staging = tmp_path / "mefor-verify-planted"
+    staging.mkdir()
+    outside = tmp_path / "outside.dat"
+    outside.write_bytes(b"not the engine's to empty")
+    try:
+        os.link(outside, staging / "link.dat")
+    except OSError as exc:  # pragma: no cover - a file system without hard links
+        pytest.skip(f"hard links unavailable here: {exc}")
+    (staging / "own.tar").write_bytes(b"synthetic plaintext")
+
+    unproven = dr_backup._empty_files_in_place(staging)
+    assert unproven == ["link.dat (hard-linked, not truncated)"]
+    assert outside.read_bytes() == b"not the engine's to empty"
+    assert (staging / "own.tar").read_bytes() == b""
+
+
+async def test_a_config_dir_holding_the_data_dir_does_not_bundle_the_staging(
+    tmp_path, monkeypatch
+) -> None:
+    """With the store inside the config dir, the backup's own staging sits inside it too. Its plaintext
+    snapshot and the tar being written must not be tarred into the config bundle."""
+    import tarfile
+
+    from messagefoundry.store.backup_codec import decrypt_stream
+
+    _isolate_os_temp(tmp_path, monkeypatch)
+    cfg = tmp_path / "cfg"
+    key = generate_key()
+    store = await _keyed_store(cfg, key)
+    (cfg / "connections.toml").write_text("# synthetic\n", encoding="utf-8")
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "dest")),
+        store_settings=StoreSettings(path=str(cfg / "msg.db"), encryption_key=key),
+        config_dir=cfg,
+        instance="dev",
+    )
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None
+    tar_path = tmp_path / "out.tar"
+    with open(result.archive_path, "rb") as src, open(tar_path, "wb") as dst:
+        decrypt_stream(src, dst, base64.b64decode(key))
+    with tarfile.open(tar_path, "r:") as tar:
+        names = tar.getnames()
+    assert "config/connections.toml" in names
+    assert not [n for n in names if "mefor-backup-" in n or "mefor-verify-" in n], names
+
+
+async def test_a_staging_leftover_after_a_good_build_is_alerted_and_audited(
+    tmp_path, monkeypatch
+) -> None:
+    """The archive is good and published, so the run succeeds, and the plaintext the teardown could
+    not clear is still what an operator hears about: a `cleanup` alert and a field in the audit row."""
+    import json
+
+    data_dir = tmp_path / "data"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    real_teardown = dr_backup._teardown_staging
+
+    def build_teardown_fails(path: Path) -> str | None:
+        real_teardown(path)
+        if path.name.startswith("mefor-backup-"):
+            return f"the plaintext staging directory {path} could not be removed (synthetic)"
+        return None
+
+    monkeypatch.setattr(dr_backup, "_teardown_staging", build_teardown_fails)
+    alerts: list[tuple[str, str, str | None]] = []
+
+    class _Sink:
+        def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
+            alerts.append((name, kind, detail))
+
+        def __getattr__(self, _name: str) -> object:
+            return lambda *a, **k: None
+
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "dest")),
+        store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key),
+        config_dir=None,
+        instance="dev",
+        alert_sink=_Sink(),  # type: ignore[arg-type]
+    )
+    try:
+        result = await runner.run_once(now=1.0)
+        rows = [r for r in await store.list_audit(limit=10) if r["action"] == "dr_backup"]
+    finally:
+        await store.close()
+    assert result is not None and Path(result.archive_path).is_file()
+    assert result.staging_leftover is not None and "synthetic" in result.staging_leftover
+    (row,) = rows
+    detail = json.loads(row["detail"])
+    assert detail["verify"] == "PASS" and "synthetic" in detail["staging_leftover"]
+    assert [(n, k) for n, k, _d in alerts] == [("dr_backup", "cleanup")]
 
 
 # --- #1167: the keyring walk visits every key ------------------------------------------
@@ -439,3 +574,10 @@ def test_key_selection_keeps_first_match_and_reports_none(monkeypatch) -> None:
     other = base64.b64decode(generate_key())
     assert dr_backup._select_decrypt_key([other], key_fingerprint(key)) is None
     assert dr_backup._select_decrypt_key([], key_fingerprint(key)) is None
+
+
+def test_a_forged_key_id_with_a_lone_surrogate_is_a_non_match(tmp_path) -> None:
+    """The header is read before anything authenticates it. A `key_id` holding a lone surrogate must
+    come back as no match -- a clean KEY_MISMATCH -- and not as a UnicodeEncodeError."""
+    key = base64.b64decode(generate_key())
+    assert dr_backup._select_decrypt_key([key], "\ud800") is None
