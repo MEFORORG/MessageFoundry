@@ -3260,6 +3260,21 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
 
 ---
 
+## Private-key passphrase wraps (ASVS 11.4.4, BACKLOG #1352)
+
+Decrypting a passphrase-protected key file derives a key from a password, so the engine holds that
+derivation to ASVS Appendix C (owner ruling R1 of 2026-09-24). At every private-key loader it reads
+the wrap first and refuses a weak one: the TLS listeners and client hops, outbound signing and the
+SMART assertion, the DIRECT signing key, `cert import`, the SFTP key, and a database driver's
+`sslkey`. Refusal is the default and has no setting. Weak wraps include legacy `Proc-Type` PEM
+(MD5), SHA-1-based derivations, PBKDF2 under 600,000 iterations over HMAC-SHA-256 (the common tools
+write 2048), and a PKCS#12 MAC keyed by the PKCS#12 KDF rather than PBMAC1. An encrypted key with
+no passphrase is refused before any library can prompt at a terminal. SSH keys cannot reach an
+approved derivation, so the SFTP connector takes only an unencrypted key.
+
+What passes, what is refused and the re-wrap commands are stated once, in
+[CONNECTIONS.md, *Encrypted private keys must meet the wrap floor*](CONNECTIONS.md#encrypted-private-keys-must-meet-the-wrap-floor).
+
 ## Web console sign-in
 
 The browser web console (`/ui`) shows a sign-in page when the engine requires auth. Its one form

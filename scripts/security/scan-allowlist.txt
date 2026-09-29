@@ -31,3 +31,11 @@ OIDC core \d+(?:\.\d+)+/\d+
 ^ABUSE_\d{6}_ABUSE$
 ^lky_vipnyc_\d{6}$
 ^dungklose_\d{6}$
+
+# The openssl commands that re-wrap a private key at ASVS Appendix C's PBKDF2 floor (BACKLOG #1352),
+# as given to operators in docs/CONNECTIONS.md. The iteration count (six hundred thousand, written 600[0]{3} below) has the site-code SHAPE
+# and is not one: it is a published KDF parameter. Each entry is the WHOLE command line, literal,
+# so a site code in any other line, or added to one of these, still trips. A character-class
+# version was tried first and excused a line with a planted PT_<six digits>_ADT appended.
+^openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600[0]{3} -in <old key> -out <new key>$
+^openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC -iter 600[0]{3} -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 -in <cert> -inkey <key> -out <new pfx>$

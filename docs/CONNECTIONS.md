@@ -616,7 +616,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
 | `tls` | `false` | serve **HTTPS** (TLS 1.2+, the same per-connection inbound TLS builder MLLP uses). |
 | `tls_cert_file` / `tls_key_file` | — | the server-identity cert + its private key (required when `tls`). A PEM **path** (a plain string — unlike `DICOM()`, these two are not typed for `env()`). |
-| `tls_key_password` | — | passphrase for an **encrypted** `tls_key_file` — a **secret**, supply via `env()`. |
+| `tls_key_password` | — | passphrase for an **encrypted** `tls_key_file` — a **secret**, supply via `env()`; it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). |
 | `tls_ca_file` | — | trust anchor — opt-in **mTLS** (require + verify a client certificate). |
 | `tls_ca_pin` | - | the SHA-256 of `tls_ca_file`. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set on an outbound connection, or without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
 | `intake_auth` | `"none"` | **peer credential required to submit a message** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md) D6): `none` \| `api_key` \| `bearer` \| `mtls_subject`. A sibling of `source_ip_allowlist` — it authorises *submitting*, never *reading*; it mints no identity and opens no session. A missing or wrong credential is refused `401` **before any request body byte is read**, so it costs an anonymous peer nothing to be turned away. |
@@ -1131,7 +1131,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
 | `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
 | `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
-| `key_password` | both | — | **`Sftp` only** — passphrase for an encrypted `private_key`; a **secret**, via `env()` |
+| `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
 | `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying chain + hostname (#129, ADR 0094). Same contract, and the same unreported risk, as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate, no escape variable and no loosening register covers it**, so nothing but the per-build WARNING records that it is set — and the FTPS hop has **no revocation gate either**, so an expired *and* revoked partner certificate crosses here with nothing refusing it. Put the connection name and a removal date in your own risk register |
@@ -1147,6 +1147,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber). Left `false`, each upload first **lists** `remote_dir` to find a free name, so the account needs list permission there, and `POST /connections/{name}/test` checks it. A listing that fails writes nothing: the delivery is retried under the lane's retry policy, and dead-lettered if that runs out (BACKLOG #1936). A credential refusal on that listing stops the lane instead, as it does on any other step. On a write-only drop directory, only `true` delivers. It replaces any file of the same name, so pair it with a `filename` that is unique per message. |
 | `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it) |
 
+- **Unencrypted, RSA-2048 or larger (BACKLOG #1352).** An encrypted `private_key`, or any
+  `key_password`, is refused at construction: paramiko opens an encrypted key only through MD5
+  (legacy PEM) or bcrypt_pbkdf (OpenSSH format), and neither is an approved key derivation. Keep
+  the key unencrypted in the secret store that `env()` reads (`ssh-keygen -p -N '' -f <key>`
+  removes a passphrase). An RSA key under 2048 bits is refused when the connector loads it.
 - **RSA key text only.** The connector loads `private_key` with paramiko's `RSAKey` and nothing else.
   Two encodings of an RSA key load: PKCS#1, whose PEM header names `RSA PRIVATE KEY`, and the
   OpenSSH format, whose header names `OPENSSH PRIVATE KEY`. At least these are refused:
@@ -1678,7 +1683,7 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `client_cert_file` / `client_key_file` | — | **mutual TLS** client cert + key (PEM path or `env()` text). Must be set together; server verification stays on, so **incompatible with `verify_tls=false`**. |
-| `client_key_password` | — | key passphrase (a **secret** — via `env()`) |
+| `client_key_password` | — | key passphrase (a **secret** — via `env()`); it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor) |
 | `ws_security` | `false` | stamp `<wsse:Security>` (a `Timestamp` + optional `UsernameToken`) |
 | `ws_username` / `ws_password` | `basic_*` | `UsernameToken` credentials (secrets — via `env()`) |
 | `ws_password_type` | `text` | `text` (PasswordText) only. `digest` (PasswordDigest) was **retired** in BACKLOG #1171 (ASVS 11.4.1): the construction is SHA-1 by profile definition, and a UsernameToken over a cleartext hop is refused anyway, so the channel already carried the credential. Setting it raises |
@@ -1866,7 +1871,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `recipients` | — (required) | the Direct `To:` address(es) — a list or a single string |
 | `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
 | `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
-| `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()` |
+| `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()`; it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor) |
 | `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so any other key type (EC included) is refused at construction |
 | `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
@@ -2037,7 +2042,7 @@ a generic partner — the `RS384` default below is SMART's own requirement, not 
 | `scope` | `None` | the requested scopes, e.g. `system/Patient.c` (SMART v2 system scopes — no human). Request the least the connection can work with — see *Least scope* below |
 | `key_id` | `None` | the JWT `kid` → the public key registered with the server (for rotation) |
 | `audience` | = `token_url` | the assertion `aud`, if the server documents a different audience |
-| `private_key_password` | `None` | passphrase for an encrypted key (secret — use `env()`) |
+| `private_key_password` | `None` | passphrase for an encrypted key (secret — use `env()`); it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor) |
 | `expiry_skew_seconds` | `60` | re-mint this many seconds before the server's stated expiry. The engine caches a token for at most one hour after this skew, whatever `expires_in` says |
 
 ```python
@@ -2120,7 +2125,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `tls` | `false` | wrap the association in **DICOM-over-TLS** (required for a non-loopback bind — see below) |
 | `tls_cert_file` / `tls_key_file` | — | the SCP's server-identity cert + private key (required when `tls=true`) |
-| `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
+| `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). The key must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
 | `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
 | `tls_ca_pin` | - | the SHA-256 of `tls_ca_file`. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set on an outbound connection, or without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
 
@@ -2249,7 +2254,7 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 | `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
 | `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS**. There is **no `tls_verify=false`** on this connector — chain and hostname are always verified. It also carries **no revocation gate** (unlike MLLP/REST/SOAP/FHIR/DICOMweb/EMAIL), so `tls=true` here is *not* refused on a stock instance — and a revoked PACS certificate is your PKI's problem, not the engine's |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** PACS certificate with chain + hostname still verified. Combined with the missing revocation gate above, this hop can be pinned to a certificate that is **both expired and revoked** with nothing refusing, warning at posture level, or reporting it — **no posture gate, no escape variable, and `security_loosenings()` never reports it** (see the [MLLP row](#mllp--mllp)) |
-| `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted mTLS-client `tls_key_file` (`env()`-sourced). Same fail-fast semantics as the inbound SCP (no/wrong passphrase raises at construction, never a TTY hang). |
+| `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted mTLS-client `tls_key_file` (`env()`-sourced); it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). Same fail-fast semantics as the inbound SCP (no/wrong passphrase raises at construction, never a TTY hang). |
 
 **Status → retry classification.** C-STORE **Success** (`0x0000`) / a **Warning** (`0xB0xx`, stored with a
 caveat) → delivered; **Out of Resources** (`0xA7xx`) or an association/transport failure → transient
@@ -2418,6 +2423,50 @@ def to_passthrough(msg):
 ```
 
 A runnable graph ships at [`harness/config/passthrough/graph.py`](../harness/config/passthrough/graph.py).
+
+## Encrypted private keys must meet the wrap floor
+
+An encrypted private key is opened with a key derived from its passphrase, so the derivation is
+held to ASVS 11.4.4 (BACKLOG #1352). Every loader reads the key's wrap **before** anything decrypts
+it, and refuses a weak one at `check` or startup. There is no setting to turn this off.
+
+**What passes.** An unencrypted key. Or PKCS#8 PBES2 with PBKDF2-HMAC-SHA-256 at 600,000
+iterations or more, or PBKDF2-HMAC-SHA-512 at 210,000 or more, which are the ASVS Appendix C floors.
+scrypt passes at its Appendix C floor.
+
+**What is refused.** At least these:
+
+- legacy OpenSSL PEM encryption (a `Proc-Type: 4,ENCRYPTED` header), which derives the key with MD5;
+- PBES1, the PKCS#12 PBE schemes, and PBKDF2 over HMAC-SHA-1 (including a PBKDF2 block with no
+  `prf` field, which means SHA-1);
+- PBKDF2 under its floor. **The common tools write 2048 iterations by default**: `openssl req`
+  without `-nodes`, `openssl genpkey -aes256`, and `cryptography`'s `BestAvailableEncryption`. A key
+  made any of those ways is refused until you re-wrap it;
+- an encrypted key where the loader has no passphrase to give, before any library can prompt.
+
+**Re-wrap a PEM or PKCS#8 key** at the floor, then point the setting at the new file:
+
+```
+openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old key> -out <new key>
+```
+
+**A PKCS#12 bundle for `cert import`** must have PBES2 bags at the floor and a **PBMAC1** MAC at
+the floor. A MAC keyed by the PKCS#12 KDF is refused even over SHA-256, and that is what most
+exports carry, OpenSSL's default included. Re-export with OpenSSL 3.4 or later:
+
+```
+openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC -iter 600000 -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 -in <cert> -inkey <key> -out <new pfx>
+```
+
+Or skip PKCS#12 and give the certificate and key as PEM files.
+
+**Three loaders take no passphrase.** The SFTP key, `[logging].forward_tls_client_cert`, and the
+native API client's key. An encrypted key there is refused; supply it unencrypted and protect the
+file or secret store instead. The SFTP key must also be RSA-2048 or larger.
+
+**A database driver's client key** (`sslkey` in a generic `Database(...)`'s `odbc_params`, with
+`sslpassword` for its passphrase) is checked the same way before the connection string reaches the
+driver. The driver still decrypts it.
 
 ## Declaring a cleartext hop (`cleartext_accepted`)
 
