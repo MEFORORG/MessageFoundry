@@ -407,6 +407,90 @@ async def test_the_summary_is_revealed_only_by_a_route_that_declares_it(engine: 
     assert [revealed for _id, revealed in opens] == [[], ["summary"], [], ["summary"]]
 
 
+#: A distinctive delivery error. It stands in for a value the engine's scrubber missed, which is
+#: the exposure BACKLOG #2436 masks.
+_DELIVERY_ERROR = "partner rejected segment ZQX7"
+
+
+async def _seed_dead_letter(engine: Engine) -> str:
+    """One message whose only delivery is dead-lettered with :data:`_DELIVERY_ERROR`, which lands
+    in the delivery's ``last_error`` and in the ``dead`` event's ``detail``."""
+    mid = await _seed(engine)
+    outbox = await engine.store.outbox_for(mid)
+    await engine.store.dead_letter_now(outbox[0]["id"], _DELIVERY_ERROR)
+    return mid
+
+
+async def test_the_error_text_is_revealed_only_by_the_route_that_declares_it(
+    engine: Engine,
+) -> None:
+    """BACKLOG #2436, ASVS 14.2.6, owner ruling R12: the detail page and the dead-letter list show
+    each error-tier value masked on load, with a "Reveal" link to ``/errors``, and ``/errors`` shows
+    it whole. The engine masks it in the response, so the page cannot carry it. Every half reads
+    the SAME stored value, so this cannot pass by the pages carrying different data."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed_dead_letter(engine)
+    reveal = f'href="/ui/messages/{mid}/errors"'
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        bare = await c.get(f"/ui/messages/{mid}")
+        assert bare.status_code == 200
+        assert _DELIVERY_ERROR not in bare.text and "****" in bare.text
+        assert reveal in bare.text
+        dead = await c.get("/ui/dead-letters")
+        assert dead.status_code == 200
+        assert _DELIVERY_ERROR not in dead.text and reveal in dead.text
+        revealed = await c.get(f"/ui/messages/{mid}/errors")
+        assert revealed.status_code == 200
+        # Twice: the delivery's last error and the dead event's detail.
+        assert revealed.text.count(_DELIVERY_ERROR) == 2
+        assert reveal not in revealed.text  # nothing left to reveal
+        assert "ADT^A01|MSG1" not in revealed.text  # an error reveal is not a body reveal
+        # And the reveal did not become a status: the next bare open is masked again.
+        again = await c.get(f"/ui/messages/{mid}")
+        assert _DELIVERY_ERROR not in again.text and reveal in again.text
+        # A body reveal is aimed at the body, not at the delivery errors.
+        with_body = await c.get(f"/ui/messages/{mid}/body")
+        assert "ADT^A01|MSG1" in with_body.text and _DELIVERY_ERROR not in with_body.text
+    # The audit says which open unmasked it: bare, /errors, bare, /body.
+    opens = sorted(
+        (dict(a)["id"], json.loads(dict(a)["detail"])["revealed"])
+        for a in await engine.store.list_audit(limit=100)
+        if dict(a)["action"] == "message_view"
+    )
+    assert [revealed for _id, revealed in opens] == [
+        [],
+        ["events.detail", "outbox.last_error"],
+        [],
+        [],
+    ]
+
+
+async def test_a_caller_without_view_summary_gets_no_error_text_and_no_reveal_link(
+    engine: Engine,
+) -> None:
+    """The control for the mask: it only hides what permission allows. A Viewer holds
+    ``messages:read`` and not ``messages:view_summary``, so the dead-letter list gives it null
+    rather than a mask, and offers no reveal. The Operator on the same row is the positive
+    control that the row renders at all."""
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed_dead_letter(engine)
+    reveal = f'href="/ui/messages/{mid}/errors"'
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "vw")
+        dead = await c.get("/ui/dead-letters")
+        assert dead.status_code == 200 and f"/ui/messages/{mid}" in dead.text
+        assert _DELIVERY_ERROR not in dead.text and reveal not in dead.text
+        assert "****" not in dead.text
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        dead = await c.get("/ui/dead-letters")
+        assert reveal in dead.text
+
+
 async def test_the_replay_redirect_lands_on_a_page_that_reveals_nothing(engine: Engine) -> None:
     """BACKLOG #2346: a replay is not an act aimed at the summary or the body, so the page it
     redirects to reveals neither. The redirect target is asserted, not assumed."""
@@ -549,10 +633,16 @@ def test_every_ui_route_that_reads_a_body_or_opens_a_message_is_in_the_reveal_ta
         "/ui/messages/{message_id}",
         "/ui/messages/{message_id}/summary",
         "/ui/messages/{message_id}/body",
+        "/ui/messages/{message_id}/errors",
     }:
         assert "body" in UI_MESSAGE_REVEALS[path], path
     assert UI_MESSAGE_REVEALS["/ui/messages/{message_id}"] == frozenset()
     assert "summary" in UI_MESSAGE_REVEALS["/ui/messages/{message_id}/body"]
+    # BACKLOG #2436: only /errors reveals the error text, and it reveals nothing else.
+    assert [p for p, r in UI_MESSAGE_REVEALS.items() if "errors" in r] == [
+        "/ui/messages/{message_id}/errors"
+    ]
+    assert UI_MESSAGE_REVEALS["/ui/messages/{message_id}/errors"] == frozenset({"errors"})
     mounted = {getattr(r, "path", "") for r in create_app(serve_ui=True).routes}
     assert set(UI_MESSAGE_REVEALS) <= mounted, sorted(set(UI_MESSAGE_REVEALS) - mounted)
 
@@ -641,14 +731,16 @@ def test_message_detail_renders_attachments_panel() -> None:
         events=[],
         attachments=[AttachmentInfo(id=ref, content_type="application/pdf", total_bytes=2048)],
     )
-    html = str(message_detail(detail, "MSH|skel", summary_revealed=True))
+    html = str(message_detail(detail, "MSH|skel", summary_revealed=True, errors_revealed=True))
     assert "Attachments" in html
     assert "application/pdf" in html
     assert f"/ui/messages/m1/attachments/{ref}" in html  # the download link
     assert "2.0 KiB" in html  # human size
 
     empty = detail.model_copy(update={"attachments": []})
-    assert "Attachments" not in str(message_detail(empty, "MSH|skel", summary_revealed=True))
+    assert "Attachments" not in str(
+        message_detail(empty, "MSH|skel", summary_revealed=True, errors_revealed=True)
+    )
 
 
 async def test_ui_attachment_download_round_trips_and_audits(engine: Engine) -> None:

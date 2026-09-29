@@ -95,15 +95,16 @@ async def _seed(engine: Engine) -> str:
     )
 
 
-#: The ninth ``phi=True`` route, and the only non-GET one, so it is exercised on its own below
+#: The tenth ``phi=True`` route, and the only non-GET one, so it is exercised on its own below
 #: rather than in the GET loop. It rides ``require_ui_step_up`` like ``/edit`` does.
 EDIT_RESEND = "/ui/messages/{}/edit-resend"
 
 
 def _phi_routes(message_id: str) -> list[str]:
-    """The eight GET-reachable console routes whose gate passes ``phi=True``, derived by reading
-    ``messagefoundry_webconsole/routes/core.py``. With :data:`EDIT_RESEND` that is NINE in all.
-    BACKLOG #2346 added ``/summary`` and ``/body``, the detail page with a reveal declared.
+    """The nine GET-reachable console routes whose gate passes ``phi=True``, derived by reading
+    ``messagefoundry_webconsole/routes/core.py``. With :data:`EDIT_RESEND` that is TEN in all.
+    BACKLOG #2346 added ``/summary`` and ``/body``, and BACKLOG #2436 ``/errors``: the detail page
+    with a reveal declared.
 
     More than the four handlers BACKLOG #1738 names: ``parse-tree`` reaches the body fetch too, and
     the edit pair rides ``require_ui_step_up``, which builds its base as ``require_ui(*perms,
@@ -114,6 +115,7 @@ def _phi_routes(message_id: str) -> list[str]:
         f"/ui/messages/{message_id}",
         f"/ui/messages/{message_id}/summary",
         f"/ui/messages/{message_id}/body",
+        f"/ui/messages/{message_id}/errors",
         f"/ui/messages/{message_id}/parse-tree",
         f"/ui/messages/{message_id}/attachments/deadbeef",
         "/ui/dead-letters",
@@ -139,7 +141,7 @@ async def test_an_unproven_serve_hop_refuses_every_ui_phi_route(engine: Engine) 
 async def test_the_edit_resend_post_is_refused_before_it_reads_the_stored_body(
     engine: Engine,
 ) -> None:
-    """The ninth route, and the one a GET-only loop would miss.
+    """The tenth route, and the one a GET-only loop would miss.
 
     ``POST /ui/messages/{id}/edit-resend`` re-reads the PRISTINE stored copy on its reject path, so it
     emits PHI exactly as the GET editor does. It gets the refusal from the same ``phi`` arm, and it
