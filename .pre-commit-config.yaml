@@ -326,5 +326,5 @@ repos:
     rev: 1.9.4
     hooks:
       - id: bandit
-        args: ["--skip", "B101,B110,B311,B404,B608"]
+        args: ["--skip", "B101,B110,B404,B608"]
         exclude: ^(tests/|harness/|samples/|ide/|docs/benchmarks/results/|packaging/messagefoundry-webconsole/tests/)

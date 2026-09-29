@@ -1099,6 +1099,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   is refused too, with the reason `UnreadableSigningKey`. The floor is 2048, not 3072, by owner
   ruling: partner keys keep the 2048-bit floor. EC and DSA keys are not changed by this.
   (`BACKLOG #1166`, ASVS 11.2.3)
+- **The Python security scan now flags new calls into the `random` module.** Bandit check B311 was
+  skipped in both the CI scan and the pre-commit hook, so nothing would have caught a weak generator
+  returning to shipped code. Both now run it. B311 matches a fixed list of calls, such as
+  `random.random()` and `random.choice()`, and misses a few, such as `random.shuffle()`. The five
+  existing uses are seeded on purpose, for pseudonym picking, synthetic HL7 and PDF fixtures, and one
+  fuzz script. Each carries a per-line `# nosec B311` with its reason. Security values still come from
+  `secrets` and `os.urandom`.
+  ([BACKLOG #1173](docs/BACKLOG.md))
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that

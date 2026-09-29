@@ -3,7 +3,7 @@
 
 # ADR 0138 — Transit bulk-crypto provider: move the store DEK out of engine heap for ASVS 13.3.3 (demand-gated)
 
-- **Status:** Accepted (2026-07-20) — **Increment 1 built + verified** (see *Implementation status*); the deferred legs stay demand-gated
+- **Status:** Accepted (2026-07-20) — **Increment 1 built + verified** (see *Implementation status*); the deferred legs stay demand-gated. Amended 2026-09-28: the AES-GCM invocation bound on this path is a **documented operator precondition**, weaker than the engine's counted bound, and it does not meet owner ruling R3 (see the amendment at the end).
 - **Date:** 2026-07-20
 - **Related:** [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) (the KeyProvider seam this extends) · [ADR 0109](0109-at-rest-encryption-fail-closed-on-an-undeclared-phi-posture.md) (Rejected — undeclared-PHI fail-closed) · ASVS-L3-ASSESSMENT-2026-07-20.md §3 (13.3.3 Fail) · ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5 · solutions research (`ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md`) · BACKLOG **#271** · CLAUDE.md §2 (reliability/at-rest), §9 (PHI/HIPAA)
 
@@ -118,3 +118,78 @@ the trust boundary unless HSM-sealed (which is why 13.3.1 stays Partial in the h
 - [ ] Confirm OpenBao (MPL) as the shipped reference sidecar and its AGPL-compatibility as an optional dep.
 - [ ] Decide the **scope of "all crypto"**: does Pass require argon2id/token/audit HMAC also in the module, or is the store-DEK data-at-rest path sufficient (with the others as a documented residual)?
 - [ ] Define the fail-closed + availability semantics (sidecar-down behaviour, HA, startup ordering) and the migration for existing at-rest rows.
+
+## Amendment 2026-09-28 — the AES-GCM bound on this path is a documented operator precondition, not a counted bound (BACKLOG #1173)
+
+**The engine does not count Transit encrypts, and this amendment does not change that.** It records who
+owns the bound instead, because nothing on the record said so. The owner ruled on 2026-09-24 that ASVS
+11.5.2 reaches this opt-in path, and that the row stays open until it gets "a bound or attested
+delegation" (ruling R3 in `ASVS-OWNER-RULINGS-2026-09-24-BATCH126.md`).
+
+**This amendment does NOT meet R3.** It is a documented operator precondition. The owner ruled on
+2026-09-28 that a precondition only written down, with nothing recorded by the engine, does not satisfy
+R3's attested delegation. R3 needs an audited, per-deployment attestation surface that the engine
+records. That surface is not built. A new backlog row for it is being filed, and this amendment cites no
+number for it.
+
+**What the engine does in `vault_transit` mode, by symbol.**
+
+- `TransitCipher.encrypt` hands each value to Transit `encrypt_data`. It draws no local nonce and never
+  calls `AesGcmCipher._count_invocation`.
+- `store/gcm_bound.py` `bounded_cipher` returns `None` for any cipher that is not an `AesGcmCipher`. So
+  this path writes no `cipher_meta` row, raises no 2^31 `gcm_invocations` alert, and has no 2^32
+  refusal.
+- At startup `build_transit_cipher` checks that the data key exists and that its type is in
+  `TRANSIT_KEY_TYPES_DATA`. `require_transit_key_type` reads the key's metadata with `read_key` and
+  checks only its type. It does not check the key's rotation settings.
+
+**Who owns the budget today.** The per-key-version invocation budget belongs to the operator's Transit key
+management, not to the engine. The engine's local bound (the 2026-07-22 amendment to
+[ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) and `store/gcm_bound.py`) does not reach it.
+
+**Deployment precondition, owned by the operator.** Before serving in `vault_transit` mode, the operator
+rotates the Transit data key (`MEFOR_STORE_TRANSIT_KEY`) often enough that no single key version seals
+more than 2^32 values. Size the schedule from the site's peak encrypt rate, not its average. Keep the
+same margin the local bound keeps: plan to rotate by 2^31. A backfill, replay or bulk re-send spends
+the budget faster than steady traffic, so count it in.
+
+`TRANSIT_KEY_TYPES_DATA` admits `aes256-gcm96`, `chacha20-poly1305` and `xchacha20-poly1305`. The
+2^32 figure is the AES-GCM figure, from the page cited below. This amendment applies the same budget to
+`chacha20-poly1305` as a conservative choice and claims no vendor figure for it. `xchacha20-poly1305`
+uses a 192-bit nonce, so a random-nonce collision is not the limit there; no figure is claimed for it
+either.
+
+**What HashiCorp's documentation says, fetched 2026-09-28.** Only these two pages were read:
+
+- The Transit secrets engine page (<https://developer.hashicorp.com/vault/docs/secrets/transit>)
+  advises rotating an AES-GCM key before about 2^32 encryptions per key version, citing NIST SP
+  800-38D. It describes rotation as an explicit command that creates a new key version.
+- The Transit API page (<https://developer.hashicorp.com/vault/api-docs/secret/transit>) documents
+  `auto_rotate_period` on key create and key config. It rotates on a time period, is off by default
+  (`"0"`), and cannot be shorter than one hour.
+- Neither page describes rotation triggered by an encryption count.
+
+So on Vault, the precondition is met by setting `auto_rotate_period` to a period sized as above, or by
+rotating on a schedule by hand. Rotation by time bounds a key version's count only while the real rate
+stays under the rate the period was sized for. **OpenBao's documentation was not fetched.** The
+precondition applies to it unchanged, and this amendment claims nothing about what OpenBao enforces.
+
+**This is weaker than the local bound, and the record must say so.** The local bound counts every
+encrypt against a persisted per-key total, alarms at 2^31 and stops ingest at 2^32. The precondition does
+none of those things:
+
+1. Nothing counts, so nothing alarms and nothing refuses. Passing 2^32 on one key version would be
+   silent.
+2. The bound rests on a schedule sized from an estimated rate. A burst above the estimate can outrun it.
+3. The engine cannot see whether the operator met the precondition. It reads the key's metadata but
+   checks only the type, so a key with rotation off starts and serves normally.
+
+**Not built, and named so nobody reads them as done.** A counted bound for this path is still possible.
+Transit returns the key version in each ciphertext's `vault:vN:` prefix, so the engine could charge a
+per-version total the way `cipher_meta` charges a local key. A narrower step would read the key's
+rotation settings at startup and warn when rotation is off. The engine already calls `read_key` there;
+whether that answer carries the rotation settings was not checked for this amendment. Neither step
+exists today, and neither is the R3 attestation surface either.
+
+The operator-facing statement of this precondition belongs in the `cipher_provider` row of
+`docs/CONFIGURATION.md`. That row does not carry it yet.
