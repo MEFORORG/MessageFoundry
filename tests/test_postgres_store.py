@@ -3784,7 +3784,9 @@ async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> 
         return {r["column_name"] for r in rows}
 
     for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
-        await store.create_user(user_id=uid, username=uname, auth_provider="local", now=1.0)
+        await store.create_user(
+            user_id=uid, username=uname, auth_provider="local", now=1.0, password_generated=False
+        )
     try:
         for pid, owner, name, now in (
             ("pa", "alice", "ACME ADT", None),
