@@ -81,7 +81,9 @@ async def _dead(
 
 async def _payload(store: MessageStore, outbox_id: str) -> str:
     cur = await store._db.execute("SELECT payload FROM queue WHERE id=?", (outbox_id,))
-    return (await cur.fetchone())["payload"]
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return fetched_row["payload"]
 
 
 async def _set_meta(store: MessageStore, message_id: str, bag: dict[str, object]) -> None:
@@ -230,6 +232,7 @@ async def test_error_message_body_is_purged(store: MessageStore) -> None:
     )
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     msg = await store.get_message(eid)
+    assert msg is not None
     assert msg["raw"] == "" and msg["error"] is None  # the error column can embed PHI fragments
 
 
@@ -394,7 +397,9 @@ async def _attachment_rows(store: MessageStore, message_id: str) -> int:
     cur = await store._db.execute(
         "SELECT COUNT(*) AS n FROM message_attachment WHERE message_id=?", (message_id,)
     )
-    return int((await cur.fetchone())["n"])
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return int(fetched_row["n"])
 
 
 #: Stage predicates each backend's `purge_dead_letters` BODY may still carry, and why. The two body
@@ -615,7 +620,9 @@ async def test_wal_checkpoint_and_vacuum_run_clean(store: MessageStore) -> None:
     await store.wal_checkpoint()
     await store.vacuum()  # must not error (runs outside a txn) and must leave the DB usable
     cur = await store._db.execute("PRAGMA journal_mode")
-    assert str((await cur.fetchone())[0]).lower() == "wal"
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert str(fetched_row[0]).lower() == "wal"
     ok, _ = await store.integrity_check()
     assert ok
 
@@ -756,6 +763,7 @@ async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageSt
     assert result.messages_purged == 0 and result.dead_purged == 0
     # The PHI body + the delivered payload are untouched; no audit row written.
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["raw"] == "MSH|^~\\&|raw-body"  # body intact, not nulled
     assert msg["summary"] is not None
     assert await _payload(store, outbox_id) == "OUT|delivered-body"  # payload intact

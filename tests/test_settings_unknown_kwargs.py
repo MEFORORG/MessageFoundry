@@ -96,6 +96,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import messagefoundry.config.settings as _settings_module
+from messagefoundry.config.models import RetryPolicy, Schedule
 
 # The modules a test file legitimately imports a settings model (or the settings module itself)
 # from, today. See the docstring's "false-negative boundary" for what falling outside this list
@@ -293,7 +294,7 @@ def test_forbid_models_are_excluded_from_scope() -> None:
     # And the exclusion is FOR a real reason, not an accident: each is genuinely extra="forbid".
     assert _settings_module.AlertRule.model_config.get("extra") == "forbid"
     assert _settings_module.EscalationTier.model_config.get("extra") == "forbid"
-    assert _settings_module.Schedule.model_config.get("extra") == "forbid"
+    assert Schedule.model_config.get("extra") == "forbid"  # settings.py re-imports it from models
 
 
 def test_guarded_legacy_keys_actually_raise_rather_than_silently_drop() -> None:
@@ -319,7 +320,7 @@ def test_default_extra_behaves_like_ignore_not_like_forbid() -> None:
     walk, so this pin does not trip the tree-wide scan below on itself.
     """
     bogus_kwargs = {"bogus_kwarg_xyz": 123}
-    rp = _settings_module.RetryPolicy(**bogus_kwargs)  # type: ignore[arg-type]
+    rp = RetryPolicy(**bogus_kwargs)  # the class settings.py re-imports from models
     assert not hasattr(rp, "bogus_kwarg_xyz")
     assert rp.model_extra is None
-    assert _settings_module.RetryPolicy.model_config.get("extra") is None
+    assert RetryPolicy.model_config.get("extra") is None

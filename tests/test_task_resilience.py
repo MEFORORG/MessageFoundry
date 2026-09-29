@@ -100,7 +100,10 @@ async def test_delivery_worker_survives_store_error(monkeypatch: pytest.MonkeyPa
 async def test_dead_worker_is_respawned_while_running() -> None:
     # per_lane: exercises the per-outbound delivery worker respawn (pooled has no per-outbound worker).
     runner = RegistryRunner(
-        Registry(), _FlakyStore(fail_times=0), poll_interval=0.02, claim_mode="per_lane"
+        Registry(),
+        _FlakyStore(fail_times=0),  # type: ignore[arg-type]  # a stub: only the claim paths exist
+        poll_interval=0.02,
+        claim_mode="per_lane",
     )
     runner._running = True
 
@@ -257,7 +260,9 @@ async def test_router_worker_recovers_claimed_row_after_handoff_fault_without_re
 
 
 async def _is_routed(store: MessageStore, mid: str) -> bool:
-    return bool((await store.get_message(mid))["status"] == MessageStatus.ROUTED.value)
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    return bool(fetched["status"] == MessageStatus.ROUTED.value)
 
 
 class _OneRowThenFaultStore:
@@ -381,7 +386,9 @@ def _hl7(control_id: str) -> bytes:
 
 async def _inflight_rows(store: MessageStore) -> int:
     cur = await store._db.execute("SELECT COUNT(*) AS c FROM queue WHERE status='inflight'")
-    return int((await cur.fetchone())["c"])
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return int(fetched_row["c"])
 
 
 async def _delivered_count(store: MessageStore) -> int:
@@ -959,7 +966,9 @@ async def _pending_at(store: MessageStore, stage: Stage) -> int:
     cur = await store._db.execute(
         "SELECT COUNT(*) AS c FROM queue WHERE stage=? AND status='pending'", (stage.value,)
     )
-    return int((await cur.fetchone())["c"])
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return int(fetched_row["c"])
 
 
 @pytest.mark.parametrize("stage", [Stage.ROUTED, Stage.OUTBOUND], ids=lambda s: s.value)

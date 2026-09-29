@@ -149,6 +149,7 @@ async def test_claim_ready_dead_letters_undecryptable_row(tmp_path: Path) -> Non
         assert [i.destination_name for i in items] == ["good"]  # good row still delivered
         cur = await store._db.execute("SELECT status, last_error FROM queue WHERE id=?", (bad_id,))
         row = await cur.fetchone()
+        assert row is not None
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
         # last_error is itself ciphered (WP-5) AND cell-bound (ASVS 11.3.3 / ADR 0019), so decrypt it
         # under the SAME (table, column, row) AAD the store wrote with — a bare decrypt fails closed on
@@ -170,7 +171,9 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
     try:
         mid = await store.enqueue_ingress(channel_id="ch", raw=ADT)
         cur = await store._db.execute("SELECT id FROM queue WHERE stage=?", (Stage.INGRESS.value,))
-        ingress_id = (await cur.fetchone())["id"]
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        ingress_id = fetched_row["id"]
         wrong_key_token = make_cipher(generate_key()).encrypt(ADT)
         await store._db.execute(
             "UPDATE queue SET payload=? WHERE id=?", (wrong_key_token, ingress_id)
@@ -183,6 +186,7 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
             "SELECT status, last_error FROM queue WHERE id=?", (ingress_id,)
         )
         row = await cur.fetchone()
+        assert row is not None
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
         # Ciphered (WP-5) and cell-bound (ADR 0019) — decrypt under the row's own AAD, see the outbound
         # poison-row test above.
@@ -896,6 +900,7 @@ async def test_foreign_key_at_runtime_dead_letters_rather_than_degrading(tmp_pat
             "SELECT status, last_error FROM queue WHERE id=?", (row["id"],)
         )
         dead = await cur.fetchone()
+        assert dead is not None
         assert dead["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
         # last_error is ciphered (WP-5) under the ACTIVE key B, so the reopened store decrypts it —
         # under the row's own cell AAD (ADR 0019), which a v2 value requires and a v1 value ignores.

@@ -52,6 +52,7 @@ async def test_enqueue_ingress_creates_message_and_ingress_row(store: MessageSto
         channel_id="IB", raw=RAW, control_id="MSG1", message_type="ADT^A01"
     )
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["status"] == MessageStatus.RECEIVED.value  # the ACK-on-receipt disposition
     assert msg["raw"] == RAW and msg["control_id"] == "MSG1"
     # Exactly one ingress queue row, no outbound rows yet (routing hasn't happened).
@@ -614,6 +615,7 @@ async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Pa
     await RegistryRunner(reg, store)._process_ingress_item("IB", item)
 
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["status"] == MessageStatus.UNROUTED.value  # the §4 ruling — not FILTERED
     assert msg["raw"] == RAW  # the raw is preserved for the operator
     # Terminal: the ingress row was consumed in the handoff and no routed row was ever created — the

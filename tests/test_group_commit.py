@@ -28,6 +28,7 @@ listener→worker path is unaffected because the API is byte-identical with the 
 from __future__ import annotations
 
 import asyncio
+import functools
 from pathlib import Path
 from typing import Any
 
@@ -266,7 +267,7 @@ async def test_commit_failure_still_rejects_every_member(tmp_path: Path) -> None
 
         s._db.commit = failing_commit  # type: ignore[method-assign]
         results = await asyncio.gather(
-            *(gc.submit(lambda n=n: write(n)) for n in range(3)), return_exceptions=True
+            *(gc.submit(functools.partial(write, n)) for n in range(3)), return_exceptions=True
         )
         s._db.commit = real_commit  # type: ignore[method-assign]
 
@@ -358,7 +359,7 @@ async def test_two_failing_members_in_one_batch_are_each_contained(tmp_path: Pat
             return n
 
         results = await asyncio.gather(
-            *(gc.submit(lambda n=n: write(n, boom=n % 2 == 1)) for n in range(4)),
+            *(gc.submit(functools.partial(write, n, boom=n % 2 == 1)) for n in range(4)),
             return_exceptions=True,
         )
 
@@ -387,6 +388,7 @@ async def test_claim_poisonguard_standalone(store: MessageStore) -> None:
     assert item is not None
     cur = await store._db.execute("SELECT attempts, status FROM queue WHERE id=?", (item.id,))
     row = await cur.fetchone()
+    assert row is not None
     assert row["attempts"] == 1 and row["status"] == OutboxStatus.INFLIGHT.value
 
     # Now a post-claim grouped handoff for THIS row fails and rolls back. The standalone claim commit
@@ -663,7 +665,7 @@ async def test_committer_resolves_each_member_with_its_own_result(tmp_path: Path
     try:
         gc = s._group_commit
         assert gc is not None
-        out = await asyncio.gather(*(gc.submit(lambda n=n: _ret(n)) for n in range(5)))
+        out = await asyncio.gather(*(gc.submit(functools.partial(_ret, n)) for n in range(5)))
         assert out == [0, 1, 2, 3, 4]
     finally:
         await s.close()

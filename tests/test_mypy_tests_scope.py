@@ -36,7 +36,7 @@ _PYPROJECT = ROOT / "pyproject.toml"
 
 #: The most modules the ratchet may list. LOWER it when you remove entries; never raise it. A ceiling
 #: rather than an exact count, so removing a module does not also require editing this file.
-_RATCHET_CEILING = 87
+_RATCHET_CEILING = 77
 
 #: The reviewed tests.* profile. pyproject.toml's comment says why each key is there.
 _PROFILE_KEYS = {

@@ -31,7 +31,9 @@ async def store(tmp_path):
 
 async def test_open_uses_wal_and_normal_synchronous(store: MessageStore) -> None:
     cur = await store._db.execute("PRAGMA journal_mode")
-    assert str((await cur.fetchone())[0]).lower() == "wal"
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert str(fetched_row[0]).lower() == "wal"
     cur = await store._db.execute("PRAGMA synchronous")
     fetched_row = await cur.fetchone()
     assert fetched_row is not None
@@ -223,6 +225,7 @@ async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> N
         now=100.0,
     )
     msg = await store.get_message(mid)
+    assert msg is not None
     # enqueue_message (the direct/legacy write) routes straight to outbound rows → ROUTED. The staged
     # live path uses enqueue_ingress (RECEIVED) then handoff (ROUTED) — see test_staged_pipeline.
     assert msg["status"] == MessageStatus.ROUTED.value
@@ -256,6 +259,7 @@ async def test_record_received_logs_filtered_and_error(store: MessageStore) -> N
         channel_id="c1", raw="bad", status=MessageStatus.ERROR, error="parse error: boom", now=100.0
     )
     emsg = await store.get_message(eid)
+    assert emsg is not None
     assert emsg["status"] == MessageStatus.ERROR.value
     assert emsg["error"] == "parse error: boom"
 
@@ -284,7 +288,9 @@ async def test_disposition_text_is_phi_scrubbed_at_the_store_layer(store: Messag
     eid = await store.record_received(
         channel_id="c1", raw="MSH|x", status=MessageStatus.ERROR, error=f"bad value {phi}", now=0.0
     )
-    assert "DOE^JANE" not in ((await store.get_message(eid))["error"] or "")
+    fetched = await store.get_message(eid)
+    assert fetched is not None
+    assert "DOE^JANE" not in (fetched["error"] or "")
     # record_received also mirrors the error into a message_events.detail row — scrubbed there too.
     assert all("DOE^JANE" not in (e["detail"] or "") for e in await store.events_for(eid))
 

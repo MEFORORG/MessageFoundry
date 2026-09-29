@@ -190,6 +190,7 @@ async def test_respond_with_receipt_on_ingress(store: MessageStore) -> None:
     assert payload["status"] == "accepted"
     # The receipt carries the engine message_id (AC-2), returned the instant ingress committed.
     msg = await store.get_message(payload["message_id"])
+    assert msg is not None
     assert msg["status"] == MessageStatus.RECEIVED.value
 
 
@@ -270,6 +271,7 @@ async def test_content_type_selects_payload_object(store: MessageStore) -> None:
         await src.stop()
     assert resp.status == 202
     msg = await store.get_message(resp.json()["message_id"])
+    assert msg is not None
     assert msg["control_id"] == "MSG1" and msg["message_type"] == "ADT^A01"
 
     ic_json = build_inbound_connection(
@@ -281,6 +283,7 @@ async def test_content_type_selects_payload_object(store: MessageStore) -> None:
     finally:
         await src2.stop()
     msg2 = await store.get_message(resp2.json()["message_id"])
+    assert msg2 is not None
     assert msg2["raw"] == JSON_BODY  # routed verbatim as a RawMessage body (no HL7 parse)
     assert msg2["control_id"] is None
 

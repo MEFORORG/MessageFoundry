@@ -462,6 +462,11 @@ class _FakeWriter:
         return _Ssl()
 
 
+def _writer(peercert: object) -> asyncio.StreamWriter:
+    # get_extra_info is the one StreamWriter call _authorize_peer_cert makes, and the fake answers it.
+    return _FakeWriter(peercert)  # type: ignore[return-value]
+
+
 def _peercert(common_name: str) -> dict[str, object]:
     return {"subject": ((("commonName", common_name),),)}
 
@@ -488,24 +493,24 @@ def test_valid_chain_unlisted_subject_is_403() -> None:
     )
 
     # A chain the CA signed, carrying an allow-listed subject: accepted.
-    assert src._authorize_peer_cert(_FakeWriter(_peercert("partner.example")), "10.0.0.1") is None
+    assert src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1") is None
 
     # The same CA, a subject nobody listed: 403, NOT 401. A bare tls+tls_ca_file would have accepted
     # this — it means "any certificate this CA ever signed".
-    denied = src._authorize_peer_cert(_FakeWriter(_peercert("attacker.example")), "10.0.0.1")
+    denied = src._authorize_peer_cert(_writer(_peercert("attacker.example")), "10.0.0.1")
     assert isinstance(denied, HttpRequestError)
     assert denied.status == 403
     assert denied.kind == "auth_subject_denied"
 
     # No certificate presented at all is an AUTHENTICATION failure instead.
-    missing = src._authorize_peer_cert(_FakeWriter(None), "10.0.0.1")
+    missing = src._authorize_peer_cert(_writer(None), "10.0.0.1")
     assert isinstance(missing, HttpRequestError)
     assert missing.status == 401
     assert missing.kind == "intake_auth_failed"
 
     # A spoofed commonName cannot collide with a pinned SAN — the namespaces are disjoint.
     src._intake_subjects = {"SAN:DNS:partner.example": "SAN:DNS:partner.example"}
-    spoofed = src._authorize_peer_cert(_FakeWriter(_peercert("partner.example")), "10.0.0.1")
+    spoofed = src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1")
     assert isinstance(spoofed, HttpRequestError)
     assert spoofed.status == 403
 

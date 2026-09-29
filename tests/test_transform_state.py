@@ -537,4 +537,6 @@ async def test_state_op_value_serializes_through_handoff(store: MessageStore) ->
     assert store.state_view()[("ns", "rec")] == payload
     # And the on-disk JSON (identity cipher here) is well-formed.
     cur = await store._db.execute("SELECT value FROM state WHERE namespace='ns' AND key='rec'")
-    assert json.loads((await cur.fetchone())[0]) == payload
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert json.loads(fetched_row[0]) == payload

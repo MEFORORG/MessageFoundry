@@ -2835,6 +2835,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         assert row["metadata"].startswith(MARKER_PREFIX) and "WESTWING" not in row["metadata"]
         # decrypt on the read paths.
         rec = await s.get_message(mid)
+        assert rec is not None
         assert rec["summary"] == summary and rec["metadata"] == metadata
         assert any(
             m["summary"] == summary and m["metadata"] == metadata for m in await s.list_messages()

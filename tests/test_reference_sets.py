@@ -970,6 +970,7 @@ async def test_purge_is_idempotent_and_does_not_double_prefix(tmp_path: Path) ->
         row = await (
             await store._db.execute("SELECT version FROM reference_version WHERE name = 'orphan'")
         ).fetchone()
+        assert row is not None
         assert row["version"] == "purged:v1"
     finally:
         await store.close()

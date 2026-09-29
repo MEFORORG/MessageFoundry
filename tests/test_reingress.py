@@ -360,6 +360,7 @@ async def test_ingress_handoff_produces_child_and_finalizes_origin(store: Messag
     child_ing = await store.claim_next_fifo("IB_LOOP", now=112.0, stage=Stage.INGRESS.value)
     assert child_ing is not None
     child = await store.get_message(child_ing.message_id)
+    assert child is not None
     assert child["status"] == MessageStatus.RECEIVED.value and child["raw"] == "RSP^K11"
     meta = json.loads(child["metadata"])
     assert meta["correlation_id"] == origin and meta["correlation_root_id"] == origin

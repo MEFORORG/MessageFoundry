@@ -107,6 +107,7 @@ async def test_inbound_decodes_with_connection_encoding(store: MessageStore) -> 
     await runner._handle_inbound(reg.inbound["mllp_in"], raw)
     cur = await store._db.execute("SELECT status, raw FROM messages")
     row = await cur.fetchone()
+    assert row is not None
     assert row["status"] == MessageStatus.RECEIVED.value  # committed at ingress, awaiting routing
     assert "Müller" in row["raw"]  # decoded with the declared charset, not mangled
 
@@ -133,6 +134,7 @@ async def test_non_hl7_inbound_commits_raw_without_parsing(store: MessageStore) 
         "SELECT status, raw, message_type, control_id, summary FROM messages"
     )
     row = await cur.fetchone()
+    assert row is not None
     assert row["status"] == MessageStatus.RECEIVED.value  # accepted + committed at ingress
     assert row["raw"] == body.decode()  # verbatim — no \r-normalization or HL7 munging
     assert row["message_type"] == "json"
@@ -151,6 +153,7 @@ async def test_inbound_decode_error_records_error_and_naks(store: MessageStore) 
     ack = await runner._handle_inbound(reg.inbound["mllp_in"], raw)
     cur = await store._db.execute("SELECT status, raw, error FROM messages")
     row = await cur.fetchone()
+    assert row is not None
     assert row["status"] == MessageStatus.ERROR.value
     assert "decode error" in (row["error"] or "")
     assert row["raw"].encode("latin-1") == raw  # exact original bytes recoverable

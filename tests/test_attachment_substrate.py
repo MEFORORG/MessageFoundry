@@ -57,6 +57,7 @@ async def _chunk_count(s: MessageStore, ref: str) -> int:
         "SELECT COUNT(*) AS n FROM attachment_chunk WHERE attachment_id=?", (ref,)
     )
     row = await cur.fetchone()
+    assert row is not None
     return int(row["n"])
 
 
@@ -105,7 +106,9 @@ async def test_put_dedups_identical_content(store: MessageStore) -> None:
     # Dedup: one physical copy, not two — the re-put wrote nothing new.
     assert await _chunk_count(store, ref1) == len(CHUNKS)
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM attachment WHERE id=?", (ref1,))
-    assert int((await cur.fetchone())["n"]) == 1
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert int(fetched_row["n"]) == 1
     # Different content → a different content address.
     other = await store.put_attachment(["totally different"], "text/plain")
     assert other != ref1
@@ -261,7 +264,9 @@ async def _join_count(s: MessageStore, mid: str) -> int:
     cur = await s._db.execute(
         "SELECT COUNT(*) AS n FROM message_attachment WHERE message_id=?", (mid,)
     )
-    return int((await cur.fetchone())["n"])
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return int(fetched_row["n"])
 
 
 async def _detach_and_settle(
@@ -411,7 +416,9 @@ async def test_no_attachment_retention_byte_identical(store: MessageStore) -> No
     assert fetched is not None
     assert fetched["raw"] == ""
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM message_attachment")
-    assert int((await cur.fetchone())["n"]) == 0  # linkage table untouched
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert int(fetched_row["n"]) == 0  # linkage table untouched
 
 
 async def test_release_message_attachments_standalone_and_idempotent(store: MessageStore) -> None:
@@ -439,7 +446,9 @@ async def test_release_message_attachments_standalone_and_idempotent(store: Mess
 
 async def _row_payload(s: MessageStore, outbox_id: str) -> str:
     cur = await s._db.execute("SELECT payload FROM queue WHERE id=?", (outbox_id,))
-    return str((await cur.fetchone())["payload"])
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return str(fetched_row["payload"])
 
 
 async def _dead_deliver(

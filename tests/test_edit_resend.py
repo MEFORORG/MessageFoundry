@@ -150,7 +150,9 @@ async def test_reingress_after_retention_purge_rebases_the_lineage(store: Messag
 
     # Pre-purge: the child inherits the ancestry.
     before = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="pre")
-    pre_meta = json.loads((await store.get_message(before.new_message_id))["metadata"])
+    fetched = await store.get_message(before.new_message_id)
+    assert fetched is not None
+    pre_meta = json.loads(fetched["metadata"])
     assert pre_meta["correlation_root_id"] == "the-real-root"
     assert pre_meta["correlation_depth"] == 5
 
@@ -161,7 +163,9 @@ async def test_reingress_after_retention_purge_rebases_the_lineage(store: Messag
     assert await store.message_metadata_json(origin) is None
 
     after = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="post")
-    post_meta = json.loads((await store.get_message(after.new_message_id))["metadata"])
+    fetched = await store.get_message(after.new_message_id)
+    assert fetched is not None
+    post_meta = json.loads(fetched["metadata"])
 
     assert post_meta["correlation_root_id"] == origin  # RE-BASED, not "the-real-root"
     assert post_meta["correlation_depth"] == 1  # restarted, not 5

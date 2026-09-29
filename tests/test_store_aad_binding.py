@@ -80,7 +80,9 @@ async def test_messages_cells_roundtrip_under_aad_bind(aad_store: MessageStore) 
     # And the at-rest bytes are the cell-bound marker (v4 since ADR 0196), not v1 and not plaintext.
     async with aad_store._read() as db:
         cur = await db.execute("SELECT raw FROM messages WHERE id=?", (mid,))
-        on_disk = (await cur.fetchone())["raw"]
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        on_disk = fetched_row["raw"]
     assert on_disk.startswith("mfenc:v4:")
     assert _plaintext_absent(on_disk, RAW)
 
@@ -202,7 +204,9 @@ async def test_wrong_row_relocation_rejected(aad_store: MessageStore) -> None:
     b = await aad_store.enqueue_message(channel_id="IB", raw=BODY, deliveries=[("OB", RAW)])
     async with aad_store._read() as db:
         cur = await db.execute("SELECT raw FROM messages WHERE id=?", (a,))
-        a_ct = (await cur.fetchone())["raw"]
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        a_ct = fetched_row["raw"]
     async with aad_store._lock:
         await aad_store._db.execute("UPDATE messages SET raw=? WHERE id=?", (a_ct, b))
         await aad_store._db.commit()
@@ -215,7 +219,9 @@ async def test_wrong_column_relocation_rejected(aad_store: MessageStore) -> None
     mid = await aad_store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", BODY)])
     async with aad_store._read() as db:
         cur = await db.execute("SELECT raw FROM messages WHERE id=?", (mid,))
-        raw_ct = (await cur.fetchone())["raw"]
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        raw_ct = fetched_row["raw"]
     async with aad_store._lock:
         await aad_store._db.execute("UPDATE messages SET summary=? WHERE id=?", (raw_ct, mid))
         await aad_store._db.commit()
@@ -233,11 +239,14 @@ async def test_queue_payload_wrong_row_relocation_rejected(aad_store: MessageSto
             ("D1", Stage.OUTBOUND.value),
         )
         d1 = await cur.fetchone()
+        assert d1 is not None
         cur = await db.execute(
             "SELECT id FROM queue WHERE destination_name=? AND stage=?",
             ("D2", Stage.OUTBOUND.value),
         )
-        d2_id = (await cur.fetchone())["id"]
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        d2_id = fetched_row["id"]
     async with aad_store._lock:
         await aad_store._db.execute("UPDATE queue SET payload=? WHERE id=?", (d1["payload"], d2_id))
         await aad_store._db.commit()
@@ -291,7 +300,9 @@ async def test_rotate_key_upgrades_v1_to_v2_in_place(tmp_path: Path) -> None:
         assert rotated >= 1
         async with store._read() as conn:
             cur = await conn.execute("SELECT raw FROM messages WHERE id=?", (mid,))
-            on_disk = (await cur.fetchone())["raw"]
+            fetched_row = await cur.fetchone()
+            assert fetched_row is not None
+            on_disk = fetched_row["raw"]
         assert on_disk.startswith("mfenc:v4:")  # upgraded v1 to cell-bound v4 (v2 before ADR 0196)
         rec = await store.get_message(mid)  # and it still round-trips under the new key + AAD
         assert rec is not None and rec["raw"] == RAW and rec["summary"] == "s"

@@ -2056,6 +2056,7 @@ async def test_record_ack_sent_aa_body_encrypted_at_rest_ss(store) -> None:
             " WHERE message_id=? AND kind=?",
             (mid, "ack_sent"),
         )
+        assert row is not None
         disk = row["body"]
         assert disk.startswith(MARKER_PREFIX)  # stored under the encrypted marker, not in the clear
         assert disk != _ACK_AA
@@ -2401,6 +2402,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         assert row["metadata"].startswith(MARKER_PREFIX) and "WESTWING" not in row["metadata"]
         # decrypt on the read paths.
         rec = await s.get_message(mid)
+        assert rec is not None
         assert rec["summary"] == summary and rec["metadata"] == metadata
         assert any(
             m["summary"] == summary and m["metadata"] == metadata for m in await s.list_messages()
