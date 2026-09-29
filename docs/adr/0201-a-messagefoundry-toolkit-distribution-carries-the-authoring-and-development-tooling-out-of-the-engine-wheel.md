@@ -794,15 +794,18 @@ INSTALL-GUIDE text written in slice 4 should say so.
 
 ## To resolve on acceptance
 
-- [ ] The owner approves the layout: import package `messagefoundry_toolkit` at the repository root,
-      distribution `messagefoundry-toolkit` in `packaging/`, versioned in lockstep.
-- [ ] The owner approves a separate `messagefoundry-toolkit` command (option 1) over the engine
-      loading toolkit subcommands (option 2).
-- [ ] The owner takes the one-time PyPI action in section 1 before slice 2 merges.
+- [x] The owner approves the layout: import package `messagefoundry_toolkit` at the repository root,
+      distribution `messagefoundry-toolkit` in `packaging/`, versioned in lockstep. Resolved
+      2026-09-29 by the owner's acceptance.
+- [x] The owner approves a separate `messagefoundry-toolkit` command (option 1) over the engine
+      loading toolkit subcommands (option 2). Resolved 2026-09-29 by the owner's acceptance.
+- [ ] The owner takes the one-time PyPI action in section 1 before slice 2 merges. Not done: an owner
+      commitment given 2026-09-29 (*"I'll do it before slice 2"*), to be kept before slice 2 merges.
 - [ ] The follow-up answer keeping `cert self-signed` in production is recorded in a vault rulings
       file, and slice 2 updates that row's comment in `cli_surface.py` to cite it.
 - [ ] Someone reads the ASVS 5.0.0 source and settles the level: the cell and ledger row #1192 say
       2, and the brief said 3.
-- [ ] The owner accepts the release-order trade in section 1: the toolkit uploads before the engine.
+- [x] The owner accepts the release-order trade in section 1: the toolkit uploads before the engine.
+      Resolved 2026-09-29 by the owner's acceptance.
 - [ ] The build confirms the helper module's name (`cli_common.py` is a placeholder), and reads
       Warehouse's pending-publisher behaviour before relying on it.
