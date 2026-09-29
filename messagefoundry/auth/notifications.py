@@ -27,7 +27,9 @@ another action, such as the ``user.updated`` an administrator's email change or 
 from __future__ import annotations
 
 import datetime
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 # Event types. PHI-free by construction. A value is NOT an audit action: each call site audits under
@@ -115,6 +117,44 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #: hand-off, as ``mailed: true``. An instance with no relay at all is reported at startup by the serve
 #: gate, unless enforcement is ``warn`` and the operator waived notices in writing.
 LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
+
+#: What a general-log line calls each notice kind. A log call names the kind by looking it up here,
+#: never by passing the caller's ``event_type`` through, and an unknown kind logs as ``unrecognised``.
+#: Each label is a string literal equal to its kind, which
+#: ``tests/test_auth_service.py::test_every_notice_kind_has_a_log_label_equal_to_itself`` pins, so a
+#: line reads exactly as it did when it logged the kind directly.
+#:
+#: WHY A TABLE AND NOT THE VALUE. CodeQL's clear-text-logging query labels a value sensitive by the
+#: NAME it was assigned to, so ``PASSWORD_CHANGED``, ``MFA_ENABLED`` and their siblings count as a
+#: password. It follows that label through ``event_type`` into every log line that prints it (on
+#: ``main``, alerts 222 and 223 on the two ``AuthService._notify_security`` warnings). These values
+#: are labels, not credentials, so no secret was ever logged. A literal looked up by key carries no
+#: such flow, and a closed table also stops a future caller's free-form string from reaching the log.
+NOTICE_KIND_LOG_LABELS: Mapping[str, str] = MappingProxyType(
+    {
+        ACCOUNT_LOCKED: "account_locked",
+        LOGIN_AFTER_FAILURES: "login_after_failures",
+        PASSWORD_CHANGED: "password_changed",
+        PASSWORD_RESET: "password_reset",
+        TEMPORARY_CREDENTIAL_EXPIRING: "temporary_credential_expiring",
+        TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER: "temporary_credential_expiring_issuer",
+        EMAIL_CHANGED: "email_changed",
+        ROLES_CHANGED: "roles_changed",
+        USERNAME_CHANGED: "username_changed",
+        FEDERATED_IDENTITY_BOUND: "federated_identity_bound",
+        FEDERATED_IDENTITY_UNBOUND: "federated_identity_unbound",
+        FIRST_ADMINISTRATOR_TAKEOVER: "first_administrator_takeover",
+        ACCOUNT_DISABLED: "account_disabled",
+        MFA_ENABLED: "mfa_enabled",
+        MFA_DISABLED: "mfa_disabled",
+        MFA_CREDENTIAL_REMOVED: "mfa_credential_removed",
+        NOTIFY_EMAIL_SET: "notify_email_set",
+        RECOVERY_CODE_USED: "recovery_code_used",
+        ADMIN_NEW_IP: "admin_action_new_ip",
+        LOGIN_NEW_IP: "login_new_ip",
+        ACCOUNT_CREATED: "account_created",
+    }
+)
 
 
 @dataclass(frozen=True)

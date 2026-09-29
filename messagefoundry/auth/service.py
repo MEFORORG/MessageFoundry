@@ -63,6 +63,7 @@ from messagefoundry.auth.notifications import (
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NOTICE_KIND_LOG_LABELS,
     NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
@@ -99,6 +100,7 @@ from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
@@ -8613,12 +8615,15 @@ class AuthService:
             # relay at startup.
             if event_type in LOG_SILENT_EVENT_TYPES:
                 return False
+            # The kind comes from ``NOTICE_KIND_LOG_LABELS`` and the username through
+            # ``scrub_log_argument``, on both warnings here. The table's own comment says why; the
+            # username can carry a line break, since an administrator chooses it freely at create.
             _log.warning(
                 "security notice %s for %s dropped: no security-event notifier is configured, so "
                 "the account was not told out of band (the /me/security-events feed still records "
                 "it)",
-                event_type,
-                username,
+                NOTICE_KIND_LOG_LABELS.get(event_type, "unrecognised"),
+                scrub_log_argument(username),
             )
             return False
         try:
@@ -8631,14 +8636,19 @@ class AuthService:
                     detail=detail or {},
                 )
             )
-        except Exception:  # noqa: BLE001 - best-effort; never propagate into auth
+        except Exception as exc:  # noqa: BLE001 - best-effort; never propagate into auth
             # Silent for a lock notice, for the reason on the no-notifier arm above.
+            #
+            # The exception's CLASS only, never its text or traceback. The shipped notifier only
+            # enqueues here, but the seam takes any ``SecurityNotifier``, and one that raised with
+            # the event in its message would put the address, or an EMAIL_CHANGED ``detail``, in
+            # the general log -- the same thing the no-notifier arm refuses to log.
             if event_type not in LOG_SILENT_EVENT_TYPES:
                 _log.warning(
-                    "security-event notification failed (%s for %s)",
-                    event_type,
-                    username,
-                    exc_info=True,
+                    "security-event notification failed (%s for %s): %s",
+                    NOTICE_KIND_LOG_LABELS.get(event_type, "unrecognised"),
+                    scrub_log_argument(username),
+                    type(exc).__name__,
                 )
             return False
         return True

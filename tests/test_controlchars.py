@@ -19,7 +19,13 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.controlchars import _is_control_char, has_control_char, strip_control_chars
+from messagefoundry.controlchars import (
+    _is_control_char,
+    has_control_char,
+    scrub_control_chars,
+    scrub_log_argument,
+    strip_control_chars,
+)
 
 #: The set the predicate is defined to catch. Written independently of the implementation, so this
 #: is a second opinion rather than a restatement of the same expression.
@@ -91,6 +97,19 @@ def test_the_strip_defeats_header_injection_which_is_why_it_exists() -> None:
     """CRLF is the whole point: a stripped value can no longer split a request line."""
     assert "\r" not in strip_control_chars("a\rb")
     assert "\n" not in strip_control_chars("a\nb")
+
+
+def test_the_log_argument_scrub_is_the_escape_with_line_breaks_replaced_first() -> None:
+    """``scrub_log_argument`` escapes CR and LF with ``replace`` before the table runs, so CodeQL's
+    log-injection query can see the neutraliser. Its output must still equal
+    ``scrub_control_chars`` everywhere, or a log line would read differently by call site."""
+    for code in range(0x0300):
+        value = f"a{chr(code)}b"
+        assert scrub_log_argument(value) == scrub_control_chars(value), hex(code)
+    for value in ("bob\r\nforged record\x1b[2J", "a\\nb", "\n\r\r\n", ""):
+        assert scrub_log_argument(value) == scrub_control_chars(value), repr(value)
+    assert "\r" not in scrub_log_argument("a\rb")
+    assert "\n" not in scrub_log_argument("a\nb")
 
 
 # --- no site re-derives the alphabet (BACKLOG #1273) ----------------------------------------------
