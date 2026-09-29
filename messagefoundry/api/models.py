@@ -344,9 +344,12 @@ class DeadLetterList(BaseModel):
 
 
 class ConnectionEventInfo(BaseModel):
-    """One connection/transport event (Corepoint-style log, #46) — **metadata only, no PHI**: the
-    connection name, transport, direction, event kind, peer IP, and a scrubbed reason. Read via the
-    ``monitoring:read``-gated ``GET /events`` / ``GET /connections/{name}/events`` routes."""
+    """One connection/transport event (Corepoint-style log, #46): the connection name, transport,
+    direction, event kind, peer IP, and a scrubbed reason. Read via the ``monitoring:read``-gated
+    ``GET /events`` / ``GET /connections/{name}/events`` routes.
+
+    Not PHI-free. ``reason`` is free text, scrubbed at the source and again at the store, and
+    ``docs/PHI.md`` section 2 gives its column a protection level. Read the level there."""
 
     id: int
     ts: float
@@ -360,10 +363,13 @@ class ConnectionEventInfo(BaseModel):
 
 
 class AlertInstanceInfo(BaseModel):
-    """One resolvable operator-alert instance (ADR 0044, #56) — **metadata only, no PHI**: the alert
-    type, connection label, severity, lifecycle status (open/acknowledged/resolved), the
-    first/last-seen window + occurrence count, a scrubbed reason, and the ack/resolve audit fields.
-    Read via the ``monitoring:diagnose``-gated ``GET /alerts/active`` route."""
+    """One resolvable operator-alert instance (ADR 0044, #56): the alert type, connection label,
+    severity, lifecycle status (open/acknowledged/resolved), the first/last-seen window + occurrence
+    count, a scrubbed reason, and the ack/resolve audit fields. Read via the
+    ``monitoring:diagnose``-gated ``GET /alerts/active`` route.
+
+    Not PHI-free. ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives its column a
+    protection level. Read the level there."""
 
     id: int
     event_type: str
@@ -573,9 +579,10 @@ class ConnectionRow(BaseModel):
     # status "failed"/"filtered" yet stays purge-eligible (``paused`` True). ``False`` for source rows and
     # for a running or still-"stopping" (not-yet-quiesced) outbound.
     paused: bool = False
-    error: str | None = (
-        None  # set when status == "failed" (why it failed to start, ADR 0031) or "filtered" (why the DR run-profile parked it, #61 ADR 0048)
-    )
+    # Set when status == "failed" (why it failed to start, ADR 0031) or "filtered" (why the DR
+    # run-profile parked it, #61 ADR 0048). Live free text that docs/PHI.md section 2 rates, which is
+    # why GET /connections is served no-store (BACKLOG #1185).
+    error: str | None = None
     # Destination-only, sharded deployments only (ADR 0073): the engine shard that owns claiming/
     # delivery for this outbound lane. None when unsharded (every lane is local) or for source rows.
     # Lets an operator watching a backlog on one shard's view see WHICH shard is responsible for
@@ -1419,7 +1426,9 @@ class ConnectionMetadata(BaseModel):
     metadata: dict[str, Any] | None = None  # operator labels
     settings: dict[str, Any]  # secret-scrubbed view
     simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
-    error: str | None = None  # why this connection failed to start, if it did (ADR 0031)
+    # Why this connection failed to start (ADR 0031) or was DR-parked (ADR 0048). Rated in
+    # docs/PHI.md section 2 (BACKLOG #1185).
+    error: str | None = None
 
 
 class AlertRuleInfo(BaseModel):

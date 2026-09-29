@@ -3,8 +3,10 @@
 """Monitoring-area page builders for the /ui ops dashboard (ADR 0065).
 
 Read-only monitoring surfaces (BACKLOG #75 phase 1). Each builder returns escaped :class:`.._html.Markup`
-and reuses the metadata-only JSON handlers (no PHI). A lane adding a page here appends its builder + the
-name in ``__all__`` and registers its nav entry via :func:`.._html.register_nav` co-located below.
+and reuses the monitoring JSON handlers. Those are not all PHI-free: the event log's and the alert
+list's ``reason`` is scrubbed free text that ``docs/PHI.md`` section 2 gives a protection level. A lane
+adding a page here appends its builder + the name in ``__all__`` and registers its nav entry via
+:func:`.._html.register_nav` co-located below.
 """
 
 from __future__ import annotations
@@ -166,7 +168,8 @@ def alerts(
 ) -> Markup:
     """The operator-alerts page: active (open + acknowledged) instances + the loaded rules (ADR 0044/0014).
 
-    Metadata only — no PHI, no secrets (transports are reported present-or-not by the JSON handler).
+    No secrets (transports are reported present-or-not by the JSON handler). Not PHI-free: each
+    instance's ``reason`` is scrubbed free text that ``docs/PHI.md`` section 2 gives a protection level.
 
     ``limit`` is the cap the route fetched under. The list cannot page (``GET /alerts`` takes no
     offset), so the footer is :func:`._common._window_note` with the store's ``total`` rather than
@@ -335,7 +338,9 @@ def _event_filter(connection: str, kind: str = "") -> Markup:
 def events(
     rows: list[ConnectionEventInfo], *, connection: str = "", kind: str = "", error: str = ""
 ) -> Markup:
-    """The connection/transport event log (Corepoint-style, #46) — metadata only, newest first.
+    """The connection/transport event log (Corepoint-style, #46), newest first. The Reason column is
+    scrubbed free text that ``docs/PHI.md`` section 2 gives a protection level, so the page is not
+    PHI-free.
 
     ``error`` renders a refusal banner above the table, the shape ``pages.messages`` uses: the filter
     form comes back carrying what the operator typed and the route answers 400 rather than querying
