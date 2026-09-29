@@ -261,9 +261,7 @@ def test_check_dryrun_unmapped_fixture_runs_every_inbound(tmp_path: Path) -> Non
     msgs = tmp_path / "messages"
     msgs.mkdir()
     (msgs / "x.hl7").write_bytes(BAD_HL7)
-    dr = next(
-        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
-    )
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required and not dr.skipped
     assert "IB_HL7" in dr.detail  # the error names the inbound the unmapped fixture reached
 
@@ -324,7 +322,7 @@ def test_check_dryrun_fails_when_nothing_was_actually_run(tmp_path: Path) -> Non
     msgs = tmp_path / "messages"
     msgs.mkdir()
     (msgs / "x.hl7").write_bytes(ADT_A01.encode("utf-8"))  # top-level, so unmapped
-    dr = _run_dryrun(cfg, msgs)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required and not dr.skipped, dr.detail
     # Attributable to the zero, not merely to some failure: a flag-only assertion would also be
     # satisfied by the gate failing for an unrelated reason.
@@ -354,9 +352,7 @@ def test_check_dryrun_non_feed_subdir_falls_back_to_all(tmp_path: Path) -> None:
     msgs = tmp_path / "messages"
     (msgs / "misc").mkdir(parents=True)
     (msgs / "misc" / "x.hl7").write_bytes(BAD_HL7)
-    dr = next(
-        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
-    )
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required and not dr.skipped
     assert "IB_HL7" in dr.detail
 
@@ -571,9 +567,11 @@ def _assert_the_gate_blocks_on_dryrun(cfg: Path, msgs: Path) -> checks.CheckResu
     """Assert the WHOLE GATE fails because of the dryrun check, and return that check.
 
     Asserting only the dryrun check's own ``ok`` flag proves the check noticed, not that the gate
-    blocked: with ``CheckResult.blocking`` stubbed to ``False`` both ``.expect`` failure tests below
-    stayed green (Fable packet 10, part 6, control C; BACKLOG #1746 limb 1). ``blocking`` and the
-    report verdict are what ``messagefoundry check`` turns into its exit code.
+    blocked: with ``CheckResult.blocking`` stubbed to ``False`` both ``.expect`` failure tests
+    stayed green (Fable packet 10, part 6, control C; BACKLOG #1746 limb 1), and so did three other
+    dryrun-failure tests that asserted only ``ok``, ``required`` and ``skipped``. Every dryrun test
+    that expects a failure goes through here. ``blocking`` and the report verdict are what
+    ``messagefoundry check`` turns into its exit code.
     """
     report = run_checks(cfg, messages_dir=msgs, run_lint=False)
     dr = next(r for r in report.results if r.name == "dryrun")

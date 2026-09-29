@@ -70,6 +70,9 @@ replace = '''
 tests = [
     "tests/test_checks.py::test_expect_mismatch_fails",
     "tests/test_checks.py::test_expect_invalid_value_fails",
+    "tests/test_checks.py::test_check_dryrun_unmapped_fixture_runs_every_inbound",
+    "tests/test_checks.py::test_check_dryrun_fails_when_nothing_was_actually_run",
+    "tests/test_checks.py::test_check_dryrun_non_feed_subdir_falls_back_to_all",
 ]
 
 [[mutation]]

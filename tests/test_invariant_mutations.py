@@ -16,13 +16,14 @@ means the tests never judged the break.
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests._negative_controls import _test_names
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "ci" / "invariant_mutations.py"
@@ -61,24 +62,45 @@ def test_every_row_breaks_text_that_exists_exactly_once(row: Any) -> None:
     )
 
 
+def _row(find: str, replace: str = "") -> Any:
+    return _MOD.Mutation(id="x", item=1, file="f.py", find=find, replace=replace, tests=("t",))
+
+
 def test_the_anchor_count_sees_text_that_is_not_there(tmp_path: Path) -> None:
     """Paired control: the count is 0 for absent text, and CRLF files still match."""
     (tmp_path / "f.py").write_bytes(b"a = 1\r\nb = 2\r\n")
-    row = _MOD.Mutation(
-        id="x", item=1, file="f.py", find="a = 1\nb = 2\n", replace="", tests=("t",)
+    assert _MOD.anchor_count(_row("a = 1\nb = 2\n"), root=tmp_path) == 1
+    assert _MOD.anchor_count(_row("c = 3\n"), root=tmp_path) == 0
+
+
+def test_the_anchor_must_start_a_line(tmp_path: Path) -> None:
+    """A shallow anchor must not match inside a deeper-indented line elsewhere."""
+    (tmp_path / "f.py").write_bytes(
+        b"def f():\n    if x:\n        if total == 0:\n            pass\n"
     )
-    assert _MOD.anchor_count(row, root=tmp_path) == 1
-    absent = _MOD.Mutation(id="y", item=1, file="f.py", find="c = 3\n", replace="", tests=("t",))
-    assert _MOD.anchor_count(absent, root=tmp_path) == 0
+    assert _MOD.anchor_count(_row("    if total == 0:\n"), root=tmp_path) == 0
+    assert _MOD.anchor_count(_row("        if total == 0:\n"), root=tmp_path) == 1
 
 
-def _defined_tests(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    return {
-        n.name
-        for n in ast.walk(tree)
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")
-    }
+@pytest.mark.parametrize("row", [r for r in _ROWS if r.file.endswith(".py")], ids=lambda m: m.id)
+def test_every_break_still_compiles(row: Any) -> None:
+    """A break that is a SyntaxError reddens its tests on the import, not on the property."""
+    compile(_MOD.mutated_bytes(row), row.file, "exec")
+
+
+def test_an_empty_replace_is_a_deletion_not_a_missing_field(tmp_path: Path) -> None:
+    listed = tmp_path / "list.toml"
+    listed.write_text(
+        '[[mutation]]\nid = "d"\nitem = 1\nfile = "f.py"\nfind = "x\\n"\nreplace = ""\n'
+        'tests = ["tests/t.py::test_a"]\n',
+        encoding="utf-8",
+    )
+    assert [m.replace for m in _MOD.load(listed)] == [""]
+    listed.write_text(
+        listed.read_text(encoding="utf-8").replace('tests = ["tests/t.py::test_a"]', "")
+    )
+    with pytest.raises(ValueError, match="missing"):
+        _MOD.load(listed)
 
 
 @pytest.mark.parametrize("row", _ROWS, ids=lambda m: m.id)
@@ -88,7 +110,7 @@ def test_every_named_test_exists(row: Any) -> None:
         rel, _, name = node.partition("::")
         path = _REPO / rel
         assert path.is_file(), f"{row.id}: {rel} does not exist"
-        assert name in _defined_tests(path), f"{row.id}: {rel} defines no {name}"
+        assert name in _test_names(path), f"{row.id}: {rel} defines no {name}"
 
 
 @pytest.mark.parametrize(
@@ -119,8 +141,27 @@ def test_the_summary_line_is_never_what_decides() -> None:
     )
 
 
-def test_children_run_with_a_safe_path() -> None:
-    assert _MOD.child_env()["PYTHONSAFEPATH"] == "1"
+def test_children_run_with_a_safe_path_and_no_inherited_pytest_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-rN")
+    monkeypatch.setenv("PY_COLORS", "1")
+    env = _MOD.child_env()
+    assert env["PYTHONSAFEPATH"] == "1"
+    assert "PYTEST_ADDOPTS" not in env and "PY_COLORS" not in env
+
+
+def test_a_skipped_listed_test_is_seen() -> None:
+    out = "1 skipped\nSKIPPED [1] tests/t.py:3: needs a server\n"
+    assert _MOD.skipped_lines(out) == ["SKIPPED [1] tests/t.py:3: needs a server"]
+
+
+def test_a_crash_is_could_not_judge_not_survived(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom() -> list[object]:
+        raise FileNotFoundError("the list moved")
+
+    monkeypatch.setattr(_MOD, "load", boom)
+    assert _MOD.main([]) == 2
 
 
 def test_zero_selected_rows_is_not_a_pass(monkeypatch: pytest.MonkeyPatch) -> None:

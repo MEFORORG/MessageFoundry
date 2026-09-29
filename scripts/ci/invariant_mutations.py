@@ -5,7 +5,8 @@
 Each row of ``scripts/ci/invariant_mutations.toml`` is one deliberate break and the tests that must
 turn red under it. For each row this script:
 
-1. runs the row's tests UNMUTATED and requires them green (a test already red proves nothing);
+1. runs the row's tests UNMUTATED and requires them to pass with none skipped (a test already red,
+   or one that never ran, proves nothing);
 2. applies the break, runs the same tests, and restores the file in a ``finally``;
 3. checks the file's bytes are back to what they were.
 
@@ -18,12 +19,20 @@ review instrument that matched a regex against it once reported every control gr
 nothing (Fable packet 5).
 
 Every pytest child runs with ``PYTHONSAFEPATH=1``, so the working directory cannot shadow the
-installed package, and the run prints which ``messagefoundry`` answered (#1677). A tree outside this
-repository is refused, because the breaks would then land in files the tests never import.
+installed package, with colour off and ``PYTEST_ADDOPTS`` removed, so nothing in the caller's
+environment changes the ``FAILED`` lines this reads. The run prints which ``messagefoundry``
+answered (#1677) and refuses a tree outside this repository, because the breaks would then land in
+files the tests never import.
 
-Exit codes: 0 every row killed; 1 at least one row SURVIVED; 2 the run could not judge (a row not
-green before its break, an unkillable exit code, a stale ``find``, a restore mismatch, or ZERO rows
-selected -- zero is not a pass).
+IT EDITS THE LIVE CHECKOUT. While a row runs, its engine file is broken on disk, so do not run this
+in a worktree anything else is using. Before writing, it saves the original next to the file as
+``<file>.invariant-mutation-backup``; the ``finally`` removes it. A hard kill skips the ``finally``,
+so the next run restores any backup it finds before doing anything else, and says so.
+
+Exit codes: 0 every row killed; 1 at least one row SURVIVED, whatever else happened (a survivor is
+the finding, and an error elsewhere must not hide it); 2 the run could not judge (a row not green
+before its break, an unkillable exit code, a stale ``find``, a restore mismatch, any unexpected
+exception, or ZERO rows selected -- zero is not a pass).
 
 Usage::
 
@@ -44,12 +53,14 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 LIST_PATH = REPO / "scripts" / "ci" / "invariant_mutations.toml"
+BACKUP_SUFFIX = ".invariant-mutation-backup"
 
 KILLED = "KILLED"
 SURVIVED = "SURVIVED"
 ERROR = "ERROR"
 
 _TIMEOUT_SECONDS = 900
+_FIELDS = ("id", "item", "file", "find", "replace", "tests")
 
 
 @dataclass(frozen=True)
@@ -63,21 +74,24 @@ class Mutation:
 
 
 def load(path: Path = LIST_PATH) -> list[Mutation]:
-    """Parse the list, refusing a row with a missing or empty field."""
+    """Parse the list, refusing a row with a missing field, an empty ``find`` or no tests.
+
+    An empty ``replace`` is allowed: deleting a guard outright is the most natural break.
+    """
     rows = tomllib.loads(path.read_text(encoding="utf-8")).get("mutation", [])
     out: list[Mutation] = []
     for row in rows:
-        missing = [k for k in ("id", "item", "file", "find", "replace", "tests") if not row.get(k)]
-        if missing:
-            raise ValueError(f"mutation {row.get('id', '?')!r} is missing {missing}")
+        missing = [k for k in _FIELDS if k not in row]
+        if missing or not row["find"] or not row["tests"]:
+            raise ValueError(f"mutation {row.get('id', '?')!r} is missing or empty: {missing}")
         out.append(
             Mutation(
-                id=row["id"],
+                id=str(row["id"]),
                 item=int(row["item"]),
-                file=row["file"],
-                find=row["find"],
-                replace=row["replace"],
-                tests=tuple(row["tests"]),
+                file=str(row["file"]),
+                find=str(row["find"]),
+                replace=str(row["replace"]),
+                tests=tuple(str(t) for t in row["tests"]),
             )
         )
     ids = [m.id for m in out]
@@ -93,15 +107,32 @@ def _encoded(text: str, data: bytes) -> bytes:
     return raw.replace(b"\n", b"\r\n") if b"\r\n" in data else raw
 
 
+def _line_anchored_count(data: bytes, needle: bytes) -> int:
+    """Occurrences of ``needle`` that start a line, so an anchor cannot match mid-line."""
+    return data.count(b"\n" + needle) + (1 if data.startswith(needle) else 0)
+
+
 def anchor_count(m: Mutation, root: Path = REPO) -> int:
-    """How many times the row's ``find`` text occurs in its file (it must be exactly 1)."""
+    """How many lines the row's ``find`` text starts on in its file (it must be exactly 1)."""
     data = (root / m.file).read_bytes()
-    return data.count(_encoded(m.find, data))
+    return _line_anchored_count(data, _encoded(m.find, data))
+
+
+def mutated_bytes(m: Mutation, root: Path = REPO) -> bytes:
+    """The row's file with its break applied, at the line-anchored occurrence."""
+    data = (root / m.file).read_bytes()
+    find, replace = _encoded(m.find, data), _encoded(m.replace, data)
+    if data.startswith(find):
+        return replace + data[len(find) :]
+    return data.replace(b"\n" + find, b"\n" + replace, 1)
 
 
 def child_env() -> dict[str, str]:
     env = dict(os.environ)
+    for key in ("PYTEST_ADDOPTS", "PY_COLORS", "FORCE_COLOR"):
+        env.pop(key, None)
     env["PYTHONSAFEPATH"] = "1"
+    env["NO_COLOR"] = "1"
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     return env
 
@@ -120,13 +151,22 @@ def answering_tree() -> Path:
     return Path(out.stdout.strip()).resolve().parent
 
 
-def failed_nodes(output: str) -> list[str]:
-    """The node ids pytest's short summary marks ``FAILED`` (``-rf``)."""
+def _summary_nodes(output: str, marker: str) -> list[str]:
     nodes: list[str] = []
     for line in output.splitlines():
-        if line.startswith("FAILED "):
-            nodes.append(line[len("FAILED ") :].split(" - ", 1)[0].strip())
+        if line.startswith(marker):
+            nodes.append(line[len(marker) :].split(" - ", 1)[0].strip())
     return nodes
+
+
+def failed_nodes(output: str) -> list[str]:
+    """The node ids pytest's short summary marks ``FAILED`` (``-rfs``)."""
+    return _summary_nodes(output, "FAILED ")
+
+
+def skipped_lines(output: str) -> list[str]:
+    """Pytest's short-summary ``SKIPPED`` lines (``-rfs``)."""
+    return [line for line in output.splitlines() if line.startswith("SKIPPED ")]
 
 
 def _names_a_listed_test(node: str, tests: tuple[str, ...]) -> bool:
@@ -144,8 +184,9 @@ def score(returncode: int, output: str, tests: tuple[str, ...]) -> str:
 
 
 def _pytest(tests: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--color=no"]
     return subprocess.run(  # nosec B603 - fixed argv, no shell; node ids come from the list
-        [sys.executable, "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider", *tests],
+        [*argv, *tests, "-rfs"],
         cwd=REPO,
         env=child_env(),
         capture_output=True,
@@ -154,38 +195,56 @@ def _pytest(tests: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _backup(target: Path) -> Path:
+    return target.with_name(target.name + BACKUP_SUFFIX)
+
+
+def restore_leftovers(rows: list[Mutation]) -> list[str]:
+    """Restore any file a killed earlier run left broken; return the paths restored."""
+    restored: list[str] = []
+    for file in sorted({m.file for m in rows}):
+        target = REPO / file
+        backup = _backup(target)
+        if backup.is_file():
+            target.write_bytes(backup.read_bytes())
+            backup.unlink()
+            restored.append(file)
+    return restored
+
+
 def run_one(m: Mutation) -> tuple[str, str]:
     """Return ``(verdict, reason)`` for one row."""
     target = REPO / m.file
-    original = target.read_bytes()
-    found = original.count(_encoded(m.find, original))
+    found = anchor_count(m)
     if found != 1:
-        return ERROR, f"`find` occurs {found} time(s) in {m.file}, expected exactly 1 (stale row)"
+        return ERROR, f"`find` starts {found} line(s) in {m.file}, expected exactly 1 (stale row)"
     before = _pytest(m.tests)
     if before.returncode != 0:
         return ERROR, f"not green before the break (pytest exit {before.returncode})"
-    try:
-        target.write_bytes(
-            original.replace(_encoded(m.find, original), _encoded(m.replace, original), 1)
+    if skipped_lines(before.stdout):
+        return (
+            ERROR,
+            f"a listed test was skipped, so it cannot judge: {skipped_lines(before.stdout)}",
         )
+    original = target.read_bytes()
+    broken = mutated_bytes(m)
+    backup = _backup(target)
+    backup.write_bytes(original)
+    try:
+        target.write_bytes(broken)
         after = _pytest(m.tests)
     finally:
         target.write_bytes(original)
+        backup.unlink()
     if target.read_bytes() != original:
         return ERROR, f"{m.file} was not restored byte for byte"
     verdict = score(after.returncode, after.stdout + after.stderr, m.tests)
     nodes = failed_nodes(after.stdout)
     first = f", first {nodes[0]}" if nodes else ""
-    reason = f"pytest exit {after.returncode}, {len(nodes)} FAILED line(s){first}"
-    return verdict, reason
+    return verdict, f"pytest exit {after.returncode}, {len(nodes)} FAILED line(s){first}"
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    parser.add_argument("--only", action="append", default=[], help="run only this id")
-    parser.add_argument("--list", action="store_true", help="print the rows and exit")
-    args = parser.parse_args(argv)
-
+def _run(args: argparse.Namespace) -> int:
     rows = load()
     if args.only:
         unknown = sorted(set(args.only) - {m.id for m in rows})
@@ -200,6 +259,8 @@ def main(argv: list[str] | None = None) -> int:
     if not rows:
         print("error: 0 mutations selected; a run over nothing is not a pass", file=sys.stderr)
         return 2
+    for file in restore_leftovers(load()):
+        print(f"warning: restored {file} from a backup an interrupted run left behind")
 
     tree = answering_tree()
     print(f"# invariant-mutations tree={tree} list={LIST_PATH.relative_to(REPO).as_posix()}")
@@ -216,9 +277,21 @@ def main(argv: list[str] | None = None) -> int:
         f"# ran {len(rows)} mutation(s): {verdicts[KILLED]} killed, "
         f"{verdicts[SURVIVED]} survived, {verdicts[ERROR]} error"
     )
-    if verdicts[ERROR]:
+    if verdicts[SURVIVED]:
+        return 1
+    return 2 if verdicts[ERROR] else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    parser.add_argument("--only", action="append", default=[], help="run only this id")
+    parser.add_argument("--list", action="store_true", help="print the rows and exit")
+    args = parser.parse_args(argv)
+    try:
+        return _run(args)
+    except Exception as exc:  # noqa: BLE001 -- any crash is "could not judge", never "survived"
+        print(f"error: the run could not judge: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    return 1 if verdicts[SURVIVED] else 0
 
 
 if __name__ == "__main__":
