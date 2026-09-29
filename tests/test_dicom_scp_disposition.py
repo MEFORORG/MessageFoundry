@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import (  # noqa: E402
     build_inbound_connection,
 )
 from messagefoundry.parsing.dicom._inflate import DEFAULT_MAX_INFLATED_BYTES  # noqa: E402
-from messagefoundry.pipeline import wiring_runner  # noqa: E402
+from messagefoundry.pipeline import ingress_guards, wiring_runner  # noqa: E402
 from messagefoundry.pipeline.wiring_runner import RegistryRunner  # noqa: E402
 from messagefoundry.store import MessageStatus, MessageStore  # noqa: E402
 from messagefoundry.transports.dicom import DicomScpSource  # noqa: E402
@@ -122,8 +122,8 @@ async def test_an_object_in_the_16_to_128_mib_band_is_refused_to_the_sender(
     so the sender sees a failure and nothing is half-recorded. Refusal is the right side of the row's
     either/or: the engine's binary ingress ceiling is 16 MiB, so accepting the band would mean raising a
     CWE-770 bound, which is a separate decision."""
-    data = _big_sr(wiring_runner._INGRESS_MAX_BYTES + _MIB)
-    assert wiring_runner._INGRESS_MAX_BYTES < len(data) < 128 * _MIB  # the band the row names
+    data = _big_sr(ingress_guards.INGRESS_MAX_BYTES + _MIB)
+    assert ingress_guards.INGRESS_MAX_BYTES < len(data) < 128 * _MIB  # the band the row names
 
     status = await _send_through_runner(store, data)
 
@@ -138,7 +138,7 @@ async def test_a_handler_refusal_is_a_dimse_failure_and_keeps_its_error_row(
     of committing, the sender must hear a failure. The engine ceiling is lowered under a normal SR so the
     SCP's own cap passes it and only the handler refuses it. Count-and-log still holds: the ERROR row
     exists, and it is the ONLY row."""
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 256)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 256)
     data = make_sr_part10()
     assert len(data) > 256
 
@@ -176,7 +176,7 @@ def _scp(max_object_bytes: int | None, name: str | None = None) -> DicomScpSourc
 def test_the_scp_cap_never_exceeds_the_engine_ingress_ceiling(configured: int | None) -> None:
     """The shipped 128 MiB default, and an uncapped SCP, both resolve to the engine's binary ingress
     ceiling. An object above it could only ever be recorded ERROR, so the SCP must not accept one."""
-    assert _scp(configured)._max_object_bytes == wiring_runner._INGRESS_MAX_BYTES
+    assert _scp(configured)._max_object_bytes == ingress_guards.INGRESS_MAX_BYTES
 
 
 def test_a_cap_below_the_ceiling_is_kept() -> None:
@@ -192,9 +192,9 @@ def _clamp_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]
     [
         (64 * _MIB, str(64 * _MIB), 64 * _MIB),
         (
-            wiring_runner._INGRESS_MAX_BYTES + 1,
-            str(wiring_runner._INGRESS_MAX_BYTES + 1),
-            wiring_runner._INGRESS_MAX_BYTES + 1,
+            ingress_guards.INGRESS_MAX_BYTES + 1,
+            str(ingress_guards.INGRESS_MAX_BYTES + 1),
+            ingress_guards.INGRESS_MAX_BYTES + 1,
         ),
         # An explicit uncapped setting is the widest clamp of all: "no limit" becomes 16 MiB, and
         # the inflate bound falls to the codec default.
@@ -216,7 +216,7 @@ def test_a_clamped_cap_is_logged_at_build(
     message = hits[0].getMessage()
     assert repr(_NAME) in message
     assert f"max_object_bytes {shown} " in message
-    assert f"ceiling of {wiring_runner._INGRESS_MAX_BYTES} bytes" in message
+    assert f"ceiling of {ingress_guards.INGRESS_MAX_BYTES} bytes" in message
     assert f"inflate bound is {inflate} bytes" in message
 
 
@@ -243,7 +243,7 @@ def test_a_connection_that_is_refused_logs_no_clamp_warning(
 @pytest.mark.parametrize(
     "configured",
     [
-        wiring_runner._INGRESS_MAX_BYTES,
+        ingress_guards.INGRESS_MAX_BYTES,
         _MIB,
         # The shipped default is clamped too, but the factory always passes it, so it cannot be told
         # from an explicit setting. Warning on every default SCP would be noise.
