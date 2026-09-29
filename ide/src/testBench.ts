@@ -11,6 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./cli";
+import { CollectionStore, CollectionStoreError } from "./collectionStore";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
@@ -25,9 +26,9 @@ import {
   type TestCollection,
 } from "./testCollections";
 
-// Saved regression collections (BACKLOG #168, ADR 0121) live in machine-local workspaceState — NEVER a
-// repo file, and NEVER globalState (Settings-Sync-eligible → could carry PHI off-box). Keyed map.
-const COLLECTIONS_KEY = "messagefoundry.testBench.collections";
+// Saved regression collections (BACKLOG #168, ADR 0121) hold case bodies, which are PHI. They live in
+// VS Code SecretStorage, scoped to this workspace (BACKLOG #1174; see collectionStore.ts) — NEVER a
+// repo file, NEVER globalState (Settings-Sync-eligible), and no longer plain workspaceState.
 
 interface Delivery {
   to: string;
@@ -131,28 +132,93 @@ export class TestBench {
     } else if (m.command === "hex") {
       await this.showHex(m.index);
     } else if (m.command === "listCollections") {
-      await this.postCollections();
+      await this.withCollections(() => this.postCollections());
     } else if (m.command === "saveCollection") {
-      await this.saveCollection();
+      await this.withCollections(() => this.saveCollection());
     } else if (m.command === "runCollection") {
-      await this.runCollection(m.name);
+      await this.withCollections(() => this.runCollection(m.name));
     } else if (m.command === "caseDetail") {
       await this.showCaseDetail(m.run, m.index);
     } else if (m.command === "deleteCollection") {
-      await this.deleteCollection(m.name);
+      await this.withCollections(() => this.deleteCollection(m.name));
     }
   }
 
   // ---- Saved regression collections (BACKLOG #168, ADR 0121) -----------------------------------
-  // All persistence is machine-local workspaceState (not globalState — that is Settings-Sync-eligible
-  // and could carry PHI off-box). Case bodies are PHI; authors are steered to synthetic cases.
+  // Case bodies are PHI; authors are steered to synthetic cases. Persistence is VS Code SecretStorage
+  // (encrypted with an OS-keychain-held key), keyed per workspace, with a one-time move out of the
+  // workspaceState key earlier builds used (BACKLOG #1174). The logic lives in collectionStore.ts.
 
-  private loadCollections(): Record<string, TestCollection> {
-    return this.context.workspaceState.get<Record<string, TestCollection>>(COLLECTIONS_KEY, {});
+  private collections: CollectionStore | undefined;
+
+  private collectionStore(): CollectionStore {
+    // storageUri is VS Code's own per-workspace scope (the one workspaceState used). It is undefined
+    // only in a window with no folder open, where saving is refused anyway (it needs workspaceDir()).
+    this.collections ??= new CollectionStore(
+      this.context.secrets,
+      this.context.workspaceState,
+      this.context.storageUri?.toString() ?? "(no workspace)",
+    );
+    return this.collections;
   }
 
-  private async storeCollections(map: Record<string, TestCollection>): Promise<void> {
-    await this.context.workspaceState.update(COLLECTIONS_KEY, map);
+  private loadCollections(): Promise<Record<string, TestCollection>> {
+    return this.collectionStore().load();
+  }
+
+  private storeCollections(map: Record<string, TestCollection>): Promise<void> {
+    return this.collectionStore().save(map);
+  }
+
+  /**
+   * Run a collection action, reporting a storage failure without echoing anything it read: only the
+   * error's type is logged, never its message, which could quote a stored body. An unreadable stored
+   * value would block every collection command, so that case offers to delete the saved collections.
+   */
+  private async withCollections(action: () => Promise<void>): Promise<void> {
+    try {
+      await action();
+    } catch (e) {
+      console.warn(
+        `MessageFoundry Test Bench: collection storage failed (${e instanceof Error ? e.name : typeof e})`,
+      );
+      if (!(e instanceof CollectionStoreError)) {
+        void vscode.window.showErrorMessage(
+          "MessageFoundry: saved Test Bench collections could not be read or written.",
+        );
+        // A save or delete drops the held run before its store call, so re-list rather than leave a
+        // run view on screen whose Detail buttons can no longer be answered. Best effort.
+        try {
+          await this.postCollections();
+        } catch {
+          /* the message above already reports the storage failure */
+        }
+        return;
+      }
+      const reset = await vscode.window.showErrorMessage(
+        `MessageFoundry: ${e.message}. Delete the saved collections for this workspace?`,
+        { modal: true },
+        "Delete",
+      );
+      if (reset === "Delete") {
+        try {
+          await this.collectionStore().reset();
+          this.dropRun(); // every collection is gone, so no held run's details may stay in memory
+        } catch {
+          void vscode.window.showErrorMessage(
+            "MessageFoundry: the saved Test Bench collections could not be deleted.",
+          );
+          return;
+        }
+        try {
+          await this.postCollections();
+        } catch {
+          void vscode.window.showErrorMessage(
+            "MessageFoundry: saved Test Bench collections could not be read or written.",
+          );
+        }
+      }
+    }
   }
 
   /** Post the current collection list (name + case count only — bodies stay in the host) to the webview. */
@@ -160,7 +226,10 @@ export class TestBench {
     if (!this.panel) {
       return;
     }
-    const map = this.loadCollections();
+    const map = await this.loadCollections();
+    if (!this.panel) {
+      return; // closed while the (possibly migrating) load ran
+    }
     const items = Object.values(map)
       .map((c) => ({ name: c.name, cases: c.cases.length }))
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -185,7 +254,7 @@ export class TestBench {
     if (!name) {
       return;
     }
-    const map = this.loadCollections();
+    const map = await this.loadCollections();
     if (map[name]) {
       const overwrite = await vscode.window.showWarningMessage(
         `A collection named "${name}" already exists. Overwrite it?`,
@@ -211,7 +280,7 @@ export class TestBench {
   }
 
   private async deleteCollection(name: string): Promise<void> {
-    const map = this.loadCollections();
+    const map = await this.loadCollections();
     if (!map[name]) {
       return;
     }
@@ -241,7 +310,9 @@ export class TestBench {
     }
     const panel = this.panel;
     const gen = ++this.viewGen;
-    const coll = this.loadCollections()[name];
+    // The load is async now (SecretStorage, BACKLOG #1174). The generation is taken first, so the
+    // check after the dry-run also drops a run whose view moved on during the load.
+    const coll = (await this.loadCollections())[name];
     const cwd = workspaceDir();
     if (!coll || !cwd) {
       return;
