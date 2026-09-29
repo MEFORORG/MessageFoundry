@@ -265,12 +265,14 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ### Changed
 - **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
-  encrypted.** Before, the MAC was checked only when something in the bundle was encrypted, so an
-  `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle with an MD5 or SHA-1 MAC loaded. That
-  MAC still derives its key from the passphrase through the PKCS#12 KDF, so it is now refused like
-  any MAC that is not PBMAC1 at the PBKDF2 floor. An unencrypted bundle with no MAC still loads,
-  since nothing in it comes from a password. The refusal gives the `openssl` re-export command.
-  (`BACKLOG #1352`)
+  encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
+  `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256
+  MAC. That MAC still derives its key from the passphrase through the PKCS#12 KDF. It is now
+  refused like any MAC that is not PBMAC1 at the PBKDF2 floor. **This includes OpenSSL's default
+  MAC and `cryptography`'s `NoEncryption` output**, which carries a SHA-256 MAC under an empty
+  passphrase. An unencrypted bundle with no MAC (`-nomac`) still loads with no passphrase, since
+  nothing in it comes from a password. A bundle with an approved MAC now needs `MEFOR_PFX_PASSWORD`
+  even when its bags are clear. The refusal gives the `openssl` re-export commands. (`BACKLOG #1352`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before

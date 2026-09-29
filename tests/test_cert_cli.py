@@ -3,9 +3,9 @@
 """CLI cert tooling (BACKLOG #71/#72): `.pfx` import, read-only inventory, self-signed dev certs.
 
 Driven end-to-end through `messagefoundry.__main__.main([...])` (int return codes + capsys/tmp_path),
-matching tests/test_cli.py. `.pfx` bundles are built in-memory with pkcs12.serialize_key_and_certificates
-(there is no shipped helper). Security-relevant coverage: the 0o600 + O_EXCL key write, the env-only
-passphrase, and that a bad/missing password never leaks into the error output.
+matching tests/test_cli.py. `.pfx` bundles are built in-memory by tests/_approved_key_wrap.py over
+pkcs12.serialize_key_and_certificates. Security-relevant coverage: the 0o600 + O_EXCL key write,
+the env-only passphrase, and that a bad/missing password never leaks into the error output.
 """
 
 from __future__ import annotations

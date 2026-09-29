@@ -748,10 +748,26 @@ def test_a_weak_mac_over_unencrypted_bags_is_refused(
 def test_unencrypted_bags_pass_with_an_approved_mac_or_with_none(material: Material) -> None:
     # The controls for the refusals above, over the SAME clear bags: only the MacData differs.
     clear = _clear_bags(material)
-    assert _p12_refusal(with_pbmac1(clear, b"synthetic-pfx", iterations=600_000)) is None
+    pbmac1 = with_pbmac1(clear, b"synthetic-pfx", iterations=600_000)
+    assert _p12_refusal(pbmac1) is None
+    # The MAC is keyed by the passphrase, so with none configured the check names the setting
+    # rather than leaving cryptography to fail with a generic error.
+    refusal = _p12_refusal(pbmac1, given=False)
+    assert refusal is not None and "no passphrase is configured" in refusal
     # No MacData at all: nothing in the bundle is derived from a password, so there is no
     # derivation to judge, as with an unencrypted PEM key. No passphrase is needed either.
     assert _p12_refusal(without_mac(clear), given=False) is None
+
+
+def test_the_clear_bag_note_is_only_on_a_clear_bag_refusal(material: Material) -> None:
+    # The same PKCS#12-KDF MAC over SHA-256 on encrypted bags: refused, without the note that
+    # says no bag is encrypted. The clear-bag arm is the control that the note exists at all.
+    cert = _p12_cert(material.key)
+    encrypted = _p12_refusal(pkcs12_bundle(material.key, cert, b"synthetic-pfx"))
+    clear = _p12_refusal(_clear_bags(material))
+    assert encrypted is not None and "rather than PBMAC1" in encrypted
+    assert "no bag is encrypted" not in encrypted
+    assert clear is not None and "no bag is encrypted" in clear
 
 
 def test_an_encrypted_pkcs12_bundle_with_no_mac_is_refused(material: Material) -> None:

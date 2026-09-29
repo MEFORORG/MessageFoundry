@@ -9,6 +9,10 @@ the EncryptedPrivateKeyInfo DER from ``cryptography``'s own PBKDF2 and AES-CBC p
 that need an encrypted key use :func:`approved_pkcs8_pem`; ``tests/test_keywrap.py`` also uses
 :func:`pkcs8_pem` to build the weak variants.
 
+It also writes PKCS#12 bundles: :func:`approved_pfx` for an accepted one, and :func:`clear_pfx`,
+:func:`with_pkcs12_kdf_mac` and :func:`with_pbmac1` for the MAC shapes ``cryptography`` will not
+write.
+
 The output is a real key file: the loaders' own tests decrypt it through OpenSSL and ``cryptography``.
 Keys and passphrases here are synthetic.
 """
@@ -224,12 +228,14 @@ def with_pkcs12_kdf_mac(pfx: bytes, passphrase: bytes, *, mac_hash: str, iterati
     """``pfx`` with its MacData replaced by a legacy one: HMAC keyed by the PKCS#12 KDF.
 
     RFC 7292 Appendix B.2 with ID 3, the MAC key. This is what ``openssl pkcs12 -macalg`` writes.
-    It is built here because ``cryptography``'s writer always encrypts the bags, so it cannot write
-    a MAC over clear ones. The passphrase is a BMPString with a two-byte terminator. The bundles are
-    real: the cert CLI tests open them through ``cryptography``, which checks the MAC."""
+    ``cryptography`` cannot write it over clear bags with a chosen hash and passphrase: its
+    ``NoEncryption`` writes SHA-256 under an empty passphrase only, and its encryption builder
+    always encrypts the bags. The passphrase is a BMPString with a two-byte terminator. The bundles
+    are real: the cert CLI tests open them through ``cryptography``, which checks the MAC."""
     head, content = _pfx_parts(pfx)
     oid_dotted, algorithm = _PKCS12_MAC_HASH[mac_hash]
-    block = 64  # the hash's input block size: 64 bytes for MD5, SHA-1 and SHA-256
+    block = algorithm.block_size  # v in RFC 7292 B.2: the hash's input block, in bytes
+    assert block is not None
     salt = os.urandom(8)
 
     def fill(data: bytes) -> bytes:
