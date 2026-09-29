@@ -338,6 +338,8 @@ _CONTEXTUAL_TOKENS = frozenset(
         "admin_write_rate_limit_per_actor",
         "admin_write_rate_limit_window_seconds",
         "admin_write_rate_limit_enabled",
+        # BACKLOG #2301: the minimum gap between two admin writes by one actor, a THROTTLE.
+        "admin_write_min_interval_seconds",
         "ad_session_recheck_seconds",
         "ad_session_recheck_strikes",
         "ad_session_recheck_max_users",
@@ -426,6 +428,8 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     # BACKLOG #287: a provisional human-timing floor, so pinned like min_dwell_seconds below. Anchored
     # on "per 15 s", because a bare "15 s" is also a substring of "115 s".
     ("auth", "admin_write_rate_limit_window_seconds", 15.0, "per 15 s"),
+    # BACKLOG #2301: the provisional minimum gap between two admin writes, pinned for the same reason.
+    ("auth", "admin_write_min_interval_seconds", 0.15, "0.15 s"),
     ("auth", "ad_session_recheck_strikes", 2, "**2 consecutive**"),
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),

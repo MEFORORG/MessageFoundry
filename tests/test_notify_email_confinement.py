@@ -55,7 +55,12 @@ class _FakeNotifier:
 
 
 def _no_mfa(**overrides: Any) -> AuthSettings:
-    return AuthSettings(require_mfa=False, login_rate_limit_enabled=False, **overrides)
+    return AuthSettings(
+        admin_write_min_interval_seconds=0,
+        require_mfa=False,
+        login_rate_limit_enabled=False,
+        **overrides,
+    )
 
 
 async def _add_local(service: AuthService, username: str, *, email: str | None = None) -> str:

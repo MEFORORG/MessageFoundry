@@ -2828,6 +2828,18 @@ class AuthSettings(_Section):
     # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
     # every write after the twelfth would be refused for the life of the process.
     admin_write_rate_limit_window_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    # THE MINIMUM GAP BETWEEN TWO WRITES BY ONE ACTOR, AND IT IS PROVISIONAL TOO (BACKLOG #2301, ASVS
+    # 2.4.2; owner ruling R7 of 2026-09-23). The count above admits its twelve writes back to back;
+    # this refuses a write that lands sooner than this after the same actor's last admitted one. It
+    # charges nothing: a refused write is not recorded, as with the count. Same sources as above. The
+    # fastest console write the model allows, with the decision made and the hand already in place,
+    # is one click, BB = 0.2 s (Kieras 1993), or Tab then Enter at the fastest typist the model lists,
+    # 2 K = 2 x 0.08 s = 0.16 s (Card, Moran and Newell 1980). The default sits just under the faster,
+    # at 0.15 s. A real second write also waits for the page to come back, which only adds to the
+    # gap. It is a judgment, not a measurement, and nobody has timed a person on THIS console. 0 turns
+    # the gap off. It must be shorter than the window, or the last write ages out of the window before
+    # the gap is measured (checked below).
+    admin_write_min_interval_seconds: float = Field(default=0.15, ge=0, allow_inf_nan=False)
 
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
@@ -2835,6 +2847,20 @@ class AuthSettings(_Section):
     # touch the audit log; which events the /me/security-events feed shows is stated once, in
     # auth/notifications.py.
     notify_security_events: bool = True
+
+    @model_validator(mode="after")
+    def _check_admin_write_gap_inside_window(self) -> AuthSettings:
+        # A gap as long as the window measures nothing: the limiter prunes the last write before it
+        # compares, so the gap would silently fall back to the count. Refused at load instead.
+        if (
+            self.admin_write_rate_limit_enabled
+            and self.admin_write_min_interval_seconds >= self.admin_write_rate_limit_window_seconds
+        ):
+            raise ValueError(
+                "admin_write_min_interval_seconds must be shorter than "
+                "admin_write_rate_limit_window_seconds"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_lockout_ceiling(self) -> AuthSettings:

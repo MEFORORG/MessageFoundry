@@ -43,7 +43,10 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     # Step-up-recency tests, not MFA tests: pin require_mfa=False so the admin's step-up path isn't
     # first blocked by the BACKLOG #187 secure default (require_mfa now ON for the Administrator role).
     # Tests that DO exercise require_mfa pass it explicitly.
-    service = AuthService(engine.store, settings or AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store,
+        settings or AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
+    )
     await service.initialize()
     return service
 
@@ -174,6 +177,7 @@ async def test_ad_user_reauth_uses_a_live_rebind(engine: Engine) -> None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(
+        admin_write_min_interval_seconds=0,
         ad_enabled=True,
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",

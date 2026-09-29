@@ -1363,6 +1363,8 @@ class AuthService:
                 per_key=settings.admin_write_rate_limit_per_actor,
                 glob=0,
                 window_seconds=settings.admin_write_rate_limit_window_seconds,
+                # BACKLOG #2301: the per-actor gap floor, beside the count.
+                min_interval_seconds=settings.admin_write_min_interval_seconds,
             )
             if settings.admin_write_rate_limit_enabled
             else None

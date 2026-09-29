@@ -71,6 +71,7 @@ async def _service(
     service = AuthService(
         engine.store,
         AuthSettings(
+            admin_write_min_interval_seconds=0,
             require_mfa=False,
             phi_read_rate_limit_per_actor=per_actor,
             step_up_max_age_seconds=step_up_max_age,

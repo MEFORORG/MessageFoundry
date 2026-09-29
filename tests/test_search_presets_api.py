@@ -32,7 +32,9 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _user(engine: Engine, role: Role, name: str) -> AuthService:
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     uid = await service.create_local_user(
         username=name, password=PW, display_name=None, email=None, roles=[role.value], actor="t"

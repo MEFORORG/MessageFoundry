@@ -54,7 +54,9 @@ async def _service(engine: Engine) -> AuthService:
     # an authenticator — so under the new default every unenrolled session diverts to
     # /ui/account?m=enroll_first. Pin require_mfa=False here (the pre-#187 assumption); the handful
     # of tests that DO exercise the require_mfa gate construct their own AuthSettings(require_mfa=True).
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
     await service.initialize()
     return service
 
@@ -4412,7 +4414,9 @@ async def test_stale_reauth_only_bounces_to_reauth(engine: Engine) -> None:
     # So each lane below is driven TWICE (BACKLOG #1851): an ungranted arm, which bounces under
     # every window and therefore measures the window not at all, and a minted arm, which bounces
     # only because the negative window expired the grant on its way out of the mint.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, step_up_max_age_seconds=-1)
+    )
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:

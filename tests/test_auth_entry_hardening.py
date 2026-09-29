@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -133,7 +134,9 @@ async def test_admin_write_limiter_per_actor(engine: Engine) -> None:
     svc = await _service(
         engine,
         AuthSettings(
-            admin_write_rate_limit_per_actor=2, admin_write_rate_limit_window_seconds=60.0
+            admin_write_min_interval_seconds=0,
+            admin_write_rate_limit_per_actor=2,
+            admin_write_rate_limit_window_seconds=60.0,
         ),
     )
     assert svc.allow_admin_write("a")
@@ -176,6 +179,64 @@ def test_admin_write_window_refuses_a_value_that_would_switch_the_floor_off_or_j
     # is refused until restart). Both are refused at load instead.
     with pytest.raises(ValidationError):
         AuthSettings(admin_write_rate_limit_window_seconds=window)
+
+
+# --- BACKLOG #2301 (ASVS 2.4.2): the minimum gap between two admin writes ----------------------
+
+
+def test_admin_write_gap_ships_default_on_at_its_provisional_floor() -> None:
+    # Pinned like the count above: the default is a provisional human-timing floor (the comment on
+    # the setting derives it), so changing it must be a deliberate act that moves the docs too.
+    assert AuthSettings().admin_write_min_interval_seconds == 0.15
+
+
+@pytest.mark.parametrize("gap", [-0.1, float("nan"), float("inf")])
+def test_admin_write_gap_refuses_a_value_that_would_switch_it_off_or_jam_it(gap: float) -> None:
+    # nan compares False against everything, so `elapsed < nan` would switch the gap off silently.
+    with pytest.raises(ValidationError):
+        AuthSettings(admin_write_min_interval_seconds=gap)
+
+
+def test_admin_write_gap_as_long_as_the_window_is_refused_at_load() -> None:
+    # The limiter prunes the last write before it measures the gap, so a gap as long as the window
+    # would silently fall back to the count. Refused while the limiter is on; ignored while it is off.
+    with pytest.raises(ValidationError, match="shorter than"):
+        AuthSettings(admin_write_min_interval_seconds=15.0)
+    assert AuthSettings(admin_write_min_interval_seconds=14.9).admin_write_min_interval_seconds
+    AuthSettings(admin_write_rate_limit_enabled=False, admin_write_min_interval_seconds=15.0)
+
+
+async def test_admin_write_gap_refuses_a_write_just_inside_it_and_admits_one_just_past_it(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The count alone admits twelve writes back to back. The gap refuses the second write while it
+    # is younger than the floor after the first, and admits it just past. The limiter's own clock is
+    # faked, so no test sleeps.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    gap = AuthSettings().admin_write_min_interval_seconds
+    svc = AuthService(engine.store, AuthSettings())
+    assert svc.allow_admin_write("a")
+    clock[0] += gap - 0.001
+    assert not svc.allow_admin_write("a"), "a write just inside the gap was admitted"
+    assert svc.allow_admin_write("b"), "the gap is per actor, not global"
+    # A refused write is not recorded, so the gap still runs from the first write.
+    clock[0] += 0.002
+    assert svc.allow_admin_write("a"), "a write just past the gap was refused"
+
+
+async def test_admin_write_gap_zero_admits_back_to_back_writes(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control for the refusal above: with the gap off, one instant admits the count's budget.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: 1000.0)
+    )
+    svc = AuthService(engine.store, AuthSettings(admin_write_min_interval_seconds=0))
+    assert all(svc.allow_admin_write("a") for _ in range(12))
+    assert not svc.allow_admin_write("a")  # the count still binds at the thirteenth
 
 
 # --- API-INPUT: length + body-size caps --------------------------------------

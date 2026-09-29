@@ -40,7 +40,11 @@ async def _service(
 ) -> AuthService:
     service = AuthService(
         engine.store,
-        AuthSettings(require_mfa=require_mfa, login_rate_limit_enabled=False),
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            require_mfa=require_mfa,
+            login_rate_limit_enabled=False,
+        ),
         security_notifier=notifier,
     )
     await service.initialize()
