@@ -464,10 +464,13 @@ _FTP_CONNECTION_LIMIT = re.compile(
 
 #: Words that mark a reply as being about the credential or the account, even when it also names a
 #: limit. A reply carrying one anywhere is not read as a connection limit, so it keeps the
-#: credential-fault class.
+#: credential-fault class. Each starts at a word boundary, so "entries" is not "tries". Two
+#: busy-server words are left out on purpose: "retry" ("please retry later") and "permitted" ("no
+#: more than 10 users permitted"). "Rejected" and "denied" stay in, although a busy server says them
+#: too: such a reply stops the lane, the cheaper of the two errors.
 _FTP_CREDENTIAL_WORDS = re.compile(
-    r"attempt|fail|passw|incorrect|invalid|lock|tries|retr(?:y|ies)|denied|reject|disabl|auth"
-    r"|permit|expir",
+    r"\b(?:attempt|fail|passw|incorrect|invalid|lock|tries\b|retries\b|denied|reject|disabl|auth"
+    r"|expir|cred|wrong\b|bad\b|unknown|not\s+found|suspend|bann?ed\b)",
     re.IGNORECASE,
 )
 
@@ -1325,7 +1328,8 @@ class _SftpClient(_RemoteClient):
     def _op(self, fn: Callable[[Any], _T], *, watchdog: _WriteWatchdog | None = None) -> _T:
         """Connect, open an SFTP channel, run ``fn(sftp)``, always close. ``watchdog``, when given,
         watches the work for a stall (:class:`_WriteWatchdog`); a failure after it fired is
-        reported as a stalled upload, transient, whatever paramiko raised once the client closed."""
+        reported as a stalled upload, transient, whatever paramiko raised once the transport
+        closed."""
         try:
             return self._session(fn, watchdog)
         except _RemoteError as exc:
@@ -1629,7 +1633,9 @@ class RemoteFileDestination(DestinationConnector):
         except _RemoteError as exc:
             # A store cut off part-way, by the stall bound (#2082) or a dropped connection, can leave
             # a partial temp behind, one more on every retry. Not after a credential fault: another
-            # login would be one more refused attempt against the partner account.
+            # login would be one more refused attempt against the partner account. A store that
+            # failed before it connected left no temp, so this costs one more connect and a warning
+            # there; _prepare_remote_dir connected just before, so that case is rare.
             if not exc.credential_fault:
                 self._remove_temp(tmp, name, "store")
             raise

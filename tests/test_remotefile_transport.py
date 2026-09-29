@@ -2221,6 +2221,10 @@ def _ftps_client() -> _FtpClient:
         ),
         ("login", "530 Sorry, no more than 10 users allowed"),
         ("login", "530 Too many connections from your internet address"),
+        ("login", "530 Too many connections, please retry later"),
+        ("login", "530 No more than 10 users permitted"),
+        ("login", "530 Connection limit reached"),
+        ("login", "530 Maximum number of users exceeded"),
         (
             "greeting",
             "530 Sorry, the maximum number of allowed clients (20) are already connected.",
@@ -2280,6 +2284,12 @@ def test_a_tls_refusal_is_a_configuration_fault_not_a_credential_fault(
         "530-This server allows a maximum of 50 users.\n530 Authentication rejected.",
         "530 User account disabled: maximum sessions policy",
         "530 Access denied: user jmax, user not permitted",
+        # Compound replies that name a limit AND the credential or the account.
+        "530 Bad login: too many connections",
+        "530 Too many connections or wrong credentials",
+        "530 Unknown user; too many users",
+        "530 User not found: too many users",
+        "530 Account suspended: maximum sessions exceeded",
     ],
 )
 def test_a_refused_credential_is_still_a_credential_fault(

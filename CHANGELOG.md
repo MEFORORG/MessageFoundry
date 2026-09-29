@@ -599,7 +599,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   raw are now classified.** paramiko retries a stalled socket write without limit, so such an upload
   would have held its worker thread for good. The connector now closes the connection once an upload
   makes no progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per 32 KiB step), and the delivery is
-  retried, after the partial temp file is removed; any failed store now removes its temp, except
+  retried, after the partial temp file is removed where it can be; a failed store now removes its temp, except
   after a refused credential. An `EOFError` and a helper thread that cannot start are now transient, and a
   `paramiko.SFTPError` is permanent. With `overwrite = false`, a same-named symlink, directory or
   other non-file entry now counts as a collision, and `POST /connections/{name}/test` ensures and
