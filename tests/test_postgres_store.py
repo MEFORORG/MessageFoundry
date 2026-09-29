@@ -157,7 +157,7 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 
     monkeypatch.setattr(PostgresStore, "open", _open_then_arm)
 
-    gen = store.__wrapped__()
+    gen = store.__wrapped__()  # type: ignore[attr-defined]  # the fixture's own function
     with pytest.raises(RuntimeError, match="fixture setup failed after open"):
         await anext(gen)
 
@@ -2824,7 +2824,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
 
     settings = load_settings(environ=os.environ).store
     summary, metadata = "MRN=999001 NAME=DOE^JANE", '{"site": "WESTWING"}'
-    s = await PostgresStore.open(settings, cipher=AesGcmCipher(b"k" * 32))
+    s = await PostgresStore.open(settings, cipher=AesGcmCipher(bytearray(b"k" * 32)))
     try:
         mid = await s.enqueue_message(
             channel_id="IB", raw=RAW, deliveries=[("OB", "p")], summary=summary, metadata=metadata
@@ -4658,7 +4658,9 @@ async def test_ack_fires_after_skeleton_and_incref_commit_pg(store) -> None:
 
     row = await _only_message(store)
     assert row["status"] == MessageStatus.RECEIVED.value
-    ref, _ = parse_doc_ref(Message.parse(row["raw"]).field("OBX-5.5"))
+    doc = Message.parse(row["raw"]).field("OBX-5.5")
+    assert doc is not None
+    ref, _ = parse_doc_ref(doc)
     assert await _a_refcount(store, ref) == 1  # incref durable at the moment AA is available
 
 
@@ -4809,12 +4811,14 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
     inside ``PostgresStore.open``, the close-time settlement, or the persistence across a reopen. A
     keyed handle is the only way those run here at all."""
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.gcm_bound import GCM_RESERVE_BLOCK
     from messagefoundry.store.postgres import PostgresStore
 
     settings = load_settings(environ=os.environ).store
     k = generate_key()
     cipher = make_cipher(k)
+    assert isinstance(cipher, AesGcmCipher)
     key_id = cipher.active_key_id
     try:
         keyed = await PostgresStore.open(settings, cipher=cipher)
@@ -4831,6 +4835,7 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
             await keyed.close()  # settles to the exact spend
 
         reopened_cipher = make_cipher(k)
+        assert isinstance(reopened_cipher, AesGcmCipher)
         reopened = await PostgresStore.open(settings, cipher=reopened_cipher)
         try:
             # The requirement: the KEY's lifetime figure survives the process, on this backend.

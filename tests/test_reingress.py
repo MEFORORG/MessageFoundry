@@ -369,7 +369,7 @@ async def test_ingress_handoff_produces_child_and_finalizes_origin(store: Messag
 
 async def test_ingress_handoff_is_idempotent_no_double_child(store: MessageStore) -> None:
     origin, work = await _seed_reingress(store)
-    kw = dict(  # noqa: C408
+    kw: dict[str, Any] = dict(  # noqa: C408
         loopback_channel_id="IB_LOOP",
         correlation_depth_cap=8,
         control_id="C",
