@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Every root holding Python, and scripts/ PowerShell, cannot abort a stock Windows console.
+"""Console-bound text in the gated roots stays safe on a stock Windows console (BACKLOG #1030).
 
-BACKLOG #1030. The surfaces are named under SCOPE below. This file was
-scripts-only when it shipped, and widening it is the item's whole point, so the summary line
-counts surfaces rather than naming one.
+The surfaces are named under SCOPE below. This file was scripts-only when it shipped, and widening
+it is the item's whole point. The gate is lexical and under-reports by construction, so a green run
+means no console-bound LITERAL can abort; it is not a guarantee about runtime values.
 
 THE DEFECT THIS REPLACES. Enforcement was per-file and hand-placed: ``tests/test_cli.py`` asserts one
 STRING is cp1252-encodable, ``tests/test_announce_hook.py`` asserts one FILE is ASCII, and
@@ -66,10 +66,10 @@ THREE PROPERTIES THIS KEEPS, each of which the item names:
   * IT NEVER SILENTLY DROPS A FILE. A file that will not decode as UTF-8 is a FAILURE, not a skip.
 
 SCOPE, STATED RATHER THAN IMPLIED. Two predicates, in file order: ``scripts/**/*.py`` here and
-``scripts/**/*.ps1`` next gate on ENCODABILITY; every other root holding Python gates on REACHING a
-console, one parametrized row per root (``_REACH_ROOTS``): messagefoundry/, harness/, tests/,
-messagefoundry_webconsole/, packaging/, samples/, tee/, fuzz/, docker/ and docs/. Which predicate a
-surface gets is a measurement, not a preference, and the section that applies it carries the count.
+``scripts/**/*.ps1`` next gate on ENCODABILITY; every other top-level directory holding Python
+gates on REACHING a console, one parametrized row per root in ``_REACH_ROOTS``, which is the list
+of record. A census test fails on a root no row walks. Which predicate a surface gets is a
+measurement, not a preference, and the section that applies it carries the count.
 
 ``docs/`` PROSE IS DELIBERATELY OUT, AND ITS POSITIVE CONTROL DIED UNDER IT. (The two Python files
 under docs/ are a reach row like any other root; this paragraph is about Markdown, which no stream
@@ -91,7 +91,7 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import pytest
 
@@ -202,38 +202,54 @@ def _script_hardens(text: str) -> bool:
 
 
 @functools.cache
-def _tracked(suffix: str) -> tuple[str, ...]:
-    """Every TRACKED file ending in ``suffix``, repository-relative, in posix form.
+def _git_listing() -> tuple[str, ...]:
+    """Every file git would carry into a commit: TRACKED, plus UNTRACKED-BUT-NOT-IGNORED.
 
-    THE SCOPE IS WHAT GIT TRACKS, NOT WHAT IS ON DISK (BACKLOG #1030). A filesystem walk also reads
-    whatever happens to sit under a root on this machine -- an untracked scratch file, a stray
-    ``.venv`` or build output inside ``packaging/``, a sibling session's half-written file -- so the
-    same test could give different answers in two checkouts of one commit. Tracked files are what CI
-    checks out and what a pull request can change.
-
-    THE COST, STATED: a new file is not scanned until it is ``git add``-ed. CI sees it either way.
+    THE SCOPE IS WHAT GIT SEES, NOT WHAT IS ON DISK (BACKLOG #1030). A filesystem walk also reads
+    whatever is ignored under a root on this machine -- a stray ``.venv``, build output inside
+    ``packaging/`` -- so two checkouts of one commit could disagree. The untracked half is kept on
+    purpose: a Builder runs this suite BEFORE it stages anything (CLAUDE.md section 5), and a
+    tracked-only listing would pass a new, unstaged file that CI then fails after the Builder exits.
 
     Deliberately NOT a ``<root>/**/*.py`` pathspec: that form DROPS every top-level file under the
-    root (measured on the engine, 240 files against 267 at the time). The whole list is read once,
-    unfiltered by git, and filtered here. A git failure raises rather than returning an empty list,
-    because an empty list is the false zero this module exists to refuse.
+    root (measured on the engine, 240 files against 267 at the time). The whole list is read ONCE,
+    unfiltered by git, and filtered in Python. A git failure or an empty listing FAILS, with git's
+    own stderr, rather than returning nothing: an empty list is the false zero this module refuses.
     """
-    listing = subprocess.run(
-        ["git", "-C", str(_ROOT), "ls-files", "-z"], capture_output=True, check=True
-    ).stdout.decode("utf-8")
-    return tuple(sorted(p for p in listing.split("\0") if p.endswith(suffix)))
+    proc = subprocess.run(
+        ["git", "-C", str(_ROOT), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True,
+        check=False,
+    )
+    stderr = proc.stderr.decode("utf-8", "backslashreplace")
+    assert proc.returncode == 0, f"git ls-files failed ({proc.returncode}): {stderr}"
+    # `-z` terminates the listing with a NUL, so the split leaves one empty string to drop; and
+    # `--cached --others` lists a path twice while it is staged-and-modified, hence the set.
+    listing = tuple(sorted({p for p in proc.stdout.decode("utf-8").split("\0") if p}))
+    assert listing, "git ls-files returned nothing -- every scan below would be vacuous"
+    return listing
+
+
+def _tracked(suffix: str) -> tuple[str, ...]:
+    """Every listed file ending in ``suffix``, repository-relative, in posix form."""
+    return tuple(p for p in _git_listing() if p.endswith(suffix))
 
 
 @functools.cache
 def _files_under(root: Path, suffix: str = ".py") -> tuple[Path, ...]:
-    """Every tracked ``suffix`` file under ``root``, recursively. THE ONE WALK in this module.
+    """Every listed ``suffix`` file under ``root``, recursively. THE ONE WALK in this module.
 
     Every surface -- both scripts halves and every reach root -- goes through this, so no two can
     disagree about what "under a root" means. Cached, and a TUPLE, so the result cannot be mutated
     out from under a sibling test that has not run yet. A tracked file deleted from the working tree
     is left out: there is nothing on disk to read.
+
+    ``root`` must be a DIRECTORY BELOW the repository root. The repository root itself is refused
+    rather than silently matching nothing, because ``"."`` is not a prefix any listed path carries.
     """
-    prefix = root.relative_to(_ROOT).as_posix() + "/"
+    rel_root = root.relative_to(_ROOT).as_posix()
+    assert rel_root != ".", "walk a directory below the repository root, not the root itself"
+    prefix = rel_root + "/"
     return tuple(
         _ROOT / rel
         for rel in _tracked(suffix)
@@ -779,56 +795,59 @@ def _printed_unencodable(text: str) -> list[tuple[int, str]]:
     return _console_hits(tree)
 
 
-#: THE FRAMEWORK-KEYWORD ARM (BACKLOG #1030, the first of its two named detector gaps). These calls
-#: print no argument themselves, so `_writes_to_a_console` rejects them by construction -- but the
-#: framework prints SOME of their arguments later, on a console this item is named for. argparse
-#: prints `help=`, `description=`, `epilog=` and friends on `--help`, to stdout, where a non-cp1252
-#: character RAISES. pytest prints a skip or xfail reason under `-rs`/`-rx`, also on real stdout;
-#: that is how the U+2265 in tests/test_benchmark_parser.py's `skipif(reason=)` stayed live after
-#: PR 1403 fixed the print beside it (fixed by hand there, because this arm did not exist).
+#: THE ARGPARSE ARM (BACKLOG #1030, the first of its two named detector gaps). These calls print
+#: nothing themselves, so `_writes_to_a_console` rejects them by construction -- but argparse prints
+#: their strings later, on `--help`, `--version` or a usage error, to stdout, where a non-cp1252
+#: character RAISES. Every string such a call carries can reach that output: `help=`,
+#: `description=`, `epilog=`, `usage=`, `prog=`, `title=`, `metavar=`, `version=`, `choices=`, an
+#: option string, a subcommand name, a positional group title, and `default=` through
+#: `%(default)s` or ArgumentDefaultsHelpFormatter. So EVERY argument of these calls is walked. An
+#: allow-list of printed keywords was written first; a code review showed argparse printing six
+#: shapes it missed. Measured 2026-09-29 over every reach root: ZERO hits, a ratchet at zero.
 #:
-#: ONLY THE PRINTED ARGUMENTS ARE WALKED, never the whole call: `add_argument("--x", default=...)`
-#: and `skipif("sys.platform == 'win32'", ...)` carry strings that are compared or evaluated, not
-#: printed. Measured 2026-09-29 over every reach root: ZERO hits, so this lands as a ratchet at zero
-#: and changes no source file. Its planted controls are
-#: `test_the_framework_keyword_arm_sees_what_argparse_and_pytest_print` and its negative twin.
+#: `description=__doc__` IS HOW THIS TREE SPELLS IT, not a literal, so a `__doc__` inside any
+#: console-bound argument resolves to the module docstring (see `_console_hits`).
+#:
+#: PYTEST REASONS ARE DELIBERATELY NOT AN ARM, AND THE REASON IS READ FROM PYTEST'S SOURCE. A
+#: `skipif(reason=)` does reach a console under `-rs`, but TerminalWriter.write_raw
+#: (`_pytest/_io/terminalwriter.py`, pytest 9.1.1) catches UnicodeEncodeError and writes the text
+#: again, unicode-escaped. The line is corrupted, never aborted and never lost, so failing it with
+#: this gate's "aborts" message would rest a control on a false premise (SDS-3.7).
 _ARGPARSE_CALLS = frozenset(
-    {
-        "ArgumentParser",
-        "add_argument",
-        "add_argument_group",
-        "add_mutually_exclusive_group",
-        "add_parser",
-        "add_subparsers",
-    }
+    {"ArgumentParser", "add_argument", "add_argument_group", "add_parser", "add_subparsers"}
 )
-_ARGPARSE_PRINTED = frozenset({"description", "epilog", "help", "prog", "title", "usage"})
 
 
 def _framework_printed_args(call: ast.Call) -> list[ast.expr]:
-    """The arguments of an argparse or pytest call that the framework later PRINTS, else []."""
-    if not isinstance(call.func, (ast.Attribute, ast.Name)):
+    """Every argument of an argparse call, since argparse can print any of them; else []."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        name = func.attr
+    elif isinstance(func, ast.Name):
+        name = func.id
+    else:
         return []
-    parts = _dotted(call.func)
-    name = parts[-1] if parts else ""
-    if name in _ARGPARSE_CALLS:
-        return [kw.value for kw in call.keywords if kw.arg in _ARGPARSE_PRINTED]
-    if "pytest" not in parts:
+    if name not in _ARGPARSE_CALLS:
         return []
-    reason = [kw.value for kw in call.keywords if kw.arg in ("reason", "msg")]
-    # A positional argument is the printed reason for `pytest.skip/fail/xfail(...)` and for
-    # `pytest.mark.skip(...)`. For `pytest.mark.skipif/xfail(...)` it is the CONDITION, which is
-    # evaluated and never printed, so only the keyword counts there.
-    if name in ("skip", "fail") or (name == "xfail" and "mark" not in parts):
-        return list(call.args) + reason
-    if name in ("skipif", "xfail", "importorskip"):
-        return reason
-    return []
+    return list(call.args) + [kw.value for kw in call.keywords]
+
+
+def _module_docstring(tree: ast.Module) -> ast.Constant | None:
+    """The module docstring's node, which ``__doc__`` evaluates to; else None."""
+    first = tree.body[0] if tree.body else None
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        return first.value
+    return None
 
 
 def _console_hits(tree: ast.Module) -> list[tuple[int, str]]:
     """The tree-taking half of ``_printed_unencodable``, so a caller that has already parsed the
     file does not pay for a second parse. The controls below call the text-taking form."""
+    doc = _module_docstring(tree)
     hits: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -838,7 +857,10 @@ def _console_hits(tree: ast.Module) -> list[tuple[int, str]]:
         else:
             printed = _framework_printed_args(node)
         for arg in printed:
-            for sub in ast.walk(arg):
+            for walked in ast.walk(arg):
+                sub = walked
+                if isinstance(sub, ast.Name) and sub.id == "__doc__" and doc is not None:
+                    sub = doc
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                     for ch in _unencodable(sub.value):
                         hits.append((sub.lineno, ch))
@@ -851,6 +873,11 @@ class _RootScan(NamedTuple):
     offenders: tuple[str, ...]
     exempted: tuple[str, ...]
     unreadable: tuple[str, ...]
+
+
+#: The three verdicts ``_classify`` can return, typed so a mistyped kind fails mypy rather than
+#: raising KeyError only on the day some file first reaches that branch.
+_Kind = Literal["offender", "exempted", "unreadable"]
 
 
 @functools.cache
@@ -868,7 +895,7 @@ def _scan_root(root: Path) -> _RootScan:
     A file that fails to decode or parse lands in `unreadable` and contributes nothing to the other
     two lists. That is not a silent skip; the test that asserts on `unreadable` names it.
     """
-    found: dict[str, list[str]] = {"offender": [], "exempted": [], "unreadable": []}
+    found: dict[_Kind, list[str]] = {"offender": [], "exempted": [], "unreadable": []}
     for path in _files_under(root):
         rel = path.relative_to(_ROOT).as_posix()
         try:
@@ -882,12 +909,20 @@ def _scan_root(root: Path) -> _RootScan:
     return _RootScan(tuple(found["offender"]), tuple(found["exempted"]), tuple(found["unreadable"]))
 
 
-def _classify(rel: str, text: str) -> tuple[str, str] | None:
+#: Reach roots whose code may NOT import the engine, so the chokepoint is out of reach and the
+#: direct ``sys.stdout.reconfigure(encoding=... or errors=...)`` call -- the scripts half's second
+#: form, read from the tree by ``_reconfigures_stdout`` -- is accepted there instead. tee/ is a
+#: standalone relay that vendors ``messagefoundry/anon/`` so that it imports nothing from the
+#: engine; requiring the chokepoint would leave its first console-bound glyph with no legal remedy.
+#: ``test_a_stdlib_only_root_imports_nothing_from_the_engine`` re-derives that premise every run.
+_STDLIB_ONLY_ROOTS = ("tee/",)
+
+
+def _classify(rel: str, text: str) -> tuple[_Kind, str] | None:
     """One file's verdict under the reach gate: ``(kind, message)``, or None when it is clean.
 
-    ``kind`` is ``offender``, ``exempted`` or ``unreadable``. Split out of ``_scan_root`` so the
-    planted-glyph control below drives the SAME decision on a real file's text that the gate
-    drives on the file itself, rather than a reconstruction of it.
+    Split out of ``_scan_root`` so the planted-glyph control below drives the SAME decision on a
+    real file's text that the gate drives on the file itself, rather than a reconstruction of it.
     """
     try:
         tree = ast.parse(text)
@@ -897,12 +932,18 @@ def _classify(rel: str, text: str) -> tuple[str, str] | None:
     if not hits:
         return None
     shown = ", ".join(f"line {ln} U+{ord(c):04X}" for ln, c in hits[:6])
-    if _calls_the_chokepoint(tree):
+    stdlib_only = rel.startswith(_STDLIB_ONLY_ROOTS)
+    if _calls_the_chokepoint(tree) or (stdlib_only and _reconfigures_stdout(tree)):
         return "exempted", f"{rel} ({shown})"
+    remedy = (
+        "sys.stdout.reconfigure(errors=...), since this root may not import the engine"
+        if stdlib_only
+        else f"{_CHOKEPOINT_MODULE}.{_CHOKEPOINT} first in main()"
+    )
     return "offender", (
-        f"{rel} sends {len(hits)} non-cp1252 character(s) [{shown}] to a console and does "
-        f"NOT call {_CHOKEPOINT_MODULE}.{_CHOKEPOINT} -- on a stock Windows console print() "
-        f"aborts and a log record is DROPPED with only a stderr notice"
+        f"{rel} sends {len(hits)} non-cp1252 character(s) [{shown}] to a console and does not "
+        f"harden it (call {remedy}) -- on a stock Windows console print() and argparse --help "
+        f"abort, a stderr line is corrupted, and a log record is DROPPED with a stderr notice"
     )
 
 
@@ -951,45 +992,64 @@ def test_a_logger_is_matched_by_name_and_a_lookalike_is_not() -> None:
         assert _printed_unencodable(f'{other}.info("{glyph}")') == [], other
 
 
-def test_the_framework_keyword_arm_sees_what_argparse_and_pytest_print() -> None:
-    """The planted positive control for the framework-keyword arm: every shape it claims to cover,
-    each of which must fire. A zero over the tree means nothing without this."""
+def test_the_argparse_arm_sees_every_shape_argparse_prints() -> None:
+    """The planted positive control for the argparse arm: every shape it claims to cover must
+    fire. A zero over the tree means nothing without this."""
     g = chr(0x2265)
     for printed in (
         f'argparse.ArgumentParser(description="a {g} b")',
         f'ArgumentParser(prog="x", epilog="a {g} b")',
         f'parser.add_argument("--n", help="a {g} b")',
-        f'sub.add_parser("run", help="a {g} b")',
-        f'parser.add_argument_group(title="a {g} b")',
+        f'parser.add_argument("--n", metavar="a {g} b")',
+        f'parser.add_argument("--n", choices=["a {g} b"])',
+        f'parser.add_argument("--{g}")',
+        f'parser.add_argument("--v", action="version", version="a {g} b")',
+        f'sub.add_parser("a {g} b")',
+        f'parser.add_argument_group("a {g} b")',
         f'parser.add_subparsers(title="t", description="a {g} b")',
-        f'@pytest.mark.skipif(sys.flags.gil, reason="a {g} b")\ndef t(): pass',
-        f'@pytest.mark.xfail(True, reason="a {g} b")\ndef t(): pass',
-        f'@pytest.mark.skip("a {g} b")\ndef t(): pass',
-        f'pytest.skip("a {g} b")',
-        f'pytest.fail("a {g} b")',
-        f'pytest.xfail("a {g} b")',
-        f'pytest.importorskip("mod", reason="a {g} b")',
     ):
         assert _printed_unencodable(printed) == [(1, g)], printed
 
 
-def test_the_framework_keyword_arm_ignores_what_is_never_printed() -> None:
-    """The negative twin: strings those same calls carry but NEVER print. Walking the whole call
-    would fire on each of these and teach a reader to distrust the arm."""
+def test_description_from_the_docstring_resolves_to_the_docstring() -> None:
+    """`description=__doc__` is how this tree writes it, so a bare constant check would miss the
+    commonest real shape. The hit lands on the docstring's line, where the character sits."""
+    g = chr(0x2265)
+    text = f'"""Send a file {g} the engine."""\nimport argparse\n' + (
+        "argparse.ArgumentParser(description=__doc__)"
+    )
+    assert _printed_unencodable(text) == [(1, g)]
+    # And print(__doc__) is the same path through the older arm.
+    assert _printed_unencodable(f'"""x {g} y."""\nprint(__doc__)') == [(1, g)]
+    # A docstring that is never handed to a console stays out of scope, as before.
+    assert _printed_unencodable(f'"""x {g} y."""\nargparse.ArgumentParser(description="ok")') == []
+
+
+def test_the_argparse_arm_stays_silent_where_it_should() -> None:
+    """The negative twin. A lookalike name that is not an argparse call, and representable text on
+    a real one, must not fire. Pytest reasons are out by decision (see `_ARGPARSE_CALLS`)."""
     g = chr(0x2265)
     for silent in (
-        f'parser.add_argument("--n", default="a {g} b")',
-        f'parser.add_argument("--n", choices=["a {g} b"])',
-        f'parser.add_argument("--{g}")',
-        # A skipif / mark.xfail CONDITION is evaluated, not printed.
-        f'@pytest.mark.skipif("a {g} b", reason="ascii")\ndef t(): pass',
-        f'@pytest.mark.xfail("a {g} b", reason="ascii")\ndef t(): pass',
-        # A lookalike method on something that is not pytest is out of scope by construction.
-        f'self.skip("a {g} b")',
-        # Representable text never fires, on this arm as on the others.
+        f'self.add_item("a {g} b")',
+        f'@pytest.mark.skipif(True, reason="a {g} b")\ndef t(): pass',
         'parser.add_argument("--n", help="an em dash ' + chr(0x2014) + '")',
     ):
         assert _printed_unencodable(silent) == [], silent
+
+
+def test_pytest_really_escapes_what_it_cannot_encode() -> None:
+    """RE-DERIVE THE PREMISE THAT KEEPS PYTEST REASONS OUT OF THE GATE. If pytest ever lets the
+    UnicodeEncodeError propagate -- its own comment says it may -- this fails, and the reasons
+    should become an arm."""
+    import io
+
+    from _pytest._io.terminalwriter import TerminalWriter
+
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    TerminalWriter(stream).write("a " + chr(0x2265) + " b")
+    stream.flush()
+    assert raw.getvalue() == b"a \\u2265 b"
 
 
 def test_the_engine_gate_would_have_caught_the_alert_that_prompted_it() -> None:
@@ -1084,13 +1144,13 @@ def test_the_scripts_direct_form_must_set_a_codec_or_an_error_handler() -> None:
 
 
 # =================================================================================================
-# THE TWO ROOTS THE THREE WALKS ABOVE LEFT UNWATCHED: harness/ and tests/ (BACKLOG #1030).
+# THE REACH ROOTS: harness/ and tests/ first (PR 1403), then every other root (BACKLOG #1030).
 #
-# THE ITEM'S COMPLAINT IS THAT THIS CLASS KEEPS RECURRING, and these were the two largest roots
-# the three walks above never looked at. Measured 2026-09-21 at af3512fa7: 75 Python files under
-# harness/ and 853 under tests/, 928 together, against 275 under messagefoundry/. They are not a
-# tail case; they are most of the tree. Six smaller roots are still out, named at the foot of this
-# block -- this paragraph is about size, not about completeness.
+# THE ITEM'S COMPLAINT IS THAT THIS CLASS KEEPS RECURRING, and harness/ and tests/ were the two
+# largest roots the walks of the day never looked at. Measured 2026-09-21 at af3512fa7: 75 Python
+# files under harness/ and 853 under tests/, 928 together, against 275 under messagefoundry/. They
+# were not a tail case; they were most of the tree. The smaller roots followed later, in the
+# paragraph near the foot of this block.
 #
 # THE SAME PREDICATE AS THE ENGINE HALF, AND THE FIGURES ARE THE WHOLE ARGUMENT. Both figures below
 # are AT af3512fa7, this change's base, because that ref is where the choice was made. Gating these
@@ -1119,6 +1179,12 @@ def test_the_scripts_direct_form_must_set_a_codec_or_an_error_handler() -> None:
 # its own trade-off; the character is removed here so this file does not keep a live console path
 # the block above claims is closed.
 #
+# CORRECTED 2026-09-29: that reason never ABORTED. Pytest's TerminalWriter catches the
+# UnicodeEncodeError and writes the reason again, unicode-escaped, so the path corrupted the line
+# rather than killing the run; removing the character was still right. The widening pass has since
+# landed for argparse and was declined for pytest on exactly that measurement -- see
+# `_ARGPARSE_CALLS` and `test_pytest_really_escapes_what_it_cannot_encode`.
+#
 # WHY A TEST TREE IS WORTH GATING WHEN NOTHING IN IT SHIPS. A test prints to the developer console
 # this whole item is named for, and an abort there is indistinguishable from a real failure of the
 # thing under test -- so it sends the reader after the wrong defect.
@@ -1136,13 +1202,14 @@ def test_the_scripts_direct_form_must_set_a_codec_or_an_error_handler() -> None:
 # 35, packaging/ 35 (26 when PR 1403 counted it), samples/ 18, tee/ 18, fuzz/ 3, docker/ 2, docs/ 2.
 # ALL SEVEN MEASURED ZERO console-bound hits on that run, so bringing them in changed no file. That
 # zero is why they were left out before, and it is exactly why they are in now: a root with nothing
-# to find is the root that acquires the first one unwatched. The planted-glyph control below proves
-# the zero on each root is the detector looking rather than the detector blind.
+# to find is the root that acquires the first one unwatched. The planted-glyph control below shows
+# the decision reads each root's real text and can say something other than clean there.
 #
 # Two deserve naming. packaging/ IS the second pytest collection root -- pyproject's `testpaths`
 # names `packaging/messagefoundry-webconsole/tests` -- so the paragraph above about test trees
 # applies to it in full. tee/ vendors messagefoundry/anon/ behind a CLI that prints to an operator
-# console.
+# console, and it may not import the engine, so it is the one root where the direct
+# `sys.stdout.reconfigure` form is the accepted remedy (`_STDLIB_ONLY_ROOTS`).
 #
 # THE ENGINE IS A ROW HERE TOO. Its three tests were hand-written wrappers beside this
 # parametrization until this change; they are rows of it now, so one control governs all ten roots.
@@ -1170,7 +1237,7 @@ _REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
     ("messagefoundry", _ENGINE, 250, ("__main__.py", "pipeline/wiring_runner.py")),
     ("harness", _HARNESS, 60, ("__main__.py", "reconcile/__main__.py")),
     # Its ONLY nested file, measured 2026-09-29: 1 of 1,021. If it is ever legitimately removed,
-    # the shape check below fails LOUDLY and points here rather than reporting a clean tree.
+    # the pin check below fails LOUDLY and points here rather than reporting a clean tree.
     (
         "tests",
         _TESTS,
@@ -1201,6 +1268,9 @@ _REACH_ROOT_IDS = [label for label, _root, _floor, _pins in _REACH_ROOTS]
 #: ``(label, root)`` only, for the tests that use neither the floor nor the pins. Carrying all four
 #: fields into them would read as though the floor and the pins participate in the gate itself.
 _REACH_ROOT_PATHS = tuple((label, root) for label, root, _floor, _pins in _REACH_ROOTS)
+
+#: ``(label, root, pins)``, for the planted-glyph control, which uses the pins and not the floor.
+_REACH_ROOT_PINS = tuple((label, root, pins) for label, root, _floor, pins in _REACH_ROOTS)
 
 
 @pytest.mark.parametrize(("label", "root", "floor", "pins"), _REACH_ROOTS, ids=_REACH_ROOT_IDS)
@@ -1251,41 +1321,77 @@ def test_every_module_under_a_reach_root_decodes_as_utf8_and_parses(label: str, 
     assert not broken, f"modules under {label}/ the scan could not read:\n  " + "\n  ".join(broken)
 
 
-@pytest.mark.parametrize(("label", "root", "floor", "pins"), _REACH_ROOTS, ids=_REACH_ROOT_IDS)
+@pytest.mark.parametrize(("label", "root", "pins"), _REACH_ROOT_PINS, ids=_REACH_ROOT_IDS)
 def test_a_glyph_planted_in_a_real_file_of_each_root_is_caught(
-    label: str, root: Path, floor: int, pins: tuple[str, ...]
+    label: str, root: Path, pins: tuple[str, ...]
 ) -> None:
-    """THE POSITIVE CONTROL FOR EACH ROOT'S ZERO. Seven of these roots measured zero hits the day
-    they were brought in, and a zero is only evidence if the same decision, on that root's own real
-    text, can say something else. So a print carrying U+2192 is appended to each pinned file's real
-    text and driven through ``_classify``, the function the gate uses on the file itself.
+    """A MODEST CONTROL, AND ITS LIMIT IS STATED. Seven of these roots measured zero hits the day
+    they were brought in. This appends a print carrying U+2192 to each pinned file's real text and
+    drives it through ``_classify``, the function the gate uses on the file itself, so it shows the
+    decision can say something other than clean on that root's own text -- its encoding, its syntax,
+    its exemption status. It does NOT exercise the walk; the coverage test's pins do that. The
+    stronger evidence, a glyph planted in one real file per root turning that root's gate row red,
+    was run by hand when the roots were added and is recorded in the commit that added them.
 
-    The verdict may be ``offender`` or ``exempted`` -- a pinned entry point that calls the chokepoint
-    is exempt by design -- but it must name the planted line. ``None`` means the detector did not
-    see a console-bound glyph in a real file of this root, and every green above would be vacuous.
+    The verdict may be ``offender`` or ``exempted``: a pinned entry point that calls the chokepoint
+    is exempt by design. ``None`` means the planted glyph went unseen.
     """
     arrow = chr(0x2192)
     for pin in pins:
         real = (root / pin).read_text(encoding="utf-8")
-        before = _classify(pin, real)
-        assert before is None or before[0] != "unreadable", before
-        # real + "\n" puts a blank line after the file's last line, so the print is two lines on.
-        planted_line = real.count("\n") + 2
         planted = real + "\n" + 'print("depth ' + arrow + ' 3")\n'
-        assert (planted_line, arrow) in _console_hits(ast.parse(planted)), f"{label}/{pin}"
         verdict = _classify(pin, planted)
         assert verdict is not None, f"{label}/{pin}: the planted glyph was not seen"
         assert verdict[0] in ("offender", "exempted"), f"{label}/{pin}: {verdict[1]}"
 
 
+def test_a_stdlib_only_root_imports_nothing_from_the_engine() -> None:
+    """RE-DERIVE THE PREMISE BEHIND `_STDLIB_ONLY_ROOTS`, never trust the constant. If tee/ ever
+    imports the engine, the chokepoint is within its reach and the second remedy should go."""
+    for prefix in _STDLIB_ONLY_ROOTS:
+        files = _files_under(_ROOT / prefix.rstrip("/"))
+        assert files, f"{prefix} is listed but holds no Python"
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    names = [node.module or ""]
+                else:
+                    continue
+                engine = [n for n in names if n.split(".")[0] == "messagefoundry"]
+                assert not engine, f"{path.relative_to(_ROOT)} imports {engine}"
+
+
+def test_the_direct_remedy_is_accepted_only_under_a_stdlib_only_root() -> None:
+    """Same text, two roots, two verdicts. If these did not diverge, `_STDLIB_ONLY_ROOTS` would be
+    a second name for the ordinary rule, or would have widened the reach gate everywhere."""
+    text = chr(10).join(
+        ["import sys", "sys.stdout.reconfigure(errors='replace')", 'print("a ' + chr(0x2192) + '")']
+    )
+    tee = _classify("tee/relay.py", text)
+    engine = _classify("messagefoundry/cli_surface.py", text)
+    assert tee is not None and tee[0] == "exempted", tee
+    assert engine is not None and engine[0] == "offender", engine
+    # And the stdlib-only root still needs the REMEDY, not merely its path.
+    bare = _classify("tee/relay.py", 'print("a ' + chr(0x2192) + '")')
+    assert bare is not None and bare[0] == "offender", bare
+
+
 def test_every_root_holding_tracked_python_is_gated() -> None:
     """THE SCOPE IS RE-DERIVED ON EVERY RUN, NOT REMEMBERED. PR 1403 named six ungated roots as "at
     least six", and a seventh, fuzz/, turned up only in a later census. So the census is the test:
-    every top-level directory holding a tracked ``.py`` file must be a reach row or scripts/ (gated
-    on encodability above). A tracked ``.py`` at the repository root itself reads as ``.`` and would
-    need a row of its own.
+    every top-level directory holding a listed ``.py`` file must be walked by a reach row or be
+    scripts/ (gated on encodability above).
+
+    The gated set comes from each row's ROOT PATH, never its label, so a mislabelled row or one
+    rooted at a subdirectory cannot claim a directory it does not walk. A ``.py`` at the repository
+    root itself reads as ``.`` here and has no remedy yet: `_files_under` walks directories, so such
+    a file needs a directory, or that function extended, before it can be gated.
     """
-    gated = {label for label, *_rest in _REACH_ROOTS} | {"scripts"}
+    for label, root, *_rest in _REACH_ROOTS:
+        assert root.parent == _ROOT, f"row {label} must walk a whole top-level directory: {root}"
+    gated = {root.name for _label, root, *_rest in _REACH_ROOTS} | {_SCRIPTS.name}
     roots = {rel.split("/", 1)[0] if "/" in rel else "." for rel in _tracked(".py")}
     print(f"top-level roots holding tracked python: {sorted(roots)}")
     # The census's own control: an instrument that cannot find these two proves nothing by
@@ -1412,7 +1518,8 @@ def test_the_extension_would_have_caught_both_sites_it_was_built_for() -> None:
 # `harness/load/ingress_probe.py`, `messagefoundry/generators/adt.py` and
 # `messagefoundry/pipeline/_sandbox_worker.py` have one, and the last speaks a protocol over its
 # pipes, where re-encoding the stream would change a wire format rather than harden a console.
-# `tee/__main__.py` is outside both roots, like the rest of tee/.
+# `tee/__main__.py` is outside this rule: tee/ may not import the engine, so its console hardening,
+# when it needs one, is the direct form `_STDLIB_ONLY_ROOTS` accepts under the reach gate above.
 #
 # The runtime CONTROL, which drives the reconcile CLI with a non-cp1252 path under a cp1252 stream
 # and asserts the bytes come back intact, is `tests/test_console_streams.py`.
