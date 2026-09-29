@@ -389,6 +389,35 @@ async def test_a_self_fenced_drain_answers_200_and_audits_both_facts(tmp_path: P
         assert json.loads(str(rows[0]["detail"])) == expected
 
 
+class _SelfFencedCoordinator(_StandinCoordinator):
+    """The gate is clear and the lease row still names this node: the self-fence window."""
+
+    def may_own_lease_row(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("coord", "role", "owns"),
+    [
+        (_StandinCoordinator(clustered=True, leader=False), "standby", False),
+        (_SelfFencedCoordinator(clustered=True, leader=False), "standby", True),
+        (_StandinCoordinator(clustered=False, leader=True), "single-node", False),
+    ],
+    ids=["standby", "self-fenced", "single-node"],
+)
+async def test_cluster_status_publishes_the_engines_own_drain_test(
+    tmp_path: Path, coord: _StandinCoordinator, role: str, owns: bool
+) -> None:
+    # BACKLOG #1988. owns_lease_row is the coordinator's may_own_lease_row(), the same predicate the
+    # stepdown gates its write on, so a client offers the control exactly when the engine would drain.
+    # A self-fenced node reads role=standby and owns_lease_row=true: the flag alone cannot say it.
+    async with _admin(tmp_path, coord) as (_eng, c, boss):
+        r = await c.get("/cluster/status", headers=_auth(boss))
+        assert r.status_code == 200, r.text
+        assert r.json()["role"] == role
+        assert r.json()["owns_lease_row"] is owns
+
+
 async def test_single_node_is_refused_before_the_coordinator_is_touched(tmp_path: Path) -> None:
     # 400 on a single node, gated BEFORE the coordinator (ADR 0056): there is no lease to release and
     # no standby to promote, so the answer must not depend on a NullCoordinator's no-op. The refusal is

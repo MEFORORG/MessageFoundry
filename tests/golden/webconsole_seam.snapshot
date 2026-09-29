@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-4736c00825683735
+ec18643ac47b0039
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -227,7 +227,7 @@ messagefoundry.api.models.ClaimPoolInfo: discarded_total, idle, open, opened_tot
 messagefoundry.api.models.ClaimProcInfo: degraded_reason, effective, head_forms
 messagefoundry.api.models.ClusterNode: acquire_delay_seconds, fresh, host, is_leader, last_seen, node_id, pid, promotable, started_at, status
 messagefoundry.api.models.ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
-messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, role
+messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, owns_lease_row, role
 messagefoundry.api.models.ClusterStepdownRequest: force
 messagefoundry.api.models.ClusterStepdownResult: force, lease_released, new_leader_eligible, node_id, released_at, was_leader
 messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded

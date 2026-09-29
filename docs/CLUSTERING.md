@@ -179,19 +179,25 @@ the console or any API client. They cost a cheap in-memory read (`/cluster/statu
   "clustered": true,
   "is_leader": false,
   "role": "standby",
-  "config_version": 7
+  "config_version": 7,
+  "owns_lease_row": false
 }
 ```
 
 `role` is the active-passive role for operators / a load-balancer health check: `"primary"` when this
 node is the leader (it runs the graph), `"standby"` when it is a warm follower (no listeners bound, no
 workers running), or `"single-node"` when not clustered. Single-node (no cluster) reports `clustered:
-false`, `is_leader: true`, `role: "single-node"`, `config_version: 0`:
+false`, `is_leader: true`, `role: "single-node"`, `config_version: 0`, `owns_lease_row: false`:
 
 ```json
 { "node_id": "host:1234:ab12cd34", "clustered": false, "is_leader": true,
-  "role": "single-node", "config_version": 0 }
+  "role": "single-node", "config_version": 0, "owns_lease_row": false }
 ```
+
+`owns_lease_row` says whether `POST /cluster/stepdown` on this node would release a lease row. It is
+true while the node leads. It is also true on a self-fenced node: its flag is clear, so it reports
+`standby`, but its lease row still names it. The web console reads this field to decide whether to
+offer the stepdown control. Do not work it out from `lease_expires_at`, which is on the database clock.
 
 ### `GET /cluster/nodes` — all nodes + the derived leader
 
