@@ -1429,15 +1429,18 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     assert _called(verify, "_mfa_lock_refused"), "verify_mfa no longer refuses a locked account."
 
     # 2. The sign-in legs. Exact, so a flipped `and not combined` reds too.
+    #
+    # The refusal's audit write is now a nested ``async def`` queued to run inside the failure pad
+    # (BACKLOG #1131), and it names the action through ``LOGIN_LOCKED_ACTION``, so the If is found
+    # by any ``_audit`` call in its body, however deep, that names the locked action either way.
     login_local = _service_func("_login_local")
     refusal_tests = [
         n.test
         for n in ast.walk(login_local)
         if isinstance(n, ast.If)
         and any(
-            isinstance(s, ast.Expr)
-            and _called(s, "_audit")
-            and "auth.login_locked" in ast.unparse(s)
+            _called(s, "_audit")
+            and ("auth.login_locked" in ast.unparse(s) or "LOGIN_LOCKED_ACTION" in ast.unparse(s))
             for s in n.body
         )
     ]
