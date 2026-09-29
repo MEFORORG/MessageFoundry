@@ -1003,7 +1003,17 @@ def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> s
         # claimed rows AND the kept==claimed defensive signal (a NULL claimed twin) in one fetch.
         " SELECT kp.id AS keep_id, c.id, c.message_id, c.channel_id, c.destination_name,"
         " c.handler_name, c.payload, c.attempts, c.seq, c.created_at"
-        " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id;"
+        " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id"
+        # BACKLOG #1270, the head-of-line skip: one marker row per lane whose DUE head (rn=1; STEP 2
+        # already removed a not-due head) the STEP-3 probe could not lock. STEP 4 emptied that lane,
+        # and without this row the EMPTY is indistinguishable from "no work". A NULL keep_id is the
+        # marker, with the lane in its own lane column. The epoch guard keeps a fenced ex-leader,
+        # whose probe declines every row, from reporting its whole chunk as skipped.
+        " UNION ALL SELECT NULL, NULL, NULL,"
+        + (" h.lane, NULL," if lane_col == "channel_id" else " NULL, h.lane,")
+        + " NULL, NULL, NULL, NULL, NULL FROM @heads h"
+        " WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM @locked k WHERE k.id = h.id)"
+        f"{epoch_guard};"
     )
 
 
@@ -8031,7 +8041,9 @@ class SqlServerStore:
         The batch's single result set pairs every kept id with its claimed row (``SET NOCOUNT ON``
         keeps it the sole result set; ``fetchall`` drains it under the EF-6 ``_cursor``
         close-before-release discipline). A kept row with no claimed twin is the kept!=claimed
-        signal, on which the whole call rolls back and returns EMPTY-all (fail closed). The probe's
+        signal, on which the whole call rolls back and returns EMPTY-all (fail closed). The same
+        result set carries one marker row (NULL ``keep_id``) per lane whose due head the probe could
+        not lock, which becomes ``ClaimedHeads.head_skipped`` (BACKLOG #1270). The probe's
         U-locks (held through the UPDATE) rule out a queue-row cause, but the epoch guard re-reads
         the UNLOCKED ``leader_lease`` row on a fresh RCSI statement snapshot, so a leader-epoch
         bump committed between the probe and the UPDATE legitimately zeroes the claim while the
@@ -8209,9 +8221,11 @@ class SqlServerStore:
                 *lane_list,
                 *epoch_args,  # STEP 3 probe guard
                 *epoch_args,  # STEP 5 UPDATE guard
+                *epoch_args,  # head-skip marker guard (BACKLOG #1270)
             )
         rearm: set[str] = set()
         claimed_rows: list[dict[str, Any]] = []
+        head_skipped: frozenset[str] = frozenset()
         # ADR 0114 AC-4: True ONLY once the folded reset is DURABLY committed (commit#1 returned).
         # The flag has exactly ONE assignment site besides this init — immediately after commit#1's
         # await, with no intervening await — so no suspension point can land between commit success
@@ -8257,6 +8271,11 @@ class SqlServerStore:
                 # before the connection returns to the pool (no-MARS).
                 rows = await cur.fetchall()
                 decoded = [dict(zip(columns, r)) for r in rows]  # noqa: B905
+                # BACKLOG #1270: split the head-skip marker rows (NULL keep_id, see the sole
+                # result set in _fifo_heads_steps) from the kept rows before anything reads them.
+                # Set BEFORE any fail-closed return below, so a skip already read is still reported.
+                head_skipped = frozenset(d[lane_col] for d in decoded if d["keep_id"] is None)
+                decoded = [d for d in decoded if d["keep_id"] is not None]
                 if use_proc:
                     # The proc CALL pinned 9 parameter descriptors on this POOLED cursor
                     # (descriptor[0] = SQL_DOUBLE for @now FLOAT); those pins are PERSISTENT cursor
@@ -8285,7 +8304,7 @@ class SqlServerStore:
                         len(decoded),
                         sum(1 for d in decoded if d["id"] is not None),
                     )
-                    return ClaimedHeads(by_lane={}, rearm=frozenset())
+                    return ClaimedHeads(by_lane={}, rearm=frozenset(), head_skipped=head_skipped)
                 # Iterate in CANONICAL message_id order: H2 may take the per-message finalize
                 # applock for SEVERAL messages in this one txn, and a monotone subsequence of the
                 # sorted order can never form a lock cycle with _lock_finalize_batch callers (or a
@@ -8401,6 +8420,9 @@ class SqlServerStore:
                         lock_timeout=ClaimLockTimeout(
                             phase=abort_phase, lanes_in_claim=len(lane_list)
                         ),
+                        # Empty on a HEAD-phase abort (it precedes the fetch); on a FINALIZE-phase
+                        # abort the fetch already ran, so a skip it observed still rides out.
+                        head_skipped=head_skipped,
                     )
                 raise
             finally:
@@ -8498,7 +8520,7 @@ class SqlServerStore:
                 by_lane[lane] = items
             else:
                 rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))
+        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
 
     async def list_fifo_lanes(
         self,

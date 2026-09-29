@@ -185,9 +185,10 @@ def test_lint_lane_col_appears_at_exactly_the_two_predicate_sites() -> None:
     assert "AND channel_id = l.lane" not in dst
 
 
-def test_lint_epoch_guard_fixed_nullable_on_both_sites() -> None:
+def test_lint_epoch_guard_fixed_nullable_on_every_site() -> None:
     body = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v1", "channel_id")
-    assert body.count(ss._CLAIM_PROC_EPOCH_GUARD) == 2  # STEP-3 probe AND STEP-5 UPDATE
+    # STEP-3 probe, STEP-5 UPDATE, and the BACKLOG #1270 head-skip marker rows.
+    assert body.count(ss._CLAIM_PROC_EPOCH_GUARD) == 3
     assert "@leader_epoch IS NULL OR" in ss._CLAIM_PROC_EPOCH_GUARD
 
 
@@ -626,10 +627,11 @@ def test_ac9_result_processing_is_one_shared_path_after_the_pin_clear() -> None:
 # rewritten head, so this is NOT the OBJECT_DEFINITION text; see _as_object_definition): drift in the
 # shared fragments, the OPENJSON lane source, the fixed-nullable epoch guard, the signature, or
 # the @fold_reset tail fails here and must be a reviewed, deliberate change (re-pin + the ADR 0064
-# hash re-applies the DDL; the startup gate's expected hashes follow automatically).
+# hash re-applies the DDL; the startup gate's expected hashes follow automatically). Re-pinned for
+# BACKLOG #1270: the shared result set gained the head-skip marker rows (see the AC-1 goldens note).
 _GOLDEN_PROC_BODY_SHA256 = {
-    "mefor_claim_fifo_heads_cid_v1": "9c685181b413be4936746312745f3c8e43830d7dc22e6ab2cfc8ba9443bb43e2",
-    "mefor_claim_fifo_heads_dst_v1": "0eaf2de29ae5ca09764bdabd2d3c40bca7c7feef8f347e6bab0800e5a3a97052",
+    "mefor_claim_fifo_heads_cid_v1": "cfec8a2178fc864b3026e1c8c07f78d8f4cc39b31701b05560b3a752e5d2a285",
+    "mefor_claim_fifo_heads_dst_v1": "6eb622b4a6fa500f48c14e25963c6613ce6f1ea52a7b64b7c0d7b4f4eb6595ea",
 }
 
 

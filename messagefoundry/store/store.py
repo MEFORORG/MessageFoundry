@@ -1025,11 +1025,29 @@ class ClaimedHeads:
     ``RETURNING``, so there is no attempt-level event to report and there structurally cannot be one;
     SQLite's single-writer lock makes the case unobservable. Do not write a consumer that reads
     ``None`` as proof the lanes were genuinely idle — the same absence-of-a-veto reading the
-    occupancy fence carries."""
+    occupancy fence carries.
+
+    ``head_skipped`` names the lanes whose DUE head the claim DISCOVERED but its lock probe could not
+    take (BACKLOG #1270, the head-of-line skip): the SQL Server ``READPAST`` / Postgres ``FOR UPDATE
+    SKIP LOCKED`` probe passed over it, either because another transaction holds it or because it
+    changed between discovery and the probe. The head-pin (ADR 0066 §3.2 STEP 4) then empties the
+    lane rather than claim past it, so the lane is absent from ``by_lane`` for a reason other than
+    "there is no work". Unlike ``lock_timeout`` this IS per lane: the claim completed and read the
+    discovered heads, so every name here is an observation, never the caller's request echoed back.
+    On SQL Server the probe carries the H1 epoch guard, so a fenced ex-leader reports none. On
+    Postgres the guard sits on the UPDATE only, so a fenced node can still report a skip it truly
+    observed (another transaction held that head).
+
+    **Empty means NOT ESTABLISHED, again.** SQLite cannot observe the case (its process-wide lock
+    serializes the claim behind any writer). A 1222 abort on the claim batch reads no row. An
+    UNCOMMITTED head is invisible to discovery on both server backends, so a lane waiting on one
+    reports nothing here. REPORTING, never control flow: the EMPTY contract and the sweep recovery
+    are unchanged."""
 
     by_lane: dict[str, list[OutboxItem]]
     rearm: frozenset[str]
     lock_timeout: ClaimLockTimeout | None = None
+    head_skipped: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

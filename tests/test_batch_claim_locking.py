@@ -360,6 +360,20 @@ async def _claim_heads_until(store: Any, *args: Any, **kwargs: Any) -> Any:
     return res
 
 
+def _assert_skip_named(res: Any, lane: str, *, abort_ok: bool) -> None:
+    """BACKLOG #1270: a lane EMPTY behind a held head must NAME its route, never read as "no work".
+
+    The completed claim names the lane in ``head_skipped``. On SQL Server alone the whole attempt may
+    instead abort on 1222 (``lock_timeout``) and read no row, which names the route without the lane;
+    ``abort_ok`` admits that, and only that. Either way a silent EMPTY fails here."""
+    if abort_ok and res.lock_timeout is not None:
+        assert res.head_skipped == frozenset()  # an aborted claim read no row, so it names none
+        return
+    assert res.head_skipped == frozenset({lane}), (
+        f"the locked head's lane came back EMPTY without being named: {res.head_skipped!r}"
+    )
+
+
 # --- 1a: true T6 — locked head => lane EMPTY, no lock-wait, N claimed first after
 
 
@@ -377,6 +391,7 @@ async def test_pooled_1a_pg_locked_head_lane_empty_never_blocks(pg_store: Any) -
             pg_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
+        _assert_skip_named(res, channel, abort_ok=False)
         rows = await _pg_lane_pending(pg_store, channel)
         assert all(
             r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows
@@ -388,6 +403,7 @@ async def test_pooled_1a_pg_locked_head_lane_empty_never_blocks(pg_store: Any) -
         pg_store, Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
     )
     assert [it.message_id for it in after.by_lane[channel]] == mids  # N first, whole prefix
+    assert after.head_skipped == frozenset()  # the lock is gone, so nothing is named skipped
 
 
 async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -> None:
@@ -404,6 +420,7 @@ async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -
             ss_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
+        _assert_skip_named(res, channel, abort_ok=True)
         rows = await _ss_lane_pending(ss_store, channel)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
@@ -414,6 +431,7 @@ async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -
         ss_store, Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
     )
     assert [it.message_id for it in after.by_lane[channel]] == mids
+    assert after.head_skipped == frozenset()
 
 
 # --- 1b: uncommitted-producer head (single-writer lane) + the fan-in disclosure
@@ -442,6 +460,7 @@ async def test_pooled_1b_pg_uncommitted_head_invisible_then_claimed(pg_store: An
     try:
         res = await _claim_heads_no_block(pg_store, Stage.INGRESS.value, [channel], now=200.0)
         assert res.by_lane == {}  # invisible head — EMPTY, no block
+        assert res.head_skipped == frozenset()  # #1270: never discovered, so never named skipped
         await tx.commit()
     finally:
         await pg_store._pool.release(conn)
@@ -474,6 +493,7 @@ async def test_pooled_1b_ss_uncommitted_head_invisible_then_claimed(ss_store: An
     try:
         res = await _claim_heads_no_block(ss_store, Stage.INGRESS.value, [channel], now=200.0)
         assert res.by_lane == {}
+        assert res.head_skipped == frozenset()  # #1270: never discovered, so never named skipped
         # Driver-level commit (autocommit=False pool): a SQL `COMMIT TRAN` only decrements the
         # nested @@TRANCOUNT the implicit txn already opened, so the row never durably commits and
         # res2's RCSI snapshot would miss it. conn.commit() is the store's own commit primitive.
@@ -581,6 +601,7 @@ async def test_pooled_1c_pg_multilane_isolation(pg_store: Any) -> None:
         )
         assert set(res.by_lane) == {channel_b}  # B drains; A is EMPTY, not [N+1]
         assert [it.message_id for it in res.by_lane[channel_b]] == b
+        assert res.head_skipped == frozenset({channel_a})  # #1270: A named, B (claimed) not
         rows = await _pg_lane_pending(pg_store, channel_a)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
@@ -599,6 +620,7 @@ async def test_pooled_1c_ss_multilane_isolation(ss_store: Any) -> None:
         )
         assert set(res.by_lane) == {channel_b}
         assert [it.message_id for it in res.by_lane[channel_b]] == b
+        assert res.head_skipped == frozenset({channel_a})  # #1270: A named, B (claimed) not
         rows = await _ss_lane_pending(ss_store, channel_a)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
@@ -620,6 +642,8 @@ async def test_pooled_1e_pg_midprefix_gap_truncates_tail_untouched(pg_store: Any
         )
         # Only the contiguous head prefix [N]; the locked N+1 truncates; N+2 is NOT pulled forward.
         assert [it.message_id for it in res.by_lane[channel]] == [mids[0]]
+        # #1270: a mid-prefix gap is NOT a head skip — the head was claimed, the lane is not EMPTY.
+        assert res.head_skipped == frozenset()
         rows = await pg_store._fetchall(
             "SELECT message_id, status, attempts FROM queue"
             " WHERE channel_id=$1 AND stage=$2 AND message_id <> $3 ORDER BY seq",
@@ -644,6 +668,7 @@ async def test_pooled_1e_ss_midprefix_gap_truncates_tail_untouched(ss_store: Any
             ss_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert [it.message_id for it in res.by_lane[channel]] == [mids[0]]
+        assert res.head_skipped == frozenset()  # #1270: a mid-prefix gap is not a head skip
         rows = await ss_store._fetchall(
             "SELECT message_id, status, attempts FROM queue"
             " WHERE channel_id=? AND stage=? AND message_id <> ? ORDER BY seq",
@@ -672,6 +697,7 @@ async def test_pooled_1f_pg_wedged_head_attempts_neutral(pg_store: Any) -> None:
                 pg_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
+            _assert_skip_named(res, channel, abort_ok=False)  # #1270: every pass, not just one
         rows = await _pg_lane_pending(pg_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [
             (OutboxStatus.PENDING.value, 0)
@@ -696,6 +722,7 @@ async def test_pooled_1f_ss_wedged_head_attempts_neutral(ss_store: Any) -> None:
                 ss_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
+            _assert_skip_named(res, channel, abort_ok=True)  # #1270: every pass, not just one
         rows = await _ss_lane_pending(ss_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [(OutboxStatus.PENDING.value, 0)] * 3
     finally:
