@@ -536,9 +536,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window so it may perform highly sensitive operations for the configured
         period. Rate-limited like the password change; a failure is a 403 that counts against this
-        session's re-proof budget, and toward the account lockout unless a lock is already live. The
-        failure that exhausts the budget ends the session with a 401 (BACKLOG #1138). The account lock
-        does not refuse it.
+        session's re-proof budget, and toward the account lockout unless the sign-in lock is already
+        live. The failure that exhausts the budget ends the session with a 401 (BACKLOG #1138).
+        Neither account lock refuses it.
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""

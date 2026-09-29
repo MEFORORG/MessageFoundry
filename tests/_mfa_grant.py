@@ -21,13 +21,13 @@ import inspect
 import textwrap
 from typing import Any
 
-__all__ = ["mfa_grant_values"]
+__all__ = ["keyword_values", "mfa_grant_values"]
 
 
-def mfa_grant_values(func: Any) -> list[ast.expr]:
-    """Every expression passed as ``mfa_verified=`` inside ``func``'s source, in source order.
+def keyword_values(func: Any, keyword: str) -> list[ast.expr]:
+    """Every expression passed as ``keyword=`` inside ``func``'s source, in source order.
 
-    An empty list means the seam moved -- the leg passes no such keyword at all -- which callers must
+    An empty list means the seam moved -- ``func`` passes no such keyword at all -- which callers must
     treat as a failure rather than as "no constant found", or the assertion passes vacuously.
     """
     tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
@@ -36,5 +36,11 @@ def mfa_grant_values(func: Any) -> list[ast.expr]:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         for kw in node.keywords
-        if kw.arg == "mfa_verified"
+        if kw.arg == keyword
     ]
+
+
+def mfa_grant_values(func: Any) -> list[ast.expr]:
+    """Every expression passed as ``mfa_verified=`` inside ``func``'s source (see
+    :func:`keyword_values`, including why an empty list is a failure)."""
+    return keyword_values(func, "mfa_verified")
