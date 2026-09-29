@@ -43,6 +43,7 @@ from messagefoundry.config.memory_encryption import (
 )
 from messagefoundry.config.settings import (
     AlertsSettings,
+    ApiSettings,
     AuthSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -69,6 +70,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         unverified_db_hops=(),
         attested_hops=(),
         revocation_attested_hops=(),
+        api=ApiSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
     )

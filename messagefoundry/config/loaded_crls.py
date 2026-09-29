@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The CRL copies that live TLS contexts hold, so the expiry monitor judges those and not only the file
+(BACKLOG #299).
+
+**Why this exists.** A hop reads its CRL file once, when it builds its TLS context, and most hops keep
+that context for every handshake until a restart or a config reload. The expiry monitor
+(:mod:`messagefoundry.pipeline.cert_expiry`) read only the file on each pass. So an operator who
+replaced an expiring CRL would have seen the ``crl_expiry`` alert clear while the running hop still held
+the old copy, which would go on to lapse and refuse every peer. The monitor and the hop disagreed.
+
+:func:`~messagefoundry.config.tls_policy.harden_crl_check` loads the CRL settings into a context, and
+it records each load here. That covers at least every CRL *setting* found on 2026-09-28. It does not
+cover a CRL block placed inside a CA bundle, which ``load_verify_locations`` loads with the CA and
+nothing here records. The monitor takes one :func:`snapshot` per pass, asks it for the copies live
+contexts still hold, and judges the soonest of those and the file. A held copy of a file no monitor
+row names, such as an inbound ``tls_crl_file`` given as a deferred ``env()`` value, gets its own row.
+So the alert stays up until every context holding the old copy is gone: a restart or a rebuild.
+
+**The registry holds each context WEAKLY.** An entry lasts exactly as long as the context it describes.
+A throwaway context (a ``check`` dry run, a ``verify`` probe, a test) drops out when it is collected,
+and a hop rebuilt by a config reload drops its old entry when the old context goes. A context kept
+alive by something that will never handshake with it again would keep its entry and raise a spurious
+alert. That errs the safe way: a false "restart needed" over a false all-clear.
+
+**A hop that rebuilds its context for every connection does not record.** The Postgres store builds a
+fresh context per pool connection (BACKLOG #300), so its next handshake reads the file as it is then,
+and the file is the truth for that hop. Recording those contexts would also be wrong, because an open
+pool connection keeps its context alive long after its one handshake. Such a caller passes
+``record_held_copy=False`` to ``harden_crl_check``.
+
+**The key is the configured path, not the resolved file.** A common rotation replaces a symlink's
+target. Resolving the link at load and again at the monitor pass would give two different keys, so
+the monitor would find no held copy and clear the alert, which is the defect this module closes. The
+key is the absolute, case-normalized path as configured, with no link resolution.
+
+**The fingerprint is change detection inside one process, not an integrity check.** It is the
+length and the builtin ``hash()`` of the file's bytes. Both sides of every comparison run in the
+same process, so the per-process salt that makes ``hash()`` useless across processes does not
+matter here. Nothing is authenticated by it: whoever can write the CRL file already decides what is
+revoked, so a crafted collision would buy them nothing they do not have.
+
+Engine-side, stdlib only. It stores public CRL metadata (issuer, ``nextUpdate``, a fingerprint of the
+file), never key material and never message content.
+"""
+
+from __future__ import annotations
+
+import os
+import ssl
+import threading
+import weakref
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from messagefoundry.pki import CrlFacts
+
+__all__ = [
+    "HeldCrl",
+    "HeldCrlSnapshot",
+    "crl_fingerprint",
+    "held_crl_copies",
+    "record_crl_load",
+    "snapshot",
+]
+
+
+@dataclass(frozen=True)
+class HeldCrl:
+    """One CRL file load that a live context still holds.
+
+    ``fingerprint`` is :func:`crl_fingerprint` of the bytes the load judged, so the monitor can tell
+    a held copy from a replaced file. ``facts`` are those of the soonest-expiring CRL block in that
+    load, the rule :func:`~messagefoundry.pki.soonest_crl` applies to the file; call
+    :meth:`~messagefoundry.pki.CrlFacts.at` for the days left now. ``setting`` names the knob the
+    hop loaded it from, such as ``[tls].crl_file``, or is ``None`` where the caller named none (an
+    inbound connection's ``tls_crl_file``)."""
+
+    path_key: str
+    fingerprint: tuple[int, int]
+    facts: CrlFacts
+    setting: str | None = None
+
+
+# Keyed by context, held weakly: an entry lives exactly as long as its context. A context may load
+# more than one CRL file in principle, so each value is a tuple; overwriting would drop a copy and
+# read as an all-clear. The lock covers a load on one thread (the store and SMTP builders run off the
+# event loop) racing a monitor read on another; the copy below is taken under it, so the monitor
+# never iterates the live mapping.
+_HELD: weakref.WeakKeyDictionary[ssl.SSLContext, tuple[HeldCrl, ...]] = weakref.WeakKeyDictionary()
+_LOCK = threading.Lock()
+
+
+def _path_key(path: str | os.PathLike[str]) -> str:
+    """Absolute and case-normalized, links NOT resolved; the module docstring says why."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def crl_fingerprint(pem: bytes) -> tuple[int, int]:
+    """A cheap in-process identity for a CRL file's bytes; the module docstring says why it suffices."""
+    return (len(pem), hash(pem))
+
+
+def record_crl_load(
+    ctx: ssl.SSLContext, crl_file: str, pem: bytes, facts: CrlFacts, *, setting: str | None = None
+) -> None:
+    """Record that ``ctx`` now holds the CRL file ``crl_file``, whose judged bytes were ``pem`` and
+    whose soonest-expiring block is ``facts``. Called by ``harden_crl_check`` after a load succeeds."""
+    held = HeldCrl(_path_key(crl_file), crl_fingerprint(pem), facts, setting)
+    with _LOCK:
+        _HELD[ctx] = (*_HELD.get(ctx, ()), held)
+
+
+class HeldCrlSnapshot:
+    """Every held copy at one instant, indexed by path key, for one monitor pass.
+
+    One snapshot per pass keeps the pass linear in the number of held copies. A lookup per row
+    against the live registry would take the lock and copy every entry once per row."""
+
+    def __init__(self, copies: Iterable[HeldCrl]) -> None:
+        self._by_path: dict[str, list[HeldCrl]] = {}
+        for held in copies:
+            self._by_path.setdefault(held.path_key, []).append(held)
+
+    def copies(self, path: str | os.PathLike[str]) -> list[HeldCrl]:
+        """Every copy of the CRL file at ``path`` held at the snapshot, one per load.
+
+        Two settings that name one file share its copies, because the key is the file: a stale copy
+        held by either hop is a stale copy of that file."""
+        return list(self._by_path.get(_path_key(path), ()))
+
+    def unwatched(self, watched: Iterable[str | os.PathLike[str]]) -> list[str]:
+        """The held paths that no entry of ``watched`` names, sorted, each once, in key form
+        (absolute, case-normalized), which opens the same file."""
+        seen = {_path_key(path) for path in watched}
+        return sorted(set(self._by_path) - seen)
+
+
+def snapshot() -> HeldCrlSnapshot:
+    """The copies live contexts hold now.
+
+    A context collected while the copy is taken can make ``WeakKeyDictionary`` raise
+    ``RuntimeError``, since its removal callback does not take this lock. The copy is retried
+    rather than letting one pass fall back to the file alone, which is the gap this module closes."""
+    for _ in range(3):
+        try:
+            with _LOCK:
+                return HeldCrlSnapshot([held for loads in list(_HELD.values()) for held in loads])
+        except RuntimeError:
+            continue
+    with _LOCK:
+        return HeldCrlSnapshot([held for loads in list(_HELD.values()) for held in loads])
+
+
+def held_crl_copies(path: str | os.PathLike[str]) -> list[HeldCrl]:
+    """Every copy of the CRL file at ``path`` that a live context still holds, one per load."""
+    return snapshot().copies(path)

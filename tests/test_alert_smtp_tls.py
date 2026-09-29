@@ -28,6 +28,7 @@ from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AlertsSettings,
+    ApiSettings,
     AuthSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -216,6 +217,7 @@ def _names(**kw: Any) -> list[str]:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -264,6 +266,7 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )

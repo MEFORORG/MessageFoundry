@@ -23,22 +23,38 @@
 # Pinned to Debian 12 "bookworm": a mature base whose Microsoft ODBC repo (the -sqlserver variant) is
 # well-supported. Debian 13 "trixie" signs its MS repo with a key absent from the legacy microsoft.asc
 # bundle, which trixie's strict `sqv` then rejects — bookworm avoids that. Bump deliberately, not by
-# floating the tag. (For stronger supply-chain integrity, pin by digest: python:3.14-slim-bookworm@sha256:…)
-ARG PYTHON_VERSION=3.14
-ARG DEBIAN_RELEASE=bookworm
+# floating the tag.
+#
+# The ONE registry base, pinned BY DIGEST (BACKLOG #1193). A tag alone is mutable: the registry can
+# serve a different image under the same name tomorrow. The digest is the multi-arch index digest for
+# the tag beside it, so each platform pulls its own image under one pin. Every other stage descends
+# from this one, directly or through builder-base or runtime-base, so there is a single line to move.
+# It is written out literally, not through an ARG, because Dependabot cannot follow an interpolated
+# tag; its `docker` entry in .github/dependabot.yml moves the digest when the tag gets a security
+# rebuild. The pin also freezes the base's Debian packages: a fix reaches the image only when that
+# digest moves, and a build from an older checkout keeps that checkout's digest.
+FROM python:3.14-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56 AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
-FROM python:${PYTHON_VERSION}-slim-${DEBIAN_RELEASE} AS builder-base
+FROM python-base AS builder-base
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 WORKDIR /src
+# The build frontend comes from the SAME hash-pinned lock that ci.yml's packaging job and release.yml's
+# build steps install, so the image builds its wheel with the tooling the release uses. The base
+# image's bundled pip installs it; no unpinned pip is fetched. The lock is the whole release-tools
+# group (sigstore and the SBOM tools too), installed into this throwaway stage's system Python; none
+# of it reaches /opt/venv or the runtime image. It needs a wheel for the build platform for every
+# package in it; CI builds amd64 only. `--require-hashes` covers that lock. PEP 517 isolation then
+# installs the backend from pyproject.toml's [build-system] `==` pin, with no hash, exactly as CI and
+# the release do (BACKLOG #1546).
+COPY ci/locks/release-tools.lock /tmp/release-tools.lock
+RUN python -m pip install --require-hashes -r /tmp/release-tools.lock
 # Only what the wheel build needs (version is single-sourced from messagefoundry/__init__.py; PEP 639
 # license-files are LICENSE + NOTICE). Copying these before the package keeps the layer cache warm.
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY messagefoundry ./messagefoundry
-# Use the base image's bundled pip (don't fetch an unpinned pip into the hash-locked build path).
-RUN python -m pip install build \
- && python -m build --wheel --outdir /wheels .
+RUN python -m build --wheel --outdir /wheels .
 
 # ---- builder (core / SQLite): venv = core deps (hash-locked) + the engine wheel ------------------
 FROM builder-base AS builder
@@ -55,7 +71,7 @@ RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-deps /wheels/messagefoundry-*.whl
 
 # ---- runtime-base: hardened common runtime (no venv yet — copied by the final stages) ------------
-FROM python:${PYTHON_VERSION}-slim-${DEBIAN_RELEASE} AS runtime-base
+FROM python-base AS runtime-base
 # tini = a real PID 1 that forwards SIGTERM, so `docker stop` triggers uvicorn's graceful shutdown ->
 # the ASGI lifespan -> engine.stop() (drains MLLP clients within _CLIENT_SHUTDOWN_GRACE). Without it a
 # shell PID 1 would swallow SIGTERM and the stop would be ungraceful. curl = the HEALTHCHECK probe.

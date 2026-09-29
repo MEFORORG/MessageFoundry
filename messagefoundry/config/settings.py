@@ -57,6 +57,7 @@ from pydantic import (
     model_validator,
 )
 
+from messagefoundry.api_tls_source import api_tls_source
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -1180,6 +1181,19 @@ class ApiSettings(_Section):
         """Whether the Posture-B proxy TLS/KEX floor is declared (#200): a ``proxy_tls_min_version`` is
         set. Undeclared → a prod-PHI Posture-B bind refuses (the engine cannot observe the proxy's TLS)."""
         return self.proxy_tls_min_version is not None
+
+    @property
+    def serves_plaintext_upstream_hop(self) -> bool:
+        """Whether the engine serves the proxy-to-engine hop in PLAINTEXT (BACKLOG #1179): a declared
+        upstream terminator and no operator certificate, in :func:`api_tls_source`'s order. The one
+        definition the serve refusal, its AUDIT line, the ``upstream-hop-ack`` check leg and
+        ``security_loosenings()`` share, so none of them can decide the question differently."""
+        return (
+            api_tls_source(
+                cert_file=self.tls_cert_file, tls_terminated_upstream=self.tls_terminated_upstream
+            )
+            == "upstream"
+        )
 
     @field_validator("public_origin", mode="after")
     @classmethod
@@ -2516,9 +2530,12 @@ class AuthSettings(_Section):
     # security fix. THIS IS THE SINGLE PLACE that mismatch is explained; do not restate it (SDS-3.5).
     #
     # OPERATOR NOTE: under ``every_local_account`` a non-interactive bearer-token service account
-    # becomes MFA-pending and cannot enroll unattended — move it to mTLS (api/security.py:
-    # require_service_cert, which is exempt by design) or set this to ``administrators``. Moving it to
-    # AD is NO LONGER an escape: a directory account is in scope like any other.
+    # becomes MFA-pending and cannot enroll unattended. ``administrators`` frees only a LOCAL account
+    # without the Administrator role (AuthService._mfa_required_for keeps that role in scope under
+    # either value); ``require_mfa = false`` frees any un-enrolled account, at the exposure gate's
+    # cost. Moving it to AD is NO LONGER an escape: a directory account is in scope like any other.
+    # Nor is mTLS: require_service_cert (api/security.py) admits a cert identity on
+    # GET /service/identity alone, so it cannot carry a working service account.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     # TOTP clock-skew tolerance, in 30-second time steps, applied when verifying a submitted code
     # (BACKLOG #187; ASVS 6.5.5). Default 0 = STRICT: only the current 30 s step is accepted, so a
@@ -6005,6 +6022,7 @@ def security_loosenings(
     unverified_db_hops: Sequence[str],
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
+    api: ApiSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
 ) -> list[tuple[str, str]]:
@@ -6017,6 +6035,7 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
+    ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
@@ -6040,6 +6059,9 @@ def security_loosenings(
     needs a new REQUIRED parameter (every one here is required by design, so an optional detector
     cannot be added quietly), which is a larger change than the item that exposed it — filed as
     content rather than folded in.
+
+    ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
+    every call site names it. It carries the BACKLOG #1179 acknowledgement.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -6313,6 +6335,21 @@ def security_loosenings(
                 "a session token used from a NEW client address can perform a sensitive admin action "
                 "without a fresh step-up -- nothing audits, notifies or challenges the address change "
                 "mid-session",
+            )
+        )
+    # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS
+    # 12.3.3 at partial, so the acknowledgement is named here as well as warned at serve. Conditional
+    # on the hop actually being plaintext, by the predicate serve uses: with an operator tls_cert_file
+    # the engine serves that hop over TLS and the acknowledgement is inert.
+    if api.plaintext_upstream_hop_acknowledged and api.serves_plaintext_upstream_hop:
+        out.append(
+            (
+                "plaintext_upstream_hop_acknowledged",
+                "the proxy-to-engine hop behind [api].tls_terminated_upstream is PLAINTEXT and the "
+                "engine does nothing to protect it -- the operator has acknowledged that securing "
+                "it is the deploying site's job. At least sign-in credentials, session tokens and "
+                "PHI reads cross that hop unencrypted; isolating the hop limits who can read them "
+                "but encrypts nothing (set [api].tls_cert_file to serve it over TLS instead)",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the

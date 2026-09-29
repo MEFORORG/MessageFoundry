@@ -143,7 +143,8 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     # Both DEAD branches guarded; the success path deliberately is not (it ADMITS a message, and
     # fencing it would convert a permitted duplicate into a LOST re-ingress).
     "ingress_handoff": (2, 2),
-    # ONE statement with a conditional suffix: the guard is "" on the retry branch, which re-pends.
+    # ONE statement with a conditional suffix: the epoch guard on the DEAD branch, and on the retry
+    # branch, which re-pends, a status term (ADR 0157 Amendment A), never the epoch guard.
     "mark_failed": (1, 1),
     "mark_batch_failed": (1, 1),
     "dead_letter_batch": (1, 1),

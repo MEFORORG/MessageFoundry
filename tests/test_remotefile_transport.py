@@ -38,6 +38,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
+from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
 from messagefoundry.transports import build_destination, build_source, remotefile
 from messagefoundry.transports.base import (
@@ -61,6 +62,7 @@ from messagefoundry.transports.remotefile import (
     _RemoteOversize,
     _SftpClient,
 )
+from tests._approved_key_wrap import approved_pkcs8_pem
 
 #: Small chunk for the fake client, so a test body is delivered in several pieces without needing a
 #: multi-MiB fixture. The shipped chunk size is asserted separately, below.
@@ -1698,23 +1700,18 @@ def _encrypted_client_cert(tmp_path: Path, passphrase: str) -> tuple[str, str]:
     )
     cp, kp = tmp_path / "ftps-enc-c.pem", tmp_path / "ftps-enc-k.pem"
     cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    kp.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
-        )
-    )
+    # The approved wrap: the loader refuses BestAvailableEncryption's 2048 iterations (#1352).
+    kp.write_bytes(approved_pkcs8_pem(key, passphrase))
     return str(cp), str(kp)
 
 
 def test_ftps_encrypted_client_key_missing_password_raises_not_prompts(tmp_path: Path) -> None:
     # LOAD-BEARING security assertion (FILE-19): an encrypted client key with NO tls_key_password must
-    # fail deterministically (ssl.SSLError) via the empty-bytes callback, NOT fall back to OpenSSL's
-    # blocking TTY prompt (there is no TTY under a service account). Without the guard at
-    # remotefile.py:206 this test would HANG on the prompt instead of raising.
+    # fail deterministically, NOT fall back to OpenSSL's blocking TTY prompt (there is no TTY under a
+    # service account). Since BACKLOG #1352 the key-wrap check refuses it before OpenSSL reads the
+    # key; the empty-bytes callback in _ftps_ssl_context stays behind it as the backstop.
     cert, key = _encrypted_client_cert(tmp_path, "s3cr3t-pass")
-    with pytest.raises(ssl.SSLError):
+    with pytest.raises(KeyWrapRefused, match="no passphrase is configured"):
         _ftps_ssl_context({"host": "h", "tls_cert_file": cert, "tls_key_file": key})
 
 

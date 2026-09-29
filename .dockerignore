@@ -2,8 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 #
 # Keep the engine image build context small and free of anything sensitive. docker/Dockerfile COPYs
-# only: pyproject.toml, README.md, LICENSE, NOTICE, messagefoundry/, and docker/locks/. Everything
-# else is excluded so it can never end up in an image layer (PHI, secrets, dev tooling, the GUI harness).
+# only: pyproject.toml, README.md, LICENSE, NOTICE, messagefoundry/, docker/locks/, and
+# ci/locks/release-tools.lock (the hash-pinned build frontend for the builder stage). This file is a
+# DENYLIST: it keeps the sensitive and bulky paths below out of the context (PHI, secrets, dev
+# tooling, the GUI harness), but other top-level files still reach the daemon. A `COPY . .` would
+# bake them in, so COPY named paths only.
 
 # VCS / editor / caches
 **/.git

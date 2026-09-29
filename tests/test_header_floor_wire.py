@@ -29,10 +29,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from collections.abc import AsyncIterator
+import sys
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -52,6 +53,7 @@ from messagefoundry.api.header_floor import (
     HSTS_HEADER,
 )
 from messagefoundry.api.protocol_headers import (
+    ProtocolFloorUnavailable,
     floored_http_protocol_class,
     floored_ws_protocol_class,
 )
@@ -253,14 +255,20 @@ async def test_the_app_error_500_carries_nosniff(
     _assert_protocol_family(control, shipped, 500)
 
 
-@pytest.mark.parametrize("base", [WebSocketProtocol, WebSocketsSansIOProtocol])
-async def test_the_websocket_500_carries_nosniff(base: type[Any]) -> None:
+async def test_the_websocket_500_carries_nosniff() -> None:
     request = _HANDSHAKE.format(path="/ws/stats").encode()
-    async with _served(_raises, ws=base) as port:
+    async with _served(_raises, ws=WebSocketProtocol) as port:
         control = await _exchange(port, request)
-    async with _served(_raises, ws=floored_ws_protocol_class(base=base)) as port:
+    async with _served(_raises, ws=floored_ws_protocol_class(base=WebSocketProtocol)) as port:
         shipped = await _exchange(port, request)
     _assert_protocol_family(control, shipped, 500)
+
+
+def test_the_sans_io_websocket_protocol_is_refused_not_served_bare() -> None:
+    """It writes its own handshake rejections without ``write_http_response``, so the floor cannot
+    reach them. The build refuses it rather than serving those answers without the headers."""
+    with pytest.raises(ProtocolFloorUnavailable, match="write_http_response method"):
+        floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
 
 
 def test_no_websocket_library_means_no_websocket_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -282,7 +290,7 @@ async def test_the_legacy_websocket_handshake_rejection_carries_nosniff() -> Non
     _assert_protocol_family(control, shipped, 400)
 
 
-# --- fail open: a failure on the header path never changes a status ---------------------------
+# --- per-response steps degrade: a failure on the header path never changes a status -----------
 
 
 async def _ok(scope: Scope, receive: Receive, send: Send) -> None:
@@ -339,7 +347,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _MALFORMED,
             400,
-            {"http": floored_http_protocol_class(base=HttpToolsProtocol)},
+            lambda: {"http": floored_http_protocol_class(base=HttpToolsProtocol)},
             id="http-400",
         ),
         pytest.param(
@@ -349,7 +357,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _GET,
             500,
-            {"http": floored_http_protocol_class(base=H11Protocol)},
+            lambda: {"http": floored_http_protocol_class(base=H11Protocol)},
             id="http-500",
         ),
         pytest.param(
@@ -359,7 +367,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _MALFORMED,
             400,
-            {"http": floored_http_protocol_class(base=H11Protocol)},
+            lambda: {"http": floored_http_protocol_class(base=H11Protocol)},
             id="h11-400",
         ),
         pytest.param(
@@ -369,7 +377,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _HANDSHAKE.format(path="/ws").encode(),
             500,
-            {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
+            lambda: {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
             id="ws-500",
         ),
         pytest.param(
@@ -379,7 +387,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _MALFORMED,
             400,
-            {"http": floored_http_protocol_class(base=H11Protocol)},
+            lambda: {"http": floored_http_protocol_class(base=H11Protocol)},
             id="transport-swap",
         ),
         pytest.param(
@@ -391,26 +399,29 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             .replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "")
             .encode(),
             400,
-            {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
+            lambda: {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
             id="legacy-handshake-400",
         ),
     ],
 )
-async def test_every_header_step_fails_open(
+async def test_every_per_response_header_step_degrades(
     target: str,
     value: Any,
     step: str,
     app: Any,
     request_bytes: bytes,
     status: int,
-    config: dict[str, Any],
+    config: Callable[[], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Built here, not at collection: a hook drift then fails these arms alone, rather than refusing
+    # the whole module at import and hiding the version-pin test that explains it.
+    protocols = config()
     monkeypatch.setattr(protocol_headers, "_WARNED", set())
     monkeypatch.setattr(protocol_headers, target, value)
     caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
-    async with _served(app, **config) as port:
+    async with _served(app, **protocols) as port:
         response = await _exchange(port, request_bytes)
     assert response[0] == status
     _one_warning(caplog, step)
@@ -442,11 +453,14 @@ def test_a_hooked_cycle_is_still_freed_by_refcount(cycle_module: str) -> None:
 def test_a_changed_handshake_writer_signature_reaches_the_server_unchanged(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Fail open on a signature change: a writer called with one argument, where 16.0 passes
+    """Degrade on a signature change: a writer called with one argument, where 16.0 passes
     (status, headers, body), must still write, not raise inside the override."""
     written: list[tuple[Any, ...]] = []
 
     class _Stub(asyncio.Protocol):
+        def connection_made(self, transport: Any) -> None:
+            self.transport = transport
+
         def send_500_response(self) -> None:
             pass
 
@@ -461,3 +475,261 @@ def test_a_changed_handshake_writer_signature_reaches_the_server_unchanged(
     assert written == [("a single response object",)]
     hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
     assert len(hits) == 1 and "ws-handshake: header addition" in hits[0], hits
+
+
+# --- fail closed at class build: a missing hook refuses, it never falls back ---------------------
+#
+# Each fake is built from parts, so an arm drops exactly one hook. The complete fakes must BUILD in
+# the same run, or a refusal could be the fixture's fault rather than the missing hook's.
+
+_FAKE_MODULE = "tests._fake_uvicorn_protocol_module"
+
+
+def _sets_cycle_and_transport(self: Any) -> None:
+    self.cycle = None
+    self.transport = None
+
+
+def _sets_cycle(self: Any) -> None:
+    self.cycle = None
+
+
+def _sets_transport(self: Any) -> None:
+    self.transport = None
+
+
+def _sets_default_headers(self: Any) -> None:
+    self.default_headers = []
+
+
+def _sets_nothing(self: Any) -> None:
+    pass
+
+
+def _writes(self: Any, *args: Any) -> None:
+    pass
+
+
+async def _sends_500(self: Any) -> None:
+    pass
+
+
+def _fake_http(monkeypatch: pytest.MonkeyPatch, drop: str | None) -> type[Any]:
+    """An HTTP protocol shaped like uvicorn's with ``drop`` removed, in a registered module, so the
+    floor looks up its cycle class the way it looks up uvicorn's."""
+    cycle_members: dict[str, Any] = {
+        "__module__": _FAKE_MODULE,
+        "__init__": _sets_nothing if drop == "default_headers" else _sets_default_headers,
+        # uvicorn's is a coroutine; a plain method in its place is the moved hook.
+        "send_500_response": _writes if drop == "send_500_response" else _sends_500,
+    }
+    module = ModuleType(_FAKE_MODULE)
+    if drop != "RequestResponseCycle":
+        module.RequestResponseCycle = type("RequestResponseCycle", (), cycle_members)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, _FAKE_MODULE, module)
+    init = {"cycle": _sets_transport, "transport": _sets_cycle}.get(
+        drop or "", _sets_cycle_and_transport
+    )
+    members: dict[str, Any] = {"__module__": _FAKE_MODULE, "__init__": init}
+    if drop != "send_400_response":
+        members["send_400_response"] = _writes
+    return type("FakeHTTPProtocol", (asyncio.Protocol,), members)
+
+
+def _fake_ws(drop: str | None) -> type[Any]:
+    members: dict[str, Any] = {
+        "__module__": _FAKE_MODULE,
+        "__init__": _sets_nothing if drop == "transport" else _sets_transport,
+    }
+    for name in ("send_500_response", "write_http_response"):
+        if drop != name:
+            members[name] = _writes
+    return type("FakeWebSocketProtocol", (asyncio.Protocol,), members)
+
+
+def test_the_complete_fakes_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control for every refusal below: with nothing dropped, both fakes are floored."""
+    assert floored_http_protocol_class(base=_fake_http(monkeypatch, None)) is not None
+    assert floored_ws_protocol_class(base=_fake_ws(None)) is not None
+
+
+@pytest.mark.parametrize(
+    ("drop", "named"),
+    [
+        ("send_400_response", "synchronous send_400_response method"),
+        ("cycle", "cycle attribute"),
+        ("transport", "transport attribute"),
+        ("RequestResponseCycle", "RequestResponseCycle in its module"),
+        ("send_500_response", "send_500_response coroutine"),
+        ("default_headers", "default_headers attribute"),
+    ],
+)
+def test_an_http_base_missing_a_hook_is_refused(
+    drop: str, named: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _fake_http(monkeypatch, drop)
+    with pytest.raises(ProtocolFloorUnavailable) as refused:
+        floored_http_protocol_class(base=base)
+    message = str(refused.value)
+    assert f"has no {named}" in message, message
+    assert f"uvicorn {uvicorn.__version__}" in message, message
+    assert f"websockets {websockets_version}" in message, message
+
+
+@pytest.mark.parametrize(
+    ("drop", "named"),
+    [
+        ("send_500_response", "synchronous send_500_response method"),
+        ("transport", "transport attribute"),
+        ("write_http_response", "synchronous write_http_response method"),
+    ],
+)
+def test_a_websocket_base_missing_a_hook_is_refused(drop: str, named: str) -> None:
+    with pytest.raises(ProtocolFloorUnavailable) as refused:
+        floored_ws_protocol_class(base=_fake_ws(drop))
+    assert f"has no {named}" in str(refused.value), str(refused.value)
+    assert refused.value.hook == named
+    assert f"uvicorn {uvicorn.__version__}" in str(refused.value)
+
+
+async def _async_hook(self: Any, *args: Any) -> None:
+    pass
+
+
+@pytest.mark.parametrize("hook", ["send_500_response", "write_http_response"])
+def test_a_websocket_hook_that_became_a_coroutine_is_refused(hook: str) -> None:
+    """The floor calls these synchronously. A coroutine in their place would build, then hand the
+    server an unawaited coroutine instead of a written response."""
+    base = type("AsyncHookWebSocketProtocol", (_fake_ws(None),), {hook: _async_hook})
+    with pytest.raises(ProtocolFloorUnavailable, match=f"synchronous {hook} method"):
+        floored_ws_protocol_class(base=base)
+
+
+def test_an_http_400_hook_that_became_a_coroutine_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = type("AsyncHookHTTPProtocol", (_fake_http(monkeypatch, None),), {})
+    base.send_400_response = _async_hook  # type: ignore[attr-defined]
+    with pytest.raises(ProtocolFloorUnavailable, match="synchronous send_400_response method"):
+        floored_http_protocol_class(base=base)
+
+
+def test_a_third_party_base_assigning_transport_does_not_satisfy_the_check() -> None:
+    """websockets' own protocol assigns ``transport`` too. Only the class defining the hook that
+    uses it, or a subclass, counts, so a rename in uvicorn's class is still refused."""
+    third_party = type("ThirdPartyProtocol", (asyncio.Protocol,), {"__init__": _sets_transport})
+    members = {"__module__": _FAKE_MODULE, "__init__": _sets_nothing}
+    members.update(send_500_response=_writes, write_http_response=_writes)
+    base = type("RenamedTransportProtocol", (third_party,), members)
+    with pytest.raises(ProtocolFloorUnavailable, match="transport attribute"):
+        floored_ws_protocol_class(base=base)
+
+
+def _sets_transport_in_a_closure(self: Any) -> None:
+    def assign() -> None:
+        self.transport = None
+
+    assign()
+
+
+def test_an_assignment_moved_into_a_nested_function_still_counts() -> None:
+    """The check reads nested code too, so moving an assignment into a helper closure is not an
+    outage caused by the checker."""
+    members = {"__module__": _FAKE_MODULE, "__init__": _sets_transport_in_a_closure}
+    members.update(send_500_response=_writes, write_http_response=_writes)
+    base = type("ClosureTransportProtocol", (asyncio.Protocol,), members)
+    assert floored_ws_protocol_class(base=base) is not None
+
+
+def test_the_installed_uvicorn_passes_the_check() -> None:
+    """The control that matters for serve: the protocols the lock installs, and the ones
+    ``http="auto"`` and ``ws="auto"`` resolve to, all build."""
+    for base in (HttpToolsProtocol, H11Protocol, None):
+        assert floored_http_protocol_class(base=base) is not None
+    for ws_base in (WebSocketProtocol, None):
+        assert floored_ws_protocol_class(base=ws_base) is not None
+
+
+def test_a_wrapper_over_uvicorns_hook_still_sees_uvicorns_assignments() -> None:
+    """A subclass that wraps the hook, or a class floored twice, must not hide the assignments in
+    uvicorn's own class: the check scans up to the base-most class that defines the hook."""
+
+    class Wrapped(H11Protocol):
+        def send_400_response(self, msg: str) -> None:
+            super().send_400_response(msg)
+
+    assert floored_http_protocol_class(base=Wrapped) is not None
+    assert floored_http_protocol_class(base=floored_http_protocol_class(base=H11Protocol))
+    assert floored_ws_protocol_class(base=floored_ws_protocol_class(base=WebSocketProtocol))
+
+
+def _serve_captured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str = "serve"
+) -> tuple[int, dict[str, Any], set[Path]]:
+    """Run ``command`` against a fixture that starts clean. Returns the exit code, what reached
+    ``uvicorn.run``, and the files the command itself created (a TLS pair, a store)."""
+    from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import (
+        PHI_GATE_PROVISIONS_TOML,
+        make_syslog_ca_and_crl,
+        setenv_verified_log_forwarding,
+    )
+
+    captured: dict[str, Any] = {}
+    monkeypatch.chdir(tmp_path)
+    setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
+    (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    samples = Path(__file__).resolve().parents[1] / "samples" / "config"
+    before = set(tmp_path.rglob("*"))
+    rc = main([command, "--config", str(samples), "--env", "dev"])
+    return rc, captured, set(tmp_path.rglob("*")) - before
+
+
+def test_serve_hands_uvicorn_the_floored_protocols(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the refusal below: the same fixture starts, serves the floor, and creates
+    files, so the refusal's empty set is not a probe that cannot see creation."""
+    rc, captured, created = _serve_captured(tmp_path, monkeypatch)
+    assert rc == 0
+    assert captured["http"].__name__ == "_FlooredHTTPProtocol"
+    assert captured["ws"].__name__ == "_FlooredWebSocketProtocol"
+    assert created, "serve created nothing, so the refusal's empty set would prove nothing"
+
+
+def test_serve_refuses_to_start_when_uvicorn_lacks_a_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "uvicorn.protocols.http.auto.AutoHTTPProtocol",
+        _fake_http(monkeypatch, "send_400_response"),
+    )
+    rc, captured, created = _serve_captured(tmp_path, monkeypatch)
+    assert rc == 2
+    assert captured == {}, "uvicorn.run was reached"
+    assert created == set(), f"serve refused only after a side effect: {created}"
+    err = capsys.readouterr().err
+    assert "send_400_response method" in err and "refusing to start." in err, err
+
+
+def test_supervise_refuses_the_fleet_before_spawning_or_renewing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every shard would refuse, and the supervisor restarts a refused shard at once, so the fleet
+    is refused once, up front, before the shared TLS pair is renewed."""
+
+    def _no_spawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("supervise spawned shards")
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
+    monkeypatch.setattr(
+        "uvicorn.protocols.http.auto.AutoHTTPProtocol",
+        _fake_http(monkeypatch, "send_400_response"),
+    )
+    rc, _, created = _serve_captured(tmp_path, monkeypatch, command="supervise")
+    assert rc == 2
+    assert created == set(), f"supervise refused only after a side effect: {created}"
+    err = capsys.readouterr().err
+    assert "send_400_response method" in err and "refusing to start the fleet" in err, err

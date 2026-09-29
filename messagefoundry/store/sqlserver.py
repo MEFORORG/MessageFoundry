@@ -1173,7 +1173,9 @@ _EPOCH_GUARD_RESOLVE = (
 
 #: Spliced between a fenced resolve's SET list and its WHERE, so the rows the UPDATE touched come back
 #: as a rowset. The fence reads THAT, never ``cursor.rowcount``, which a session-wide
-#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Only present with the guard.
+#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Present with the epoch guard,
+#: and on ``mark_failed``'s retry branch with its status term (ADR 0157 Amendment A), which is NOT a
+#: fence. So the clause alone does not mean a fence is armed.
 _RESOLVE_OUTPUT = " OUTPUT inserted.id"
 
 
@@ -8862,8 +8864,9 @@ class SqlServerStore:
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
-        """See the base contract: returns ``next_attempt_at`` when rescheduled, ``None`` when
-        dead-lettered/missing (the runner arms the per-lane retry wake on a float, WS-C)."""
+        """See the base contract: returns ``next_attempt_at`` on the retry branch, whether or not the
+        row was still INFLIGHT to re-pend, and ``None`` when dead-lettered/missing (the runner arms the
+        per-lane retry wake on a float, WS-C)."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -8887,31 +8890,45 @@ class SqlServerStore:
                         retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                # ADR 0157 C1: guard the DEAD branch ONLY. The retry branch returns the row to
-                # PENDING; fencing THAT would leave it INFLIGHT, turning a permitted duplicate into a
-                # forbidden strand. On the retry branch the suffix is "", so the statement and params
-                # are byte-identical to pre-Inc-3, and checked=False means no result is read.
+                # ADR 0157 C1: the epoch fence guards the DEAD branch ONLY. The retry branch returns
+                # the row to PENDING; fencing THAT would leave it INFLIGHT, turning a permitted
+                # duplicate into a forbidden strand. Amendment A (BACKLOG #2078, #2348) gives the retry
+                # branch a STATUS term instead: it re-pends only a row still INFLIGHT, so a late worker
+                # cannot re-pend a row that is already DONE, DEAD or CANCELLED. A row it declines is not
+                # INFLIGHT, so it cannot strand one. A match is read from the OUTPUT rowset, never from
+                # cursor.rowcount, for the reason _exec_terminal gives.
+                retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    self._resolve_guard() if status == OutboxStatus.DEAD.value else ("", "", ())
+                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    if retrying
+                    else self._resolve_guard()
                 )
-                await self._exec_terminal(
-                    cur,
-                    "mark_failed(dead)",
-                    (outbox_id,),
+                sql = (
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                     + output
                     + " WHERE id=?"
-                    + guard,
-                    (
-                        status,
-                        next_at,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                        now,
-                        outbox_id,
-                        *guard_params,
-                    ),
-                    checked=bool(guard),
+                    + guard
                 )
+                params = (
+                    status,
+                    next_at,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                    *guard_params,
+                )
+                if retrying:
+                    # Not through _exec_terminal: a miss here is a no-op, never a fence. It writes
+                    # nothing, not even the 'failed' event, and still returns the retry time so a row
+                    # something else left PENDING gets its wake.
+                    await cur.execute(sql, params)
+                    if not await cur.fetchall():
+                        await self._commit(conn)
+                        return next_at
+                else:
+                    await self._exec_terminal(
+                        cur, "mark_failed(dead)", (outbox_id,), sql, params, checked=bool(guard)
+                    )
                 await self._event(
                     cur, message_id, event, destination_name, f"attempt {attempts}: {error}", now
                 )
@@ -8939,7 +8956,9 @@ class SqlServerStore:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter."""
+        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
+        On the retry branch a member no longer INFLIGHT is skipped and keeps its own state (ADR 0157
+        Amendment A); the shared retry time still comes back when every member was skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -8968,30 +8987,44 @@ class SqlServerStore:
                 # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
                 # rolls all N back, matching the all-or-nothing contract the docstring promises.
+                # Amendment A, as mark_failed: on the retry branch a member no longer INFLIGHT is
+                # skipped, event and all, and the members still INFLIGHT re-pend together.
+                retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    self._resolve_guard() if status == OutboxStatus.DEAD.value else ("", "", ())
+                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    if retrying
+                    else self._resolve_guard()
                 )
                 present_ids = tuple(member[0] for member in present)
+                sql = (
+                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                    + output
+                    + " WHERE id=?"
+                    + guard
+                )
                 finalize: dict[str, None] = {}
                 for outbox_id, message_id, destination_name, attempts in present:
-                    await self._exec_terminal(
-                        cur,
-                        "mark_batch_failed(dead)",
-                        present_ids,
-                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                        + output
-                        + " WHERE id=?"
-                        + guard,
-                        (
-                            status,
-                            next_at,
-                            self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                            now,
-                            outbox_id,
-                            *guard_params,
-                        ),
-                        checked=bool(guard),
+                    params = (
+                        status,
+                        next_at,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                        *guard_params,
                     )
+                    if retrying:
+                        await cur.execute(sql, params)
+                        if not await cur.fetchall():
+                            continue
+                    else:
+                        await self._exec_terminal(
+                            cur,
+                            "mark_batch_failed(dead)",
+                            present_ids,
+                            sql,
+                            params,
+                            checked=bool(guard),
+                        )
                     await self._event(
                         cur,
                         message_id,

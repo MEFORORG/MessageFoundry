@@ -1482,13 +1482,14 @@ async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> N
         email=None,
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-ops,dc=x"}),
+        directory_object_id="75920276-799f-51a3-9e67-4e4b9c43fd0c",
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(

@@ -18,6 +18,7 @@ import ast
 import base64
 import inspect
 import textwrap
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -57,16 +58,17 @@ def _principal(username: str = "jdoe") -> AdPrincipal:
         email=None,
         dn=f"CN={username},DC=x",
         groups=frozenset({ADMINS}),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, username)),
     )
 
 
 class _FakeLdap:
     """``authenticate`` is the live re-bind ``POST /me/reauth`` makes for a directory account."""
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return _principal(username) if password == AD_PW else None
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return _principal(username)
 
 

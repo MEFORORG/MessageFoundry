@@ -50,7 +50,8 @@ decision 3). Unless you also supply `[api].tls_cert_file`, the hop from the prox
 deploying site's job: a same-host loopback hop, an isolated network segment, or a host firewall. So
 `serve` refuses to start that topology (exit 2) until `[api].plaintext_upstream_hop_acknowledged =
 true` is set. It refuses in **every** mode, under `enforce` or `warn`, on a loopback bind or not. The
-setting records that the operator took the hop on; it secures nothing by itself. With an operator
+setting records that the operator took the hop on; it secures nothing by itself. It is a listed
+loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each start reports it. With an operator
 `tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging and the setting is
 not required. The proxy must then speak https to the engine and trust that certificate, or every
 request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
@@ -729,10 +730,15 @@ tuple: they act only on the caller's own account.
 > principal whose identifier disagrees with the row holding its username is refused rather than handed
 > that row. A recycled name gets a new account with a new `user_id`.
 >
-> **One residual, and it is the honest limit of the control.** A directory that returns no immutable
-> identifier at all still resolves by username; the engine cannot key on an identifier it is never
-> given. The engine warns once per distinct cause -- the attribute absent, or present in a shape it
-> cannot read -- so a site on that path is told rather than left to assume the control is running.
+> **A directory that returns no immutable identifier signs nobody in (BACKLOG #2027).** It used to
+> resolve by username, which left the recycle open on that path. A Windows SSO sign-in whose
+> principal carries no `objectGUID` is now refused as `directory_object_id_missing`, and so is an AD
+> step-up re-bind on a row with none; neither refusal counts toward the lockout. The re-bind binds
+> the entry its search finds by the row's `objectGUID`, never by the name. The engine warns once per
+> distinct cause -- the attribute absent, or present in a shape it cannot read -- so a site on that
+> path learns why its sign-ins fail. **At least two readers still ask about an id-less row by its
+> name:** the session reconciler, and `verify_mfa`'s directory check on a row with no federated
+> binding. A directory that reissued the name answers for its new holder there.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
@@ -1348,8 +1354,9 @@ Without this, an account disabled in the directory would keep renewing its windo
 until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as
 fresh as that pass, which runs every `[auth].ad_session_recheck_seconds` (300 s by default) and
 revokes after `[auth].ad_session_recheck_strikes` refusals in a row (2 by default). An id-less row
-with no binding is still looked up by name, as the reconciler and the Windows SSO sign-in look it
-up; a name is the weaker key, since a directory can reissue it.
+with no binding is still looked up by name, as the reconciler looks it up; a name is the weaker key,
+since a directory can reissue it. The Windows SSO sign-in and the password step-up refuse such a row
+instead (BACKLOG #2027).
 
 **This check fails closed, which is the opposite of the reconciler, and the cost is availability.**
 The reconciler revokes, so it fails open on an unreachable directory and waits for repeated answers
@@ -1573,7 +1580,8 @@ row written before `sessions.auth_mechanism` existed. An OIDC session never reac
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
 **rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
-opt-out**: when the API is bound **off-loopback** with `require_mfa` *turned off*, `serve` makes the
+opt-out**: when the instance is **exposed** (an off-loopback bind, or a declared TLS-terminating
+proxy, `[api].tls_terminated_upstream`) with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** under `[security].enforcement = enforce`, the
 default in every environment, and **warns** otherwise or where
 `[security].allow_single_factor_admin_when_exposed` is set, mirroring the keyless-store and
@@ -1586,12 +1594,22 @@ holder enrols an engine factor to get past the gate. An earlier revision of this
 Under the shipped `[security] require_mfa_scope = "every_local_account"` it covers **every** account
 — the value's name is narrower than its behaviour — every local administrator, any service account, and every
 directory principal. A non-interactive bearer-token account becomes MFA-pending and cannot enrol
-unattended. **That is a decision a deploying site must make before first start:** either such an
-account moves to the mTLS service-identity plane, or the scope is set to `administrators`. Making it
-an AD principal is **no longer** an escape. An operator who opts out at
-exposure re-enables `[security].require_mfa = true` (or keeps the bind on loopback).
-[CONFIGURATION.md](CONFIGURATION.md) `[security].require_mfa_scope` is the authority on the two
-remedies and on why mTLS is not a third.
+unattended. **That is a decision a deploying site must make before first start**, and two settings
+answer it, each with a limit. Setting the scope to `administrators` frees only a **local** account
+that does not hold the Administrator role. The Administrator role stays in scope under either value
+(`AuthService._mfa_required_for`), and a directory session that proved no factor stays MFA-pending
+under both (`AuthService._unverified_session_owes_factor`). Setting `[security].require_mfa = false`
+frees any account that has not enrolled a factor, whatever its role, at the cost of the exposure
+gate named earlier in this paragraph: on an exposed instance `serve` refuses to start under
+`enforce` unless `allow_single_factor_admin_when_exposed` is set. An account that has enrolled a
+factor still owes it under either setting; an OIDC sign-in meets it while
+`[auth].oidc_require_mfa_claim` is on, the default. Making the account an AD principal is **no
+longer** an escape. Nor is the mTLS service-identity plane: a certificate identity is admitted on one route only,
+`GET /service/identity`, so it cannot carry a working service account (the mTLS row of the pathway
+table below). An operator who opts out at exposure re-enables `[security].require_mfa = true`, or
+keeps the instance unexposed: a loopback bind with no declared TLS-terminating proxy.
+[CONFIGURATION.md](CONFIGURATION.md) `[security].require_mfa_scope` is the authority on both
+remedies and on why neither AD nor mTLS is a third.
 
 ### Administrative-interface defense-in-depth (WP-L3-13, ASVS 8.4.2)
 
@@ -2532,7 +2550,7 @@ list, which admits any certificate its CA ever signed.
 
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
-| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled; the second-step lock refuses both, and the second step. Each lock doubles per cycle up to `lockout_max_minutes` where the owner has that way past it + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
+| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled; the second-step lock refuses both, and the second step. The second-step lock doubles per cycle up to `lockout_max_minutes` on every local account, and the sign-in lock does so only on a local account with TOTP enrolled; every other lock keeps `lockout_minutes` + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
 | **AD** (LDAP simple-bind, LDAPS by default) — **step-up re-authentication only; the sign-in was retired** | password, verified by a bind **as the user** against the DC. It no longer mints a session: `POST /auth/login` with `provider=ad` is refused and audited, and the bind survives only at `POST /me/reauth` and the console's `POST /ui/reauth`, where it re-proves a session **Kerberos** minted. An `oidc` session never reaches the bind: `reauth()` refuses it before any verify and it steps up at the IdP (the OIDC row). The one other session it can reach is a row written before `sessions.auth_mechanism` existed, which reads NULL and takes this leg for an AD account. So this row carries no MFA grant of its own — the session's MFA state was decided at its own sign-in. The delegated-directory relaxation it used to carry is **retired** (BACKLOG #1144): no pathway grants MFA satisfaction on a directory assertion the engine cannot read | the **directory's** lockout/complexity policy; engine-side, a **per-actor** step-up budget, **not** the sign-in limiter — the bind is post-session, so an unauthenticated flood cannot reach it — plus the **engine** per-account lockout, which a rejected re-bind feeds (BACKLOG #1138), and a per-session cap: the session whose re-binds reach `lockout_threshold` rejections is revoked, so it sends the DC at most that many. `[auth].login_rate_limit_enabled=false` removes the per-actor budget too, because that flag builds neither limiter. The lockout feed and the per-session cap survive it, so the flag does not strip this pathway bare. The engine lock sets the engine's own row and is enforced at the Kerberos and OIDC sign-ins, not at the re-bind. It never writes a lock to the directory account, but each rejected re-bind still reaches the DC, so the domain's own lockout policy can lock the domain account too | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind, and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
 | **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves the ticket leg with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way). An enrolled engine TOTP or recovery code still feeds the per-account lockout, and a locked account row refuses this sign-in (BACKLOG #1638) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. Both legs (`GET /ui/sso` and the JSON `POST /auth/negotiate`) mint with no step-up window, so a sensitive action forces a step-up unless a TOTP or recovery code proved at the MFA gate has already stamped one. That step-up is the **AD** row's directory re-bind, at `POST /me/reauth` or `POST /ui/reauth` |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess on the federated leg, so that leg feeds no per-account lockout, though a lock another leg set on the account row refuses this sign-in (BACKLOG #1638); both legs (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) charge the sign-in window, and so does `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) (`[auth].login_rate_limit_enabled`, default on — **off leaves the federated leg with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout. The **step-up leg** checks no engine credential either, so a refused IdP step-up feeds no lockout and no per-session re-proof cap, and neither account lock refuses it. Its start, `POST /ui/reauth/oidc`, draws the per-actor ceremony budget, and the IdP's return to `GET /ui/oidc/callback` draws the sign-in window | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184). The session's absolute lifetime is capped at the verified `id_token.exp` and at `auth_time + [auth].oidc_max_age_seconds`; minted with no step-up window. **Its step-up goes back to the IdP and never to a password** (BACKLOG #296, ADR 0142 Amendment B). `POST /ui/reauth/oidc` sends the browser to the IdP with `max_age=0` and `prompt=login`, and `complete_oidc_step_up` elevates the session only when, among other checks, the new `auth_time` is no earlier than the moment the flow was staged, less `oidc_clock_skew_seconds`, and the verified (issuer, sub) pair is still the account's. It then stamps `reauth_at`, rotates the session, and mints the action-bound grant when the action the operator started from takes one and the session is not refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action). Console only: `POST /me/reauth` refuses an `oidc` session, and the JSON plane has no federated step-up |

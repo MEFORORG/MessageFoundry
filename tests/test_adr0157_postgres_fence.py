@@ -278,7 +278,47 @@ async def test_mark_failed_dead_branch_fenced_retry_branch_lands(store) -> None:
     next_at = await store.mark_failed(claimed_b.id, "transient", RetryPolicy(max_attempts=None))
     assert isinstance(next_at, float)  # rescheduled, not dead-lettered
     assert (await store.outbox_for(mid_b))[0]["status"] == OutboxStatus.PENDING.value
-    assert store.fenced_writes == 1  # UNCHANGED — the retry branch is never inspected
+    assert store.fenced_writes == 1  # UNCHANGED — the retry branch is never fenced
+
+
+async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(store) -> None:
+    """ADR 0157 Amendment A (BACKLOG #2078, #2348): #2078's own interleaving. The ex-leader claims
+    under epoch 5, stalls, and is superseded; the successor delivers the row. The ex-leader's send then
+    fails and it calls ``mark_failed`` on the retry branch. The status term must leave the row DONE and
+    write no ``failed`` event on the PROCESSED message, and the call still returns the retry time.
+
+    Mutation that must break it: drop the retry branch's status term, and the row goes back to
+    PENDING and is sent a second time."""
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    claimed = await _claim_one(store)
+    await _superseded(store)
+    store.set_leader_epoch(6, lease_key=_LEASE_KEY)  # act as the successor for one write
+    await store.mark_done(claimed.id)
+    store.set_leader_epoch(5, lease_key=_LEASE_KEY)  # back to the stale ex-leader
+
+    next_at = await store.mark_failed(claimed.id, "late", RetryPolicy(max_attempts=None))
+
+    assert isinstance(next_at, float)
+    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    assert "failed" not in await _events(store, mid)
+    assert store.fenced_writes == 0  # a status miss is a no-op, never a fence
+
+    # The batch twin, with one member finished and one still INFLIGHT: only the INFLIGHT one moves.
+    mid2 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB2", "p"), ("OB3", "p")], now=100.0
+    )
+    a = await _claim_one(store, "OB2")
+    b = await _claim_one(store, "OB3")
+    await store.mark_done(a.id)
+    assert isinstance(
+        await store.mark_batch_failed([a.id, b.id], "late", RetryPolicy(max_attempts=None)), float
+    )
+    statuses = {r["destination_name"]: r["status"] for r in await store.outbox_for(mid2)}
+    assert statuses == {"OB2": OutboxStatus.DONE.value, "OB3": OutboxStatus.PENDING.value}
+    assert (await _events(store, mid2)).count("failed") == 1
 
 
 async def test_repend_writes_land_under_a_bumped_epoch(store) -> None:

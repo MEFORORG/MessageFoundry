@@ -264,6 +264,7 @@ from messagefoundry.config.secretprovider import (
 from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
+    ApiSettings,
     ApprovalsSettings,
     AuthSettings,
     BackupSettings,
@@ -409,7 +410,9 @@ _NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/upload
 #: reason they were missed: the control above is keyed to the PHI-read families, so sensitivity that
 #: arrives under a different permission falls outside it. ``connection_event.reason`` and
 #: ``alert_instance.reason`` are both **PL-2** free text (§2 of ``docs/PHI.md``), so these responses
-#: were served with no cache directive at all.
+#: were served with no cache directive at all. Not every member projects a stored column:
+#: ``/connections`` and its metadata route carry a live field ``docs/PHI.md`` rates in prose, and
+#: ``/security/posture`` is here for the reason its own comment gives.
 #:
 #: TEMPLATES, because ``/connections/{name}/events`` cannot be written as a prefix without blanketing
 #: the whole ``/connections`` dashboard family — most of which returns no classified column. The
@@ -432,6 +435,13 @@ _NO_STORE_ROUTE_PATHS = frozenset(
         "/alerts/{alert_id}/resolve",
         "/alerts/{alert_id}/suspend",
         "/alerts/{alert_id}/resume",
+        # The dashboard row and the metadata view both carry a live ``error`` string: why the
+        # connection failed to start (ADR 0031) or why the DR run-profile parked it (ADR 0048).
+        # docs/PHI.md section 2 rates both fields (BACKLOG #1185). EXACT templates on purpose: a
+        # ``/connections`` prefix would also stamp the start/stop/restart/flag POSTs, which return no
+        # rated field.
+        "/connections",
+        "/connections/{name}/metadata",
         # Not a PL-rated column: the static-credential inventory (BACKLOG #1182) names every backend
         # hop on a weak credential and its peer, a map worth keeping out of a browser or proxy cache.
         # Set here, not in the route, because the web console calls the route's handler directly.
@@ -2156,6 +2166,10 @@ def create_app(
         secret_rotation_settings = (
             getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
         )
+        # BACKLOG #1179: [api] carries the plaintext upstream-hop acknowledgement. Read off the
+        # resolved settings serve stashed, the #1989 object; an app built without them (the
+        # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
+        api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
         # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
         # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
         # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
@@ -2202,6 +2216,7 @@ def create_app(
                 unverified_db_hops=db_hops,
                 attested_hops=attested_hops,
                 revocation_attested_hops=revocation_hops,
+                api=api_settings,
                 store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -3088,9 +3103,12 @@ def create_app(
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
     ) -> list[ConnectionEventInfo]:
-        """The Corepoint-style connection/transport event log (#46), newest first — **metadata only,
-        no PHI**, so it is gated by ``monitoring:read`` (not the PHI-read tier). Optionally filtered by
-        ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp."""
+        """The Corepoint-style connection/transport event log (#46), newest first. Optionally filtered
+        by ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp.
+
+        Not PHI-free: ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives it a
+        protection level. It is gated by ``monitoring:read`` rather than a PHI permission, and the
+        response is served ``no-store`` (``_NO_STORE_ROUTE_PATHS``)."""
         # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
         # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
         if connection is not None and not identity.can_access_channel(connection):
@@ -3154,9 +3172,11 @@ def create_app(
         identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
         limit: int = Query(200, ge=1, le=1000),
     ) -> AlertInstanceList:
-        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen`` first —
-        **metadata only, no PHI**. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the
-        ack/resolve tier), with the same per-channel RBAC scope as ``GET /events``.
+        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen``
+        first. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the ack/resolve tier),
+        with the same per-channel RBAC scope as ``GET /events``. Not PHI-free: ``reason`` is scrubbed
+        free text, ``docs/PHI.md`` section 2 gives it a protection level, and the response is served
+        ``no-store`` (``_NO_STORE_ROUTE_PATHS``).
 
         ``total``/``worst_severity`` aggregate EVERY active instance in that scope, not this page of
         them. One ``allowed_channels`` value feeds both reads, so the aggregate is scoped identically
@@ -4244,12 +4264,14 @@ def create_app(
         # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
         # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
-        # OPENING ONE MESSAGE IS THE REVEAL ACT (ASVS 14.2.6). The list and search surfaces mask the
-        # summary, because those are where complete identifiers could be read off a screen opened for
-        # another reason. This route is a deliberate, per-message, already-audited open — record_view
-        # above plus the tamper-evident audit chain — so it is the specific act that lifts the mask,
-        # and it lifts it for THIS message only. The reveal is a call argument with nowhere to live
-        # between calls, so it cannot become a session-wide toggle by accident.
+        # OPENING ONE MESSAGE IS NOT THE REVEAL ACT under the strict reading of ASVS 14.2.6 ("unless
+        # the user specifically views it"), which BACKLOG #1187 adopts. The list and search surfaces
+        # mask the summary; this route lifts that mask for THIS message on every open, and it also
+        # returns the raw body. Many opens are not aimed at the summary or the body at all: the
+        # dead-letter "view" link, the redirect after a replay, a direct URL. So this unmask is the
+        # shipped behaviour and a recorded gap, not the control the verb asks for. What it does keep:
+        # the unmask is a call argument with nowhere to live between calls, so it cannot become a
+        # session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
         detail = redact_unauthorized(
@@ -4749,11 +4771,9 @@ def create_app(
         principal whose id disagrees with the row holding its username is refused rather than handed
         the row. A recycled name therefore gets a new ``user_id``, which is what this check needs.
 
-        **The residual, stated because it is what a reader would otherwise assume away:** a directory
-        that returns no immutable identifier at all still resolves by name, because the engine cannot
-        key on an identifier it is not given. The LDAP layer warns once per distinct cause -- absent
-        as well as unreadable -- so a site on that path is told, rather than left to assume a control
-        is running for it.
+        **A directory that returns no immutable identifier signs nobody in** (BACKLOG #2027): a
+        principal with no id is refused rather than resolved by name. The LDAP layer warns once per
+        distinct cause -- absent as well as unreadable -- so a site on that path learns why.
 
         The channel axis is deliberately NOT used, and ONE of its two original reasons has since
         expired. The surviving one is decisive on its own: an uploaded file carries no channel at

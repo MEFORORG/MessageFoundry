@@ -34,12 +34,12 @@ The old gate-shaped arm is KEPT as a second disjunct. It costs nothing, and it s
 read that no model walk can see -- ``GET /messages/{message_id}/attachments/{attachment_id}`` streams
 raw bytes and declares no ``response_model`` at all.
 
-**Two rulings this module deliberately does NOT make**, both recorded as open questions on BACKLOG
-#1185. First, the route and model docstrings say "metadata only, no PHI" while ``docs/PHI.md`` rates
-their ``reason`` column PL-2; one of the two is wrong and the ASVS cell rests on which. This file is
-built as though PL-2 is correct, because PL-2 is the shipped classification. Second, whether
-"sensitive data" in the 14.2.2 verb tracks the PHI PERMISSION or the PHI CLASSIFICATION is unsettled.
-This guard makes the classification-shaped reading buildable and asserts nothing about the other.
+**Three rulings this module once left open are settled** (Manager decisions of 2026-09-24 on BACKLOG
+#1185). First, ``docs/PHI.md`` wins over the "metadata only, no PHI" docstrings, which were corrected to
+point at it. Second, "sensitive data" in the 14.2.2 verb tracks the CLASSIFICATION, not the permission,
+which is the predicate this module already uses. Third, the live ``ConnectionRow.error`` and
+``ConnectionMetadata.error`` fields take a stored column's rating. ``docs/PHI.md`` section 2 states
+which column and why, in prose, and the register below binds both fields to it.
 """
 
 from __future__ import annotations
@@ -113,8 +113,9 @@ def _classified_columns() -> dict[str, str]:
 #:
 #: ``None`` is a statement about PROVENANCE, not about sensitivity. It says the value is composed in
 #: the route body from live engine state, so no section 2 row rates it -- it does NOT assert the value
-#: is harmless. Two entries below are live free-text diagnostics shaped very like their persisted
-#: twin, and they are recorded as an open question on BACKLOG #1185 rather than ruled here.
+#: is harmless. A live field CAN be bound to a column when ``docs/PHI.md`` rates it with that column:
+#: the two ``error`` entries below are the case, and :func:`test_the_live_error_fields_are_rated_in_prose`
+#: holds the doc to that.
 #:
 #: The register exists because a bare COLUMN NAME is ambiguous across tables: ``detail`` is PL-2 as
 #: ``message_events.detail`` and PL-4 as ``audit_log.detail``. Matching on the name alone selected 34
@@ -171,12 +172,11 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     ("StaticCredentialHopView", "detail"): None,
     ("AiPolicy", "reason"): None,  # why the AI policy clamped, derived from config
     ("ConnectionMetadata", "metadata"): None,  # the operator's own connections.toml label table
-    # OPEN QUESTION, recorded on BACKLOG #1185 and deliberately NOT ruled here. These two carry a
-    # connector's start-failure string from the RegistryRunner (ADR 0031) -- live engine state, so no
-    # section 2 row rates them. Their persisted twin, connection_event.reason, IS rated PL-2. Whether
-    # the live string deserves the same rating is a classification ruling for the owner.
-    ("ConnectionRow", "error"): None,
-    ("ConnectionMetadata", "error"): None,
+    # --- live fields rated with a stored twin (BACKLOG #1185, Manager decision 2026-09-24) ----------
+    # Live engine state, so no section 2 ROW names them. Section 2's prose rates each FIELD with its
+    # stored twin and says why that column is the twin.
+    ("ConnectionRow", "error"): "alert_instance.reason",
+    ("ConnectionMetadata", "error"): "alert_instance.reason",
 }
 
 
@@ -330,6 +330,10 @@ _EXPECTED_CLASSIFIED_ONLY = frozenset(
         "/alerts/{alert_id}/resolve",
         "/alerts/{alert_id}/suspend",
         "/alerts/{alert_id}/resume",
+        # The two live ``error`` fields (BACKLOG #1185). Exact templates: the start/stop/restart/flag
+        # POSTs under /connections/{name}/ return no rated field and must stay unstamped.
+        "/connections",
+        "/connections/{name}/metadata",
     }
 )
 
@@ -388,6 +392,31 @@ def test_the_two_phi_md_parsers_agree() -> None:
     assert shared, "the two parsers now share no keys at all -- one of them has stopped working"
     disagree = {k: (mine[k], theirs[k]) for k in shared if mine[k] != theirs[k]}
     assert disagree == {}, f"the two docs/PHI.md section 2 parsers disagree: {disagree}"
+
+
+def test_the_live_error_fields_are_rated_in_prose() -> None:
+    """The register binds ``ConnectionRow.error`` and ``ConnectionMetadata.error`` to a STORED column.
+    That binding is only honest while ``docs/PHI.md`` section 2 says so, and the table cannot: it
+    lists stored columns. So one prose paragraph must name both fields, the column the register binds
+    them to, and that column's level. Deleting the paragraph, re-binding the fields, or re-rating the
+    column without updating the prose reds here. The wording itself is free to change."""
+    # One paragraph of section 2 prose: table rows out, then split on blank lines.
+    prose = "\n".join(line for line in _section(2).splitlines() if not line.strip().startswith("|"))
+    paragraphs = [" ".join(p.split()) for p in re.split(r"\n\s*\n", prose)]
+    fields = ("`ConnectionRow.error`", "`ConnectionMetadata.error`")
+    rating = [p for p in paragraphs if all(f in p for f in fields)]
+    assert len(rating) == 1, (
+        f"expected one section 2 paragraph rating both fields, got {len(rating)}"
+    )
+    columns = {
+        _RESPONSE_FIELD_COLUMN[(m, "error")] for m in ("ConnectionRow", "ConnectionMetadata")
+    }
+    assert len(columns) == 1 and None not in columns, columns
+    (column,) = columns
+    assert column is not None
+    level = _classified_columns()[column]
+    assert f"`{column}`" in rating[0], f"the rating paragraph no longer names {column}"
+    assert level in rating[0], f"the rating paragraph no longer states {level}"
 
 
 def test_every_bound_column_is_classified_in_phi_md() -> None:
@@ -549,7 +578,7 @@ def test_the_hop_probe_reads_the_call_not_a_mention(app: FastAPI) -> None:
 
 def test_the_classification_arm_selects_what_only_it_can_see(app: FastAPI) -> None:
     """The other half of the non-vacuity pair, and the one that matters for BACKLOG #1185: these
-    seven are invisible to the gate arm, so if the classification arm goes quiet nothing else here
+    nine are invisible to the gate arm, so if the classification arm goes quiet nothing else here
     would notice."""
     selected = {
         r.path
@@ -604,3 +633,24 @@ async def test_no_store_is_not_blanket(client: httpx.AsyncClient) -> None:
     cacheable-by-default, which is what keeps the header a meaningful signal where it IS set."""
     for path in ("/health", "/status"):
         assert (await client.get(path)).headers.get("cache-control") is None
+
+
+async def test_the_connections_templates_are_exact_not_a_prefix(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    """``/connections`` is in the covered set as an exact TEMPLATE. The start POST under it returns
+    no rated field, so it must stay unstamped; a stamp here would mean the set had turned into a
+    prefix. The positive half is the wire test above, which drives both GETs.
+
+    The route is looked up first. Both a live route with an unknown name and a deleted route answer
+    404, so the status alone cannot show this probe reached the route it is about."""
+    start = [
+        r
+        for r in app.routes
+        if isinstance(r, APIRoute)
+        and r.path == "/connections/{name}/start"
+        and "POST" in (r.methods or set())
+    ]
+    assert len(start) == 1, "the start route moved; re-point this negative control"
+    resp = await client.post("/connections/x/start")
+    assert resp.headers.get("cache-control") is None
