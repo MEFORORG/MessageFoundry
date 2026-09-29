@@ -2843,7 +2843,10 @@ def _serve(args: argparse.Namespace) -> int:
     # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
     # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
-    # never trips this.
+    # never trips this. The hop here is NOT cleartext: the non-loopback gate above has already
+    # refused every arm but the warn path, so this fires only with no operator certificate and no
+    # declared proxy, where the engine would serve https on the minted placeholder (ADR 0172). The
+    # message says that, rather than "without TLS" (BACKLOG #1672).
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
     # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
     #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
@@ -2870,11 +2873,14 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
-            f"non-loopback host {settings.api.host!r} without TLS. The /ui surface requires "
-            "in-process TLS ([api].tls_cert_file) or a declared TLS-terminating proxy "
-            "([api].tls_terminated_upstream + trusted_proxies); --allow-insecure-bind does not cover "
-            "it. Set [security].listen_address to a loopback address (127.0.0.1) for local-only "
-            "access, or configure TLS.",
+            f"non-loopback host {settings.api.host!r} without an operator certificate or a "
+            "declared TLS-terminating proxy. The only certificate available is the engine's "
+            "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
+            "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
+            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies); "
+            "--allow-insecure-bind does not cover it, and neither does "
+            "[security].require_encryption_for_remote=false. Set [security].listen_address to a loopback "
+            "address (127.0.0.1) for local-only access, or configure one of those two.",
             file=sys.stderr,
         )
         return 2
@@ -3009,12 +3015,28 @@ def _serve(args: argparse.Namespace) -> int:
     # 2026-08-17: a warning earns nothing by itself). It reports an operator's explicit choice; it does
     # not gate, refuse, or re-enable anything. Imported from the console package root rather than its
     # private `_auth` module, and reached only when serve_ui survived the find_spec gate above, so the
-    # wheel is present by construction.
+    # wheel is PRESENT by construction. Present is not importable (BACKLOG #1907): an older console
+    # lacks these names, or its own import chain fails against this engine. This is the FIRST import
+    # of the console on the serve path, after the provenance gate above and before create_app's
+    # assert_engine_seam. Uncaught, a failure here would reach main()'s last-resort catch (BACKLOG
+    # #1863): exit 1 and one generic redacted log line that never names the console or the seam.
+    # Refuse here instead, exit 2, naming the seam and the installed version. The exception text is
+    # rendered through safe_exc, as that catch would render it. A console that imports cleanly but
+    # speaks another seam still fails at create_app's assert_engine_seam; that path is unchanged.
     if settings.api.serve_ui:
-        from messagefoundry_webconsole import (
-            BROWSER_HARDENING_OPT_OUT_ENV,
-            browser_hardening_enabled,
-        )
+        try:
+            from messagefoundry_webconsole import (
+                BROWSER_HARDENING_OPT_OUT_ENV,
+                browser_hardening_enabled,
+            )
+        except ImportError as exc:
+            from messagefoundry.api._webconsole_import import console_import_failure
+
+            print(
+                f"error: refusing to mount the web console: {console_import_failure(exc)}",
+                file=sys.stderr,
+            )
+            return 2
 
         if not browser_hardening_enabled():
             print(

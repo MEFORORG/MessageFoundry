@@ -271,6 +271,12 @@ class MonitorPanel(QWidget):
             self._set_status(str(exc), error=True)
             return
         if not self._ensure_auth(client):
+            # A must-change sign-in leaves the client holding a session it will never use. End it
+            # before dropping the client, or it stays live until it expires (BACKLOG #2091). The
+            # engine lets a must-change session reach /auth/logout.
+            if client.token is not None:
+                with contextlib.suppress(ApiError):
+                    client.logout()
             client.close()
             return
 

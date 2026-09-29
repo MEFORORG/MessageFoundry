@@ -1570,8 +1570,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the NEWEST
         # `limit` rows and nothing older, which is not the full trail and must not be described as one
         # (BACKLOG #1743): this wrapper takes no offset because the store's list_audit has none, so
-        # there is no second page to reach and no total to compare against. Filter + CSV export are the
-        # JSON GET /audit surface, and the export is what produces a complete record. AUDIT_READ is
+        # there is no second page to reach and no total to compare against. The filters are on GET
+        # /audit and the CSV is GET /audit/export, which is capped too (its own `limit`, no offset),
+        # so it does not hold the whole trail either. AUDIT_READ is
         # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
         # dependency of its own. The identity it is handed is the page's caller, and it decides which
         # rows that caller may read (BACKLOG #1131).
