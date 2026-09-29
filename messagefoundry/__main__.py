@@ -4986,8 +4986,9 @@ def _cert(args: argparse.Namespace) -> int:
 def _cert_import(args: argparse.Namespace) -> int:
     """`cert import` — import a PKCS#12/.pfx bundle into the PEM files the TLS loaders read.
 
-    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD`` (absent/empty ⇒ an unencrypted bundle,
-    ``password=None``); it is never a CLI arg and never echoed. A bad password / malformed bundle is
+    The bundle passphrase comes ONLY from ``MEFOR_PFX_PASSWORD`` (absent or empty means ``password=None``,
+    which only an unencrypted bundle with no MAC can use, BACKLOG #1352); it is never a CLI arg and
+    never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
     public; key.pem is written ``O_EXCL`` + ``0o600`` + ``_secure_file`` and refuses to overwrite."""
     import os

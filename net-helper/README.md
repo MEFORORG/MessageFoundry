@@ -82,8 +82,13 @@ steps below, and [`uninstall-net-helper.ps1`](../scripts/service/uninstall-net-h
 registration back off. Run both from an elevated PowerShell.
 
 ```powershell
-.\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -NssmPath C:\tools\nssm.exe
+.\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -HelperSha256 <SHA-256> -NssmPath C:\tools\nssm.exe
 ```
+
+`-HelperSha256` is required. It is the SHA-256 of the `mefor-net-helper.exe` you are installing, taken
+from the build that made it: the `net-helper` workflow's job summary, or `Get-FileHash` over your own
+`dotnet publish` output. The script refuses a binary that does not match, before and after it copies
+it, because it starts that binary as LocalSystem.
 
 It does three things the manual steps leave to you.
 
@@ -99,9 +104,10 @@ It does three things the manual steps leave to you.
   asks of you: it says nothing about the files already in the folder, or about the parent it
   inherits from. Pass `-AllowBroadAcl` to install anyway.
 
-It does not download NSSM. The pinned archive and its SHA-256 live in `install-service.ps1`, and a
-second copy of that pin would be a second thing to keep current, so steps 1 to 4 of
-[Prepare the files once](#prepare-the-files-once-on-any-machine) are still yours to run. Skip that
+It does not download NSSM. The pinned archive and its SHA-256 live in `install-service.ps1`, so
+steps 1 to 4 of [Prepare the files once](#prepare-the-files-once-on-any-machine) are still yours to
+run. It does check the `nssm.exe` you give it against the SHA-256 of the `win64` binary in that
+archive, and refuses a copy that does not match. Skip that
 section's steps 5 and 6: the script writes its own `mefor-net-helper.conf` into `-InstallDir` from
 the engine, and never reads the one you would copy from the example.
 

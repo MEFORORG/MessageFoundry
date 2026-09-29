@@ -33,10 +33,17 @@ venv interpreter) and the per-connection firewall openings the service needs.
    .venv\Scripts\python.exe -m pip install -e . --no-deps
    ```
    `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
-2. **NSSM** — provisioned automatically. If `nssm.exe` isn't on `PATH` (or passed via
-   `-NssmPath`), `install-service.ps1` downloads the pinned, SHA‑256‑verified release into
-   `<DataDir>\bin\nssm.exe` and uses it. No manual install needed. (You can still pre-install it
-   — `choco install nssm` or a download from <https://nssm.cc> — and it'll be used if found.)
+2. **NSSM** — provisioned automatically. `install-service.ps1` keeps the `nssm.exe` the service
+   runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
+   anyone but administrators can write to or owns, because it runs that file as administrator. It
+   fills the folder from `-NssmPath`, from an `nssm` on `PATH`, or by downloading the pinned,
+   SHA‑256‑verified release. No manual install needed.
+   A copy you already have is used only if its SHA-256 matches the pinned win64 `nssm.exe` from
+   NSSM 2.24. The installer refuses a `-NssmPath` copy that does not match, and names both hashes.
+   A copy on `PATH` that does not match is skipped with a warning, and the installer downloads the
+   pinned release instead. A package manager's `nssm` may be a different build, so it may be
+   skipped this way. On a host with no internet access, pass `-NssmPath` with the win64 `nssm.exe`
+   from `nssm-2.24.zip`. The uninstaller runs no `nssm.exe` at all.
 3. **An elevated PowerShell** (Run as Administrator) — required to register a service.
    `messagefoundry service install --env <name>` elevates for you (a UAC prompt) and runs the
    install script below in a visible window so you can read its output.
@@ -158,7 +165,7 @@ service keeps the code it loaded **at process start**. To pick up new code (a pu
 switch, a merge), just **restart** it (elevated):
 
 ```powershell
-& C:\ProgramData\MessageFoundry\bin\nssm.exe restart MessageFoundry
+Restart-Service MessageFoundry
 curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
@@ -169,7 +176,7 @@ definition drifted — the install script is idempotent (it stops and reconfigur
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod   # elevated; re-points the exe + AppParameters
-& C:\ProgramData\MessageFoundry\bin\nssm.exe start MessageFoundry
+Start-Service MessageFoundry
 ```
 
 If the package was installed **non-editable** (a plain `pip install .`), the venv holds a
@@ -188,15 +195,18 @@ snapshot of the old code — run `.venv\Scripts\python.exe -m pip install -e .` 
 ## Start / stop / status
 
 ```powershell
-nssm start  MessageFoundry
-nssm status MessageFoundry
-nssm stop   MessageFoundry      # Ctrl+C -> graceful connection shutdown (up to 15s)
-nssm restart MessageFoundry
+Start-Service   MessageFoundry
+Get-Service     MessageFoundry
+Stop-Service    MessageFoundry   # NSSM answers with Ctrl+C -> graceful connection shutdown (up to 15s)
+Restart-Service MessageFoundry
 ```
 
-If `nssm` isn't on `PATH`, it's the auto-downloaded copy at `<DataDir>\bin\nssm.exe`
-(e.g. `C:\ProgramData\MessageFoundry\bin\nssm.exe`). You can also use the built-in
-`sc.exe` / Services.msc once installed.
+Run them from an elevated prompt. `nssm start`, `nssm stop` and `nssm restart` send the same
+request, and Services.msc or `sc.exe` work too. The service's own `nssm.exe` is in
+`C:\Program Files\MessageFoundry\nssm` (the installer's `-NssmDir`). For a command only NSSM has,
+such as `nssm set`, run that copy. The installer checked its hash and keeps it where only
+administrators can write ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8). An
+`nssm` found anywhere else is a copy nothing has checked.
 
 For a one-click desktop alternative to these commands — engine status at a glance plus
 start/stop/restart, the console, and the log from the notification area — run the
@@ -270,7 +280,8 @@ PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI
 The key is a base64 32-byte secret. Two ways to supply it:
 
 - **Environment (cross-platform default).** Set `MEFOR_STORE_ENCRYPTION_KEY` in the service's
-  environment (`nssm set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`). Simple,
+  environment (`& "C:\Program Files\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`,
+  the copy the installer checked; see [Start / stop / status](#start--stop--status)). Simple,
   but the plaintext key sits in the service environment block, readable by any local administrator.
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
@@ -631,16 +642,18 @@ host-wide — coordinate with whatever else the box runs.
 .\scripts\service\uninstall-service.ps1
 ```
 
-This stops the service and removes its registration. **It does not return the host to its
+This stops the service through Windows and removes its registration with `sc.exe`. It runs no
+`nssm.exe`, so there is no copy for it to trust. **It does not return the host to its
 pre-install state.** The script reads the host before it removes the registration, then prints an
 inventory of what is still there and the command that clears each one. Read that inventory; the
 list below says what it covers.
 
 | Left behind | Why | Clear it with |
 |---|---|---|
-| The `DataDir` tree — logs, message store, and `bin\nssm.exe` if the installer downloaded it | Your data, and the NSSM binary the uninstall just used | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
+| The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
+| The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself only when no other service installed with the same `-NssmDir` remains and you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
-| The `SeServiceLogonRight` ("Log on as a service") grant | NSSM's `ObjectName` does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
+| The `SeServiceLogonRight` ("Log on as a service") grant | Setting the service's run-as account does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
 | Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
 
@@ -673,7 +686,8 @@ read rather than printing a shorter list. Check those by hand before you call th
 - **Service won't start / exits immediately.** Read `service.err.log`. The most common
   cause is a bad path baked into the service: a service resolves a relative path against
   its own working directory, not against yours. Read what is actually registered —
-  `nssm get MessageFoundry AppParameters` and `nssm get MessageFoundry AppDirectory` — and
+  `Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters | Select-Object AppParameters, AppDirectory`,
+  which needs no `nssm.exe` — and
   compare it against where the files really are. The installer makes `-Config`, `-DbPath`,
   `-DataDir` and `-AppExe` absolute, anchored to the directory you ran it from, so
   re-running it from a *different* directory changes what a relative argument meant. Pass
@@ -682,8 +696,8 @@ read rather than printing a shorter list. Check those by hand before you call th
   port `2575`. If a stray `messagefoundry serve` (or a second copy of the service) is already
   running, the listener fails to bind. Make sure only one instance runs:
   `Get-Process messagefoundry,python | Format-Table Id,ProcessName,Path`.
-- **`/health` doesn't respond.** Confirm the service is `SERVICE_RUNNING`
-  (`nssm status MessageFoundry`) and that nothing else owns port `8765`.
+- **`/health` doesn't respond.** Confirm the service is running
+  (`Get-Service MessageFoundry`) and that nothing else owns port `8765`.
 - **Permissions on the data dir.** The service runs by default as the least-privilege virtual
   account `NT SERVICE\<ServiceName>`, to which the installer grants read/write on
   `C:\ProgramData\MessageFoundry` (after registration, once the per-service SID resolves). If

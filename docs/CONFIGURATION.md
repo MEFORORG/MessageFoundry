@@ -522,7 +522,9 @@ def anonymize(msg):
   async, so `state_get(namespace, key, default=None)` reads an in-memory **read-through cache** the
   engine maintains (loaded at startup, updated as writes commit) and publishes around each
   router/transform run — exactly how `code_set()` resolves against an active set. A missing key returns
-  `default` (state is sparse, not a referenced table). **Non-linearization caveat:** a read reflects
+  `default` (state is sparse, not a referenced table). The cache holds each value encrypted and
+  decodes it on every read, so each call returns a fresh copy: changing the returned object does not
+  change the stored state (BACKLOG #1174). **Non-linearization caveat:** a read reflects
   committed state as of its invocation, but is **not** linearized with a concurrent sibling handler's
   write — fine for read-mostly correlation; a race-sensitive read-modify-write within one namespace
   needs author care.
@@ -634,7 +636,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `login_rate_limit_per_ip` | int | 10 | max attempts per client IP per window (`0` disables). **One number, two limiters:** it is also the per-**actor** budget of the credential-**ceremony** limiter (`/me/password`, `/me/reauth`, `/me/mfa/confirm` + the console re-auth routes) — the `_per_ip` name is historical, and retuning it retunes both |
 | `login_rate_limit_global` | int | 60 | max attempts across all clients per window (`0` disables). Sign-in window only — the ceremony limiter has **no** global dimension (`glob=0`) |
 | `login_rate_limit_window_seconds` | float | 60 | sliding-window length — shared by the sign-in window **and** the per-actor credential-**ceremony** limiter, exactly as `login_rate_limit_per_ip` is |
-| `phi_read_rate_limit_enabled` | bool | `true` | per-actor anti-automation throttle (ASVS 2.4.1) — bounds scripted PHI harvesting on top of pagination + access auditing. Charged on **8 JSON routes** via `require_phi_read`, on the **4 bulk-PHI step-up GETs** at admission (`/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, `/search/layered` — `require_step_up` paces NON-GET only, so these charge it themselves), and on the **7 `/ui` PHI views** via `require_ui(…, phi=True)` |
+| `phi_read_rate_limit_enabled` | bool | `true` | per-actor anti-automation throttle (ASVS 2.4.1) — bounds scripted PHI harvesting on top of pagination + access auditing. Charged on **8 JSON routes** via `require_phi_read`, on the **4 bulk-PHI step-up GETs** at admission (`/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, `/search/layered` — `require_step_up` paces NON-GET only, so these charge it themselves), and on the **8 `/ui` PHI views** via `require_ui(…, phi=True)` |
 | `phi_read_rate_limit_per_actor` | int | 120 | max PHI reads per user per window (generous — clears console/human use; `0` disables this dimension) |
 | `phi_read_rate_limit_global` | int | 0 | max PHI reads across all users per window (`0` = off) |
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length |
