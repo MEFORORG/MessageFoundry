@@ -9,12 +9,19 @@ by ``reset_stale_inflight`` at the next start and by nothing before it, and it w
 ``pending_depth`` counts pending rows only, and the buildup and stall checks run only from a lane's own
 processing path, which a strand has stopped.
 
-This file covers the read (``inflight_by_lane``) and the runner's in-flight watch that pages on it.
+This file covers the read (``inflight_by_lane``), the runner's in-flight watch that pages on it, and
+the two ``pooled`` rows of P3-03's measured table as failure-injection tests:
+
+* ``route_handoff`` raises once: T17 re-pends the head and the message routes, no restart.
+* ``route_handoff`` AND ``reschedule_claimed`` each raise once: the row strands. It still strands (part
+  B ships no reclaim; see ``_check_inflight_strands``), and now the in-flight watch pages it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -28,10 +35,10 @@ from messagefoundry.config.wiring import (
     OutboundConnection,
     Registry,
 )
-from messagefoundry.pipeline import wiring_runner
+from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStore, Stage
+from messagefoundry.store import MessageStatus, MessageStore, Stage
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1611B|P|2.5.1\r"
 
@@ -78,6 +85,25 @@ def _registry(tmp_path: Path) -> Registry:
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: [])
     return reg
+
+
+async def _ingress_inflight(store: MessageStore) -> int:
+    cur = await store._db.execute(
+        "SELECT COUNT(*) AS c FROM queue WHERE stage=? AND channel_id=? AND status=?",
+        (Stage.INGRESS.value, "IB", "inflight"),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return int(row["c"])
+
+
+async def _until(pred: Any, *, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await pred():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("timed out waiting for condition")
 
 
 # --- the read ---------------------------------------------------------------------------------------
@@ -199,3 +225,93 @@ async def test_watch_reads_nothing_while_every_age_is_off(
 
     monkeypatch.setattr(store, "inflight_by_lane", boom)
     await runner._check_inflight_strands(now=10_000.0)
+
+
+# --- P3-03's two pooled rows, end to end ------------------------------------------------------------
+
+
+def _fail_once(monkeypatch: pytest.MonkeyPatch, obj: Any, attr: str, calls: dict[str, int]) -> None:
+    real = getattr(obj, attr)
+
+    async def flaky(*a: Any, **k: Any) -> Any:
+        calls[attr] = calls.get(attr, 0) + 1
+        if calls[attr] == 1:
+            raise RuntimeError(f"simulated transient store fault in {attr}")
+        return await real(*a, **k)
+
+    monkeypatch.setattr(obj, attr, flaky)
+
+
+async def test_pooled_route_handoff_fault_recovers_through_t17(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-03's first pooled row: ``route_handoff`` raises once. T17 re-pends the head not-due, the
+    lane re-claims it after the backoff, and the message routes with no restart and no reload."""
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
+    calls: dict[str, int] = {}
+    _fail_once(monkeypatch, store, "route_handoff", calls)
+    runner = RegistryRunner(
+        _registry(tmp_path), store, claim_mode="pooled", pooled_sweep_interval=0.05
+    )
+    await runner.start()
+    try:
+        mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+        runner._dispatchers[Stage.INGRESS].mark_ready("IB")
+
+        async def routed() -> bool:
+            msg = await store.get_message(mid)
+            return msg is not None and msg["status"] != MessageStatus.RECEIVED.value
+
+        await _until(routed)
+        assert calls["route_handoff"] >= 2  # the fault fired and the row was re-tried
+        assert await _ingress_inflight(store) == 0
+    finally:
+        await runner.stop()
+
+
+async def test_pooled_double_fault_strands_and_the_watch_pages_it(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P3-03's second pooled row: ``route_handoff`` AND ``reschedule_claimed`` each raise once. T17's
+    own re-pend fails, so the row stays ``inflight``, and ``pending_depth`` reads the lane empty.
+
+    It STILL strands after part B, by design: no reclaim shipped, because the pooled serializer holds
+    claimed rows this runner cannot see, and re-pending a held row sends it twice. What changed is that
+    the strand now pages. If a safe reclaim ever lands, this test is the one to flip: the row should
+    then route instead of staying in flight."""
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(wiring_runner, "_INFLIGHT_WATCH_INTERVAL_SECONDS", 0.05)
+    calls: dict[str, int] = {}
+    _fail_once(monkeypatch, store, "route_handoff", calls)
+    _fail_once(monkeypatch, store, "reschedule_claimed", calls)
+    sink = _RecordingSink()
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_oldest_seconds=0.3),
+        claim_mode="pooled",
+        pooled_sweep_interval=0.05,
+    )
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        await runner.start()
+        try:
+            mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
+            runner._dispatchers[Stage.INGRESS].mark_ready("IB")
+
+            async def paged() -> bool:
+                return "held in flight on ingress lane 'IB'" in caplog.text
+
+            await _until(paged)
+            # Both faults fired, once each, and nothing retried the row after them.
+            assert calls == {"route_handoff": 1, "reschedule_claimed": 1}
+            msg = await store.get_message(mid)
+            assert msg is not None and msg["status"] == MessageStatus.RECEIVED.value
+            assert await _ingress_inflight(store) == 1
+            assert await store.pending_depth("IB", stage=Stage.INGRESS.value) == (0, None)
+            assert any(name == "IB" and depth == 1 for name, depth, _ in sink.buildup)
+        finally:
+            await runner.stop()
