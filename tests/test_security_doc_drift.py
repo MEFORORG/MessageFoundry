@@ -82,9 +82,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # directory mirror row a federated binding needs, with no Kerberos sign-in -- and no /ui route.
 # BACKLOG #2345 (ASVS 14.2.6) added one JSON route, GET /messages/{message_id}/raw -- the raw body's
 # own audited fetch, split from the open -- and no /ui route: the console calls it in-process.
+# BACKLOG #2346 (ASVS 14.2.6) added two /ui routes and no JSON route: GET /ui/messages/{message_id}/summary
+# and /body, the detail page with the summary, or the summary and the body, revealed on an explicit act.
 _ROUTES_DEFAULT = 115
 _ROUTES_WITH_DOCS = 119
-_ROUTES_WITH_UI = 230
+_ROUTES_WITH_UI = 232
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -135,7 +137,11 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/messages"),
         ("GET", "/ui/messages/{message_id}"),
         ("GET", "/ui/messages/{message_id}/attachments/{attachment_id}"),
+        # BACKLOG #2346: the detail page with the body, and with the summary, revealed. Same gate and
+        # same reason as the bare detail page above; item 4 of the doc block names them.
+        ("GET", "/ui/messages/{message_id}/body"),
         ("GET", "/ui/messages/{message_id}/parse-tree"),
+        ("GET", "/ui/messages/{message_id}/summary"),
         ("GET", "/ui/uploaded-logs"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),

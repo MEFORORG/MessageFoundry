@@ -246,6 +246,12 @@ from typing import Any
 #: would AttributeError at render, and a new required field fails the ``UiDeps`` construction, so a
 #: skew must fail the handshake. Unnumbered, as above.
 #:
+#: BACKLOG #2346 (ASVS 14.2.6): ``get_message`` gained the keyword ``reveal_summary``, and the console
+#: passes it on every call. That did NOT move the digest, because the snapshot records a
+#: ``CoreHandlers`` field's name and not the handler's parameters. So an engine that carries #2345 but
+#: not #2346 would pass the handshake with this console and then fail each message page with a
+#: TypeError. Neither is released, so no such pair can ship, but the gate does not see it.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
@@ -271,6 +277,7 @@ class CoreHandlers:
 
     list_connections: Callable[..., Awaitable[Any]]
     list_messages: Callable[..., Awaitable[Any]]
+    # Takes ``reveal_summary`` (BACKLOG #2346); the console sets it from its per-route reveal table.
     get_message: Callable[..., Awaitable[Any]]
     # The raw body's own audited fetch (BACKLOG #2345). Its JSON gate is
     # require_phi_read(MESSAGES_VIEW_RAW), so a /ui route calling it must assert messages:view_raw

@@ -260,7 +260,8 @@ async def test_hostile_hl7_is_escaped(engine: Engine) -> None:
     mid = await _seed(engine, raw=XSS_RAW, control_id="X1")
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        r = await c.get(f"/ui/messages/{mid}")
+        # /body: the bare detail page renders no body until the operator asks (BACKLOG #2346).
+        r = await c.get(f"/ui/messages/{mid}/body")
         assert r.status_code == 200
         body = r.text
         assert "<script>alert(1)</script>" not in body  # never rendered as live markup
@@ -319,17 +320,20 @@ async def test_ui_message_detail_audits_like_json(engine: Engine) -> None:
 
 
 async def test_ui_body_reads_audit_as_console_body_views(engine: Engine) -> None:
-    """BACKLOG #2345: the detail, parse-tree and edit pages still show the body on load, and each
-    read goes through the engine's audited body fetch tagged ``console``. So does the edit POST's
-    reject arm, which re-renders the pristine body. The parse tree reads the body alone; the other
-    three also open the message (``message_view``). The body really rendering on each page is the
-    control: a page that silently lost it would write no row and render no ``MSH``."""
+    """BACKLOG #2345 and #2346: every page that shows the body reads it through the engine's audited
+    body fetch tagged ``console``, and only a route that declares ``body`` does. The bare detail page
+    opens the message and reads no body; ``/body`` (the "Show raw message" link), the parse tree, the
+    editor and the edit POST's reject arm each read it once. The body really rendering on each of
+    those is the control: a page that silently lost it would write no row and render no ``MSH``."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")  # a fresh login counts as a recent step-up, for the editor
-        page = await c.get(f"/ui/messages/{mid}")
+        bare = await c.get(f"/ui/messages/{mid}")
+        assert bare.status_code == 200 and "ADT^A01|MSG1" not in bare.text
+        assert f'href="/ui/messages/{mid}/body"' in bare.text  # the act is offered, not taken
+        page = await c.get(f"/ui/messages/{mid}/body")
         assert page.status_code == 200 and "ADT^A01|MSG1" in page.text
         tree = await c.get(f"/ui/messages/{mid}/parse-tree")
         assert tree.status_code == 200 and "PID" in tree.text
@@ -349,7 +353,169 @@ async def test_ui_body_reads_audit_as_console_body_views(engine: Engine) -> None
         {"message_id": mid, "surface": "console"}
     ] * 4
     assert all(r["actor"] == "op" for r in body_views)
-    assert [r["action"] for r in rows].count("message_view") == 3
+    # Four opens: the bare page, /body, the editor and the reject arm open the message; the parse
+    # tree shows no metadata and does not. This message has no summary, so even /body's declared
+    # reveal unmasks nothing and records false; the summary test below covers the true case.
+    opens = [json.loads(r["detail"]) for r in rows if r["action"] == "message_view"]
+    assert [o["summary_revealed"] for o in opens] == [False] * 4
+
+
+async def test_the_summary_is_revealed_only_by_a_route_that_declares_it(engine: Engine) -> None:
+    """BACKLOG #2346, ASVS 14.2.6: the bare detail page is where the dead-letter "view" link, the
+    replay redirect and a typed URL land, and none of those is an act aimed at the summary, so it
+    shows the summary masked, exactly as the list does. ``/summary`` is where the list links from the
+    masked summary, and it shows it complete. Both halves read the SAME stored value, so this cannot
+    pass by the two pages carrying different data."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    stored = "MRN 100001 · DOE, JANE"
+    masked = "MRN ****0001 · D**, J**"
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1",
+        raw=ADT,
+        deliveries=[("archive", ADT)],
+        control_id="MSG1",
+        message_type="ADT^A01",
+        source_type="file",
+        summary=stored,
+    )
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        listing = await c.get("/ui/messages")
+        assert masked in listing.text and stored not in listing.text
+        # The list links from the masked summary to the route that reveals it.
+        assert f'href="/ui/messages/{mid}/summary"' in listing.text
+        bare = await c.get(f"/ui/messages/{mid}")
+        assert bare.status_code == 200
+        assert masked in bare.text and stored not in bare.text
+        assert f'href="/ui/messages/{mid}/summary"' in bare.text  # the Reveal link
+        revealed = await c.get(f"/ui/messages/{mid}/summary")
+        assert revealed.status_code == 200 and stored in revealed.text
+        assert "ADT^A01|MSG1" not in revealed.text  # a summary reveal is not a body reveal
+        # And the reveal did not become a status: the next bare open is masked again.
+        again = await c.get(f"/ui/messages/{mid}")
+        assert masked in again.text and stored not in again.text
+    # The audit says which open unmasked it: the bare, revealed, bare sequence, in whichever order
+    # the store lists rows (the sequence is a palindrome).
+    opens = [
+        json.loads(dict(a)["detail"])["summary_revealed"]
+        for a in await engine.store.list_audit(limit=100)
+        if dict(a)["action"] == "message_view"
+    ]
+    assert opens == [False, True, False]
+
+
+async def test_the_replay_redirect_lands_on_a_page_that_reveals_nothing(engine: Engine) -> None:
+    """BACKLOG #2346: a replay is not an act aimed at the summary or the body, so the page it
+    redirects to reveals neither. The redirect target is asserted, not assumed."""
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "boss")
+        r = await c.post(
+            f"/ui/messages/{mid}/replay",
+            headers={"Sec-Fetch-Site": "same-origin"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == f"/ui/messages/{mid}"
+
+
+def test_every_ui_route_that_reads_a_body_or_opens_a_message_is_in_the_reveal_table() -> None:
+    """The reveal table is the single statement of which /ui routes show a body or a summary. This
+    DERIVES the other side from ``routes/core.py``'s syntax tree, so a new route cannot read a body
+    or open a message without a row: every route handler that reaches ``_message_body`` (directly,
+    through a nested function, or through ``_detail_page``) must declare ``body`` or be a detail
+    route, every one that reaches ``_open_message`` must have a row, and no route handler may call
+    ``core.get_message`` directly, which would bypass the table. The
+    table's rows must also name mounted routes, so a rename cannot leave a dead row."""
+    import ast
+    import inspect
+
+    import messagefoundry_webconsole.routes.core as core_routes
+    from messagefoundry_webconsole.routes.core import UI_MESSAGE_REVEALS
+
+    tree = ast.parse(inspect.getsource(core_routes))
+
+    def _calls(node: ast.AST) -> set[str]:
+        names: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                f = sub.func
+                if isinstance(f, ast.Name):
+                    names.add(f.id)
+                elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+                    names.add(f"{f.value.id}.{f.attr}")
+        return names
+
+    readers: set[str] = set()
+    openers: set[str] = set()
+    direct_get_message: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls = _calls(fn)
+        paths = [
+            d.args[0].value
+            for d in fn.decorator_list
+            if isinstance(d, ast.Call)
+            and isinstance(d.func, ast.Attribute)
+            and isinstance(d.func.value, ast.Name)
+            and d.func.value.id == "app"
+            and d.args
+            and isinstance(d.args[0], ast.Constant)
+            and isinstance(d.args[0].value, str)
+        ]
+        # A route handler's walk includes its own nested functions (the edit POST's _reject arm).
+        if paths and "core.get_message" in calls:
+            direct_get_message.append(fn.name)
+        for path in paths:
+            if calls & {"_message_body", "_detail_page"}:
+                readers.add(path)
+            if calls & {"_open_message", "_detail_page"}:
+                openers.add(path)
+    assert readers, "the scan found no body-reading route: a broken instrument, not a clean tree"
+    assert direct_get_message == [], (
+        f"{direct_get_message} call core.get_message directly, bypassing UI_MESSAGE_REVEALS"
+    )
+    assert (readers | openers) <= set(UI_MESSAGE_REVEALS), sorted(
+        (readers | openers) - set(UI_MESSAGE_REVEALS)
+    )
+    # A reader that is not a detail route fetches the body unconditionally, so it must declare it.
+    for path in readers - {
+        "/ui/messages/{message_id}",
+        "/ui/messages/{message_id}/summary",
+        "/ui/messages/{message_id}/body",
+    }:
+        assert "body" in UI_MESSAGE_REVEALS[path], path
+    assert UI_MESSAGE_REVEALS["/ui/messages/{message_id}"] == frozenset()
+    mounted = {getattr(r, "path", "") for r in create_app(serve_ui=True).routes}
+    assert set(UI_MESSAGE_REVEALS) <= mounted, sorted(set(UI_MESSAGE_REVEALS) - mounted)
+
+
+async def test_a_route_that_does_not_declare_body_cannot_fetch_one(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: the console refuses to fetch a body for a route whose row lacks ``body``. Shown
+    by emptying the parse tree's own row, because that handler fetches the body unconditionally: the
+    same request that renders the tree in the test above now errors and writes no
+    ``message_body_view`` row. The raise is expected, so the transport is told not to re-raise it."""
+    import messagefoundry_webconsole.routes.core as core_routes
+
+    patched = dict(core_routes.UI_MESSAGE_REVEALS)
+    patched["/ui/messages/{message_id}/parse-tree"] = frozenset()
+    monkeypatch.setattr(core_routes, "UI_MESSAGE_REVEALS", patched)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _cookie_login(c, "op")
+        r = await c.get(f"/ui/messages/{mid}/parse-tree")
+        assert r.status_code == 500 and "PID" not in r.text
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=100)]
+    assert "message_body_view" not in actions
 
 
 async def test_the_json_body_fetch_refuses_a_forged_console_surface(engine: Engine) -> None:
@@ -411,14 +577,14 @@ def test_message_detail_renders_attachments_panel() -> None:
         events=[],
         attachments=[AttachmentInfo(id=ref, content_type="application/pdf", total_bytes=2048)],
     )
-    html = str(message_detail(detail, "MSH|skel"))
+    html = str(message_detail(detail, "MSH|skel", summary_revealed=True))
     assert "Attachments" in html
     assert "application/pdf" in html
     assert f"/ui/messages/m1/attachments/{ref}" in html  # the download link
     assert "2.0 KiB" in html  # human size
 
     empty = detail.model_copy(update={"attachments": []})
-    assert "Attachments" not in str(message_detail(empty, "MSH|skel"))
+    assert "Attachments" not in str(message_detail(empty, "MSH|skel", summary_revealed=True))
 
 
 async def test_ui_attachment_download_round_trips_and_audits(engine: Engine) -> None:

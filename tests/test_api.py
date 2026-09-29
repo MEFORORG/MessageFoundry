@@ -576,23 +576,24 @@ async def test_messages_expose_event_summary_metadata(
         summary="MRN 100001 · DOE, JANE",
     )
     msg = (await client.get("/messages")).json()["messages"][0]
-    # List surface: the summary is display-masked until a per-message open reveals it (ASVS 14.2.6).
+    # List surface: the summary is display-masked until an explicit per-message reveal (ASVS 14.2.6).
     # The shape survives -- label, separator, name comma -- so the row still reads as a row.
     assert msg["summary"] == "MRN ****0001 · D**, J**"
     assert msg["event"] == "received"
     assert msg["metadata"] is None
 
 
-async def test_list_masks_the_summary_and_opening_one_message_reveals_it(
+async def test_list_masks_the_summary_and_only_an_explicit_reveal_lifts_it(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
-    """The mask and its reveal, end to end and in one place (ASVS 14.2.6, BACKLOG #1187).
+    """The mask and its reveal, end to end and in one place (ASVS 14.2.6, BACKLOG #1187, #2346).
 
-    Opening a single message IS the reveal act: it is deliberate, per-record, and already audited
-    (``record_view`` plus the tamper-evident chain). The list is the surface where complete
-    identifiers could be read off a screen opened for another reason, so it stays masked.
+    Opening a single message is NOT the reveal act under the strict reading #1187 adopts: a
+    dead-letter link, a replay redirect or a typed URL opens a message with no act aimed at the
+    summary. So a plain open masks it exactly as the list does, and only ``reveal_summary`` lifts
+    the mask, for that one response. The ``message_view`` row records which it was.
 
-    Both halves are asserted against the SAME stored value, so this cannot pass by the list and the
+    Every half is asserted against the SAME stored value, so this cannot pass by the list and the
     detail simply carrying different data.
     """
     stored = "MRN 100001 · DOE, JANE"
@@ -608,11 +609,24 @@ async def test_list_masks_the_summary_and_opening_one_message_reveals_it(
     assert listed["summary"] == "MRN ****0001 · D**, J**"  # census surface: masked
 
     opened = (await client.get(f"/messages/{listed['id']}")).json()
-    assert opened["summary"] == stored  # the per-message open is the act that lifts it
+    assert opened["summary"] == "MRN ****0001 · D**, J**"  # a plain open reveals nothing
 
-    # And the list is still masked afterwards -- the reveal did not become a status.
+    revealed = (await client.get(f"/messages/{listed['id']}?reveal_summary=true")).json()
+    assert revealed["summary"] == stored  # the explicit act lifts it
+
+    # And a later plain open, and the list, are masked again -- the reveal did not become a status.
+    reopened = (await client.get(f"/messages/{listed['id']}")).json()
+    assert reopened["summary"] == "MRN ****0001 · D**, J**"
     again = (await client.get("/messages")).json()["messages"][0]
     assert again["summary"] == "MRN ****0001 · D**, J**"
+
+    views = [
+        json.loads(a["detail"])
+        for a in await engine.store.list_audit()
+        if a["action"] == "message_view"
+    ]
+    # A palindrome, so the assertion holds whichever order the audit lists rows in.
+    assert [v["summary_revealed"] for v in views] == [False, True, False]
 
 
 async def test_summary_access_audited_server_side_and_coalesced(engine: Engine) -> None:
@@ -654,7 +668,7 @@ async def test_the_audit_separates_a_masked_list_from_a_real_disclosure(engine: 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         listed = (await c.get("/messages")).json()["messages"][0]
-        await c.get(f"/messages/{listed['id']}")  # the open IS the reveal act
+        await c.get(f"/messages/{listed['id']}?reveal_summary=true")  # the explicit reveal act
         await app.state.summary_auditor.flush(engine.store)
 
     rows = [a for a in await engine.store.list_audit() if a["action"] == "summary_access"]

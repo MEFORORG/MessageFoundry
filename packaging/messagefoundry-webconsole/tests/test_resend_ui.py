@@ -81,7 +81,7 @@ def test_one_delivery_needs_no_placeholder() -> None:
     first-option default is the right answer. The engine would resolve an omitted source here too --
     naming it explicitly costs nothing and keeps the POST's meaning independent of how many rows the
     message happens to have when it is submitted."""
-    html = str(message_detail(_detail("archive"), ADT))
+    html = str(message_detail(_detail("archive"), ADT, summary_revealed=True))
     assert 'action="/ui/messages/m1/resend-confirm"' in html
     assert '<option value="archive">archive</option>' in html
     assert "Choose a delivery" not in html
@@ -96,7 +96,7 @@ def test_a_fanned_out_message_must_be_given_a_source() -> None:
     would have silently chosen one operator's body for them. The disabled placeholder is what makes
     the choice deliberate, and ``required`` is what makes an unchosen submit fail in the browser
     rather than at the engine."""
-    html = str(message_detail(_detail("archive", "OB_PARTNER_ADT"), ADT))
+    html = str(message_detail(_detail("archive", "OB_PARTNER_ADT"), ADT, summary_revealed=True))
     assert '<option value="" disabled selected>Choose a delivery</option>' in html
     assert '<select name="source" required>' in html
     assert '<option value="archive">archive</option>' in html
@@ -107,7 +107,7 @@ def test_duplicate_delivery_rows_collapse_to_one_option() -> None:
     """Two rows for one destination (a retry, a replay) are ONE source, so they must not render as two
     identical options -- which would read as a choice that is not one, and would re-introduce the
     placeholder on a message that in fact has a single source."""
-    html = str(message_detail(_detail("archive", "archive"), ADT))
+    html = str(message_detail(_detail("archive", "archive"), ADT, summary_revealed=True))
     assert html.count('<option value="archive">') == 1
     assert "Choose a delivery" not in html
 
@@ -116,7 +116,7 @@ def test_a_message_with_no_delivery_is_explained_not_offered_a_form() -> None:
     """A message that never produced an outbound row (ERROR/FILTERED/UNROUTED) has no transformed body
     to copy, so every resend of it would 409. Rendering the form anyway would be an affordance that
     can only fail."""
-    html = str(message_detail(_detail(), ADT))
+    html = str(message_detail(_detail(), ADT, summary_revealed=True))
     assert "Resend to another outbound" in html
     assert "no stored delivery" in html
     assert "/ui/messages/m1/resend-confirm" not in html

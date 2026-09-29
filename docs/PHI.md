@@ -543,7 +543,9 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
   `GET /messages/{id}/raw` path under `messages:view_raw` + `require_phi_read` (the PHI-read hop guard +
   per-actor pacing) + per-channel scope. That route writes a `record_view` and a `message_body_view`
   audit row naming the `surface` that asked. Opening a message, `GET /messages/{id}`, returns its
-  metadata and no body, and writes `message_view` (BACKLOG #2345). A detached document is the **same PHI**, so
+  metadata and no body, and writes `message_view` (BACKLOG #2345). The open returns `summary` and
+  `metadata` masked, as the list does, unless the caller passes `reveal_summary=true`; the
+  `message_view` row records which (`summary_revealed`, BACKLOG #2346). A detached document is the **same PHI**, so
   `GET /messages/{message_id}/attachments/{attachment_id}` rides the *same* `messages:view_raw` gate and
   channel scope, **plus a `message_attachment` linkage check** — a guessed content address that is not
   linked to an in-scope message is a 404 — and writes a `record_view` **and** an `attachment_download`
@@ -968,9 +970,19 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   response model is outside both. Those shapes rest on review.
 - **Audited raw view only.** A raw message body is shown only via the same audited body fetch the
   JSON API serves at `GET /messages/{id}/raw` (record_view + a tamper-evident `message_body_view` audit
-  row whose `surface` is `console`); there is no second, unaudited PHI render path. The detail,
-  parse-tree and edit pages still fetch the body on load; asking for an explicit operator act first
-  is BACKLOG #2346, not built.
+  row whose `surface` is `console`); there is no second, unaudited PHI render path.
+- **The body and the summary appear only on an explicit act (BACKLOG #2346, ASVS 14.2.6).** Opening
+  a message at `/ui/messages/{id}` shows its metadata with the summary masked and no body. That is
+  where the dead-letter "view" link, the redirect after a replay or an edit-resend, and a typed bare
+  URL land. The message list and content search link from the masked summary to
+  `/ui/messages/{id}/summary`, which reveals the summary. The detail page's "Show raw message" link
+  is `/ui/messages/{id}/body`, which shows the body and the summary. The parse-tree and edit pages
+  exist to show the body. What each route reveals is declared once, in
+  `routes.core.UI_MESSAGE_REVEALS`, and the console refuses to fetch a body for a route that does
+  not declare one. A reveal is a request, never a setting, so it does not carry to the next page.
+  The reveal addresses are ordinary GETs, so going back to one (Back, history, a restored tab) is
+  a new request, audited and charged to the PHI-read budget like the first.
+  The test harness does the same with a Show body button.
 - **Attachments are neutralized at serve; the stored document is never rewritten.** A detached document (ADR 0105) is a
   verbatim clinical payload carrying its own attacker-influenced `OBX-5.2` MIME label, and the
   preserve-the-original invariant forbids editing the stored bytes — so the browser-safety control runs
@@ -1007,7 +1019,8 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
 **`[BUILT]`** (one cleanup)
 
 Every PHI access is recorded in the append-only `audit_log` with the **acting user**:
-`message_view` (opening one message), `message_body_view` (its raw body, with a `surface` naming
+`message_view` (opening one message, with `summary_revealed` saying whether that open unmasked
+the summary), `message_body_view` (its raw body, with a `surface` naming
 which client asked: `harness`, `apiclient` or `api` as the HTTP caller declares it, or `console`,
 which the engine records itself for the web console), `summary_access` (patient summaries),
 plus the auth and admin events

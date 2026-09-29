@@ -25,11 +25,13 @@ GET /ui/messages/search/layered	presets	query	-	-
 GET /ui/messages/{message_id}	message_id	path	-	-
 GET /ui/messages/{message_id}/attachments/{attachment_id}	attachment_id	path	-	-
 GET /ui/messages/{message_id}/attachments/{attachment_id}	message_id	path	-	-
+GET /ui/messages/{message_id}/body	message_id	path	-	-
 GET /ui/messages/{message_id}/edit	message_id	path	-	-
 GET /ui/messages/{message_id}/parse-tree	message_id	path	-	-
 GET /ui/messages/{message_id}/resend-confirm	message_id	path	-	-
 GET /ui/messages/{message_id}/resend-confirm	source	query	-	-
 GET /ui/messages/{message_id}/resend-confirm	to	query	-	-
+GET /ui/messages/{message_id}/summary	message_id	path	-	-
 GET /ui/reauth	next	query	-	-
 GET /ui/roles/{role_id}/edit	role_id	path	-	-
 GET /ui/uploaded-logs	e	query	-	-

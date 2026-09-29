@@ -209,6 +209,42 @@ def test_get_message_body_names_its_surface_and_decodes_the_body(
     ]
 
 
+def test_get_message_sends_the_summary_reveal_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2346: a plain open sends the bare URL, so the engine masks the summary; only
+    ``reveal_summary=True`` adds the parameter that lifts the mask. Both requests are captured, so
+    the bare URL is the control that the flag is what differs."""
+    from messagefoundry.apiclient.client import EngineClient
+
+    client = EngineClient("http://127.0.0.1:8765")
+    sent: list[str] = []
+    detail = {
+        "id": "m1",
+        "channel_id": "ch1",
+        "received_at": 0.0,
+        "source_type": "file",
+        "control_id": None,
+        "message_type": None,
+        "status": "processed",
+        "error": None,
+        "outbox": [],
+        "events": [],
+    }
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json=detail, request=request)
+
+    monkeypatch.setattr(client._http, "send", _capture)
+    client.get_message("m1")
+    client.get_message("m1", reveal_summary=True)
+    assert sent == [
+        "http://127.0.0.1:8765/messages/m1",
+        "http://127.0.0.1:8765/messages/m1?reveal_summary=true",
+    ]
+
+
 # --- ASVS 1.2.2 (BACKLOG #1107): contextual encoding + a URL scheme allow-list ----------------
 #
 # Two clauses, and only two. Clause 1 percent-encodes the identifiers this client interpolates into

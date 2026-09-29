@@ -4206,7 +4206,18 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+        # Annotated rather than ``= Query(False)``, for the reason get_message_body gives: this is a
+        # CoreHandlers seam function too, and an in-process caller that leaves it out must get False.
+        reveal_summary: Annotated[bool, Query()] = False,
     ) -> MessageDetail:
+        """Open one message: metadata, deliveries, events and attachments, and never its body.
+
+        ``reveal_summary`` is the explicit act that lifts the display mask on ``summary`` and
+        ``metadata`` for this one response (BACKLOG #2346, ASVS 14.2.6). Left out, those two come
+        back masked exactly as the list surfaces return them, so an open with no act aimed at the
+        summary (a dead-letter link, a replay redirect, a direct URL) does not unmask them. The open
+        still returns what no list does, the delivery errors and event details, gated on
+        ``messages:view_summary`` as before; the flag does not touch those."""
         row = await engine.store.get_message(message_id)
         # 404 (not 403) when the message is outside the caller's channel scope — don't reveal that a
         # message exists in another tenant's channel (per-channel RBAC).
@@ -4214,17 +4225,27 @@ def create_app(
             if row is not None:
                 await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
-        # Opening a message is PHI access even without its body: the revealed summary and metadata
-        # below carry patient identifiers. Record it (with the viewer) before returning. record_view
-        # gives the per-message timeline; record_audit puts it in the tamper-evident, GET /audit-visible
-        # compliance chain (docs/PHI.md §6 names message_view as audited — review M-3). The BODY is
-        # not here: it has its own fetch and its own audit action, get_message_body below (#2345).
+        # Opening a message is PHI access even without its body: status, errors, deliveries and events
+        # can carry identifiers, and a revealed summary does. Record it (with the viewer) before
+        # returning. record_view gives the per-message timeline; record_audit puts it in the
+        # tamper-evident, GET /audit-visible compliance chain (docs/PHI.md §6 names message_view as
+        # audited — review M-3), with whether this open revealed the summary. The BODY is not here:
+        # it has its own fetch and its own audit action, get_message_body below (#2345).
+        # ``summary_revealed`` records what the response unmasks, not what the caller asked for: a
+        # caller without view_summary gets nulls, and an empty value has nothing to unmask, so
+        # neither is recorded as a disclosure it never received (BACKLOG #2346).
+        projected = _summary(row)
+        summary_revealed = (
+            reveal_summary
+            and identity.has(Permission.MESSAGES_VIEW_SUMMARY)
+            and bool(projected.summary or projected.metadata)
+        )
         await engine.store.record_view(message_id, actor=identity.username)
         await engine.store.record_audit(
             "message_view",
             actor=identity.username,
             channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id}),
+            detail=json.dumps({"message_id": message_id, "summary_revealed": summary_revealed}),
             client=client_ip(request),
         )
         outbox_rows = await engine.store.outbox_for(message_id)
@@ -4235,7 +4256,7 @@ def create_app(
         # (non-streaming) message.
         attachment_rows = await engine.store.attachments_for(message_id)
         detail = MessageDetail(
-            **_summary(row).model_dump(),
+            **projected.model_dump(),
             outbox=[
                 OutboxInfo(
                     id=o["id"],
@@ -4271,17 +4292,19 @@ def create_app(
         # redacted individually. The raw body is not on this response (#2345). Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
         # OPENING ONE MESSAGE IS NOT THE REVEAL ACT under the strict reading of ASVS 14.2.6 ("unless
-        # the user specifically views it"), which BACKLOG #1187 adopts. The list and search surfaces
-        # mask the summary; this route lifts that mask for THIS message on every open. The raw body
-        # is served by get_message_body instead. Many opens are not aimed at the summary at all: the
-        # dead-letter "view" link, the redirect after a replay, a direct URL. So this unmask is the
-        # shipped behaviour and a recorded gap, not the control the verb asks for. What it does keep:
-        # the unmask is a call argument with nowhere to live between calls, so it cannot become a
+        # the user specifically views it"), which BACKLOG #1187 adopts. So an open masks the summary
+        # and metadata exactly as the list does, and only ``reveal_summary`` lifts the mask, for THIS
+        # response (BACKLOG #2346). The caller sets it on an act aimed at the summary: the web console
+        # declares it per route, and a bare open (a dead-letter link, a replay redirect, a direct URL)
+        # leaves it off. The raw body is get_message_body's, a separate act with its own audit row.
+        # The unmask is a call argument with nowhere to live between calls, so it cannot become a
         # session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
         detail = redact_unauthorized(
-            detail, identity, revealed=frozenset({"summary", "metadata"})
+            detail,
+            identity,
+            revealed=frozenset({"summary", "metadata"}) if reveal_summary else frozenset(),
         ).model_copy(update={"outbox": outbox, "events": events})
         rows = [detail, *outbox, *events]
         exposed, masked = count_exposed(rows), count_masked(rows)

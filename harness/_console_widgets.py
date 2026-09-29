@@ -187,14 +187,31 @@ class ParseTreeView(QTreeWidget):
 @dataclass(frozen=True)
 class _DetailSnapshot:
     """One off-thread message-detail read, applied on the main thread. ``message_id`` lets a stale
-    result (superseded by a newer ``load``) be dropped; ``error`` set means a read failed. ``raw`` is
-    the body, which the engine serves from its own audited fetch (BACKLOG #2345). It is required, so
-    a success path cannot forget it: ``None`` means the body fetch failed, and ``error`` says why."""
+    result (superseded by a newer ``load``) be dropped; ``error`` set means the read failed. It
+    carries no body: the engine serves that from its own audited fetch (BACKLOG #2345), and this
+    panel asks for it only when the operator presses Show body (BACKLOG #2346)."""
 
     message_id: str
     detail: MessageDetail | None
     error: str | None
+
+
+@dataclass(frozen=True)
+class _BodySnapshot:
+    """One off-thread body read, started by the Show body button and applied on the main thread.
+    Exactly one of ``raw`` and ``error`` is set. ``open_seq`` names the open it was asked for, so a
+    body is never painted onto a later open of the same message that nobody asked to see."""
+
+    message_id: str
+    open_seq: int
     raw: str | None
+    error: str | None
+
+
+#: What the Raw tab says until the operator asks for the body (BACKLOG #2346, ASVS 14.2.6).
+_BODY_HIDDEN_TEXT = (
+    "The raw message is not loaded. Press Show body to fetch it; each view is audited."
+)
 
 
 class MessageDetailPanel(QWidget):
@@ -210,20 +227,30 @@ class MessageDetailPanel(QWidget):
         self._runner = AsyncRunner(self)
         self._message_id: str | None = None
         self._pending_id: str | None = None  # the latest requested load (drops stale results)
+        # Bumped by every load() and clear(). A body fetch carries the value it started under, and
+        # _apply_body drops it once the number has moved on (BACKLOG #2346).
+        self._open_seq = 0
 
         self._summary = QLabel("Select a message")
         self._summary.setWordWrap(True)
         self._replay = QPushButton("Replay")
         self._replay.setEnabled(False)
         self._replay.clicked.connect(self._on_replay)
+        # The explicit act that fetches the body (BACKLOG #2346, ASVS 14.2.6). Selecting a row opens
+        # the message and nothing more; the body is a second, separately audited request.
+        self._show_body = QPushButton("Show body")
+        self._show_body.setEnabled(False)
+        self._show_body.clicked.connect(self._on_show_body)
 
         header = QHBoxLayout()
         header.addWidget(self._summary, stretch=1)
+        header.addWidget(self._show_body)
         header.addWidget(self._replay)
 
         self._tree = ParseTreeView()
         self._raw = QPlainTextEdit()
         self._raw.setReadOnly(True)
+        self._raw.setPlaceholderText(_BODY_HIDDEN_TEXT)
         self._outbox = QTableWidget(0, 5)
         fill_table(
             self._outbox, ["Destination", "Status", "Attempts", "Next attempt", "Last error"]
@@ -242,10 +269,16 @@ class MessageDetailPanel(QWidget):
         layout.addWidget(tabs)
 
     def clear(self) -> None:
-        self._message_id = None
+        self._open_seq += 1
         self._pending_id = None  # a pending load() must not re-populate after an explicit clear
-        self._summary.setText("Select a message")
+        self._reset("Select a message")
+
+    def _reset(self, label: str) -> None:
+        """Show no message: no metadata, no body, and neither action offered."""
+        self._message_id = None
+        self._summary.setText(label)
         self._replay.setEnabled(False)
+        self._show_body.setEnabled(False)
         self._tree.clear()
         self._raw.clear()
         self._outbox.setRowCount(0)
@@ -254,7 +287,10 @@ class MessageDetailPanel(QWidget):
     def load(self, message_id: str) -> None:
         # Read the message OFF the main thread; apply on the main thread. A newer load() supersedes
         # an in-flight one (rapid row clicks / replay), so a stale result is dropped in _apply.
+        self._open_seq += 1
         self._pending_id = message_id
+        # No Show body until this open lands: a press now would fetch the previous message's body.
+        self._show_body.setEnabled(False)
         self._runner.submit(lambda: self._fetch(message_id), on_done=self._apply)
 
     def stop(self) -> None:
@@ -262,24 +298,15 @@ class MessageDetailPanel(QWidget):
         self._runner.stop()
 
     def _fetch(self, message_id: str) -> _DetailSnapshot:
-        """Runs on a worker thread — only blocking I/O, no widget access."""
+        """Runs on a worker thread — only blocking I/O, no widget access.
+
+        Opens the message and nothing more. The body is a separate audited act (BACKLOG #2345) that
+        waits for the Show body button (BACKLOG #2346), so selecting a row charges the PHI-read
+        budget once, not twice."""
         try:
-            detail = self._poll.get_message(message_id)
+            return _DetailSnapshot(message_id, self._poll.get_message(message_id), None)
         except ApiError as exc:
-            return _DetailSnapshot(message_id, None, str(exc), None)
-        # The body is its own audited act (BACKLOG #2345). This panel still shows it as soon as a
-        # row is selected; waiting for an explicit operator act is BACKLOG #2346.
-        if message_id != self._pending_id:
-            # A newer load() or a clear() superseded this one while the open ran. Fetching the body
-            # now would write a message_body_view row for a body nobody will see; _apply drops this.
-            return _DetailSnapshot(message_id, detail, None, None)
-        try:
-            body = self._poll.get_message_body(message_id, surface="harness")
-        except ApiError as exc:
-            # The open already succeeded and was audited, so show it and report the body failure
-            # (a 429 from the PHI-read budget, say) rather than discarding both.
-            return _DetailSnapshot(message_id, detail, str(exc), None)
-        return _DetailSnapshot(message_id, detail, None, body.raw)
+            return _DetailSnapshot(message_id, None, str(exc))
 
     def _apply(self, snap: _DetailSnapshot) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
@@ -287,12 +314,15 @@ class MessageDetailPanel(QWidget):
             return  # a newer load() (or a clear()) superseded this result
         if snap.error is not None:
             self.error.emit(snap.error)
-        detail = snap.detail
-        if detail is None:
+            # Never leave the previous message's metadata and body under the newly selected row.
+            self._reset("The message could not be opened.")
             return
+        detail = snap.detail
+        assert detail is not None
         message_id = snap.message_id
         self._message_id = message_id
         self._replay.setEnabled(True)
+        self._show_body.setEnabled(True)
         # Escape HL7-derived fields (message_type/control_id/error come from raw message content)
         # before interpolating into this rich-text label, so a crafted message can't inject HTML (H1).
         self._summary.setText(
@@ -306,13 +336,10 @@ class MessageDetailPanel(QWidget):
                 else ""
             )
         )
-        if snap.raw is None:
-            # The body fetch failed; its error was emitted above. Show no stale body.
-            self._tree.clear()
-            self._raw.clear()
-        else:
-            self._tree.show_message(snap.raw)
-            self._raw.setPlainText(snap.raw.replace("\r", "\n"))
+        # A newly opened message shows no body, and never the previous message's body: the operator
+        # asks for this one's with Show body.
+        self._tree.clear()
+        self._raw.clear()
 
         self._outbox.setRowCount(len(detail.outbox))
         for r, o in enumerate(detail.outbox):
@@ -331,6 +358,41 @@ class MessageDetailPanel(QWidget):
         for r, e in enumerate(detail.events):
             for c, text in enumerate([fmt_ts(e.ts), e.event, e.destination or "", e.detail or ""]):
                 self._events.setItem(r, c, QTableWidgetItem(text))
+
+    def _on_show_body(self) -> None:
+        """The explicit act (BACKLOG #2346): fetch the open message's body, tagged ``harness`` so
+        the engine's ``message_body_view`` row names this client. Each press is its own request, and
+        the button stays disabled until it answers, so a double-click is one read, not two."""
+        message_id = self._message_id
+        if message_id is None or message_id != self._pending_id:
+            return  # nothing open, or a newer load() is still in flight
+        open_seq = self._open_seq
+        self._show_body.setEnabled(False)
+        self._runner.submit(
+            lambda: self._fetch_body(message_id, open_seq), on_done=self._apply_body
+        )
+
+    def _fetch_body(self, message_id: str, open_seq: int) -> _BodySnapshot:
+        """Runs on a worker thread — only blocking I/O, no widget access."""
+        try:
+            body = self._poll.get_message_body(message_id, surface="harness")
+        except ApiError as exc:
+            # A 429 from the PHI-read budget, say. The open stays on screen; only the body failed.
+            return _BodySnapshot(message_id, open_seq, None, str(exc))
+        return _BodySnapshot(message_id, open_seq, body.raw, None)
+
+    def _apply_body(self, snap: _BodySnapshot) -> None:
+        """Runs on the main thread (result slot). Drops a body asked for under an earlier open, so a
+        slow fetch never paints onto another message, nor onto a later open of the same message
+        (a re-selection, or the reload after Replay) that nobody asked to see."""
+        if snap.open_seq != self._open_seq or snap.message_id != self._message_id:
+            return
+        self._show_body.setEnabled(True)
+        if snap.raw is None:
+            self.error.emit(snap.error or "the body could not be read")
+            return
+        self._tree.show_message(snap.raw)
+        self._raw.setPlainText(snap.raw.replace("\r", "\n"))
 
     def _on_replay(self) -> None:
         if self._message_id is None:

@@ -1171,10 +1171,18 @@ class EngineClient:
             MessageSearchResults,
         )
 
-    def get_message(self, message_id: str) -> MessageDetail:
+    def get_message(self, message_id: str, *, reveal_summary: bool = False) -> MessageDetail:
         """Open one message: metadata, deliveries and events, and NOT its body (BACKLOG #2345). The
-        body is :meth:`get_message_body`, a separate audited act."""
-        return _decode(self._get(f"/messages/{_seg(message_id)}"), MessageDetail)
+        body is :meth:`get_message_body`, a separate audited act.
+
+        ``summary`` and ``metadata`` come back display-masked, as on the list, unless
+        ``reveal_summary`` is set. Set it only on an operator act aimed at the summary (BACKLOG
+        #2346, ASVS 14.2.6); the engine records the choice in the ``message_view`` audit row."""
+        # None drops the parameter, so a plain open sends the same URL it always did.
+        flag = "true" if reveal_summary else None
+        return _decode(
+            self._get(f"/messages/{_seg(message_id)}", reveal_summary=flag), MessageDetail
+        )
 
     def get_message_body(
         self, message_id: str, *, surface: BodySurface = "apiclient"
