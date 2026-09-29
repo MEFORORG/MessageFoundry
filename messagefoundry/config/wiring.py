@@ -1559,8 +1559,7 @@ def MLLP(
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
-    """An MLLP endpoint. Inbound uses port plus the resource caps max_connections,
-    max_connections_per_host, receive_timeout, max_frame_seconds and max_frame_bytes (the bind
+    """An MLLP endpoint. Inbound uses port plus the inbound resource caps described below (the bind
     interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the

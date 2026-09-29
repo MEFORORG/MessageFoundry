@@ -289,10 +289,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   complete frames of one listener are in the inbound handler (decode, parse, validate, ingress
   commit) at once. The row measured about 64 MiB of handling cost per 16 MiB message, so the peak
   was `max_connections` times that, 10 to 16 GiB across 256 frames; it is now a setting of its own.
-  A frame over the limit waits for a slot, first come first served, and is never refused or NAK'd.
-  It still holds the bytes it arrived in, so the raw buffer bound is unchanged. A frame still
-  waiting when the listener stops, or when its own connection closes, is not handled and gets no
-  ACK, so the sender resends it; a WARNING names the peer. `None`/`0` turns it off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
+  A frame over the limit waits for a slot, first come first served, and is never refused, dropped
+  or NAK'd; once decoded it is always handled, as with the limit off, and a waiter still queued at
+  stop is cancelled past the shutdown grace like a slow handler. It still holds the bytes it arrived
+  in, so the raw buffer bound is unchanged. `None`/`0` turns it off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
   ([BACKLOG #1725](docs/BACKLOG.md), act 3)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.

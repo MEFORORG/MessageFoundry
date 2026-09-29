@@ -81,7 +81,6 @@ from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.transports.base import (
-    INTAKE_PAUSE_POLL_SECONDS,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -216,12 +215,12 @@ DEFAULT_MAX_CONNECTIONS_PER_HOST = 32
 #: is the handling multiplier on top of it. The bound is per LISTENER, so a site with many inbound
 #: listeners has one budget per listener, not one for the engine.
 #:
-#: Waiting is first come, first served (see ``MLLPSource._take_inflight_slot`` for how strictly)
-#: and never refuses: a frame gets a slot as soon as one frees, and nothing is NAK'd for waiting.
-#: A frame still WAITING is given up, unhandled and unacknowledged, in two cases: stop() began, or
-#: its own connection closed. Either way the sender has no ACK and resends it, so handling the
-#: stale copy would only commit a duplicate. Each case logs a WARNING. A frame that finds a slot
-#: free is handled exactly as with the bound off. ``None``/``0`` disables it, like every cap here.
+#: A frame over the bound waits for a slot, in ``asyncio.Semaphore`` order, and is never refused,
+#: dropped or NAK'd. **Once a frame is decoded it is always handled**, exactly as with the bound off:
+#: the wait sits between reading a frame and committing it, and giving a frame up there would lose
+#: it on an inbound that sends no replies, whose sender never resends. So stop() treats a waiting
+#: frame as it treats one in the handler: it waits for it inside the shutdown grace, and cancels it
+#: past that, as it cancels a slow handler. ``None``/``0`` disables it, like every cap here.
 #:
 #: **Per listener, below the store's group-commit batch.** With ``[store].group_commit_window_ms``
 #: above zero (it ships at 0), a batch flushes early at ``group_commit_max_batch`` rows (64). One
@@ -287,11 +286,6 @@ _TLS_HANDSHAKE_TIMEOUT = 10.0
 # teardown in a test must not silently shorten this too. On the stdlib loop stop() does not wait
 # for it, and on uvloop it can; see stop().
 _TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
-
-# Seconds between checks, while a frame waits for an in-flight slot, that its own connection is
-# still open (BACKLOG #1725 act 3). The stream API offers no event for a peer's EOF, so it is polled;
-# stop() does not wait for this, it wakes the wait at once. The intake pause polls at the same rate.
-_INFLIGHT_POLL_SECONDS = INTAKE_PAUSE_POLL_SECONDS
 
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
@@ -1735,7 +1729,8 @@ class MLLPSource(SourceConnector):
     The caps BACKLOG #1725 added are documented once, on :data:`DEFAULT_MAX_CONNECTIONS_PER_HOST`,
     :data:`DEFAULT_MAX_FRAME_SECONDS` and :data:`DEFAULT_MAX_INFLIGHT_FRAMES` above — what each
     bounds, why the default is the number it is, and what it does NOT cover. Read those rather than a
-    summary here; this docstring deliberately does not restate them.
+    summary here; this docstring deliberately does not restate them, and does not count the caps
+    either, because a closed count is a claim that goes stale the next time a cap is added.
     """
 
     def __init__(self, config: Source) -> None:
@@ -1798,21 +1793,23 @@ class MLLPSource(SourceConnector):
         # negative `max_connections` admits no connection, and a negative `max_frame_bytes` rejects
         # every frame. Written `not > 0` so NaN is refused with them. The same rule the other three
         # listeners get from `positive_cap`, applied here without touching the call sites above.
-        # `max_inflight_frames` (BACKLOG #1725 act 3) joins them: a negative one would let no frame
-        # be handled at all.
-        self.max_inflight_frames: int | None = _cap_setting(
-            s.get("max_inflight_frames", DEFAULT_MAX_INFLIGHT_FRAMES), int
-        )
         for knob, cap in (
             ("max_connections", self.max_connections),
             ("receive_timeout", self.receive_timeout),
             ("max_frame_bytes", self.max_frame_bytes),
-            ("max_inflight_frames", self.max_inflight_frames),
         ):
             if cap is not None and not cap > 0:
                 raise ValueError(
                     f"MLLP {knob}={cap!r} must be above zero (use None or 0 to disable it)"
                 )
+        # BACKLOG #1725 act 3. Read through `positive_cap`, which also names the key when the value
+        # is not a number; a negative one would let no frame be handled at all.
+        self.max_inflight_frames: int | None = positive_cap(
+            s.get("max_inflight_frames", DEFAULT_MAX_INFLIGHT_FRAMES),
+            int,
+            knob="max_inflight_frames",
+            transport="MLLP",
+        )
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
@@ -1857,9 +1854,6 @@ class MLLPSource(SourceConnector):
         # True while this listener runs TLS handshakes itself, after its own checks (BACKLOG #1606);
         # set at start() from the running loop, see `_upgrades_tls_itself`.
         self._upgrade_tls = False
-        # Set with `_stopping`, so a frame waiting for an in-flight slot wakes at stop() rather than
-        # when a slot frees (BACKLOG #1725 act 3). Replaced at every start().
-        self._stop_event = asyncio.Event()
         # The in-flight frame slots, `max_inflight_frames` of them; None when the bound is off.
         # Built at start() rather than here, so a slot a straggler from the previous run never
         # gave back cannot shrink the restarted listener's budget. Each holder releases the
@@ -1874,7 +1868,6 @@ class MLLPSource(SourceConnector):
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
         self._stopping = False  # a restart of this same instance serves again (see __init__)
-        self._stop_event = asyncio.Event()
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
         )
@@ -1920,21 +1913,25 @@ class MLLPSource(SourceConnector):
         self._clients.add(writer)
         task = asyncio.get_running_loop().create_task(self._on_client(reader, writer))
         self._client_tasks.add(task)
-        task.add_done_callback(self._client_task_done)
+        task.add_done_callback(lambda done: self._client_task_done(done, writer))
 
-    def _client_task_done(self, task: asyncio.Task[None]) -> None:
-        """Drop a finished TLS client task, and log a fault the task did not handle itself.
+    def _client_task_done(self, task: asyncio.Task[None], writer: asyncio.StreamWriter) -> None:
+        """Drop a finished TLS client task, close its socket if the task was cancelled or failed,
+        and log a fault the task did not handle itself.
 
-        asyncio does this for a coroutine accept callback; `_on_tls_accept` is not one, so without
-        this an unexpected fault would surface only as "Task exception was never retrieved"."""
+        asyncio does all three for a coroutine accept callback; `_on_tls_accept` is not one. The
+        close matters for a task cancelled before its first step, whose own ``finally`` never ran,
+        which would otherwise leave a paused socket open until it is collected."""
         self._client_tasks.discard(task)
         if task.cancelled():
+            writer.close()
             return
         exc = task.exception()
         if exc is not None:
             logger.error("MLLP client connection task failed: %s", safe_exc(exc))
+            writer.close()
 
-    async def _start_tls(self, writer: asyncio.StreamWriter) -> bool:
+    async def _start_tls(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
         """Run the TLS handshake on an admitted socket; ``False`` when it did not complete.
 
         Bounded both ends (BACKLOG #1606): the handshake by :data:`_TLS_HANDSHAKE_TIMEOUT`, and the
@@ -1955,6 +1952,14 @@ class MLLPSource(SourceConnector):
         the raw transport, already closed, is put back and the socket is treated as a handshake
         that did not complete. An ``AttributeError`` with the transport still in place is a
         different fault and is re-raised.
+
+        **After a successful upgrade the READER is pointed at the TLS transport too.**
+        ``StreamWriter.start_tls`` swaps the writer's and the protocol's transport but leaves the
+        reader on the raw socket, so the reader's flow control would pause the raw socket under
+        the TLS layer. If that pause were in force at a close, the peer's close_notify could not be
+        read and every such close would wait out :data:`_TLS_SHUTDOWN_TIMEOUT`. Pausing the TLS
+        transport instead only stops delivery to the reader, which is what a loop-level TLS
+        listener's reader does.
         """
         assert self._ssl is not None
         raw = writer.transport
@@ -1981,78 +1986,27 @@ class MLLPSource(SourceConnector):
                 raw.get_extra_info("peername"),
             )
             return False
+        reader._transport = writer.transport  # type: ignore[attr-defined]  # see the docstring
         return True
 
-    async def _take_inflight_slot(
-        self,
-        slots: asyncio.Semaphore,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> str | None:
-        """Wait for an in-flight frame slot (BACKLOG #1725 act 3).
+    async def _handle_bounded(self, message: bytes) -> str | None:
+        """Run the inbound handler inside one of this listener's in-flight slots, if the bound is on
+        (BACKLOG #1725 act 3).
 
-        Returns ``None`` once the slot is held, or why the frame was given up instead: ``stopping``
-        or ``connection closed``. A frame that finds a slot free takes it at once, with no other
-        check, so it is handled exactly as it would be with the bound off.
-
-        A frame that must wait queues on ``asyncio.Semaphore``, which wakes waiters in order. The
-        order is not strict: the request joins the queue one loop turn after the frame found no
-        slot, and a slot freed in that turn can go to a frame that arrived later. So a frame can be
-        overtaken by at most the frames of that one turn; it is never starved.
-
-        The wait ends early on stop(), at once, or when this frame's own connection closes, seen
-        within :data:`_INFLIGHT_POLL_SECONDS`. In both cases the sender has no ACK and resends,
-        so handling this copy would only commit a duplicate. A cancellation, which stop() delivers
-        to stragglers, is safe here too: a slot granted in the same turn is handed straight back.
+        The wait is a plain ``acquire()``: first come, first served, never refused, and cancellable,
+        which is how stop() ends it past its shutdown grace, as it ends a slow handler. A frame
+        that is waiting is never given up otherwise, for the reason on
+        :data:`DEFAULT_MAX_INFLIGHT_FRAMES`. The slot is released as soon as the handler returns or
+        raises, before the ACK is written, so a slow reader of ACKs cannot hold one: the bound is
+        on the HANDLING path only. The semaphore released is the one acquired, even if a restart
+        has replaced ``_inflight`` meanwhile.
         """
-        if not slots.locked():
-            await slots.acquire()  # a free slot: acquire() returns without suspending
-            return None
-        acquire = asyncio.ensure_future(slots.acquire())
-        stopping = asyncio.ensure_future(self._stop_event.wait())
-        reason: str | None = None
-        try:
-            while reason is None and not acquire.done():
-                await asyncio.wait(
-                    (acquire, stopping),
-                    timeout=_INFLIGHT_POLL_SECONDS,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if self._stopping:
-                    reason = "stopping"
-                elif writer.is_closing() or reader.at_eof():
-                    reason = "connection closed"
-        except BaseException:
-            stopping.cancel()
-            self._give_up_slot(acquire, slots)
-            raise
-        stopping.cancel()
-        if reason is not None:
-            self._give_up_slot(acquire, slots)  # a slot granted in the same turn is not used
-        return reason
-
-    @staticmethod
-    def _give_up_slot(acquire: asyncio.Future[Any], slots: asyncio.Semaphore) -> None:
-        """Abandon a slot request: hand back a slot already granted, else withdraw the request.
-
-        Withdrawing is safe at any point: asyncio's ``acquire()`` gives back a slot it was granted
-        in the same turn it is cancelled, so no slot is lost either way."""
-        if acquire.done() and not acquire.cancelled() and acquire.exception() is None:
-            slots.release()
-        else:
-            acquire.cancel()
-
-    async def _handle_in_slot(self, message: bytes, slots: asyncio.Semaphore | None) -> str | None:
-        """Run the inbound handler, then give back the in-flight slot the caller took, if any.
-
-        Released as soon as the handler returns or raises, before the ACK is written, so a slow
-        reader of ACKs cannot hold a slot: the bound is on the HANDLING path only."""
         assert self._handler is not None
-        try:
+        slots = self._inflight
+        if slots is None:
             return await self._handler(message)
-        finally:
-            if slots is not None:
-                slots.release()
+        async with slots:
+            return await self._handler(message)
 
     @property
     def sockport(self) -> int:
@@ -2062,10 +2016,8 @@ class MLLPSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
-        # First, so a connection that reaches `_on_client` from here on is refused there unread,
-        # and a frame waiting for an in-flight slot gives up now (BACKLOG #1725 act 3).
+        # First, so a connection that reaches `_on_client` from here on is refused there unread.
         self._stopping = True
-        self._stop_event.set()
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
@@ -2344,22 +2296,6 @@ class MLLPSource(SourceConnector):
             self.max_frame_seconds,
         )
 
-    def _log_inflight_gave_up(self, writer: asyncio.StreamWriter, why: str) -> None:
-        """Record a complete frame given up while it waited for an in-flight slot (BACKLOG #1725).
-
-        The count-and-log rule says nothing is silently dropped, and the `closed` event for the
-        connection reads as a plain end, so this line is the record. It is not a lost message: no
-        ACK was sent, so the sender still holds it and resends. Socket metadata only, never frame
-        bytes. One line per connection, since the connection closes after it, which is the rate
-        the frame-deadline warning beside it already accepts."""
-        logger.warning(
-            "MLLP frame from %s was not handled: it was waiting for one of max_inflight_frames "
-            "(%d) slots when the %s. It was not acknowledged, so the sender resends it.",
-            writer.get_extra_info("peername"),
-            self.max_inflight_frames,
-            "listener began stopping" if why == "stopping" else "connection closed",
-        )
-
     def _frame_seconds_left(self, frame_opened_at: float | None) -> float | None:
         """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
 
@@ -2456,7 +2392,7 @@ class MLLPSource(SourceConnector):
             try:
                 if self._upgrade_tls:
                     handshaking = True
-                    if not await self._start_tls(writer):
+                    if not await self._start_tls(reader, writer):
                         return  # never a session: no `established`, so no `closed` either
                     handshaking = False
                     if self._stopping:
@@ -2534,21 +2470,11 @@ class MLLPSource(SourceConnector):
                     try:
                         decoded = 0
                         handler_dropped = False
-                        gave_up = False
                         for message in decoder.feed(chunk):
                             decoded += 1
-                            # BACKLOG #1725 act 3: at most `max_inflight_frames` frames of this
-                            # listener are in the handler at once. The same object is released as
-                            # was taken, even if a restart has replaced `_inflight` meanwhile.
-                            slots = self._inflight
-                            if slots is not None:
-                                why = await self._take_inflight_slot(slots, reader, writer)
-                                if why is not None:
-                                    self._log_inflight_gave_up(writer, why)
-                                    gave_up = True
-                                    break
                             try:
-                                reply = await self._handle_in_slot(message, slots)
+                                # BACKLOG #1725 act 3: bounded per listener; see the method.
+                                reply = await self._handle_bounded(message)
                             except Exception as exc:  # noqa: BLE001 -- see _answer_handler_failure
                                 # BACKLOG #1619: the handler faulted on a frame the decoder read
                                 # cleanly, which is not a framing fault. A store outage at the
@@ -2569,8 +2495,6 @@ class MLLPSource(SourceConnector):
                         if handler_dropped:
                             failed = True  # handler_error already names why this closes
                             break
-                        if gave_up:
-                            break  # close as on EOF, as the intake pause does; logged above
                         # Charge AFTER the messages in this chunk are fully handled and ACKed.
                         if pacer is not None:
                             pacer.settle(decoded)

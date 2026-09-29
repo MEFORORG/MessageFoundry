@@ -1121,9 +1121,11 @@ async def test_a_peer_dropping_as_its_handshake_completes_is_closed_quietly(
 async def test_stop_closes_an_unhandshaken_socket_without_close_clients(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """uvloop's Server has no close_clients(), so before the fix stop() could not reach a socket
-    still in its handshake there and left it to the handshake bound. Such a socket is tracked with
-    every other client now, so stop() closes it on any loop."""
+    """Where the listener upgrades TLS itself (the stdlib loop), a socket still in its handshake is
+    tracked with every other client, so stop() closes it even on a server with no close_clients().
+    Before the fix only close_clients() could reach it. uvloop keeps the loop-level handshake and is
+    NOT covered by this: there stop() leaves such a socket to the handshake bound, which
+    `test_stop_and_restart_on_uvloop` pins."""
     monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
     source, _cert_path = _tls_source(tmp_path)
     await source.start(_ack)
@@ -1149,3 +1151,43 @@ async def test_stop_closes_an_unhandshaken_socket_without_close_clients(
     finally:
         if not stopped:
             await source.stop()
+
+
+async def test_the_reader_follows_the_socket_into_tls(tmp_path: Path) -> None:
+    """``StreamWriter.start_tls`` moves the writer and the protocol onto the TLS transport but leaves
+    the reader on the raw socket, so the reader's flow control would pause the raw socket under the
+    TLS layer and a close could then wait out the close-exchange bound. The listener moves the
+    reader across itself; this pins it for a real handshake."""
+    source, cert = _tls_source(tmp_path)
+    seen: list[bool] = []
+    real_start_tls = source._start_tls
+
+    async def spy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
+        ok = await real_start_tls(reader, writer)
+        seen.append(ok and reader._transport is writer.transport)  # type: ignore[attr-defined]
+        return ok
+
+    source._start_tls = spy  # type: ignore[method-assign]
+    await source.start(_ack)
+    try:
+        dest = MLLPDestination(
+            Destination(
+                name="out",
+                type=ConnectorType.MLLP,
+                settings={
+                    "host": "127.0.0.1",
+                    "port": source.sockport,
+                    "timeout_seconds": 5,
+                    "tls": True,
+                    "tls_ca_file": cert,
+                    "tls_check_hostname": True,
+                },
+            )
+        )
+        try:
+            await dest.send(ADT)
+        finally:
+            await dest.aclose()
+    finally:
+        await source.stop()
+    assert seen == [True]
