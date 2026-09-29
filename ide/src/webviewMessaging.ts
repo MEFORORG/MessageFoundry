@@ -85,6 +85,9 @@
 //     could post into them, and no policy in the extension sets `frame-src` or `child-src` — nested
 //     frames fall back to `default-src 'none'`.
 //   * The discriminator check at each receiver, which is what makes an unexpected message a no-op.
+//   * The payload shape check at each receiver: every message it handles must carry its required
+//     fields with the right JS types, or it is discarded. Seven receivers use `SHAPE_HELPERS` below;
+//     Test Bench keeps its own `shapeOk()`. Types only: value ranges are not checked here.
 //
 // WHAT THIS DOES NOT COVER, stated so a reviewer does not have to infer it. The token authenticates
 // the SENDER, not the message: a host-side bug that posts the wrong payload is stamped as validly as
@@ -179,9 +182,9 @@ export function postToWebview(
 /**
  * JSON for interpolation into an inline `<script>`, with `<` escaped so no value can close the tag.
  *
- * The same rule the per-panel `embed()` helpers use. The token is base64url and could not carry a
- * `<` today; routing it through the escape anyway is what keeps that from becoming an unstated
- * assumption the next value inherits.
+ * The panel scripts (`*Webview.ts`) embed their seed data with it too. The token is base64url and
+ * could not carry a `<` today; routing it through the escape anyway is what keeps that from becoming
+ * an unstated assumption the next value inherits.
  */
 export function embedJson(value: unknown): string {
   return JSON.stringify(value ?? null).replace(/</g, "\\u003c");
@@ -212,3 +215,34 @@ export function guardScript(token: string): string {
       return d;
     }`;
 }
+
+/**
+ * The payload-shape helpers a receiver runs AFTER `mfTrusted()`, as inline script source.
+ *
+ * ASVS 3.5.5 asks a receiver to check the syntax of what it is handed, not only who handed it. Here
+ * that means the REQUIRED FIELDS of each message and their JS types. Value ranges and business limits
+ * are a different requirement and are not checked here. A receiver declares one entry per message it
+ * handles and calls `mfShapeOk(d, 'command', SHAPES, '<panel>')`; on `false` it returns without
+ * acting. A message whose discriminator has no entry is discarded the same way.
+ *
+ * Test Bench predates this and keeps its own `shapeOk()` (testBenchWebview.ts). The `mf` prefix keeps
+ * these names clear of any panel's own helpers.
+ */
+export const SHAPE_HELPERS = `
+    // PAYLOAD SHAPE (ASVS 3.5.5): required fields and their JS types. See webviewMessaging.ts.
+    function mfStr(x) { return typeof x === 'string'; }
+    function mfNum(x) { return typeof x === 'number' && Number.isFinite(x); }
+    function mfInt(x) { return Number.isSafeInteger(x); }
+    function mfBool(x) { return typeof x === 'boolean'; }
+    function mfObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
+    function mfArrOf(x, f) { return Array.isArray(x) && x.every((v) => f(v) === true); }
+    // An OPTIONAL field: absent (or null) passes, present must match.
+    function mfOpt(x, f) { return x === undefined || x === null || f(x) === true; }
+    function mfShapeOk(d, key, shapes, panel) {
+      const k = d[key];
+      const check = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k) ? shapes[k] : null;
+      if (check && check(d) === true) { return true; }
+      // Named in the webview console, so a host and page that drift apart read as a discard.
+      console.warn('MessageFoundry ' + panel + ': discarded a malformed "' + String(k) + '" message');
+      return false;
+    }`;
