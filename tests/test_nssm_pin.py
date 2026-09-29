@@ -284,7 +284,14 @@ _CASES = r"""
   $throwWith = ''; $changeApplies = $false
   Invoke-AccountCase 'acct-not-applied' { Set-ServiceAccount -ServiceName 'Svc' -Account 'NT SERVICE\Svc' }
   $changeApplies = $true
-  Invoke-AccountCase 'acct-canonical' { Set-ServiceAccount -ServiceName 'Svc' -Account $env:USERNAME }
+  # The bare name comes from [Environment]::UserName, which asks the OS, NOT from $env:USERNAME: Linux
+  # pwsh does not set that variable, and CI run 36610203607 went red on ubuntu when this case handed
+  # Set-ServiceAccount an empty name. USERNAME is cleared around the case so that the variable
+  # creeping back in fails on every host, not only on Linux.
+  $savedUser = $env:USERNAME; $env:USERNAME = $null
+  $bareName = [Environment]::UserName
+  Invoke-AccountCase 'acct-canonical' { Set-ServiceAccount -ServiceName 'Svc' -Account $bareName }
+  $env:USERNAME = $savedUser
   # Where each resolver case left nssm.exe, and what it holds; and what was sent to icacls.
   $res['homes'] = @{}
   foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -Filter 'home-*')) {
