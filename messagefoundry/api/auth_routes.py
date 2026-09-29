@@ -202,7 +202,8 @@ def _rate_limited(request: Request, label: str) -> HTTPException:
     return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many attempts; please retry later")
 
 
-def _service(request: Request) -> AuthService:
+async def _service(request: Request) -> AuthService:
+    # ``async`` for the reason ``messagefoundry.api.app._get_engine`` gives; keep it non-blocking.
     auth = get_auth(request)
     if auth is None or not auth.enabled:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")
