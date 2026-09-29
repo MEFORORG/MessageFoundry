@@ -89,6 +89,7 @@ _DEK_DEPARTURES = frozenset(
         "8.1.5.2.1 generation",
         "8.2.4 key derivation",
         "5.3.6 cryptoperiod",
+        "7.4 deactivated",
         "7.5 compromised",
         "8.3.4 destruction",
     }
@@ -509,22 +510,35 @@ def test_the_totp_mapping_row_takes_no_cryptoperiod() -> None:
     )
 
 
-def dek_clause_rows(doc: str) -> dict[str, str]:
-    """Each WRITTEN row of the DEK's SP 800-57 mapping, by its clause (first cell) -> the whole row."""
+def dek_clause_rows(doc: str) -> tuple[dict[str, str], list[str]]:
+    """The DEK mapping's WRITTEN rows by clause -> whole row, and any clause written twice.
+
+    Only lines inside the DEK mapping subsection are read, so a row elsewhere in the doc that
+    happens to lead with the same clause can neither stand in for one nor mask an edit to one."""
     lines = doc.splitlines()
-    firsts = set(_first_cells(lines, _DEK_MAPPING_HEADING))
+    start = next((i for i, ln in enumerate(lines) if ln.startswith(_DEK_MAPPING_HEADING)), None)
+    if start is None:
+        return {}, []
+    end = next(
+        (i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.startswith("### ")),
+        len(lines),
+    )
+    section = lines[start:end]
+    firsts = _first_cells(section, _DEK_MAPPING_HEADING)
     rows: dict[str, str] = {}
-    for line in lines:
+    for line in section:
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if line.startswith("| ") and cells[0] in firsts:
             rows.setdefault(cells[0], line)
-    return rows
+    twice = sorted({c for c in firsts if firsts.count(c) > 1})
+    return rows, twice
 
 
 def dek_mapping_problems(doc: str) -> list[str]:
     """Where the DEK mapping departs from :data:`_DEK_CLAUSES` and :data:`_DEK_DEPARTURES`."""
-    rows = dek_clause_rows(doc)
-    problems = [f"missing clause row: {c}" for c in sorted(_DEK_CLAUSES - set(rows))]
+    rows, twice = dek_clause_rows(doc)
+    problems = [f"clause row written twice: {c}" for c in twice]
+    problems += [f"missing clause row: {c}" for c in sorted(_DEK_CLAUSES - set(rows))]
     problems += [f"clause row not in _DEK_CLAUSES: {c}" for c in sorted(set(rows) - _DEK_CLAUSES)]
     problems += [
         f"departure no longer named: {c}"
@@ -538,7 +552,7 @@ def test_the_dek_has_a_clause_by_clause_sp800_57_mapping() -> None:
     """BACKLOG #1162: the DEK's SP 800-57 alignment is mapped, not only claimed. Row PRESENCE and the
     departure flags only; whether each row reads the standard correctly is the reviewer's job."""
     doc = _DOC.read_text(encoding="utf-8")
-    assert len(dek_clause_rows(doc)) >= 10, "the DEK mapping table or its heading moved"
+    assert len(dek_clause_rows(doc)[0]) >= 10, "the DEK mapping table or its heading moved"
     problems = dek_mapping_problems(doc)
     assert not problems, f"DEK SP 800-57 mapping under '{_DEK_MAPPING_HEADING}': {problems}"
 
@@ -558,11 +572,57 @@ def test_the_dek_mapping_guard_turns_red() -> None:
     emptied = [f"{row} - | - | - |" if line.startswith(row) else line for line in lines]
     assert "missing clause row: 5.2 one purpose" in dek_mapping_problems("\n".join(emptied))
     stripped = [
-        line.replace("**Departure.**", "") if line.startswith(row) else line for line in lines
+        re.sub(r"\*\*Departure[^*]*\*\*", "", line) if line.startswith(row) else line
+        for line in lines
     ]
     assert "departure no longer named: 5.2 one purpose" in dek_mapping_problems("\n".join(stripped))
     # The DEK rows must not count as the other keys' mapping rows, and must not be found without
     # their own heading.
+    doubled = [line for line in lines for _ in range(2 if line.startswith(row) else 1)]
+    assert "clause row written twice: 5.2 one purpose" in dek_mapping_problems("\n".join(doubled))
     headless = doc.replace(_DEK_MAPPING_HEADING, "### A renamed heading")
     assert "missing clause row: 8.3.4 destruction" in dek_mapping_problems(headless)
     assert not ({"5.2 one purpose"} & mapping_labels(doc))
+
+
+#: Code symbols the DEK mapping cites, by module. A rename leaves the prose pointing at nothing.
+_DEK_CITED_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "messagefoundry/store/crypto.py": (
+        "derive_store_data_key",
+        "_SubkeyDeriver",
+        "_derive_audit_mac_key",
+        "rotation_fingerprint_key",
+        "_WriteKey",
+        "generate_key",
+        "_secure_zero",
+        "_lock_memory",
+    ),
+    "messagefoundry/store/backup_codec.py": ("ArchiveHeader", "frame_key"),
+    "messagefoundry/pipeline/dr_backup.py": ("_resolve_key", "_store_salt"),
+    "messagefoundry/store/store.py": ("settle_audit_ranges",),
+}
+
+
+def test_the_dek_mapping_cites_live_code() -> None:
+    """The symbols and defaults the DEK mapping quotes must still exist and match, so a rename or a
+    changed default turns this red instead of leaving the mapping quietly wrong."""
+    from messagefoundry.config.settings import SecretRotationSettings
+    from messagefoundry.store.crypto import CipherInfo  # noqa: F401 - cited as the fingerprint view
+    from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION
+
+    doc = _DOC.read_text(encoding="utf-8")
+    rows, _ = dek_clause_rows(doc)
+    section = "\n".join(rows.values())
+    for rel, names in _DEK_CITED_SYMBOLS.items():
+        source = (_ROOT / rel).read_text(encoding="utf-8")
+        for name in names:
+            assert re.search(rf"`[^`]*\b{name}\b[^`]*`", doc), (
+                f"{name} is listed here but not cited"
+            )
+            assert re.search(rf"^\s*(?:async\s+)?(?:def|class)\s+{name}\b", source, re.M), (
+                f"{rel} no longer defines {name}, which the DEK mapping cites"
+            )
+    defaults = SecretRotationSettings()
+    assert defaults.store_key_max_age_days == 365 and "`store_key_max_age_days` (365)" in section
+    assert defaults.enforce_grace_days == 30 and "`enforce_grace_days` (30)" in section
+    assert AUDIT_KEY_EPOCH_ACTION == "audit.key_epoch" and "`audit.key_epoch`" in doc
