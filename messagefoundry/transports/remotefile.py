@@ -28,6 +28,8 @@ transient, never written blind (BACKLOG #1936). Only a credential fault keeps it
 after the handler returns — moves the file to ``processed_subdir`` (or deletes it per ``after_read``).
 A handler failure leaves the file in place to re-emit (at-least-once); an over-``max_file_bytes`` file
 is moved to ``error_subdir`` before it's retrieved (a transport-level reject, like the File source).
+A file is read only once it lists at the same size on two polls in a row (the settle gate, BACKLOG
+#2071; :meth:`RemoteFileSource._settled`), so every file waits at least one poll.
 
 **``max_file_bytes`` is charged TWICE, and the second charge is the one that binds** (BACKLOG #1191).
 The pre-retrieve gate compares the size the server reported in its own directory listing, so it is
@@ -110,6 +112,8 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
     LEAVE_SEEN_CACHE_MAX,
+    SETTLE_MISS_LIMIT,
+    SETTLE_SEEN_MAX,
     ScanRejected,
     _content_matches_declared,
     render_filename,
@@ -1538,6 +1542,10 @@ class RemoteFileSource(SourceConnector):
         # ledger's own count cap. A miss falls through to ledger.is_processed(); eviction never causes a
         # false re-ingest. Never a cleartext filename; never logged at INFO+.
         self._processed_seen: OrderedDict[str, None] = OrderedDict()
+        # BACKLOG #2071 settle gate: the listed size each not-yet-admitted file showed at the poll that
+        # last saw it, and how many polls in a row have since failed to list it, keyed by name. In
+        # memory only and never logged. See _settled.
+        self._settle_seen: dict[str, tuple[int, int]] = {}
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
         self._validate_directory: bool = bool(s.get("validate_directory", False))
@@ -1670,6 +1678,7 @@ class RemoteFileSource(SourceConnector):
         entries = await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         newly_recorded = 0  # #142: files marked processed THIS poll — gates one end-of-poll prune
         listing = sorted(entries)
+        self._prune_settle(listing)
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, (name, size) in enumerate(listing):
             if self._stop.is_set():
@@ -1707,6 +1716,10 @@ class RemoteFileSource(SourceConnector):
             # mtime) — never a cleartext filename, never logged at INFO+.
             file_key = self._file_key(name, size) if self._after_read == "leave" else None
             if file_key is not None and await self._leave_already_ingested(file_key):
+                continue
+            if not self._settled(name, size):
+                # BACKLOG #2071: first sighting, or the listed size changed since the last poll.
+                # Nothing is read, moved or charged against the per-tick budget.
                 continue
             if self._max_file_bytes is not None and size > self._max_file_bytes:
                 # Transport-level reject *before* any bytes are read — parallels the File source's
@@ -1755,6 +1768,8 @@ class RemoteFileSource(SourceConnector):
                     exc.read,
                     exc.after,
                 )
+                # Still moving, so it must settle again from its latest size (#2071).
+                self._remember_size(name, exc.read if exc.after is None else exc.after)
                 continue
             except _RemoteError as exc:
                 # Transient (locked / vanished mid-poll): leave it in place to retry next poll rather
@@ -1849,7 +1864,8 @@ class RemoteFileSource(SourceConnector):
         one quarantined to ``error_subdir`` (over the listed size, over the retrieved size, a
         content-vs-type mismatch, a scanner rejection). Those leave the poll directory, so the next poll
         starts on new work. The arms that leave a file **in place** for a later retry — a refused unsafe
-        listing name, a transient retrieve failure, a malfunctioning scan hook, a handler failure — do
+        listing name, a file not yet settled (#2071), a transient retrieve failure, a malfunctioning
+        scan hook, a handler failure — do
         NOT charge, because a stuck file that sorts early would otherwise eat the whole budget every
         poll and starve the healthy files behind it. This mirrors
         :meth:`~messagefoundry.transports.file.FileSource._at_ceiling`, which states the rule in full.
@@ -1865,6 +1881,65 @@ class RemoteFileSource(SourceConnector):
             remaining,
         )
         return True
+
+    def _settled(self, name: str, size: int) -> bool:
+        """True when ``name`` lists at the same size it listed at the last poll that looked at it,
+        which admits it for reading (BACKLOG #2071). Otherwise remember ``size`` and return False, so
+        the file waits for a later poll.
+
+        This is the local File source's settle gate (#1811) ported here, and
+        :meth:`~messagefoundry.transports.file.FileSource._settled` states the rule in full: why it
+        exists beside #116, why it is always on with no setting, and why ``poll_seconds`` is its
+        window. It shares that source's memory bounds, ``SETTLE_SEEN_MAX`` and ``SETTLE_MISS_LIMIT``.
+
+        **Where it differs.** A remote listing carries no reliable modification time, so the signal
+        is the listed size alone, the one :meth:`_file_key` already uses. So besides what the local
+        gate cannot see, this one also misses a same-size rewrite, and a server that lists every
+        file at the same size, or at 0, as an FTP server without ``MLSD`` or ``SIZE`` does. On such
+        a server every file waits one poll and nothing more. The key is the name, since every
+        listed file sits in the one ``remote_dir``."""
+        seen = self._settle_seen.get(name)
+        if seen is not None and seen[0] == size:
+            del self._settle_seen[name]
+            return True
+        recorded = self._remember_size(name, size)
+        # safe_name hashes the name, so skip it when nobody reads the line.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "REMOTEFILE %s: %s not yet settled (listed at %d bytes); %s",
+                _redact(self._host, self._remote_dir),
+                safe_name(name),
+                size,
+                "waiting for the next poll to agree"
+                if recorded
+                else f"settle memory is full ({SETTLE_SEEN_MAX}), so it waits for room",
+            )
+        return False
+
+    def _remember_size(self, name: str, size: int) -> bool:
+        """Record ``size`` as this poll's sighting of ``name`` and return True. At ``SETTLE_SEEN_MAX``
+        a name not already recorded is left out and this returns False, so it waits for room; the
+        local source's constant says why that is not eviction."""
+        if name in self._settle_seen or len(self._settle_seen) < SETTLE_SEEN_MAX:
+            self._settle_seen[name] = (size, 0)
+            return True
+        return False
+
+    def _prune_settle(self, listing: list[tuple[str, int]]) -> None:
+        """Forget a file once ``SETTLE_MISS_LIMIT`` polls in a row have not listed it (moved, deleted,
+        renamed away), so the settle map is bounded by the poll directory. A file listed again has its
+        count reset. A failed listing raises before this runs, so it never counts as a miss."""
+        if not self._settle_seen:
+            return
+        listed = {name for name, _ in listing}
+        for name, (size, missed) in list(self._settle_seen.items()):
+            if name in listed:
+                if missed:
+                    self._settle_seen[name] = (size, 0)
+            elif missed + 1 >= SETTLE_MISS_LIMIT:
+                del self._settle_seen[name]
+            else:
+                self._settle_seen[name] = (size, missed + 1)
 
     def _file_key(self, name: str, size: int) -> str:
         """A stable, HASHED identity for a remote source file, for the leave-in-place dedup ledger
