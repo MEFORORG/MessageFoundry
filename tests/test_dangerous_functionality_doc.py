@@ -23,7 +23,7 @@ This file derives two inventories from ``messagefoundry/**`` by AST and holds th
 
 Four more checks hold the page's later lists and counts to the tree (BACKLOG #1190): the section 7
 archive readers, the section 8 service-script table, the section 9 extension counts over ``ide/src``,
-and the section 10 count of ``innerHTML`` writes in the web console's scripts, plus the claim that
+and the section 10 count of HTML writes in the web console's scripts, plus the claim that
 the console's Python holds none of the engine's classes. The TypeScript and JavaScript checks read
 by pattern, not by parser, and skip whole-line comments only.
 
@@ -147,6 +147,8 @@ def _imports_any(source: str, libs: tuple[str, ...], attr: str | None = None) ->
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module is not None:
+            if attr is not None and any(alias.name == attr for alias in node.names):
+                return True
             names = [node.module]
         elif attr is not None and isinstance(node, ast.Attribute) and node.attr == attr:
             return True
@@ -662,7 +664,8 @@ def _service_drift(text: str, live: set[str]) -> list[str]:
 def _script_code_lines(source: str) -> list[str]:
     """Lines of a TypeScript or JavaScript file that are not whole-line comments, by the rule
     ``_is_comment_only`` in ``scripts/security/crypto_inventory_check.py`` uses. A trailing comment
-    stays on its line; the patterns below never match inside one that follows a real call."""
+    stays on its line, so a call named inside one counts, and so does a line inside a block comment
+    that does not start with ``*``. The page says so."""
     return [line for line in source.splitlines() if not line.lstrip().startswith(("//", "*", "/*"))]
 
 
@@ -680,6 +683,8 @@ def _ide_sources() -> dict[str, str]:
 _IDE_CALLS: dict[str, re.Pattern[str]] = {
     "execFile": re.compile(r"\bexecFile\("),
     "createTerminal": re.compile(r"\.createTerminal\("),
+    "startDebugging": re.compile(r"\.startDebugging\("),
+    "openExternal": re.compile(r"\.openExternal\("),
     "enableScripts: true": re.compile(r"\benableScripts:\s*true\b"),
 }
 
@@ -723,18 +728,23 @@ _CHILD_PROCESS_IMPORT_RE = re.compile(
 )
 
 
-def _child_process_problems(sources: Mapping[str, str]) -> list[str]:
-    """Section 9 says every process start uses ``execFile``. So every code line naming
-    ``child_process`` must be a named import of ``execFile`` alone; a ``spawn``, an ``exec``, a
-    namespace import or a ``require`` fails here."""
+#: VS Code task runners. Section 9 has no row for them, so any use must fail until it gets one.
+_VSCODE_TASK_RE = re.compile(r"\b(?:ShellExecution|ProcessExecution|executeTask)\b")
+
+
+def _other_start_problems(sources: Mapping[str, str]) -> list[str]:
+    """Starts section 9's table has no row for. Every code line naming ``child_process`` must be a
+    named import of ``execFile`` alone, so a ``spawn``, an ``exec``, a namespace import or a
+    ``require`` fails here; so does any VS Code task."""
     problems: list[str] = []
     for rel, source in sources.items():
         for line in _script_code_lines(source):
-            if "child_process" not in line:
-                continue
-            match = _CHILD_PROCESS_IMPORT_RE.match(line)
-            names = {name.strip() for name in match.group(1).split(",")} if match else set()
-            if names != {"execFile"}:
+            if "child_process" in line:
+                match = _CHILD_PROCESS_IMPORT_RE.match(line)
+                names = {name.strip() for name in match.group(1).split(",")} if match else set()
+                if names != {"execFile"}:
+                    problems.append(f"{rel}: {line.strip()}")
+            if _VSCODE_TASK_RE.search(line):
                 problems.append(f"{rel}: {line.strip()}")
     return problems
 
@@ -755,22 +765,26 @@ def _console_python() -> dict[str, str]:
     }
 
 
-_INNER_HTML_RE = re.compile(r"\.innerHTML\s*=(?!=)")
+#: Writes of an HTML string into the page: an assignment or ``+=`` to ``innerHTML`` or
+#: ``outerHTML``, ``insertAdjacentHTML`` and ``document.write``.
+_HTML_SINK_RE = re.compile(
+    r"\.(?:inner|outer)HTML\s*\+?=(?!=)|\.insertAdjacentHTML\(|\bdocument\.write(?:ln)?\("
+)
 
 
 def _console_sink_count(scripts: Mapping[str, str]) -> int:
     return sum(
-        len(_INNER_HTML_RE.findall(line))
+        len(_HTML_SINK_RE.findall(line))
         for source in scripts.values()
         for line in _script_code_lines(source)
     )
 
 
 def _console_drift(text: str, live: int) -> list[str]:
-    match = re.search(r"into `innerHTML` in (\d+) places", _section(text, 10))
-    assert match is not None, "section 10 does not state 'into `innerHTML` in <N> places'"
+    match = re.search(r"writes HTML\s+into the page in (\d+) places", _section(text, 10))
+    assert match is not None, "section 10 does not state 'writes HTML into the page in <N> places'"
     page = int(match.group(1))
-    return [] if page == live else [f"section 10 says {page} innerHTML writes; the code has {live}"]
+    return [] if page == live else [f"section 10 says {page} HTML writes; the code has {live}"]
 
 
 #: Calls that import or run a module named at run time.
@@ -787,8 +801,16 @@ def _called_name(call: ast.Call) -> str | None:
 
 def _console_python_problems(sources: Mapping[str, str]) -> list[str]:
     """Section 10 says the console's Python makes no process start, native call, archive read or
-    import by name. The first three reuse the engine inventories above."""
-    problems = [f"{rel} imports ctypes" for rel in sorted(_ctypes_modules(sources))]
+    import by name. The first three reuse the engine inventories above. Its inline scripts live in
+    Python strings, so an HTML write in any non-comment line is reported too: section 10's count
+    covers only ``static/``."""
+    problems = [
+        f"{rel}:{number} writes HTML into the page"
+        for rel, source in sorted(sources.items())
+        for number, line in enumerate(source.splitlines(), start=1)
+        if not line.lstrip().startswith("#") and _HTML_SINK_RE.search(line)
+    ]
+    problems += [f"{rel} imports ctypes" for rel in sorted(_ctypes_modules(sources))]
     problems += [f"{rel} starts a process" for rel in sorted(_start_sites(sources))]
     problems += [f"{rel} reads an archive" for rel in sorted(_archive_modules(sources))]
     for rel, source in sorted(sources.items()):
@@ -818,7 +840,7 @@ def test_every_service_script_has_a_row() -> None:
 
 def test_the_extension_counts_match_the_code() -> None:
     problems = _ide_drift(_doc_text(), _ide_counts(_ide_sources()))
-    _assert_no_drift(9, problems + _child_process_problems(_ide_sources()))
+    _assert_no_drift(9, problems + _other_start_problems(_ide_sources()))
 
 
 def test_the_console_matches_the_code() -> None:
@@ -831,6 +853,7 @@ def test_the_later_section_detectors_fire() -> None:
     assert _imports_archive_lib("import tarfile\n")
     assert _imports_archive_lib("from compression import zstd\n")
     assert _imports_archive_lib("import shutil\nshutil.unpack_archive(p, d)\n")
+    assert _imports_archive_lib("from shutil import unpack_archive\nunpack_archive(p, d)\n")
     assert not _imports_archive_lib('"""import tarfile"""\nNOTE = "zipfile"\n')
     assert "install-service.ps1" in _service_scripts()
     live = _ide_counts(_ide_sources())
@@ -841,16 +864,26 @@ def test_the_later_section_detectors_fire() -> None:
         "// vscode.window.createTerminal(x)\n * execFile(a, b)\nconst s = 'enableScripts: false';\n"
     )
     assert _ide_counts({"a.ts": quiet}) == dict.fromkeys(_IDE_CALLS, (0, 0))
-    assert _console_sink_count(_console_scripts()), "no innerHTML write found: the scan is dead"
+    assert _console_sink_count(_console_scripts()), "no HTML write found: the scan is dead"
     assert _console_sink_count({"a.js": "// el.innerHTML = x\nif (el.innerHTML == y) {}\n"}) == 0
-    assert _console_sink_count({"a.js": "el.innerHTML = x; // server-built\n"}) == 1
+    for sink in (
+        "el.innerHTML = x; // server-built",
+        "el.innerHTML += x;",
+        "el.outerHTML = x;",
+        "el.insertAdjacentHTML('beforeend', x);",
+        "document.write(x);",
+    ):
+        assert _console_sink_count({"a.js": sink}) == 1, sink
+    assert not _other_start_problems({"a.ts": 'import { execFile } from "node:child_process";'})
     for planted in (
         'import { spawn } from "node:child_process";',
         'import { execFile, exec } from "child_process";',
         'import * as cp from "node:child_process";',
         'const cp = require("child_process");',
+        "await vscode.tasks.executeTask(task);",
+        "const run = new vscode.ShellExecution(cmd);",
     ):
-        assert _child_process_problems({"a.ts": planted}), planted
+        assert _other_start_problems({"a.ts": planted}), planted
     assert _console_python(), "no console Python found: the scan is dead"
     assert not _console_python_problems({"a.py": '"""subprocess.run, import ctypes"""\n'})
     for planted in (
@@ -859,6 +892,7 @@ def test_the_later_section_detectors_fire() -> None:
         "import zipfile\n",
         "import importlib\nimportlib.import_module(name)\n",
         "__import__(name)\n",
+        "JS = 'el.innerHTML = x;'\n",
     ):
         assert _console_python_problems({"a.py": planted}), planted
 
@@ -892,8 +926,6 @@ def test_later_section_drift_is_reported() -> None:
     grown["newPanel.ts"] = "panel.webview.options = { enableScripts: true };\n"
     assert _ide_drift(text, _ide_counts(grown))
 
-    claim = f"into `innerHTML` in {sinks} places"
-    assert _console_drift(
-        _replace_once(text, claim, f"into `innerHTML` in {sinks + 1} places"), sinks
-    )
+    claim = f"into the page in {sinks} places"
+    assert _console_drift(_replace_once(text, claim, f"into the page in {sinks + 1} places"), sinks)
     assert _console_drift(text, sinks + 1)
