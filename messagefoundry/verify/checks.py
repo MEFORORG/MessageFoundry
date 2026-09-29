@@ -25,9 +25,13 @@ import socket
 import sys
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from messagefoundry import __version__
 from messagefoundry.verify.model import CheckResult, Status
+
+if TYPE_CHECKING:
+    from messagefoundry.config.settings import AuthSettings, StoreSettings
 
 
 def _can_import(module: str) -> bool:
@@ -310,6 +314,66 @@ def check_console_no_window() -> CheckResult:
         "every sc.exe spawn passes CREATE_NO_WINDOW; visually confirm no console flashes "
         "during the Status-page poll",
         evidence=", ".join(_NO_WINDOW_MODULES),
+    )
+
+
+def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckResult:
+    """ADR 0197 Amendment A, AC-A9: name every account that is still lockable with no way past.
+
+    Runs ``AuthService.lockable_account_census`` against the configured store: every local account
+    ``[security].require_mfa`` covers that holds a chosen password and no authenticator app, and every
+    enabled TOTP secret the engine cannot decrypt. A finding FAILS this check, so an operator sees
+    it, and it never stops ``serve`` -- the engine only warns and audits at startup. Usernames only;
+    no secret is printed. A SQLite store that does not exist yet is SKIP, as nothing is at risk.
+
+    Imports lazily: ``--section host`` must not pull the store stack in (see ``smoke.py``)."""
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.verify.smoke import missing_sqlite_store
+
+    rid, title = "auth.lockable_accounts", "Accounts with no way past a sign-in lock"
+    absent = missing_sqlite_store(store)
+    if absent is not None:
+        return CheckResult(rid, title, Status.SKIP, f"no SQLite store at {absent} yet")
+
+    from messagefoundry.auth.service import AuthService, LockableAccountCensus
+    from messagefoundry.store.base import open_store
+
+    async def _census() -> LockableAccountCensus:
+        handle = await open_store(store, keyless_chain_refusal=None)  # read-only
+        try:
+            return await AuthService(handle, auth).lockable_account_census()
+        finally:
+            await handle.close()
+
+    try:
+        census = run_guarded(_census())
+    except Exception as exc:  # any driver or decode failure: the check broke, not a finding
+        return CheckResult(rid, title, Status.ERROR, f"could not read the accounts: {exc}")
+    if census.clean:
+        return CheckResult(
+            rid,
+            title,
+            Status.PASS,
+            "every local account the MFA requirement covers holds a generated credential or an "
+            "authenticator app, and every enabled TOTP secret decrypts",
+        )
+    parts: list[str] = []
+    if census.no_way_past:
+        parts.append(
+            "chosen password and no authenticator app (anyone who knows the username can lock them "
+            "out): " + ", ".join(census.no_way_past)
+        )
+    if census.undecryptable_totp:
+        parts.append(
+            "TOTP secret this engine cannot decrypt: " + ", ".join(census.undecryptable_totp)
+        )
+    return CheckResult(
+        rid,
+        title,
+        Status.FAIL,
+        "; ".join(parts)
+        + ". Ask each holder to enrol an authenticator app, or reset the account's factors "
+        "(POST /users/{id}/reset-mfa), which issues a generated credential.",
     )
 
 

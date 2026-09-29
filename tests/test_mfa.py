@@ -2399,3 +2399,139 @@ async def test_disable_mfa_refuses_removing_totp_while_covered_even_beside_a_pas
         assert (await service.mfa_status(identity)).enabled is True
     finally:
         await store.close()
+
+
+# --- ADR 0197 Amendment A, AC-A9: the census of accounts with no way past -------------------------
+
+
+async def test_the_census_names_a_covered_chosen_password_with_no_totp_and_only_that(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A must-change Administrator whose password was typed for it (``create_admin``) is covered,
+    holds a chosen credential and no TOTP: named. A generated credential, a TOTP holder, a disabled
+    account and a directory account are not. With the requirement off, nothing is covered."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await create_admin(service)
+        await _created_holder(service, username="generated")
+        enrolled_id, _ = await _created_holder(service, username="enrolled")
+        await store.set_totp_secret(enrolled_id, secret="JBSWY3DPEHPK3PXP")
+        await store.enable_totp(enrolled_id, recovery_code_hashes=[])
+        disabled_id, _ = await _created_holder(service, username="disabled")
+        await store.set_password(
+            disabled_id, password_hash="h", password_generated=False, must_change_password=False
+        )
+        await store.set_user_disabled(disabled_id, disabled=True)
+        await store.create_user(
+            user_id="dir-1", username="directory", auth_provider="ad", password_generated=False
+        )
+        census = await service.lockable_account_census()
+        assert census.no_way_past == (ADMIN_USERNAME,)
+        assert census.undecryptable_totp == ()
+        assert not census.clean
+
+        off = await AuthService(store, AuthSettings(require_mfa=False)).lockable_account_census()
+        assert off.clean
+    finally:
+        await store.close()
+
+
+async def test_the_census_names_an_enabled_totp_secret_the_engine_cannot_decrypt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner's way past is the combined sign-in; with an unreadable secret it becomes "right
+    password, wrong code", which feeds the second-step lock. The census names it."""
+    from messagefoundry.store.crypto import CipherError
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity = await _enrol_totp(service, monkeypatch)
+        assert (await service.lockable_account_census()).clean
+        real = store.get_totp_secret
+
+        async def broken(user_id: str) -> str | None:
+            if user_id == identity.user_id:
+                raise CipherError("synthetic: the key this blob was sealed under is gone")
+            return await real(user_id)
+
+        monkeypatch.setattr(store, "get_totp_secret", broken)
+        census = await service.lockable_account_census()
+        assert census.undecryptable_totp == (ADMIN_USERNAME,)
+        assert census.no_way_past == ()
+    finally:
+        await store.close()
+
+
+async def test_the_census_names_nothing_on_a_store_built_through_the_new_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every account made and claimed through the shipped paths is generated or holds TOTP."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        user_id, issued = await _created_holder(service)
+        out = await service.login("holder", issued)
+        assert out.identity is not None and out.token is not None
+        assert (await service.lockable_account_census()).clean
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        confirmed = await service.confirm_mfa_enrollment(
+            out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+        )
+        assert confirmed.ok
+        assert await service.change_password(out.identity, "a-brand-new-chosen-passphrase") == []
+        assert (await service.lockable_account_census()).clean
+        await service.admin_reset_mfa(user_id, actor="test-admin")
+        assert (await service.lockable_account_census()).clean
+    finally:
+        await store.close()
+
+
+async def test_the_startup_census_warns_and_audits_and_does_not_refuse(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC-A9: a finding is a WARNING and one audit row naming usernames, never a raise."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await create_admin(service)
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            census = await service.report_lockable_account_census()
+        assert census.no_way_past == (ADMIN_USERNAME,)
+        assert any(ADMIN_USERNAME in r.getMessage() for r in caplog.records)
+        rows = await store.list_audit(limit=10, action="auth.lockable_account_census")
+        assert len(rows) == 1 and ADMIN_USERNAME in str(rows[0]["detail"])
+        assert "JBSWY" not in str(rows[0]["detail"])
+    finally:
+        await store.close()
+
+
+async def test_the_mfa_enabled_notice_to_a_must_change_account_says_who_to_tell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N-B2 "a new credential to protect": an interceptor can now enrol without rotating, so the
+    MFA_ENABLED notice to a must-change account tells the holder what an unexpected one means."""
+    from messagefoundry.pipeline.security_notify import _build_body
+
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        _user_id, issued = await _created_holder(service)
+        out = await service.login("holder", issued)
+        assert out.identity is not None and out.token is not None
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        await service.confirm_mfa_enrollment(
+            out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+        )
+        event = next(e for e in notifier.events if e.event_type == MFA_ENABLED)
+        assert event.detail.get("issued_credential") is True
+        body = _build_body(event)
+        assert "have not signed in" in body and "administrator" in body
+    finally:
+        await store.close()

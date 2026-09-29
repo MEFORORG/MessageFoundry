@@ -6178,6 +6178,79 @@ class AuthService:
             and not self._has_way_past(user)
         )
 
+    async def lockable_account_census(self) -> LockableAccountCensus:
+        """Name every account that is still lockable with no way past the sign-in lock (ADR 0197
+        Amendment A, N-B2 part 6, AC-A9).
+
+        Two populations. **A covered local account holding a chosen credential and no TOTP**: the
+        gates of part 4 never let a holder reach that state under the shipped defaults, so one that
+        exists got there another way -- for instance while the site ran with ``require_mfa`` off,
+        or from before this change. **An enabled TOTP secret the engine cannot decrypt**: the owner's
+        combined sign-in then reads as "right password, wrong code", which feeds the second-step
+        lock, so the owner's way past has become a way to lock themselves out.
+
+        Read-only. Disabled accounts are skipped: they cannot sign in, so they cannot be locked out
+        of anything. Each TOTP secret is decrypted and dropped at once; the census returns usernames
+        only. The caller decides what to do with the answer: :meth:`report_lockable_account_census`
+        warns and audits, and ``messagefoundry verify`` reports it. Neither refuses to start, since
+        refusing would hand an account-level fact a site-wide veto."""
+        no_way_past: list[str] = []
+        undecryptable: list[str] = []
+        for user in await self._store.list_users():
+            if user.disabled or user.auth_provider != AuthProvider.LOCAL.value:
+                continue
+            if user.totp_enabled:
+                try:
+                    secret = await self._store.get_totp_secret(user.id)
+                except Exception:  # noqa: BLE001 -- any decrypt failure is exactly the finding
+                    secret = None
+                if not secret:
+                    undecryptable.append(user.username)
+                continue
+            if user.password_generated:
+                continue
+            roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
+            if self._covered_by_requirement(user, roles):
+                no_way_past.append(user.username)
+        return LockableAccountCensus(
+            no_way_past=tuple(sorted(no_way_past)), undecryptable_totp=tuple(sorted(undecryptable))
+        )
+
+    async def report_lockable_account_census(self) -> LockableAccountCensus:
+        """Run :meth:`lockable_account_census` at startup: WARN and write one audit row when it
+        names anyone, and do nothing more (AC-A9). Usernames only, never a secret."""
+        census = await self.lockable_account_census()
+        if census.clean:
+            return census
+        if census.no_way_past:
+            _log.warning(
+                "ADR 0197: %d local account(s) the MFA requirement covers hold a chosen password and "
+                "no authenticator app, so anyone who knows the username can lock them out with no "
+                "way past: %s. Ask each holder to enrol an authenticator app, or reset the account's "
+                "factors (POST /users/{id}/reset-mfa) to issue a generated credential.",
+                len(census.no_way_past),
+                ", ".join(census.no_way_past),
+            )
+        if census.undecryptable_totp:
+            _log.warning(
+                "ADR 0197: %d account(s) have an enabled TOTP secret this engine cannot decrypt, so "
+                "their combined sign-in cannot pass a lock: %s. Check the store key, or reset the "
+                "account's factors (POST /users/{id}/reset-mfa).",
+                len(census.undecryptable_totp),
+                ", ".join(census.undecryptable_totp),
+            )
+        await self._audit(
+            "auth.lockable_account_census",
+            actor="system",
+            detail=_json(
+                {
+                    "no_way_past": list(census.no_way_past),
+                    "undecryptable_totp": list(census.undecryptable_totp),
+                }
+            ),
+        )
+        return census
+
     async def _second_factor_enrolled(self, user: UserRecord) -> bool:
         """Any second factor enrolled — TOTP **or** ≥1 WebAuthn passkey (ADR 0068 decision 5). The
         store round-trip only runs when TOTP alone doesn't already answer."""
@@ -6346,8 +6419,15 @@ class AuthService:
             return elevation
         await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
+        # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
+        # an issued credential can enrol their own authenticator without rotating. The notice to a
+        # must-change account says so, and says what to do.
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
+            MFA_ENABLED,
+            username=user.username,
+            email=user.notify_email,
+            client=client,
+            detail={"issued_credential": True} if user.must_change_password else None,
         )
         return elevation
 
