@@ -84,9 +84,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # own audited fetch, split from the open -- and no /ui route: the console calls it in-process.
 # BACKLOG #2346 (ASVS 14.2.6) added two /ui routes and no JSON route: GET /ui/messages/{message_id}/summary
 # and /body, the detail page with the summary, or the summary and the body, revealed on an explicit act.
+# BACKLOG #2436 (ASVS 14.2.6, owner ruling R12) added one /ui route and no JSON route:
+# GET /ui/messages/{message_id}/errors, the detail page with the error text revealed.
 _ROUTES_DEFAULT = 115
 _ROUTES_WITH_DOCS = 119
-_ROUTES_WITH_UI = 232
+_ROUTES_WITH_UI = 233
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -140,6 +142,8 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         # BACKLOG #2346: the detail page with the body, and with the summary, revealed. Same gate and
         # same reason as the bare detail page above; item 4 of the doc block names them.
         ("GET", "/ui/messages/{message_id}/body"),
+        # BACKLOG #2436: the detail page with the error text revealed. Same gate and same reason.
+        ("GET", "/ui/messages/{message_id}/errors"),
         ("GET", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/messages/{message_id}/summary"),
         ("GET", "/ui/uploaded-logs"),

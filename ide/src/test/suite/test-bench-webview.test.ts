@@ -5,7 +5,7 @@ import * as assert from "assert";
 import { hexdump } from "../../hexdump";
 import { diffMessages } from "../../hl7diff";
 import { testBenchScript } from "../../testBenchWebview";
-import { compareCase } from "../../testCollections";
+import { judgeCollectionRun } from "../../testCollections";
 import { buildTraceDetail, type TraceEntry } from "../../traceView";
 import { CHANNEL_FIELD } from "../../webviewMessaging";
 
@@ -16,7 +16,7 @@ import { CHANNEL_FIELD } from "../../webviewMessaging";
 // was. Escaping is not a discard, and a payload that only rendered escaped would fail these tests.
 //
 // Each well-formed fixture is built by the SAME pure host-side function testBench.ts posts from
-// (hexdump, diffMessages, buildTraceDetail, compareCase), and each one must render. That is the
+// (hexdump, diffMessages, buildTraceDetail, judgeCollectionRun), and each one must render. That is the
 // control: a receiver that discarded everything would pass every malformed case below and prove
 // nothing. Every malformed case is that fixture with ONE field changed.
 //
@@ -38,7 +38,7 @@ interface JsdomWindow {
   [key: string]: unknown;
 }
 interface JsdomVirtualConsole {
-  on(event: string, handler: (err: unknown) => void): void;
+  on(event: string, handler: (...args: unknown[]) => void): void;
 }
 interface JsdomModule {
   JSDOM: new (html: string, options?: Record<string, unknown>) => { window: JsdomWindow };
@@ -65,6 +65,10 @@ interface Bench {
   readonly results: DomNode;
   /** Every exception the page raised, loading or handling a message. */
   readonly errors: unknown[];
+  /** Every message the page posted to the host, JSON-copied out of the page's realm. */
+  readonly posted: Payload[];
+  /** Every console.warn the page wrote. A shape discard names itself there. */
+  readonly warnings: string[];
   /** Deliver a stamped, same-origin message exactly as the host path would. */
   deliver(data: Record<string, unknown>): void;
 }
@@ -79,8 +83,11 @@ function closeWindows(): void {
 
 function bench(state: Record<string, unknown> | null = null): Bench {
   const errors: unknown[] = [];
+  const posted: Payload[] = [];
+  const warnings: string[] = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on("jsdomError", (e: unknown) => errors.push(e));
+  virtualConsole.on("warn", (...args: unknown[]) => warnings.push(args.map(String).join(" ")));
   const dom = new JSDOM(`<!DOCTYPE html><body>${BODY}</body>`, {
     runScripts: "dangerously",
     virtualConsole,
@@ -91,7 +98,7 @@ function bench(state: Record<string, unknown> | null = null): Bench {
   window.acquireVsCodeApi = () => ({
     getState: () => state,
     setState: () => undefined,
-    postMessage: () => undefined,
+    postMessage: (m: unknown) => posted.push(JSON.parse(JSON.stringify(m)) as Payload),
   });
   const script = window.document.createElement("script");
   script.textContent = testBenchScript(TOKEN);
@@ -104,6 +111,8 @@ function bench(state: Record<string, unknown> | null = null): Bench {
     detail,
     results,
     errors,
+    posted,
+    warnings,
     deliver(data): void {
       const ev = new window.MessageEvent("message", {
         origin: window.origin,
@@ -196,14 +205,40 @@ const TRACE_ENTRY = {
 } as unknown as TraceEntry;
 const TRACE: Payload = { type: "trace", detail: buildTraceDetail(TRACE_ENTRY, () => TRACE_SOURCE) };
 
-const cmp = compareCase([{ to: "OB_X", payload: MSG_A }], [{ to: "OB_X", payload: MSG_B }]);
+// Two failing cases, each with its own distinctive values, so a test can tell whose values rendered.
+// Case 0 differs in PID-3 (A123 expected, B456 actual). Case 1 differs in PID-3 (C789, D012) and
+// carries an error text naming E555.
+const MSG_C = "MSH|^~\\&|APP|FAC|RCV|RF|20200101010101||ADT^A01|C2|P|2.5\rPID|1||C789";
+const MSG_D = "MSH|^~\\&|APP|FAC|RCV|RF|20200101010101||ADT^A01|C2|P|2.5\rPID|1||D012";
+const JUDGED = judgeCollectionRun(
+  [
+    { name: "case_a", input: MSG_A, expected: [{ to: "OB_X", payload: MSG_A }] },
+    { name: "case_c", input: MSG_C, expected: [{ to: "OB_X", payload: MSG_C }] },
+  ],
+  [
+    { disposition: "received", error: null, deliveries: [{ to: "OB_X", payload: MSG_B }] },
+    { disposition: "received", error: "handler failed near E555", deliveries: [{ to: "OB_X", payload: MSG_D }] },
+  ],
+);
+const RUN_ID = 3;
 const RUN: Payload = {
   type: "collectionRun",
   name: "regress",
-  passed: 0,
-  total: 1,
-  results: [{ name: "case_0000", pass: false, disposition: "received", error: null, deliveries: cmp.deliveries }],
+  run: RUN_ID,
+  passed: JUDGED.passed,
+  total: JUDGED.summaries.length,
+  results: JUDGED.summaries,
 };
+/** What the host posts when case `index` is clicked (testBench.ts showCaseDetail). */
+function caseDetail(index: number, run = RUN_ID): Payload {
+  return { type: "caseDetail", run, index, ...JUDGED.details[index] };
+}
+/** Every before/after value and error text of case `index`, which the run view must not show unasked. */
+function valuesOf(index: number): string[] {
+  const d = JUDGED.details[index];
+  const vals = d.deliveries.flatMap((x) => x.differences.flatMap((f) => [f.before, f.after]));
+  return d.error ? [...vals, d.error] : vals;
+}
 
 const COLLECTIONS: Payload = { type: "collections", items: [{ name: "regress", cases: 2 }] };
 
@@ -216,8 +251,12 @@ suite("Test Bench webview — the harness itself", () => {
     assert.ok((HEX.dump as Payload).lines.length > 0, "hex fixture has no rows");
     assert.ok(TRACE.detail.invocations[0].coverage.lines.length > 0, "trace fixture has no coverage lines");
     assert.ok(TRACE.detail.invocations[0].profile.lines.length > 0, "trace fixture has no profile lines");
-    assert.strictEqual(cmp.deliveries[0].status, "mismatch", "the run fixture must carry a difference");
-    assert.ok(cmp.deliveries[0].differences.length > 0);
+    for (const i of [0, 1]) {
+      assert.strictEqual(JUDGED.summaries[i].pass, false, `run case ${i} must fail`);
+      assert.strictEqual(JUDGED.details[i].deliveries[0].status, "mismatch", `run case ${i} must carry a difference`);
+    }
+    assert.deepStrictEqual(valuesOf(0), ["A123", "B456"]);
+    assert.deepStrictEqual(valuesOf(1), ["C789", "D012", "handler failed near E555"]);
   });
 
   test("the harness sees an exception thrown by a listener", () => {
@@ -335,8 +374,8 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
 
   test("collectionRun: well-formed renders (control)", () => {
     const b = assertRendered(RUN, "collectionRun");
-    assert.ok(b.detail.innerHTML.includes("0 / 1 passed"), "the summary did not render");
-    assert.ok(b.detail.querySelector(".case .diffs"), "the failing case's difference did not render");
+    assert.ok(b.detail.innerHTML.includes("0 / 2 passed"), "the summary did not render");
+    assert.strictEqual(b.detail.querySelectorAll("button[data-case-detail]").length, 2, "each case needs a Details button");
   });
 
   test("collectionRun: malformed payloads are discarded", () => {
@@ -345,13 +384,13 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       ["a string total", (p) => (p.total = "1")],
       ["no total", (p) => delete p.total],
       ["results not an array", (p) => (p.results = { 0: p.results[0] })],
-      ["a string difference index", (p) => (p.results[0].deliveries[0].differences[0].index = "3")],
-      ["markup as a difference index", (p) => (p.results[0].deliveries[0].differences[0].index = XSS)],
-      ["a numeric error", (p) => (p.results[0].error = 5)],
       ["a string pass flag", (p) => (p.results[0].pass = "false")],
       ["a numeric case name", (p) => (p.results[0].name = 1)],
-      ["deliveries not an array", (p) => (p.results[0].deliveries = null)],
+      ["a numeric disposition", (p) => (p.results[0].disposition = 1)],
       ["a null run name", (p) => (p.name = null)],
+      ["no run id", (p) => delete p.run],
+      ["markup as the run id", (p) => (p.run = XSS)],
+      ["a negative run id", (p) => (p.run = -1)],
     ]);
   });
 
@@ -413,5 +452,176 @@ suite("Test Bench webview — escaping still applies to a well-formed payload", 
     const b = assertRendered(p, "hex with a markup source");
     assert.strictEqual(b.detail.querySelector("img"), null, "the source became an element");
     assert.ok(b.detail.textContent.includes("<img"), "the source text was dropped rather than escaped");
+  });
+});
+
+// ASVS 14.2.6 (BACKLOG #2437, owner ruling R13; ADR 0121 "Reveal on click"). A collection run shows
+// pass or fail per case, and a case's field values only after a click on that case, one at a time.
+suite("Test Bench webview — a collection run reveals values one case at a time", () => {
+  teardown(closeWindows);
+
+  function runOnScreen(): Bench {
+    return assertRendered(RUN, "collectionRun");
+  }
+  function button(b: Bench, index: number): DomNode {
+    const btn = b.detail.querySelector(`button[data-case-detail="${index}"]`);
+    assert.ok(btn, `no Details button for case ${index}`);
+    return btn;
+  }
+  /** Click case `index`, then deliver the host's reply to that click. */
+  function reveal(b: Bench, index: number): void {
+    button(b, index).click();
+    b.deliver(caseDetail(index));
+  }
+  /** Assert the view shows every value of case `index` and none of the other case's; null: none. */
+  function assertShows(b: Bench, index: number | null, why: string): void {
+    const html = b.detail.innerHTML as string;
+    for (const i of [0, 1]) {
+      for (const v of valuesOf(i)) {
+        const want = i === index;
+        assert.strictEqual(html.includes(v), want, `${why}: case ${i} value ${v} ${want ? "missing" : "shown"}`);
+      }
+      assert.strictEqual(button(b, i).getAttribute("aria-expanded"), String(i === index), `${why}: case ${i} aria-expanded`);
+    }
+    assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw`);
+  }
+
+  test("the run renders names, PASS or FAIL and dispositions, and no value", () => {
+    const b = runOnScreen();
+    assertShows(b, null, "before any click");
+    assert.strictEqual(b.detail.querySelector(".diffs"), null, "a difference rendered unasked");
+    for (const c of JUDGED.summaries) {
+      assert.ok(b.detail.textContent.includes(c.name), `case name ${c.name} missing`);
+    }
+    assert.strictEqual(b.detail.querySelectorAll(".case .badge.fail").length, 2, "one FAIL badge per case");
+    assert.strictEqual(button(b, 1).getAttribute("aria-label"), "Details for case_c");
+  });
+
+  test("a click asks the host for that one case, and nothing renders until it answers", () => {
+    const b = runOnScreen();
+    button(b, 1).click();
+    assert.deepStrictEqual(b.posted, [{ command: "caseDetail", run: RUN_ID, index: 1 }]);
+    assertShows(b, null, "clicked, no reply yet");
+  });
+
+  test("one click shows one case, and a second case replaces the first", () => {
+    const b = runOnScreen();
+    reveal(b, 1);
+    assertShows(b, 1, "case 1 revealed");
+    reveal(b, 0);
+    assertShows(b, 0, "case 0 revealed after case 1");
+  });
+
+  test("a second click on an open case closes it without asking the host", () => {
+    const b = runOnScreen();
+    reveal(b, 0);
+    button(b, 0).click();
+    assertShows(b, null, "closed again");
+    assert.strictEqual(b.posted.length, 1, "closing posted a request");
+  });
+
+  test("a second click on a case still waiting asks again rather than doing nothing", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    button(b, 0).click();
+    assert.strictEqual(b.posted.length, 2);
+    b.deliver(caseDetail(0));
+    assertShows(b, 0, "the reply to either request");
+  });
+
+  test("a reply that lands after Back does not reveal the case", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    b.window.document.getElementById("back").click();
+    b.deliver(caseDetail(0));
+    assertShows(b, null, "late reply after Back");
+  });
+
+  test("a reply that lands after another view replaced the run renders nothing", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    b.deliver(clone(COLLECTIONS));
+    b.deliver(clone(RUN)); // the same run id back on screen, with no case asked for
+    b.deliver(caseDetail(0));
+    assertShows(b, null, "reply for a request made before the view changed");
+  });
+
+  test("a reply for a case other than the one last asked for renders nothing", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    button(b, 1).click();
+    b.deliver(caseDetail(0));
+    assertShows(b, null, "reply for the replaced request");
+    b.deliver(caseDetail(1));
+    assertShows(b, 1, "reply for the latest request");
+  });
+
+  test("Back clears a revealed case from the hidden view", () => {
+    const b = runOnScreen();
+    reveal(b, 1);
+    b.window.document.getElementById("back").click();
+    assertShows(b, null, "after Back");
+  });
+
+  test("a reply nobody asked for, or for another run, renders nothing", () => {
+    const b = runOnScreen();
+    const before = b.detail.innerHTML;
+    b.deliver(caseDetail(0));
+    button(b, 0).click();
+    b.deliver(caseDetail(0, RUN_ID + 1));
+    b.deliver({ ...caseDetail(0), index: 7 });
+    assert.strictEqual(b.detail.innerHTML, before, "an unasked or stale reply rendered");
+    assertShows(b, null, "unasked or stale replies");
+    assertDiscarded(caseDetail(0), "no run on screen");
+  });
+
+  test("a case with no difference and no error says so rather than rendering blank", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    b.deliver({ type: "caseDetail", run: RUN_ID, index: 0, error: null, deliveries: [] });
+    assert.ok(b.detail.textContent.includes("No differences."));
+  });
+
+  test("caseDetail: malformed payloads are discarded by the shape check", () => {
+    // Control: the unmutated JSON copy renders, and warns nothing.
+    const control = runOnScreen();
+    button(control, 0).click();
+    control.deliver(clone(caseDetail(0)));
+    assertShows(control, 0, "control");
+    assert.deepStrictEqual(control.warnings, []);
+    const good = caseDetail(0);
+    const cases: [string, (p: Payload) => void][] = [
+      ["a string difference index", (p) => (p.deliveries[0].differences[0].index = "3")],
+      ["markup as a difference index", (p) => (p.deliveries[0].differences[0].index = XSS)],
+      ["a numeric before value", (p) => (p.deliveries[0].differences[0].before = 5)],
+      ["a numeric error", (p) => (p.error = 5)],
+      ["deliveries not an array", (p) => (p.deliveries = null)],
+      ["a string case index", (p) => (p.index = "0")],
+      ["a string run id", (p) => (p.run = String(RUN_ID))],
+      ["no run id", (p) => delete p.run],
+    ];
+    for (const [why, mutate] of cases) {
+      const b = runOnScreen();
+      button(b, 0).click();
+      const shown = b.detail.innerHTML;
+      const p = clone(good);
+      mutate(p);
+      assert.notDeepStrictEqual(p, good, `${why}: the mutation changed nothing, so it tests nothing`);
+      b.deliver(p);
+      assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw instead of discarding`);
+      assert.strictEqual(b.detail.innerHTML, shown, `${why}: detail was re-rendered`);
+      // The discard must come from the shape check, not from the stale-reply check behind it.
+      assert.ok(b.warnings.some((w) => w.includes('discarded a malformed "caseDetail"')), `${why}: not a shape discard`);
+    }
+  });
+
+  test("markup in a revealed value renders as text", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    const p = clone(caseDetail(0));
+    p.deliveries[0].differences[0].after = XSS;
+    b.deliver(p);
+    assert.strictEqual(b.detail.querySelector("img"), null, "a difference value became an element");
+    assert.ok(b.detail.textContent.includes("<img"), "the value was dropped rather than escaped");
   });
 });

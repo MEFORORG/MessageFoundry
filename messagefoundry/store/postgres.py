@@ -62,6 +62,7 @@ from collections.abc import (
     Collection,
     Iterable,
     Mapping,
+    MutableMapping,
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
@@ -136,6 +137,11 @@ from messagefoundry.store.privilege import (
     PostgresRoleFacts,
     StorePrivilegeReport,
     postgres_excess,
+)
+from messagefoundry.store.sealed_cache import (
+    new_reference_set,
+    new_state_cache,
+    sealed_reference_set,
 )
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
@@ -1278,9 +1284,10 @@ class PostgresStore:
         self._owner = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         # Read-through caches (loaded at open; updated only after the owning txn commits) — mirror the
         # SQLite store's _state_cache / _reference_cache so a Handler's synchronous state_get(...) /
-        # reference("name").get(key) resolves.
-        self._state_cache: dict[tuple[str, str], Any] = {}
-        self._reference_cache: dict[str, dict[str, Any]] = {}
+        # reference("name").get(key) resolves. Both hold values SEALED (BACKLOG #1174): see
+        # messagefoundry.store.sealed_cache.
+        self._state_cache: MutableMapping[tuple[str, str], Any] = new_state_cache()
+        self._reference_cache: dict[str, MutableMapping[str, Any]] = {}
         # The active reference VERSION currently reflected in _reference_cache, per set (Track B Step 6).
         # converge_reference_cache() compares the shared store's authoritative active version against
         # this to decide which sets a FOLLOWER must re-load (read-through), so a leader-materialized
@@ -2170,7 +2177,7 @@ class PostgresStore:
         loads the WHOLE ``state`` table here (so it starts fully converged), and recording the per-namespace
         versions means its first convergence tick won't needlessly re-read every namespace it already holds."""
         rows = await self._fetchall("SELECT namespace, key, value FROM state")
-        cache: dict[tuple[str, str], Any] = {}
+        cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
             # #241 F2: fail closed (StoreKeylessError) on a keyless open of an encrypted store, rather
             # than a raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
@@ -2197,22 +2204,25 @@ class PostgresStore:
 
     async def _read_active_reference_snapshots(
         self,
-    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    ) -> tuple[dict[str, MutableMapping[str, Any]], dict[str, str]]:
         """Read every set's ACTIVE snapshot (rows + version) from the shared store, decrypting values.
 
         The shared JOIN/decrypt logic behind both the open-time :meth:`_load_reference_cache` and the
         follower :meth:`converge_reference_cache`. Drives from ``reference_version`` (the authoritative
         active-version list) LEFT JOIN ``reference`` so a set synced to ZERO rows is still a present
-        empty ``{}``. Returns ``({name: {key: value}}, {name: version})``."""
+        empty ``{}``. Returns ``({name: {key: value}}, {name: version})``, each set sealed (BACKLOG
+        #1174)."""
         rows = await self._fetchall(
             "SELECT v.name AS name, v.version AS version, r.key AS key, r.value AS value "
             "FROM reference_version v "
             "LEFT JOIN reference r ON r.name = v.name AND r.version = v.version"
         )
-        cache: dict[str, dict[str, Any]] = {}
+        cache: dict[str, MutableMapping[str, Any]] = {}
         versions: dict[str, str] = {}
         for r in rows:
-            entry = cache.setdefault(r["name"], {})
+            entry = cache.get(r["name"])
+            if entry is None:
+                entry = cache[r["name"]] = new_reference_set(r["name"])
             versions[r["name"]] = r["version"]
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
                 # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
@@ -2291,12 +2301,14 @@ class PostgresStore:
         refreshed: list[str] = []
         for ns, version, seen, fresh in pending:
             if self._state_versions.get(ns) == seen:
-                # No local write intervened during our read → safe destructive reseed (drop the
-                # namespace's old entries first, handling a sibling's deletes/purges, then re-seed).
-                for ck in [c for c in self._state_cache if c[0] == ns]:
-                    del self._state_cache[ck]
+                # No local write intervened during our read → safe reseed. Write the fresh rows
+                # FIRST, then drop the namespace's keys the read no longer holds (a sibling's
+                # deletes/purges): a Handler thread reading mid-reseed then never misses a key that
+                # is present, which the old drop-then-reseed order allowed.
                 for k, v in fresh.items():
                     self._state_cache[(ns, k)] = v
+                for ck in [c for c in self._state_cache if c[0] == ns and c[1] not in fresh]:
+                    del self._state_cache[ck]
             else:
                 # A local transform_handoff committed + published to THIS namespace during our read
                 # window, advancing the DB version past `version`. A destructive reseed from the stale
@@ -2305,7 +2317,8 @@ class PostgresStore:
                 # deliberately record `version` (< the DB version the local write bumped to) so the next
                 # tick does a clean reseed that reconciles any sibling deletes this merge could not see.
                 for k, v in fresh.items():
-                    self._state_cache.setdefault((ns, k), v)
+                    if (ns, k) not in self._state_cache:  # setdefault would decrypt the kept value
+                        self._state_cache[(ns, k)] = v
             self._state_versions[ns] = version
             refreshed.append(ns)
         return refreshed
@@ -3549,17 +3562,18 @@ class PostgresStore:
         transaction: drop the set's prior rows, insert the new snapshot (each value JSON-encoded then
         encrypted), and upsert the ``reference_version`` pointer. The read cache swaps only after
         commit, so a failed sync leaves the last-good snapshot live. Ported, not stubbed."""
+        encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
         encrypted = [
             (
                 name,
                 version,
                 k,
                 self._cipher.encrypt(
-                    encode_reference_value(v),
+                    text,
                     aad=cell_aad("reference", "value", name, version, k),
                 ),
             )
-            for k, v in rows.items()
+            for k, text in encoded
         ]
         async with self._timed_acquire() as conn, conn.transaction():
             await conn.execute("DELETE FROM reference WHERE name=$1", name)
@@ -3582,10 +3596,10 @@ class PostgresStore:
                 time.time(),
                 len(encrypted),
             )
-        # Commit succeeded → swap the active snapshot in the read cache (plaintext, decoded form) and
+        # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174) and
         # record the active version so a follower's converge_reference_cache() (Track B Step 6) can tell
         # this node already reflects it (no needless re-load on the node that just wrote it).
-        self._reference_cache[name] = dict(rows)
+        self._reference_cache[name] = sealed_reference_set(name, encoded)
         self._reference_versions[name] = version
 
     # --- delivery worker path ------------------------------------------------
@@ -8592,7 +8606,9 @@ class PostgresStore:
                     bumped.append((ns, int(vrow["version"])))
         # Commit succeeded → evict the purged keys from the read-through cache.
         for ck in purged_keys:
-            self._state_cache.pop(ck, None)
+            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+            if ck in self._state_cache:
+                del self._state_cache[ck]
         # Record this node's new per-namespace versions so its own converge skips re-reading them.
         for ns, ver in bumped:
             self._state_versions[ns] = ver

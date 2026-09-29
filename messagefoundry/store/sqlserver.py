@@ -45,6 +45,7 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
+    MutableMapping,
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
@@ -116,6 +117,11 @@ from messagefoundry.store.privilege import (
     SQLSERVER_FIXED_SERVER_ROLES,
     StorePrivilegeReport,
     sqlserver_excess,
+)
+from messagefoundry.store.sealed_cache import (
+    new_reference_set,
+    new_state_cache,
+    sealed_reference_set,
 )
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
@@ -2415,13 +2421,14 @@ class SqlServerStore:
         self._acquire_wait = AcquireWaitHistogram()
         # ADR 0005 transform-state read-through cache (parity with SQLite/PG): loaded at open, updated
         # post-commit by transform_handoff, surfaced via state_view() so a Handler's cross-message
-        # state_get(...) resolves in-process.
-        self._state_cache: dict[tuple[str, str], Any] = {}
+        # state_get(...) resolves in-process. Values are held SEALED (BACKLOG #1174): see
+        # messagefoundry.store.sealed_cache.
+        self._state_cache: MutableMapping[tuple[str, str], Any] = new_state_cache()
         # ADR 0006 reference-snapshot read cache (parity with SQLite/PG, BACKLOG #235): the active
-        # snapshot of every set, {name: {key: decoded_value}}. Loaded at open; write_reference_snapshot
-        # swaps a set's entry only AFTER its transaction commits (a rolled-back sync never leaks into
-        # reference_view, so the last-good snapshot stays live).
-        self._reference_cache: dict[str, dict[str, Any]] = {}
+        # snapshot of every set, {name: {key: value}}, each set sealed like the state cache. Loaded at
+        # open; write_reference_snapshot swaps a set's entry only AFTER its transaction commits (a
+        # rolled-back sync never leaks into reference_view, so the last-good snapshot stays live).
+        self._reference_cache: dict[str, MutableMapping[str, Any]] = {}
         # The active reference VERSION currently reflected in _reference_cache, per set (Track B
         # Step 6): converge_reference_cache compares the shared store's authoritative active version
         # against this and re-reads only the sets that differ. Seeded at open (_load_reference_cache)
@@ -6924,7 +6931,7 @@ class SqlServerStore:
     async def _load_state_cache(self) -> None:
         """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
         rows = await self._fetchall("SELECT namespace, [key], value FROM state")
-        cache: dict[tuple[str, str], Any] = {}
+        cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
             # #241 F2: UN-MASK the former silent-skip of unreadable state rows — that quietly dropped
             # PHI-bearing transform state on a keyless/rotated open (worse than a crash). Fail closed
@@ -6952,8 +6959,9 @@ class SqlServerStore:
 
     async def _read_active_reference_snapshots(
         self,
-    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-        """Read every set's ACTIVE snapshot (rows + version) from the shared store, decrypting values.
+    ) -> tuple[dict[str, MutableMapping[str, Any]], dict[str, str]]:
+        """Read every set's ACTIVE snapshot (rows + version) from the shared store, decrypting values
+        and sealing each set (BACKLOG #1174).
 
         The shared JOIN/decrypt logic behind both the open-time :meth:`_load_reference_cache` and the
         follower :meth:`converge_reference_cache` (mirrors the Postgres port). Drives from
@@ -6965,10 +6973,12 @@ class SqlServerStore:
             " FROM reference_version v"
             " LEFT JOIN reference r ON r.name = v.name AND r.version = v.version"
         )
-        cache: dict[str, dict[str, Any]] = {}
+        cache: dict[str, MutableMapping[str, Any]] = {}
         versions: dict[str, str] = {}
         for r in rows:
-            entry = cache.setdefault(r["name"], {})
+            entry = cache.get(r["name"])
+            if entry is None:
+                entry = cache[r["name"]] = new_reference_set(r["name"])
             versions[r["name"]] = r["version"]
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
                 # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
@@ -7031,17 +7041,18 @@ class SqlServerStore:
         leaks into :meth:`reference_view`. Same build-new-then-flip contract as SQLite/Postgres, so it
         is idempotent on a re-run with the same rows."""
         self._guard_reference_widths(name, rows)
+        encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
         encrypted = [
             (
                 name,
                 version,
                 k,
                 self._cipher.encrypt(
-                    encode_reference_value(v),
+                    text,
                     aad=cell_aad("reference", "value", name, version, k),
                 ),
             )
-            for k, v in rows.items()
+            for k, text in encoded
         ]
         now = time.time()
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -7065,10 +7076,10 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        # Commit succeeded → swap the active snapshot in the read cache (plaintext, decoded form) AND
+        # Commit succeeded → swap the active snapshot in the read cache (sealed, BACKLOG #1174) AND
         # record the active version, so a follower's converge_reference_cache() (Track B Step 6) can
         # tell this node already reflects it (no needless re-load on the node that just wrote it).
-        self._reference_cache[name] = dict(rows)
+        self._reference_cache[name] = sealed_reference_set(name, encoded)
         self._reference_versions[name] = version
 
     async def converge_reference_cache(self) -> list[str]:
@@ -7785,7 +7796,9 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         for ck in purged_keys:
-            self._state_cache.pop(ck, None)
+            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+            if ck in self._state_cache:
+                del self._state_cache[ck]
         return len(purged_keys)
 
     async def purge_dead_letters(

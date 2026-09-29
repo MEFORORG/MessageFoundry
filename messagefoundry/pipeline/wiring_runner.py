@@ -180,6 +180,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
 from messagefoundry.transports import (
     DeliveryError,
@@ -7301,7 +7302,7 @@ class RegistryRunner:
         (deterministic per-batch snapshot, ADR 0005):** because every sibling's PURE transform is computed
         BEFORE any sibling's handoff commits, a LIVE ``state_view()`` read would be interleaving-dependent.
         So this concurrent run freezes ONE point-in-time copy of the committed transform-state at
-        run-start (``dict(self.store.state_view())``) and threads it into every sibling's
+        run-start (``point_in_time(self.store.state_view())``) and threads it into every sibling's
         :meth:`_prepare_routed`, so each deterministically observes the state as of the message-batch's
         start — no sibling sees another sibling's in-run ``state_set``/``set_meta`` write, independent of
         interleaving. Defined semantics: *a message's sibling handlers read message-batch-start
@@ -7333,12 +7334,14 @@ class RegistryRunner:
             # siblings compute before any sibling's serial _apply_routed commits, reading the LIVE
             # state_view() would be interleaving-dependent; reading this frozen snapshot makes every
             # sibling deterministically observe message-batch-start state (no sibling sees another's
-            # in-run write). dict(state_view()) is a point-in-time copy: state_view() is a live
+            # in-run write). point_in_time(state_view()) is a point-in-time copy: state_view() is a live
             # MappingProxyType over the store's cache and each committed write REPLACES a key (never an
-            # in-place mutation), so the copied {(ns, key): value} references never change afterwards.
+            # in-place mutation), so the copied entries never change afterwards. It copies the SEALED
+            # entries (BACKLOG #1174): dict(state_view()) would decrypt the whole state table on the
+            # event loop for every concurrent run and hold it in plaintext for the run.
             # READ-side only — no store write, no txn-boundary change, no reordering (the apply below
             # stays the sole serial in-claim-order writer, so the final committed state is unchanged).
-            state_snapshot: Mapping[tuple[str, str], Any] = dict(self.store.state_view())
+            state_snapshot: Mapping[tuple[str, str], Any] = point_in_time(self.store.state_view())
 
             async def _compute(
                 it: OutboxItem,

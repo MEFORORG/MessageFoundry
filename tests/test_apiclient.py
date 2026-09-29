@@ -239,9 +239,14 @@ def test_get_message_sends_the_summary_reveal_only_when_asked(
     monkeypatch.setattr(client._http, "send", _capture)
     client.get_message("m1")
     client.get_message("m1", reveal_summary=True)
+    # BACKLOG #2436: the error-text reveal is its own parameter, sent only when asked.
+    client.get_message("m1", reveal_errors=True)
+    client.get_message("m1", reveal_summary=True, reveal_errors=True)
     assert sent == [
         "http://127.0.0.1:8765/messages/m1",
         "http://127.0.0.1:8765/messages/m1?reveal_summary=true",
+        "http://127.0.0.1:8765/messages/m1?reveal_errors=true",
+        "http://127.0.0.1:8765/messages/m1?reveal_summary=true&reveal_errors=true",
     ]
 
 

@@ -76,6 +76,12 @@ under Changed says why engine 0.4.0 does not work with this console.
     shown in UTC.
 
 ### Changed
+- **The error text is masked until the operator asks** (`BACKLOG #2436`, ASVS 14.2.6, owner
+  ruling R12). The detail page shows the message's error, each delivery's last error and each
+  event's detail as `****`, each with a "Reveal" link to the new `/ui/messages/{id}/errors`. The
+  dead-letter list masks each last error the same way and links it to that message's `/errors`.
+  The engine masks the text in its response, so the page never carries it. Needs an engine whose
+  `get_message` accepts `reveal_errors`.
 - **The message detail page shows the body and the summary only when the operator asks**
   (`BACKLOG #2346`, ASVS 14.2.6). `/ui/messages/{id}` now shows the metadata with the summary
   masked and no body. A "Show raw message" link opens `/ui/messages/{id}/body`, and a "Reveal"

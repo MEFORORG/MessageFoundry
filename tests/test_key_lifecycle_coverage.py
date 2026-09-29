@@ -77,6 +77,7 @@ _API_CLIENT = "Native API client key"
 _NONPROD = "Non-production self-signed key"
 _TOTP = "TOTP shared secret"
 _ANON_SALT = "Anonymizer re-identification salt"
+_SEALED = "Sealed-cache key"
 
 #: Modules that load, mint, derive from, or feed a key, and the lifecycle row(s) governing it.
 _CARRIES_KEY: dict[str, frozenset[str]] = {
@@ -125,6 +126,8 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/__main__.py": frozenset({_ANON_SALT}),
+    # BACKLOG #1174: the per-process key that seals the state and reference caches.
+    "messagefoundry/store/sealed_cache.py": frozenset({_SEALED}),
 }
 
 _KEYLESS = (
