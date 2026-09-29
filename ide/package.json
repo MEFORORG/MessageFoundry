@@ -835,7 +835,7 @@
   },
   "overrides": {
     "serialize-javascript": ">=7.0.5",
-    "undici": "^7.29.0",
+    "undici": "^7.29.1",
     "diff": ">=8.0.3",
     "fast-uri": "^3.1.5",
     "linkify-it": "^5.0.2",
