@@ -149,6 +149,9 @@ _SERVED_EXT: dict[str, str] = {
     "text/csv": ".csv",
     "text/plain": ".txt",
 }
+#: Wraps a marker text as a well-formed SVG drawing, for a case that needs an SVG the route can parse.
+_SVG_OPEN = b'<svg xmlns="http://www.w3.org/2000/svg"><title>'
+_SVG_CLOSE = b"</title></svg>"
 #: What every non-allow-listed type gets, refused or merely unknown.
 _OCTET = "application/octet-stream"
 _OCTET_EXT = ".bin"
@@ -186,7 +189,7 @@ async def _seed_streaming(
 
 
 async def _seed_labelled(
-    engine: Engine, content_type: str, marker: str, *, prefix: bytes = b""
+    engine: Engine, content_type: str, marker: str, *, prefix: bytes = b"", suffix: bytes = b""
 ) -> tuple[str, str]:
     """Seed one document carrying ``content_type``, with bytes UNIQUE to ``marker``.
 
@@ -194,9 +197,9 @@ async def _seed_labelled(
     returns the existing ref and writes nothing, so the FIRST writer's ``content_type`` governs every
     later linkage of the same body. A per-MIME table that reused one document would therefore collapse
     onto the first label and assert nothing — every case must seed its own bytes."""
-    doc = base64.b64encode(prefix + f"synthetic document {marker} not real PHI".encode()).decode(
-        "ascii"
-    )
+    doc = base64.b64encode(
+        prefix + f"synthetic document {marker} not real PHI".encode() + suffix
+    ).decode("ascii")
     ref = await engine.store.put_attachment([doc], content_type)
     mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
     return mid, ref
@@ -343,8 +346,10 @@ async def test_browser_active_label_is_downgraded_to_octet_stream(
     filename carries the allow-list's ``.bin`` default — so no ``.svg``/``.html``/``.hta``/``.js`` name is
     produced either. Mixed-case vectors are in the table because the token grammar admits uppercase and
     the allow-list lookup is case-folded, so ``Image/SVG+XML`` must resolve exactly as ``image/svg+xml``
-    does."""
-    mid, ref = await _seed_labelled(engine, label, marker=label)
+    does. An SVG label is seeded as a well-formed drawing, because the route refuses an SVG it cannot
+    parse (ADR 0105 amendment 2026-09-28) and this test is about the declared type."""
+    prefix, suffix = (_SVG_OPEN, _SVG_CLOSE) if "svg" in label.casefold() else (b"", b"")
+    mid, ref = await _seed_labelled(engine, label, marker=label, prefix=prefix, suffix=suffix)
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
     assert _base_media_type(r) == _OCTET
@@ -685,6 +690,104 @@ async def test_download_out_of_scope_message_is_404_not_403(engine: Engine) -> N
         assert (await c.get(f"/messages/{mid_a}/attachments/{ref_a}", headers=h)).status_code == 200
         assert (await c.get(f"/messages/{mid_b}/attachments/{ref_b}", headers=h)).status_code == 404
     assert any(a["action"] == "auth.channel_denied" for a in await engine.store.list_audit())
+
+
+# --- ASVS 1.3.4: the SVG served copy is sanitized, the stored value is not (BACKLOG #2299) ----------
+
+#: A synthetic hostile SVG: a script, an event handler, a foreignObject, a javascript: link and an
+#: external reference, around one harmless shape that must survive.
+_HOSTILE_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+    b'onload="alert(1)"><script>alert(2)</script>'
+    b'<foreignObject><div xmlns="http://www.w3.org/1999/xhtml">x</div></foreignObject>'
+    b'<a xlink:href="javascript:alert(3)"><circle r="1"/></a>'
+    b'<use xlink:href="http://evil.example/x.svg#a"/>'
+    b'<rect id="kept" width="5" height="5" fill="#123456"/></svg>'
+)
+
+
+async def _stored_value(engine: Engine, ref: str) -> str:
+    """The attachment's stored (verbatim base64) value, read straight from the store."""
+    return "".join([chunk async for chunk in engine.store.read_attachment(ref)])
+
+
+@pytest.mark.parametrize("label", ["image/svg+xml", "text/xml"])
+async def test_svg_served_copy_is_sanitized_and_stored_value_is_untouched(
+    engine: Engine, client: httpx.AsyncClient, label: str
+) -> None:
+    """``text/xml`` is here because the sanitizer keys on the document's root as well as the label, so
+    a sender cannot skip it by mislabelling the SVG."""
+    mid, ref = await _seed_labelled(
+        engine, label, marker=label, prefix=_HOSTILE_SVG + b"<!--", suffix=b"-->"
+    )
+    before = await _stored_value(engine, ref)
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    served = r.content.lower()
+    for needle in (
+        b"script",
+        b"onload",
+        b"foreignobject",
+        b"javascript",
+        b"evil.example",
+        b"alert",
+    ):
+        assert needle not in served, needle
+    assert b'<rect id="kept" width="5" height="5" fill="#123456">' in r.content
+    # The declared type and the download name are unchanged by the sanitizer.
+    assert _base_media_type(r) == _OCTET
+    assert r.headers["content-disposition"] == _disposition(ref, _OCTET_EXT)
+    assert r.headers["content-security-policy"] == _ATTACHMENT_CSP
+    # ADR 0105 owner ruling 3: the STORED value is byte-identical after the download.
+    after = await _stored_value(engine, ref)
+    assert after == before
+    assert base64.b64decode(after).startswith(_HOSTILE_SVG)
+
+
+@pytest.mark.parametrize(
+    ("label", "prefix", "suffix"),
+    [
+        ("image/svg+xml", b"<svg><rect>", b"</svg>"),
+        (
+            "image/svg+xml",
+            b'<!DOCTYPE svg [<!ENTITY a "aaaa"><!ENTITY b "&a;&a;&a;&a;">]><svg>',
+            b"&b;</svg>",
+        ),
+        (
+            "text/xml",
+            b'<!DOCTYPE d [<!ENTITY a "b">]><svg xmlns="http://www.w3.org/2000/svg">',
+            b"</svg>",
+        ),
+    ],
+    ids=["malformed", "entity-bomb", "entity-with-a-non-svg-label"],
+)
+async def test_svg_that_cannot_be_sanitized_is_refused_and_not_audited_as_served(
+    engine: Engine, client: httpx.AsyncClient, label: str, prefix: bytes, suffix: bytes
+) -> None:
+    """Fail closed: no copy of an SVG the parser cannot vet leaves the route, not even the original."""
+    mid, ref = await _seed_labelled(engine, label, marker=label, prefix=prefix, suffix=suffix)
+    before = await _stored_value(engine, ref)
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 422
+    assert b"synthetic document" not in r.content
+    assert not [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    assert await _stored_value(engine, ref) == before
+
+
+async def test_non_svg_xml_is_served_byte_for_byte(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """An XML document whose root is not ``svg`` is not the sanitizer's business, even if it embeds one."""
+    prefix, suffix = (
+        b'<?xml version="1.0"?><ClinicalDocument><svg onload="x"/><note>',
+        b"</note></ClinicalDocument>",
+    )
+    mid, ref = await _seed_labelled(
+        engine, "application/xml", marker="cda", prefix=prefix, suffix=suffix
+    )
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.content == prefix + b"synthetic document cda not real PHI" + suffix
 
 
 # NOTE: test_runbook_documents_the_shipped_download_safety_mechanism moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against
