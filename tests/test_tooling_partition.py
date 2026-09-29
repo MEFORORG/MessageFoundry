@@ -101,6 +101,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # reads the real `git ls-files` scope -- which is the half that makes it engine-subject.
         "test_control_char_check.py",
         "test_crypto_inventory_scanner.py",
+        # AST-scans messagefoundry/**/*.py for every ctypes import and every process start, and
+        # holds docs/DANGEROUS-FUNCTIONALITY.md to both inventories (BACKLOG #1934). A new site
+        # arrives as an ENGINE diff, which does not trip the tooling path gate, so as tooling it
+        # would face nothing on the change it exists to catch.
+        "test_dangerous_functionality_doc.py",
         "test_dependency_boundaries.py",
         "test_ech_record_premise.py",
         # Same shape as control_char_check and licence_header_gate above, and listed for the same
