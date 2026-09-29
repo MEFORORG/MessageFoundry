@@ -645,6 +645,14 @@ open's checkpoint rather than never, but the invariant is worth naming rather th
 **Out of scope: `vault_transit`.** That cipher draws no local nonce and constructs no local `AESGCM`; key
 lifetime is Vault's to version. The bound is a no-op there and for the identity cipher, by design.
 
+> **Corrected 2026-09-28 (BACKLOG #1173).** "Key lifetime is Vault's to version" reads as if Vault
+> enforces the 2^32 bound on this path. Nothing on the record showed that, and Vault's own Transit
+> documentation describes rotation as the operator's act, off by default. The bound on the Transit path
+> is a **documented operator precondition**, and it is weaker than the counted bound above. The owner
+> ruled on 2026-09-28 that it does not meet ruling R3, which needs an attestation the engine records.
+> [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+> 2026-09-28 amendment states the deployment precondition and cites the pages read.
+
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
 
@@ -709,3 +717,85 @@ not.
 
 **Scope.** This amends the *default* only. The `cell_aad` builder, the `mfenc:v2` format, the dual-read
 dispatch, the rotation upgrade path and the three-backend threading are all unchanged.
+
+## Amendment 2026-09-28 — which generator each security value draws from, and why demand cannot exhaust it (ASVS 11.5.2, BACKLOG #1173)
+
+This is the written design statement that ASVS 11.5.2's limb (d) names. Ruling R3 of
+`ASVS-OWNER-RULINGS-2026-09-24-BATCH126.md` left open whether a pass needs one; the owner ruled on
+2026-09-28 that a written design statement IS required for an 11.5.2 pass. This amendment claims no
+verdict. Code is cited by symbol.
+
+**Security values come from two kinds of generator.** The engine draws some itself, per call, from the
+operating system. A crypto library draws the rest inside the process. The tables list at least these
+values; they are not a full census.
+
+**Drawn by the engine, per call, from the operating system's generator.**
+
+| Value | Call | Symbol |
+|---|---|---|
+| Session and API tokens | `secrets.token_urlsafe` | `auth/tokens.py` `mint_token` |
+| Generated policy passwords | `secrets.token_urlsafe` | `auth/service.py` `AuthService._generate_policy_password` |
+| TOTP secrets and recovery codes | `secrets.token_bytes`, `secrets.choice` | `auth/totp.py` `generate_secret`, `generate_recovery_codes` |
+| WebAuthn challenges | `secrets.token_bytes` | `auth/webauthn.py` `new_challenge` |
+| OIDC PKCE verifier, state, nonce, flow id | `secrets.token_bytes` | `auth/oidc/flow.py` `generate_pkce`, `start_flow`, `new_flow_id` |
+| SMART client-assertion `jti` | `secrets.token_urlsafe` | `transports/smart.py` `SmartBackendTokenProvider._assertion_claims` |
+| Web console CSP nonces | `secrets.token_urlsafe` | `messagefoundry_webconsole/_security.py` `UiSecurityHeadersMiddleware` |
+| AES-GCM nonces at rest | `os.urandom` | `store/crypto.py` `AesGcmCipher.encrypt` |
+| Backup frame nonces | `os.urandom` | `store/backup_codec.py` `encrypt_stream` |
+| Store salt, new store keys | `os.urandom` | `store/crypto.py` `new_store_salt`, `generate_key` |
+
+The web console's browser code draws no randomness of its own. Its CSP nonce comes from the server row
+above.
+
+**Drawn inside a crypto library, from that library's generator.**
+
+| Value | Library | Symbol |
+|---|---|---|
+| The self-signed TLS key | OpenSSL, through `cryptography` | `pki.py` `make_self_signed` |
+| TLS handshake randoms and ephemeral keys | OpenSSL, through `ssl` | every TLS hop |
+| ECDSA signature values, RSA-PSS salts | OpenSSL, through `cryptography` | `transports/signing.py` `_sign` |
+| IDE extension webview CSP nonces | Node, `node:crypto` `randomBytes` | `ide/src/cspNonce.ts` `nonce` |
+
+**Why demand cannot exhaust or degrade the generator.**
+
+1. **The engine's own draws hold no process state.** Python's documentation says `secrets` uses the
+   best source the operating system provides, and that `random.SystemRandom` calls `os.urandom` and
+   "does not rely on software state" (<https://docs.python.org/3/library/secrets.html>,
+   <https://docs.python.org/3/library/random.html>, read 2026-09-28). The engine keeps no entropy pool,
+   cached seed or generator object of its own for any row in the first table. So load has nothing in
+   the process to deplete, and there is no reseed step to starve.
+2. **The library draws do hold state, and the library reseeds it.** OpenSSL's generator lives in the
+   process, and there are two copies: `ssl` links one OpenSSL (3.5.7 in a venv built 2026-09-28) and
+   `cryptography` bundles another (4.0.2 in the same venv), each with its own generator. The OpenSSL
+   3.0 `RAND(7)` manual page (<https://docs.openssl.org/3.0/man7/RAND/>, read
+   2026-09-28) says it seeds and reseeds itself automatically from the operating system's trusted
+   sources, and that reseeding can fail if those sources fail. The pages for 3.5 and 4.0 were not
+   checked. The engine does not manage that state and
+   adds none of its own. Node's documentation was not read for this amendment, so it claims nothing
+   about the generator behind `randomBytes`. `cspNonce.ts` keeps no state of its own around it.
+3. **No generator state is copied by a fork.** The engine starts its children as fresh interpreters:
+   engine shards through `asyncio.create_subprocess_exec` in `pipeline/supervisor.py` `_default_spawn`,
+   and the sandbox worker through `subprocess.Popen` in `pipeline/sandbox.py`. Nothing in
+   `messagefoundry/` or `messagefoundry_webconsole/` imports `multiprocessing` or calls `os.fork`. Both
+   names do appear, as strings in lists of what user code may not reach. So the engine's own code never
+   forks, and copies no generator state into a child. That grep covers first-party code only. It does
+   not cover third-party packages, or user Router and Handler code, which runs in the engine process
+   when the sandbox is off.
+4. **Volume wears out a key, not the generator.** The one value whose safety falls with volume is the
+   96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
+   counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path does
+   not. Its bound is a documented operator precondition, weaker than the counted one, recorded in
+   [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+   2026-09-28 amendment.
+
+**What this statement does not cover.** How fast the operating system's generator runs, and whether it
+ever blocks, are properties of Windows and Linux. The platform pages for `os.urandom` and Node's
+`randomBytes` were not read for this amendment, so it restates neither.
+
+**What stops a weak generator coming back, and where it stops short.** Bandit B311 now runs in both the
+CI scan and the pre-commit hook, with each seeded non-security `random` use marked per line. B311 is a
+fixed list of call names, not an import check. It flags at least `random.random`, `random.choice`,
+`random.getrandbits` and `random.Random(...)`, and it misses some calls, such as `random.shuffle`. For
+the TypeScript and JavaScript roots, `scripts/security/crypto_inventory_check.py`
+`check_non_python_randomness` fails on `Math.random`. The extension's own
+`ide/src/test/suite/extension-hardening.test.ts` checks the same.

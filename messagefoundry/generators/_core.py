@@ -468,7 +468,7 @@ def generate_message(code: str, trigger: str, index: int, *, seed: str = DEFAULT
     """Build one ``\\r``-delimited HL7 message (deterministic given ``code``/``trigger``/``seed``)."""
     spec = _REGISTRY[code]
     structure = spec.trigger_to_structure[trigger]
-    rng = random.Random(f"{seed}|{code}|{trigger}|{index}")
+    rng = random.Random(f"{seed}|{code}|{trigger}|{index}")  # nosec B311 (synthetic HL7, seeded)
     sending_app, sending_fac = rng.choice(d.SENDING_APPS)
     receiving_app, receiving_fac = rng.choice(d.RECEIVING_APPS)
     ctx = Ctx(

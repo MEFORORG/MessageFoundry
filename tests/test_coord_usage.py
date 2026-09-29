@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _bash_resolver import probe_env, require_bash
 
 from tests._spawn_lock import run_single
 
@@ -469,8 +470,6 @@ def test_the_installer_refuses_to_replace_someone_elses_statusline(tmp_path: Pat
 
 # --- the shell the statusLine is actually run under ------------------------------------------------
 
-BASH = shutil.which("bash")
-
 # THE FORM THAT SHIPPED BEFORE THE SHELL-AGNOSTIC ONE, kept here as a literal so the bash check below
 # carries its own positive control. An instrument that cannot reject this string proves nothing by
 # accepting the current command, and a check that has never failed is not evidence. The paths are
@@ -484,7 +483,14 @@ LEGACY_POWERSHELL_COMMAND = (
 )
 
 
-def bash_parse(tmp_path: Path, command: str, name: str) -> tuple[int, str]:
+@pytest.fixture(scope="module")
+def bash(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """NOT ``shutil.which("bash")`` (BACKLOG #1216): on a box with WSL that can be the WSL launcher,
+    which cannot open a Windows path. ``require_bash`` probes, and fails loudly rather than skipping."""
+    return require_bash(tmp_path_factory.mktemp("resolve-bash"))
+
+
+def bash_parse(bash: str, tmp_path: Path, command: str, name: str) -> tuple[int, str]:
     """Does bash ACCEPT this string as a script? ``bash -n`` parses it and runs nothing.
 
     Written to a file rather than passed through ``-c`` so the bytes bash reads are the bytes out of
@@ -492,15 +498,20 @@ def bash_parse(tmp_path: Path, command: str, name: str) -> tuple[int, str]:
     """
     f = tmp_path / name
     f.write_bytes(command.encode("utf-8"))
+    # as_posix, NOT str: bash reads a Windows path's backslashes as escapes, so the check would
+    # report a missing file (measured: `C:Users...legacy.sh`) instead of a verdict on the script.
     proc = subprocess.run(
-        [str(BASH), "-n", str(f)], capture_output=True, text=True, timeout=TIMEOUT, check=False
+        [bash, "-n", f.as_posix()],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
     )
     return proc.returncode, proc.stderr
 
 
-@pytest.mark.skipif(BASH is None, reason="the other shell has to be present to check it")
 def test_the_wired_command_parses_under_bash_and_the_form_it_replaced_does_not(
-    tmp_path: Path,
+    bash: str, tmp_path: Path
 ) -> None:
     """THE PROPERTY NOTHING IN THIS FILE ASSERTED, which is exactly why the defect survived.
 
@@ -514,7 +525,7 @@ def test_the_wired_command_parses_under_bash_and_the_form_it_replaced_does_not(
     nothing unless the same call returns non-zero on the form it replaced. Both readings live in one
     test so they cannot drift apart.
     """
-    legacy_rc, legacy_err = bash_parse(tmp_path, LEGACY_POWERSHELL_COMMAND, "legacy.sh")
+    legacy_rc, legacy_err = bash_parse(bash, tmp_path, LEGACY_POWERSHELL_COMMAND, "legacy.sh")
     assert legacy_rc != 0, (
         "bash ACCEPTED the PowerShell-source command, so this check cannot see the class of defect "
         f"it exists for and its verdict on the current command is worthless: {legacy_err!r}"
@@ -524,12 +535,11 @@ def test_the_wired_command_parses_under_bash_and_the_form_it_replaced_does_not(
     settings = tmp_path / "settings.json"
     settings.write_text("{}", encoding="utf-8")
     assert install("-SettingsPath", str(settings), pin=None).returncode == 0
-    rc, err = bash_parse(tmp_path, wired(settings), "wired.sh")
+    rc, err = bash_parse(bash, tmp_path, wired(settings), "wired.sh")
     assert rc == 0, f"bash cannot parse the wired statusLine, so it never reaches pwsh: {err!r}"
 
 
-@pytest.mark.skipif(BASH is None, reason="the other shell has to be present to check it")
-def test_bash_runs_the_wired_command_end_to_end_and_it_publishes(tmp_path: Path) -> None:
+def test_bash_runs_the_wired_command_end_to_end_and_it_publishes(bash: str, tmp_path: Path) -> None:
     """PARSING IS NOT RUNNING. ``bash -n`` would happily accept a command whose quoting split a path
     containing a space, or whose backslashes were eaten -- and the collector would then publish
     nowhere, or into some other directory, with the status bar looking fine. So drive the production
@@ -543,13 +553,13 @@ def test_bash_runs_the_wired_command_end_to_end_and_it_publishes(tmp_path: Path)
     script.write_bytes(wired(settings).encode("utf-8"))
     payload = json.dumps({"session_id": "bash", "rate_limits": {"five_hour": window(44.0, 3600)}})
     proc = subprocess.run(
-        [str(BASH), str(script)],
+        [bash, script.as_posix()],
         input=payload,
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
         check=False,
-        env=_env(None),
+        env=probe_env(Path(bash), _env(None)),
     )
     assert proc.returncode == 0, f"bash could not run the wired command: {proc.stderr!r}"
     assert "44" in proc.stdout, f"no reading came out of the wired command: {proc.stdout!r}"

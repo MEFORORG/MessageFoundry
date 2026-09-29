@@ -178,5 +178,8 @@ class Keyer:
         return int.from_bytes(digest, "big")
 
     def rng(self, kind: str, value: str) -> random.Random:
-        """A deterministic :class:`random.Random` for ``(kind, value)`` — the surrogate picker."""
-        return random.Random(self.seed(kind, value))
+        """A deterministic :class:`random.Random` for ``(kind, value)`` — the surrogate picker.
+
+        Not a security draw: the pseudonym must repeat for the same input, and the one-way property
+        comes from the keyed BLAKE2b seed above, not from this generator (BACKLOG #1173)."""
+        return random.Random(self.seed(kind, value))  # nosec B311 (seeded picker, see docstring)
