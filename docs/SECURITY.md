@@ -50,7 +50,8 @@ decision 3). Unless you also supply `[api].tls_cert_file`, the hop from the prox
 deploying site's job: a same-host loopback hop, an isolated network segment, or a host firewall. So
 `serve` refuses to start that topology (exit 2) until `[api].plaintext_upstream_hop_acknowledged =
 true` is set. It refuses in **every** mode, under `enforce` or `warn`, on a loopback bind or not. The
-setting records that the operator took the hop on; it secures nothing by itself. With an operator
+setting records that the operator took the hop on; it secures nothing by itself. It is a listed
+loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each start reports it. With an operator
 `tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging and the setting is
 not required. The proxy must then speak https to the engine and trust that certificate, or every
 request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at

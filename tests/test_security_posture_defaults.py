@@ -27,6 +27,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
     AlertsSettings,
+    ApiSettings,
     AuthSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -62,6 +63,7 @@ def _names(
     db_hops: tuple[str, ...] = (),
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
+    api: ApiSettings | None = None,
 ) -> list[str]:
     """The loosening SWITCH NAMES for a settings combination (defaults where not overridden)."""
     return [
@@ -77,6 +79,7 @@ def _names(
             unverified_db_hops=db_hops,
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
+            api=api or ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -115,6 +118,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -142,6 +146,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -166,6 +171,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -211,6 +217,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -225,6 +232,66 @@ def test_new_ip_step_up_off_with_auth_off_is_NOT_a_loosening() -> None:
     assert "admin_new_ip_step_up" not in _names(
         auth=AuthSettings(enabled=False, admin_new_ip_step_up=False)
     )
+
+
+# --- [api].plaintext_upstream_hop_acknowledged (BACKLOG #1179) --------------------------------
+# Owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS 12.3.3 at partial.
+# The acknowledgement is therefore a listed loosening, as the #1967 retention acknowledgements are.
+
+
+def _terminated(*, ack: bool, cert: bool = False) -> ApiSettings:
+    """A declared upstream terminator, optionally acknowledged and optionally with an operator cert.
+
+    The cert paths are never opened here: api_tls_source reads only whether one is configured."""
+    fields: dict[str, object] = {
+        "tls_terminated_upstream": True,
+        "trusted_proxies": ["10.0.0.1"],
+        "plaintext_upstream_hop_acknowledged": ack,
+    }
+    if cert:
+        fields["tls_cert_file"] = "operator-cert.pem"
+        fields["tls_key_file"] = "operator-key.pem"
+    return ApiSettings(**fields)  # type: ignore[arg-type]
+
+
+def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
+    named = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            api=_terminated(ack=True),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    )
+    risk = named["plaintext_upstream_hop_acknowledged"]
+    # What the site gives up, not merely that a switch is set: the hop is plaintext and unprotected.
+    assert "PLAINTEXT" in risk
+    assert "deploying site's job" in risk
+    assert "tls_cert_file" in risk
+
+
+def test_the_plaintext_hop_acknowledgement_is_not_reported_when_unset() -> None:
+    """The negative control. The shipped [api] defaults acknowledge nothing, and a terminator with no
+    acknowledgement is not a loosening here: serve REFUSES it, so there is no weakening to report."""
+    assert "plaintext_upstream_hop_acknowledged" not in _names()
+    assert "plaintext_upstream_hop_acknowledged" not in _names(api=_terminated(ack=False))
+
+
+def test_the_plaintext_hop_acknowledgement_is_not_reported_when_a_cert_serves_the_hop() -> None:
+    """With an operator tls_cert_file the engine serves that hop over TLS (api_tls_source's order), so
+    the acknowledgement is inert and reporting it would name a weakening that does not exist."""
+    assert "plaintext_upstream_hop_acknowledged" not in _names(api=_terminated(ack=True, cert=True))
+    # The control that makes the zero above mean something: the same object without the cert fires.
+    assert "plaintext_upstream_hop_acknowledged" in _names(api=_terminated(ack=True))
 
 
 # --- the cross-field refusal, keyed on model_fields_set ---------------------------------------
@@ -596,6 +663,20 @@ async def test_posture_route_reports_the_auth_deviation(engine: Engine) -> None:
     assert "ad_session_recheck_seconds" in switches
 
 
+async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: Engine) -> None:
+    """BACKLOG #1179: the route reads [api] off the resolved settings serve stashes (#1989)."""
+    body = await _posture_body(
+        engine, static_credential_settings=ServiceSettings(api=_terminated(ack=True))
+    )
+    switches = [entry["switch"] for entry in body["loosenings"]]  # type: ignore[index,union-attr]
+    assert "plaintext_upstream_hop_acknowledged" in switches
+    # Negative control: the same stash without the acknowledgement's plaintext hop reports nothing.
+    quiet = await _posture_body(
+        engine, static_credential_settings=ServiceSettings(api=_terminated(ack=True, cert=True))
+    )
+    assert quiet["loosenings"] == []
+
+
 async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Engine) -> None:
     """The route must be quiet on a default instance, or its signal is worthless."""
     body = await _posture_body(engine)
@@ -621,6 +702,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -660,6 +742,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -690,6 +773,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -717,6 +801,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
