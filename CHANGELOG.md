@@ -568,6 +568,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   That includes presets saved under the no-auth `system` identity. On PostgreSQL and SQL Server the
   step runs in the schema batch, under `provision-schema` and `auto` alike. The 0.4.0 entry's advice
   to drop the table first no longer applies from this release on. (`BACKLOG #1909`)
+- **A pooled stage no longer gains a processing slot when a claimer dies mid-bookkeeping.** When a
+  claim ended with no serializer, the dispatcher returned the lane's slot and then booked the episode
+  and moved the lane on. If either step raised, the claimer died with the lane still marked as
+  claiming, and its replacement returned the same slot again. The stage could then run more lanes at
+  once than `pooled_max_processing_lanes` allows. Each lane now records whether it holds a slot, and
+  one helper returns it at most once per reservation, on every path that ends a claim.
+  (`BACKLOG #2075`)
 - **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
   whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
   algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal

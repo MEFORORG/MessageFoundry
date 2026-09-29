@@ -183,6 +183,11 @@ class _LaneState:
     # rather than a double-book or a poisoned mean. A field on this already-per-lane dataclass (never a
     # new lane→start_ns dict): zero allocation per episode, zero growth with message volume.
     episode_start_ns: int = 0
+    # BACKLOG #2075: this lane holds one of the stage's processing slots. Set where the slot is
+    # reserved (_assemble_chunk) and cleared by the one release that returns it (_release_lane_slot).
+    # The phase alone cannot say this: a lane whose bookkeeping raised after its slot came back is
+    # still CLAIMING, and the respawn's adoption, keyed on CLAIMING, released it a second time.
+    slot_held: bool = False
 
 
 @dataclass
@@ -917,15 +922,10 @@ class StageDispatcher:
             st = self._states.get(lane)
             if st is None or st.phase is not _LanePhase.CLAIMING:
                 continue
-            self._release_slot()
-            self._drop_lane_episode(st, end_ns)
             if st.pause_pending:
-                st.phase = _LanePhase.PAUSED
-                st.pause_pending = False
-                st.dirty = False
-                self._fire_paused(lane)
+                self._end_claim(lane, st, end_ns, _LanePhase.PAUSED)
             else:
-                self._to_ready(lane, woken=st.ready_woken)
+                self._end_claim(lane, st, end_ns, _LanePhase.READY, woken=st.ready_woken)
         claimer.abandoned.clear()
 
     def _mark_task_healthy(self, name: str) -> None:
@@ -1007,6 +1007,7 @@ class StageDispatcher:
             # interleave.
             st.episode_start_ns = now_ns
             self._slots_free -= 1  # reserve
+            st.slot_held = True
             lanes.append(lane)
         return lanes
 
@@ -1035,13 +1036,11 @@ class StageDispatcher:
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
             err_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
             for lane in lanes:
-                self._release_slot()
                 st = self._states[lane]
                 # S_lane DROP (error path): the claim rendered no service — the same exclusion the claim
                 # timer already makes for a raised claim — but the lane WAS occupied for that interval,
                 # so it is booked as `dropped` (occupancy), never as `episode` (service).
-                self._drop_lane_episode(st, err_ns)
-                self._to_ready(lane, woken=st.ready_woken)
+                self._end_claim(lane, st, err_ns, _LanePhase.READY, woken=st.ready_woken)
             # BACKLOG #1844: on a backoff, with the running count (messagefoundry.log_backoff).
             claimer.faults = claimer.faults.record(
                 log,
@@ -1111,40 +1110,28 @@ class StageDispatcher:
                     # An operator pause landed while CLAIMING and the claim came back EMPTY (or rearm-only):
                     # the lane is already quiesced (no row claimed, the reserved slot never consumed), so
                     # route it STRAIGHT to PAUSED — a pause must never drop to a claimable IDLE / re-ready.
-                    self._release_slot()
-                    self._drop_lane_episode(st, rel_ns)  # S_lane DROP: no service was rendered
-                    st.phase = _LanePhase.PAUSED
-                    st.pause_pending = False
-                    st.dirty = False
-                    self._fire_paused(lane)
+                    # S_lane DROP: no service was rendered.
+                    self._end_claim(lane, st, rel_ns, _LanePhase.PAUSED)
                 elif (
                     lane in result.rearm
                 ):  # T10: head consumed in-store (H2/poison) -> immediate re-claim
-                    self._release_slot()
                     # S_lane DROP (rearm): claim-only, the lane never entered PROCESSING. These are frequent
                     # and sub-millisecond — booking them as SERVICE would drag S_lane down toward the bare
                     # claim time and manufacture the "lanes do not bind" verdict on the load-bearing question.
                     # They ARE lane occupancy, though (the lane sat reserved across the whole shared claim
                     # round-trip), so they go to `dropped` — discarding them outright is what would make the
                     # negative branch of the ARM 1 test unfalsifiable.
-                    self._drop_lane_episode(st, rel_ns)
-                    self._to_ready(lane, woken=st.ready_woken)
+                    self._end_claim(lane, st, rel_ns, _LanePhase.READY, woken=st.ready_woken)
                 else:  # EMPTY
                     # The lane-level books are unchanged: an aborted claim is still an EMPTY claim for
                     # every lane it covered, because that is what happened to each lane. What is NOT
                     # recorded here is any per-lane cause — see the attempt-level booking below.
-                    # Booked BEFORE the slot release (#1609): the injected observer is the one call
-                    # here that could raise, and a lane _abandon_claim finds still CLAIMING must still
-                    # hold its slot.
                     self._record_empty(woken=st.ready_woken)
-                    self._release_slot()
-                    self._drop_lane_episode(
-                        st, rel_ns
-                    )  # S_lane DROP: same as rearm — occupancy, not service
+                    # S_lane DROP: same as rearm — occupancy, not service.
                     if st.dirty:  # T11: a wake raced the claim -> re-claim now, no sweep wait
-                        self._to_ready(lane, woken=True)
+                        self._end_claim(lane, st, rel_ns, _LanePhase.READY, woken=True)
                     else:  # T12
-                        st.phase = _LanePhase.IDLE
+                        self._end_claim(lane, st, rel_ns, _LanePhase.IDLE)
                 dispatched += 1
         except Exception:
             self._abandon_claim(claimer, lanes[dispatched:], result.by_lane)
@@ -1285,10 +1272,10 @@ class StageDispatcher:
         # of which is one.
         _episode_end_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
         self._lane_tasks.pop(lane, None)
-        self._release_slot()
         st = self._states.get(lane)
-        if st is None:  # torn down under us — the stamp died with the state; nothing to book
+        if st is None:  # torn down under us: stop() already returned every slot, nothing to book
             return
+        self._release_lane_slot(st)
         # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
         # stamp that survived it could be mis-booked onto the lane's NEXT episode.
         _episode_start_ns = st.episode_start_ns
@@ -1303,10 +1290,7 @@ class StageDispatcher:
             # S_lane DROP: an operator pause is not the product's service time — booking it would let an
             # operator action move the ceiling arithmetic. Occupancy, though, so it goes to `dropped`.
             self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
-            st.pause_pending = False
-            st.phase = _LanePhase.PAUSED
-            st.dirty = False
-            self._fire_paused(lane)
+            self._to_paused(lane, st)
             return
         if (
             outcome.kind is None
@@ -1472,6 +1456,42 @@ class StageDispatcher:
         st.dirty = False
         st.ready_woken = woken
         self._enqueue(lane)
+
+    def _to_paused(self, lane: str, st: _LaneState) -> None:
+        """Land a quiesced lane's pending operator pause: PAUSED, and tell the runner."""
+        st.phase = _LanePhase.PAUSED
+        st.pause_pending = False
+        st.dirty = False
+        self._fire_paused(lane)
+
+    def _end_claim(
+        self, lane: str, st: _LaneState, end_ns: int, to: _LanePhase, *, woken: bool = False
+    ) -> None:
+        """End a CLAIMING lane's episode without a serializer: return its slot, book the episode as
+        a drop, and move the lane to ``to`` (READY, IDLE or PAUSED).
+
+        BACKLOG #2075. The slot goes back FIRST, through :meth:`_release_lane_slot`, which releases
+        at most once per reservation. If the bookkeeping after it raises, the lane is left CLAIMING
+        with its slot already returned, and the claimer dies. The respawn's adoption then finds the
+        lane CLAIMING and ends its claim again, and the second release is a no-op. Releasing last,
+        in a ``finally``, would instead leak the slot for good if the release itself raised after
+        the lane had already left CLAIMING, because nothing would come back for it."""
+        self._release_lane_slot(st)
+        self._drop_lane_episode(st, end_ns)
+        if to is _LanePhase.READY:
+            self._to_ready(lane, woken=woken)
+        elif to is _LanePhase.PAUSED:
+            self._to_paused(lane, st)
+        else:
+            st.phase = to
+
+    def _release_lane_slot(self, st: _LaneState) -> None:
+        """Return ``st``'s slot if it still holds one, else do nothing (BACKLOG #2075). The flag is
+        cleared only after the release returns, so a release that raises is retried by whichever
+        path next ends the lane's claim."""
+        if st.slot_held:
+            self._release_slot()
+            st.slot_held = False
 
     def _lane_done(self, lane: str, st: _LaneState, *, claimed_full: bool) -> None:
         """Every item resolved. Re-arm if a wake raced processing (T14); else, for a FULL batch claimed
