@@ -133,6 +133,17 @@ def test_the_database_legs_keep_their_ESTABLISHED_attribution(bash: Path) -> Non
     assert "CAUSE NOT ESTABLISHED" not in r.stdout
 
 
+def test_the_database_legs_do_not_file_every_crash_under_1459(bash: Path) -> None:
+    """BACKLOG #2049. A second crash class is known on those legs: the store's cancel path freed ODBC
+    handles under a running statement. Both exit 139, so the wrapper cannot pick one. Naming #1459
+    alone filed that crash under an upstream bug; the default must name both and say it cannot
+    tell them apart."""
+    r = _run(bash, 139, attempts="1")
+    assert "2049" in r.stdout, "the store cancel-path class is missing from the attribution"
+    assert "cannot tell them apart" in r.stdout
+    assert "likely the pyodbc" not in r.stdout, "the old single-cause wording is back"
+
+
 # ---------------------------------------------------------------------------------------------
 # THE COVERAGE ARM -- the gap the item was filed for
 # ---------------------------------------------------------------------------------------------

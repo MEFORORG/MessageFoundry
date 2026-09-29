@@ -20,8 +20,10 @@
 #
 # WHY THIS IS SAFE (does not mask real regressions): we retry ONLY on the native-crash exit
 # codes below. A genuine test failure exits 1 and is re-raised immediately, never retried.
-# Our own Python cannot cause a native segfault — a real logic regression surfaces as a
-# pytest assertion (exit 1), so this wrapper can never hide one. Each retry emits a visible
+# CORRECTED 2026-09-28 (BACKLOG #2049): this paragraph said our own Python cannot cause a native
+# segfault. It can. The store's cancel path, pure Python, closed ODBC handles under a running
+# statement, and the driver then crashed. So a retried crash CAN be a regression of ours; the
+# section below on crash classes says how that class is kept visible. Each retry emits a visible
 # ::warning:: (grep CI logs for "NATIVE CRASH" to track the flake frequency against #1459).
 #
 # REMOVING THIS WRAPPER IS NOT A BLANKET DELETION -- READ THE CALLER SET FIRST (BACKLOG #1260).
@@ -46,17 +48,27 @@
 # error to catch because the part a reader checks is true. So callers where the class is NOT known
 # set RETRY_NATIVE_CRASH_CAUSE="" and the message says so in words.
 #
+# THE DATABASE LEGS HAVE MORE THAN ONE CRASH CLASS, AND THIS WRAPPER CANNOT TELL THEM APART
+# (BACKLOG #2049). The default attribution used to name #1459 alone. A second class is known: the
+# SQL Server store's cancel path freed ODBC handles while the cancelled statement still ran, and the
+# statement then read its result metadata from freed memory (SQLDescribeColW, SQLColAttributeW), not
+# from the parameter-binding path #1459 is about. Naming only #1459 filed that crash under an upstream
+# bug. Both are exit 139 and nothing the wrapper sees separates them, so the default clause names
+# both and says so; the faulthandler dump is where a reader tells them apart.
+# tests/test_sqlserver_store.py also runs a cancel scenario in a child process, so a crash of that
+# class fails its own test as an assertion (exit 1), which this wrapper never retries.
+#
 # Usage: scripts/ci/retry-native-crash.sh <cmd> [args...]
 # Env:   RETRY_NATIVE_CRASH_ATTEMPTS (default 3)
-#        RETRY_NATIVE_CRASH_CAUSE    attribution clause; default names the pyodbc class (correct for
-#                                    the database legs). Set to "" on any leg where it is unproven.
+#        RETRY_NATIVE_CRASH_CAUSE    attribution clause; default names the two classes known on the
+#                                    database legs. Set to "" on any leg where neither is proven.
 set -uo pipefail
 
 attempts="${RETRY_NATIVE_CRASH_ATTEMPTS:-3}"
 
-# Defaulting to the pyodbc clause keeps the nine database-leg call sites saying exactly what they
-# say today; only a caller that has NOT established the class has to opt out.
-default_cause=" -- likely the pyodbc py3.14 parameter-binding segfault (mkleehammer/pyodbc#1459)"
+# The default serves the nine database-leg call sites, so only a caller where neither class is
+# established has to opt out. It names both known classes and does not pick one.
+default_cause=" -- a database-leg crash class: the pyodbc py3.14 parameter-binding segfault (mkleehammer/pyodbc#1459) or a handle freed under a running statement on the store cancel path (BACKLOG #2049); this wrapper cannot tell them apart, read the faulthandler dump"
 cause="${RETRY_NATIVE_CRASH_CAUSE-$default_cause}"
 if [ -z "$cause" ]; then
   # DELIBERATELY NAMES NO CLASS, NOT EVEN TO WARN AGAINST ONE. An earlier draft said "do not
