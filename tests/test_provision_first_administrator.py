@@ -13,6 +13,7 @@ here describes what a deploying site would inherit, never a live exposure.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
 import time
@@ -1284,6 +1285,10 @@ class _Terminal:
     def show(self, text: str) -> None:
         self.shown.append(text)
 
+    def fileno(self) -> int:
+        # A stand-in stream names no device, as a replaced real stdin would not either.
+        raise io.UnsupportedOperation("fileno")
+
     def isatty(self) -> bool:
         return True
 
@@ -1396,6 +1401,7 @@ def test_the_key_goes_to_the_console_device_and_nowhere_else(
 
     real = cli._show_on_terminal.__wrapped__  # type: ignore[attr-defined]
     device = tmp_path / "console"
+    device.write_text("")  # a device exists before anything writes to it; open() never creates one
     monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(device))
     real("  key: SYNTHETICKEY\n")
     assert device.read_text(encoding="utf-8") == "  key: SYNTHETICKEY\n"

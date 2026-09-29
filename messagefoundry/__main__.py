@@ -5569,6 +5569,26 @@ def _controlling_terminal_path() -> str:
     return "CONOUT$" if sys.platform == "win32" else "/dev/tty"
 
 
+def _open_terminal() -> int:
+    """Open the console device for writing, or raise :class:`OSError`. The controlling terminal
+    first; on POSIX, the terminal on stdin when there is none. A session started under ``setsid``
+    (for example ``su -c``) has a tty on stdin but no controlling terminal, and ``/dev/tty`` refuses
+    it with ENXIO although the operator is sitting at that very tty."""
+    import os
+
+    try:
+        return os.open(_controlling_terminal_path(), os.O_WRONLY)
+    except OSError as exc:
+        if sys.platform == "win32" or not sys.stdin.isatty():
+            raise
+        try:
+            return os.open(os.ttyname(sys.stdin.fileno()), os.O_WRONLY)
+        except (OSError, ValueError):
+            # stdin names no terminal device after all (``fileno`` raises on a replaced stream):
+            # report the controlling-terminal failure, which is the one the operator can act on.
+            raise exc from None
+
+
 def _show_on_terminal(text: str) -> None:
     """Write ``text`` to the controlling terminal itself, never to stdout or stderr (ADR 0197
     Amendment A, N-A; CodeQL alert 228, BACKLOG #1131).
@@ -5577,10 +5597,19 @@ def _show_on_terminal(text: str) -> None:
     codes. Stdout carries ``--json``, and either stream can be redirected into a file, a service
     wrapper's log or a CI capture, which is where the alert said the key could land. Opening the
     console device writes to the screen and nowhere else. Raises :class:`OSError` when the process
-    has no console, so a caller can refuse rather than fall back to a stream."""
-    with open(_controlling_terminal_path(), "w", encoding="utf-8") as console:
-        console.write(text)
-        console.flush()
+    has no console, or it goes away mid-write, so a caller can refuse rather than fall back to a
+    stream."""
+    import os
+
+    data = text.encode("utf-8", "replace")
+    fd = _open_terminal()
+    try:
+        # A terminal may take a write in pieces; loop until every byte is out, so a recovery code is
+        # never silently cut short.
+        while data:
+            data = data[os.write(fd, data) :]
+    finally:
+        os.close(fd)
 
 
 def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str, float]:
