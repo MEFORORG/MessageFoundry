@@ -50,12 +50,29 @@ FORCE_CONFIRM = "/ui/cluster/force-stepdown-confirm"
 
 
 def _status(
-    node_id: str = "node-a", *, clustered: bool = True, is_leader: bool = True
+    node_id: str = "node-a",
+    *,
+    clustered: bool = True,
+    is_leader: bool = True,
+    owns_lease_row: bool | None = None,
 ) -> ClusterStatus:
+    """``owns_lease_row`` defaults to what a real engine publishes outside the self-fence window: True
+    on a clustered leader, False otherwise (single-node has no lease row)."""
     role = "single-node" if not clustered else ("primary" if is_leader else "standby")
+    owns = (clustered and is_leader) if owns_lease_row is None else owns_lease_row
     return ClusterStatus(
-        node_id=node_id, clustered=clustered, is_leader=is_leader, role=role, config_version=3
+        node_id=node_id,
+        clustered=clustered,
+        is_leader=is_leader,
+        role=role,
+        config_version=3,
+        owns_lease_row=owns,
     )
+
+
+def _fenced() -> ClusterStatus:
+    """node-a self-fenced: its flag is clear, and the engine would still drain its lease row."""
+    return _status(is_leader=False, owns_lease_row=True)
 
 
 def _node(
@@ -129,14 +146,21 @@ def test_the_leader_with_cluster_control_is_offered_both_actions() -> None:
         ),
         (_status(), _healthy(), False, "needs the cluster:control permission"),
         (
-            # This node's own flag agrees there is no leader; with the flag still set, the same
-            # heartbeat reads as leadership changing hands instead (the next case).
+            # The just-released window, after the heartbeat caught up: the lease row still names
+            # node-a but the engine owes it nothing, so owns_lease_row is False and nothing drains.
+            # This is the case a console rule of "the lease names this node" would wrongly offer.
             _status(is_leader=False),
-            _nodes(_node("node-a"), _node("node-b"), leader=None),
+            _nodes(_node("node-a"), _node("node-b"), leader=None, lease_owner="node-a"),
             True,
             "No node holds live leadership",
         ),
-        (_status(is_leader=False), _healthy(), True, "Leadership is changing hands"),
+        (
+            # The same release, one heartbeat earlier: the heartbeat still names node-a.
+            _status(is_leader=False),
+            _healthy(),
+            True,
+            "Leadership is changing hands",
+        ),
         (
             _status("node-b", is_leader=False),
             _healthy(),
@@ -167,6 +191,55 @@ def test_the_leaderless_window_reads_as_a_failover_in_progress() -> None:
     assert "Failover in progress" in html
     # The node that let go is the lease owner, and it is not offered as its own successor.
     assert "Nodes that can take it: node-b." in html
+
+
+@pytest.mark.parametrize(
+    "nodes",
+    [
+        _healthy(),  # before its next heartbeat, which still carries the leader flag
+        _nodes(_node("node-a"), _node("node-b"), leader=None),  # after it
+    ],
+    ids=["heartbeat-lags", "heartbeat-caught-up"],
+)
+def test_a_self_fenced_node_is_offered_the_control_with_its_own_wording(
+    nodes: ClusterNodeList,
+) -> None:
+    """BACKLOG #1988. The engine drains a self-fenced node (#1508), so the console offers the
+    control there too, on the engine's own ``owns_lease_row`` rather than a lease-expiry guess. The
+    wording says the node is releasing a lease it no longer serves, and it does not call this a
+    failover in progress: no standby can take a lease row that still names this node."""
+    html = str(pages.high_availability(_fenced(), nodes, can_control=True))
+    assert _offers(html, CONFIRM)
+    assert _offers(html, FORCE_CONFIRM)
+    assert "disabled title=" not in html
+    assert "releases the lease it no longer serves" in html
+    assert "its lease row still names it" in html
+    assert "Failover in progress" not in html
+
+
+def test_a_self_fenced_node_whose_lease_moved_is_told_what_the_engine_will_answer() -> None:
+    """The engine still sends the owner-scoped write while it has not seen its lease move, so the
+    control stays offered; the page says the lease names another node, so expect a 409."""
+    moved = _nodes(
+        _node("node-a"), _node("node-b", is_leader=True), leader="node-b", lease_owner="node-b"
+    )
+    html = str(pages.high_availability(_fenced(), moved, can_control=True))
+    assert _offers(html, CONFIRM)
+    assert "this node holds no lease" in html
+    assert "its lease row still names it" not in html
+
+
+def test_the_self_fenced_confirm_says_it_releases_a_lease_not_leadership() -> None:
+    planned = str(pages.stepdown_confirm(_fenced(), _healthy(), force=False))
+    assert "This releases the lease node-a still holds." in planned
+    assert "This releases leadership on" not in planned
+    assert 'method="post" action="/ui/cluster/stepdown"' in planned
+    forced = str(pages.stepdown_confirm(_fenced(), _healthy(), force=True))
+    assert "This releases the lease node-a still holds." in forced
+    assert 'method="post" action="/ui/cluster/force-stepdown"' in forced
+    # The forced page used to say force "does not step down a node that is not the leader", which
+    # a self-fenced node, offered this very page, would contradict.
+    assert "not the leader" not in forced
 
 
 def test_a_leaderless_cluster_with_no_candidate_does_not_claim_a_failover() -> None:
@@ -357,12 +430,17 @@ class _Coordinator(NullCoordinator):
         self,
         *,
         clustered: bool = True,
+        leader: bool = True,
+        owns_row: bool | None = None,
         members: list[ClusterMember] | None = None,
         step_down: tuple[bool, float | None, bool] = (True, 1_700_000_000.5, True),
         raises: Exception | None = None,
     ) -> None:
         super().__init__("node-a")
         self._clustered = clustered
+        self._leader = leader
+        # What a real coordinator reports outside the self-fence window: it owns a row while it leads.
+        self._owns_row = (clustered and leader) if owns_row is None else owns_row
         self._members = (
             members
             if members is not None
@@ -374,6 +452,12 @@ class _Coordinator(NullCoordinator):
 
     def is_clustered(self) -> bool:
         return self._clustered
+
+    def is_leader(self) -> bool:
+        return self._leader
+
+    def may_own_lease_row(self) -> bool:
+        return self._owns_row
 
     async def cluster_members(self) -> list[ClusterMember]:
         return self._members
@@ -522,6 +606,66 @@ async def test_a_stepdown_through_the_console_reaches_the_engine_and_redirects(
         assert "Leadership released." in (await c.get(r.headers["location"])).text
 
 
+async def test_a_self_fenced_node_is_drained_through_the_console(tmp_path: Path) -> None:
+    """BACKLOG #1988, close criterion 2. The node's flag is clear, its heartbeat no longer names it,
+    and the engine would still drain its lease row. Before this change only the API could: the page
+    disabled the control and the confirm page rendered no form. The whole path runs here, from the
+    offered control through the confirm page to the real ``POST /cluster/stepdown`` handler."""
+    coord = _Coordinator(
+        leader=False,
+        owns_row=True,
+        members=[_member("node-a"), _member("node-b")],
+        step_down=(False, None, True),
+    )
+    async with _console(tmp_path, coord) as (engine, c):
+        for path in ("/ui/cluster", "/ui/cluster/live"):
+            html = (await c.get(path)).text
+            assert _offers(html, CONFIRM), path
+            assert "releases the lease it no longer serves" in html, path
+        confirm = await c.get(CONFIRM)
+        assert confirm.status_code == 200
+        assert "This releases the lease node-a still holds." in confirm.text
+        assert _offers(confirm.text, "/ui/cluster/stepdown")
+        r = await c.post("/ui/cluster/stepdown", headers=SAME_ORIGIN)
+        assert r.status_code == 303, r.text
+        assert r.headers["location"] == "/ui/cluster?m=released"
+        assert coord.step_down_calls == 1
+        detail = json.loads(str((await _stepdown_rows(engine))[0]["detail"]))
+        assert detail["was_leader"] is False and detail["lease_released"] is True
+
+
+@pytest.mark.parametrize(
+    ("leader", "members", "reason"),
+    [
+        (
+            # A standby that never held the lease: the engine would drain nothing here.
+            False,
+            [_member("node-a"), _member("node-b", is_leader=True)],
+            "open the console on the leader, node-b",
+        ),
+        (
+            # Just released: no leader yet, the lease row still names node-a, and nothing is owed.
+            False,
+            [_member("node-a"), _member("node-b")],
+            "No node holds live leadership",
+        ),
+    ],
+    ids=["standby", "just-released"],
+)
+async def test_a_node_the_engine_would_not_drain_is_not_offered_the_control(
+    tmp_path: Path, leader: bool, members: list[ClusterMember], reason: str
+) -> None:
+    coord = _Coordinator(leader=leader, owns_row=False, members=members)
+    async with _console(tmp_path, coord) as (_engine, c):
+        html = (await c.get("/ui/cluster")).text
+        assert not _offers(html, CONFIRM)
+        assert reason in html
+        confirm = await c.get(CONFIRM)
+        assert confirm.status_code == 200
+        assert not _offers(confirm.text, "/ui/cluster/stepdown")
+    assert coord.step_down_calls == 0
+
+
 async def test_a_forced_drain_of_the_last_node_carries_the_drain_notice(tmp_path: Path) -> None:
     coord = _Coordinator(members=[_member("node-a", is_leader=True)])
     async with _console(tmp_path, coord) as (engine, c):
@@ -539,7 +683,7 @@ async def test_a_forced_drain_of_the_last_node_carries_the_drain_notice(tmp_path
         (
             lambda: _Coordinator(step_down=(False, None, False)),
             409,
-            "This node is not the leader",
+            "This node holds no lease to release",
             1,
         ),
         (

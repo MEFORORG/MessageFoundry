@@ -126,6 +126,16 @@ under Changed says why engine 0.4.0 does not work with this console.
   holds the new value and the one-value rule above still applies.
 
 ### Fixed
+- **The High Availability page offers the stepdown control on a self-fenced node** (`BACKLOG
+  #1988`). The engine already drained such a node through the API (`BACKLOG #1508`), but the page
+  offered the control only when both leadership signals named the node, so the operator had to use
+  the API. The page now offers it exactly when the engine would drain the node, read from the new
+  `ClusterStatus.owns_lease_row`. It does not guess from `lease_expires_at`, which is on the
+  database clock. A node that has just released its lease, or a standby, stays disabled. On a
+  self-fenced node the page and both confirm pages say the node is releasing a lease it no longer
+  serves, and do not call it a failover in progress. The `409` refusal page now reads "This node
+  holds no lease to release" and names the self-fenced race among the cases where failover already
+  worked. Needs an engine that publishes `owns_lease_row`, so the seam digest moved.
 - **The uploaded-file pages explain a refused, throttled or unavailable action** (`BACKLOG #1169`,
   PR 1506 follow-up A). Browse, resend and delete showed the engine's raw JSON for a status they
   did not map. Two new allow-listed codes cover browse: `browse_hop_refused` (the PHI-read hop
