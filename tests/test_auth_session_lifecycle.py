@@ -471,10 +471,10 @@ async def test_ad_role_change_on_relogin_revokes_other_sessions() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
@@ -542,10 +542,10 @@ async def test_local_and_ad_session_expiry_is_unchanged_by_the_cap_seam() -> Non
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
@@ -585,10 +585,10 @@ async def test_ad_login_success_audit_detail_is_byte_identical() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]

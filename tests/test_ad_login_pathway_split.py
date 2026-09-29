@@ -73,13 +73,13 @@ class _FakeLdap:
     def __init__(self) -> None:
         self.binds: list[str] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         self.binds.append(username)
         if password == "synthetic-good":
             return _principal(username)
         return None
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return _principal(username)
 
 
@@ -241,7 +241,7 @@ async def test_step_up_re_bind_treats_a_directory_outage_as_a_refusal() -> None:
     """Fail-closed on the step-up path: an unreachable directory must not grant the action."""
 
     class _Down(_FakeLdap):
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             raise LdapError("synthetic: LDAP socket closed")
 
     store = await MessageStore.open(":memory:")

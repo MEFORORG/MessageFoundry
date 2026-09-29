@@ -312,10 +312,10 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if (username == "jdoe" and password == "pw") else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
             def probe_principal(

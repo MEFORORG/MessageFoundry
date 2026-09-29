@@ -168,10 +168,10 @@ async def test_ad_user_reauth_uses_a_live_rebind(engine: Engine) -> None:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "ad-pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(
@@ -445,10 +445,10 @@ async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> N
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "ad-pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(

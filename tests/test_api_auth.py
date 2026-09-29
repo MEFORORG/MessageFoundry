@@ -1439,10 +1439,10 @@ async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> N
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(

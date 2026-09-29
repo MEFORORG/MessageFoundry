@@ -5397,10 +5397,10 @@ def _ad_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(
@@ -5593,10 +5593,10 @@ def _sso_service(engine: Engine) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if (username == "jdoe" and password == "pw") else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     settings = AuthSettings(
@@ -6929,7 +6929,7 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
     )
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
         def resolve_principal(

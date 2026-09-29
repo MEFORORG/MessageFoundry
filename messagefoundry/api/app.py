@@ -4749,11 +4749,9 @@ def create_app(
         principal whose id disagrees with the row holding its username is refused rather than handed
         the row. A recycled name therefore gets a new ``user_id``, which is what this check needs.
 
-        **The residual, stated because it is what a reader would otherwise assume away:** a directory
-        that returns no immutable identifier at all still resolves by name, because the engine cannot
-        key on an identifier it is not given. The LDAP layer warns once per distinct cause -- absent
-        as well as unreadable -- so a site on that path is told, rather than left to assume a control
-        is running for it.
+        **A directory that returns no immutable identifier signs nobody in** (BACKLOG #2027): a
+        principal with no id is refused rather than resolved by name. The LDAP layer warns once per
+        distinct cause -- absent as well as unreadable -- so a site on that path learns why.
 
         The channel axis is deliberately NOT used, and ONE of its two original reasons has since
         expired. The surviving one is decisive on its own: an uploaded file carries no channel at

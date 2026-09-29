@@ -403,10 +403,10 @@ class _FakeLdap:
     """Stands in for the directory. These tests drive ``_complete_ad_login`` with a principal
     directly -- the LDAP lookup itself is covered above, against the entry double."""
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return None
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return None
 
 
@@ -669,7 +669,8 @@ async def test_a_bound_row_is_refused_to_a_login_that_presents_no_identity() -> 
             )
         ).ok
         out = await service._complete_ad_login(_principal("jsmith", None), None, mfa_verified=True)
-        assert not out.ok and out.reason == "directory_identity_conflict"
+        # BACKLOG #2027 names the cause: the id is missing, not a recycled name.
+        assert not out.ok and out.reason == DIRECTORY_OBJECT_ID_MISSING
     finally:
         await store.close()
 
@@ -1221,10 +1222,10 @@ class _ResolvingLdap:
     def __init__(self, principal: AdPrincipal) -> None:
         self._principal = principal
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return None
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return self._principal if username == self._principal.username else None
 
 
@@ -1313,18 +1314,26 @@ async def test_a_locked_mirror_row_does_not_complete_a_kerberos_login(
 
 class _RebindDirectory:
     """A directory whose re-bind answer the test sets. ``bound`` is who a good password binds as;
-    ``named`` is who the name resolves to after a refusal. ``binds`` counts password binds."""
+    ``named`` is who the lookup answers after a refusal. ``binds`` counts password binds, and
+    ``keys`` records the ``object_id`` each call was keyed on."""
 
     def __init__(self, bound: AdPrincipal | None, named: AdPrincipal | None) -> None:
         self.bound = bound
         self.named = named
         self.binds = 0
+        self.keys: list[object] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(
+        self, username: str, password: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
         self.binds += 1
+        self.keys.append(object_id)
         return self.bound if password == "synthetic-good" else None
 
-    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
+        self.keys.append(object_id)
         return self.named
 
 
@@ -1394,9 +1403,8 @@ async def test_a_re_bind_that_binds_another_directory_object_is_refused(
         assert directory.binds == 1
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
-        assert any(
-            '"reason": "directory_identity_conflict"' in d for d in await _reauth_rows(store)
-        )
+        reason = DIRECTORY_OBJECT_ID_MISSING if bound_id is None else "directory_identity_conflict"
+        assert any(f'"reason": "{reason}"' in d for d in await _reauth_rows(store))
     finally:
         await store.close()
 
@@ -1419,6 +1427,20 @@ async def test_a_refused_re_bind_against_another_object_is_not_counted() -> None
         await store.close()
 
 
+async def test_a_renamed_account_still_steps_up_by_its_object_id() -> None:
+    """The row's cached name is stale after a directory-side rename. Keyed by the id, the bind still
+    finds the account, so the rename does not cost its holder the step-up."""
+    store = await MessageStore.open(":memory:")
+    try:
+        renamed = _principal("jsmith-married", GUID_A_TEXT)
+        directory = _RebindDirectory(renamed, renamed)
+        service, identity, token = await _reauth_session(store, directory)
+        good = await service.reauth(identity, "synthetic-good", token=token)
+        assert good.ok and directory.keys == [GUID_A_TEXT]
+    finally:
+        await store.close()
+
+
 async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts() -> None:
     """THE CONTROL for the three refusals above: the same fixtures with the row's own id count a
     wrong password and elevate on a good one, so the refusals are the id check and not a broken
@@ -1435,5 +1457,7 @@ async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts(
         good = await service.reauth(identity, "synthetic-good", token=token)
         assert good.ok and good.token is not None
         assert not any('"reason"' in d for d in await _reauth_rows(store))
+        # Every directory call was keyed on the row's own id, never on the recyclable name alone.
+        assert directory.keys == [GUID_A_TEXT, GUID_A_TEXT, GUID_A_TEXT]
     finally:
         await store.close()

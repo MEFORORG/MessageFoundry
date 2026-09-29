@@ -384,10 +384,10 @@ async def test_ad_login_syncs_roles_from_group_map() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if (username == "jdoe" and password == "pw") else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         settings = AuthSettings(
@@ -679,10 +679,10 @@ async def test_notifier_fires_on_ad_driven_role_change() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return principal if (username == "jdoe" and password == "pw") else None
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
 
         settings = AuthSettings(
@@ -761,10 +761,10 @@ async def test_a_directory_repoint_cannot_redirect_the_accounts_notices() -> Non
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
                 return None  # simple bind is retired (BACKLOG #1137); logins go through the tail
 
-            def resolve_principal(self, username: str) -> AdPrincipal | None:
+            def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return original if username == "jdoe" else None
 
         settings = AuthSettings(

@@ -1030,23 +1030,24 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ### Security
 - **BREAKING: a directory account with no directory id no longer signs in or steps up by its
-  username.** A Windows SSO sign-in whose directory entry carries no readable `objectGUID` is now
-  refused, whether or not an account already exists for that name, and no account is created. The
-  web console shows the generic SSO failure, and the `auth.login_failed` audit row carries
-  `directory_object_id_missing`. The AD step-up re-bind (`POST /me/reauth`, `POST /ui/reauth`) is
-  refused with the same reason on an account with no directory id, before the password is sent to
-  the directory. It is also refused when the bind reaches a different directory object than the
-  account's own, or one with no readable id; that `auth.reauth` row carries
-  `directory_identity_conflict`. None of these refusals counts toward the account lockout.
+  username.** The engine now refuses a Windows SSO sign-in whose directory entry has no readable
+  `objectGUID`. It refuses whether or not an account already exists for that name, and it creates
+  no account. The web console shows the generic SSO failure, and the `auth.login_failed` audit row
+  carries `directory_object_id_missing`. The AD step-up re-bind (`POST /me/reauth`,
+  `POST /ui/reauth`) refuses an account with no directory id for the same reason. It refuses before
+  it sends the password anywhere. It also refuses an answer about a different directory object
+  (`directory_identity_conflict`) or one with no readable id. None of these refusals counts toward
+  the account lockout. The web console still shows these step-up refusals as a wrong password.
   - **Why.** A username is the only key such an account has, and a directory can give a freed
     username to a new person. That person's sign-in would then reach the old account and give it
     their groups, and their password would step up the old account's session (ADR 0184 AC-5).
   - **The cost.** A directory that does not return `objectGUID` to the service account signs nobody
     in through Windows SSO. The engine logs a warning naming the cause once. The fix is to make the
-    attribute readable to the service account. An account left with no directory id is removed, and
-    the person signs in again to create it with one.
-  - **The step-up check needs no extra directory read.** The bind already returns the bound
-    entry's `objectGUID`, and a refused bind reuses the lookup it already made.
+    attribute readable to the service account. For an account left with no directory id, an
+    administrator deletes it, and the person signs in again to create it with one.
+  - **The step-up re-bind now finds the account by its `objectGUID`, not its username.** The typed
+    password goes only to the account's own directory entry, and a renamed account can still step
+    up. This adds no directory read: each lookup is keyed on the id instead of the name.
 
   (`BACKLOG #2027`, ADR 0184)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**

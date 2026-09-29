@@ -102,7 +102,7 @@ class _FakeLdap:
         self.probes: list[str] = []
         self.probe_keys: list[tuple[str, str]] = []
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         # Login/step-up binds are deliberately NOT counted in ``probes``; that list measures the
         # reconciler's directory load only.
         return self._lookup(username)
