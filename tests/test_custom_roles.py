@@ -31,6 +31,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
 
@@ -46,7 +47,8 @@ async def _service(store: MessageStore) -> AuthService:
 
 
 async def _make_user(service: AuthService, username: str, *role_ids: str) -> str:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -323,7 +325,8 @@ async def test_crud_requires_users_manage(engine: Engine) -> None:
     service = AuthService(engine.store, AuthSettings())
     await service.initialize()
     # a VIEWER has neither USERS_MANAGE nor USERS_READ
-    viewer_id = await service.create_local_user(
+    viewer_id = await create_local_user_chosen(
+        service,
         username="viewer",
         password=PW,
         display_name=None,
@@ -338,7 +341,10 @@ async def test_crud_requires_users_manage(engine: Engine) -> None:
     u = await engine.store.get_user(viewer_id)
     assert u is not None and u.password_hash is not None
     await engine.store.set_password(
-        viewer_id, password_hash=u.password_hash, must_change_password=False
+        viewer_id,
+        password_hash=u.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:

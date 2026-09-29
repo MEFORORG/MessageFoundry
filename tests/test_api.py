@@ -169,17 +169,19 @@ async def test_list_messages_with_filters_and_pagination(
     assert r.json()["total"] == 0
 
 
-async def test_message_detail_includes_body_and_records_audit_view(
+async def test_message_detail_carries_no_body_and_records_audit_view(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
     mid = await _seed_message(engine)
     r = await client.get(f"/messages/{mid}")
     assert r.status_code == 200
     detail = r.json()
-    assert detail["raw"] == ADT
+    # BACKLOG #2345: the open carries no body, under any key. The body is its own audited fetch.
+    assert "raw" not in detail
+    assert "MSH|" not in r.text
     assert detail["outbox"][0]["destination_name"] == "archive"
     assert detail["events"][0]["event"] == "received"
-    # Opening the body must have appended a 'viewed' audit event.
+    # Opening the message must have appended a 'viewed' audit event.
     events = await engine.store.events_for(mid)
     assert any(e["event"] == "viewed" for e in events)
 
@@ -294,6 +296,55 @@ async def test_message_view_recorded_in_tamper_evident_audit_log(
     views = [a for a in await engine.store.list_audit() if a["action"] == "message_view"]
     assert len(views) == 1
     assert views[0]["channel_id"] == "ch1" and mid in (views[0]["detail"] or "")
+
+
+async def test_the_open_writes_message_view_and_no_body_view(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """BACKLOG #2345: opening a message is one act and reading its body is another. The open writes
+    exactly one ``message_view`` row and no ``message_body_view`` row."""
+    mid = await _seed_message(engine)
+    assert (await client.get(f"/messages/{mid}")).status_code == 200
+    actions = [a["action"] for a in await engine.store.list_audit()]
+    assert actions.count("message_view") == 1
+    assert "message_body_view" not in actions
+
+
+async def test_the_body_fetch_returns_the_body_and_audits_its_surface(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """BACKLOG #2345: ``GET /messages/{id}/raw`` returns the body and writes its own
+    ``message_body_view`` row naming the surface that asked. It writes no ``message_view`` row, so
+    the audit trail can tell a body read from an open."""
+    mid = await _seed_message(engine)
+    r = await client.get(f"/messages/{mid}/raw", params={"surface": "harness"})
+    assert r.status_code == 200
+    assert r.json() == {"message_id": mid, "raw": ADT}
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_body_view"]
+    assert len(rows) == 1
+    assert rows[0]["channel_id"] == "ch1"
+    assert json.loads(rows[0]["detail"]) == {"message_id": mid, "surface": "harness"}
+    assert "message_view" not in [a["action"] for a in await engine.store.list_audit()]
+    # The body read is PHI access, so it lands on the per-message timeline too.
+    assert any(e["event"] == "viewed" for e in await engine.store.events_for(mid))
+
+
+async def test_the_body_fetch_surface_defaults_to_api_and_is_a_closed_set(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """A caller that names no surface is recorded as ``api``. A value outside the closed set is a
+    422, and it is refused before any body is read or any row is written."""
+    mid = await _seed_message(engine)
+    assert (await client.get(f"/messages/{mid}/raw")).status_code == 200
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_body_view"]
+    assert [json.loads(a["detail"])["surface"] for a in rows] == ["api"]
+    refused = await client.get(f"/messages/{mid}/raw", params={"surface": "browser"})
+    assert refused.status_code == 422
+    assert "MSH|" not in refused.text
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_body_view"]
+    assert len(rows) == 1  # the refused call wrote nothing
+    assert (await client.get(f"/messages/{ABSENT_ID}/raw")).status_code == 404
+    assert (await client.get(f"/messages/{MALFORMED_ID}/raw")).status_code == 422
 
 
 async def test_replay_actions_are_audited(engine: Engine, client: httpx.AsyncClient) -> None:
@@ -525,23 +576,24 @@ async def test_messages_expose_event_summary_metadata(
         summary="MRN 100001 · DOE, JANE",
     )
     msg = (await client.get("/messages")).json()["messages"][0]
-    # List surface: the summary is display-masked until a per-message open reveals it (ASVS 14.2.6).
+    # List surface: the summary is display-masked until an explicit per-message reveal (ASVS 14.2.6).
     # The shape survives -- label, separator, name comma -- so the row still reads as a row.
     assert msg["summary"] == "MRN ****0001 · D**, J**"
     assert msg["event"] == "received"
     assert msg["metadata"] is None
 
 
-async def test_list_masks_the_summary_and_opening_one_message_reveals_it(
+async def test_list_masks_the_summary_and_only_an_explicit_reveal_lifts_it(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
-    """The mask and its reveal, end to end and in one place (ASVS 14.2.6, BACKLOG #1187).
+    """The mask and its reveal, end to end and in one place (ASVS 14.2.6, BACKLOG #1187, #2346).
 
-    Opening a single message IS the reveal act: it is deliberate, per-record, and already audited
-    (``record_view`` plus the tamper-evident chain). The list is the surface where complete
-    identifiers could be read off a screen opened for another reason, so it stays masked.
+    Opening a single message is NOT the reveal act under the strict reading #1187 adopts: a
+    dead-letter link, a replay redirect or a typed URL opens a message with no act aimed at the
+    summary. So a plain open masks it exactly as the list does, and only ``reveal_summary`` lifts
+    the mask, for that one response. The ``message_view`` row records which it was.
 
-    Both halves are asserted against the SAME stored value, so this cannot pass by the list and the
+    Every half is asserted against the SAME stored value, so this cannot pass by the list and the
     detail simply carrying different data.
     """
     stored = "MRN 100001 · DOE, JANE"
@@ -557,11 +609,24 @@ async def test_list_masks_the_summary_and_opening_one_message_reveals_it(
     assert listed["summary"] == "MRN ****0001 · D**, J**"  # census surface: masked
 
     opened = (await client.get(f"/messages/{listed['id']}")).json()
-    assert opened["summary"] == stored  # the per-message open is the act that lifts it
+    assert opened["summary"] == "MRN ****0001 · D**, J**"  # a plain open reveals nothing
 
-    # And the list is still masked afterwards -- the reveal did not become a status.
+    revealed = (await client.get(f"/messages/{listed['id']}?reveal_summary=true")).json()
+    assert revealed["summary"] == stored  # the explicit act lifts it
+
+    # And a later plain open, and the list, are masked again -- the reveal did not become a status.
+    reopened = (await client.get(f"/messages/{listed['id']}")).json()
+    assert reopened["summary"] == "MRN ****0001 · D**, J**"
     again = (await client.get("/messages")).json()["messages"][0]
     assert again["summary"] == "MRN ****0001 · D**, J**"
+
+    views = [
+        json.loads(a["detail"])
+        for a in await engine.store.list_audit()
+        if a["action"] == "message_view"
+    ]
+    # A palindrome, so the assertion holds whichever order the audit lists rows in.
+    assert [v["revealed"] for v in views] == [[], ["summary"], []]
 
 
 async def test_summary_access_audited_server_side_and_coalesced(engine: Engine) -> None:
@@ -603,7 +668,7 @@ async def test_the_audit_separates_a_masked_list_from_a_real_disclosure(engine: 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         listed = (await c.get("/messages")).json()["messages"][0]
-        await c.get(f"/messages/{listed['id']}")  # the open IS the reveal act
+        await c.get(f"/messages/{listed['id']}?reveal_summary=true")  # the explicit reveal act
         await app.state.summary_auditor.flush(engine.store)
 
     rows = [a for a in await engine.store.list_audit() if a["action"] == "summary_access"]

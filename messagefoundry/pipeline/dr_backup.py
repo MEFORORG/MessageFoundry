@@ -35,7 +35,10 @@ the event loop via :func:`asyncio.to_thread`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import functools
+import hmac
 import io
 import json
 import logging
@@ -43,6 +46,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import sys
 import tarfile
 import tempfile
 import threading
@@ -164,10 +168,10 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: so a lying header or stream cannot exhaust the extract temp dir — but it runs on ``archive.tar``,
 #: which the decrypt has already written to that same temp dir in full. So the member cap is reached
 #: only after the disk it protects is spent. This moves the bound to the first write — on the restore
-#: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted;
-#: it stages in the OS temp dir rather than beside the store, and giving it this bound means adding an
-#: escape arm to that function's ordered ``except`` block, which is a wider change than the one this
-#: constant documents.
+#: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted,
+#: though since BACKLOG #1174 it too stages beside a SQLite store. Its copy is no larger than the
+#: archive file it reads, and giving it this bound means adding an escape arm to that function's
+#: ordered ``except`` block, which is a wider change than the one this constant documents.
 #:
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
@@ -205,7 +209,8 @@ _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 class BackupError(RuntimeError):
     """A backup run failed at a named phase (``snapshot``/``encrypt``/``write``/``verify``/
-    ``destination``). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
+    ``destination``). The same alert also carries kind ``cleanup``, for a good run whose staging
+    could not be cleared (see :attr:`BackupResult.staging_leftover`). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
     record it in the ``dr_backup`` ERROR audit row — the message is the ``safe_exc``-scrubbed cause
     (PHI-free)."""
 
@@ -251,6 +256,11 @@ class BackupResult:
     verify: VerifyResult | None
     pruned: int
     encrypted: bool
+    #: Set when the build's staging directory could not be shown free of plaintext after the archive
+    #: was written (BACKLOG #1174): a PHI-free sentence naming it. The archive is good and published;
+    #: the run alerts ``backup_failed`` with kind ``cleanup`` and records this in its audit row, and the
+    #: next backup's sweep retries the directory.
+    staging_leftover: str | None = None
 
 
 @dataclass(frozen=True)
@@ -463,18 +473,49 @@ class BackupRunner:
             if occupied.exists():
                 raise BackupError("write", f"archive already exists: {occupied}")
 
-        # Build everything under one temp dir. The CONSISTENT SNAPSHOT must run on the ENGINE event loop
-        # (store.snapshot_to takes the store lock for its WAL checkpoint and drives aiosqlite, which is
-        # bound to this loop — it does its own off-loop copy, off the store lock since BACKLOG #1937).
-        # The CPU/IO-heavy tar + AEAD then run OFF the loop in a worker thread over the snapshot file
-        # (never blocking asyncio, never the whole store in RAM).
-        with tempfile.TemporaryDirectory(prefix="mefor-backup-") as tmp:
-            tmpdir = Path(tmp)
+        # Build everything in one staging directory: the data dir on a SQLite store, `.mefor-staging`
+        # under the destination otherwise (BACKLOG #1174; see `_open_staging`). First the sweep removes
+        # what a crashed or killed run left there. It goes by each directory's lock, never by age, so
+        # a sibling engine shard's live run survives it. Both run off the loop.
+        staging_root, secure = self._staging_root(dest_dir)
+        await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
+        loop = asyncio.get_running_loop()
+        opening = loop.run_in_executor(
+            None,
+            functools.partial(_open_staging, staging_root, _BACKUP_STAGING_PREFIX, secure=secure),
+        )
+        try:
+            work = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            # The open may still land after this cancel. Release it then, or its lock would stay held
+            # and its directory would look live to every sweep for the life of the process.
+            opening.add_done_callback(_release_when_opened)
+            raise
+        except OSError as exc:
+            raise BackupError(
+                "write",
+                f"could not create a staging directory under {staging_root}: {safe_exc(exc)}",
+            ) from exc
+
+        # The CONSISTENT SNAPSHOT must run on the ENGINE event loop (store.snapshot_to takes the store
+        # lock for its WAL checkpoint and drives aiosqlite, which is bound to this loop — it does its own
+        # off-loop copy, off the store lock since BACKLOG #1937). The CPU/IO-heavy tar + AEAD then run
+        # OFF the loop in a worker thread over the snapshot file (never blocking asyncio, never the whole
+        # store in RAM).
+        #
+        # The staging directory holds plaintext, so it is released on every path. Once the worker has
+        # claimed it, the WORKER releases it, after it has let go of the files: a build cancelled on the
+        # loop keeps running on its thread, and tearing the directory down under it would leave what it
+        # writes afterwards behind. The loop's own release covers only the paths the worker never ran.
+        staging_leftover: str | None = None
+        try:
+            # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine
+            # leaves its decrypted copy there. Each backup sweeps it too, taking only what this
+            # account owns (see `_sweep_abandoned_staging`).
+            await asyncio.to_thread(_sweep_os_temp, work.path)
             snap_path: Path | None = None
-            snapshot_sha256 = ""
-            row_counts: dict[str, int] = {}
             if not config_only:
-                snap_path = tmpdir / _STORE_MEMBER
+                snap_path = work.path / _STORE_MEMBER
                 try:
                     await self._store.snapshot_to(snap_path, method=s.snapshot_method)
                 except (
@@ -486,8 +527,14 @@ class BackupRunner:
                     # and a failure there is a snapshot failure too, not a generic backup one.
                     raise BackupError("snapshot", safe_exc(exc)) from exc
             try:
-                snapshot_sha256, row_counts, archive_bytes = await asyncio.to_thread(
-                    self._build_archive_blocking,
+                (
+                    snapshot_sha256,
+                    row_counts,
+                    archive_bytes,
+                    staging_leftover,
+                ) = await asyncio.to_thread(
+                    self._build_in_staging,
+                    work,
                     out_path=staging_path,
                     snap_path=snap_path,
                     key=key,
@@ -505,7 +552,69 @@ class BackupRunner:
                 # queued in `_frames` and were charged by the NEXT run that finished -- under its own
                 # key, if the key had been rotated in between -- or never, for a one-shot backup.
                 await self._charge_archive_invocations()
+        except BaseException as exc:
+            # Submitted to the executor at once and shielded: a second cancellation must not cancel
+            # the release before it starts, which would leave the lock held and the directory
+            # looking live to every sweep for the life of the process.
+            release = loop.run_in_executor(
+                None, functools.partial(work.release, unless_claimed=True)
+            )
+            leftover = await asyncio.shield(release)
+            if leftover is None:
+                raise
+            if isinstance(exc, BackupError):
+                # First, so the 200-character cut the failure record applies keeps the directory.
+                raise BackupError(exc.kind, f"{leftover}; the run failed: {exc}") from exc
+            exc.add_note(leftover)
+            raise
 
+        verify: VerifyResult | None = None
+        try:
+            verify = await self._verify_and_publish(
+                staging_path,
+                archive_path,
+                key=key,
+                staging_root=staging_root,
+                secure=secure,
+            )
+        except BackupError as exc:
+            if staging_leftover is None:
+                raise
+            # The staging teardown failed too; that must not ride only in the log. It leads, so the
+            # 200-character cut the failure record applies keeps the directory.
+            raise BackupError(exc.kind, f"{staging_leftover}; the run failed: {exc}") from exc
+
+        # keep-N prune runs only after that rename, so the candidate set contains this archive and
+        # every earlier archive that also passed — and nothing that failed (AC-6).
+        pruned = self._prune_keep_n(dest_dir, inst, just_written=archive_path)
+
+        return BackupResult(
+            archive_path=str(archive_path),
+            archive_bytes=archive_bytes,
+            snapshot_sha256=snapshot_sha256,
+            config_only=config_only,
+            snapshot_method=s.snapshot_method,
+            key_id=key_id,
+            config_fingerprint=self._config_fingerprint(),
+            row_counts=row_counts,
+            verify=verify,
+            pruned=pruned,
+            encrypted=key is not None,
+            staging_leftover=staging_leftover,
+        )
+
+    async def _verify_and_publish(
+        self,
+        staging_path: Path,
+        archive_path: Path,
+        *,
+        key: bytes | None,
+        staging_root: Path,
+        secure: bool,
+    ) -> VerifyResult | None:
+        """Restore-verify the written archive when configured, then publish it under its canonical
+        name. Raises :class:`BackupError` when either fails."""
+        s = self._settings
         verify: VerifyResult | None = None
         if s.verify_after_backup:
             # The just-written archive is sealed under the active key, so the active key is the only
@@ -520,6 +629,9 @@ class BackupRunner:
                 # The LIVE store settings, so a full verify opens the snapshot under this instance's
                 # real cipher/keyring/provider rather than a bare default (see _full_open_check).
                 store_settings=self._store_settings,
+                # The same staging root as the build, so the next backup's sweep covers both.
+                staging_root=staging_root,
+                secure=secure,
             )
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
@@ -538,24 +650,7 @@ class BackupRunner:
 
         # Only now does the archive earn the canonical name.
         self._publish_archive(staging_path, archive_path)
-
-        # keep-N prune runs only after that rename, so the candidate set contains this archive and
-        # every earlier archive that also passed — and nothing that failed (AC-6).
-        pruned = self._prune_keep_n(dest_dir, inst, just_written=archive_path)
-
-        return BackupResult(
-            archive_path=str(archive_path),
-            archive_bytes=archive_bytes,
-            snapshot_sha256=snapshot_sha256,
-            config_only=config_only,
-            snapshot_method=s.snapshot_method,
-            key_id=key_id,
-            config_fingerprint=self._config_fingerprint(),
-            row_counts=row_counts,
-            verify=verify,
-            pruned=pruned,
-            encrypted=key is not None,
-        )
+        return verify
 
     def _store_salt(self) -> bytes | None:
         """The live store's salt, whose data sub-key the archive frames are sealed under (ADR 0196), or
@@ -662,6 +757,50 @@ class BackupRunner:
 
     # --- archive build (worker thread; no event loop, no store await) --------
 
+    def _build_in_staging(
+        self,
+        work: _Staging,
+        *,
+        out_path: Path,
+        snap_path: Path | None,
+        key: bytes | None,
+        key_id: str | None,
+        config_only: bool,
+        now: float,
+        salt: bytes | None = None,
+    ) -> tuple[str, dict[str, int], int, str | None]:
+        """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
+        thread. Returns the build's result plus the release's leftover sentence (``None`` when no file
+        in the directory still holds plaintext). Releasing here, not on the loop, is what makes a
+        cancelled build clean up after itself: it keeps running on this thread, and the directory goes
+        only once it has let go of the files."""
+        if not work.claim():
+            raise OSError(f"the backup staging directory {work.path} was released before the build")
+        try:
+            built = self._build_archive_blocking(
+                out_path=out_path,
+                snap_path=snap_path,
+                key=key,
+                key_id=key_id,
+                config_only=config_only,
+                now=now,
+                salt=salt,
+                work_dir=work.path,
+                secure=work.secure,
+            )
+        except BaseException as exc:
+            leftover = work.release()
+            if leftover is None:
+                raise
+            if isinstance(exc, OSError | BackupCodecError):
+                # Named in the error itself, first, so the audit row and the alert carry it; a note
+                # would not survive the loop wrapping this into a BackupError.
+                kind = "write" if isinstance(exc, OSError) else "encrypt"
+                raise BackupError(kind, f"{leftover}; the build failed: {safe_exc(exc)}") from exc
+            exc.add_note(leftover)
+            raise
+        return (*built, work.release())
+
     def _build_archive_blocking(
         self,
         *,
@@ -671,12 +810,16 @@ class BackupRunner:
         key_id: str | None,
         config_only: bool,
         now: float,
+        work_dir: Path,
+        secure: bool,
         salt: bytes | None = None,
     ) -> tuple[str, dict[str, int], int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
-        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes)``. The tar goes to a temp file
-        (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the archive.
+        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes)``. The tar goes to a file in
+        ``work_dir`` (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the
+        archive. That tar is plaintext, so with ``secure`` it is locked to its owner before its first
+        byte, the way the restore path locks its own staged tar.
 
         ``out_path`` is the STAGING path, not the canonical archive name — the caller publishes that
         name by rename once the archive has passed every configured check (see :data:`_STAGING_SUFFIX`).
@@ -707,9 +850,11 @@ class BackupRunner:
         }
         manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
 
-        with tempfile.TemporaryDirectory(prefix="mefor-tar-") as tar_tmp:
-            tar_path = Path(tar_tmp) / "archive.tar"
-            with tarfile.open(tar_path, "w") as tar:
+        # In the run's own staging directory, which the caller releases on every exit.
+        tar_path = work_dir / "archive.tar"
+        with open(tar_path, "wb") as tar_fh:
+            _secure_staged(tar_path, secure)
+            with tarfile.open(fileobj=tar_fh, mode="w") as tar:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
                 if self._settings.include_config and self._config_dir is not None:
@@ -719,31 +864,31 @@ class BackupRunner:
                 info.mtime = int(now)
                 tar.addfile(info, io.BytesIO(manifest_bytes))
 
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tar_path, "rb") as src, open(out_path, "wb") as dst:
-                if key is not None:
-                    # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the key it is sealed
-                    # under -- the store data sub-key for a salted archive, the DEK for an unsalted one
-                    # (ADR 0196 AC-6) -- so it spends that key's budget. The id is derived here from the
-                    # same (key, salt) the codec seals under, so the two cannot disagree. Record the
-                    # count (the worker thread holds no store) and charge it after the run.
-                    charge_id = store_data_key_id(key, salt) if salt else key_fingerprint(key)
-                    encrypt_stream(
-                        src,
-                        dst,
-                        key,
-                        on_frames=functools.partial(self._record_frames, charge_id),
-                        salt=salt,
-                    )
-                else:
-                    # No key + allow_unencrypted: write the plaintext tar verbatim (synthetic/no-PHI box).
-                    while True:
-                        buf = src.read(1024 * 1024)
-                        if not buf:
-                            break
-                        dst.write(buf)
-                dst.flush()
-                os.fsync(dst.fileno())
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tar_path, "rb") as src, open(out_path, "wb") as dst:
+            if key is not None:
+                # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the key it is sealed
+                # under -- the store data sub-key for a salted archive, the DEK for an unsalted one
+                # (ADR 0196 AC-6) -- so it spends that key's budget. The id is derived here from the
+                # same (key, salt) the codec seals under, so the two cannot disagree. Record the
+                # count (the worker thread holds no store) and charge it after the run.
+                charge_id = store_data_key_id(key, salt) if salt else key_fingerprint(key)
+                encrypt_stream(
+                    src,
+                    dst,
+                    key,
+                    on_frames=functools.partial(self._record_frames, charge_id),
+                    salt=salt,
+                )
+            else:
+                # No key + allow_unencrypted: write the plaintext tar verbatim (synthetic/no-PHI box).
+                while True:
+                    buf = src.read(1024 * 1024)
+                    if not buf:
+                        break
+                    dst.write(buf)
+            dst.flush()
+            os.fsync(dst.fileno())
         archive_bytes = out_path.stat().st_size
         return snapshot_sha256, row_counts, archive_bytes
 
@@ -755,6 +900,14 @@ class BackupRunner:
         assert base is not None
         for path in sorted(base.rglob("*")):
             if path.is_symlink() or not path.is_file():
+                continue
+            if any(
+                _is_staging_dir(base / parent)
+                for parent in path.relative_to(base).parents
+                if parent != Path(".")
+            ):
+                # A data dir inside the config dir puts the backup's own staging there (BACKLOG
+                # #1174): its plaintext snapshot and the tar being written must not ride in the bundle.
                 continue
             rel = path.relative_to(base).as_posix()
             tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel}")
@@ -879,9 +1032,20 @@ class BackupRunner:
             "verify_decrypted_cells": verify.decrypted_cells if verify is not None else None,
             "pruned": result.pruned,
         }
+        if result.staging_leftover is not None:
+            detail["staging_leftover"] = result.staging_leftover  # a path and file names, PHI-free
         await self._store.record_audit(
             "dr_backup", actor="system", detail=json.dumps(detail, sort_keys=True), now=now
         )
+        if result.staging_leftover is not None:
+            # The archive is good, so the run succeeds; the plaintext left in staging is what an
+            # operator must still hear about, through the same alert a failed run raises.
+            try:
+                self._alert_sink.backup_failed(
+                    "dr_backup", kind="cleanup", detail=result.staging_leftover
+                )
+            except Exception:
+                log.warning("DR backup: backup_failed alert sink raised", exc_info=True)
 
     async def _record_failure(self, kind: str, exc: BaseException, now: float) -> None:
         reason = safe_exc(exc) if isinstance(exc, BaseException) else str(exc)
@@ -924,6 +1088,16 @@ class BackupRunner:
 
     def _is_server_db(self) -> bool:
         return self._backend_value() in (StoreBackend.POSTGRES.value, StoreBackend.SQLSERVER.value)
+
+    def _staging_root(self, dest_dir: Path) -> tuple[Path, bool]:
+        """Where this runner stages plaintext, and whether it secures the files; see
+        :func:`_staging_root_for`."""
+        path = getattr(self._store, "path", None)
+        return _staging_root_for(
+            server_db=self._is_server_db(),
+            store_path=path if isinstance(path, str) else None,
+            destination=dest_dir,
+        )
 
     def _backend_value(self) -> str:
         backend = getattr(self._store, "backend", None)
@@ -978,11 +1152,20 @@ def _select_decrypt_key(keys: list[bytes], header_key_id: str) -> bytes | None:
     """From the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys"), pick the
     key whose ``key_id`` fingerprint matches the archive header, or ``None`` if none does. So a backup
     taken under a now-retired key still verifies after a routine key rotation (WP-5), instead of a false
-    ``KEY_MISMATCH``."""
+    ``KEY_MISMATCH``.
+
+    The walk visits EVERY key and compares each with ``hmac.compare_digest``, with no return on the
+    first match, so the work done does not depend on where in the keyring the match sits (ASVS 11.2.4,
+    BACKLOG #1167). The first matching key still wins, as it did."""
+    # `surrogatepass`: the header is read before anything authenticates it, and a forged `key_id`
+    # holding a lone surrogate must be a non-match, not a UnicodeEncodeError.
+    target = header_key_id.encode("utf-8", "surrogatepass")
+    match: bytes | None = None
     for key in keys:
-        if key_fingerprint(key) == header_key_id:
-            return key
-    return None
+        # The compare runs before the `match is None` test, so it runs for every key.
+        if hmac.compare_digest(key_fingerprint(key).encode("ascii"), target) and match is None:
+            match = key
+    return match
 
 
 def _as_store_settings(settings: object) -> StoreSettings | None:
@@ -1000,10 +1183,20 @@ def _verify_archive_blocking(
     archive_path: str,
     keys: list[bytes],
     full: bool,
+    staging_root: Path | None,
+    secure: bool = False,
     allow_unencrypted: bool = False,
     store_settings: object | None = None,
 ) -> VerifyResult:
     """Lightweight (or full) restore-verify of a ``.mfbak`` archive — runs OFF the event loop.
+
+    ``staging_root`` is where the decrypted archive is staged (BACKLOG #1174). A backup's own verify
+    passes its build's root, a SQLite store's data directory or ``.mefor-staging`` under the backup
+    destination (see :func:`_staging_root_for`). A standalone verify passes ``None``: it stages in the
+    OS temp dir, and first sweeps that dir of this account's own abandoned staging (see
+    :func:`_standalone_staging_root` and the staging-location block above :class:`_Staging`).
+    ``secure`` locks each staged file to its owner before its first byte,
+    which every case but ``.mefor-staging`` passes.
 
     ``keys`` is the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys") — the
     archive is matched against the whole set so one taken under a now-retired key still verifies after a
@@ -1027,10 +1220,11 @@ def _verify_archive_blocking(
     ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells, so an
     archive that is fine and a key configuration that is not are not both reported as ``FAIL``.
 
-    Steps 2 to 4 write the decrypted archive into a ``mefor-verify-*`` staging directory, which is
-    discarded on every exit path by :func:`_discard_verify_staging`. When decrypted bytes survive that,
-    the result says so: a ``PASS`` becomes ``FAIL``, and any other verdict keeps its status and gains
-    the directory in its reason."""
+    Steps 2 to 4 write the decrypted archive into a ``mefor-verify-*`` staging directory, locked for
+    the run (see :func:`_open_staging`), which is discarded on every exit path by
+    :func:`_discard_verify_staging`. When decrypted bytes survive that, the result says so: a ``PASS``
+    becomes ``FAIL``, and any other verdict keeps its status and gains the directory in its reason. Its
+    lock is released either way, so the next sweep of the same root removes what survived."""
     try:
         # (1) Pre-decryption key check (only meaningful for an encrypted archive). For a plaintext
         # archive (no codec header) there is no key to mismatch.
@@ -1061,25 +1255,34 @@ def _verify_archive_blocking(
                     reason=f"no resolved key (active or retired) matches archive key_id={header_key_id}",
                 )
 
-        staging = Path(tempfile.mkdtemp(prefix="mefor-verify-"))
+        standalone = staging_root is None
+        if staging_root is None:
+            staging_root = _standalone_staging_root()
+        work = _open_staging(staging_root, _VERIFY_STAGING_PREFIX, secure=secure)
     except (BackupCodecError, OSError, tarfile.TarError) as exc:
         return _verify_failure(exc)
 
-    # Everything from here writes decrypted plaintext into `staging`, so its teardown is explicit and
-    # not a `TemporaryDirectory`: that `__exit__` raised when one unlink was refused (on Windows, a
-    # handle still open on the extracted store), which REPLACED the verdict or the error in flight and
-    # left the directory, holding the decrypted store, permanently in the OS temp dir (BACKLOG #1721).
-    # `_discard_verify_staging` never raises, so whatever the verify concluded is what reaches the
-    # caller, and an exception escaping the verify is still the verify's own.
+    # Everything from here writes decrypted plaintext into the staging directory, so its teardown is
+    # explicit and not a `TemporaryDirectory`: that `__exit__` raised when one unlink was refused (on
+    # Windows, a handle still open on the extracted store), which REPLACED the verdict or the error in
+    # flight and left the directory, holding the decrypted store, permanently behind (BACKLOG #1721).
+    # `release` never raises, so whatever the verify concluded is what reaches the caller, and an
+    # exception escaping the verify is still the verify's own.
     try:
+        if standalone:
+            # After the key precheck, so a verify that was never going to stage pays for no scan, and
+            # before the decrypt, so a dead run's plaintext is gone before this one needs the space.
+            # Inside this block, so even a fault in the sweep still releases this run's directory.
+            _sweep_abandoned_staging(staging_root, owned_like=work.path)
         try:
             result = _verify_in_staging(
-                staging,
+                work.path,
                 archive_path=archive_path,
                 encrypted=encrypted,
                 match_key=match_key,
                 full=full,
                 store_settings=store_settings,
+                secure=secure,
             )
         except (BackupCodecError, OSError, tarfile.TarError) as exc:
             result = _verify_failure(exc)
@@ -1087,11 +1290,11 @@ def _verify_archive_blocking(
         # Unexpected, an interrupt, or a fault while mapping an expected one. The teardown still
         # runs, and a directory it could not clear rides on the exception as a note rather than
         # living only in the log.
-        leftover = _discard_verify_staging(staging)
+        leftover = work.release()
         if leftover is not None:
             exc.add_note(leftover)
         raise
-    leftover = _discard_verify_staging(staging)
+    leftover = work.release()
     if leftover is None:
         return result
     # Decrypted bytes outlived the teardown. That is not a fact about the archive, but it is the one
@@ -1179,7 +1382,7 @@ def _empty_files_in_place(staging: Path) -> list[str]:
         for name in filenames:
             entry = Path(dirpath) / name
             try:
-                mode = os.lstat(entry).st_mode
+                st = os.lstat(entry)
             except FileNotFoundError:
                 continue
             except OSError:
@@ -1187,7 +1390,13 @@ def _empty_files_in_place(staging: Path) -> list[str]:
                 continue
             # A link is never followed: truncating through one would empty a file outside the
             # directory, and the link itself holds no plaintext.
-            if not stat.S_ISREG(mode):
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            # Nor is a HARD link truncated: it shares its bytes with a name outside this directory.
+            # No file the engine stages has a second link, so one here was put there by someone
+            # else, and the orphan sweep runs this on directories it did not make this run.
+            if st.st_nlink > 1:
+                unproven.append(f"{name} (hard-linked, not truncated)")
                 continue
             try:
                 with open(entry, "r+b") as fh:
@@ -1200,9 +1409,10 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
-    """Remove a restore-verify staging directory, which holds the decrypted archive. Never raises.
+    """Remove a DR staging directory -- a backup's snapshot and plaintext tar, or a verify's decrypted
+    archive. Never raises.
 
-    Returns ``None`` when no file there still holds decrypted bytes, or a PHI-free sentence naming the
+    Returns ``None`` when no file there still holds plaintext, or a PHI-free sentence naming the
     directory when one might. When the first removal is refused it empties every file in place at
     once, then retries the removal on a short schedule. A file another process holds open cannot be
     unlinked on Windows, but it can usually still be truncated, because Python's own ``open`` and
@@ -1213,7 +1423,7 @@ def _discard_verify_staging(staging: Path) -> str | None:
     Truncation rather than an overwrite with zeros: on an SSD or a copy-on-write volume an overwrite
     lands on new blocks and proves nothing, so the promise that can be kept is that the FILE no
     longer holds the plaintext. The blocks it freed still do until reused, and only full-disk
-    encryption on the temp volume covers them (docs/PHI.md section 10)."""
+    encryption on the staging volume covers them (docs/PHI.md section 10)."""
     unproven: list[str] = []
     try:
         if _remove_tree(staging):
@@ -1224,30 +1434,393 @@ def _discard_verify_staging(staging: Path) -> str | None:
             if _remove_tree(staging):
                 return None
     except Exception as exc:  # never raise over the verdict or the error in flight
-        log.error(
-            "restore-verify could not clear its staging directory %s: %s", staging, safe_exc(exc)
-        )
+        log.error("DR staging directory %s could not be cleared: %s", staging, safe_exc(exc))
         return (
-            f"the decrypted staging directory {staging} could not be cleared; "
+            f"the plaintext staging directory {staging} could not be cleared; "
             "delete it once nothing holds it open"
         )
     if unproven:
         log.error(
-            "restore-verify could not remove its staging directory %s, and could not empty %s in "
-            "it; delete it once nothing holds it open",
+            "DR staging directory %s could not be removed, and %s in it could not be emptied; "
+            "delete it once nothing holds it open",
             staging,
             ", ".join(unproven),
         )
         return (
-            f"the decrypted staging directory {staging} could not be removed, and "
+            f"the plaintext staging directory {staging} could not be removed, and "
             f"{', '.join(unproven)} could not be emptied; delete it once nothing holds it open"
         )
     log.warning(
-        "restore-verify emptied every file in its staging directory %s but could not remove it; "
-        "no file in it holds decrypted bytes, and it can be deleted once nothing holds it open",
+        "DR staging directory %s had every file emptied but could not be removed; no file in it "
+        "holds plaintext, and it can be deleted once nothing holds it open",
         staging,
     )
     return None
+
+
+# --- staging location, per-run lock, and the orphan sweep (BACKLOG #1174, #1721) ---------------------
+#
+# A backup stages a plaintext tar of the store snapshot, and a verify stages the decrypted archive.
+# Both used to live under the OS temp dir. They now live where the engine's own controls reach:
+#
+# * A SQLite store stages in its own DATA DIRECTORY, beside the store, and applies the store's
+#   best-effort `_secure_file` to each staged tar and extracted store before its first byte, the way
+#   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes. What
+#   `_secure_file` leaves inside a temp directory's own DACL is not always owner-only (ADR 0163).
+# * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
+#   destination. The engine applies no ACL there; docs/PHI.md records that as a gap, not a control.
+# * A STANDALONE verify (`restore-verify`, the DR cold-seed activation) is neither. It stages in a
+#   private `mkdtemp` directory under the OS temp dir: mode 0700 on POSIX, and on Windows the
+#   protected DACL Python 3.13+ writes for that mode (SYSTEM, Administrators, OWNER RIGHTS), with
+#   `_secure_file` on each staged file. So it does not stage in the archive's directory, which on a
+#   DR box may be a read-only share with no engine ACL. Nor does it stage beside `[store].path`,
+#   the current directory under the default relative path. The exception is when one of those IS
+#   the OS temp dir. Each standalone verify, and each backup, sweeps the temp dir of the
+#   directories this account owns, and only those, since the temp dir can be shared.
+#
+# Every staging directory holds a lock file, locked for the whole run. A crash or SIGKILL releases the
+# lock with the process, and that is the ONLY proof of abandonment the sweep accepts. Age is not proof:
+# a sibling engine shard sharing the destination can be mid-backup in a directory of any age.
+
+#: The staging directory prefixes. The sweep looks for these and nothing else.
+_BACKUP_STAGING_PREFIX = "mefor-backup-"
+_VERIFY_STAGING_PREFIX = "mefor-verify-"
+_SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
+
+#: The server-DB staging root, a dot-prefixed directory under the backup destination.
+_SERVER_DB_STAGING_DIR = ".mefor-staging"
+
+#: The per-run lock file inside each staging directory, and the empty marker a run creates only once
+#: it holds that lock. The marker is a file of its own, not bytes in the lock file, because a teardown
+#: that cannot remove the directory truncates every file in it: a marker written INTO the lock file
+#: would be emptied with the rest, and the sweep could then never prove the directory abandoned.
+_LOCK_NAME = ".lock"
+_HELD_MARKER_NAME = ".lock-held"
+
+#: ``errno`` values that mean the file system cannot lock at all (an NFS mount without a lock daemon,
+#: some FUSE and SMB mounts), as opposed to a lock someone else holds.
+_LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
+
+
+def _lock_exclusive(fd: int, *, wait: bool) -> bool:
+    """Take an exclusive OS lock on ``fd``. ``True`` when held. With ``wait`` False, ``False`` means
+    another handle holds it. The OS drops the lock when the process dies, which is what lets a crashed
+    run's directory be told apart from a live one.
+
+    ``flock`` on POSIX, not ``lockf``: a ``lockf`` lock belongs to the process, so a second handle in
+    the same process would not conflict, and a live run could not be told apart from a dead one by an
+    engine that shares its process. ``msvcrt.locking`` on Windows is per handle already."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            # A held range refuses with EACCES, or EDEADLOCK, the CRT's other contention code (the
+            # same reading as `api/tls.py`). Anything else is a real fault and propagates.
+            if wait or exc.errno not in (errno.EACCES, errno.EDEADLOCK):
+                raise
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if wait:
+            raise
+        return False
+    return True
+
+
+def _unlock_and_close(fd: int) -> None:
+    """Drop the lock and close the handle. Never raises."""
+    # A failed unlock is harmless: closing the handle below drops the lock anyway.
+    with contextlib.suppress(OSError):
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+class _Staging:
+    """One staging directory and the lock that proves it is live. Released exactly once.
+
+    ``claim`` and ``release`` share one mutex so a worker thread and the event loop can hand the
+    directory between them: a worker that has claimed it releases it itself, once it has let go of the
+    files, and a release from the loop then does nothing and does not wait."""
+
+    def __init__(self, path: Path, fd: int, *, secure: bool) -> None:
+        self.path = path
+        self.secure = secure
+        self._fd = fd
+        self._mutex = threading.Lock()
+        self._released = False
+        self._claimed = False
+
+    def claim(self) -> bool:
+        """Called by a worker before it touches the directory. ``False`` if it is already gone."""
+        with self._mutex:
+            if self._released:
+                return False
+            self._claimed = True
+            return True
+
+    def release(self, *, unless_claimed: bool = False) -> str | None:
+        """Drop the lock and remove the directory. Never raises. Returns ``None`` when no file there
+        still holds plaintext, or a PHI-free sentence naming the directory when one might (see
+        :func:`_discard_verify_staging`). The lock is dropped first because Windows will not delete a
+        file that is still open."""
+        with self._mutex:
+            if self._released or (unless_claimed and self._claimed):
+                return None
+            self._released = True
+        _unlock_and_close(self._fd)
+        return _teardown_staging(self.path)
+
+
+def _teardown_staging(path: Path) -> str | None:
+    """:func:`_discard_verify_staging`, then, if the directory survived, put its lock file and marker
+    back so the next sweep can prove it abandoned. Never raises.
+
+    A refused removal can take the lock file and marker with it, because ``rmtree`` removes entries in
+    listing order and on NTFS the dot-names list first. Left like that, the directory would hold
+    plaintext and no proof, and every later sweep would skip it. Nobody holds the lock now, so the
+    files are all the proof needs."""
+    leftover = _discard_verify_staging(path)
+    if os.path.lexists(path):
+        try:
+            for name in (_LOCK_NAME, _HELD_MARKER_NAME):
+                os.close(os.open(path / name, os.O_WRONLY | os.O_CREAT, 0o600))
+        except OSError as exc:
+            log.warning(
+                "DR staging directory %s survived its teardown and could not be marked for the next "
+                "sweep: %s",
+                path,
+                safe_exc(exc),
+            )
+    return leftover
+
+
+def _release_when_opened(opening: asyncio.Future[_Staging]) -> None:
+    """Done-callback for an open whose awaiter was cancelled: release what it opened, off the loop."""
+    if opening.cancelled() or opening.exception() is not None:
+        return
+    work = opening.result()
+    asyncio.get_running_loop().run_in_executor(None, work.release)
+
+
+def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
+    """Create a staging directory under ``root`` and take its lock before anything is written there.
+
+    The marker is created only AFTER the lock is held. A sweep that takes the lock and finds no marker
+    cannot tell a crash in that instant from a run about to take its lock, so it leaves the directory
+    alone. Nothing in such a directory holds plaintext yet."""
+    root.mkdir(parents=True, exist_ok=True)
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+    try:
+        fd = os.open(
+            path / _LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+    except OSError:
+        _remove_tree(path)
+        raise
+    try:
+        _lock_exclusive(fd, wait=True)
+    except OSError as exc:
+        if exc.errno not in _LOCK_UNSUPPORTED:
+            _unlock_and_close(fd)
+            _remove_tree(path)
+            raise
+        # No lock is possible here, so no marker either: the sweep can then never prove this
+        # directory abandoned, and a crash leaves it for the operator. That is still safe, and it
+        # keeps a backup working on a destination that cannot lock.
+        log.warning(
+            "DR staging root %s cannot be locked (%s); staging there without a lock, so a directory "
+            "a crash leaves behind will not be swept",
+            root,
+            safe_exc(exc),
+        )
+        return _Staging(path, fd, secure=secure)
+    try:
+        os.close(os.open(path / _HELD_MARKER_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except OSError:
+        _unlock_and_close(fd)
+        _remove_tree(path)
+        raise
+    return _Staging(path, fd, secure=secure)
+
+
+def _is_staging_dir(path: Path) -> bool:
+    """Whether ``path`` is a directory this module stages in: ``.mefor-staging``, or a prefixed
+    directory holding a lock file. The lock file is what keeps an operator's own directory that
+    happens to share a prefix, such as ``codesets/mefor-verify-maps``, in the config bundle."""
+    if path.name == _SERVER_DB_STAGING_DIR:
+        return True
+    return path.name.startswith(_SWEPT_PREFIXES) and os.path.lexists(path / _LOCK_NAME)
+
+
+def _secure_staged(path: Path, secure: bool) -> None:
+    """Apply the store's ``_secure_file`` to a just-created, still-empty staged file when ``secure``."""
+    if secure:
+        from messagefoundry.store.store import _secure_file
+
+        _secure_file(path)
+
+
+def _staging_root_for(
+    *, server_db: bool, store_path: str | None, destination: Path
+) -> tuple[Path, bool]:
+    """Where to stage, and whether to lock the files with ``_secure_file``.
+
+    A SQLite store on disk stages in its own data directory, secured. Anything else stages in
+    ``.mefor-staging`` under ``destination``, unsecured: a server-DB store has no data directory, and
+    an in-memory store has none either."""
+    if not server_db and store_path and store_path != ":memory:":
+        return Path(store_path).absolute().parent, True
+    return destination.absolute() / _SERVER_DB_STAGING_DIR, False
+
+
+def _standalone_staging_root() -> Path:
+    """The OS temp dir, where a standalone verify stages, and which each backup also sweeps.
+
+    Whatever ``tempfile.gettempdir`` answers. When no temp candidate is writable Python falls back to
+    the current directory, and this does not second-guess that: telling the fallback apart from a
+    temp dir that is also the current directory needs ``tempfile``'s private candidate list."""
+    return Path(tempfile.gettempdir()).absolute()
+
+
+def _sweep_os_temp(owned_like: Path) -> int:
+    """The backup's sweep of the OS temp dir, for what a killed standalone verify on this account
+    left there. Never raises: a temp dir that cannot be found is a reason to skip, not to fail."""
+    try:
+        root = _standalone_staging_root()
+    except OSError as exc:
+        log.warning("DR staging: no OS temp dir to sweep: %s", safe_exc(exc))
+        return 0
+    return _sweep_abandoned_staging(root, owned_like=owned_like)
+
+
+def _owner_of(path: Path) -> object | None:
+    """Who owns ``path``: a uid on POSIX, an owner SID on Windows. ``None`` when it cannot be read,
+    and ``None`` for a link or any other reparse point, whose owner is never reported: Windows would
+    read through it to its target. Compared only with another ``_owner_of`` answer.
+
+    On Windows an elevated process's default owner is Administrators, not its user, so every elevated
+    account on the box, and SYSTEM, can share one owner here."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & reparse:
+        return None
+    if sys.platform != "win32":
+        return st.st_uid
+    from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl, _resolve_sid
+
+    sddl = _read_dacl_sddl(path, owner=True)
+    found = _SDDL_OWNER.search(sddl) if sddl else None
+    return _resolve_sid(found.group(1)) if found else None
+
+
+def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> int:
+    """Remove the staging directories under ``root`` that a dead run left behind. Never raises.
+
+    A directory is removed only when its lock file exists, its lock can be taken, and it holds the
+    marker a run creates once it holds the lock. That set means the run that made it is
+    gone: the OS dropped its lock with the process. Everything else is left alone -- a live run holds
+    its lock, and a directory with no lock or no marker has not had plaintext written to it. Age is
+    never consulted. Returns how many directories were removed.
+
+    ``owned_like`` names a directory this run just created. When given, only a directory with the same
+    owner is a candidate, and nothing is swept if that owner cannot be read. A standalone verify and
+    each backup pass it for the OS temp dir, which can be shared: another account could plant a
+    directory there holding a lock file and a marker, and the teardown must never run on a tree it
+    controls."""
+    swept = 0
+    owner: object | None = None
+    if owned_like is not None:
+        owner = _owner_of(owned_like)
+        if owner is None:
+            log.warning(
+                "DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root
+            )
+            return 0
+    try:
+        entries = list(os.scandir(root))
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        log.warning("DR staging: could not list staging root %s: %s", root, safe_exc(exc))
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(_SWEPT_PREFIXES):
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False) or os.path.isjunction(entry.path):
+                continue
+        except OSError:
+            continue
+        path = Path(entry.path)
+        if owned_like is not None and path == owned_like:
+            continue  # this run's own directory, held live
+        # No lock file is no proof either way. Checked before the owner, which on Windows costs a
+        # security-descriptor read, so a temp dir full of other programs' leftovers stays cheap.
+        if not os.path.lexists(path / _LOCK_NAME):
+            continue
+        if owner is not None and _owner_of(path) != owner:
+            continue  # not this account's: another account's run, or a plant
+        try:
+            fd = os.open(path / _LOCK_NAME, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        except FileNotFoundError:
+            continue  # no lock file: no proof either way
+        except OSError as exc:
+            # Most often a directory another account made -- an interactive `backup` run as an
+            # administrator -- which this account cannot open. Said, not skipped silently.
+            log.warning(
+                "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
+                path,
+                safe_exc(exc),
+            )
+            continue
+        try:
+            if not _lock_exclusive(fd, wait=False):
+                continue  # a live run holds it
+            if not os.path.lexists(path / _HELD_MARKER_NAME):
+                continue  # locked by nobody, but no marker: not proven abandoned
+        except OSError as exc:
+            log.warning(
+                "DR staging: could not test the lock of staging directory %s: %s",
+                path,
+                safe_exc(exc),
+            )
+            continue
+        finally:
+            _unlock_and_close(fd)
+        leftover = _teardown_staging(path)
+        if leftover is not None:
+            log.error("DR staging: an abandoned staging directory survived the sweep: %s", leftover)
+        elif os.path.lexists(path):
+            log.warning(
+                "DR staging: emptied abandoned staging directory %s but could not remove it; the "
+                "next sweep of this root retries it",
+                path,
+            )
+        else:
+            swept += 1
+            log.info("DR staging: removed abandoned staging directory %s", path)
+    return swept
 
 
 def _verify_in_staging(
@@ -1258,12 +1831,15 @@ def _verify_in_staging(
     match_key: bytes | None,
     full: bool,
     store_settings: object | None,
+    secure: bool = False,
 ) -> VerifyResult:
     """Steps 2 to 4 of :func:`_verify_archive_blocking`, writing into ``staging``, which the caller
-    creates and always discards."""
+    creates and always discards. With ``secure``, each plaintext file is locked to its owner before its
+    first byte."""
     tar_path = staging / "archive.tar"
     # (2) decrypt (or copy a plaintext archive) to the tar.
     with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
+        _secure_staged(tar_path, secure)
         if encrypted:
             assert match_key is not None
             # Post-authentication resource bound on the temp dir (see the constant). An over-cap
@@ -1286,7 +1862,7 @@ def _verify_in_staging(
             integrity_ok=True,
             reason="config-only archive (server-DB store, DBA-delegated DB)",
         )
-    snap = _extract_member(tar_path, _STORE_MEMBER, staging)
+    snap = _extract_member(tar_path, _STORE_MEMBER, staging, secure=secure)
     if snap is None:
         return VerifyResult("FAIL", reason="archive has no store.db member")
 
@@ -1389,11 +1965,15 @@ async def run_restore_verify(
         base64.b64decode(k)
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
+    # `staging_root=None` is a standalone verify: a private directory under the OS temp dir, never
+    # where the backup runner stages. See the staging-location block above `_Staging` (BACKLOG #1174).
     return await asyncio.to_thread(
         _verify_archive_blocking,
         archive_path=archive_path,
         keys=keys,
         full=full,
+        staging_root=None,
+        secure=True,
         allow_unencrypted=allow_unencrypted,
         # Threaded through so a full verify opens the snapshot under the SAME cipher/keyring/provider
         # the keyring above was resolved from, instead of a bare default (see _full_open_check).
@@ -1759,8 +2339,8 @@ def _extract_member(
     on the destination volume, where ``TemporaryDirectory`` inherits whatever the parent grants on
     Windows, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
-    under the inherited ACL for as long as the write takes. The verify path leaves it off and keeps the
-    posture ``docs/PHI.md`` records for ``mefor-verify-*``.
+    under the inherited ACL for as long as the write takes. The verify path passes it everywhere but
+    ``.mefor-staging`` (BACKLOG #1174).
 
     Path-traversal-safe by construction, NOT by an after-the-fact check: the member's *stored name* is
     never used as a filesystem path — we look the member up by name, then stream its CONTENT to a fixed
@@ -1790,12 +2370,9 @@ def _extract_member(
             return None
         streamed = 0
         with open(out, "wb") as fh:
-            if secure:
-                # Reuse the store's own PHI-at-rest primitive, on the empty file, before any of the
-                # member's bytes reach it.
-                from messagefoundry.store.store import _secure_file
-
-                _secure_file(out)
+            # Reuse the store's own PHI-at-rest primitive, on the empty file, before any of the
+            # member's bytes reach it.
+            _secure_staged(out, secure)
             while True:
                 buf = src.read(1024 * 1024)
                 if not buf:

@@ -39,6 +39,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >= 15 chars, satisfies the ASVS password policy
 
@@ -139,7 +140,8 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             ("rawonly", [custom.id]),
             ("boss", [Role.ADMINISTRATOR.value]),
         ):
-            uid = await service.create_local_user(
+            uid = await create_local_user_chosen(
+                service,
                 username=username,
                 password=PW,
                 display_name=None,
@@ -155,7 +157,10 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             assert user is not None and user.password_hash is not None
             # Admin-created accounts force first-login rotation (WP-L3-12); clear it, keep the hash.
             await service.store.set_password(
-                uid, password_hash=user.password_hash, must_change_password=False
+                uid,
+                password_hash=user.password_hash,
+                must_change_password=False,
+                password_generated=False,
             )
 
         mid = await engine.store.enqueue_message(
@@ -315,5 +320,10 @@ async def test_view_raw_without_view_summary_is_reachable(seeded: _Seed) -> None
         response = await client.get(f"/messages/{seeded.message_id}", headers=headers)
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["raw"], "the custom role holds messages:view_raw, so the body must be returned"
         assert body["summary"] is None and body["error"] is None and body["metadata"] is None
+        # The body is its own fetch since BACKLOG #2345, on the same messages:view_raw gate.
+        raw = await client.get(f"/messages/{seeded.message_id}/raw", headers=headers)
+        assert raw.status_code == 200, raw.text
+        assert raw.json()["raw"], (
+            "the custom role holds messages:view_raw, so the body must be returned"
+        )

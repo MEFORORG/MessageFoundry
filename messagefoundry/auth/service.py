@@ -24,8 +24,9 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
@@ -33,6 +34,12 @@ from typing import Any, Final, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
+from messagefoundry.auth.audit_visibility import (
+    ACCOUNT_LOCKED_ACTION,
+    LOCK_NOTICE_ACTION,
+    LOCKED_REFUSAL_DETAIL,
+    LOGIN_LOCKED_ACTION,
+)
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
@@ -51,6 +58,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
+    LOG_SILENT_EVENT_TYPES,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
     MFA_CREDENTIAL_REMOVED,
@@ -67,6 +75,7 @@ from messagefoundry.auth.notifications import (
     USERNAME_CHANGED,
     SecurityEvent,
     SecurityNotifier,
+    notice_kind_log_label,
 )
 from messagefoundry.auth.oidc import PendingFlow
 from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher
@@ -92,7 +101,10 @@ from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
+from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.store.base import AdminStore
+from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -156,7 +168,7 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     half. THIS FUNCTION deliberately does not stop the engine -- HL7 flow does not depend on password
     screening, and bricking a message engine over an auth data asset would trade a contained failure for
     an outage. The engine's own ``serve`` lifespan no longer stops either, since BACKLOG #1447: a FIRST
-    run used to fail there, and :meth:`AuthService._generate_policy_password` now suppresses this screen
+    run used to fail there, and :func:`generate_policy_password` now suppresses this screen
     on its own candidate -- see that call for why. Stated as that ONE path rather than as "nothing
     anywhere": the ``provision-admin`` CLI still refuses on this, as an error message since Wave 2.
 
@@ -344,6 +356,24 @@ async def _sleep_until(deadline: float) -> None:
 # (fail-safe: a dropped grant just re-prompts, never a bypass), mirroring `_new_ip_seen`'s self-eviction.
 _ACTION_STEP_UP_GRANT_MAX = 4096
 
+
+def _prune_grants(grants: dict[tuple[str, str], float], now: float) -> None:
+    """Drop every expired entry from a per-action grant map (monotonic clock)."""
+    for key in [k for k, deadline in grants.items() if deadline <= now]:
+        del grants[key]
+
+
+def _bounded_grant_put(
+    grants: dict[tuple[str, str], float], key: tuple[str, str], deadline: float, now: float
+) -> None:
+    """Prune ``grants``, evict its OLDEST entry at :data:`_ACTION_STEP_UP_GRANT_MAX` (fail-safe: a
+    dropped grant just re-prompts, never a bypass), then store ``key``."""
+    _prune_grants(grants, now)
+    if key not in grants and len(grants) >= _ACTION_STEP_UP_GRANT_MAX:
+        del grants[min(grants, key=grants.__getitem__)]
+    grants[key] = deadline
+
+
 # Action identifiers for the per-action step-up grants (ADR 0077). Named constants so the JSON API deps,
 # the /ui twins, and the tests all reference the SAME grant string (a typo would only ever fail closed —
 # an unmatched grant re-prompts — but the shared constants keep the wiring legible). WP245 (ASVS 7.5.1)
@@ -377,6 +407,28 @@ STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — s
 # MFA-gated, for the same reason `admin_reset_password` is.
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
 
+#: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
+#: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
+#: Amendment A, Manager decision 2026-09-29). No other action's grant is recorded, so no other
+#: route can restore one, whatever it calls.
+_REFUNDABLE_ACTIONS = frozenset(
+    {STEP_UP_ACTION_ADMIN_RESET_PASSWORD, STEP_UP_ACTION_ADMIN_RESET_MFA}
+)
+
+#: The grant THIS REQUEST spent on a refundable action, as ``(service id, key, deadline)``, or
+#: ``None``. A context variable, not a map on the service: the route gate spends the grant and the
+#: handler that may refund it run in one request's context, so a refund can only ever restore the
+#: grant its own request spent -- never one a concurrent request of the same session spent, which a
+#: map keyed by (token, action) could not tell apart. The service id binds it to the instance that
+#: issued the grant, so no other instance can take it. Every
+#: :meth:`AuthService.has_action_step_up` call overwrites it, so every action-bound gate starts its
+#: request from a clean record; a successful action leaves its spend in place, which is harmless
+#: because a refund is reached only after a gate that has just overwritten it. It does NOT rely on
+#: a task boundary between requests.
+_SPENT_REFUNDABLE_GRANT: ContextVar[tuple[int, tuple[str, str], float] | None] = ContextVar(
+    "_SPENT_REFUNDABLE_GRANT", default=None
+)
+
 #: The closed-set reason a federated login is refused with when its verified ``(issuer, sub)`` is
 #: bound to no account (ADR 0184 AC-4). Named because the browser layer maps it to a login-page code.
 FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
@@ -385,9 +437,9 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: account carries no ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5). Written into the
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`. Also the
 #: reason a federated login refuses an already-bound id-less row, and a reconciliation pass skips one
-#: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id and an AD step-up
-#: re-bind on a row with none. Deliberately absent from the browser layer's code map, so it shows as
-#: generic.
+#: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id, and an AD step-up
+#: re-bind or ``verify_mfa`` directory check on a row with none. Deliberately absent from the
+#: browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
 #: The closed-set reason a directory answer is refused with when it names another directory object
@@ -525,11 +577,16 @@ class Elevation:
     #: checked and nothing was charged. It qualifies the wrong-proof state: the token still
     #: authenticates, and the caller must send the operator to the IdP leg rather than re-prompt.
     idp_step_up_required: bool = False
-    #: Set only by :meth:`AuthService.verify_mfa`, on a directory account the directory did not
-    #: confirm as present and enabled, including when it could not be reached (BACKLOG #2023). The
-    #: code was never checked and nothing was charged. It qualifies the wrong-proof state: the token
-    #: still authenticates, and the caller must say the directory could not confirm the account
-    #: rather than call the code wrong.
+    #: Set by :meth:`AuthService.verify_mfa`, on a directory account the directory did not confirm
+    #: as present and enabled, including when it could not be reached (BACKLOG #2023), or a row with
+    #: no directory id (BACKLOG #2027). Set by :meth:`AuthService.reauth` when the directory re-bind
+    #: could not judge the password, for at least these causes: no directory, no enabled entry for
+    #: the row's id, an unreachable one, a row with no id, or an entry that is not provably the
+    #: row's own (BACKLOG #2027). Either way the proof was never checked and nothing was charged. It
+    #: qualifies the wrong-proof state: the token still authenticates, and the caller must say the
+    #: directory could not confirm the account rather than call the code or the password wrong. The
+    #: cause goes to the audit row (``reason`` on ``auth.reauth``, ``outcome`` on
+    #: ``auth.mfa_failed``) and never to the caller.
     directory_unconfirmed: bool = False
 
     @property
@@ -621,12 +678,105 @@ class TemporaryPasswordUnavailable(RuntimeError):
 #: the name: at least "password", "passphrase", "secret", "token", "account" and "cert".
 _RESET_GENERATION_ATTEMPTS = 64
 
+#: The username the generator probe screens against: synthetic, long, and unlike any real account
+#: name, so the own-username clause cannot be the reason the probe fails.
+_PROBE_USERNAME = "mf-startup-credential-probe"
+
+
+def credential_generation_problem(policy: PasswordPolicy) -> str | None:
+    """Try the temporary-credential generator once under ``policy`` and a synthetic username (ADR 0197
+    Amendment A, Manager decision 2026-09-29). ``None`` when it can issue; otherwise the refusal,
+    followed by what it breaks. The generated value is discarded. The one probe behind both the
+    engine's startup check and ``messagefoundry verify``'s ``auth.credential_generation``."""
+    try:
+        # Quiet: each caller reports the failure once, in its own words.
+        generate_policy_password(policy, username=_PROBE_USERNAME, log_failure=False)
+    except TemporaryPasswordUnavailable as exc:
+        return (
+            f"{exc}. Creating an account, resetting a password and resetting an account's factors "
+            "will answer 503 until it is fixed."
+        )
+    except Exception as exc:  # noqa: BLE001 -- a probe reports; it never stops `serve` or `verify`
+        return (
+            f"the credential generator raised {type(exc).__name__}, so creating an account and both "
+            "resets would fail too"
+        )
+    return None
+
 
 def _temporary_password_chars(min_length: int) -> int:
     """The generated password's length: the policy minimum, but never under 32 characters.
     ``token_urlsafe`` carries 6 bits per character, so 32 characters keep the 192-bit floor of BACKLOG
     #1172, and any longer minimum carries more."""
     return max(32, min_length)
+
+
+def generate_policy_password(
+    policy: PasswordPolicy, *, username: str | None = None, log_failure: bool = True
+) -> str:
+    """A random password that satisfies the active policy — so an administrator-issued temporary
+    credential is held to the same bar operators are. ``token_urlsafe(n)`` yields about 1.33 times
+    n characters, cut to :func:`_temporary_password_chars`, so the length is at least
+    ``min_length``. The loop covers a context hit or an opt-in character-class requirement a given
+    token happens to miss.
+
+    Every clause except the breach screen, which is suppressed per-call for the reason stated at
+    the call below (BACKLOG #1447).
+
+    ``username`` is the account the password is for, so the own-username clause applies too.
+    ``log_failure=False`` is for :func:`credential_generation_problem`, whose callers log or print
+    the failure themselves; every issuing path keeps the ERROR.
+
+    Raises :class:`TemporaryPasswordUnavailable` when no candidate clears the policy. It never
+    returns an unscreened password. The old last-resort return appended ``aA1!`` without a screen,
+    so a site context word inside it would have issued a credential the policy refuses (BACKLOG
+    #1132)."""
+    # At least 32 CHARACTERS (192 bits). token_urlsafe's argument is a byte count and min_length
+    # is a CHARACTER count, so the bytes are derived from the characters: 3 bytes make 4
+    # characters, and the cut below never pads, so a short byte count would silently lower the
+    # entropy floor (BACKLOG #1172).
+    chars = _temporary_password_chars(policy.min_length)
+    length = -(-chars * 3 // 4)  # ceiling: enough bytes for `chars` characters
+    # The suffixed form exists only for an opt-in character class the bare token happens to miss.
+    # With every class rule off it cannot help: the bare token then fails only on a context word
+    # or the username, and the suffix keeps either one.
+    class_rules = (
+        policy.require_uppercase
+        or policy.require_lowercase
+        or policy.require_digit
+        or policy.require_symbol
+    )
+    for _ in range(_RESET_GENERATION_ATTEMPTS):
+        token = secrets.token_urlsafe(length)[:chars]
+        # The bare token first. The suffixed form is screened like the token: a site term can sit
+        # inside it too.
+        candidates = (token, token + "aA1!") if class_rules else (token,)
+        # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
+        # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
+        # contain it -- the breach clause is inert on this input by construction. Honouring
+        # `check_breached` here therefore converts a screen that can never FIRE into one that
+        # always BLOCKS: the corpus load raises on an unusable install (BACKLOG #1438). While this
+        # also generated the first-run account (retired by ADR 0183), the raise escaped an
+        # unguarded lifespan call and the engine did not start at all.
+        #
+        # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
+        # operator- or user-supplied password, where the corpus is the whole point and refusing is
+        # right -- so do NOT widen this to the policy field or the `[auth]` setting.
+        for candidate in candidates:
+            if not policy.violations(candidate, username=username, suppress_breach_check=True):
+                return candidate
+    if log_failure:
+        _log.error(
+            "no temporary password cleared the password policy in %d tries; the likely cause is "
+            "[auth].password_extra_context_words holding so many short terms that nearly every "
+            "random string contains one, which would refuse most passphrases too",
+            _RESET_GENERATION_ATTEMPTS,
+        )
+    raise TemporaryPasswordUnavailable(
+        "could not generate a temporary password that clears the password policy; check "
+        "[auth].password_extra_context_words for short or very common terms, then restart the "
+        "engine, which reads [auth] only at start"
+    )
 
 
 # Characters that let one address field name more than one mailbox, or smuggle a display name or a
@@ -789,6 +939,32 @@ class ChannelScopeSourceConflict(RuntimeError):
     between this write's read and its compare-and-set."""
 
 
+#: The ONE detail every refusal of ADR 0197 Amendment A's first-sign-in order carries (N-B2 part 4):
+#: a password change, a passkey registration and a TOTP removal refused because the account would
+#: hold no factor with a way past the sign-in lock. Fixed, so it tells a caller nothing it did not
+#: already know from holding the session.
+ENROL_AUTHENTICATOR_FIRST = "enrol an authenticator app first"
+
+
+#: The detail ``disable_mfa`` refuses with while ``[security].require_mfa`` covers the account (ADR
+#: 0197 Amendment A, AC-A3a). In wave 1 TOTP is the only way past the sign-in lock, so a covered
+#: account keeps it; an administrator's factor reset remains the recovery.
+TOTP_REMOVAL_REFUSED = (
+    "your authenticator app is the last second factor that gets you past a sign-in lock, and MFA "
+    "is required for your account, so it cannot be removed -- an administrator can reset it"
+)
+
+
+class FactorEnrolmentRequired(ValueError):
+    """The account ``[security].require_mfa`` covers holds no factor with a way past the sign-in lock,
+    so this step must wait until it enrols one (ADR 0197 Amendment A, N-B2 part 4). In wave 1 only
+    TOTP is such a factor. A ``ValueError`` so every route that already renders a flow refusal renders
+    this one too; the password routes map it to 403 with :data:`ENROL_AUTHENTICATOR_FIRST`."""
+
+    def __init__(self) -> None:
+        super().__init__(ENROL_AUTHENTICATOR_FIRST)
+
+
 class UsernameTaken(RuntimeError):
     """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
     (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
@@ -824,11 +1000,12 @@ class DirectoryObjectIdMissing(ValueError):
     writes sits on a row carrying an id, and the id is written at the row's creation and never
     cleared, so both re-resolves above ask by the id for it. It does not reach at least these: a
     direct ``set_user_federated_subject`` call, which checks no id, and whose one caller is the
-    bind; and ``verify_mfa``'s directory check, which asks about an id-less UNBOUND row by its name.
-    The step-up re-proof and a Windows SSO sign-in no longer reach an id-less row at all: both refuse
-    it with this reason (BACKLOG #2027). For a binding already on an id-less row, written before this refusal existed or planted through that setter, the two re-resolves
-    above no longer ask by name (BACKLOG #2027): the federated login refuses it with this same
-    reason, and the reconciler skips it (``_holds_unkeyed_federated_binding``).
+    bind. The step-up re-proof, ``verify_mfa``'s directory check and a Windows SSO sign-in no
+    longer reach an id-less row at all: each refuses it with this reason (BACKLOG #2027). For a
+    binding already on an id-less row, written before this refusal existed or planted through that
+    setter, the two re-resolves above no longer ask by name (BACKLOG #2027): the federated login
+    refuses it with this same reason, and the reconciler skips it
+    (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
 
     :meth:`AuthService.create_directory_account` raises it too, before any write, when the directory
@@ -890,8 +1067,8 @@ def _live_lock(user: UserRecord, now: float) -> bool:
     return user.locked_until is not None and now < user.locked_until
 
 
-#: The ONE audit reason a refused combined sign-in on a TOTP-enrolled local account records,
-#: whichever factor was wrong (BACKLOG #1131). It must not name which factor verified: the
+#: The ONE audit reason a refused sign-in on an existing, enabled local account records, combined or
+#: password-only, whichever factor was wrong and whatever lock refused it (BACKLOG #1131). It must not name which factor verified: the
 #: ``auth.login_failed`` row is read by an ``audit:read`` holder who is not an administrator (the
 #: built-in ``AUDITOR`` role), and a per-factor slug there was a password oracle -- the sign-in lock
 #: does not refuse a combined sign-in, so such a reader could arm the lock, send candidate passwords
@@ -901,15 +1078,70 @@ def _live_lock(user: UserRecord, now: float) -> bool:
 #: surface, and the counting is what stops a password holder guessing codes uncounted, so it must
 #: not collapse.
 #:
-#: **A coarser residual remains, and this slug does not close it.** The second-step counter is fed
-#: only by a right factor, so sending one candidate ``lockout_threshold`` times locks that counter
-#: iff the password was right, and the lock's ``auth.account_locked`` / ``auth.lock_notice`` /
-#: ``auth.login_locked`` rows are audit-visible while a live sign-in lock keeps the sign-in counter
-#: from emitting any (:func:`next_lockout_state` never re-locks a live counter). That is the same
-#: oracle at ``lockout_threshold`` requests per candidate instead of one. Closing it would suppress
-#: the ``auth.account_locked`` row ADR 0197 AC-10 mandates, so it is an owner/ADR decision, tracked
-#: as the lock-event limb of #1131; ``tests/test_combined_sign_in_audit_oracle.py`` xfails it.
-_COMBINED_FAILURE_REASON = "bad_credentials"
+#: **The coarser lock-event oracle is closed by owner ruling 2026-09-28.** The second-step counter is
+#: fed only by a right factor, so sending one candidate ``lockout_threshold`` times locks that
+#: counter iff the password was right. The lock rows that follow are now read only with
+#: ``users:manage`` (:mod:`messagefoundry.auth.audit_visibility`), and a refusal BY a lock writes the
+#: same ``auth.login_failed`` row as a wrong credential, before its users:manage-only
+#: ``auth.login_locked`` (:func:`_local_refusal_detail`). So a reader without ``users:manage`` sees
+#: one identical row per refused attempt in every lock state. It is also why a PASSWORD-ONLY refusal
+#: uses this reason and not ``bad_password``: a refusal by a live lock never checked the password,
+#: and a slug saying it was wrong would be false in the administrator's view, while a different
+#: slug would show everyone else that a lock was live.
+_LOCAL_REFUSAL_REASON = "bad_credentials"
+
+
+async def _run_in_order(writes: Sequence[Callable[[], Awaitable[None]]]) -> None:
+    """Run deferred audit writes one after another, in the order they were queued."""
+    for write in writes:
+        await write()
+
+
+async def _sleep_until_write_point(deadline: float) -> None:
+    """Await the monotonic instant a refused sign-in writes its audit rows (BACKLOG #1131).
+
+    Kept apart from :func:`_sleep_until`, which is the answer's pad: tests replace that one to read
+    back the one deadline each seam computes, and this wait is not a second pad."""
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+async def _write_through_cancellation(writes: Sequence[Callable[[], Awaitable[None]]]) -> None:
+    """Run ``writes`` to completion even if the caller is cancelled, then re-raise the cancel.
+
+    Shielded, and awaited again after each cancel, so a repeated cancellation neither abandons the
+    writes nor lets the caller leave (and release the account's queue) before they finish. A write
+    that fails raises as it did when the rows were written inline."""
+    task = asyncio.ensure_future(_run_in_order(writes))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Recorded before anything else, so a cancel that lands in the turn the writes finish
+            # is still re-raised rather than swallowed.
+            cancelled = True
+    if cancelled:
+        if not task.cancelled() and task.exception() is not None:
+            # Nobody else will read it: the caller is leaving with the cancel.
+            _log.error(
+                "a refused sign-in's audit write failed while the request was cancelled",
+                exc_info=task.exception(),
+            )
+        raise asyncio.CancelledError
+    task.result()
+
+
+def _local_refusal_detail(reason: str, *, combined: bool) -> str:
+    """The ``auth.login_failed`` detail of a refused local credential sign-in (BACKLOG #1131).
+
+    The one builder for both the verified refusal and the refusal by a lock, so the row a reader
+    without ``users:manage`` sees cannot differ between them by a key, a value or their order."""
+    detail: dict[str, Any] = {"provider": "local", "reason": reason}
+    if combined:
+        detail["combined"] = True
+    return _json(detail)
 
 
 def _route_combined_failure(
@@ -921,16 +1153,16 @@ def _route_combined_failure(
     a caller holding the password or the TOTP device can get one right; neither right counts on the
     SIGN-IN counter, which a live sign-in lock leaves unextended.
 
-    The audit reason is :data:`_COMBINED_FAILURE_REASON` for ALL THREE arms, so the
+    The audit reason is :data:`_LOCAL_REFUSAL_REASON` for ALL THREE arms, so the
     ``auth.login_failed`` row an ``audit:read`` holder reads is identical whichever factor was wrong
     (BACKLOG #1131). The ``factor`` still names which factor verified, but it feeds only the
     ``ACCOUNT_LOCKED`` notice, which reaches the account's own holder out of band, never the audit
     trail. The caller learns nothing either: every refusal is the one fixed answer."""
     if password_ok:
-        return "second_step", _COMBINED_FAILURE_REASON, "password"
+        return "second_step", _LOCAL_REFUSAL_REASON, "password"
     if code_ok:
-        return "second_step", _COMBINED_FAILURE_REASON, "code"
-    return "sign_in", _COMBINED_FAILURE_REASON, None
+        return "second_step", _LOCAL_REFUSAL_REASON, "code"
+    return "sign_in", _LOCAL_REFUSAL_REASON, None
 
 
 def _holds_lockout_state(user: UserRecord) -> bool:
@@ -1011,20 +1243,29 @@ class _Reproof:
     #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
     cycles: int = 0
     cleared: bool = False
-    #: A closed-set slug for an uncounted refusal the directory's identity decided (BACKLOG #2027):
-    #: the row has no id, or the directory answered about an entry that is not the row's own. Written
-    #: onto the ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
+    #: A closed-set slug for an uncounted directory refusal that judged no password (BACKLOG #2027):
+    #: at least a row with no id, or any :class:`_DirectoryRebind` reason. Written onto the
+    #: ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
     reason: str | None = None
+    #: A directory re-proof the directory could not decide, so no password was judged and nothing
+    #: was charged; ``reason`` says why. Carried to ``Elevation.directory_unconfirmed`` so a caller
+    #: does not report the password as wrong.
+    directory_unconfirmed: bool = False
 
 
 @dataclass(frozen=True)
 class _DirectoryRebind:
     """The outcome of :meth:`AuthService._reauth_ad`.
 
-    ``verdict`` keeps the three answers that method documents. ``reason`` is set only when the
-    entry the directory answered about is not provably the row's own: its id is unreadable or
-    names another object (BACKLOG #2027). ``verdict`` is then ``None``, whether or not the bind
-    itself succeeded."""
+    ``verdict`` keeps the three answers that method documents. ``reason`` is a closed-set slug set
+    whenever ``verdict`` is ``None``, naming why the directory could not judge the password
+    (BACKLOG #2027): ``not_configured``, ``directory_unavailable`` or ``not_in_directory``, and,
+    from a directory implementation that does not check the id itself,
+    ``directory_object_id_missing`` or ``directory_identity_conflict`` (``None`` whether or not
+    the bind succeeded). ``not_in_directory`` means what the IdP step-up's same slug means: no
+    ENABLED entry for the row's id, so absent, disabled, an unreadable account state, or an entry
+    that does not read the id back. The TOTP leg's audit ``outcome`` tells those apart; this leg's
+    second lookup does not."""
 
     verdict: bool | None
     reason: str | None = None
@@ -1125,6 +1366,11 @@ class ProvisionedAdministrator:
     username: str
     repaired: bool
     holder_notice: str | None = None
+    #: The single-use recovery codes minted with the TOTP enrolment (ADR 0197 Amendment A, N-A),
+    #: plaintext, for the command to print ONCE to the operator's terminal. Empty when the command
+    #: enrolled no TOTP (``--no-totp``, which only a site with ``require_mfa`` off may pass). Never
+    #: in ``--json`` output, never logged, never audited.
+    recovery_codes: tuple[str, ...] = ()
 
 
 # BACKLOG #2019: the three outcomes of the notice a repair owes the account's earlier holder. They are
@@ -1160,6 +1406,35 @@ class IssuedCredential:
 
 
 @dataclass(frozen=True)
+class CreatedLocalAccount:
+    """What :meth:`AuthService.create_local_user` returns: the new row's id and its engine-generated
+    birth credential, handed to the creating administrator **once** (ADR 0197 Amendment A, N-B2
+    part 1). The administrator never chooses the password, so nothing a caller guesses can be the
+    credential, and wrong passwords arm no lock while it stands."""
+
+    user_id: str
+    credential: IssuedCredential
+
+
+@dataclass(frozen=True)
+class LockableAccountCensus:
+    """What :meth:`AuthService.lockable_account_census` found (ADR 0197 Amendment A, N-B2 part 6).
+
+    ``no_way_past`` names every local account ``[security].require_mfa`` covers that holds a chosen
+    credential (``password_generated`` unset) and no factor with a way past the sign-in lock -- TOTP,
+    in wave 1. ``undecryptable_totp`` names every account whose ENABLED TOTP secret the engine cannot
+    decrypt, which turns the owner's combined sign-in into "right password, wrong code". Both are
+    usernames only, sorted; neither carries a secret."""
+
+    no_way_past: tuple[str, ...] = ()
+    undecryptable_totp: tuple[str, ...] = ()
+
+    @property
+    def clean(self) -> bool:
+        return not self.no_way_past and not self.undecryptable_totp
+
+
+@dataclass(frozen=True)
 class CustomRoleInfo:
     """An admin-defined custom role and its resolved permission subset (ADR 0045)."""
 
@@ -1186,6 +1461,108 @@ def _roles_from_ids(ids: Iterable[str]) -> frozenset[Role]:
     return frozenset(out)
 
 
+def _scope_covers(settings: AuthSettings, roles: frozenset[Role]) -> bool:
+    """Whether ``[security].require_mfa`` and its scope cover an account holding ``roles``, before
+    any factor is counted. The one statement of the scope rule: ``AuthService._mfa_required_for``,
+    the enrol-first gates and :func:`lockable_account_census` all ask it."""
+    if not settings.require_mfa:
+        return False
+    return settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
+
+
+def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozenset[Role]) -> bool:
+    """Whether the requirement covers ``user`` as a LOCAL account, enrolled or not (ADR 0197
+    Amendment A): :func:`_scope_covers`, restricted to local accounts."""
+    return user.auth_provider == AuthProvider.LOCAL.value and _scope_covers(settings, roles)
+
+
+class CensusNeedsTheStoreKey(RuntimeError):
+    """The census read a TOTP cell that is still ciphertext: the store was opened without the key it
+    was written under (a keyless open passes cells through unchanged). That is a fact about the
+    shell, not about any account, so the census stops rather than naming every enrolled account
+    (ADR 0197 Amendment A). ``messagefoundry verify`` reports it as an ERROR naming the key."""
+
+
+async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
+    """Whether ``user``'s enabled TOTP secret decrypts to a key the engine can compute codes with.
+
+    Two ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
+    the account and never the value. Or a keyless open hands the stored ciphertext through unchanged,
+    which is not base32, so computing a code from it fails. Any other store error propagates: it
+    says nothing about this secret, and filing it as "undecryptable" would send an operator to reset
+    a healthy account."""
+    try:
+        secret = await store.get_totp_secret(user.id)
+    except CipherError:
+        _log.warning(
+            "the TOTP secret of account %r does not decrypt under this store key", user.username
+        )
+        return False
+    if not secret:
+        return False
+    if secret.startswith(MARKER_PREFIX):
+        raise CensusNeedsTheStoreKey(
+            "a TOTP secret is still ciphertext: this shell opened the store without the key it was "
+            "written under. Set the service's store key here and run again."
+        )
+    try:
+        totp.totp(secret)
+    except ValueError:  # binascii.Error is a ValueError: not base32, so no key
+        return False
+    return True
+
+
+async def lockable_account_census(
+    store: AdminStore, settings: AuthSettings
+) -> LockableAccountCensus:
+    """Name every account that is still lockable with no way past the sign-in lock (ADR 0197
+    Amendment A, N-B2 part 6, AC-A9).
+
+    Two populations. **A covered local account holding a chosen credential and no TOTP**: the gates
+    of part 4 never let a holder reach that state under the shipped defaults, so one that exists got
+    there another way -- for instance while the site ran with ``require_mfa`` off, or from before
+    this change. **An enabled TOTP secret the engine cannot use**, on any account, directory accounts
+    included: the owner's combined sign-in then reads as "right password, wrong code", which feeds
+    the second-step lock, so the owner's way past has become a way to lock themselves out.
+
+    Read-only, and it needs no :class:`AuthService`, so ``messagefoundry verify`` runs it without the
+    trust-anchor preflights or a directory client. Disabled accounts are read too: one cannot sign in
+    now, but it is lockable the moment it is re-enabled. A local row with no password hash is
+    skipped: nobody can sign into it, so there is nothing to lock (an interrupted
+    ``provision-admin`` leaves one). Raises :class:`CensusNeedsTheStoreKey` when a TOTP cell is
+    still ciphertext, which means this shell lacks the store key. Usernames only; each secret is
+    dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
+    ``verify`` reports. Neither refuses to start, since refusing would hand an account-level fact a
+    site-wide veto."""
+    no_way_past: list[str] = []
+    undecryptable: list[str] = []
+    for user in await store.list_users():
+        # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
+        # runs only at startup and in verify.
+        if user.totp_enabled:
+            if not await _totp_secret_usable(store, user):
+                undecryptable.append(user.username)
+            continue
+        if (
+            user.password_generated
+            or user.password_hash is None
+            or user.auth_provider != AuthProvider.LOCAL.value
+            or not settings.require_mfa
+        ):
+            continue
+        # The role read only where the scope depends on it.
+        roles = (
+            frozenset()
+            if settings.require_mfa_scope == "every_local_account"
+            else _roles_from_ids(await store.get_user_role_ids(user.id))
+        )
+        if _requirement_covers(settings, user, roles):
+            no_way_past.append(user.username)
+    return LockableAccountCensus(
+        no_way_past=tuple(sorted(no_way_past)), undecryptable_totp=tuple(sorted(undecryptable))
+    )
+
+
 def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
 
@@ -1195,7 +1572,7 @@ def _json(obj: Any) -> str:
 # be passed in and double-audit an event its own call site already audits.
 #: ADR 0197 Decision item 7: the audit row a mailed ``ACCOUNT_LOCKED`` notice writes, and the window
 #: it throttles over. See :meth:`AuthService._lock_notice_due`.
-_LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
+_LOCK_NOTICE_ACTION: Final = LOCK_NOTICE_ACTION
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 
 #: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_credential_issuer` finds the audit row
@@ -1219,7 +1596,7 @@ _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        ACCOUNT_LOCKED: "auth.account_locked",
+        ACCOUNT_LOCKED: ACCOUNT_LOCKED_ACTION,
         LOGIN_AFTER_FAILURES: "auth.login_after_failures",
     }
 )
@@ -1685,69 +2062,6 @@ class AuthService:
                 role_id=role.value, display_name=label, description=description, builtin=True
             )
 
-    def _generate_policy_password(self, username: str | None = None) -> str:
-        """A random password that satisfies the active policy — so an administrator-issued temporary
-        credential is held to the same bar operators are. ``token_urlsafe(n)`` yields about 1.33 times
-        n characters, cut to :func:`_temporary_password_chars`, so the length is at least
-        ``min_length``. The loop covers a context hit or an opt-in character-class requirement a given
-        token happens to miss.
-
-        Every clause except the breach screen, which is suppressed per-call for the reason stated at
-        the call below (BACKLOG #1447).
-
-        ``username`` is the account the password is for, so the own-username clause applies too.
-
-        Raises :class:`TemporaryPasswordUnavailable` when no candidate clears the policy. It never
-        returns an unscreened password. The old last-resort return appended ``aA1!`` without a screen,
-        so a site context word inside it would have issued a credential the policy refuses (BACKLOG
-        #1132)."""
-        # At least 32 CHARACTERS (192 bits). token_urlsafe's argument is a byte count and min_length
-        # is a CHARACTER count, so the bytes are derived from the characters: 3 bytes make 4
-        # characters, and the cut below never pads, so a short byte count would silently lower the
-        # entropy floor (BACKLOG #1172).
-        policy = self._policy
-        chars = _temporary_password_chars(policy.min_length)
-        length = -(-chars * 3 // 4)  # ceiling: enough bytes for `chars` characters
-        # The suffixed form exists only for an opt-in character class the bare token happens to miss.
-        # With every class rule off it cannot help: the bare token then fails only on a context word
-        # or the username, and the suffix keeps either one.
-        class_rules = (
-            policy.require_uppercase
-            or policy.require_lowercase
-            or policy.require_digit
-            or policy.require_symbol
-        )
-        for _ in range(_RESET_GENERATION_ATTEMPTS):
-            token = secrets.token_urlsafe(length)[:chars]
-            # The bare token first. The suffixed form is screened like the token: a site term can sit
-            # inside it too.
-            candidates = (token, token + "aA1!") if class_rules else (token,)
-            # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
-            # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
-            # contain it -- the breach clause is inert on this input by construction. Honouring
-            # `check_breached` here therefore converts a screen that can never FIRE into one that
-            # always BLOCKS: the corpus load raises on an unusable install (BACKLOG #1438). While this
-            # also generated the first-run account (retired by ADR 0183), the raise escaped an
-            # unguarded lifespan call and the engine did not start at all.
-            #
-            # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
-            # operator- or user-supplied password, where the corpus is the whole point and refusing is
-            # right -- so do NOT widen this to the policy field or the `[auth]` setting.
-            for candidate in candidates:
-                if not policy.violations(candidate, username=username, suppress_breach_check=True):
-                    return candidate
-        _log.error(
-            "no temporary password cleared the password policy in %d tries; the likely cause is "
-            "[auth].password_extra_context_words holding so many short terms that nearly every "
-            "random string contains one, which would refuse most passphrases too",
-            _RESET_GENERATION_ATTEMPTS,
-        )
-        raise TemporaryPasswordUnavailable(
-            "could not generate a temporary password that clears the password policy; check "
-            "[auth].password_extra_context_words for short or very common terms, then restart the "
-            "engine, which reads [auth] only at start"
-        )
-
     async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:
         """True iff some enabled administrator other than ``exclude_id`` exists.
 
@@ -1778,8 +2092,30 @@ class AuthService:
         display_name: str | None = None,
         notify_email: str | None = None,
         actor: str,
+        totp_secret: str | None = None,
+        totp_code: str | None = None,
+        totp_code_read_at: float | None = None,
     ) -> ProvisionedAdministrator:
         """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        **IT ENROLS TOTP FROM BIRTH (ADR 0197 Amendment A, N-A, AC-A5).** ``totp_secret`` is the
+        secret the command generated and showed at the terminal, and ``totp_code`` the code the
+        operator read back from their authenticator. Both are checked HERE, before any store write,
+        with the pure :func:`totp.verify_totp_step` at the configured skew, so a mistyped code writes
+        nothing and cannot leave a half-built row. Then the writes run in ADR 0183's order with the
+        enrolment before the role: row, password, TOTP secret with its step consumed and its recovery
+        codes, address, role LAST. The account is born with option E's way past the sign-in lock.
+        ``totp_code_read_at`` is the instant the command read the code, so this check judges the code
+        against the step it was read in rather than failing a correct code that crossed a step
+        boundary while the store opened. ``None`` means now.
+        While ``[security].require_mfa`` is on, a call with no secret is refused, because the scope
+        always covers an administrator.
+
+        **THE REPAIR BRANCH CLEARS EVERYTHING THE EARLIER HOLDER COULD STILL USE**, first: TOTP, its
+        recovery codes, every passkey, and every session on the row. Before this, the branch revoked
+        no session, and ``_build_identity`` re-reads roles on every request, so a live session the
+        earlier holder kept became an Administrator session when the role was written -- an ADR 0183
+        defect this amendment fixes because it edits this branch.
 
         THIS IS THE "NOT PRESENT" ARM OF ASVS 6.3.2, and it is the half that has to exist before the
         other half can be built. The verb asks that default user accounts "are not present in the
@@ -1844,6 +2180,26 @@ class AuthService:
         violations = self._policy.violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
+        # ADR 0197 Amendment A (N-A): the code is proved in memory, before any write.
+        matched_step: int | None = None
+        if totp_secret is None:
+            if self._settings.require_mfa:
+                raise FirstAdministratorRefused(
+                    "MFA is required ([security].require_mfa), so the first Administrator enrols an "
+                    "authenticator app at the terminal; --no-totp is only for a site that turned "
+                    "the requirement off"
+                )
+        else:
+            matched_step = totp.verify_totp_step(
+                totp_secret,
+                (totp_code or "").strip(),
+                now=totp_code_read_at,
+                window=self._settings.totp_skew_steps,
+            )
+            if matched_step is None:
+                raise FirstAdministratorRefused(
+                    "the authenticator code did not match; nothing was written"
+                )
 
         existing = await self._store.get_user_by_username(username)
         repaired = existing is not None
@@ -1853,26 +2209,17 @@ class AuthService:
         # "" and the notifier drops it, so "dispatched" would be a false record.
         prior_notify_email = ((existing.notify_email if existing else None) or "").strip() or None
         if existing is not None:
-            # A directory identity draws its authority from the directory, so it is never promoted
-            # here whatever its role state -- provision a separate local account instead.
-            if existing.auth_provider != AuthProvider.LOCAL.value:
-                raise FirstAdministratorRefused(
-                    f"{username!r} is a {existing.auth_provider} account -- provision a separate "
-                    "local administrator under a different name"
-                )
-            # Refused rather than re-enabled: an operator who disabled this account did so on
-            # purpose, and silently reviving it under a new credential is not a recovery.
-            if existing.disabled:
-                raise FirstAdministratorRefused(
-                    f"the account named {username!r} is disabled -- re-enable it from the web "
-                    "console, or provision under a different username"
-                )
-            if await self._store.get_user_role_ids(existing.id):
-                raise FirstAdministratorRefused(
-                    f"an account named {username!r} already exists and holds roles -- choose "
-                    "another username"
-                )
+            refusal = await self._existing_row_refusal(existing, username)
+            if refusal is not None:
+                raise FirstAdministratorRefused(refusal)
             user_id = existing.id
+            # ADR 0197 Amendment A (AC-A5): a row somebody else held must not carry their factor,
+            # or a session of theirs, onto the new Administrator. Cleared BEFORE anything is
+            # written for the new holder, and before the role that would make a kept session an
+            # Administrator session.
+            await self._store.disable_totp(user_id)
+            await self._store.delete_all_webauthn_credentials(user_id)
+            await self._store.revoke_user_sessions(user_id)
         else:
             user_id = uuid4().hex
             await self._store.create_user(
@@ -1888,13 +2235,36 @@ class AuthService:
                 # unobservable until that write, which is what actually decides it.
                 password_hash=None,
                 must_change_password=True,
+                password_generated=False,
             )
         await self._seed_roles()
+        # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
+        # secret is written, so a code this row already spent (an interrupted earlier run in the
+        # same 30 seconds) is refused with no password written. The row itself stays roleless.
+        if matched_step is not None and not await self._store.consume_totp_step(
+            user_id, matched_step
+        ):
+            raise FirstAdministratorRefused(
+                "that authenticator code was already used on this account; no password was set. "
+                "Wait for the next code and run the command again"
+            )
         await self._store.set_password(
             user_id,
             password_hash=await self._argon2(hash_password, password),
             must_change_password=False,
+            password_generated=False,
         )
+        plain_codes: tuple[str, ...] = ()
+        if totp_secret is not None and matched_step is not None:
+            # Enrolled BEFORE the role, which stays last, so every interruption still leaves a
+            # roleless row a re-run completes -- and the repair branch above clears a half-enrolled
+            # one before this runs again.
+            await self._store.set_totp_secret(user_id, secret=totp_secret)
+            plain_codes = tuple(
+                totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
+            )
+            hashes = [await self._argon2(hash_password, c) for c in plain_codes]
+            await self._store.enable_totp(user_id, recovery_code_hashes=hashes)
         if notify_email is not None:
             # Unconditional rather than fresh-path-only, because the invariant "the supplied address
             # always lands" is simpler than the case analysis. On the fresh path `create_user` already
@@ -1902,6 +2272,12 @@ class AuthService:
             # write is the only one that carries it.
             await self._store.set_user_notify_email(user_id, email=notify_email)
         await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        if repaired:
+            # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
+            # still worked until ``set_password`` above, so a sign-in in that window minted a session
+            # the first revoke never saw, and roles are re-read on every request. Revoking once more
+            # here ends it before it can act as an Administrator.
+            await self._store.revoke_user_sessions(user_id)
         # BACKLOG #2019: a repair can take over an account somebody else holds -- one an administrator
         # created with no roles, say -- so its earlier holder is told, at the address they held. Told
         # rather than refused, because an address is no sign of a second holder: a run given --email
@@ -1943,12 +2319,58 @@ class AuthService:
                     "holder_notice": holder_notice,
                     # The earlier address itself is not recorded here; the notice went to it.
                     "notify_email_moved": moved,
+                    "totp_enrolled": totp_secret is not None,
                 }
             ),
         )
         return ProvisionedAdministrator(
-            user_id=user_id, username=username, repaired=repaired, holder_notice=holder_notice
+            user_id=user_id,
+            username=username,
+            repaired=repaired,
+            holder_notice=holder_notice,
+            recovery_codes=plain_codes,
         )
+
+    async def _existing_row_refusal(self, existing: UserRecord, username: str) -> str | None:
+        """Why ``provision_first_administrator`` would refuse to complete ``existing``, or ``None``.
+
+        A directory identity draws its authority from the directory, so it is never promoted here
+        whatever its role state -- provision a separate local account instead. A disabled account is
+        refused rather than re-enabled: an operator who disabled it did so on purpose, and silently
+        reviving it under a new credential is not a recovery. An account holding roles is somebody's
+        in use."""
+        if existing.auth_provider != AuthProvider.LOCAL.value:
+            return (
+                f"{username!r} is a {existing.auth_provider} account -- provision a separate "
+                "local administrator under a different name"
+            )
+        if existing.disabled:
+            return (
+                f"the account named {username!r} is disabled -- re-enable it from the web "
+                "console, or provision under a different username"
+            )
+        if await self._store.get_user_role_ids(existing.id):
+            return (
+                f"an account named {username!r} already exists and holds roles -- choose "
+                "another username"
+            )
+        return None
+
+    async def provision_refusal(self, username: str) -> str | None:
+        """What ``provision_first_administrator`` would refuse ``username`` for, asked BEFORE any
+        prompt (ADR 0197 Amendment A): an enabled Administrator exists, or the named row is one this
+        command will not complete. ``provision-admin`` asks it first, so an operator is never shown
+        an authenticator key for an account the store then refuses. The service still refuses on its
+        own; this is the courtesy, that is the control."""
+        name = username.strip()
+        if await self.has_enabled_administrator():
+            return (
+                "this store already has an enabled Administrator, so there is nothing to provision "
+                "-- create further accounts from the web console, and use `admin-unlock` if the "
+                "administrator is locked out"
+            )
+        existing = await self._store.get_user_by_username(name)
+        return None if existing is None else await self._existing_row_refusal(existing, name)
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
         """The instant an admin-issued must-change credential stops working, or ``None`` when
@@ -2123,6 +2545,20 @@ class AuthService:
         arrived = totp.wall_clock()  # the instant a combined sign-in's code is judged at
         async with self._account_credential_lock(username):
             queued = time.monotonic() - started
+            # A refused local sign-in's audit rows are written at a FIXED point of the padded
+            # window, not as its branch finishes (BACKLOG #1131, Manager decision 2026-09-28).
+            # Written as the branch finished, a row's ``ts``, and the moment it appeared to a reader
+            # polling ``GET /audit``, showed how much work the branch did: a refusal by a live lock
+            # does one dummy verify, a verified refusal also reads the TOTP secret and counts the
+            # failure, and only a right candidate arms the second-step lock. The point is the
+            # equalizer's own floor, half a budget past the attempt's turn in the queue, so the rows
+            # land there on every branch whose work fits in half a budget (the same condition the
+            # answer's slot already rests on), and the answer still goes out on its slot: the
+            # writes run INSIDE the padded window, never after it, so they cannot delay it.
+            # Written after the pad instead, the answer would wait for the writes, and the branches
+            # write different numbers of rows. The COUNT still runs before this, so counting is
+            # unchanged.
+            after_pad: list[Callable[[], Awaitable[None]]] = []
             outcome = await self._dispatch_login(
                 username,
                 password,
@@ -2131,7 +2567,15 @@ class AuthService:
                 supersedes=supersedes,
                 totp_code=totp_code,
                 arrived=arrived,
+                after_pad=after_pad,
             )
+            if after_pad:
+                try:
+                    await _sleep_until_write_point(started + queued + _FAILURE_BUDGET_SECONDS / 2)
+                finally:
+                    # A caller who drops the request here does not drop the audit trail
+                    # (count-and-log), and the account's queue is held until the rows are in.
+                    await _write_through_cancellation(after_pad)
             return await self._equalize_failure(outcome, started, seam="login", queued=queued)
 
     async def _dispatch_login(
@@ -2144,6 +2588,7 @@ class AuthService:
         supersedes: str | None = None,
         totp_code: str | None = None,
         arrived: float | None = None,
+        after_pad: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -2173,6 +2618,7 @@ class AuthService:
             supersedes=supersedes,
             totp_code=totp_code,
             arrived=arrived,
+            after_pad=after_pad,
         )
 
     def _account_credential_lock(self, username: str) -> AbstractAsyncContextManager[None]:
@@ -2189,6 +2635,7 @@ class AuthService:
         supersedes: str | None = None,
         totp_code: str | None = None,
         arrived: float | None = None,
+        after_pad: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> LoginOutcome:
         """The local password sign-in, and inside it the COMBINED sign-in (ADR 0197, BACKLOG #1131).
         It runs inside :meth:`login`'s per-account queue, which is what keeps the check below and
@@ -2216,25 +2663,55 @@ class AuthService:
 
         Kept inside this method on purpose rather than in a ``_login*`` sibling:
         ``tests/test_docs_security_pathways.py`` treats every ``_login*`` coroutine as a new 6.1.3
-        pathway, and this is the local pathway with a second factor, not a new one."""
+        pathway, and this is the local pathway with a second factor, not a new one.
+
+        **A refusal's audit rows go to ``after_pad``** when the caller passes one, and :meth:`login`
+        writes them at a fixed point inside its failure pad, so their ``ts`` does not show which
+        branch refused.
+        Everything else, the failure count included, runs here as before."""
         code = totp_code.strip() if totp_code else ""
+
+        async def later(write: Callable[[], Awaitable[None]]) -> None:
+            if after_pad is None:
+                await write()
+            else:
+                after_pad.append(write)
+
         user = await self._store.get_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
-            await self._audit(
-                "auth.login_failed",
-                actor=username,
-                detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
-                client=client,
-            )
+
+            async def unknown_row() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
+                    client=client,
+                )
+
+            await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
         combined = bool(code) and user.totp_enabled
         if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
-            await self._audit("auth.login_locked", actor=username, client=client)
+
+            # Owner ruling 2026-09-28 (BACKLOG #1131): first the row every reader sees, byte-identical
+            # to a wrong credential's, then the lock row only ``users:manage`` reads. Without the
+            # first, a live second-step lock -- which only a right candidate can set -- would show a
+            # reader without ``users:manage`` a missing row where a wrong candidate leaves one.
+            async def locked_rows() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                    client=client,
+                )
+                await self._audit(LOGIN_LOCKED_ACTION, actor=username, client=client)
+
+            await later(locked_rows)
             return LoginOutcome(ok=False, error="account locked")
         refused: tuple[LockoutCounter, str, str | None] | None = None
         if combined:
@@ -2246,24 +2723,29 @@ class AuthService:
         elif user.password_hash is None or not await self._argon2(
             verify_password, user.password_hash, password
         ):
-            refused = ("sign_in", "bad_password", None)
+            refused = ("sign_in", _LOCAL_REFUSAL_REASON, None)
         if refused is not None:
             counter, reason, factor = refused
             failure = await self._register_failure(user, now, counter=counter)
-            failed_detail: dict[str, Any] = {"provider": "local", "reason": reason}
-            if combined:
-                failed_detail["combined"] = True
-            await self._audit(
-                "auth.login_failed", actor=username, detail=_json(failed_detail), client=client
-            )
-            await self._record_lock(
-                user,
-                counter,
-                failure,
-                client=client,
-                audit_detail={"provider": "local"},
-                factor=factor,
-            )
+
+            async def refused_rows() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(reason, combined=combined),
+                    client=client,
+                )
+                # The lock this failure set, if any: its row, and its notice.
+                await self._record_lock(
+                    user,
+                    counter,
+                    failure,
+                    client=client,
+                    audit_detail={"provider": "local"},
+                    factor=factor,
+                )
+
+            await later(refused_rows)
             return LoginOutcome(ok=False, error="invalid credentials")
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
         # password verified, but a `must_change_password` temp that is older than
@@ -2279,12 +2761,16 @@ class AuthService:
         expiry_hours = self._settings.initial_password_expiry_hours
         deadline = self.initial_credential_deadline(user.password_changed_at)
         if user.must_change_password and deadline is not None and now > deadline:
-            await self._audit(
-                "auth.temp_password_expired",
-                actor=username,
-                detail=_json({"provider": "local", "expiry_hours": expiry_hours}),
-                client=client,
-            )
+
+            async def expired_row() -> None:
+                await self._audit(
+                    "auth.temp_password_expired",
+                    actor=username,
+                    detail=_json({"provider": "local", "expiry_hours": expiry_hours}),
+                    client=client,
+                )
+
+            await later(expired_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         # ``user.password_hash`` is not None past this point: the combined path's verify refuses a
         # row with no hash, and the password path's ``or`` does.
@@ -3458,8 +3944,9 @@ class AuthService:
             # account signs nobody in through Windows SSO. The LDAP layer warns once per shape, and
             # the remedy is to make the attribute readable. The caller sees the generic failure; the
             # precise reason is on the ``auth.login_failed`` row. The federated leg re-resolves by
-            # the bound row's id, so it reaches this only if that entry's id is unreadable, and is
-            # then audited in its own shape.
+            # the bound row's id, and the shipped LDAP client answers an entry that does not read
+            # that id back as no match (``not_in_directory``, BACKLOG #2027). So the federated arm
+            # below is reached only through a directory implementation that does not check it.
             if federated:
                 await self._directory_reject_audit(
                     principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING
@@ -4014,6 +4501,7 @@ class AuthService:
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
             audit=refusal,
+            password_generated=False,
         )
         if not adopt:
             if typed_notify_email is None:
@@ -5650,17 +6138,19 @@ class AuthService:
                 # else whose password would then step this session up. Refused before the directory
                 # is asked, so no password leaves the engine and nothing is charged -- the caller
                 # did not guess wrong.
-                return _Reproof(ok=False, user=user, reason=DIRECTORY_OBJECT_ID_MISSING)
-            rebind = await self._reauth_ad(
-                user.username, password, object_id=user.directory_object_id
-            )
-            verdict, reason = rebind.verdict, rebind.reason
+                verdict, reason = None, DIRECTORY_OBJECT_ID_MISSING
+            else:
+                rebind = await self._reauth_ad(
+                    user.username, password, object_id=user.directory_object_id
+                )
+                verdict, reason = rebind.verdict, rebind.reason
         else:
             verdict = user.password_hash is not None and await self._argon2(
                 verify_password, user.password_hash, password
             )
         if verdict is None:
-            return _Reproof(ok=False, user=user, reason=reason)
+            # Only the directory leg answers None: it could not judge the password at all.
+            return _Reproof(ok=False, user=user, reason=reason, directory_unconfirmed=True)
         charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
@@ -5785,7 +6275,10 @@ class AuthService:
             token=token,
         )
         ok = proof.ok
-        elevation = Elevation(session_lost=proof.session_revoked or proof.session_gone)
+        elevation = Elevation(
+            session_lost=proof.session_revoked or proof.session_gone,
+            directory_unconfirmed=proof.directory_unconfirmed,
+        )
         grant_refused = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
@@ -5978,34 +6471,68 @@ class AuthService:
         on the same clock as the session window. On the global-bound overflow the OLDEST grant is
         evicted (fail-safe: a dropped grant just re-prompts, never a bypass)."""
         now = time.monotonic()
-        self._prune_action_step_up_grants(now)
-        key = (token_hash, action)
-        if key not in self._action_step_up_grants and (
-            len(self._action_step_up_grants) >= _ACTION_STEP_UP_GRANT_MAX
-        ):
-            oldest = min(self._action_step_up_grants, key=self._action_step_up_grants.__getitem__)
-            del self._action_step_up_grants[oldest]
-        self._action_step_up_grants[key] = now + self._settings.step_up_max_age_seconds
+        _bounded_grant_put(
+            self._action_step_up_grants,
+            (token_hash, action),
+            now + self._settings.step_up_max_age_seconds,
+            now,
+        )
 
     def _prune_action_step_up_grants(self, now: float) -> None:
         """Drop expired per-action grants (monotonic clock — a wall-clock step can't widen the window)."""
-        expired = [k for k, deadline in self._action_step_up_grants.items() if deadline <= now]
-        for key in expired:
-            del self._action_step_up_grants[key]
+        _prune_grants(self._action_step_up_grants, now)
 
     async def has_action_step_up(self, token: str | None, action: str) -> bool:
         """Whether the caller holds a fresh step-up grant BOUND to ``action`` — and **consume** it
         (single-use). ADR 0077. A grant is minted only by a step-up: ``reauth(purpose=action)`` (POST
         /me/reauth or /ui/reauth), or :meth:`complete_oidc_step_up` for an OIDC session's IdP leg. Never
         by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
-        new authenticator. Returns False for a missing token / no grant / an expired grant."""
+        new authenticator. Returns False for a missing token / no grant / an expired grant.
+
+        SIDE EFFECT, for :meth:`refund_action_step_up`: every call overwrites the request's
+        :data:`_SPENT_REFUNDABLE_GRANT` record, with this spend when ``action`` is refundable and
+        with nothing otherwise. So a second call in the same request, for any action, ends the
+        first spend's refund; a path that wants the refund must reach it with no call between."""
+        _SPENT_REFUNDABLE_GRANT.set(None)
         if not token:
             return False
         now = time.monotonic()
         self._prune_action_step_up_grants(now)
         # pop = single-use: the grant is gone whether or not it was still live (a stale pop is harmless).
-        deadline = self._action_step_up_grants.pop((hash_token(token), action), None)
-        return deadline is not None and deadline > now
+        key = (hash_token(token), action)
+        deadline = self._action_step_up_grants.pop(key, None)
+        if deadline is None or deadline <= now:
+            return False
+        if action in _REFUNDABLE_ACTIONS:
+            _SPENT_REFUNDABLE_GRANT.set((id(self), key, deadline))
+        return True
+
+    def refund_action_step_up(self, action: str) -> bool:
+        """Give back the step-up grant THIS REQUEST spent on ``action``, when the route it opened
+        then failed BEFORE any side effect (ADR 0197 Amendment A, Manager decision 2026-09-29).
+
+        The action-bound gate runs as a route dependency, so it spends the single-use grant before
+        the handler can learn that no credential can be issued. Without a refund, a request that
+        changed nothing would still cost the administrator their proof. What the refund buys is a
+        retry IN THE SAME PROCESS -- the case of a borderline list that fails at random. Fixing
+        ``[auth].password_extra_context_words`` needs a restart, which forgets every grant anyway.
+
+        It restores only the grant this request's gate spent (:data:`_SPENT_REFUNDABLE_GRANT`), and
+        only with its ORIGINAL deadline, so it can never mint a grant, never extend one, and never
+        restore one that has expired. A second refund finds nothing. Only
+        :data:`_REFUNDABLE_ACTIONS` are ever recorded, so no other action's grant can be restored.
+        A live grant the session minted since (a fresh re-authentication) is left as it is rather than
+        overwritten. Returns whether a grant was restored."""
+        spent = _SPENT_REFUNDABLE_GRANT.get()
+        if spent is None or spent[0] != id(self) or spent[1][1] != action:
+            return False  # nothing spent here, by another instance, or for another action: kept
+        _SPENT_REFUNDABLE_GRANT.set(None)
+        _, key, deadline = spent
+        now = time.monotonic()
+        if deadline <= now or key in self._action_step_up_grants:
+            return False
+        _bounded_grant_put(self._action_step_up_grants, key, deadline, now)
+        return True
 
     async def _reauth_ad(self, username: str, password: str, *, object_id: str) -> _DirectoryRebind:
         """Re-verify an AD credential via a live directory re-bind (no session adopted).
@@ -6029,20 +6556,24 @@ class AuthService:
         renamed account still steps up. **This costs no extra directory read:** each call is the
         same one round trip it was, keyed on the id instead of the name.
 
-        Each answer is still checked against ``object_id``, because the entry's own id is read
-        separately from the search that found it. An answer carrying no readable id is ``None`` with
-        reason ``directory_object_id_missing``, and one about another object is ``None`` with
-        ``directory_identity_conflict``. Neither is counted. A refused bind is counted once the
-        id-keyed lookup finds the entry, because that bind was judged against this account. ``object_id`` is required, so no caller
-        can re-bind a row that has none; :meth:`_reproof_serialized` refuses that row first."""
+        The entry's own id is read separately from the search that found it. ``LdapAuthenticator``
+        answers an id-keyed entry that does not read back the id it was found by as no match, and
+        never binds the typed password as it (BACKLOG #2027). Such an entry is therefore
+        ``not_in_directory`` here and is not counted.
+        Each answer is still checked against ``object_id``, for any other directory implementation:
+        an answer carrying no readable id is ``None`` with reason ``directory_object_id_missing``,
+        and one about another object is ``None`` with ``directory_identity_conflict``. Neither is
+        counted. A refused bind is counted once the id-keyed lookup finds the entry, because that
+        bind was judged against this account. ``object_id`` is required, so no caller can re-bind a
+        row that has none; :meth:`_reproof_serialized` refuses that row first."""
         if self._ldap is None:
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "not_configured")
         try:
             principal = await asyncio.to_thread(
                 self._ldap.authenticate, username, password, object_id=object_id
             )
         except LdapError:
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "directory_unavailable")
         if principal is not None:
             mismatch = _directory_answer_mismatch(principal, object_id)
             return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
@@ -6054,11 +6585,15 @@ class AuthService:
             # ``authenticate`` also answers None where no real bind was judged (an empty password, an
             # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
             # that then fails cannot show the password was checked. Not counted, like an outage.
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "directory_unavailable")
         # Found by the row's own id, so the bind that failed was judged against this account: it
         # counts, whatever id the entry reads back. Not counting an unreadable one would let a
-        # held session send the DC unlimited guesses past the per-session cap.
-        return _DirectoryRebind(None) if known is None else _DirectoryRebind(False)
+        # held session send the DC unlimited guesses past the per-session cap. (LdapAuthenticator
+        # never binds such an entry, and answers None for it here, so it reaches this only through
+        # another directory implementation.)
+        return (
+            _DirectoryRebind(None, "not_in_directory") if known is None else _DirectoryRebind(False)
+        )
 
     async def has_recent_step_up(self, token: str | None) -> bool:
         """Whether the caller's session re-verified its credential within
@@ -6284,15 +6819,33 @@ class AuthService:
 
         Returns policy violations (empty list = changed). No-op-safe for AD identities at the API
         layer, which rejects password changes for AD users before calling this.
+
+        **Raises :class:`FactorEnrolmentRequired` while ``[security].require_mfa`` covers the account
+        and it holds no factor with a way past the sign-in lock** (ADR 0197 Amendment A, N-B2 part 4).
+        The rotation ends every session, the holder's own included, so without this a holder who does
+        everything right passes through "a password they chose, no factor, no session", and anyone
+        who knows the username can lock them out at that moment. The refusal is HERE and not only in
+        the route gate, because the web console's password form calls the JSON handler in-process,
+        past its ``Depends`` gate. And the write carries the condition itself (``require_totp``), so
+        an ``admin_reset_mfa`` that clears TOTP between this read and the write makes the write match
+        no row, and the change is refused rather than landing on an account with no way past.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
-        await self._store.set_password(
+        user = await self._store.get_user(identity.user_id)
+        covered = user is not None and self._covered_by_requirement(user, identity.roles)
+        if covered and user is not None and not self._has_way_past(user):
+            raise FactorEnrolmentRequired()
+        written = await self._store.set_password(
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
+            password_generated=False,
+            require_totp=covered,
         )
+        if not written and covered:
+            raise FactorEnrolmentRequired()
         await self._store.revoke_user_sessions(identity.user_id)
         await self._audit("auth.password_changed", actor=identity.username, client=client)
         user = await self._store.get_user(identity.user_id)
@@ -6305,6 +6858,91 @@ class AuthService:
         return []
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
+
+    def _covered_by_requirement(self, user: UserRecord, roles: frozenset[Role]) -> bool:
+        """Whether ``user`` is a LOCAL account that ``[security].require_mfa`` covers, enrolled or not
+        (ADR 0197 Amendment A). The gates of N-B2 part 4 key on this and on
+        :meth:`_has_way_past`, never on ``must_change_password``: a site that ran with the requirement
+        off and then turned it on holds accounts with a chosen password, no factor and no must-change
+        flag, and the gates must reach those too."""
+        return _requirement_covers(self._settings, user, roles)
+
+    @staticmethod
+    def _has_way_past(user: UserRecord) -> bool:
+        """Whether ``user`` holds a factor with a way past the SIGN-IN lock (ADR 0197 Amendment A).
+
+        WAVE 1: TOTP ONLY, because only TOTP has a combined sign-in (option E). A passkey counts as a
+        second factor everywhere else, but the engine cannot use it to get past the lock, and a
+        passkey registered without a discoverable-credential request may never get a way past at all
+        (the amendment's fact 11). Wave 2 adds a passkey recorded as discoverable."""
+        return user.totp_enabled
+
+    async def must_enrol_before_rotating(self, identity: Identity) -> bool:
+        """Whether a password change by ``identity`` would be refused with
+        :class:`FactorEnrolmentRequired` right now. The route and the console ask it FIRST, so they
+        send the holder to enrolment before asking for a password the service would then refuse.
+        The service still refuses on its own; this is a courtesy, not the control."""
+        user = await self._store.get_user(identity.user_id)
+        return (
+            user is not None
+            and self._covered_by_requirement(user, identity.roles)
+            and not self._has_way_past(user)
+        )
+
+    async def lockable_account_census(self) -> LockableAccountCensus:
+        """:func:`lockable_account_census` over this service's store and settings."""
+        return await lockable_account_census(self._store, self._settings)
+
+    def probe_credential_generation(self) -> bool:
+        """Run the temporary-credential generator once, at startup, under the configured policy and a
+        synthetic username (ADR 0197 Amendment A, Manager decision 2026-09-29, prompted by PR 1761).
+
+        Account creation, the password reset and the factor reset all issue a generated credential.
+        Since BACKLOG #1132 the generator screens the site's own context words, and a pathological
+        ``[auth].password_extra_context_words`` list can make it fail every time. Those paths refuse
+        harmlessly (they generate before any write, and the route refunds the spent step-up grant),
+        but an operator should learn of it at start, not at the first account creation. So this logs
+        an ERROR and returns ``False``; it never raises and never refuses the start. The credential
+        is discarded. A borderline list can still pass this one run and fail a later one."""
+        problem = credential_generation_problem(self._policy)
+        if problem is not None:
+            _log.error("startup probe: %s", problem)
+        return problem is None
+
+    async def report_lockable_account_census(self) -> LockableAccountCensus:
+        """Run :meth:`lockable_account_census` at startup: WARN and write one audit row when it
+        names anyone, and do nothing more (AC-A9). Usernames only, never a secret."""
+        census = await self.lockable_account_census()
+        if census.clean:
+            return census
+        if census.no_way_past:
+            _log.warning(
+                "ADR 0197: %d local account(s) the MFA requirement covers hold a chosen password and "
+                "no authenticator app, so anyone who knows the username can lock them out with no "
+                "way past: %s. Ask each holder to enrol an authenticator app, or reset the account's "
+                "factors (POST /users/{id}/reset-mfa) to issue a generated credential.",
+                len(census.no_way_past),
+                ", ".join(census.no_way_past),
+            )
+        if census.undecryptable_totp:
+            _log.warning(
+                "ADR 0197: %d account(s) have an enabled TOTP secret this engine cannot decrypt, so "
+                "their combined sign-in cannot pass a lock: %s. Check the store key, or reset the "
+                "account's factors (POST /users/{id}/reset-mfa).",
+                len(census.undecryptable_totp),
+                ", ".join(census.undecryptable_totp),
+            )
+        await self._audit(
+            "auth.lockable_account_census",
+            actor="system",
+            detail=_json(
+                {
+                    "no_way_past": list(census.no_way_past),
+                    "undecryptable_totp": list(census.undecryptable_totp),
+                }
+            ),
+        )
+        return census
 
     async def _second_factor_enrolled(self, user: UserRecord) -> bool:
         """Any second factor enrolled — TOTP **or** ≥1 WebAuthn passkey (ADR 0068 decision 5). The
@@ -6329,11 +6967,7 @@ class AuthService:
         evidence, and the enrollment ceremonies now accept a directory account."""
         if second_factor_enrolled:
             return True
-        if not self._settings.require_mfa:
-            return False
-        return (
-            self._settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
-        )
+        return _scope_covers(self._settings, roles)
 
     async def mfa_satisfied(self, token: str | None) -> bool:
         """Whether the caller's session has met its second-factor requirement — True when the session
@@ -6474,8 +7108,15 @@ class AuthService:
             return elevation
         await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
+        # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
+        # an issued credential can enrol their own authenticator without rotating. The notice to a
+        # must-change account says so, and says what to do.
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
+            MFA_ENABLED,
+            username=user.username,
+            email=user.notify_email,
+            client=client,
+            detail={"issued_credential": True} if user.must_change_password else None,
         )
         return elevation
 
@@ -6637,7 +7278,8 @@ class AuthService:
         await self._audit(
             "auth.mfa_failed",
             actor=user.username,
-            detail=_json({"reason": "locked"}),
+            # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
+            detail=LOCKED_REFUSAL_DETAIL,
             client=client,
         )
         return True
@@ -6659,18 +7301,19 @@ class AuthService:
         nothing, so the next attempt asks again. An AD row on an engine with no directory
         configured is refused as ``not_configured``, because nothing can confirm it.
 
-        A row with a federated binding and no ``directory_object_id`` is refused unasked. ADR 0184
-        AC-5 forbids asking the directory about a bound row by its name, and it has no other key.
-        An id-less row with no binding is still asked by name, as the reconciler asks it; the Windows
-        SSO sign-in and the password step-up refuse such a row instead (BACKLOG #2027). A name is
-        the weaker key (BACKLOG #1532), but it is a stronger check than the no lookup this path made
-        before.
+        **A row with no ``directory_object_id`` is refused unasked, whether or not it holds a
+        federated binding** (ADR 0184 AC-5, BACKLOG #2027). Its only other key is its name, and a
+        directory may reissue a freed name to someone else, whose account would then vouch for this
+        row. The Windows SSO sign-in and the password step-up refuse the same row the same way.
+        This leg used to ask an id-less row with no binding by its name.
         """
         if self._ldap is None:
             return "not_configured"
-        if _holds_unkeyed_federated_binding(user):
+        if not user.directory_object_id:
             return DIRECTORY_OBJECT_ID_MISSING
         # The reconciler's own probe, so both ask the same question by the same key, off the loop.
+        # They differ on an id-less row only: this leg refuses it above, and the reconciler still
+        # probes an unbound one by name (BACKLOG #2027).
         probe = await self._probe_principal(user)
         if probe.outcome is reconcile.ProbeOutcome.PRESENT:
             return None
@@ -6685,7 +7328,8 @@ class AuthService:
         arrived: float | None = None,
     ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
-        match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
+        match). TOTP is checked first, and a TOTP success does no argon2 work; a refused TOTP
+        replay still pays the recovery-code walk (ADR 0170). Recovery codes are argon2id-hashed and
         single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
 
         ``client`` is the caller's address, carried onto the recovery-code audit row and notice
@@ -6693,6 +7337,7 @@ class AuthService:
         code = code.strip()
         if not code:
             return False
+        totp_refused = False
         secret = await self._store.get_totp_secret(user.id)
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
@@ -6712,7 +7357,15 @@ class AuthService:
                 # tolerated future (fast-clock) code to the CURRENT step (SEC-014), so consuming it
                 # can't advance the high-water mark past now and lock the user out of their own next
                 # legitimate code.
-                return await self._store.consume_totp_step(user.id, matched_step)
+                if await self._store.consume_totp_step(user.id, matched_step):
+                    return True
+                # ASVS 11.2.4 (BACKLOG #1167, ADR 0170 amendment). The step was already consumed:
+                # a replay, or a second use inside the same step. Returning here cost no argon2
+                # work, while a WRONG code falls through to the recovery-code walk below. Both answer
+                # False, so the wall clock was the only thing telling them apart. So fall through
+                # to the SAME walk (same store read, same hashes, same slot count) and refuse after
+                # it. A success stays fast: it already reveals its outcome.
+                totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
         real = list(await self._store.get_recovery_code_hashes(user.id))
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
@@ -6735,7 +7388,8 @@ class AuthService:
             ok = await self._argon2(verify_password, h, normalized)
             if ok and i < len(real) and matched < 0:
                 matched = i  # recorded, NOT returned -- returning here restores the leak
-        if matched < 0:
+        if matched < 0 or totp_refused:
+            # A refused TOTP code never spends a recovery code, even one it somehow matched.
             return False
         # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
         # concurrent verify of the same single-use code can't double-spend it (WP-14).
@@ -6785,6 +7439,14 @@ class AuthService:
         every passkey and is deliberately unguarded. Nothing here narrows it.
         """
         user = await self._store.get_user(identity.user_id)
+        # ADR 0197 Amendment A, AC-A3a: removing TOTP removes the account's way past the sign-in lock
+        # (wave 1: nothing else is one), so a covered account may not remove it, passkeys or not.
+        if (
+            user is not None
+            and user.totp_enabled
+            and self._covered_by_requirement(user, identity.roles)
+        ):
+            raise ValueError(TOTP_REMOVAL_REFUSED)
         if user is not None and user.totp_enabled:
             creds = await self._store.list_webauthn_credentials(identity.user_id)
             # Dropping to zero factors while MFA is required is not a lockout — it lands the user in
@@ -6811,7 +7473,7 @@ class AuthService:
             client=client,
         )
 
-    async def admin_reset_mfa(self, user_id: str, *, actor: str) -> None:
+    async def admin_reset_mfa(self, user_id: str, *, actor: str) -> IssuedCredential | None:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
         recovery path; ADR 0068 extends this to credentials) — and revoke their sessions so they
         re-enroll. The always-available recovery for a locked-out passkey user. Raises
@@ -6821,12 +7483,50 @@ class AuthService:
         true while no directory account could hold an engine factor. Once one can, keeping it would
         make enrollment a one-way door: a directory user who lost the authenticator would have no
         recovery at all, because every route that could help stands behind the factor they lost. This
-        is the widest of the refusals the item names, and it is included for that reason."""
+        is the widest of the refusals the item names, and it is included for that reason.
+
+        **ON A LOCAL ACCOUNT IT ALSO ISSUES A GENERATED CREDENTIAL, AND RETURNS IT ONCE** (ADR 0197
+        Amendment A, N-B2 part 5, AC-A4). Without it the lost-authenticator recovery would leave a
+        chosen password, no factor and no session, which anyone who knows the username can lock
+        before the holder signs in to enrol again. **The credential is written FIRST**, before TOTP
+        and the passkeys are cleared, so a crash between the writes leaves a generated credential
+        with factors, never a chosen password without them. A directory account has no engine
+        password and gets ``None``."""
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
+        issued: IssuedCredential | None = None
+        temp_hash: str | None = None
+        if user.auth_provider == AuthProvider.LOCAL.value:
+            temp = generate_policy_password(self._policy, username=user.username)
+            temp_hash = await self._argon2(hash_password, temp)
+            await self._store.set_password(
+                user_id,
+                password_hash=temp_hash,
+                must_change_password=True,
+                password_generated=True,
+            )
         await self._store.disable_totp(user_id)
         removed = await self._store.delete_all_webauthn_credentials(user_id)
+        if temp_hash is not None:
+            # WRITTEN AGAIN, now that the factors are gone. A holder's rotation whose conditional
+            # write ran between the first write and ``disable_totp`` matched ``totp_enabled = 1`` and
+            # replaced the generated credential with a chosen one; the factor clear then left that
+            # chosen password with no factor -- the lockable state. This second, unconditional write
+            # restores the generated credential, so the reset always ends where it says it does.
+            await self._store.set_password(
+                user_id,
+                password_hash=temp_hash,
+                must_change_password=True,
+                password_generated=True,
+            )
+            stamped = await self._store.get_user(user_id)
+            issued = IssuedCredential(
+                password=temp,
+                expires_at=self.initial_credential_deadline(
+                    None if stamped is None else stamped.password_changed_at
+                ),
+            )
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "auth.mfa_reset",
@@ -6836,12 +7536,27 @@ class AuthService:
                     "user_id": user_id,
                     "username": user.username,
                     "webauthn_credentials_removed": removed,
+                    "credential_issued": issued is not None,
                 }
             ),
         )
         await self._notify_security(
             MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
+        if issued is not None:
+            # The password changed too, so the holder is told as for an administrator's password
+            # reset, with the new credential's deadline (BACKLOG #1141).
+            await self._notify_security(
+                PASSWORD_RESET,
+                username=user.username,
+                email=user.notify_email,
+                detail=(
+                    None
+                    if issued.expires_at is None or user.disabled
+                    else {"expires_at": issued.expires_at}
+                ),
+            )
+        return issued
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
         """The caller's current MFA posture for ``GET /me/mfa``."""
@@ -6903,6 +7618,10 @@ class AuthService:
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
+        # ADR 0197 Amendment A, AC-A3: a covered account's FIRST factor must be one with a way past
+        # the sign-in lock, and in wave 1 a passkey is not, so registration waits for TOTP.
+        if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
+            raise FactorEnrolmentRequired()
         existing = await self._store.list_webauthn_credentials(identity.user_id)
         challenge = webauthn.new_challenge()
         options = webauthn.registration_options(
@@ -7077,7 +7796,8 @@ class AuthService:
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
-                detail=_json({"reason": "locked"}),
+                # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
+                detail=LOCKED_REFUSAL_DETAIL,
                 client=client,
             )
             return Elevation()
@@ -7198,9 +7918,21 @@ class AuthService:
         if user is None:
             return False
         creds = await self._store.list_webauthn_credentials(identity.user_id)
-        target = next((c for c in creds if c.credential_id_hash == credential_id_hash), None)
+        # ASVS 11.2.4 (BACKLOG #1167). Every credential is compared, and each compare is constant-time:
+        # a `next(... == ...)` search stopped at the matching slot and its `==` stopped at the first
+        # differing character. The store delete below still matches the row by SQL equality.
+        target: WebAuthnCredential | None = None
+        for cred in creds:
+            same = constant_time_equal(cred.credential_id_hash, credential_id_hash)
+            if same and target is None:
+                target = cred  # recorded, NOT returned -- the walk runs to the end
         if target is None:
             return False
+        # ADR 0197 Amendment A, AC-A3a asks whether a removal would take the account's last way
+        # past the sign-in lock. In wave 1 a passkey is never one (``_has_way_past``), so removing
+        # one cannot, and this path adds no refusal: a holder must stay able to revoke a lost or
+        # stolen passkey. From wave 2 a discoverable passkey is a way past, and the check belongs
+        # here.
         last_second_factor = len(creds) == 1 and not user.totp_enabled
         if last_second_factor and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=False
@@ -7280,14 +8012,21 @@ class AuthService:
         self,
         *,
         username: str,
-        password: str,
         display_name: str | None,
         email: str | None,
         roles: Sequence[str],
         actor: str,
         client: str | None = None,
-    ) -> str:
-        """Create a local account with an admin-set, must-change initial password.
+    ) -> CreatedLocalAccount:
+        """Create a local account with an ENGINE-GENERATED, must-change initial credential, returned
+        once (ADR 0197 Amendment A, N-B2 part 1, AC-A2).
+
+        The administrator no longer chooses it. The credential is the 192-bit
+        :func:`generate_policy_password` the password reset already issues, written with
+        ``password_generated`` set, so wrong passwords arm no sign-in lock until the holder replaces
+        it. That is what stops anyone who knows the username locking the account before its first
+        sign-in. The returned :class:`CreatedLocalAccount` carries the deadline the login gate will
+        refuse on, as :meth:`admin_reset_password` does.
 
         ``client`` is the creating administrator's address. It lands on the ``user.created`` row
         (ADR 0150, BACKLOG #315), so the step that can mint a second dual-control approver is
@@ -7309,8 +8048,9 @@ class AuthService:
                 )
             email = _require_single_mailbox(email)
         user_id = uuid4().hex
+        temp = generate_policy_password(self._policy, username=username)
         # Hashed before the insert so the handler below covers the store call alone.
-        password_hash = await self._argon2(hash_password, password)
+        password_hash = await self._argon2(hash_password, temp)
         try:
             await self._store.create_user(
                 user_id=user_id,
@@ -7322,6 +8062,7 @@ class AuthService:
                 # Admin-set the credential is a one-time temp: force rotation on first login so the
                 # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
                 must_change_password=True,
+                password_generated=True,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -7351,7 +8092,16 @@ class AuthService:
                 # notice sends the administrator's address to the account's mailbox.
                 detail={"roles": list(roles)},
             )
-        return user_id
+        stamped = await self._store.get_user(user_id)
+        return CreatedLocalAccount(
+            user_id=user_id,
+            credential=IssuedCredential(
+                password=temp,
+                expires_at=self.initial_credential_deadline(
+                    None if stamped is None else stamped.password_changed_at
+                ),
+            ),
+        )
 
     async def update_user(
         self,
@@ -7605,11 +8355,12 @@ class AuthService:
             raise ValueError("no such user")
         if user.auth_provider != AuthProvider.LOCAL.value:
             raise ValueError("only local users have a password to reset")
-        temp = self._generate_policy_password(username=user.username)
+        temp = generate_policy_password(self._policy, username=user.username)
         await self._store.set_password(
             user_id,
             password_hash=await self._argon2(hash_password, temp),
             must_change_password=True,
+            password_generated=True,
         )
         await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
         await self._audit(
@@ -8383,14 +9134,25 @@ class AuthService:
         newest of those through ``list_audit``, as the first-seen login-address check reads its
         baseline. No column needed.
 
-        The row is written only when a notifier is wired, since with none nothing is mailed and there
-        is nothing to throttle. It records whether a mail could go out (``mailed``): an account with
+        **With no notifier wired the row is still written, as ``mailed: false`` with
+        ``reason: no_notifier``, and nothing is throttled** (BACKLOG #1131, owner ruling 2026-09-28).
+        It is the one record that a lock notice went undelivered: the general-log line that used to
+        say so is gone, because a ``logs:view`` reader could read a lock off it. The row is read only
+        with ``users:manage``. Not written when ``[auth].notify_security_events`` is off, a documented
+        choice rather than a failure. With a notifier wired, the row records whether a mail could go
+        out (``mailed``): an account with
         no notification address is throttled too, which spares the log the notifier's drop warning
         every 15 minutes, but its row says ``mailed: false``, so once an address is set the next
         lock of that kind IS mailed rather than held back by a notice nobody received. A failed read
         fails OPEN, sending the mail, and is logged: a duplicate notice is the cheap failure here, a
         missing one the costly."""
         if self._security_notifier is None:
+            if self._settings.notify_security_events:
+                await self._audit(
+                    _LOCK_NOTICE_ACTION,
+                    actor=user.username,
+                    detail=_json({"lock": lock, "mailed": False, "reason": "no_notifier"}),
+                )
             return True
         mailable = bool(user.notify_email)
         now = time.time()
@@ -8400,8 +9162,11 @@ class AuthService:
                 actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
             )
         except Exception:
+            # Names neither the account nor the notice kind (BACKLOG #1131): this line runs only
+            # when a lock lands, and ``GET /logs/tail`` serves the log to ``logs:view``. It still
+            # tells an operator the store read failed and that a notice went unthrottled.
             _log.exception(
-                "lock-notice throttle read failed for %s; sending the notice", user.username
+                "a security-notice throttle read failed; the notice was sent unthrottled"
             )
             rows = []
         for row in rows:
@@ -8465,12 +9230,21 @@ class AuthService:
             # there would report the setting working as a fault.
             if not self._settings.notify_security_events:
                 return False
+            # Not for a lock notice (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per lock would
+            # show a logs:view reader when one landed. ``_lock_notice_due`` records it instead, on the
+            # users:manage-only ``auth.lock_notice`` row, and the serve gate reports the missing
+            # relay at startup.
+            if event_type in LOG_SILENT_EVENT_TYPES:
+                return False
+            # The kind comes from ``notice_kind_log_label`` and the username through
+            # ``scrub_log_argument``, on both warnings here, and each one's docstring says why. The
+            # username can carry a line break, since an administrator chooses it freely at create.
             _log.warning(
                 "security notice %s for %s dropped: no security-event notifier is configured, so "
                 "the account was not told out of band (the /me/security-events feed still records "
                 "it)",
-                event_type,
-                username,
+                notice_kind_log_label(event_type),
+                scrub_log_argument(username),
             )
             return False
         try:
@@ -8483,12 +9257,19 @@ class AuthService:
                     detail=detail or {},
                 )
             )
-        except Exception:  # noqa: BLE001 - best-effort; never propagate into auth
-            _log.warning(
-                "security-event notification failed (%s for %s)",
-                event_type,
-                username,
-                exc_info=True,
-            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; never propagate into auth
+            # Silent for a lock notice, for the reason on the no-notifier arm above.
+            #
+            # The exception's CLASS only, never its text or traceback. The shipped notifier only
+            # enqueues here, but the seam takes any ``SecurityNotifier``, and one that raised with
+            # the event in its message would put the address, or an EMAIL_CHANGED ``detail``, in
+            # the general log -- the same thing the no-notifier arm refuses to log.
+            if event_type not in LOG_SILENT_EVENT_TYPES:
+                _log.warning(
+                    "security-event notification failed (%s for %s): %s",
+                    notice_kind_log_label(event_type),
+                    scrub_log_argument(username),
+                    type(exc).__name__,
+                )
             return False
         return True

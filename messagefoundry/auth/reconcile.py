@@ -65,9 +65,12 @@ class ProbeOutcome(Enum):
     #: a wave of them is held (ADR 0195, :func:`hold_engaged`).
     UNDETERMINED = "undetermined"
     #: The lookup matched nothing, or an id-keyed probe held a stored ``objectGUID`` that could not
-    #: be parsed, so no search ran. **Ambiguous**: deleted, moved out of the search base, or a search
-    #: base that was never right. Strikes, never revokes on its own. Since ADR 0195 a disabled or an
-    #: unreadable entry is NOT this outcome.
+    #: be parsed, so no search ran, or an id-keyed search's entry did not read back that id (BACKLOG
+    #: #2027). **Ambiguous**: deleted, moved out of the search base, or a search
+    #: base that was never right. Strikes, never revokes on its own. Since ADR 0195 a disabled entry,
+    #: or one whose ``userAccountControl`` is unreadable, is NOT this outcome, with one exception
+    #: (BACKLOG #2027): an entry an id-keyed search found that does not read back that id is this
+    #: outcome whatever its account state, because it is not this account's entry.
     ABSENT = "absent"
     #: The directory could not be consulted (``LdapError`` — connectivity/bind/config). Contributes
     #: nothing: no strike, no revocation, no strike reset.

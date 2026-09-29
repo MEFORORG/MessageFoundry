@@ -473,6 +473,13 @@ timing parity across its outcomes has to be measured, not assumed.
   Test: to build with the chosen shape, including an arm that runs `admin-unlock` and then a new
   lock at a high cycle count and asserts a mail, and an arm that locks every 15 minutes for 25
   hours and asserts exactly two mails.
+
+  *Note, 2026-09-28 (BACKLOG #1131):* the lock rows are read only with `users:manage`, by owner
+  ruling 2026-09-28. That covers `auth.account_locked`, `auth.lock_notice`, `auth.login_locked`,
+  `auth.admin_unlocked`, and the `reason: locked` refusals of the factor and directory legs. AC-10
+  is unchanged: the engine still writes every one, and an Administrator reads them all. A reader
+  without `users:manage`, the built-in Auditor included, sees one uniform `auth.login_failed` row
+  per refused sign-in in every lock state instead. The list is `messagefoundry/auth/audit_visibility.py`.
 - **AC-10a** — WHILE a counter's lock is live, WHEN an attempt reaches the store, THE SYSTEM SHALL
   leave that lock's expiry and cycle count unchanged. Test: to build with the chosen shape, in
   `tests/_lockout_store_contract.py`.
@@ -1169,6 +1176,11 @@ assessor reading control 1 will reach it. The lock-state counts separate the out
 administrator too, who can already reset that password; whether that is acceptable belongs to that
 fix.
 
+*Update, 2026-09-28:* that branch builds the per-request reason slug. The lock-event half is closed
+by owner ruling 2026-09-28, which makes the lock rows `users:manage`-only, on its own branch
+stacked on that one (see the note under AC-10). The lock-state counts stay on the `users:manage`
+surface, where the administrator reading them can already reset the password.
+
 ### Recommendation
 
 **Adopt N-B2 and N-A in wave 1, and N-G in wave 2. Confidence: medium, about 70 percent, that
@@ -1331,6 +1343,21 @@ ruling.
   factor removal that would leave it no factor with a way past.
 - **AC-A4** -- WHEN `admin_reset_mfa` runs on a local account, THE SYSTEM SHALL issue a generated
   credential in the same call.
+> **Note (2026-09-29), a Manager decision prompted by PR 1761 (BACKLOG #1132), not an owner
+> ruling. It applies to AC-A2 and AC-A4.** This amendment treated the credential generator as
+> unable to fail. Since PR 1761 it screens the site's own context words and raises
+> `TemporaryPasswordUnavailable` after `_RESET_GENERATION_ATTEMPTS` misses, so account creation, the
+> password reset and the factor reset can answer 503. That happens only on a pathological
+> `[auth].password_extra_context_words` list. The screen stays, because #1132's intent is that no
+> issued credential fails the policy. The failure is made harmless and early instead. Every path
+> that issues a generated credential generates it before any row is written, any factor cleared or
+> any session revoked, and a route whose action-bound gate already spent the single-use step-up grant
+> gives it back (`AuthService.refund_action_step_up`, which restores only a grant it spent, with its
+> original deadline). And the engine probes the generator once at start, logging an ERROR on
+> failure, and `messagefoundry verify` reports the same as `auth.credential_generation`. Neither
+> refuses to start. `provision-admin` issues no generated credential, since the operator types it,
+> so it needed no change for this.
+
 - **AC-A5** -- WHEN `provision-admin` completes while `require_mfa` is on, THE SYSTEM SHALL have
   enabled TOTP on the new administrator before its role is written; and WHEN it repairs a roleless
   row, THE SYSTEM SHALL first clear that row's factors and revoke its sessions.

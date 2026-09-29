@@ -765,6 +765,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     provision_admin.add_argument("--db", default=None, help="store path (overrides [store].path)")
     provision_admin.add_argument("--json", action="store_true", help="emit JSON")
+    provision_admin.add_argument(
+        "--no-totp",
+        action="store_true",
+        help="do not enrol an authenticator app (refused while [security].require_mfa is on)",
+    )
 
     # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An Administrator provisioned without --email is
     # refused at the next start by the ADR 0167 deliverability gate, and provision-admin then refuses
@@ -4998,8 +5003,14 @@ def _cert_import(args: argparse.Namespace) -> int:
 
     pw_env = os.environ.get("MEFOR_PFX_PASSWORD")
     password = pw_env.encode() if pw_env else None
+    from messagefoundry.keywrap import KeyWrapRefused
+
     try:
         key, cert, cas = pki.load_pkcs12(pfx_bytes, password)
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: a weak or unreadable wrap. Checked before any decryption, and the
+        # text names the setting and the re-export command, never the passphrase or the bundle.
+        return _cert_fail(str(exc), as_json=args.json)
     except Exception:
         # NEVER surface the underlying exception text — a bad-password/decrypt error must not leak the
         # passphrase into stderr/logs/CI. The failure cause is intentionally generic.
@@ -5472,6 +5483,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     """
     import getpass
 
+    from messagefoundry.auth.audit_visibility import ADMIN_UNLOCKED_ACTION
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
@@ -5504,8 +5516,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 "cycles_reset": bool(args.reset_cycles),
             }
             await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
+            # Read only with users:manage (owner ruling 2026-09-28, BACKLOG #1131): its detail names
+            # both locks, which would tell another reader which counter a campaign armed.
             await store.record_audit(
-                "auth.admin_unlocked",
+                ADMIN_UNLOCKED_ACTION,
                 actor=f"cli:{getpass.getuser()}",
                 detail=json.dumps({"username": args.username, **report}),
             )
@@ -5552,6 +5566,135 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
 class _PasswordEntryRefused(RuntimeError):
     """The interactive credential prompt declined. The message is operator-facing."""
+
+
+#: How many wrong authenticator codes ``provision-admin`` accepts before it stops. Nothing is written
+#: on a stop, so the operator simply runs it again.
+_PROVISION_TOTP_ATTEMPTS = 5
+
+
+def _controlling_terminal_path() -> str:
+    """The device that IS the operator's console, whatever stdout and stderr were redirected to."""
+    return "CONOUT$" if sys.platform == "win32" else "/dev/tty"
+
+
+def _open_terminal() -> int:
+    """Open the console device for writing, or raise :class:`OSError`. The controlling terminal
+    first; on POSIX, the terminal on stdin when there is none. A session started under ``setsid``
+    (for example ``su <user> -c``) has a tty on stdin but no controlling terminal, and ``/dev/tty``
+    refuses it with ENXIO although the operator is sitting at that very tty.
+
+    The fallback re-opens stdin's tty by path first, which gives a fresh blocking, write-only
+    descriptor. Under ``su`` the tty still belongs to the operator (mode 620), so the target user
+    cannot open it by name; then it DUPLICATES stdin's descriptor, which is already open to that
+    tty (and shares stdin's access mode, so a read-only stdin fails at the write, which the caller
+    turns into a refusal). Binary mode on Windows, so a newline is written as sent."""
+    import contextlib
+    import os
+
+    try:
+        return os.open(_controlling_terminal_path(), os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    except OSError:
+        if sys.platform == "win32":
+            raise
+        stdin_fd: int | None = None
+        # stdin may name no descriptor: ``fileno`` raises on a replaced stream.
+        with contextlib.suppress(OSError, ValueError):
+            stdin_fd = sys.stdin.fileno()
+        if stdin_fd is None or not os.isatty(stdin_fd):
+            raise  # the controlling-terminal failure, which is the one the operator can act on
+        with contextlib.suppress(OSError):
+            return os.open(os.ttyname(stdin_fd), os.O_WRONLY)
+        return os.dup(stdin_fd)
+
+
+def _show_on_terminal(text: str) -> None:
+    """Write ``text`` to the controlling terminal itself, never to stdout or stderr (ADR 0197
+    Amendment A, N-A; CodeQL alert 228, BACKLOG #1131).
+
+    For what the operator must see and nothing may keep: the new TOTP key, its URI and the recovery
+    codes. Stdout carries ``--json``, and either stream can be redirected into a file, a service
+    wrapper's log or a CI capture, which is where the alert said the key could land. Opening the
+    console device writes to the screen and nowhere else. Raises :class:`OSError` when the process
+    has no console, or it goes away mid-write, so a caller can refuse rather than fall back to a
+    stream."""
+    import os
+
+    data = text.encode("utf-8", "replace")
+    fd = _open_terminal()
+    try:
+        # A terminal may take a write in pieces; loop until every byte is out, so a recovery code is
+        # never silently cut short.
+        while data:
+            written = os.write(fd, data)
+            if written <= 0:
+                # A stalled or hung-up terminal can accept nothing without raising; never spin.
+                raise OSError("the console accepted no bytes")
+            data = data[written:]
+    finally:
+        os.close(fd)
+
+
+def _show_during_enrolment(text: str, *, refusal: str) -> None:
+    """Show the key, a prompt or a retry message on the console during enrolment, so an operator
+    who redirected stderr still sees what the command is waiting for. Raises
+    :class:`_PasswordEntryRefused` with ``refusal`` and the cause when the console cannot be written;
+    enrolment is before any store write, so the refusal always says nothing was written."""
+    try:
+        _show_on_terminal(text)
+    except OSError as exc:
+        raise _PasswordEntryRefused(f"{refusal} ({exc}); nothing was written") from exc
+
+
+def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str, float]:
+    """Generate a TOTP secret in memory, show it, and read back a code that proves it (ADR 0197
+    Amendment A, N-A). Returns ``(secret, code, instant the code was read)``.
+
+    The key and its URI go to the console device through :func:`_show_on_terminal`, never to stdout
+    or stderr: ``--json`` output is stdout, and either stream can be redirected. They are never in
+    argv, a file or a log either. The prompts go there too, so they stay visible when stderr is
+    redirected (:func:`_show_during_enrolment`); a refusal goes to stderr as every refusal does. The code
+    is checked with the pure :func:`totp.verify_totp_step` at the configured skew and re-prompted on
+    a mistake, all BEFORE the store is opened for writing, so a wrong code writes nothing. Raises
+    :class:`_PasswordEntryRefused` with no terminal or no console to show the key on, on an empty
+    code, or after :data:`_PROVISION_TOTP_ATTEMPTS` wrong codes."""
+    import time as _time
+
+    from messagefoundry.auth import totp
+
+    if not sys.stdin.isatty():
+        raise _PasswordEntryRefused(
+            "refusing to provision without a terminal: the authenticator app is enrolled "
+            "interactively. Run this from a console."
+        )
+    secret = totp.generate_secret()
+    _show_during_enrolment(
+        "\nEnrol an authenticator app for this Administrator now (ADR 0197). Add this account "
+        "to the app by its URI, which names the algorithm, then type the 6-digit code it shows. "
+        "The codes use SHA-256: an app that takes only the key must be set to SHA-256, or its "
+        "codes will never match.\n"
+        f"  key: {secret}\n"
+        f"  URI: {totp.otpauth_uri(secret, username)}\n",
+        refusal="could not open the console to show the authenticator key. Run this from a console",
+    )
+    went_away = "the console went away during enrolment"
+    for attempt in range(1, _PROVISION_TOTP_ATTEMPTS + 1):
+        _show_during_enrolment("Authenticator code: ", refusal=went_away)
+        code = sys.stdin.readline().strip()
+        read_at = _time.time()
+        if not code:
+            raise _PasswordEntryRefused("empty authenticator code; nothing was written")
+        if totp.verify_totp_step(secret, code, now=read_at, window=skew_steps) is not None:
+            return secret, code, read_at
+        if attempt < _PROVISION_TOTP_ATTEMPTS:  # never "try again" when no attempt is left
+            _show_during_enrolment(
+                "That code did not match. Try the current one.\n", refusal=went_away
+            )
+    raise _PasswordEntryRefused(
+        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match; nothing was written. Check that the app "
+        "uses SHA-256 (add the account by its URI) and that the device's clock is right, then run "
+        "the command again."
+    )
 
 
 def _read_new_password(prompt: str) -> str:
@@ -6011,7 +6154,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     trust_anchors_enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
 
-    async def administrator_exists() -> bool:
+    async def administrator_exists() -> str | None:
         from messagefoundry.store.base import StoreNotFoundError
 
         # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
@@ -6028,10 +6171,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         except StoreNotFoundError:
-            return False
+            return None
         try:
             service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
-            return await service.has_enabled_administrator()
+            # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
+            # and before an authenticator key is shown for an account that would then be refused.
+            return await service.provision_refusal(username)
         finally:
             await store.close()
 
@@ -6049,13 +6194,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-    if exists:
-        return _emit_error(
-            "this store already has an enabled Administrator, so there is nothing to provision "
-            "-- create further accounts from the web console, and use `admin-unlock` if the "
-            "administrator is locked out",
-            as_json=args.json,
-        )
+    if exists is not None:
+        return _emit_error(exists, as_json=args.json)
 
     try:
         password = _read_new_password("New administrator password: ")
@@ -6078,6 +6218,26 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     if violations:
         return _emit_error("; ".join(violations), as_json=args.json)
+
+    # ADR 0197 Amendment A (N-A): the first Administrator is born with an authenticator app, so
+    # option E's combined sign-in is its way past a lock anyone who knows the username can set.
+    totp_secret: str | None = None
+    totp_code: str | None = None
+    totp_read_at: float | None = None
+    if args.no_totp:
+        if settings.auth.require_mfa:
+            return _emit_error(
+                "--no-totp is refused: MFA is required ([security].require_mfa), and the "
+                "requirement always covers an Administrator",
+                as_json=args.json,
+            )
+    else:
+        try:
+            totp_secret, totp_code, totp_read_at = _enrol_totp_at_terminal(
+                username=username, skew_steps=settings.auth.totp_skew_steps
+            )
+        except _PasswordEntryRefused as exc:
+            return _emit_error(str(exc), as_json=args.json)
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
@@ -6124,6 +6284,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     display_name=args.display_name,
                     notify_email=args.email,
                     actor=f"cli:{getpass.getuser()}",
+                    totp_secret=totp_secret,
+                    totp_code=totp_code,
+                    totp_code_read_at=totp_read_at,
                 )
             finally:
                 if security_notifier is not None:
@@ -6153,6 +6316,29 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
+    codes_shown = False  # true only once issued codes actually reached the console
+    if outcome.recovery_codes:
+        # To the console device ONCE, in both output modes: never stdout (the --json body) and never
+        # stderr, which can be redirected into a log (CodeQL alert 228, BACKLOG #1131).
+        try:
+            _show_on_terminal(
+                "\nRecovery codes, shown once. Each signs in once in place of an authenticator "
+                "code. Store them somewhere safe, then clear this terminal's scrollback:\n  "
+                + "\n  ".join(outcome.recovery_codes)
+                + "\n"
+            )
+            codes_shown = True
+        except OSError as exc:
+            # The account is written and signs in with its authenticator app. The codes are not
+            # printed anywhere else, for the reason above; ``recovery_codes_shown`` says so to a
+            # caller reading only the --json body.
+            print(
+                f"WARNING: the recovery codes could not be shown on the console ({exc}), and they "
+                "cannot be shown again. The Administrator signs in with its authenticator app. "
+                "Without the codes, a lost authenticator can be reset only by another "
+                "Administrator, so create a second one soon.",
+                file=sys.stderr,
+            )
     if args.json:
         _print_json(
             {
@@ -6166,6 +6352,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "notify_email_set": bool(args.email and args.email.strip()),
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
+                # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.
+                "totp_enrolled": totp_secret is not None,
+                # True only when recovery codes were issued AND reached the console; false with
+                # --no-totp (none issued) and when the console failed before showing them.
+                "recovery_codes_shown": codes_shown,
             },
             compact=True,
         )
@@ -7063,6 +7254,8 @@ def _backup(args: argparse.Namespace) -> int:
         "verify": result.verify.status if result.verify is not None else "skipped",
         "pruned": result.pruned,
     }
+    if result.staging_leftover is not None:  # BACKLOG #1174: a good archive, plaintext left behind
+        payload["staging_leftover"] = result.staging_leftover
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -7071,6 +7264,8 @@ def _backup(args: argparse.Namespace) -> int:
             f"  encrypted={result.encrypted} config_only={result.config_only} key_id={result.key_id}"
         )
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
+        if result.staging_leftover is not None:
+            print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
     return 0
 
 

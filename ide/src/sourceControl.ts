@@ -9,7 +9,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
-import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
+import { openChannel, postToWebview } from "./webviewMessaging";
+import { sourceControlScript } from "./sourceControlWebview";
 
 const GITIGNORE_MARKER = "# --- MessageFoundry ---";
 // Kept deliberately minimal; NOTE we do NOT ignore .vscode/ (so a team shares messagefoundry.*
@@ -493,28 +494,7 @@ function renderRepoStorageHtml(webview: vscode.Webview, current: string): string
     <button id="save">Save</button>
     <button id="cancel" class="secondary">Cancel</button>
   </div>
-  <script nonce="${n}">
-    const vscode = acquireVsCodeApi();${guardScript(token)}
-    const url = document.getElementById('url');
-    const err = document.getElementById('err');
-    function mode() { return document.querySelector('input[name=mode]:checked').value; }
-    function sync() { const remote = mode() === 'remote'; url.disabled = !remote; if (remote) url.focus(); }
-    document.querySelectorAll('input[name=mode]').forEach(function (r) {
-      r.addEventListener('change', function () { err.textContent = ''; sync(); });
-    });
-    document.getElementById('save').addEventListener('click', function () {
-      err.textContent = '';
-      vscode.postMessage({ command: 'save', mode: mode(), url: url.value });
-    });
-    document.getElementById('cancel').addEventListener('click', function () {
-      vscode.postMessage({ command: 'cancel' });
-    });
-    ${WEBVIEW_GUARD_NOTE}
-    window.addEventListener('message', function (e) {
-      const d = mfTrusted(e);
-      if (d && d.command === 'error') { err.textContent = d.text; }
-    });
-    sync();
+  <script nonce="${n}">${sourceControlScript(token)}
   </script>
 </body>
 </html>`;

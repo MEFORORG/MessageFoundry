@@ -39,8 +39,9 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import (
@@ -65,7 +66,12 @@ from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate, IdentityResolver
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
-from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
+from messagefoundry.api.field_authz import (
+    MASKED_UNTIL_REVEALED,
+    count_exposed,
+    count_masked,
+    redact_unauthorized,
+)
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
@@ -100,6 +106,8 @@ from messagefoundry.api.models import (
     ApprovalResolveRequest,
     ApprovalResolveResult,
     AttachmentInfo,
+    AuditedBodySurface,
+    BodySurface,
     CapturedResponseInfo,
     ChannelInfo,
     ClaimPoolInfo,
@@ -138,6 +146,7 @@ from messagefoundry.api.models import (
     LogLevelUpdate,
     LogSinkInfo,
     LogTailPage,
+    MessageBody,
     MessageDetail,
     MessageExportRequest,
     MessageList,
@@ -227,6 +236,7 @@ from messagefoundry.api.validation import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
+from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
@@ -242,7 +252,7 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import config_fingerprint_detail
+from messagefoundry.config.fingerprint import config_fingerprint_detail, fingerprint_matches
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -612,7 +622,9 @@ def _log_sink_health() -> list[LogSinkInfo]:
     ]
 
 
-def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[list[str], int, bool]:
+def _read_log_tail(
+    log_dir: str | None, *, limit: int, offset: int, audit_copies: bool = True
+) -> tuple[list[str], int, bool]:
     """A **redacted** page of the newest app-log file's tail for the in-console viewer (#171, ADR 0130).
 
     Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
@@ -623,7 +635,12 @@ def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[lis
     identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
     gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
-    **never raises** (an unreadable dir/file yields an empty, unavailable page)."""
+    **never raises** (an unreadable dir/file yields an empty, unavailable page).
+
+    ``audit_copies=False`` drops the off-box tee's audit-row copies BEFORE paging, so ``total_lines``
+    and the page boundaries do not count them either (BACKLOG #1131; see
+    :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
+    from messagefoundry.auth.audit_visibility import is_audit_copy_line
     from messagefoundry.support.redact import redact_log_line
 
     if not log_dir:
@@ -642,6 +659,8 @@ def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[lis
     except OSError:
         return [], 0, False
     all_lines = text.splitlines()
+    if not audit_copies:
+        all_lines = [line for line in all_lines if not is_audit_copy_line(line)]
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
@@ -4036,7 +4055,7 @@ def create_app(
         scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
     ) -> StreamingResponse:
         """Stream a batch of message bodies to a downloadable NDJSON file (#124, ADR 0131) — the
-        Corepoint-parity bulk export a one-at-a-time ``/messages/{id}`` raw view can't provide.
+        Corepoint-parity bulk export a one-at-a-time ``/messages/{id}/raw`` fetch can't provide.
 
         Selection is either an explicit ``ids`` set (the UI's *save-selected*) or the **basic**
         ``/messages/search`` filters (the UI's *save-all* — reusing ``search_messages`` for the id set);
@@ -4056,7 +4075,7 @@ def create_app(
         enforce_phi_read_hop(request)
         # Charged BEFORE selection: step-up pacing is NON-GET only, so without this a single actor can
         # stream far more bodies per minute through the export GET than the per-actor budget allows
-        # through /messages/{id}. Admission-time so a refused call does no store work. The POST shape
+        # through /messages/{id}/raw. Admission-time so a refused call does no store work. The POST shape
         # draws on this same PHI-read bucket (its admin-write charge is a different, stricter one).
         enforce_phi_read_pacing(request, identity)
         allowed = _scope(identity)  # per-channel RBAC (None = all)
@@ -4203,7 +4222,18 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+        # Annotated rather than ``= Query(False)``, for the reason get_message_body gives: this is a
+        # CoreHandlers seam function too, and an in-process caller that leaves it out must get False.
+        reveal_summary: Annotated[bool, Query()] = False,
     ) -> MessageDetail:
+        """Open one message: metadata, deliveries, events and attachments, and never its body.
+
+        ``reveal_summary`` is the explicit act that lifts the display mask on ``summary`` and
+        ``metadata`` for this one response (BACKLOG #2346, ASVS 14.2.6). Left out, those two come
+        back masked exactly as the list surfaces return them, so an open with no act aimed at the
+        summary (a dead-letter link, a replay redirect, a direct URL) does not unmask them. The open
+        still returns what no list does, the delivery errors and event details, gated on
+        ``messages:view_summary`` as before; the flag does not touch those."""
         row = await engine.store.get_message(message_id)
         # 404 (not 403) when the message is outside the caller's channel scope — don't reveal that a
         # message exists in another tenant's channel (per-channel RBAC).
@@ -4211,27 +4241,21 @@ def create_app(
             if row is not None:
                 await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
-        # Opening a body is PHI access — record it (with the viewer) before returning. record_view
-        # gives the per-message timeline; record_audit puts it in the tamper-evident, GET /audit-visible
-        # compliance chain (docs/PHI.md §6 names message_view as audited — review M-3).
+        # Opening a message is PHI access even without its body: status, errors, deliveries and events
+        # can carry identifiers, and a revealed summary does. record_view writes the `viewed` event
+        # for the per-message timeline FIRST, so the events this open returns include it. The
+        # audit row follows redaction below, because it records what the response revealed. The
+        # BODY is not here: it has its own fetch and its own audit action, get_message_body (#2345).
         await engine.store.record_view(message_id, actor=identity.username)
-        await engine.store.record_audit(
-            "message_view",
-            actor=identity.username,
-            channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id}),
-            client=client_ip(request),
-        )
         outbox_rows = await engine.store.outbox_for(message_id)
         event_rows = await engine.store.events_for(message_id)
         # Metadata-only list of the very-large documents detached from this message (#149, ADR 0105
-        # Phase 3b) — id/content_type/total_bytes, never the bytes. No extra PHI exposure over the raw
-        # body this route already gated: it just tells the operator a detached document exists + how to
-        # pull it (the audited /attachments/{id} download). Empty for a normal (non-streaming) message.
+        # Phase 3b) — id/content_type/total_bytes, never the bytes. It tells the operator a detached
+        # document exists + how to pull it (the audited /attachments/{id} download). Empty for a normal
+        # (non-streaming) message.
         attachment_rows = await engine.store.attachments_for(message_id)
         detail = MessageDetail(
             **_summary(row).model_dump(),
-            raw=row["raw"],
             outbox=[
                 OutboxInfo(
                     id=o["id"],
@@ -4264,21 +4288,37 @@ def create_app(
         # Per-property PHI gate (#120): the patient `summary`, the exception `error`, every delivery
         # `last_error`, and every event `detail` gate on messages:view_summary. Redaction keys on the
         # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
-        # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
+        # redacted individually. The raw body is not on this response (#2345). Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
         # OPENING ONE MESSAGE IS NOT THE REVEAL ACT under the strict reading of ASVS 14.2.6 ("unless
-        # the user specifically views it"), which BACKLOG #1187 adopts. The list and search surfaces
-        # mask the summary; this route lifts that mask for THIS message on every open, and it also
-        # returns the raw body. Many opens are not aimed at the summary or the body at all: the
-        # dead-letter "view" link, the redirect after a replay, a direct URL. So this unmask is the
-        # shipped behaviour and a recorded gap, not the control the verb asks for. What it does keep:
-        # the unmask is a call argument with nowhere to live between calls, so it cannot become a
+        # the user specifically views it"), which BACKLOG #1187 adopts. So an open masks the summary
+        # and metadata exactly as the list does, and only ``reveal_summary`` lifts the mask, for THIS
+        # response (BACKLOG #2346). The caller sets it on an act aimed at the summary: the web console
+        # declares it per route, and a bare open (a dead-letter link, a replay redirect, a direct URL)
+        # leaves it off. The raw body is get_message_body's, a separate act with its own audit row.
+        # The unmask is a call argument with nowhere to live between calls, so it cannot become a
         # session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
         detail = redact_unauthorized(
-            detail, identity, revealed=frozenset({"summary", "metadata"})
+            detail,
+            identity,
+            revealed=MASKED_UNTIL_REVEALED if reveal_summary else frozenset(),
         ).model_copy(update={"outbox": outbox, "events": events})
+        # record_audit puts the open in the tamper-evident, GET /audit-visible compliance chain
+        # (docs/PHI.md §6 names message_view as audited — review M-3), still before returning.
+        # ``revealed`` names the masked-until-revealed properties this response carries complete,
+        # read from the redacted model rather than from the request: a caller without view_summary
+        # got nulls, and an empty value had nothing to unmask, so neither is recorded as a
+        # disclosure it never received (BACKLOG #2346).
+        revealed = sorted(p for p in MASKED_UNTIL_REVEALED if reveal_summary and getattr(detail, p))
+        await engine.store.record_audit(
+            "message_view",
+            actor=identity.username,
+            channel_id=row["channel_id"],
+            detail=json.dumps({"message_id": message_id, "revealed": revealed}),
+            client=client_ip(request),
+        )
         rows = [detail, *outbox, *events]
         exposed, masked = count_exposed(rows), count_masked(rows)
         if exposed or masked:
@@ -4291,6 +4331,50 @@ def create_app(
                 masked=masked,
             )
         return detail
+
+    @app.get("/messages/{message_id}/raw", response_model=MessageBody)
+    async def get_message_body(
+        message_id: ResourceId,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+        # Annotated rather than ``= Query("api")``: this is also a CoreHandlers seam function, and an
+        # in-process caller that leaves ``surface`` out must get the string, not a Query object.
+        surface: Annotated[BodySurface, Query()] = "api",
+    ) -> MessageBody:
+        """One message's raw body, as its own audited act (BACKLOG #2345, ASVS 14.2.6).
+
+        Split from :func:`get_message` so that opening a message and reading its body are two acts
+        with two audit rows: ``message_view`` for the open, ``message_body_view`` for this. The same
+        ``MESSAGES_VIEW_RAW`` gate and per-channel 404 guard as the open, because the body is the
+        datum that permission has always governed.
+
+        The audit row's ``surface`` says which client asked, from the closed
+        :data:`AuditedBodySurface` set. It is an audit discriminator, never an authorization input,
+        so a caller that lies about it reads nothing it could not read by telling the truth. An HTTP
+        caller declares ``harness``, ``apiclient`` or ``api``. The engine records ``console`` itself
+        when the matched route is a ``/ui`` route, which only the web console's in-process call can
+        produce; ``console`` is not a value the query parameter accepts."""
+        recorded: AuditedBodySurface = (
+            "console" if (_matched_route_path(request) or "").startswith("/ui/") else surface
+        )
+        row = await engine.store.get_message(message_id)
+        # 404 (not 403) outside the caller's channel scope, mirroring get_message.
+        if row is None or not identity.can_access_channel(row["channel_id"]):
+            if row is not None:
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
+            raise HTTPException(404, f"no such message: {message_id}")
+        # Audit BEFORE the body leaves: record_view for the per-message timeline, and a dedicated
+        # action in the tamper-evident chain so a body read never collapses into a message_view row.
+        await engine.store.record_view(message_id, actor=identity.username)
+        await engine.store.record_audit(
+            "message_body_view",
+            actor=identity.username,
+            channel_id=row["channel_id"],
+            detail=json.dumps({"message_id": message_id, "surface": recorded}),
+            client=client_ip(request),
+        )
+        return MessageBody(message_id=message_id, raw=row["raw"])
 
     # SVG sanitizing runs on the default thread pool, which the pipeline's router and transform
     # workers share; two slots bound how many pool threads concurrent downloads can hold.
@@ -5814,7 +5898,8 @@ def create_app(
         if target is not None:
             try:
                 current = await asyncio.to_thread(config_fingerprint_detail, target)
-                drift = current.get("fingerprint") != fp
+                # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift.
+                drift = not fingerprint_matches(current.get("fingerprint"), fp)
             except OSError:  # dir unreadable now — report clean rather than a false DRIFT alarm
                 drift = False
         git_head = loaded.get("git_head") if loaded else None
@@ -5942,6 +6027,14 @@ def create_app(
         # loop; it never raises, so /status does not either. `None` means stdout-only and NOTHING
         # else -- see LogInfo for the three states (BACKLOG #1563).
         logs = await asyncio.to_thread(_log_storage, getattr(request.app.state, "log_dir", None))
+        # BACKLOG #1131 (Manager decision 2026-09-28, under the owner's lock-rows ruling): the log
+        # directory's byte total counts the off-box tee's copy of every audit row, the hidden lock
+        # rows included, so on a quiet instance it grows by exactly one line when a lock lands.
+        # ``monitoring:read`` reaches this route and is held by the Auditor and the Operator, so the
+        # total goes only to a caller who may read those copies. The free-space half stays: the
+        # console's disk-full check reads it.
+        if logs is not None and not reads_audit_copies_in_the_log(_user):
+            logs = logs.model_copy(update={"size_bytes": None})
         # No-network version-update signal (#30, ADR 0026): the engine's latest local diff (version
         # strings only, no PHI). None when [update_check] is disabled / no pass has run — additive, so
         # the existing payload is unchanged when off.
@@ -5985,7 +6078,9 @@ def create_app(
                 journal_mode=db.journal_mode,
                 messages=db.messages,
                 events=db.events,
-                audit=db.audit,
+                # BACKLOG #1131: the whole-table count includes the hidden lock rows, so it goes only
+                # to a caller who may read them (see the log size above).
+                audit=db.audit if reads_audit_copies_in_the_log(_user) else None,
                 synchronous=db.synchronous,
             ),
             logs=logs,
@@ -6063,7 +6158,13 @@ def create_app(
         log_dir = getattr(request.app.state, "log_dir", None)
         # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
         lines, total, available = await asyncio.to_thread(
-            _read_log_tail, log_dir, limit=limit, offset=offset
+            partial(
+                _read_log_tail,
+                log_dir,
+                limit=limit,
+                offset=offset,
+                audit_copies=reads_audit_copies_in_the_log(identity),
+            )
         )
         # Audit the redacted-log read like a message view (#171): actor + how many lines were exposed, never
         # the content. Only when something was actually served, so a poll of an empty/unconfigured tail
@@ -6766,6 +6867,7 @@ def create_app(
                 list_connections=list_connections,
                 list_messages=list_messages,
                 get_message=get_message,
+                get_message_body=get_message_body,
                 download_attachment=download_attachment,
                 list_dead_letters=list_dead_letters,
                 start_connection=start_connection,
@@ -7767,6 +7869,24 @@ def create_managed_app(
                     alerts_settings=alerts_settings,
                     security_settings=security_settings,
                 )
+                # ADR 0197 Amendment A, AC-A9: name every account still lockable with no way past a
+                # sign-in lock. It warns and audits and NEVER refuses to start: an account-level fact
+                # must not get a site-wide veto, so even a failure of the census itself is logged
+                # and startup continues.
+                try:
+                    await auth.report_lockable_account_census()
+                except Exception:  # noqa: BLE001 -- see the comment above
+                    _log.exception("the lockable-account census could not run; startup continues")
+                # ADR 0197 Amendment A, Manager decision 2026-09-29: learn at start, not at the first
+                # account creation, that the password policy leaves no credential to issue. It logs
+                # an ERROR and returns, and is guarded like the census: a policy-level fact must
+                # never refuse the start, whatever a later policy clause raises.
+                try:
+                    auth.probe_credential_generation()
+                except Exception:  # noqa: BLE001 -- see the comment above
+                    _log.exception(
+                        "the credential-generation probe could not run; startup continues"
+                    )
                 if not auth.webauthn_available() and await store.any_webauthn_credentials():
                     # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
                     # not installed (engine moved/reinstalled, same DB) — affected users stay

@@ -20,6 +20,7 @@ import base64
 from urllib.parse import urlencode
 
 import httpx
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -64,7 +65,8 @@ async def _scoped_operator(service: AuthService) -> None:
     The scope is set BEFORE the caller logs in: ``set_channel_scope`` revokes the user's sessions,
     so scoping an already-logged-in client would log it straight back out.
     """
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username="op",
         password=PW,
         display_name=None,
@@ -75,7 +77,10 @@ async def _scoped_operator(service: AuthService) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     await service.set_channel_scope(user_id, [_ALLOWED], actor="test")
 

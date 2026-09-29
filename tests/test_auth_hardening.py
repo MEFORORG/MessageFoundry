@@ -39,7 +39,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
-from tests._admin_account import ADMIN_USERNAME, create_admin
+from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -69,7 +69,8 @@ def _client(engine: Engine, service: AuthService, **app_kwargs: object) -> httpx
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -86,7 +87,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -140,7 +144,7 @@ async def test_summary_redacted_for_caller_without_view_summary(engine: Engine) 
         op_msg = (await c.get("/messages", headers=op)).json()["messages"][0]
         vw_msg = (await c.get("/messages", headers=vw)).json()["messages"][0]
         # The LIST is the census surface, so an authorized operator sees the summary MASKED here
-        # (ASVS 14.2.6); opening one message is the act that reveals it. `error` is not a masked
+        # (ASVS 14.2.6); only an explicit per-message reveal lifts it (BACKLOG #2346). `error` is not a masked
         # property, so it comes through complete in the same response -- which is what keeps this a
         # test of the mask rather than of redaction.
         assert op_msg["summary"] == "MRN **** · ****"
@@ -183,55 +187,59 @@ def test_ad_requires_ldaps_unless_overridden() -> None:
 
 
 async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None:
-    # M2 + ASVS 6.3.3. An unclaimed admin is must_change AND (since 6.3.3) mfa_pending at the same
-    # instant, so this pins BOTH the refusal ORDER and the fact that the pair is escapable — the
-    # bricked-fresh-account regression. Order is load-bearing: GET /me/mfa is MFA-exempt but NOT
-    # must-change-exempt, so leading with MFA would send this account to /auth/mfa-verify, which it
-    # cannot satisfy before rotating. The account must be told to rotate FIRST.
+    # M2 + ASVS 6.3.3, re-ordered by ADR 0197 Amendment A (AC-A3). An unclaimed admin is must_change
+    # AND mfa_pending with no factor. It used to rotate first; that passed the holder through "a
+    # chosen password, no factor, no session", which anyone who knows the username could lock. Now
+    # it ENROLS TOTP first, from the pending must-change session, then rotates. The pair is still
+    # escapable -- the bricked-fresh-account regression this test was written against.
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
     admin = await create_admin(service)
     async with _client(engine, service) as c:
         login = await _login(c, admin.username, admin.password)
         assert login.status_code == 200 and login.json()["must_change_password"] is True
-        h = _auth(login.json()["token"])
+        tok = str(login.json()["token"])
         # a rotation-required session may not reach protected routes...
-        blocked = await c.get("/users", headers=h)
+        blocked = await c.get("/users", headers=_auth(tok))
         assert blocked.status_code == 403
-        # ...and it is the PASSWORD refusal, not the MFA one, even though both apply.
+        # ...and it is the PASSWORD refusal, not the MFA one, naming the step that comes first.
         assert blocked.headers.get("X-MFA-Required") is None
         assert "password change required" in blocked.text
-        # ...but the self-service routes stay reachable
-        assert (await c.get("/auth/me", headers=h)).status_code == 200
-        rotated = await c.post(
+        assert "enrol an authenticator app first" in blocked.text
+        # ...the self-service routes stay reachable...
+        assert (await c.get("/auth/me", headers=_auth(tok))).status_code == 200
+        # ...but the rotation waits for TOTP.
+        refused = await c.post(
             "/me/password",
-            headers=h,
+            headers=_auth(tok),
             json={"current_password": admin.password, "new_password": "a-rotated-passphrase-99"},
         )
-        assert rotated.status_code == 200
+        assert refused.status_code == 403 and "enrol an authenticator app first" in refused.text
 
-        # Rotating clears must_change, but the second factor is still owed: the fresh session is
-        # MFA-pending and now carries the OTHER refusal.
-        tok = (await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"]
-        pending = await c.get("/users", headers=_auth(tok))
-        assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
-
-        # The account is NOT bricked: enrollment rides require_reauth_only_action, which opts out of
-        # the access gate, so the escape path is reachable from the pending session itself.
-        r, tok = await _reauth(c, tok, purpose="mfa_enroll", password="a-rotated-passphrase-99")
+        # The account is NOT bricked: the enrolment is reachable from the must-change session.
+        r, tok = await _reauth(c, tok, purpose="mfa_enroll", password=admin.password)
         assert r.status_code == 200
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
-        r, tok = await _reauth(c, tok, purpose="mfa_confirm", password="a-rotated-passphrase-99")
+        r, tok = await _reauth(c, tok, purpose="mfa_confirm", password=admin.password)
         assert r.status_code == 200
         confirmed = await c.post(
             "/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok)
         )
         assert confirmed.status_code == 200
         tok = str(confirmed.json()["token"])  # the confirm re-keyed the session (ASVS 7.2.4)
-        # Confirming satisfies THIS session's factor, so the estate is reachable again.
-        assert (await c.get("/users", headers=_auth(tok))).status_code == 200
+        # Still must-change, and now nothing comes first: the refusal says rotate, only.
+        blocked = await c.get("/users", headers=_auth(tok))
+        assert blocked.status_code == 403 and "enrol" not in blocked.text
+        rotated = await c.post(
+            "/me/password",
+            headers=_auth(tok),
+            json={"current_password": admin.password, "new_password": "a-rotated-passphrase-99"},
+        )
+        assert rotated.status_code == 200
 
-
-# --- M4: AD login cannot adopt a like-named local account --------------------
+        # Rotating ended every session. The next sign-in owes the TOTP it enrolled.
+        tok = (await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"]
+        pending = await c.get("/users", headers=_auth(tok))
+        assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
 
 
 async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engine) -> None:
@@ -295,7 +303,6 @@ async def test_cannot_remove_last_administrator(engine: Engine) -> None:
                 headers=h,
                 json={
                     "username": "root2",
-                    "password": PW,
                     "roles": ["administrator"],
                     "email": "root2@example.org",
                 },
@@ -352,7 +359,11 @@ async def test_lockout_counter_resets_after_window(engine: Engine) -> None:
     service = AuthService(engine.store, AuthSettings(lockout_threshold=3, lockout_minutes=15))
     await engine.store.upsert_role(role_id="viewer", display_name="Viewer")
     await engine.store.create_user(
-        user_id="u1", username="bob", auth_provider="local", password_hash=hash_password(PW)
+        user_id="u1",
+        username="bob",
+        auth_provider="local",
+        password_hash=hash_password(PW),
+        password_generated=False,
     )
     # simulate a prior lockout whose window has already lapsed
     await engine.store.record_login_failure(
@@ -608,6 +619,69 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     )
 
 
+@pytest.mark.parametrize(
+    ("present", "expect_ok"), [("fresh", True), ("replayed", False), ("wrong", False)]
+)
+async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, present: str, expect_ok: bool
+) -> None:
+    """A replayed TOTP and a wrong code must both fail after the same argon2 work (#1167, ADR 0170).
+
+    A replayed code matches the secret, so the branch used to return the store's refusal with no
+    argon2 work at all, while a wrong code fell through to the full recovery-code walk. Both return
+    False, and the wall clock told them apart. The ``wrong`` row is the control: it already paid
+    the walk, so it pins the work the ``replayed`` row must match. A success stays fast (zero), and
+    is not claimed to be equal.
+
+    The HASHES are pinned as well as the count: a replay that padded with the dummy hash alone
+    would cost differently from a wrong code as soon as the live codes and the dummy were minted
+    under different argon2 parameters.
+    """
+    import messagefoundry.auth.service as svc
+    from messagefoundry.auth import totp
+
+    used: list[str] = []
+    real = svc.verify_password
+
+    def counting(stored_hash: str, password: str) -> bool:
+        used.append(stored_hash)
+        return real(stored_hash, password)
+
+    monkeypatch.setattr(svc, "verify_password", counting)
+
+    slots = 10
+    service = await _service(engine, AuthSettings(require_mfa=False, mfa_recovery_code_count=slots))
+    await _add(service, "totpeq", Role.VIEWER)
+    user = await engine.store.get_user_by_username("totpeq")
+    assert user is not None
+    secret = totp.generate_secret()
+    await engine.store.set_totp_secret(user.id, secret=secret)
+    # Fewer live codes than slots, so a walk that forgot the padding would show as 2, not 10.
+    live = [hash_password(c) for c in ("AAAA-1111", "BBBB-2222")]
+    await engine.store.enable_totp(user.id, recovery_code_hashes=live)
+    walk = live + [svc._DUMMY_PASSWORD_HASH] * (slots - len(live))
+    # A fixed arrival moment, so the step cannot roll over between minting and verifying the code.
+    arrived = 1_900_000_000.0
+    code = totp.totp(secret, now=arrived)
+    if present == "replayed":
+        assert await service._verify_second_factor(user, code, arrived=arrived) is True
+    elif present == "wrong":
+        code = f"{(int(code) + 1) % 1_000_000:06d}"
+
+    used.clear()
+    ok = await service._verify_second_factor(user, code, arrived=arrived)
+
+    assert ok is expect_ok
+    expected = [] if expect_ok else walk
+    assert len(used) == len(expected), (
+        f"{present}: {len(used)} argon2 verifies, expected {len(expected)}. A replayed code "
+        "making 0 means the TOTP branch still returns before the recovery-code work"
+    )
+    assert used == expected, f"{present}: the verifies did not run against the walk's own hashes"
+    if present == "replayed":
+        assert await engine.store.get_recovery_code_hashes(user.id) == live, "a code was spent"
+
+
 # --- L13: a secret in the config file is warned about ------------------------
 
 
@@ -626,7 +700,11 @@ def test_secret_in_config_file_warns(tmp_path: Path, caplog: pytest.LogCaptureFi
 
 async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
     await engine.store.create_user(
-        user_id="u", username="reaper", auth_provider="local", password_hash=hash_password(PW)
+        user_id="u",
+        username="reaper",
+        auth_provider="local",
+        password_hash=hash_password(PW),
+        password_generated=False,
     )
     await engine.store.create_session(
         token_hash="expired-hash", user_id="u", expires_at=1.0, now=1.0

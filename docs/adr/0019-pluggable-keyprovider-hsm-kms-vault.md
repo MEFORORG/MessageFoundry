@@ -734,7 +734,7 @@ values; they are not a full census.
 | Value | Call | Symbol |
 |---|---|---|
 | Session and API tokens | `secrets.token_urlsafe` | `auth/tokens.py` `mint_token` |
-| Generated policy passwords | `secrets.token_urlsafe` | `auth/service.py` `AuthService._generate_policy_password` |
+| Generated policy passwords | `secrets.token_urlsafe` | `auth/service.py` `generate_policy_password` |
 | TOTP secrets and recovery codes | `secrets.token_bytes`, `secrets.choice` | `auth/totp.py` `generate_secret`, `generate_recovery_codes` |
 | WebAuthn challenges | `secrets.token_bytes` | `auth/webauthn.py` `new_challenge` |
 | OIDC PKCE verifier, state, nonce, flow id | `secrets.token_bytes` | `auth/oidc/flow.py` `generate_pkce`, `start_flow`, `new_flow_id` |

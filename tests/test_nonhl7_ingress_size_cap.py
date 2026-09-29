@@ -20,7 +20,7 @@ from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.binary import is_marked
-from messagefoundry.pipeline import wiring_runner
+from messagefoundry.pipeline import ingress_guards
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
 
@@ -70,7 +70,7 @@ async def _rows(store: MessageStore) -> list[dict]:
 
 
 async def test_text_over_cap_records_error(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 64)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_JSON", ContentType.JSON)
     runner = RegistryRunner(reg, store)
 
@@ -87,7 +87,7 @@ async def test_text_over_cap_records_error(store: MessageStore, monkeypatch) -> 
 
 
 async def test_text_under_cap_received(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 64)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_JSON", ContentType.JSON)
     runner = RegistryRunner(reg, store)
 
@@ -100,7 +100,7 @@ async def test_text_under_cap_received(store: MessageStore, monkeypatch) -> None
 
 
 async def test_text_boundary_exact_cap_accepted(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 64)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_JSON", ContentType.JSON)
     runner = RegistryRunner(reg, store)
 
@@ -119,7 +119,7 @@ async def test_text_boundary_exact_cap_accepted(store: MessageStore, monkeypatch
 
 
 async def test_binary_over_cap_records_error(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 64)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_DICOM", ContentType.DICOM)
     runner = RegistryRunner(reg, store)
 
@@ -145,7 +145,7 @@ async def test_binary_over_cap_nul_free_stays_plain_latin1(
 ) -> None:
     # INGEST-4 anti-over-rejection: a NUL-FREE byte view is store-safe (U+0001..U+00FF ride TEXT/NVARCHAR
     # intact), so the helper must keep the faithful, human-readable latin-1 view — NOT base64 everything.
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 64)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_DICOM", ContentType.DICOM)
     runner = RegistryRunner(reg, store)
 
@@ -161,7 +161,7 @@ async def test_binary_over_cap_nul_free_stays_plain_latin1(
 
 
 async def test_binary_under_cap_received(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 200)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 200)
     reg = _registry("IB_DICOM", ContentType.DICOM)
     runner = RegistryRunner(reg, store)
 
@@ -174,7 +174,7 @@ async def test_binary_under_cap_received(store: MessageStore, monkeypatch) -> No
 
 
 async def test_binary_boundary_measured_on_raw_bytes(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 140)
+    monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 140)
     reg = _registry("IB_DICOM", ContentType.DICOM)
     runner = RegistryRunner(reg, store)
 

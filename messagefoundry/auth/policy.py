@@ -294,7 +294,7 @@ class PasswordPolicy:
         AND-ed with ``check_breached``, so it can only ever SUPPRESS -- it cannot assert a screen an
         operator turned off -- and the ``False`` default reproduces the field exactly, so a caller
         that passes nothing keeps failing closed. WHY a caller may legitimately pass it is stated at
-        the call site, in ``AuthService._generate_policy_password``. Read that before adding a second
+        the call site, in ``auth.service.generate_policy_password``. Read that before adding a second
         one; a static arm in ``tests/test_password_corpus_guard.py`` pins how many there are."""
         problems: list[str] = []
         if len(password) < self.min_length:

@@ -133,7 +133,7 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     ("MessageDetail", "summary"): "messages.summary",
     ("MessageDetail", "error"): "messages.error",
     ("MessageDetail", "metadata"): "messages.metadata",
-    ("MessageDetail", "raw"): "messages.raw",
+    ("MessageBody", "raw"): "messages.raw",
     ("DeadLetterRow", "summary"): "messages.summary",
     ("DeadLetterRow", "last_error"): "queue.last_error",
     ("OutboxInfo", "last_error"): "queue.last_error",
@@ -151,6 +151,7 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     ("SecurityEventInfo", "detail"): "audit_log.detail",
     # --- composed in the route body; no store column to rate -----------------------------------
     ("SimpleMessage", "detail"): None,  # a literal operation-result string
+    ("MfaResetResponse", "detail"): None,  # the literal "MFA reset" (ADR 0197 Amendment A)
     # Both construction sites are engine-authored literals -- auth_routes.py `detail="re-verified"`
     # on /me/reauth and `detail="verified"` on /auth/mfa-verify. Neither route reads the store.
     ("ElevatedResponse", "detail"): None,
@@ -306,6 +307,7 @@ _EXPECTED_PHI_READS = frozenset(
         "/messages/search",
         "/messages/export",
         "/messages/{message_id}",
+        "/messages/{message_id}/raw",
         "/messages/{message_id}/attachments/{attachment_id}",
         "/messages/{message_id}/outbound",
         "/messages/{message_id}/responses",

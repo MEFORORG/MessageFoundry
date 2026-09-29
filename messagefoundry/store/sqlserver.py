@@ -69,6 +69,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
@@ -186,7 +187,9 @@ from messagefoundry.store.store import (
     audit_row_hash,
     birth_notify_email,
     build_audit_mac_keys,
+    check_password_generated,
     delivery_key,
+    lockout_arms,
     lockout_clear_set,
     lockout_escalates,
     next_lockout_state,
@@ -195,6 +198,7 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
+    rotation_factor_term,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -1859,7 +1863,10 @@ _SCHEMA: list[str] = [
         -- ADR 0197 (BACKLOG #1131): the sign-in lock's cycle count, and the second-step counter's
         -- three columns. Each defaults to no history, which is the pre-ADR state.
         lock_cycles INT NOT NULL DEFAULT 0, second_step_failed_attempts INT NOT NULL DEFAULT 0,
-        second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0)""",
+        second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0,
+        -- ADR 0197 Amendment A (BACKLOG #1131): 1 while the credential in force is
+        -- engine-generated; wrong passwords arm no sign-in lock then.
+        password_generated BIT NOT NULL DEFAULT 0)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1901,6 +1908,10 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD second_step_locked_until FLOAT NULL""",
     """IF COL_LENGTH('users','second_step_lock_cycles') IS NULL
         ALTER TABLE users ADD second_step_lock_cycles INT NOT NULL DEFAULT 0""",
+    # ADR 0197 Amendment A (BACKLOG #1131): COL_LENGTH-gated ADD. 0 on an existing row reads "the
+    # holder chose this credential", which keeps the account LOCKABLE -- the closed direction.
+    """IF COL_LENGTH('users','password_generated') IS NULL
+        ALTER TABLE users ADD password_generated BIT NOT NULL DEFAULT 0""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -9027,8 +9038,8 @@ class SqlServerStore:
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
         """See the base contract: returns ``next_attempt_at`` on the retry branch, whether or not the
-        row was still INFLIGHT to re-pend, and ``None`` when dead-lettered/missing (the runner arms the
-        per-lane retry wake on a float, WS-C)."""
+        row was still INFLIGHT or PENDING to re-pend, and ``None`` when dead-lettered/missing (the
+        runner arms the per-lane retry wake on a float, WS-C)."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9049,19 +9060,25 @@ class SqlServerStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
+                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT, turning a permitted
                 # duplicate into a forbidden strand. Amendment A (BACKLOG #2078, #2348) gives the retry
-                # branch a STATUS term instead: it re-pends only a row still INFLIGHT, so a late worker
-                # cannot re-pend a row that is already DONE, DEAD or CANCELLED. A row it declines is not
-                # INFLIGHT, so it cannot strand one. A match is read from the OUTPUT rowset, never from
-                # cursor.rowcount, for the reason _exec_terminal gives.
+                # branch a STATUS term instead, widened by owner ruling 2026-09-29: it re-pends a row
+                # that is INFLIGHT or PENDING, so a late worker cannot re-pend a row that is already
+                # DONE, DEAD or CANCELLED, and a row something else re-pended still takes this attempt's
+                # backoff, event and last_error. A row it declines is terminal, so it cannot strand
+                # one. A match is read from the OUTPUT rowset, never from cursor.rowcount, for the
+                # reason _exec_terminal gives.
                 retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    (
+                        _RESOLVE_OUTPUT,
+                        " AND status IN (?, ?)",
+                        (OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+                    )
                     if retrying
                     else self._resolve_guard()
                 )
@@ -9080,9 +9097,9 @@ class SqlServerStore:
                     *guard_params,
                 )
                 if retrying:
-                    # Not through _exec_terminal: a miss here is a no-op, never a fence. It writes
-                    # nothing, not even the 'failed' event, and still returns the retry time so a row
-                    # something else left PENDING gets its wake.
+                    # Not through _exec_terminal: a miss here is a no-op, never a fence. A miss is a
+                    # terminal (or vanished) row. It writes nothing, not even the 'failed' event, and
+                    # still returns the retry time, as Amendment A's ruling item 3 chose.
                     await cur.execute(sql, params)
                     if not await cur.fetchall():
                         await self._commit(conn)
@@ -9119,8 +9136,9 @@ class SqlServerStore:
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
         all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
-        On the retry branch a member no longer INFLIGHT is skipped and keeps its own state (ADR 0157
-        Amendment A); the shared retry time still comes back when every member was skipped."""
+        On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
+        own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
+        when every member was skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9143,17 +9161,23 @@ class SqlServerStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                        retry.backoff_seconds
+                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
                 # rolls all N back, matching the all-or-nothing contract the docstring promises.
-                # Amendment A, as mark_failed: on the retry branch a member no longer INFLIGHT is
-                # skipped, event and all, and the members still INFLIGHT re-pend together.
+                # Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a terminal
+                # member is skipped, event and all, and the INFLIGHT and PENDING members re-pend
+                # together to the one shared deadline.
                 retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    (
+                        _RESOLVE_OUTPUT,
+                        " AND status IN (?, ?)",
+                        (OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+                    )
                     if retrying
                     else self._resolve_guard()
                 )
@@ -9634,6 +9658,17 @@ class SqlServerStore:
         count = int(row["c"]) if row is not None and row["c"] is not None else 0
         oldest = row["m"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
+
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol). Routed
+        through ``_fetchall`` for the same RCSI read hygiene as :meth:`pending_depth`."""
+        lane_col = self._lane_col(stage)  # code-controlled literal
+        rows = await self._fetchall(
+            f"SELECT {lane_col} AS lane, COUNT(*) AS c, MIN(updated_at) AS m FROM queue"
+            f" WHERE stage=? AND status=? GROUP BY {lane_col}",
+            (stage, OutboxStatus.INFLIGHT.value),
+        )
+        return {str(r["lane"]): (int(r["c"]), float(r["m"])) for r in rows}
 
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
@@ -10929,6 +10964,7 @@ class SqlServerStore:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> list[dict[str, Any]]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
 
@@ -10949,6 +10985,14 @@ class SqlServerStore:
         if until is not None:
             clauses.append("ts <= ?")
             params.append(until)
+        if exclude is not None:
+            # After TOP (?)'s value in ``params``, which is the order the placeholders appear in.
+
+            def bind(value: str) -> str:
+                params.append(value)
+                return "?"
+
+            clauses.extend(exclude.clauses(bind))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT TOP (?) * FROM audit_log{where} ORDER BY id DESC"
         return await self._fetchall(sql, tuple(params))
@@ -11059,18 +11103,21 @@ class SqlServerStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        password_generated: bool,
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
         audit: AuditAppend | None = None,
     ) -> None:
+        check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
         sql = (
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until, directory_object_id)"
-            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)"
+            " must_change_password, failed_attempts, locked_until, directory_object_id,"
+            " password_generated)"
+            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?,?)"
         )
         params = (
             user_id,
@@ -11085,6 +11132,7 @@ class SqlServerStore:
             now if password_hash is not None else None,
             1 if must_change_password else 0,
             directory_object_id,
+            1 if password_generated else 0,
         )
         if audit is None:
             await self._execute(sql, params)
@@ -11157,18 +11205,40 @@ class SqlServerStore:
         user_id: str,
         *,
         password_hash: str,
+        password_generated: bool,
         must_change_password: bool = True,
+        require_totp: bool = False,
         now: float | None = None,
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
         claim_set = password_claim_set(must_change_password, "?")
         claim_args: tuple[float, ...] = () if must_change_password else (now,)
-        await self._execute(
-            "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
-            f"{claim_set}"
-            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=? WHERE id=?",
-            (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
-        )
+        condition = rotation_factor_term("1") if require_totp else ""
+        # OUTPUT, never ``cursor.rowcount``: a session-wide ``SET NOCOUNT ON`` suppresses the count
+        # (see ``_RESOLVE_OUTPUT``), and a conditional rotation must know whether it matched.
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
+                    f"{claim_set}"
+                    f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=?, updated_at=?"
+                    f" OUTPUT inserted.id WHERE id=?{condition}",
+                    (
+                        password_hash,
+                        now,
+                        1 if must_change_password else 0,
+                        *claim_args,
+                        1 if password_generated else 0,
+                        now,
+                        user_id,
+                    ),
+                )
+                written = bool(await cur.fetchall())
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return written
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -11214,8 +11284,9 @@ class SqlServerStore:
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
+            # ``last_totp_step`` too: see the SQLite twin (ADR 0197 Amendment A).
             "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-            " totp_recovery_codes=NULL, updated_at=? WHERE id=?",
+            " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
             (now, user_id),
         )
 
@@ -11522,8 +11593,8 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
-                    " FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                    f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
+                    " password_generated FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
                 # fetchall reads the counters AND drains the SELECT so the same-cursor UPDATE below is
@@ -11543,6 +11614,7 @@ class SqlServerStore:
                     escalate=lockout_escalates(
                         counter, auth_provider=str(rows[0][3]), totp_enabled=bool(rows[0][4])
                     ),
+                    lockable=lockout_arms(counter, password_generated=bool(rows[0][5])),
                 )
                 await cur.execute(
                     f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?,"

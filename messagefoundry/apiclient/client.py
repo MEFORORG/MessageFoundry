@@ -36,12 +36,14 @@ from messagefoundry.api.auth_models import (
     LoginResponse,
     MfaConfirmResponse,
     MfaEnrollResponse,
+    MfaResetResponse,
     MfaStatusResponse,
     ProvidersInfo,
     RoleInfo,
     SessionInfo,
     SessionList,
     SimpleMessage,
+    UserCreatedResponse,
     UserSummary,
 )
 from messagefoundry.api.models import (
@@ -50,6 +52,7 @@ from messagefoundry.api.models import (
     AlertsConfig,
     ApprovalList,
     ApprovalResolveResult,
+    BodySurface,
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
@@ -61,6 +64,7 @@ from messagefoundry.api.models import (
     DeadLetterReplayResult,
     Health,
     IntegrityResult,
+    MessageBody,
     MessageDetail,
     MessageList,
     MessageSearchResults,
@@ -101,8 +105,8 @@ MAX_REQUEST_HEADER_VALUE_LEN = 8192
 #
 # WHY 128 MiB AND NOT THE ENGINE'S OWN 16 MiB. The engine's one-message ceiling is 16 MiB
 # (parsing.peek.DEFAULT_MAX_MESSAGE_BYTES), and the obvious move is to reuse it the way
-# transports/bounded_read.py does. It is wrong here. ``GET /messages/{id}`` answers with a
-# MessageDetail whose ``raw`` field carries the WHOLE message body JSON-escaped, and worst-case
+# transports/bounded_read.py does. It is wrong here. ``GET /messages/{id}/raw`` answers with a
+# MessageBody whose ``raw`` field carries the WHOLE message body JSON-escaped, and worst-case
 # ``\uXXXX`` escaping costs 6 bytes per source byte -- so a 16 MiB message the engine legitimately
 # accepted can come back as roughly 96 MiB of JSON. A flat 16 MiB client ceiling would refuse that
 # reply: the client would break on a message the engine was configured to take. 128 MiB clears the
@@ -281,8 +285,8 @@ def _seg(value: str | int) -> str:
     #1107).** The ``%2F`` emitted here survives onto the wire, but the SERVER undoes it: ASGI defines
     ``scope["path"]`` as the DECODED path and Starlette routes on it, so a slash is a separator again
     before any route is matched. Measured on a real uvicorn server rather than TestClient. The engine
-    API has 13 route pairs shaped ``/x/{id}`` against ``/x/{id}/verb`` (``/users/{user_id}`` against
-    its six sub-routes, ``/messages/{message_id}`` against its five, ``/uploads/{file_id}`` against
+    API has 14 route pairs shaped ``/x/{id}`` against ``/x/{id}/verb`` (``/users/{user_id}`` against
+    its six sub-routes, ``/messages/{message_id}`` against its six, ``/uploads/{file_id}`` against
     its two), so an id carrying ``/verb`` reaches the sibling handler on a matching method. What
     keeps that from mattering today is that every id interpolated here is engine-minted and read back
     from a lookup -- which is provenance, not encoding. Do not cite this function as containment for
@@ -1045,9 +1049,11 @@ class EngineClient:
         """Turn off the signed-in user's TOTP MFA (step-up gated)."""
         self._request("DELETE", "/me/mfa")
 
-    def reset_user_mfa(self, user_id: str) -> None:
-        """Admin: clear a user's MFA enrollment and revoke their sessions (step-up gated)."""
-        self._request("POST", f"/users/{_seg(user_id)}/reset-mfa")
+    def reset_user_mfa(self, user_id: str) -> MfaResetResponse:
+        """Admin: clear a user's MFA enrollment and revoke their sessions (step-up gated). On a local
+        account the engine also issues a generated credential, returned ONCE in ``temp_password``
+        (ADR 0197 Amendment A); convey it out-of-band, since the old password no longer works."""
+        return _decode(self._request("POST", f"/users/{_seg(user_id)}/reset-mfa"), MfaResetResponse)
 
     # --- endpoints -----------------------------------------------------------
 
@@ -1169,8 +1175,26 @@ class EngineClient:
             MessageSearchResults,
         )
 
-    def get_message(self, message_id: str) -> MessageDetail:
-        return _decode(self._get(f"/messages/{_seg(message_id)}"), MessageDetail)
+    def get_message(self, message_id: str, *, reveal_summary: bool = False) -> MessageDetail:
+        """Open one message: metadata, deliveries and events, and NOT its body (BACKLOG #2345). The
+        body is :meth:`get_message_body`, a separate audited act.
+
+        ``summary`` and ``metadata`` come back display-masked, as on the list, unless
+        ``reveal_summary`` is set. Set it only on an operator act aimed at the summary (BACKLOG
+        #2346, ASVS 14.2.6); the engine records the choice in the ``message_view`` audit row."""
+        # None drops the parameter, so a plain open sends the same URL it always did.
+        flag = "true" if reveal_summary else None
+        return _decode(
+            self._get(f"/messages/{_seg(message_id)}", reveal_summary=flag), MessageDetail
+        )
+
+    def get_message_body(
+        self, message_id: str, *, surface: BodySurface = "apiclient"
+    ) -> MessageBody:
+        """Fetch one message's raw body. The engine writes a ``message_body_view`` audit row naming
+        ``surface``, which says which client asked. Pass the caller's own surface (the harness
+        passes ``harness``); the default names this library."""
+        return _decode(self._get(f"/messages/{_seg(message_id)}/raw", surface=surface), MessageBody)
 
     def replay(self, message_id: str) -> ReplayResult:
         return _decode(self._request("POST", f"/messages/{_seg(message_id)}/replay"), ReplayResult)
@@ -1580,21 +1604,22 @@ class EngineClient:
     def create_user(
         self,
         username: str,
-        password: str,
         *,
         email: str,
         display_name: str | None = None,
         roles: list[str] | None = None,
-    ) -> UserSummary:
-        """``email`` is required: it becomes the account's notification address (BACKLOG #2018)."""
+    ) -> UserCreatedResponse:
+        """``email`` is required: it becomes the account's notification address (BACKLOG #2018).
+
+        There is no password argument (ADR 0197 Amendment A): the engine generates the credential
+        and returns it ONCE, in ``temp_password``, for the caller to convey out-of-band."""
         body = {
             "username": username,
-            "password": password,
             "display_name": display_name,
             "email": email,
             "roles": roles or [],
         }
-        return _decode(self._request("POST", "/users", json=body), UserSummary)
+        return _decode(self._request("POST", "/users", json=body), UserCreatedResponse)
 
     def set_user_roles(self, user_id: str, roles: list[str]) -> None:
         self._request("PUT", f"/users/{_seg(user_id)}/roles", json={"roles": roles})

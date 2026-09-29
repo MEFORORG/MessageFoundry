@@ -34,6 +34,7 @@ from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
+from tests._admin_account import create_local_user_chosen
 
 
 @pytest.fixture
@@ -599,7 +600,8 @@ async def test_responses_route_rbac_and_audit(tmp_path: Any) -> None:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         for user, role in [("op", Role.OPERATOR), ("vw", Role.VIEWER), ("aud", Role.AUDITOR)]:
-            uid = await service.create_local_user(
+            uid = await create_local_user_chosen(
+                service,
                 username=user,
                 password=pw,
                 display_name=None,
@@ -615,7 +617,10 @@ async def test_responses_route_rbac_and_audit(tmp_path: Any) -> None:
             u = await service.store.get_user(uid)
             assert u is not None and u.password_hash is not None
             await service.store.set_password(
-                uid, password_hash=u.password_hash, must_change_password=False
+                uid,
+                password_hash=u.password_hash,
+                must_change_password=False,
+                password_generated=False,
             )
         # Seed a message with one captured reply.
         mid = await engine.store.enqueue_message(

@@ -28,12 +28,11 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_admin
+from tests._admin_account import create_admin, create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {
     "username": "newbie",
-    "password": PW,
     "roles": ["viewer"],
     "email": "newbie@example.org",
 }
@@ -51,7 +50,8 @@ class _FakeNotifier:
 
 async def _enabled_admin(service: AuthService, *, client: str) -> tuple[str, Identity]:
     """Create an enabled admin (no forced first-login rotation) + a live session from ``client``."""
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="boss",
         password=PW,
         display_name=None,
@@ -66,7 +66,7 @@ async def _enabled_admin(service: AuthService, *, client: str) -> tuple[str, Ide
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     out = await service.login("boss", PW, client=client)
     assert out.ok and out.token is not None and out.identity is not None
@@ -125,7 +125,8 @@ async def test_missing_baseline_and_bad_tokens_not_flagged() -> None:
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_chosen(
+            service,
             username="x",
             password=PW,
             display_name=None,
@@ -204,7 +205,8 @@ async def test_loopback_addresses_treated_as_same_host() -> None:
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
         await service.initialize()
-        uid = await service.create_local_user(
+        uid = await create_local_user_chosen(
+            service,
             username="x",
             password=PW,
             display_name=None,
@@ -283,7 +285,8 @@ def _auth(token: str) -> dict[str, str]:
 
 
 async def _add_admin(service: AuthService, username: str) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -298,7 +301,10 @@ async def _add_admin(service: AuthService, username: str) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -326,7 +332,7 @@ async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine
         # From the SAME address the fresh login may act (network-location + step-up freshness hold).
         assert (await a.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 201
     # Same token, a DIFFERENT client address → forced step-up.
-    n2 = {"username": "n2", "password": PW, "roles": ["viewer"], "email": "n2@example.org"}
+    n2 = {"username": "n2", "roles": ["viewer"], "email": "n2@example.org"}
     async with _client_at(engine, service, "10.9.9.9") as b:
         blocked = await b.post("/users", headers=_auth(token), json=n2)
         assert blocked.status_code == 403
@@ -371,7 +377,8 @@ async def test_new_ip_never_overrides_rbac(engine: Engine) -> None:
     # step-up op isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
     service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True, require_mfa=False))
     await service.initialize()
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="viewer1",
         password=PW,
         display_name=None,
@@ -386,7 +393,7 @@ async def test_new_ip_never_overrides_rbac(engine: Engine) -> None:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     async with _client_at(engine, service, "10.0.0.1") as a:
         token = await _login_token(a, "viewer1")

@@ -89,6 +89,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
@@ -199,7 +200,9 @@ from messagefoundry.store.store import (
     audit_row_hash,
     birth_notify_email,
     build_audit_mac_keys,
+    check_password_generated,
     delivery_key,
+    lockout_arms,
     lockout_clear_set,
     lockout_escalates,
     next_lockout_state,
@@ -208,6 +211,7 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
+    rotation_factor_term,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -670,7 +674,10 @@ _SCHEMA: list[str] = [
         lock_cycles          INTEGER NOT NULL DEFAULT 0,
         second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,
         second_step_locked_until DOUBLE PRECISION,
-        second_step_lock_cycles INTEGER NOT NULL DEFAULT 0
+        second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,
+        -- ADR 0197 Amendment A (BACKLOG #1131): TRUE while the credential in force is
+        -- engine-generated; wrong passwords arm no sign-in lock then.
+        password_generated   BOOLEAN NOT NULL DEFAULT FALSE
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -888,7 +895,9 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # caveat: the CREATE TABLE moved as well, and the bump is what ties the migration body to the hash.
 # 5 (ADR 0197, BACKLOG #1131): the four lockout columns (lock_cycles and the three second_step_*
 # columns) are ADDed in the same function. Same contract, same caveat.
-_MIGRATION_REV = 5
+# 6 (ADR 0197 Amendment A, BACKLOG #1131): the users.password_generated ADD lands in the same
+# function. Same contract, same caveat.
+_MIGRATION_REV = 6
 
 
 def _schema_hash() -> str:
@@ -1717,6 +1726,9 @@ class PostgresStore:
             ("second_step_failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("second_step_locked_until", "DOUBLE PRECISION"),
             ("second_step_lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
+            # ADR 0197 Amendment A (BACKLOG #1131). FALSE on an existing row reads "the holder
+            # chose this credential", which keeps the account LOCKABLE -- the closed direction.
+            ("password_generated", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -5278,9 +5290,9 @@ class PostgresStore:
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
         """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns the
-        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT to
-        re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry wake on a
-        float — WS-C; see the base contract)."""
+        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT or
+        PENDING to re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry
+        wake on a float — WS-C; see the base contract)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
@@ -5295,20 +5307,24 @@ class PostgresStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
+                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT instead — converting a
                 # permitted duplicate into a forbidden strand. Amendment A (BACKLOG #2078, #2348) gives
-                # the retry branch a STATUS term instead: it re-pends only a row still INFLIGHT, so a
-                # late worker cannot re-pend a row that is already DONE, DEAD or CANCELLED. A row it
-                # declines is not INFLIGHT, so it cannot strand one. ONE statement with a conditional
-                # suffix, not two: the DEAD/retry decision is already computed above, strictly before
-                # the UPDATE.
+                # the retry branch a STATUS term instead, widened by owner ruling 2026-09-29: it
+                # re-pends a row that is INFLIGHT or PENDING, so a late worker cannot re-pend a row
+                # that is already DONE, DEAD or CANCELLED, and a row reclaim_expired_leases re-pended
+                # mid-send still takes this attempt's backoff, event and last_error. A row it declines
+                # is terminal, so it cannot strand one. ONE statement with a conditional suffix, not
+                # two: the DEAD/retry decision is already computed above, strictly before the UPDATE.
                 retrying = status == OutboxStatus.PENDING.value
                 guard, guard_args = (
-                    (" AND status=$6", [OutboxStatus.INFLIGHT.value])
+                    (
+                        " AND status IN ($6, $7)",
+                        [OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value],
+                    )
                     if retrying
                     else self._resolve_guard(6)
                 )
@@ -5325,9 +5341,9 @@ class PostgresStore:
                     *guard_args,
                 )
                 if retrying:
-                    # Not through _exec_terminal: a miss here is a no-op, never a fence. It writes
-                    # nothing, not even the 'failed' event, and still returns the retry time so a row
-                    # the lease sweep left PENDING gets its wake.
+                    # Not through _exec_terminal: a miss here is a no-op, never a fence. A miss is a
+                    # terminal (or vanished) row. It writes nothing, not even the 'failed' event, and
+                    # still returns the retry time, as Amendment A's ruling item 3 chose.
                     if _rowcount(await conn.execute(sql, *args)) == 0:
                         return next_at
                 else:
@@ -5363,8 +5379,9 @@ class PostgresStore:
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
         all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
-        On the retry branch a member no longer INFLIGHT is skipped and keeps its own state (ADR 0157
-        Amendment A); the shared retry time still comes back when every member was skipped."""
+        On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
+        own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
+        when every member was skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
@@ -5382,17 +5399,22 @@ class PostgresStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                        retry.backoff_seconds
+                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the identical DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the whole loop: a fence on any member raises out
                 # and rolls all N back, matching the all-or-nothing contract the docstring promises.
-                # Amendment A, as mark_failed: on the retry branch a member no longer INFLIGHT is
-                # skipped, event and all, and the members still INFLIGHT re-pend together.
+                # Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a terminal
+                # member is skipped, event and all, and the INFLIGHT and PENDING members re-pend
+                # together to the one shared deadline.
                 retrying = status == OutboxStatus.PENDING.value
                 guard, guard_args = (
-                    (" AND status=$6", [OutboxStatus.INFLIGHT.value])
+                    (
+                        " AND status IN ($6, $7)",
+                        [OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value],
+                    )
                     if retrying
                     else self._resolve_guard(6)
                 )
@@ -5495,6 +5517,19 @@ class PostgresStore:
         count = int(row["n"]) if row is not None else 0
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
+
+    async def inflight_by_lane(self, *, stage: str) -> dict[str, tuple[int, float]]:
+        """``{lane: (inflight_count, oldest_claimed_at)}`` at ``stage`` (see the protocol). Every claim
+        writes ``updated_at`` with the lease, and no lease renewal rewrites it, so the smallest
+        ``updated_at`` is the oldest claim time."""
+        lane_col = self._lane_col(stage)
+        rows = await self._fetchall(
+            f"SELECT {lane_col} AS lane, COUNT(*) AS n, MIN(updated_at) AS oldest FROM queue"
+            f" WHERE stage=$1 AND status=$2 GROUP BY {lane_col}",
+            stage,
+            OutboxStatus.INFLIGHT.value,
+        )
+        return {str(r["lane"]): (int(r["n"]), float(r["oldest"])) for r in rows}
 
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
@@ -6986,6 +7021,7 @@ class PostgresStore:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
 
@@ -7005,6 +7041,13 @@ class PostgresStore:
         if until is not None:
             params.append(until)
             clauses.append(f"ts <= ${len(params)}")
+        if exclude is not None:
+
+            def bind(value: str) -> str:
+                params.append(value)
+                return f"${len(params)}"
+
+            clauses.extend(exclude.clauses(bind))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
@@ -7281,18 +7324,21 @@ class PostgresStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        password_generated: bool,
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
         audit: AuditAppend | None = None,
     ) -> None:
+        check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
         sql = (
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until, directory_object_id)"
-            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11)"
+            " must_change_password, failed_attempts, locked_until, directory_object_id,"
+            " password_generated)"
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11,$12)"
         )
         params = (
             user_id,
@@ -7306,6 +7352,7 @@ class PostgresStore:
             now if password_hash is not None else None,
             must_change_password,
             directory_object_id,
+            password_generated,
         )
         if audit is None:
             await self._execute(sql, *params)
@@ -7406,21 +7453,28 @@ class PostgresStore:
         user_id: str,
         *,
         password_hash: str,
+        password_generated: bool,
         must_change_password: bool = True,
+        require_totp: bool = False,
         now: float | None = None,
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
         # $2 is already `now`, so the claim term reuses it and the argument list is unchanged.
         claim_set = password_claim_set(must_change_password, "$2")
-        await self._execute(
-            "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
-            f"{claim_set}"
-            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=$2 WHERE id=$4",
-            password_hash,
-            now,
-            must_change_password,
-            user_id,
-        )
+        condition = rotation_factor_term("TRUE") if require_totp else ""
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
+                f"{claim_set}"
+                f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=$5, updated_at=$2"
+                f" WHERE id=$4{condition}",
+                password_hash,
+                now,
+                must_change_password,
+                user_id,
+                password_generated,
+            )
+        return _rowcount(result) > 0
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -7468,8 +7522,9 @@ class PostgresStore:
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
+            # ``last_totp_step`` too: see the SQLite twin (ADR 0197 Amendment A).
             "UPDATE users SET totp_secret=NULL, totp_enabled=FALSE, totp_enrolled_at=NULL,"
-            " totp_recovery_codes=NULL, updated_at=$1 WHERE id=$2",
+            " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=$1 WHERE id=$2",
             now,
             user_id,
         )
@@ -7734,8 +7789,8 @@ class PostgresStore:
         attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
-                " FROM users WHERE id=$1 FOR UPDATE",
+                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
+                " password_generated FROM users WHERE id=$1 FOR UPDATE",
                 user_id,
             )
             if row is None:
@@ -7753,6 +7808,7 @@ class PostgresStore:
                     auth_provider=str(row["auth_provider"]),
                     totp_enabled=bool(row["totp_enabled"]),
                 ),
+                lockable=lockout_arms(counter, password_generated=bool(row["password_generated"])),
             )
             await conn.execute(
                 f"UPDATE users SET {attempts_col}=$1, {until_col}=$2, {cycles_col}=$3,"

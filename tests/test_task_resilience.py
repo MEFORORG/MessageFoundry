@@ -28,6 +28,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, Stage
 from messagefoundry.store.store import MessageStatus, OutboxItem
 from messagefoundry.transports.file import FileSource
+from tests._admin_account import create_local_user_chosen
 
 
 async def _until(predicate: Any, timeout: float = 2.0) -> None:
@@ -681,6 +682,9 @@ async def test_a_claimer_that_keeps_dying_backs_off_and_never_resets_to_an_immed
     monkeypatch.setattr(stage_dispatcher, "_RESPAWN_STABLE_SECONDS", 0.05)
     store = _LaneStore(["L"])
     d = _dispatcher(store, ["L"], [])
+    # BACKLOG #2074 STOPs a lane that keeps killing its claimer. This test is about the respawn
+    # backoff, so keep the deaths coming for its whole run.
+    d._infra_fault_stop_after = 1000
     delays: list[float] = []
     real_spawn_task = d._spawn_task
 
@@ -793,7 +797,8 @@ async def test_status_names_a_pooled_stage_whose_claimer_is_down(
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         pw = "Viewer-pw-1609-long-enough"
-        uid = await service.create_local_user(
+        uid = await create_local_user_chosen(
+            service,
             username="vw",
             password=pw,
             display_name=None,
@@ -805,7 +810,7 @@ async def test_status_names_a_pooled_stage_whose_claimer_is_down(
         u = await service.store.get_user(uid)
         assert u is not None and u.password_hash is not None
         await service.store.set_password(
-            uid, password_hash=u.password_hash, must_change_password=False
+            uid, password_hash=u.password_hash, must_change_password=False, password_generated=False
         )
         await engine.start()
         runner = engine.registry_runner

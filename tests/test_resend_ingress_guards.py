@@ -47,6 +47,7 @@ from messagefoundry.pipeline.ingress_guards import (
 )
 from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore, Stage
+from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -111,7 +112,8 @@ async def _operator(engine: Engine) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="op",
         password=PW,
         display_name=None,
@@ -122,7 +124,7 @@ async def _operator(engine: Engine) -> AuthService:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     return service

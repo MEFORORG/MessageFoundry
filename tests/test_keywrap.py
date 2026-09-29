@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import base64
 import datetime
+import os
 import ssl
 import sys
 from collections.abc import Callable
@@ -25,8 +26,10 @@ from typing import Any, NamedTuple
 
 import pytest
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import keywrap
@@ -36,14 +39,18 @@ from tests._approved_key_wrap import (
     PBES2,
     PBKDF2,
     SCRYPT,
+    approved_pfx,
     integer,
     octets,
     oid,
     pem,
     pkcs8_pem,
+    pkcs12_bundle,
     seq,
     tlv,
+    with_pbmac1,
 )
+from tests._approved_key_wrap import _tlv_at as tlv_at
 
 _PASSPHRASE = "synthetic-test-passphrase"  # a fixture value, not a secret
 
@@ -671,3 +678,253 @@ def test_the_leaf_imports_only_the_standard_library() -> None:
     assert imported, "the walk found no imports at all"
     outside = sorted(m for m in imported if m.split(".")[0] not in sys.stdlib_module_names)
     assert outside == [], outside
+
+
+# --- phase 2: PKCS#12 bundles, SFTP keys and a database driver's client key ------------------
+
+
+def _p12_cert(key: ec.EllipticCurvePrivateKey) -> x509.Certificate:
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "p12.test")])
+    now = datetime.datetime.now(datetime.UTC)
+    return (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+
+
+def _p12_refusal(pfx: bytes, *, given: bool = True) -> str | None:
+    return keywrap.pkcs12_wrap_refusal(pfx, setting="s", unlock_setting="u", passphrase_given=given)
+
+
+def test_an_unencrypted_pkcs12_bundle_passes_whatever_its_mac(material: Material) -> None:
+    # Over clear bags the MAC's key guards no secret, so its PKCS#12-KDF derivation is not judged.
+    cert = _p12_cert(material.key)
+    clear = pkcs12.serialize_key_and_certificates(
+        b"x", material.key, cert, None, serialization.NoEncryption()
+    )
+    assert _p12_refusal(clear, given=False) is None
+
+
+def test_an_encrypted_pkcs12_bundle_with_no_mac_is_refused(material: Material) -> None:
+    # The approved bundle is the control: the same bytes with only the MacData dropped must flip.
+    approved = approved_pfx(material.key, _p12_cert(material.key), b"synthetic-pfx")
+    assert _p12_refusal(approved) is None
+    outer_start, _ = tlv_at(approved, 0)
+    _, after_version = tlv_at(approved, outer_start)
+    _, after_auth_safe = tlv_at(approved, after_version)
+    no_mac = seq(approved[outer_start:after_auth_safe])
+    refusal = _p12_refusal(no_mac)
+    assert refusal is not None and "carries no MAC" in refusal
+
+
+def test_a_pbmac1_mac_over_sha1_and_a_truncated_bundle_are_refused(material: Material) -> None:
+    cert = _p12_cert(material.key)
+    approved = approved_pfx(material.key, cert, b"synthetic-pfx")
+    assert _p12_refusal(approved) is None
+    sha1_prf = with_pbmac1(
+        pkcs12_bundle(material.key, cert, b"synthetic-pfx"),
+        b"synthetic-pfx",
+        iterations=600_000,
+        prf="sha1",
+    )
+    for bad, why in ((sha1_prf, "PBKDF2-HMAC-SHA-1"), (approved[:-4], "cannot read")):
+        refusal = _p12_refusal(bad)
+        assert refusal is not None and why in refusal
+
+
+def _rsa_pem(bits: int, fmt: serialization.PrivateFormat, *, encrypted: bool = False) -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+    encryption: serialization.KeySerializationEncryption = (
+        serialization.BestAvailableEncryption(_PASSPHRASE.encode())
+        if encrypted
+        else serialization.NoEncryption()
+    )
+    return key.private_bytes(serialization.Encoding.PEM, fmt, encryption).decode()
+
+
+def _ssh_string(raw: bytes, pos: int) -> tuple[bytes, int]:
+    length = int.from_bytes(raw[pos : pos + 4], "big")
+    return raw[pos + 4 : pos + 4 + length], pos + 4 + length
+
+
+def _ssh_field(value: bytes) -> bytes:
+    return len(value).to_bytes(4, "big") + value
+
+
+def _openssh_encrypted_by_hand() -> str:
+    """An OpenSSH-format key whose header says aes256-ctr under bcrypt, built without bcrypt.
+
+    cryptography writes an encrypted OpenSSH key only when the ``bcrypt`` package is installed, and
+    it arrives only with the ``sftp`` extra, which the CI test legs do not install. This takes a
+    real unencrypted key and rewrites its header to the openssh-key-v1 encrypted shape, with the
+    private section replaced by opaque bytes of the padded length. ``ssh_key_encrypted`` reads only
+    the header, so this exercises the same branch a real encrypted key does."""
+    pem_lines = _rsa_pem(2048, serialization.PrivateFormat.OpenSSH).splitlines()
+    header, footer = pem_lines[0], pem_lines[-1]
+    body = "".join(pem_lines[1:-1])
+    raw = base64.b64decode(body)
+    magic = b"openssh-key-v1\x00"
+    assert raw.startswith(magic)
+    pos = len(magic)
+    for _ in range(3):  # ciphername, kdfname, kdfoptions
+        _, pos = _ssh_string(raw, pos)
+    nkeys, pos = raw[pos : pos + 4], pos + 4
+    public, pos = _ssh_string(raw, pos)
+    private, _ = _ssh_string(raw, pos)
+    sealed = os.urandom(-(-len(private) // 16) * 16)
+    kdf_options = _ssh_field(os.urandom(16)) + (16).to_bytes(4, "big")
+    blob = (
+        magic
+        + _ssh_field(b"aes256-ctr")
+        + _ssh_field(b"bcrypt")
+        + _ssh_field(kdf_options)
+        + nkeys
+        + _ssh_field(public)
+        + _ssh_field(sealed)
+    )
+    text = base64.b64encode(blob).decode()
+    lines = [text[i : i + 70] for i in range(0, len(text), 70)]
+    return "\n".join([header, *lines, footer, ""])
+
+
+@pytest.fixture(scope="module")
+def sftp_keys() -> dict[str, str]:
+    legacy = serialization.PrivateFormat.TraditionalOpenSSL
+    openssh = serialization.PrivateFormat.OpenSSH
+    try:
+        openssh_encrypted = _rsa_pem(2048, openssh, encrypted=True)
+    except UnsupportedAlgorithm:  # no bcrypt: the sftp extra is not installed
+        openssh_encrypted = _openssh_encrypted_by_hand()
+    return {
+        "plain-2048": _rsa_pem(2048, legacy),
+        "plain-1024": _rsa_pem(1024, legacy),
+        "legacy-encrypted": _rsa_pem(2048, legacy, encrypted=True),
+        "openssh-encrypted": openssh_encrypted,
+        "openssh-plain": _rsa_pem(2048, openssh),
+    }
+
+
+def test_the_hand_built_openssh_key_reads_as_encrypted_and_its_plain_twin_does_not() -> None:
+    # The control for the fallback above: the same parser must say False for the unencrypted key
+    # the fallback starts from, or a True here proves nothing.
+    plain = _rsa_pem(2048, serialization.PrivateFormat.OpenSSH)
+    assert keywrap.ssh_key_encrypted(plain.encode()) is False
+    assert keywrap.ssh_key_encrypted(_openssh_encrypted_by_hand().encode()) is True
+
+
+def _sftp(key: str, key_password: str | None = None) -> Any:
+    from messagefoundry.transports.remotefile import _SftpClient
+
+    settings: dict[str, Any] = {"host": "sftp.example.test", "private_key": key}
+    if key_password is not None:
+        settings["key_password"] = key_password
+    return _SftpClient(settings)
+
+
+@pytest.mark.parametrize(
+    ("which", "key_password", "why"),
+    [
+        ("plain-2048", _PASSPHRASE, "key_password is refused"),
+        ("legacy-encrypted", _PASSPHRASE, "key_password is refused"),
+        ("legacy-encrypted", None, "private_key is encrypted"),
+        ("openssh-encrypted", None, "private_key is encrypted"),
+    ],
+)
+def test_the_sftp_connector_refuses_a_passphrase_or_an_encrypted_key(
+    sftp_keys: dict[str, str], which: str, key_password: str | None, why: str
+) -> None:
+    with pytest.raises(ValueError, match=why) as caught:
+        _sftp(sftp_keys[which], key_password)
+    assert _PASSPHRASE not in str(caught.value)
+
+
+@pytest.mark.parametrize("which", ["plain-2048", "openssh-plain"])
+def test_the_sftp_connector_still_builds_with_an_unencrypted_key(
+    sftp_keys: dict[str, str], which: str
+) -> None:
+    assert _sftp(sftp_keys[which]) is not None
+
+
+@pytest.mark.parametrize("which", ["plain-1024", "plain-1024-openssh"])
+def test_an_sftp_rsa_key_under_2048_bits_is_refused_at_construction(
+    sftp_keys: dict[str, str], which: str
+) -> None:
+    # Refused before any connect, so `check` reports it; no paramiko needed. The 2048-bit keys
+    # building in the test above are the control.
+    key = (
+        _rsa_pem(1024, serialization.PrivateFormat.OpenSSH)
+        if which == "plain-1024-openssh"
+        else sftp_keys[which]
+    )
+    with pytest.raises(ValueError, match="RSA-1024, below the 2048-bit floor"):
+        _sftp(key)
+
+
+def test_the_sftp_key_has_a_2048_bit_rsa_floor(sftp_keys: dict[str, str]) -> None:
+    paramiko = pytest.importorskip("paramiko")
+    from messagefoundry.transports.remotefile import _RemoteError
+
+    assert _sftp(sftp_keys["plain-2048"])._load_key(paramiko).get_bits() == 2048
+    with pytest.raises(_RemoteError, match="RSA-1024, below the 2048-bit floor"):
+        _sftp(sftp_keys["plain-1024"])._load_key(paramiko)
+
+
+def _odbc(tmp_path: Path, key_bytes: bytes | None, sslpassword: str | None) -> str:
+    from messagefoundry.transports.database import _build_odbc_dsn
+
+    params: dict[str, str] = {"SSLmode": "verify-full"}
+    if key_bytes is not None:
+        params["sslkey"] = _write(tmp_path, "client.key", key_bytes)
+    if sslpassword is not None:
+        params["sslpassword"] = sslpassword
+    settings = {
+        "dialect": "generic",
+        "odbc_driver": "PostgreSQL Unicode",
+        "server": "db.test",
+        "odbc_params": params,
+    }
+    return _build_odbc_dsn(settings)
+
+
+@pytest.mark.parametrize(("wrap", "why"), _WEAK_CASES)
+def test_a_database_driver_key_with_a_weak_wrap_is_refused(
+    tmp_path: Path, material: Material, wrap: str, why: str
+) -> None:
+    with pytest.raises(KeyWrapRefused, match=why):
+        _odbc(tmp_path, material.wraps[wrap], _PASSPHRASE)
+
+
+def test_a_database_driver_key_needs_its_sslpassword_and_passes_when_approved(
+    tmp_path: Path, material: Material
+) -> None:
+    with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
+        _odbc(tmp_path, material.wraps["approved"], None)
+    assert "sslkey=" in _odbc(tmp_path, material.wraps["approved"], _PASSPHRASE)
+    assert "sslkey=" not in _odbc(tmp_path, None, None)
+
+
+@pytest.mark.parametrize("keyword", ["sslkey", "sslpassword"])
+def test_a_driver_key_keyword_given_twice_in_different_case_is_refused(
+    tmp_path: Path, material: Material, keyword: str
+) -> None:
+    # The driver reads one copy and the check would read the other, so neither is trusted.
+    from messagefoundry.transports.database import _build_odbc_dsn
+
+    path = _write(tmp_path, "client.key", material.wraps["approved"])
+    params = {"sslkey": path, "sslpassword": _PASSPHRASE, keyword.upper(): "other"}
+    settings = {
+        "dialect": "generic",
+        "odbc_driver": "PostgreSQL Unicode",
+        "server": "db.test",
+        "odbc_params": params,
+    }
+    with pytest.raises(ValueError, match=f"names {keyword} more than once"):
+        _build_odbc_dsn(settings)
+    del params[keyword.upper()]
+    assert "sslkey=" in _build_odbc_dsn(settings)

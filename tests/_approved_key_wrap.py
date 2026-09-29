@@ -18,13 +18,17 @@ from __future__ import annotations
 import base64
 import os
 
-from cryptography.hazmat.primitives import hashes, padding, serialization
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, hmac, padding, serialization
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.hazmat.primitives.serialization.pkcs12 import PKCS12PrivateKeyTypes
 
 PBES2 = "1.2.840.113549.1.5.13"
 PBKDF2 = "1.2.840.113549.1.5.12"
+PBMAC1 = "1.2.840.113549.1.5.14"
 SCRYPT = "1.3.6.1.4.1.11591.4.11"
 AES256_CBC = "2.16.840.1.101.3.4.1.42"
 NULL = b"\x05\x00"
@@ -118,3 +122,83 @@ def pkcs8_pem(
 def approved_pkcs8_pem(key: PrivateKeyTypes, passphrase: str | bytes) -> bytes:
     """PKCS#8 PBES2 with PBKDF2-HMAC-SHA-256 at 600,000 iterations: the floor, and accepted."""
     return pkcs8_pem(key, passphrase, prf="sha256", iterations=600_000)
+
+
+def approved_pfx(
+    key: PKCS12PrivateKeyTypes,
+    cert: x509.Certificate,
+    passphrase: bytes,
+    cas: list[x509.Certificate] | None = None,
+    *,
+    iterations: int = 600_000,
+) -> bytes:
+    """A PKCS#12 bundle the engine accepts: PBES2 AES-256-CBC bags at ``iterations`` and a PBMAC1
+    (RFC 9579) MAC keyed by PBKDF2-HMAC-SHA-256 at ``iterations``.
+
+    ``cryptography`` writes the bags but cannot write PBMAC1: its own MAC is keyed by the PKCS#12
+    KDF, which the engine refuses. So its MacData is replaced here by a PBMAC1 one over the same
+    authSafe content. PBMAC1's password is the UTF-8 bytes, measured against OpenSSL 3.5.7."""
+    return with_pbmac1(
+        pkcs12_bundle(key, cert, passphrase, cas, iterations=iterations),
+        passphrase,
+        iterations=iterations,
+    )
+
+
+def pkcs12_bundle(
+    key: PKCS12PrivateKeyTypes,
+    cert: x509.Certificate,
+    passphrase: bytes,
+    cas: list[x509.Certificate] | None = None,
+    *,
+    iterations: int = 600_000,
+    mac_hash: hashes.HashAlgorithm | None = None,
+) -> bytes:
+    """``cryptography``'s own bundle: PBES2 AES-256-CBC bags at ``iterations``, and its MAC keyed
+    by the PKCS#12 KDF over ``mac_hash`` (SHA-256 by default)."""
+    enc = (
+        serialization.PrivateFormat.PKCS12.encryption_builder()
+        .kdf_rounds(iterations)
+        .key_cert_algorithm(pkcs12.PBES.PBESv2SHA256AndAES256CBC)
+        .hmac_hash(mac_hash or hashes.SHA256())
+        .build(passphrase)
+    )
+    return pkcs12.serialize_key_and_certificates(b"mefor", key, cert, cas, enc)
+
+
+def _tlv_at(buf: bytes, pos: int) -> tuple[int, int]:
+    """(value start, value end) of the DER TLV at ``pos``."""
+    first = buf[pos + 1]
+    if first < 0x80:
+        return pos + 2, pos + 2 + first
+    count = first & 0x7F
+    start = pos + 2 + count
+    return start, start + int.from_bytes(buf[pos + 2 : pos + 2 + count], "big")
+
+
+def with_pbmac1(pfx: bytes, passphrase: bytes, *, iterations: int, prf: str = "sha256") -> bytes:
+    """``pfx`` with its MacData replaced by a PBMAC1 one keyed by PBKDF2 over ``prf``."""
+    outer_start, _ = _tlv_at(pfx, 0)
+    _, after_version = _tlv_at(pfx, outer_start)
+    auth_safe_start, after_auth_safe = _tlv_at(pfx, after_version)
+    # authSafe ContentInfo: contentType OID, then [0] EXPLICIT OCTET STRING. The MAC covers the
+    # OCTET STRING's value.
+    _, after_type = _tlv_at(pfx, auth_safe_start)
+    explicit_start, _ = _tlv_at(pfx, after_type)
+    content_start, content_end = _tlv_at(pfx, explicit_start)
+    prf_oid, digest = PRF[prf]
+    salt = os.urandom(16)
+    mac_key = PBKDF2HMAC(algorithm=digest, length=32, salt=salt, iterations=iterations).derive(
+        passphrase
+    )
+    signer = hmac.HMAC(mac_key, digest)
+    signer.update(pfx[content_start:content_end])
+    params = seq(
+        seq(
+            oid(PBKDF2),
+            seq(octets(salt), integer(iterations), integer(32), seq(oid(prf_oid), NULL)),
+        ),
+        seq(oid(prf_oid), NULL),
+    )
+    mac_data = seq(seq(seq(oid(PBMAC1), params), octets(signer.finalize())), octets(b"\x00" * 8))
+    return seq(pfx[outer_start:after_auth_safe], mac_data)

@@ -38,6 +38,7 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
 
@@ -86,7 +87,8 @@ async def _deployer(engine: Engine, *channels: str) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="deployer",
         password=PW,
         display_name=None,
@@ -99,7 +101,7 @@ async def _deployer(engine: Engine, *channels: str) -> AuthService:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     return service
 
