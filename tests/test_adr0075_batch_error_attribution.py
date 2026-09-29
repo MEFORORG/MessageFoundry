@@ -17,10 +17,10 @@ rollback + preserved native code for BOTH flag states.
 
 from __future__ import annotations
 
-import adr0075_batch_harness as h
 import pytest
 
 from messagefoundry.store import sqlserver as ss
+from tests import adr0075_batch_harness as h
 
 
 class FakeODBCError(Exception):

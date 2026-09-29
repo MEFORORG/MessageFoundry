@@ -10,14 +10,15 @@ import asyncio
 import pytest
 
 from messagefoundry.config.settings import UpdateCheckSettings
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.update_check import (
     UpdateCheckRunner,
     compare_versions,
 )
 
 
-class _RecordingSink:
-    """A minimal AlertSink stub capturing update_available calls (structural — no inheritance)."""
+class _RecordingSink(LoggingAlertSink):
+    """A minimal AlertSink stub capturing update_available calls; the rest log as the default does."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []

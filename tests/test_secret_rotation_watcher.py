@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import hmac
+from typing import Any
 
 import pytest
 
@@ -107,7 +108,7 @@ class _RecordingSink:
         )
 
 
-def _reconcile(store: _FakeMetaStore, **kw: object) -> dict[str, object]:
+def _reconcile(store: _FakeMetaStore, **kw: object) -> dict[str, SecretStamp]:
     settings = kw.pop("settings", None) or SecretRotationSettings()
     return asyncio.run(
         reconcile_rotation_meta(
@@ -153,8 +154,8 @@ def test_new_class_stamps_tracked_since_today_as_age_floor() -> None:
     store = _FakeMetaStore()
     stamps = _reconcile(store)
     dek = stamps[_DEK]
-    assert dek.tracked_since == _TODAY  # type: ignore[attr-defined]
-    assert dek.last_rotated == _TODAY  # type: ignore[attr-defined]
+    assert dek.tracked_since == _TODAY
+    assert dek.last_rotated == _TODAY
     assert store.rows[_DEK].fingerprint == "dekid-aaa"
 
 
@@ -165,10 +166,8 @@ def test_fingerprint_change_resets_the_clock() -> None:
     store = _FakeMetaStore(rows={_DEK: prior})
     stamps = _reconcile(store, dek_key_id="dekid-NEW")
     dek = stamps[_DEK]
-    assert dek.last_rotated == _TODAY  # reset on change  # type: ignore[attr-defined]
-    assert dek.tracked_since == datetime.date(
-        2025, 1, 1
-    )  # floor preserved  # type: ignore[attr-defined]
+    assert dek.last_rotated == _TODAY  # reset on change
+    assert dek.tracked_since == datetime.date(2025, 1, 1)  # floor preserved
     assert store.rows[_DEK].fingerprint == "dekid-NEW"
 
 
@@ -179,7 +178,7 @@ def test_unchanged_class_is_not_rewritten() -> None:
     stamps = _reconcile(store, dek_key_id="dekid-SAME")
     assert store.upserts == []  # untouched
     dek = stamps[_DEK]
-    assert dek.last_rotated == datetime.date(2025, 3, 1)  # type: ignore[attr-defined]
+    assert dek.last_rotated == datetime.date(2025, 3, 1)
 
 
 def test_reconcile_enumerates_all_held_classes() -> None:
@@ -494,9 +493,9 @@ class _CompareCounter:
         self.calls = 0
         self._real = hmac.compare_digest
 
-    def __call__(self, a: object, b: object) -> bool:
+    def __call__(self, a: Any, b: Any) -> bool:
         self.calls += 1
-        return bool(self._real(a, b))  # type: ignore[arg-type]
+        return bool(self._real(a, b))
 
 
 def test_fingerprint_comparison_goes_through_compare_digest(
@@ -537,8 +536,8 @@ def test_non_ascii_stored_fingerprint_is_a_rotation_not_a_type_error() -> None:
     store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
     stamps = _reconcile(store, dek_key_id="dekid-aaa")
     dek = stamps[_DEK]
-    assert dek.last_rotated == _TODAY  # type: ignore[attr-defined]
-    assert dek.tracked_since == datetime.date(2025, 1, 1)  # type: ignore[attr-defined]
+    assert dek.last_rotated == _TODAY
+    assert dek.tracked_since == datetime.date(2025, 1, 1)
     assert store.rows[_DEK].fingerprint == "dekid-aaa"
 
 
@@ -548,7 +547,7 @@ def test_lone_surrogate_stored_fingerprint_is_a_rotation_not_a_type_error() -> N
     prior = SecretRotationMetaRow(_DEK, "\ud800", "2025-01-01", "2025-01-01")
     store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
     stamps = _reconcile(store, dek_key_id="dekid-aaa")
-    assert stamps[_DEK].last_rotated == _TODAY  # type: ignore[attr-defined]
+    assert stamps[_DEK].last_rotated == _TODAY
 
 
 def test_fingerprint_bytes_is_total_and_injective() -> None:
