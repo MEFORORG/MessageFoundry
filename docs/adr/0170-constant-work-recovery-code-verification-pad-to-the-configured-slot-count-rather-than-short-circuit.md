@@ -105,18 +105,25 @@ whose step the store has already consumed (a replay, or a second use inside one 
 False with no argon2 work. A wrong code returned False after the full recovery-code walk. Both are
 refusals, so timing was the only thing that told them apart.
 
-`_verify_second_factor` now calls `_equalise_refused_totp` before that refusal. It does the same
-store read of the recovery hashes and runs the same `slots = max(mfa_recovery_code_count,
-len(real))` argon2 verifies through `_argon2`, each against `_DUMMY_PASSWORD_HASH` with the result
-discarded. A parametrized test pins the count: 0 for a fresh code, `slots` for a replay, and
-`slots` for a wrong code, which is the control. It was red first: the replay row made 0 verifies.
+`_verify_second_factor` now marks that refusal and falls through to the SAME recovery-code walk: the
+same store read, the same hashes (the live ones, then `_DUMMY_PASSWORD_HASH` padding) and the same
+`slots` count. It refuses after the walk, whatever the walk found, so a refused TOTP code can never
+spend a recovery code. A 6-digit TOTP code cannot match a dashed recovery code in any case. A
+parametrized test pins the hashes each verify ran against, not only their number: none for a fresh
+code, and the walk's own list for a replay and for a wrong code, which is the control. It was red
+first: the replay row made 0 verifies.
+
+A first version ran `slots` verifies against the dummy hash alone. Review caught that it would drift
+from the wrong-code path once the live codes and the dummy were minted under different argon2
+parameters, because nothing rehashes a recovery code. Falling through to the one walk removes that
+second copy of the rule.
 
 **Why this adds no amplification ceiling.** The same argument as the Decision. A wrong code already
-costs `slots` verifies, so a replay now costs what a wrong code costs, under the same semaphore and
-the same per-account lockout. Only the refusal path changed.
+costs the walk, so a replay now costs what a wrong code costs, under the same semaphore and the same
+per-account lockout. Only the refusal path changed.
 
-**What it now covers.** Equal argon2 work across every refused second-factor attempt on this
-method: a wrong code, a wrong recovery code, and a replayed TOTP code.
+**What it now covers.** At least these refusals on this method now do the same argon2 work: a wrong
+TOTP code, a wrong recovery code, and a replayed TOTP code.
 
 **What it still does not cover.** Each limb below is stated so this amendment is not read as more
 than it is:
@@ -124,12 +131,14 @@ than it is:
 - **A TOTP success stays fast.** It does no argon2 work, so a success and a refusal differ by the
   whole walk. The response already says which one happened. Running the walk on every success
   would add it to every normal MFA login, and that trade is the owner's call, not made here.
+- **An empty or blank code is refused before any work**, as it was before. That branch depends only
+  on what the caller sent, not on any stored secret.
 - **The replay does one more store round trip than a wrong code**, the `consume_totp_step` write
   attempt. That is the same line this ADR already draws for `consume_recovery_code_hash`.
-- **The replay verifies only against the dummy hash**, where a wrong code verifies against the live
-  hashes and pads with the dummy. The costs match only while the stored hashes and the dummy share
-  argon2 parameters. A change to `hash_password`'s parameters would leave older codes costing
-  differently, which the padding above already assumes away.
+- **The padding caveat is unchanged.** Dummy slots cost the same as live ones only while both were
+  hashed under the same argon2 parameters. That holds for every refusal alike now.
+- **The combined sign-in does not use this method.** `_check_both_factors` checks a TOTP code only,
+  and its refusals are padded by the failure-deadline pad instead. Nothing here changes it.
 - **Constant work, not constant time**, as above. No timing measurement has been run.
 - **Nothing outside this method.** The other sites the 11.2.4 cell names are not touched here, and
   this amendment makes no claim about them or about the cell's verdict. No re-score follows from it.

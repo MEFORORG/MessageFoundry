@@ -24,8 +24,9 @@ exactly like ``load_config`` itself.
 from __future__ import annotations
 
 import hashlib
-import hmac
 from pathlib import Path
+
+from messagefoundry.credential import constant_time_equal
 
 __all__ = ["config_fingerprint", "config_fingerprint_detail", "fingerprint_matches"]
 
@@ -111,16 +112,11 @@ def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
 def fingerprint_matches(current: object, loaded: str) -> bool:
     """Whether a recomputed fingerprint equals the loaded one, compared in constant time.
 
-    ASVS 11.2.4 (BACKLOG #1167): ``hmac.compare_digest`` over bytes, never ``==``, which stops at
-    the first differing character. Both digests are public, so this closes a bare compare rather
-    than a leak. Total: a ``current`` that is not a string (a missing key) never matches, and
-    ``surrogatepass`` keeps the encode from raising on any string CPython can hold.
+    ASVS 11.2.4 (BACKLOG #1167): never ``==``, which stops at the first differing character. Both
+    digests are public, so this closes a bare compare rather than a leak. Total: a ``current`` that
+    is not a string (a missing key) never matches.
     """
-    if not isinstance(current, str):
-        return False
-    return hmac.compare_digest(
-        current.encode("utf-8", "surrogatepass"), loaded.encode("utf-8", "surrogatepass")
-    )
+    return isinstance(current, str) and constant_time_equal(current, loaded)
 
 
 def _git_head(start: Path) -> str | None:

@@ -729,6 +729,11 @@ def _spy_compare_digest(monkeypatch: pytest.MonkeyPatch) -> list[tuple[bytes, by
     return seen
 
 
+def _compared_with(seen: list[tuple[bytes, bytes]], value: bytes) -> list[bytes]:
+    """The other operand of every recorded compare that involved ``value``, in either position."""
+    return sorted(b if a == value else a for a, b in seen if value in (a, b))
+
+
 async def test_passkey_removal_compares_every_credential_in_constant_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -750,7 +755,7 @@ async def test_passkey_removal_compares_every_credential_in_constant_time(
 
         seen = _spy_compare_digest(monkeypatch)
         assert await service.delete_webauthn_credential(identity, wanted) is True
-        against_wanted = sorted(a for a, b in seen if b == wanted.encode("ascii"))
+        against_wanted = _compared_with(seen, wanted.encode("ascii"))
         assert against_wanted == sorted(c.credential_id_hash.encode("ascii") for c in creds), (
             "every stored credential must be compared against the presented hash, "
             f"not only up to the match: {against_wanted}"
@@ -772,7 +777,7 @@ def test_challenge_rekey_compares_the_token_hash_in_constant_time(
 
     seen = _spy_compare_digest(monkeypatch)
     assert cache.rekey("old-hash", "new-hash") == 1
-    assert sorted(a for a, b in seen if b == b"old-hash") == [b"old-hash", b"other-hash"]
+    assert _compared_with(seen, b"old-hash") == [b"old-hash", b"other-hash"]
 
     assert cache.pop(("old-hash", "assert")) is None
     moved = cache.pop(("new-hash", "assert"))

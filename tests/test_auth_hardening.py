@@ -607,32 +607,31 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
 
 
 @pytest.mark.parametrize(
-    ("present", "expect_ok", "expect_verifies"),
-    [("fresh", True, 0), ("replayed", False, 10), ("wrong", False, 10)],
+    ("present", "expect_ok"), [("fresh", True), ("replayed", False), ("wrong", False)]
 )
 async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason(
-    engine: Engine,
-    monkeypatch: pytest.MonkeyPatch,
-    present: str,
-    expect_ok: bool,
-    expect_verifies: int,
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, present: str, expect_ok: bool
 ) -> None:
     """A replayed TOTP and a wrong code must both fail after the same argon2 work (#1167, ADR 0170).
 
     A replayed code matches the secret, so the branch used to return the store's refusal with no
     argon2 work at all, while a wrong code fell through to the full recovery-code walk. Both return
     False, and the wall clock told them apart. The ``wrong`` row is the control: it already paid
-    the walk, so it pins the count the ``replayed`` row must match. A success stays fast (zero), and
+    the walk, so it pins the work the ``replayed`` row must match. A success stays fast (zero), and
     is not claimed to be equal.
+
+    The HASHES are pinned as well as the count: a replay that padded with the dummy hash alone
+    would cost differently from a wrong code as soon as the live codes and the dummy were minted
+    under different argon2 parameters.
     """
     import messagefoundry.auth.service as svc
     from messagefoundry.auth import totp
 
-    calls = {"n": 0}
+    used: list[str] = []
     real = svc.verify_password
 
     def counting(stored_hash: str, password: str) -> bool:
-        calls["n"] += 1
+        used.append(stored_hash)
         return real(stored_hash, password)
 
     monkeypatch.setattr(svc, "verify_password", counting)
@@ -645,9 +644,9 @@ async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason
     secret = totp.generate_secret()
     await engine.store.set_totp_secret(user.id, secret=secret)
     # Fewer live codes than slots, so a walk that forgot the padding would show as 2, not 10.
-    await engine.store.enable_totp(
-        user.id, recovery_code_hashes=[hash_password(c) for c in ("AAAA-1111", "BBBB-2222")]
-    )
+    live = [hash_password(c) for c in ("AAAA-1111", "BBBB-2222")]
+    await engine.store.enable_totp(user.id, recovery_code_hashes=live)
+    walk = live + [svc._DUMMY_PASSWORD_HASH] * (slots - len(live))
     # A fixed arrival moment, so the step cannot roll over between minting and verifying the code.
     arrived = 1_900_000_000.0
     code = totp.totp(secret, now=arrived)
@@ -656,14 +655,18 @@ async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason
     elif present == "wrong":
         code = f"{(int(code) + 1) % 1_000_000:06d}"
 
-    calls["n"] = 0
+    used.clear()
     ok = await service._verify_second_factor(user, code, arrived=arrived)
 
     assert ok is expect_ok
-    assert calls["n"] == expect_verifies, (
-        f"{present}: {calls['n']} argon2 verifies, expected {expect_verifies}. A replayed code "
+    expected = [] if expect_ok else walk
+    assert len(used) == len(expected), (
+        f"{present}: {len(used)} argon2 verifies, expected {len(expected)}. A replayed code "
         "making 0 means the TOTP branch still returns before the recovery-code work"
     )
+    assert used == expected, f"{present}: the verifies did not run against the walk's own hashes"
+    if present == "replayed":
+        assert await engine.store.get_recovery_code_hashes(user.id) == live, "a code was spent"
 
 
 # --- L13: a secret in the config file is warned about ------------------------

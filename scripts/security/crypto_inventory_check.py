@@ -313,10 +313,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/oidc_http.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     "messagefoundry/auth/passwords.py": frozenset({"argon2"}),
     "messagefoundry/auth/policy.py": frozenset({"hashlib"}),
-    # BACKLOG #1167 (ASVS 11.2.4): hmac.compare_digest for the passkey credential-id-hash match.
-    "messagefoundry/auth/service.py": frozenset(
-        {"hmac", "messagefoundry.config.tls_policy", "secrets"}
-    ),
+    "messagefoundry/auth/service.py": frozenset({"messagefoundry.config.tls_policy", "secrets"}),
     "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
     # WP #285 (ASVS 6.7.1): SHA-256 fingerprint of an operator-supplied auth-path trust anchor
@@ -331,12 +328,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # [webauthn] extra, lazy-imported inside this module's functions) performs the COSE signature
     # verification via cryptography — a CRYPTO_LIBRARY_MODULES trigger, so the delegated verification
     # is a first-class inventory token here, not merely §4 prose.
-    # BACKLOG #1167 (ASVS 11.2.4): hmac.compare_digest for the ceremony-cache token-hash rekey.
-    "messagefoundry/auth/webauthn.py": frozenset({"hmac", "secrets", "webauthn"}),
+    "messagefoundry/auth/webauthn.py": frozenset({"secrets", "webauthn"}),
     # ADR 0041 (D1): SHA-256 content fingerprint of a loaded config bundle, recorded in the
     # config_reload audit to bind reviewed-commit -> loaded-bytes (integrity/attribution, not a secret).
-    # BACKLOG #1167 (ASVS 11.2.4): fingerprint_matches compares two of them with hmac.compare_digest.
-    "messagefoundry/config/fingerprint.py": frozenset({"hashlib", "hmac"}),
+    "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
     # ADR 0154 (D6): the neutral credential leaf both the transports and the API depend on.
@@ -924,7 +919,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/policy.py": frozenset({"hash:hashlib.sha1"}),
     "messagefoundry/auth/service.py": frozenset(
         {
-            "compare:hmac.compare_digest",  # BACKLOG #1167: the passkey credential-id-hash match
+            "compare:via messagefoundry.credential",  # BACKLOG #1167: the passkey credential match
             "compare:via messagefoundry.auth.oidc.claims",
             "compare:via messagefoundry.auth.oidc.flow",
             "compare:via messagefoundry.auth.totp",
@@ -965,7 +960,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/auth/webauthn.py": frozenset(
         {
-            "compare:hmac.compare_digest",  # BACKLOG #1167: ChallengeCache.rekey
+            "compare:via messagefoundry.credential",  # BACKLOG #1167: ChallengeCache.rekey
             "csprng:secrets.token_bytes",
             "key_cert:webauthn.helpers.decode_credential_public_key",
             "key_cert:webauthn.helpers.decoded_public_key_to_cryptography",
@@ -975,7 +970,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #1167: fingerprint_matches, the constant-time drift compare.
     "messagefoundry/config/fingerprint.py": frozenset(
-        {"compare:hmac.compare_digest", "hash:hashlib.sha256"}
+        {"compare:via messagefoundry.credential", "hash:hashlib.sha256"}
     ),
     # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
     # tls_policy.assert_hvac_tls_suites and mounts it. This row replaced an IMPORT_ONLY entry that
@@ -1019,7 +1014,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/config/wiring.py": frozenset({"hash:hashlib.sha256"}),
     "messagefoundry/credential.py": frozenset(
-        {"compare:hmac.compare_digest[sha256]", "hash:hashlib.sha256"}
+        {
+            "compare:hmac.compare_digest",  # BACKLOG #1167: constant_time_equal, over raw bytes
+            "compare:hmac.compare_digest[sha256]",
+            "hash:hashlib.sha256",
+        }
     ),
     "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
     "messagefoundry/logging_setup.py": frozenset(

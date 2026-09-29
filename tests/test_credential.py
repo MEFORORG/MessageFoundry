@@ -172,3 +172,20 @@ def test_the_issuer_matcher_is_deny_by_default() -> None:
     # The leaf's own issuer FIELD is ignored: the issuing CA writes it, so it proves nothing.
     field_only = {"subject": peercert["subject"], "issuer": ((("commonName", "Service CA"),),)}
     assert client_cert_principal_under_issuer(field_only, issuer_map) is None
+
+
+def test_constant_time_equal_is_total_and_exact() -> None:
+    """BACKLOG #1167 (ASVS 11.2.4): the digest compare the sweep routes through.
+
+    Two empty values ARE equal here, unlike ``constant_time_match``; str and bytes compare by their
+    UTF-8 bytes; and a lone surrogate encodes rather than raising ``TypeError`` out of the compare.
+    """
+    eq = credential.constant_time_equal
+    lone = chr(0xDCFF)
+    assert eq("ab12", "ab12") is True
+    assert eq("ab12", "ab13") is False
+    assert eq("ab12", "ab1") is False
+    assert eq("", "") is True
+    assert eq("ab12", b"ab12") is True
+    assert eq(lone, lone) is True
+    assert eq(lone, chr(0xDCFE)) is False

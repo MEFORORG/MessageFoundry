@@ -26,7 +26,6 @@ set (:data:`SUPPORTED_COSE_ALGS`), and the key type and curve each algorithm mus
 from __future__ import annotations
 
 import contextlib
-import hmac
 import json
 import logging
 import secrets
@@ -35,6 +34,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import json_loads_or_refusal
 
 if TYPE_CHECKING:  # the [webauthn] extra is optional — the runtime import is lazy, per-call
@@ -359,13 +359,11 @@ class ChallengeCache:
         knowing this cache is a dict keyed by tuples, and an attribute-level reach would break
         silently the day that changes.
         """
-        # Constant-time over bytes (ASVS 11.2.4, BACKLOG #1167): the key is a session token hash, and
-        # `==` stops at the first differing character. The comprehension already visits every entry.
-        old = old_token_hash.encode("utf-8", "surrogatepass")
+        # Constant-time (ASVS 11.2.4, BACKLOG #1167): the key is a session token hash, and `==` stops
+        # at the first differing character. The comprehension already visits every entry. The dict
+        # lookups in put and pop still hash and compare the key; those are left as they are.
         moved = [
-            (k, e)
-            for k, e in self._entries.items()
-            if hmac.compare_digest(k[0].encode("utf-8", "surrogatepass"), old)
+            (k, e) for k, e in self._entries.items() if constant_time_equal(k[0], old_token_hash)
         ]
         for key, entry in moved:
             del self._entries[key]

@@ -35,6 +35,7 @@ from typing import Any
 __all__ = [
     "CERT_NAME_PREFIXES",
     "VERIFIED_ISSUER_KEY",
+    "constant_time_equal",
     "constant_time_match",
     "constant_time_match_any",
     "cert_name_candidates",
@@ -104,6 +105,23 @@ def constant_time_match_any(
             # _UNCONFIGURED_SLOT is not a credential and cannot authenticate anyone.
             constant_time_match(presented, _UNCONFIGURED_SLOT)
     return matched
+
+
+def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
+    """Whether two digests or identifiers are equal, by ``hmac.compare_digest`` over bytes.
+
+    ASVS 11.2.4 (BACKLOG #1167): ``==`` stops at the first differing character. This is for values
+    such as a session token hash, a credential-id hash or a config fingerprint, not for a presented
+    credential, which is :func:`constant_time_match`'s job. It differs from that function in two
+    ways, both on purpose: two empty values ARE equal here, and nothing is digested first, so a
+    difference in LENGTH still shows. Every caller compares fixed-width digests.
+
+    Total: ``surrogatepass`` encodes any ``str`` CPython can hold, so a caller's string can never
+    raise ``TypeError`` out of the compare, and two distinct strings never map to the same bytes.
+    """
+    a_bytes = a.encode("utf-8", "surrogatepass") if isinstance(a, str) else a
+    b_bytes = b.encode("utf-8", "surrogatepass") if isinstance(b, str) else b
+    return hmac.compare_digest(a_bytes, b_bytes)
 
 
 #: The qualified name spaces :func:`cert_name_candidates` yields. A configured name outside them can
