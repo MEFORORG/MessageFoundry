@@ -457,6 +457,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
     # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #1174: the sealed read-through caches (transform state + reference sets) seal each value
+    # under a per-process AES-256-GCM key built through store.crypto._install_key (lock + wipe of the
+    # key buffer). Memory hygiene for decoded cache values, not at-rest protection.
+    "messagefoundry/store/sealed_cache.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -1160,6 +1164,18 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
+    # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
+    # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
+    # sha256) by store.crypto._install_key.
+    "messagefoundry/store/sealed_cache.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "csprng:os.urandom",
+            "hash:via messagefoundry.store.crypto",
+        }
+    ),
     # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
     # tls_policy.assert_hvac_tls_suites and mounts it, so a TLS context is built here now.
     "messagefoundry/store/keyprovider_vault.py": frozenset(

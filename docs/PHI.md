@@ -730,6 +730,15 @@ PHI is exposed for the **minimum window and surface** needed to route and transf
   pipeline stage; the store cipher re-encrypts every PHI column the moment it is written back
   ([store/crypto.py](../messagefoundry/store/crypto.py)), so persisted data never lingers in plaintext
   at rest and the staged queue carries the message forward rather than holding it open.
+- **Sealed correlation caches `[BUILT — #1174]`.** The transform-state and reference read-through
+  caches, which a Handler reads through `state_get` and `reference(...)`, keep each value as AES-256-GCM
+  ciphertext under a per-process key and decrypt it inside the read that asks for it
+  ([store/sealed_cache.py](../messagefoundry/store/sealed_cache.py)), on all three backends. Before
+  this, every live key's value sat decrypted in heap for the store's lifetime. The keys stay
+  plaintext, as the `state.key` and `reference.key` columns do at rest. The cache key lives in the same
+  process, so this raises the cost of a heap scrape; it does not protect against an attacker who can
+  read process memory, and the value a Handler gets back is an ordinary Python object with no wipe
+  hook.
 - **`summary`/`metadata` ciphered like the body (EF-3).** The `summary` (MRN/name) and `metadata` are
   routed through the store cipher on write/read — there is no SQL search or index on `summary`, so
   encrypting it costs nothing — and decrypt only at the audited, RBAC-gated read paths.

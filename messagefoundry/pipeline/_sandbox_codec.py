@@ -571,12 +571,16 @@ def _enc_table(what: str, table: Mapping[Any, Any], blobs: _Blobs) -> Any:
     the pickle it replaced). When every entry fits that shape the table travels as ONE plain JSON
     object and the C encoder/decoder does the walk. This is an ENCODING choice, not a grammar change:
     the decoder still proves every value is a ``str`` before it is used, and either form decodes, so the
-    two ends can never disagree about which one to use."""
+    two ends can never disagree about which one to use.
+
+    The table is read ONCE, into ``entries``: a store's reference set is a sealed cache that decrypts
+    on every read (BACKLOG #1174), so a shape check and then a copy would decrypt each value twice."""
+    entries = dict(table)
     if all(
-        isinstance(k, str) and isinstance(v, str) and len(v) < _BLOB_MIN for k, v in table.items()
+        isinstance(k, str) and isinstance(v, str) and len(v) < _BLOB_MIN for k, v in entries.items()
     ):
-        return {"s": dict(table)}
-    return {"a": [[_req_str(k, f"{what} key"), enc_value(v, blobs)] for k, v in table.items()]}
+        return {"s": entries}
+    return {"a": [[_req_str(k, f"{what} key"), enc_value(v, blobs)] for k, v in entries.items()]}
 
 
 def _dec_table(node: Any, what: str, reader: _Reader) -> dict[str, Any]:
