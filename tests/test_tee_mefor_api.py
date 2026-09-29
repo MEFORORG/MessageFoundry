@@ -97,8 +97,7 @@ def test_make_getter_real_roundtrip_and_404() -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        host, port = server.server_address
-        get = make_getter(f"http://{host}:{port}", "tok", timeout=2.0)
+        get = make_getter(f"http://127.0.0.1:{server.server_port}", "tok", timeout=2.0)
         assert get("/messages?limit=1&offset=0") == {"messages": []}  # auth header accepted + JSON
         with pytest.raises(MeforApiError):
             get("/missing")  # 404 -> MeforApiError

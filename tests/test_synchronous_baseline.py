@@ -21,6 +21,7 @@ listener→router-worker→transform-worker→delivery-worker path is covered en
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -46,7 +47,9 @@ async def test_db_status_reports_configured_synchronous(
         assert status.synchronous == expected
         # And it matches what the connection actually applied (PRAGMA synchronous: 1=NORMAL, 2=FULL).
         cur = await store._db.execute("PRAGMA synchronous")
-        applied = (await cur.fetchone())[0]
+        row = await cur.fetchone()
+        assert row is not None
+        applied = row[0]
         assert applied == (1 if expected == "normal" else 2)
     finally:
         await store.close()
@@ -55,7 +58,7 @@ async def test_db_status_reports_configured_synchronous(
 # --- parity: NORMAL vs FULL is byte-identical message handling ---------------
 
 
-async def _drive_pipeline(store: MessageStore) -> dict[str, object]:
+async def _drive_pipeline(store: MessageStore) -> dict[str, Any]:
     """Run a deterministic mixed workload through the full staged pipeline and capture the observable
     outcome (FIFO claim order, outbound rows, terminal dispositions, events). ``now=`` is pinned so the
     capture is independent of wall-clock resolution and the result is comparable across two stores."""

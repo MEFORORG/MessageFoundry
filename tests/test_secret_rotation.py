@@ -27,8 +27,8 @@ _REF_TS = _REF.timestamp()
 _TODAY = _REF.date()
 
 
-class _RecordingSink:
-    """An AlertSink that records secret_rotation_due calls; the other methods are inert."""
+class _RecordingSink(LoggingAlertSink):
+    """An AlertSink that records secret_rotation_due calls; the ones below are inert."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str, int]] = []
@@ -46,7 +46,13 @@ class _RecordingSink:
         pass
 
     def secret_rotation_due(
-        self, name: str, *, class_id: str, last_rotated: str, days_overdue: int
+        self,
+        name: str,
+        *,
+        class_id: str,
+        last_rotated: str,
+        days_overdue: int,
+        enforced: bool = False,
     ) -> None:
         self.calls.append((name, class_id, last_rotated, days_overdue))
 
