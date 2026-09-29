@@ -829,14 +829,20 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
         }
     ),
+    # ADR 0197 Amendment A (N-A): provision-admin generates the first Administrator's TOTP secret
+    # and checks the code read back at the terminal, through the first-party totp module (the
+    # secret from the CSPRNG, the code by HMAC and a constant-time compare), before any store write.
     "messagefoundry/__main__.py": frozenset(
         {
+            "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
+            "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
             "key_cert:via messagefoundry.api.tls",
             "key_cert:via messagefoundry.logging_setup",
             "key_cert:via messagefoundry.pki",
+            "mac:via messagefoundry.auth.totp",
             "sign_verify:via messagefoundry.api.tls",
             "sign_verify:via messagefoundry.pki",
             "tls_context:via messagefoundry.api.tls",

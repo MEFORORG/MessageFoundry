@@ -266,6 +266,11 @@ suite("engine control — the provision-admin invocations carry no credential (W
     assert.ok(HOLD_OPEN_SCRIPT.includes("input(") && HOLD_OPEN_SCRIPT.includes("sys.exit(rc)"));
     // One line with no backslash or double quote, so Windows argv quoting cannot mangle it.
     assert.ok(!/[\n\\"]/.test(HOLD_OPEN_SCRIPT));
+    // ADR 0197 Amendment A (N-A): a successful provision printed the authenticator key and the
+    // recovery codes, so on exit 0 the script says so and clears the scrollback (ESC [3J) before
+    // the terminal closes. A failed provision printed no secret and keeps its output for reading.
+    assert.ok(HOLD_OPEN_SCRIPT.includes("recovery codes above are secrets"));
+    assert.ok(HOLD_OPEN_SCRIPT.includes("chr(27) + '[3J'") && HOLD_OPEN_SCRIPT.includes("if rc == 0"));
   });
 
   test("the probe asks provision-admin with --json and no password", () => {

@@ -577,3 +577,21 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         path = getattr(item, "path", None)
         if path is not None and path.parent == _TESTS_DIR and path.name in names:
             item.add_marker(pytest.mark.tooling)
+
+
+@pytest.fixture(autouse=True)
+def _provision_admin_enrols_a_synthetic_authenticator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``provision-admin`` enrols TOTP at the terminal (ADR 0197 Amendment A, N-A), which reads a
+    code from a real terminal. Every test that drives the command about something else gets a
+    synthetic, VALID enrolment here, so it keeps testing what it was written for. The tests of the
+    enrolment itself replace this stub in their own body."""
+    import messagefoundry.__main__ as cli
+    from tests._admin_account import provision_totp
+
+    def _stub(*, username: str, skew_steps: int) -> tuple[str, str, float]:
+        kw = provision_totp()
+        return kw["totp_secret"], kw["totp_code"], kw["totp_code_read_at"]
+
+    # The real prompt, for the tests that drive it: ``cli._enrol_totp_at_terminal.__wrapped__``.
+    _stub.__wrapped__ = cli._enrol_totp_at_terminal  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", _stub)

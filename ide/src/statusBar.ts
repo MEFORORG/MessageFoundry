@@ -666,7 +666,14 @@ export class EngineStatusBar implements vscode.Disposable {
       `${admin.username}${admin.email?.trim() ? " (with a notification address)" : ""}`,
     );
     try {
-      return await exited;
+      const code = await exited;
+      // ADR 0197 Amendment A: a successful provision printed the authenticator key and the recovery
+      // codes, so its terminal is closed rather than left with that scrollback. HOLD_OPEN_SCRIPT
+      // clears the screen and scrollback first; disposing makes the close explicit.
+      if (code === 0) {
+        term.dispose();
+      }
+      return code;
     } finally {
       this.provisionTerminal = undefined;
     }

@@ -325,6 +325,9 @@ _MAY_PASS_NONE = {
     ("messagefoundry/verify/smoke.py", "check_store_connectivity._open_close"),
     ("messagefoundry/verify/smoke.py", "newest_message_id._newest"),
     ("messagefoundry/verify/smoke.py", "check_smoke_disposition._poll"),
+    # read-only: the lockable-account census reads users, roles and TOTP secrets and writes nothing
+    # (ADR 0197 Amendment A, AC-A9); the startup twin that audits runs under serve's own open
+    ("messagefoundry/verify/checks.py", "check_lockable_accounts._census"),
     # a throwaway snapshot copy, integrity-checked and deleted
     ("messagefoundry/pipeline/dr_backup.py", "_full_open_check._open"),
     # the synthetic load harness

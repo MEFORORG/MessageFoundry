@@ -31,6 +31,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import provision_totp
 
 # The three store classes, reused rather than re-derived — that module's docstring establishes the
 # property this file depends on: the drivers are imported method-locally, so all three classes import
@@ -180,7 +181,10 @@ async def test_a_directory_sign_in_creates_a_roleless_row() -> None:
     try:
         service = AuthService(control, AuthSettings())
         outcome = await service.provision_first_administrator(
-            username="site-admin", password="a-long-enough-operator-passphrase", actor="test"
+            username="site-admin",
+            password="a-long-enough-operator-passphrase",
+            actor="test",
+            **provision_totp(),
         )
         assert Role.ADMINISTRATOR.value in await control.get_user_role_ids(outcome.user_id)
         assert await service.has_enabled_administrator() is True

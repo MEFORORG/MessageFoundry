@@ -23,6 +23,8 @@ that row now, and a test that makes an account named ``admin`` on purpose is mak
 from __future__ import annotations
 
 import asyncio
+import itertools
+import time
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -38,6 +40,7 @@ __all__ = [
     "AdminAccount",
     "create_admin",
     "create_local_user_with_password",
+    "provision_totp",
     "login_admin",
 ]
 
@@ -114,3 +117,23 @@ async def create_local_user_with_password(
         password_generated=False,
     )
     return created.user_id
+
+
+#: A fixed synthetic TOTP secret for provisioning tests (ADR 0197 Amendment A, N-A). Not a secret.
+PROVISION_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
+_provision_steps = itertools.count(1)
+
+
+def provision_totp() -> dict[str, Any]:
+    """The TOTP arguments ``provision_first_administrator`` needs under the shipped
+    ``require_mfa`` (ADR 0197 Amendment A): the secret, a code for it, and the instant that code was
+    "read". Each call lands on its own later 30-second step, so repeated provisions of one row
+    (the repair tests) never replay a step the row already consumed."""
+    from messagefoundry.auth import totp
+
+    at = time.time() + totp.DEFAULT_PERIOD * next(_provision_steps)
+    return {
+        "totp_secret": PROVISION_TOTP_SECRET,
+        "totp_code": totp.totp(PROVISION_TOTP_SECRET, now=at),
+        "totp_code_read_at": at,
+    }

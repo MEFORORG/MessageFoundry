@@ -39,7 +39,7 @@ from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyE
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_with_password, provision_totp
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -117,7 +117,11 @@ async def test_provision_admin_confines_only_when_email_was_left_out() -> None:
         try:
             service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
             await service.provision_first_administrator(
-                username="first", password=PW, notify_email=notify_email, actor="cli:test"
+                username="first",
+                password=PW,
+                notify_email=notify_email,
+                actor="cli:test",
+                **provision_totp(),
             )
             assert await _flag_after_login(service, "first") is expected
         finally:

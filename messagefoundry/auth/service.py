@@ -1059,6 +1059,11 @@ class ProvisionedAdministrator:
     username: str
     repaired: bool
     holder_notice: str | None = None
+    #: The single-use recovery codes minted with the TOTP enrolment (ADR 0197 Amendment A, N-A),
+    #: plaintext, for the command to print ONCE to the operator's terminal. Empty when the command
+    #: enrolled no TOTP (``--no-totp``, which only a site with ``require_mfa`` off may pass). Never
+    #: in ``--json`` output, never logged, never audited.
+    recovery_codes: tuple[str, ...] = ()
 
 
 # BACKLOG #2019: the three outcomes of the notice a repair owes the account's earlier holder. They are
@@ -1706,8 +1711,30 @@ class AuthService:
         display_name: str | None = None,
         notify_email: str | None = None,
         actor: str,
+        totp_secret: str | None = None,
+        totp_code: str | None = None,
+        totp_code_read_at: float | None = None,
     ) -> ProvisionedAdministrator:
         """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        **IT ENROLS TOTP FROM BIRTH (ADR 0197 Amendment A, N-A, AC-A5).** ``totp_secret`` is the
+        secret the command generated and showed at the terminal, and ``totp_code`` the code the
+        operator read back from their authenticator. Both are checked HERE, before any store write,
+        with the pure :func:`totp.verify_totp_step` at the configured skew, so a mistyped code writes
+        nothing and cannot leave a half-built row. Then the writes run in ADR 0183's order with the
+        enrolment before the role: row, password, TOTP secret with its step consumed and its recovery
+        codes, address, role LAST. The account is born with option E's way past the sign-in lock.
+        ``totp_code_read_at`` is the instant the command read the code, so this check judges the code
+        against the step it was read in rather than failing a correct code that crossed a step
+        boundary while the store opened. ``None`` means now.
+        While ``[security].require_mfa`` is on, a call with no secret is refused, because the scope
+        always covers an administrator.
+
+        **THE REPAIR BRANCH CLEARS EVERYTHING THE EARLIER HOLDER COULD STILL USE**, first: TOTP, its
+        recovery codes, every passkey, and every session on the row. Before this, the branch revoked
+        no session, and ``_build_identity`` re-reads roles on every request, so a live session the
+        earlier holder kept became an Administrator session when the role was written -- an ADR 0183
+        defect this amendment fixes because it edits this branch.
 
         THIS IS THE "NOT PRESENT" ARM OF ASVS 6.3.2, and it is the half that has to exist before the
         other half can be built. The verb asks that default user accounts "are not present in the
@@ -1772,6 +1799,26 @@ class AuthService:
         violations = self._policy.violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
+        # ADR 0197 Amendment A (N-A): the code is proved in memory, before any write.
+        matched_step: int | None = None
+        if totp_secret is None:
+            if self._settings.require_mfa:
+                raise FirstAdministratorRefused(
+                    "MFA is required ([security].require_mfa), so the first Administrator enrols an "
+                    "authenticator app at the terminal; --no-totp is only for a site that turned "
+                    "the requirement off"
+                )
+        else:
+            matched_step = totp.verify_totp_step(
+                totp_secret,
+                (totp_code or "").strip(),
+                now=totp_code_read_at,
+                window=self._settings.totp_skew_steps,
+            )
+            if matched_step is None:
+                raise FirstAdministratorRefused(
+                    "the authenticator code did not match; nothing was written"
+                )
 
         existing = await self._store.get_user_by_username(username)
         repaired = existing is not None
@@ -1801,6 +1848,13 @@ class AuthService:
                     "another username"
                 )
             user_id = existing.id
+            # ADR 0197 Amendment A (AC-A5): a row somebody else held must not carry their factor,
+            # or a session of theirs, onto the new Administrator. Cleared BEFORE anything is
+            # written for the new holder, and before the role that would make a kept session an
+            # Administrator session.
+            await self._store.disable_totp(user_id)
+            await self._store.delete_all_webauthn_credentials(user_id)
+            await self._store.revoke_user_sessions(user_id)
         else:
             user_id = uuid4().hex
             await self._store.create_user(
@@ -1825,6 +1879,21 @@ class AuthService:
             must_change_password=False,
             password_generated=False,
         )
+        plain_codes: tuple[str, ...] = ()
+        if totp_secret is not None and matched_step is not None:
+            # ADR 0197 Amendment A (N-A): enrolled BEFORE the role, which stays last, so every
+            # interruption still leaves a roleless row a re-run completes -- and the repair branch
+            # above clears a half-enrolled one before this runs again.
+            await self._store.set_totp_secret(user_id, secret=totp_secret)
+            if not await self._store.consume_totp_step(user_id, matched_step):
+                raise FirstAdministratorRefused(
+                    "the authenticator code was already used; run the command again"
+                )
+            plain_codes = tuple(
+                totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
+            )
+            hashes = [await self._argon2(hash_password, c) for c in plain_codes]
+            await self._store.enable_totp(user_id, recovery_code_hashes=hashes)
         if notify_email is not None:
             # Unconditional rather than fresh-path-only, because the invariant "the supplied address
             # always lands" is simpler than the case analysis. On the fresh path `create_user` already
@@ -1873,11 +1942,16 @@ class AuthService:
                     "holder_notice": holder_notice,
                     # The earlier address itself is not recorded here; the notice went to it.
                     "notify_email_moved": moved,
+                    "totp_enrolled": totp_secret is not None,
                 }
             ),
         )
         return ProvisionedAdministrator(
-            user_id=user_id, username=username, repaired=repaired, holder_notice=holder_notice
+            user_id=user_id,
+            username=username,
+            repaired=repaired,
+            holder_notice=holder_notice,
+            recovery_codes=plain_codes,
         )
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:

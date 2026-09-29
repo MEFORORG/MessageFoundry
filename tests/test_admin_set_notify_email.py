@@ -40,6 +40,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import provision_totp
 
 # provision-admin's prompt stub and passphrase, imported rather than copied, as
 # tests/test_audit_keyless_chain_flagged.py does: that module is where the prompt is pinned.
@@ -73,7 +74,11 @@ def _seed(
         try:
             service = AuthService(store, AuthSettings())
             outcome = await service.provision_first_administrator(
-                username=_ADMIN, password=_PASSWORD, notify_email=admin_email, actor="test"
+                username=_ADMIN,
+                password=_PASSWORD,
+                notify_email=admin_email,
+                actor="test",
+                **provision_totp(),
             )
             if admin_disabled:
                 await store.set_user_disabled(outcome.user_id, disabled=True)
@@ -360,7 +365,7 @@ def test_a_keyed_store_opened_without_its_key_writes_nothing_unaudited(
         store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
             await AuthService(store, AuthSettings()).provision_first_administrator(
-                username=_ADMIN, password=_PASSWORD, actor="test"
+                username=_ADMIN, password=_PASSWORD, actor="test", **provision_totp()
             )
         finally:
             await store.close()

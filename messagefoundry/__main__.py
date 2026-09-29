@@ -761,6 +761,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     provision_admin.add_argument("--db", default=None, help="store path (overrides [store].path)")
     provision_admin.add_argument("--json", action="store_true", help="emit JSON")
+    provision_admin.add_argument(
+        "--no-totp",
+        action="store_true",
+        help="do not enrol an authenticator app (refused while [security].require_mfa is on)",
+    )
 
     # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An Administrator provisioned without --email is
     # refused at the next start by the ADR 0167 deliverability gate, and provision-admin then refuses
@@ -5506,6 +5511,53 @@ class _PasswordEntryRefused(RuntimeError):
     """The interactive credential prompt declined. The message is operator-facing."""
 
 
+#: How many wrong authenticator codes ``provision-admin`` accepts before it stops. Nothing is written
+#: on a stop, so the operator simply runs it again.
+_PROVISION_TOTP_ATTEMPTS = 5
+
+
+def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str, float]:
+    """Generate a TOTP secret in memory, show it, and read back a code that proves it (ADR 0197
+    Amendment A, N-A). Returns ``(secret, code, instant the code was read)``.
+
+    Everything goes to STDERR, never stdout: ``--json`` output is stdout, and the secret must never
+    be in it. It is never in argv, a file or a log either. The code is checked with the pure
+    :func:`totp.verify_totp_step` at the configured skew and re-prompted on a mistake, all BEFORE
+    the store is opened for writing, so a wrong code writes nothing. Raises
+    :class:`_PasswordEntryRefused` with no terminal, on an empty code, or after
+    :data:`_PROVISION_TOTP_ATTEMPTS` wrong codes."""
+    import time as _time
+
+    from messagefoundry.auth import totp
+
+    if not sys.stdin.isatty():
+        raise _PasswordEntryRefused(
+            "refusing to provision without a terminal: the authenticator app is enrolled "
+            "interactively. Run this from a console."
+        )
+    secret = totp.generate_secret()
+    print(
+        "\nEnrol an authenticator app for this Administrator now (ADR 0197). Add this account to "
+        "the app by its key or its URI, then type the 6-digit code it shows.\n"
+        f"  key: {secret}\n"
+        f"  URI: {totp.otpauth_uri(secret, username)}\n",
+        file=sys.stderr,
+    )
+    for _ in range(_PROVISION_TOTP_ATTEMPTS):
+        print("Authenticator code: ", end="", file=sys.stderr, flush=True)
+        code = sys.stdin.readline().strip()
+        read_at = _time.time()
+        if not code:
+            raise _PasswordEntryRefused("empty authenticator code; nothing was written")
+        if totp.verify_totp_step(secret, code, now=read_at, window=skew_steps) is not None:
+            return secret, code, read_at
+        print("That code did not match. Try the current one.", file=sys.stderr)
+    raise _PasswordEntryRefused(
+        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match; nothing was written. Check the device's "
+        "clock and run the command again."
+    )
+
+
 def _read_new_password(prompt: str) -> str:
     """Read a new password twice from the controlling terminal, or raise with an explanation.
 
@@ -6031,6 +6083,26 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if violations:
         return _emit_error("; ".join(violations), as_json=args.json)
 
+    # ADR 0197 Amendment A (N-A): the first Administrator is born with an authenticator app, so
+    # option E's combined sign-in is its way past a lock anyone who knows the username can set.
+    totp_secret: str | None = None
+    totp_code: str | None = None
+    totp_read_at: float | None = None
+    if args.no_totp:
+        if settings.auth.require_mfa:
+            return _emit_error(
+                "--no-totp is refused: MFA is required ([security].require_mfa), and the "
+                "requirement always covers an Administrator",
+                as_json=args.json,
+            )
+    else:
+        try:
+            totp_secret, totp_code, totp_read_at = _enrol_totp_at_terminal(
+                username=username, skew_steps=settings.auth.totp_skew_steps
+            )
+        except _PasswordEntryRefused as exc:
+            return _emit_error(str(exc), as_json=args.json)
+
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(
@@ -6076,6 +6148,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     display_name=args.display_name,
                     notify_email=args.email,
                     actor=f"cli:{getpass.getuser()}",
+                    totp_secret=totp_secret,
+                    totp_code=totp_code,
+                    totp_code_read_at=totp_read_at,
                 )
             finally:
                 if security_notifier is not None:
@@ -6105,6 +6180,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
+    if outcome.recovery_codes:
+        # To the terminal (stderr) ONCE, in both output modes, and never into the --json body.
+        print(
+            "\nRecovery codes, shown once. Each signs in once in place of an authenticator code. "
+            "Store them somewhere safe, then clear this terminal's scrollback:\n  "
+            + "\n  ".join(outcome.recovery_codes)
+            + "\n",
+            file=sys.stderr,
+        )
     if args.json:
         _print_json(
             {
@@ -6118,6 +6202,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "notify_email_set": bool(args.email and args.email.strip()),
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
+                # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.
+                "totp_enrolled": totp_secret is not None,
             },
             compact=True,
         )

@@ -34,7 +34,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_admin
+from tests._admin_account import create_admin, provision_totp
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 
@@ -91,7 +91,9 @@ async def test_an_administrator_provisioned_without_an_address_is_not_notifiable
     """
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
-    await service.provision_first_administrator(username="site-admin", password=PW, actor="test")
+    await service.provision_first_administrator(
+        username="site-admin", password=PW, actor="test", **provision_totp()
+    )
     assert await service.has_enabled_administrator() is True  # control: the account is there
     assert await service.has_notifiable_admin() is False
 
