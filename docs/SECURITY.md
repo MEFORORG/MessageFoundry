@@ -726,13 +726,12 @@ tuple: they act only on the caller's own account.
 > **A directory that returns no immutable identifier signs nobody in (BACKLOG #2027).** It used to
 > resolve by username, which left the recycle open on that path. A Windows SSO sign-in whose
 > principal carries no `objectGUID` is now refused as `directory_object_id_missing`, and so is an AD
-> step-up re-bind on a row with none. A re-bind that binds a different directory object than the
-> row's own is refused too, and neither refusal counts toward the lockout. The engine warns once per
+> step-up re-bind on a row with none; neither refusal counts toward the lockout. The re-bind binds
+> the entry its search finds by the row's `objectGUID`, never by the name. The engine warns once per
 > distinct cause -- the attribute absent, or present in a shape it cannot read -- so a site on that
-> path learns why its sign-ins fail. **Two readers still ask about an id-less row by its name:** the
-> session reconciler, and `verify_mfa`'s directory check on a row with no federated binding. A
-> directory that reissued the name answers for its new holder there. No shipped path creates an
-> id-less row any more, so only a row made earlier, or planted in the store, can meet them.
+> path learns why its sign-ins fail. **At least two readers still ask about an id-less row by its
+> name:** the session reconciler, and `verify_mfa`'s directory check on a row with no federated
+> binding. A directory that reissued the name answers for its new holder there.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is

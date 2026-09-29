@@ -1163,8 +1163,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer asks about such an account by its username either. It skips it and writes one
   `auth.ad_reconcile_binding_unkeyed` row with the same reason, once per account per process. That
   is a new audit action, separate from the outage's `auth.ad_reconcile_skipped`, because it is not
-  benign. A Windows SSO sign-in to such an account is refused as well, by the entry at the top of
-  this section; before that entry it still found the account by its username.
+  benign. A Windows SSO sign-in to such an account is refused as well, by the directory-id
+  entry at the top of this section; before it, that sign-in found the account by its username.
   - **Why.** The username is the only key such an account has. A directory can give a freed
     username to a new person, and the linked account would then take that person's groups (ADR
     0184 AC-5).
@@ -1392,7 +1392,7 @@ All notable changes to MessageFoundry are documented here. The format follows
     `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
   - **A link made before this change on such an account is left in place.** It can still be
     removed, and it cannot be moved to another `sub`. This change added no sign-in refusal for it;
-    the `BACKLOG #2027` entry at the top of this section does. On a directory that now
+    the `BACKLOG #2027` federated-link entry in this section does. On a directory that now
     returns `objectGUID`, its Windows SSO sign-in is refused as `directory_identity_conflict`, as
     it was before this change. Its federated sign-in is now refused as
     `directory_object_id_missing`, which that entry checks first.

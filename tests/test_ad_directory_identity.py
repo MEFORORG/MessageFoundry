@@ -1307,7 +1307,7 @@ async def test_a_locked_mirror_row_does_not_complete_a_kerberos_login(
 
 # --- BACKLOG #2027: the step-up re-bind must prove the row's OWN directory object ------------------
 #
-# ``_reauth_ad`` finds its bind entry by the stored username, a label a directory may reissue. These
+# ``_reauth_ad`` finds its bind entry by the row's stored objectGUID, never by the username alone. These
 # drive ``reauth`` itself, so the refusal is read where a caller meets it: the outcome, the directory
 # round trips, the engine lockout counter and the ``auth.reauth`` audit row.
 
@@ -1409,9 +1409,10 @@ async def test_a_re_bind_that_binds_another_directory_object_is_refused(
         await store.close()
 
 
-async def test_a_refused_re_bind_against_another_object_is_not_counted() -> None:
-    """A wrong password judged against the name's NEW holder is nobody's guess at this row, so it
-    must not feed this row's lockout."""
+async def test_a_refused_re_bind_keyed_on_the_rows_id_is_counted() -> None:
+    """The failed bind was keyed on the row's own id, so it was a guess at THIS account and counts,
+    even when the entry the lookup finds reads back another id. Not counting it would let a held
+    session send the directory unlimited guesses past the per-session cap."""
     store = await MessageStore.open(":memory:")
     try:
         directory = _RebindDirectory(None, _principal("jsmith", GUID_B_TEXT))
@@ -1419,10 +1420,8 @@ async def test_a_refused_re_bind_against_another_object_is_not_counted() -> None
         elevation = await service.reauth(identity, "synthetic-wrong", token=token)
         assert not elevation.ok
         row = await store.get_user(identity.user_id)
-        assert row is not None and row.failed_attempts == 0
-        assert any(
-            '"reason": "directory_identity_conflict"' in d for d in await _reauth_rows(store)
-        )
+        assert row is not None and row.failed_attempts == 1
+        assert directory.keys == [GUID_A_TEXT, GUID_A_TEXT]
     finally:
         await store.close()
 
