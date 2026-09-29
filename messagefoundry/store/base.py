@@ -808,7 +808,13 @@ class QueueStore(StoreLifecycle, Protocol):
         ``max_attempts`` is exhausted. Returns the row's new ``next_attempt_at`` (epoch seconds) when
         it was RESCHEDULED — the runner arms a per-lane retry wake at that time (WS-C: with the long
         idle backstop, the retry re-claim no longer rides a short poll) — and ``None`` when the row
-        dead-lettered or no longer exists (nothing to re-claim)."""
+        dead-lettered or no longer exists (nothing to re-claim).
+
+        The retry branch re-pends a row only while it is still ``inflight`` (ADR 0157 Amendment A,
+        BACKLOG #2078, #2348). A row that some other writer already made DONE, DEAD, CANCELLED or
+        PENDING is left exactly as it is, and no ``failed`` event is written. The call still returns
+        the retry time, so a row something else left PENDING still gets its retry wake; an early
+        wake claims nothing. The DEAD branch carries no status term (ADR 0157 C2)."""
         ...
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
@@ -831,7 +837,10 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to every member, so all N re-pend to the same ``next_attempt_at`` (re-claimed
         as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. Returns
-        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered."""
+        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered. On the
+        retry branch a member no longer ``inflight`` is skipped, event and all, as in
+        :meth:`mark_failed`, and the shared retry time is returned even when every member was
+        skipped."""
         ...
 
     async def dead_letter_batch(
