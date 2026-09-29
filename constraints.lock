@@ -47,9 +47,7 @@ charset-normalizer==3.4.7
 click==8.5.0
     # via uvicorn
 colorama==0.4.6 ; sys_platform == 'win32'
-    # via
-    #   pytest
-    #   uvicorn
+    # via pytest
 cryptography==50.0.1
     # via
     #   messagefoundry
@@ -272,7 +270,7 @@ tzdata==2026.4
     # via messagefoundry
 urllib3==2.7.0
     # via requests
-uvicorn==0.49.0
+uvicorn==0.53.0
     # via messagefoundry
 uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
     # via uvicorn
