@@ -1411,12 +1411,7 @@ def _is_bounded_message_read(node: ast.expr) -> bool:
     something it cannot round-trip, which is what E.6.3 exists to forbid.
     """
     if isinstance(node, ast.Subscript):
-        return (
-            isinstance(node.value, ast.Name)
-            and node.value.id == "msg"
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        )
+        return _is_msg_subscript(node)
     if isinstance(node, ast.Call):
         func = node.func
         if not isinstance(func, ast.Attribute) or func.attr != "field":
@@ -1429,11 +1424,44 @@ def _is_bounded_message_read(node: ast.expr) -> bool:
     return False
 
 
+def _is_msg_subscript(node: ast.expr) -> bool:
+    """Whether ``node`` is exactly ``msg["LIT"]``, a subscript read with one constant string path."""
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "msg"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    )
+
+
+def _is_empty_fallback_read(node: ast.expr) -> bool:
+    """Whether ``node`` is exactly ``msg["LIT"] or ""`` -- a subscript read that renders an absent field
+    as empty text.
+
+    ADMITTED BY THE 2026-09-29 AMENDMENT NOTE (ADR 0076 E.11), and nothing wider. A bare read renders an
+    absent field as the text ``None`` inside an f-string, because ``Message.field`` returns None; the
+    ``or ""`` fallback is the one ``copy_field`` already writes. The operand must be the empty string
+    and nothing else: ``or "N/A"`` or ``or other`` is a second value source the parts form cannot
+    express, so it stays ``dynamic``. Only the subscript spelling is admitted, because it is the one
+    the renderer writes."""
+    return (
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 2
+        and _is_msg_subscript(node.values[0])
+        and isinstance(node.values[1], ast.Constant)
+        and isinstance(node.values[1].value, str)
+        and node.values[1].value == ""
+    )
+
+
 def _is_bounded_interpolation(node: ast.expr) -> bool:
     """Whether ``node`` is the ONE interpolation shape ADR 0076 E.5 admits as writable.
 
-    An f-string whose every ``FormattedValue`` is a bounded ``Message`` read carrying **no format spec
-    and no conversion**, and whose every remaining part is a constant string.
+    An f-string whose every ``FormattedValue`` is a bounded ``Message`` read, or a subscript read with
+    an empty-string fallback (:func:`_is_empty_fallback_read`, E.11), carrying **no format spec and no
+    conversion**, and whose every remaining part is a constant string.
 
     A format spec or a conversion (``!r``/``!s``/``!a``) is excluded because each is a second rendering
     step the lens does not model: reading the emitted text back would not recover the same parts, and
@@ -1455,7 +1483,7 @@ def _is_bounded_interpolation(node: ast.expr) -> bool:
             # ``conversion`` is -1 when absent; 114/115/97 are !r/!s/!a.
             if part.conversion != -1 or part.format_spec is not None:
                 return False
-            if not _is_bounded_message_read(part.value):
+            if not (_is_bounded_message_read(part.value) or _is_empty_fallback_read(part.value)):
                 return False
             continue
         return False
@@ -1489,7 +1517,8 @@ def _param_mode(node: ast.expr) -> str:
 # never builds or re-classifies Python source, which is what keeps this from becoming the second
 # grammar E.5 refuses.
 
-#: The two part kinds. ``text`` is literal text; ``path`` is one bounded ``msg[...]`` read.
+#: The two part kinds. ``text`` is literal text; ``path`` is one bounded read, written as
+#: ``msg[...] or ""`` so an absent field is empty text (ADR 0076 E.11).
 PART_TEXT = "text"
 PART_PATH = "path"
 
@@ -1516,19 +1545,23 @@ def _template_ok(kind: str, action: str | None, pname: str) -> bool:
 
 
 def _read_path(node: ast.expr) -> str | None:
-    """The HL7 path a bounded read names, when the read is exactly a path read, else None.
+    """The path a bounded read names, when the read is exactly a path read, else None.
 
-    ``msg["X"]`` and ``msg.field("X")`` both name path ``X``: ``Message.__getitem__`` is
-    ``self.field(path)``, so the two spellings read the same value. A ``msg.field`` call with any other
-    argument list has no parts form. The renderer always writes the subscript spelling."""
+    ``msg["X"] or ""``, ``msg["X"]`` and ``msg.field("X")`` all name path ``X``. The renderer writes
+    the first (E.11), which renders an absent field as empty text. The other two are older spellings a
+    hand-written template may carry: ``Message.__getitem__`` is ``self.field(path)``, so they read the
+    same value, but an absent field renders as the text ``None``. A template edit that CHANGES the
+    parts rewrites them to the fallback form, which is the fix E.11 was ruled for; resubmitting the
+    same parts leaves the source alone. A ``msg.field`` call with any other argument list has no parts
+    form."""
+    if isinstance(node, ast.BoolOp) and _is_empty_fallback_read(node):
+        node = node.values[0]
     if (
         isinstance(node, ast.Subscript)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "msg"
+        and _is_msg_subscript(node)
         and isinstance(node.slice, ast.Constant)
-        and isinstance(node.slice.value, str)
     ):
-        return node.slice.value
+        return str(node.slice.value)
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1683,9 +1716,11 @@ def _check_parts_spec(parts: Any, pname: str) -> list[dict[str, str]]:
 def _render_parts(parts: Any, pname: str) -> str:
     """Render a templated edit's structured parts to f-string source, or refuse (ADR 0076 E.5, E.6.3).
 
-    The output is ``f"...{msg['PATH']}..."``: double quotes outside, the subscript read inside. When the
-    text carries more double quotes than single ones the two swap (``f'...{msg["PATH"]}...'``), which is
-    the choice ``ruff format`` makes, so the spliced line stays format-clean. Before it is returned, the
+    The output is ``f"...{msg['PATH'] or ''}..."``: double quotes outside, and inside the subscript read
+    with its empty-string fallback, so an absent field writes empty text rather than ``None`` (E.11).
+    When the text carries more double quotes than single ones the two swap
+    (``f'...{msg["PATH"] or ""}...'``), which is the choice ``ruff format`` makes, so the spliced line
+    stays format-clean. Before it is returned, the
     EXISTING classifier must call it ``templated`` and read back exactly the parts that were sent.
     That is round-trip totality (E.6.3) checked on every write rather than trusted, so a renderer
     defect refuses an edit instead of splicing a shape the lens cannot read back."""
@@ -1695,7 +1730,7 @@ def _render_parts(parts: Any, pname: str) -> str:
     body = "".join(
         _escape_template_text(part[PART_TEXT], outer)
         if PART_TEXT in part
-        else "{msg[" + inner + part[PART_PATH] + inner + "]}"
+        else "{msg[" + inner + part[PART_PATH] + inner + "] or " + inner * 2 + "}"
         for part in normalized
     )
     rendered = "f" + outer + body + outer
@@ -2255,7 +2290,7 @@ def rewrite_source(
 
     * a JSON scalar, written as a Python **literal** (``static``);
     * ``{"parts": [{"text": "..."}, {"path": "PID-3.1"}, ...]}``, written as the bounded interpolation
-      ``f"...{msg['PID-3.1']}..."`` (``templated``). At least one ``path`` part is required, and only a
+      ``f"...{msg['PID-3.1'] or ''}..."`` (``templated``). At least one ``path`` part is required, and only a
       param ``lens parse`` lists in the row's ``template_params`` accepts it;
     * ``{"expr": "<python source>"}``, spliced verbatim only if it classifies ``static``. An ``expr``
       that is ``dynamic`` (a bare ``msg["X"]`` read included) is refused, and so is one that is
@@ -2933,7 +2968,7 @@ def _render_moded_value(
     ``{"expr": <source>}`` is still accepted, but only when the expression is a literal. A ``dynamic``
     one would author the open-set shape E.7 keeps read-only; a bare ``msg["X"]`` read is ``dynamic``
     (only an f-string is ``templated``), so a path pick writes ``{"parts": [{"path": "X"}]}``, which
-    renders ``f"{msg['X']}"``. A ``templated`` one is refused too, so that every templated write goes
+    renders ``f"{msg['X'] or ''}"``. A ``templated`` one is refused too, so that every templated write goes
     through the parts renderer and its round-trip gate: E.5 admits ``msg.field`` reads that no parts
     list can express, and one of them, ``msg.field("OBX-5", 2)``, raises at runtime."""
     if _param_mode(node) == MODE_DYNAMIC:

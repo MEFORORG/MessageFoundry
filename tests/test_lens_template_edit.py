@@ -39,6 +39,7 @@ from messagefoundry.lens import (
     MODE_TEMPLATED,
     LensRewriteError,
     _display_width,
+    _is_empty_fallback_read,
     _normalize_parts,
     _param_mode,
     _render_parts,
@@ -85,7 +86,9 @@ def test_a_parts_value_writes_a_bounded_interpolation_and_reads_back_as_parts() 
     src = _one_row('set_field(msg, "PID-5.1", "old")')
     parts = [{"text": "MRN: "}, {"path": "PID-3.1"}]
     out = _set(src, {"value": {"parts": parts}})
-    assert out.splitlines()[5] == '    set_field(msg, "PID-5.1", f"MRN: {msg[\'PID-3.1\']}")'
+    assert (
+        out.splitlines()[5] == "    set_field(msg, \"PID-5.1\", f\"MRN: {msg['PID-3.1'] or ''}\")"
+    )
     row = _row(out)
     assert row["param_modes"] == {"path": MODE_STATIC, "value": MODE_TEMPLATED}
     assert row["param_parts"] == {"value": parts}
@@ -93,12 +96,12 @@ def test_a_parts_value_writes_a_bounded_interpolation_and_reads_back_as_parts() 
 
 
 def test_a_path_pick_writes_the_templated_form_never_a_bare_read() -> None:
-    """Manager decision for BACKLOG #237: the picker ALWAYS writes ``f"{msg['X']}"``. A bare
+    """Manager decision for BACKLOG #237: the picker ALWAYS writes ``f"{msg['X'] or ''}"``. A bare
     ``msg["X"]`` is ``dynamic`` and would be read-only the moment it landed."""
     out = _set(
         _one_row('set_field(msg, "PID-5.1", "old")'), {"value": {"parts": [{"path": "PID-3"}]}}
     )
-    assert "f\"{msg['PID-3']}\"" in out.splitlines()[5]
+    assert "f\"{msg['PID-3'] or ''}\"" in out.splitlines()[5]
     assert _row(out)["param_modes"]["value"] == MODE_TEMPLATED
 
 
@@ -173,6 +176,53 @@ def test_resubmitting_the_current_parts_changes_no_byte() -> None:
         assert _set(src, {"value": {"parts": parts}}) == src, arg
 
 
+@pytest.mark.parametrize(
+    "arg",
+    [
+        pytest.param("f\"{msg['PID-3'] or ''}\"", id="empty-fallback-the-renderer-writes"),
+        pytest.param("f\"{msg['PID-3']}\"", id="bare-read"),
+        pytest.param("f\"{msg.field('PID-3')}\"", id="field-call"),
+    ],
+)
+def test_every_admitted_read_spelling_reads_back_as_one_path_part(arg: str) -> None:
+    """ADR 0076 E.11 (owner ruling 2026-09-29). The renderer writes ``msg["X"] or ""`` so an absent
+    field is empty text rather than ``None``; that form, and the two older spellings a hand-written
+    template may carry, all read back as the same ``{"path": "X"}`` part."""
+    row = _row(_one_row(f'set_field(msg, "PID-5.1", {arg})'))
+    assert row["param_modes"]["value"] == MODE_TEMPLATED
+    assert row["param_parts"]["value"] == [{"path": "PID-3"}]
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        pytest.param("f\"{msg['PID-3'] or 'N/A'}\"", id="non-empty-fallback"),
+        pytest.param("f\"{msg['PID-3'] or y}\"", id="name-fallback"),
+        pytest.param("f\"{msg['PID-3'] or '' or ''}\"", id="chained-fallback"),
+        pytest.param("f\"{msg.field('PID-3') or ''}\"", id="field-call-fallback"),
+    ],
+)
+def test_a_fallback_wider_than_empty_text_is_dynamic_and_refused(arg: str) -> None:
+    """NEGATIVE CONTROL for E.11: only ``or ""`` on a subscript read is admitted. Any other fallback
+    is a second value source the parts form cannot express, so it stays dynamic and read-only."""
+    src = _one_row(f'set_field(msg, "PID-5.1", {arg})')
+    row = _row(src)
+    assert row["param_modes"]["value"] == MODE_DYNAMIC
+    assert "value" not in row["param_parts"] and "value" not in row["template_params"]
+    with pytest.raises(LensRewriteError, match="dynamic mode"):
+        _set(src, {"value": {"parts": [{"path": "PID-3"}]}})
+
+
+def test_a_template_edit_upgrades_an_older_bare_read_to_the_fallback_form() -> None:
+    """Changing any part re-renders the whole template, so a bare read beside the edit is rewritten
+    to ``or ""``: the fix E.11 was ruled for, applied the moment the author touches the template."""
+    src = _one_row("set_field(msg, \"PID-5.1\", f\"{msg['PID-3']}/{msg['PID-4']}\")")
+    parts = _row(src)["param_parts"]["value"]
+    parts[1] = {"text": " / "}
+    out = _set(src, {"value": {"parts": parts}})
+    assert "f\"{msg['PID-3'] or ''} / {msg['PID-4'] or ''}\"" in out.splitlines()[5]
+
+
 def test_a_literal_expr_is_written_in_its_canonical_spelling() -> None:
     """A static ``expr`` is re-rendered as the literal renderer would write it, so the line stays
     ``ruff format``-clean, and a constant JSON cannot carry is refused."""
@@ -221,7 +271,7 @@ def test_contract_v1_emits_no_param_parts() -> None:
 
 def test_the_native_form_takes_a_template_too() -> None:
     out = _set(_one_row('msg.set("PID-8", "U")'), {"value": {"parts": [{"path": "PID-8"}]}})
-    assert out.splitlines()[5] == '    msg.set("PID-8", f"{msg[\'PID-8\']}")'
+    assert out.splitlines()[5] == "    msg.set(\"PID-8\", f\"{msg['PID-8'] or ''}\")"
     row = _row(out)
     assert (row["action"], row["param_modes"]["value"]) == ("set_field", MODE_TEMPLATED)
 
@@ -233,7 +283,7 @@ def test_the_two_bounded_modes_switch_in_both_directions() -> None:
     assert out.splitlines()[5] == '    set_field(msg, "PID-5.1", "LITERAL")'
     # templated -> templated, by new parts
     out = _set(templated, {"value": {"parts": [{"path": "PID-4"}, {"text": "!"}]}})
-    assert out.splitlines()[5] == '    set_field(msg, "PID-5.1", f"{msg[\'PID-4\']}!")'
+    assert out.splitlines()[5] == "    set_field(msg, \"PID-5.1\", f\"{msg['PID-4'] or ''}!\")"
     # an expr is still accepted when the ENGINE classifies it static
     out = _set(templated, {"value": {"expr": '"plain"'}})
     assert _row(out)["param_modes"]["value"] == MODE_STATIC
@@ -369,6 +419,7 @@ TEXT_ALPHABET = [
     "}",
     "{{x}}",
     "{msg['X']}",
+    "{msg['X'] or ''}",
     "\\",
     '"',
     "'",
@@ -421,6 +472,10 @@ def _round_trip(parts: list[dict[str, str]]) -> str | None:
     assert _param_mode(node) == MODE_TEMPLATED, (parts, rendered)
     assert _template_parts(node) == _normalize_parts(parts), (parts, rendered)
     assert "\n" not in rendered and "\r" not in rendered, "a template must stay on one line"
+    # E.11: every read the renderer writes carries the empty-text fallback, never a bare read.
+    assert isinstance(node, ast.JoinedStr)
+    reads = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
+    assert reads and all(_is_empty_fallback_read(r) for r in reads), rendered
     return rendered
 
 

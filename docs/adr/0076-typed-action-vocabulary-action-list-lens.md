@@ -1055,6 +1055,54 @@ shape is this*. The amendment was written assuming one question, so a literal-bu
 had no expressible state. Any future field added beside these two should be checked against that
 question before it is checked against these sets.
 
+### E.11 Amendment note (2026-09-29): what the writable build changed in E.1, E.4 and E.5
+
+**Owner ruling 2026-09-29 (batch 180 Manager session).** Building the rewrite half of this amendment
+(BACKLOG #237, the engine piece of steps 2 and 3) departed from the text above in four places. The
+owner ruled on all four, and this note records them in one place. Nothing else in E.1 to E.10 moves.
+
+**1. E.4: a row gains three fields, not one.** At `CONTRACT_V2`, an `action`, `lookup` or
+`diagnostic` row carries `param_modes` as E.4 describes, and two more:
+
+- `param_parts` maps each `templated` param to its structured parts, a list of `{"text": ...}` and
+  `{"path": ...}` objects, or to `null` when the interpolation has no parts form.
+- `template_params` lists the params a templated write is accepted into.
+
+They exist so the IDE never takes an f-string apart. A TypeScript reading of Python source would be
+the second grammar E.5 refuses. Checked against E.10's question: `param_parts` is SHAPE detail, like
+`param_modes`, and `template_params` answers *is this editable*, as `literal_params` does for a
+literal. A write sends a template as `{"parts": [...]}`; the engine renders the f-string, and the
+classifier must read it back to the same parts before it is spliced. `CONTRACT_V1` emits none of the
+three fields, so AC-M7 is unchanged.
+
+**2. E.1: the path picker writes the templated form.** E.1 says a picker writing one bare `msg[...]`
+read is already admitted. The build does not use that route. `_param_mode` classifies a bare
+`msg["X"]` argument as `dynamic`, because only an f-string is `templated`, and AC-M2 and AC-M3 pin
+that. So the picker always writes a template, and a bare-read argument stays `dynamic` and read-only
+under AC-M5. Widening `_param_mode` to call a bare read `templated` was not taken.
+
+**3. E.5: a path part renders as `msg["X"] or ""`.** Inside an f-string a bare read renders an absent
+field as the text `None`, because `Message.field` returns `None`. A picked path would then write
+`None` into the outbound message. E.5's admitted set gains exactly one shape: a `FormattedValue` whose
+value is `msg["LIT"] or ""`, a subscript read with an empty-string fallback. That is the fallback
+`copy_field` already writes. Nothing wider is admitted. A non-empty fallback, a name, a number, a
+chained or reversed `or`, an `and`, and a fallback on a `msg.field(...)` call all stay `dynamic`.
+The renderer writes this form for every path part. The bare read and `msg.field("X")` stay admitted
+and read back as the same `{"path": "X"}` part, so round-trip totality (E.6.3) holds.
+
+**4. Template writes go into value params only.** A templated write is accepted into exactly four
+parameters: `set_field.value`, `add_repetition.value`, `append_to_field.suffix` and
+`replace_literal.new`. Every other argument takes a literal. The reason is security:
+
+- A lookup's connection, statement or query built from inbound HL7 is an SQL or FHIR injection path.
+- A diagnostic's template or label is logged unredacted. `log_note` redacts only its operands, and
+  `checkpoint` logs its label as written, so an interpolated field would put PHI in the log.
+- A path, segment id, index or setting would let message content choose which field is overwritten,
+  or put a string where an int belongs.
+
+The list is closed for the reason E.5's set is closed. `lens parse` reports it per row as
+`template_params`.
+
 ## Acceptance Criteria (Amendment E)
 
 - [ ] **AC-M1** — WHEN `lens parse` emits an `action` or `lookup` row, THE SYSTEM SHALL emit a
