@@ -368,6 +368,27 @@ def _contains_envref(value: Any, depth: int = 0) -> bool:
     return False
 
 
+def _check_tls_ca_file(factory: str, value: Any, *, unread: str | None = None) -> None:
+    """Refuse a ``tls_ca_file`` that reads as a pin but pins nothing (BACKLOG #1180).
+
+    Every connector that reads the key treats a blank value as unset, so a blank literal would look
+    pinned in review while the hop falls back to the instance ``[tls]`` anchor or the OS store. An
+    ``env()`` reference resolves later, so a blank RESOLVED value is not caught here. ``unread`` names
+    why this connection would never read the CA at all, such as plain FTP.
+
+    Raises ``ValueError`` rather than :class:`WiringError`, so ``connections_file._build_spec`` adds
+    the connection and file to the message; it re-raises a ``WiringError`` verbatim."""
+    if value is None:
+        return
+    if isinstance(value, str) and not value.strip():
+        raise ValueError(
+            f"{factory} tls_ca_file is blank. A blank value pins nothing, so the hop would trust "
+            "what it trusts with the setting unset; omit it, or name the CA's PEM file."
+        )
+    if unread is not None:
+        raise ValueError(f"{factory} tls_ca_file would never be read: {unread}.")
+
+
 def _reject_envref_headers(factory: str, headers: Any) -> None:
     """Refuse an ``env()`` reference inside a ``headers`` table (BACKLOG #1649).
 
@@ -877,6 +898,7 @@ def FhirLookup(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     encoding: str = "utf-8",
     # ADR 0153 decision 2 — the same per-connection cleartext declaration an outbound carries. It must
     # be authorable HERE: the read executor honours the pair, so leaving it to a hand-mutated
@@ -936,11 +958,15 @@ def FhirLookup(
     ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) attest that a
     revocation-checking PKI covers the SMART token endpoint this lookup signs in to, so an enforcing
     instance does not refuse that verifying hop. Same coherence rules, and the reason is recorded in
-    the WARNING logged when the attestation suppresses the refusal."""
+    the WARNING logged when the attestation suppresses the refusal.
+
+    ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
+    not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("FhirLookup", headers)
     # ADR 0153: coherence-checked at the ONE authoring surface, exactly as build_outbound_connection
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
+        _check_tls_ca_file("FhirLookup", tls_ca_file)
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
         _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
@@ -954,6 +980,7 @@ def FhirLookup(
         "basic_password": basic_password,
         "timeout_seconds": timeout_seconds,
         "verify_tls": verify_tls,
+        "tls_ca_file": tls_ca_file,
         "encoding": encoding,
     }
     # The cleartext and revocation declarations are NOT written into `settings`: they are the spec's
@@ -2486,6 +2513,7 @@ def Rest(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the HTTP response body as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -2515,8 +2543,12 @@ def Rest(
     ``proxy`` routes egress through a corporate **forward proxy** (ADR 0126): ``"default"`` uses the OS
     default web proxy, an ``http(s)://`` address is explicit, unset inherits ``[egress].proxy_url``.
     ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
-    Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly."""
+    Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly.
+
+    ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
+    not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Rest", headers)
+    _check_tls_ca_file("Rest", tls_ca_file)
     _reject_envref_in_lists(
         "Rest",
         capture_response_headers=capture_response_headers,
@@ -2535,6 +2567,7 @@ def Rest(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
+            "tls_ca_file": tls_ca_file,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2573,6 +2606,7 @@ def FHIR(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the server reply / OperationOutcome (ADR 0013)
     capture_response_headers: list[str]
@@ -2604,8 +2638,12 @@ def FHIR(
     OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter. Redirects are refused
     and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
-    (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022."""
+    (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022.
+
+    ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
+    not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("FHIR", headers)
+    _check_tls_ca_file("FHIR", tls_ca_file)
     _reject_envref_in_lists(
         "FHIR",
         capture_response_headers=capture_response_headers,
@@ -2627,6 +2665,7 @@ def FHIR(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
+            "tls_ca_file": tls_ca_file,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2925,6 +2964,7 @@ def DICOMweb(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the STOW-RS dicom+json response as a reply (ADR 0013)
     reingress_to: str
@@ -2953,8 +2993,19 @@ def DICOMweb(
     ``FailedSOPSequence`` → permanent dead-letter; 5xx/408/429/connection errors → retry). This is the
     modern HTTP imaging lane that **exceeds** both Mirth's and Corepoint's DICOM options. Put secrets in
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
-    idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever)."""
+    idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever).
+
+    ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
+    not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("DICOMweb", headers)
+    _check_tls_ca_file(
+        "DICOMweb",
+        tls_ca_file,
+        # Unlike REST/FHIR/SOAP there is no token hop here that would still read it.
+        unread=None
+        if verify_tls
+        else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
+    )
     _reject_envref_in_lists("DICOMweb", proxy_no_proxy=proxy_no_proxy)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
@@ -2967,6 +3018,7 @@ def DICOMweb(
             "basic_password": basic_password,
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
+            "tls_ca_file": tls_ca_file,
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
@@ -3313,6 +3365,7 @@ def Soap(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the SOAP response envelope as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -3370,8 +3423,12 @@ def Soap(
     is. **Check the live WSDL first:** if the service accepts a WS-Security ``UsernameToken`` header,
     use ``ws_security`` (above) and this is unnecessary. The
     operation **must be idempotent**: an at-least-once re-send mints a fresh ``<wsa:MessageID>`` (correct
-    WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate."""
+    WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate.
+
+    ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
+    not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Soap", headers)
+    _check_tls_ca_file("Soap", tls_ca_file)
     _reject_envref_in_lists(
         "Soap",
         capture_response_headers=capture_response_headers,
@@ -3390,6 +3447,7 @@ def Soap(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
+            "tls_ca_file": tls_ca_file,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -3494,6 +3552,7 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     tls_allow_expired: bool = False,  # FTPS: honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     remote_dir: str | EnvRef,
@@ -3521,7 +3580,13 @@ def Ftp(
     or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
     secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
-    ``poll_max_files`` behave exactly as they do on :func:`Sftp`."""
+    ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
+
+    ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
+    not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    _check_tls_ca_file(
+        "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
+    )
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -3529,6 +3594,7 @@ def Ftp(
             "host": host,
             "port": port,
             "tls_allow_expired": tls_allow_expired,
+            "tls_ca_file": tls_ca_file,
             "username": username,
             "password": password,
             "remote_dir": remote_dir,
