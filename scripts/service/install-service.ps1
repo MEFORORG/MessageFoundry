@@ -19,6 +19,11 @@
 [CmdletBinding()]
 param(
     [string]$NssmPath,
+    # Where the nssm.exe the service runs is kept (BACKLOG #2364). It must be a folder only
+    # administrators can write, and the script refuses one that is not: this script runs that file as
+    # administrator, and the SCM starts it as the service account. Not under -DataDir, where the
+    # engine's own account has modify rights.
+    [string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm",
     [string]$ServiceName = "MessageFoundry",
     [string]$AppExe,
     [string]$Config,
@@ -83,14 +88,13 @@ $ErrorActionPreference = "Stop"
 $NssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
 $NssmSha256 = "727D1E42275C605E0F04ABA98095C38A8E1E46DEF453CDFFCE42869428AA6743"
 
-# BEGIN pinned-hash check (kept byte-identical in install-service.ps1, uninstall-service.ps1,
-# install-net-helper.ps1 and uninstall-net-helper.ps1; guarded by tests/test_nssm_pin.py, which fails
-# if the four copies drift)
+# BEGIN pinned-hash check (kept byte-identical in install-service.ps1 and install-net-helper.ps1;
+# guarded by tests/test_nssm_pin.py, which fails if the two copies drift)
 #
 # The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
-# pins as $NssmSha256. Every script checks the copy it is about to run against this value, whichever
-# source the copy came from - -NssmPath, PATH, a cache, or a download (BACKLOG #2364). Only the
-# download used to be checked, so a copy found anywhere else ran unchecked, as administrator.
+# pins as $NssmSha256. Both installers check every nssm.exe they copy or run against this value,
+# whichever source it came from - -NssmPath, PATH, an installed copy, or a download (BACKLOG #2364).
+# Only the download used to be checked. The two uninstallers do not run nssm at all.
 $NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
 
 function Get-FilePinProblem {
@@ -116,17 +120,21 @@ function Lock-PinnedFile {
     <#
       Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
       return the open handle. Throws, with the handle closed, when the file cannot be opened that
-      way or does not match.
+      way or does not match. Dispose the handle once the script no longer runs the file.
 
-      A check alone leaves a gap: the script hashes a copy and runs it later, and a file in a folder
-      another account can write could be swapped in between. While this handle is open it cannot
-      be. Measured 2026-09-29 on Windows 11 under PowerShell 7.6: holding a FileShare.Read handle,
-      this process could still hash the file and run it, and another process's write, rename and
-      delete of it, and a rename of its folder, were all refused. A process already holding the
-      file open for writing makes the open itself fail, which is a refusal too. Dispose the handle
-      when the script no longer runs the file.
+      The folder check is what keeps a copy safe between runs. This keeps the copy that was checked
+      the copy that runs, within one run. Measured 2026-09-29 on Windows 11 under PowerShell 7.6:
+      holding a FileShare.Read handle, this process could still hash the file and run it, and
+      another process's write, rename and delete of it, and a rename of its folder or of that
+      folder's parent, were all refused. A process already holding the file open for writing makes
+      the open itself fail, which is a refusal too.
+
+      THE PATH IS MADE ABSOLUTE FIRST. [IO.File]::Open resolves a relative path against the
+      process's directory, and Get-FileHash against the PowerShell location, so a relative path
+      could lock one file and hash another.
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
     $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $problem = Get-FilePinProblem -Path $Path -Expected $Expected
     if ($problem) {
@@ -135,65 +143,209 @@ function Lock-PinnedFile {
     }
     return $handle
 }
+
+function Get-BroadWriteHolders {
+    <#
+      Principals who can write $Path, or can make themselves able to, beyond the five that always
+      may. Two arms: the OWNER, and Allow-write entries on the DACL.
+
+      Returns an empty array when the directory is administrator-only, which is what makes "the
+      folder is safe" a reading rather than an assumption.
+
+      NOT install-service.ps1's Get-BroadAclResidue, and deliberately not a copy of it. That one
+      allows the engine's service account, because the engine has to write its data directory; it
+      takes any Allow entry rather than write-class ones, and it has no owner arm. Here nothing
+      outside the five may write at all - whoever can write this folder can replace a binary that
+      an administrator runs, or that later runs as SYSTEM. Same shape, different question; naming them apart keeps a reader from
+      assuming one answers the other's.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
+    # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
+    # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
+    # REFUSAL, and in install-net-helper.ps1 its only escape is -AllowBroadAcl, which downgrades the
+    # whole check to a warning -- so one false positive would disable the gate.
+    $allowed = @(
+        "S-1-5-18",                                                                # SYSTEM
+        "S-1-5-32-544",                                                            # Administrators
+        "S-1-3-0",                                                                 # CREATOR OWNER
+        "S-1-3-4",                                                                 # OWNER RIGHTS
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"           # TrustedInstaller
+    )
+    $rights = [Security.AccessControl.FileSystemRights]
+    # THE TWO GENERIC BITS ARE IN THE MASK ON PURPOSE, and leaving them out is why a first version of
+    # this was quietly weaker than it looked. FileSystemRights names no GENERIC_ALL or GENERIC_WRITE,
+    # and a real Program Files ACL is full of them: measured on Windows 11 26200, five of its
+    # fourteen entries render as the bare numbers 268435456 (GENERIC_ALL) and -1610612736
+    # (GENERIC_READ|GENERIC_EXECUTE). Those are the inherit-only templates that decide what a file
+    # CREATED in the folder gets - which is exactly the binary this install is about to write - and
+    # none of the named bits below intersects them. So a GENERIC_ALL for Users would have passed a
+    # mask built only from the named rights.
+    $genericAll = 0x10000000
+    $genericWrite = 0x40000000
+    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::WriteAttributes -bor
+        $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
+        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
+    $found = @()
+    # RETURNED AS A RESIDUE, NOT THROWN. An unreadable DACL is not "the folder is fine", so it has to
+    # reach the caller - but throwing from here made install-net-helper.ps1's refusal message name
+    # -AllowBroadAcl as the escape when that switch is not consulted until AFTER this call. An operator following
+    # that instruction got the identical refusal: a dead end, and exactly the false-premise defect
+    # the rest of this script is written against. Returned as a finding instead, so the one decision
+    # about -AllowBroadAcl covers all three ways this can come back non-empty.
+    #
+    # -LiteralPath, NOT -Path. Measured: for a directory whose name holds '[' or ']', `Get-Acl -Path`
+    # returns $null WITHOUT raising, even under -ErrorAction Stop - so the catch never fires and the
+    # arms below read a null object.
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
+        return @("the permissions of '$Path' could not be read ($($_.Exception.Message)), so " +
+            "nothing established who can write there")
+    }
+    if ($null -eq $acl) {
+        return @("the permissions of '$Path' could not be read (Get-Acl returned nothing), so " +
+            "nothing established who can write there")
+    }
+
+    # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
+    # a low-privilege owner can rewrite the DACL whatever it says today and then replace a binary
+    # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
+    # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
+    # without it reports a clean folder for exactly that case.
+    #
+    # AND IT TAKES THE WELL-KNOWN ADMIN RIDs TOO, which the literal list cannot cover: that module's
+    # _WIN_ADMIN_RIDS records that the built-in Administrator (500), Domain Admins (512), Schema
+    # Admins (518) and Enterprise Admins (519) vary per domain. Without them a folder an admin ran
+    # `takeown` on, or one restored from a backup, is refused for being owned by an administrator.
+    $ownerSid = $null
+    try {
+        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    } catch { $ownerSid = "$($acl.Owner)" }
+    # COMPARED AS TEXT, NOT CAST. A RID is a 32-bit UNSIGNED value and [int] is signed, so casting
+    # overflows on a real SID: measured, TrustedInstaller's last group is 2271478464 and
+    # `[int]"2271478464"` throws "Value was either too large or too small for an Int32" -- which
+    # under $ErrorActionPreference = "Stop" aborted this whole check on an ordinary Program Files
+    # folder. A string compare answers the only question being asked and cannot overflow.
+    $ownerRid = if ($ownerSid -match '-(\d+)$') { $Matches[1] } else { "" }
+    if (($allowed -notcontains $ownerSid) -and ($ownerRid -notin @("500", "512", "518", "519"))) {
+        $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
+    }
+
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        $name = "$($rule.IdentityReference)"
+        # $allowed holds SIDs only, so an untranslatable identity falls back to its own text and is
+        # REPORTED rather than skipped: a SID nobody can translate is still a grant, and dropping it
+        # would turn a residue into a clean result.
+        $sid = $name
+        try {
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
+    }
+    return ($found | Select-Object -Unique)
+}
 # END pinned-hash check
 
 function Resolve-Nssm {
     <#
-      The nssm.exe this install runs, and registers the service with. Each source is checked against
-      $NssmExeSha256 before it is used (BACKLOG #2364).
+      The nssm.exe this install runs, and registers the service with: the copy in -NssmDir, a folder
+      only administrators can write (BACKLOG #2364).
 
-      The search order is -NssmPath, then PATH, then the copy cached in <DataDir>\bin, then a
-      download. The cache sits in the data directory, where the engine's own account has modify
-      rights. So without a check there, code running as the engine could plant an nssm.exe for the
-      next install to run as administrator.
+      WHY A FOLDER OF ITS OWN. The registration names an nssm.exe by path, and this script runs that
+      file as administrator. It used to be cached in <DataDir>\bin, where the engine's own account
+      has modify rights. From there, code running as the engine could replace the file, plant a DLL
+      beside it, or turn the folder into a junction, for the next install to run as administrator. A
+      hash check sees only the first of those three. So the copy that runs lives where the engine
+      cannot write, and Get-BroadWriteHolders reads the folder's owner and permissions rather than
+      assuming them.
 
-      Each source fails in its own way, on purpose:
-        -NssmPath  refused. The operator named that file, so running another would surprise them.
-        PATH       skipped with a warning, and the search goes on. A package manager's nssm is a
-                   different build with a different hash, which is ordinary and not an attack.
-        cache      refused. Only this function writes that file, from a checked download, so a
-                   mismatch means something changed it afterwards.
-        download   the archive is checked against $NssmSha256, and the nssm.exe taken out of it
-                   against $NssmExeSha256, before it is cached.
+      Every source is checked against $NssmExeSha256 before it is copied in:
+        installed  the copy already in -NssmDir. Used as it is when it passes, and REFUSED when it
+                   does not, because only an administrator can have changed it.
+        -NssmPath  refused on a mismatch. The operator named that file.
+        PATH       skipped with a warning on a mismatch. A package manager's nssm may be another
+                   build, which is ordinary and not an attack.
+        download   the archive is checked against $NssmSha256, then its nssm.exe against the pin.
 
-      THIS CHECK CHOOSES THE COPY; Lock-PinnedFile, at the call site, is what binds it. The binary
-      runs later in this script, so the caller opens it against change and checks it again under
-      that handle, which it holds until the last nssm call.
+      TWO COPIES THAT PASS THE PIN ARE THE SAME BYTES, so a passing installed copy is never
+      overwritten. That also means a reinstall never copies over the image a running service holds
+      open. The caller then holds the returned copy open with Lock-PinnedFile until its last nssm
+      call.
     #>
-    param([string]$Provided, [string]$DataDir)
+    param([string]$Provided, [Parameter(Mandatory)][string]$NssmDir)
 
+    # A folder this script creates is handed to Administrators. Otherwise its owner follows the host's
+    # default-owner policy, which under "Object creator" is the individual operator, and the check
+    # below would refuse the folder it just made. An existing folder is left as it is: its owner is
+    # the operator's choice, and the check reads it either way.
+    $created = -not (Test-Path -LiteralPath $NssmDir)
+    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
+    if ($created) { & icacls $NssmDir /setowner "*S-1-5-32-544" | Out-Null }
+    $holders = @(Get-BroadWriteHolders -Path $NssmDir)
+    if ($holders.Count -gt 0) {
+        throw ("'$NssmDir' is not administrator-only: $($holders -join '; '). Whoever can write there " +
+            "can replace the nssm.exe this script runs as administrator, or plant a DLL beside it. " +
+            "Pass -NssmDir with a folder under Program Files, or fix its permissions, and re-run.")
+    }
+    $target = Join-Path $NssmDir "nssm.exe"
+
+    $source = $null
     if ($Provided) {
         if (-not (Test-Path -LiteralPath $Provided)) { throw "NSSM not found at: $Provided" }
-        $resolved = (Resolve-Path -LiteralPath $Provided).Path
-        $problem = Get-FilePinProblem -Path $resolved -Expected $NssmExeSha256
+        $source = (Resolve-Path -LiteralPath $Provided).Path
+        $problem = Get-FilePinProblem -Path $source -Expected $NssmExeSha256
         if ($problem) {
             throw ("Refusing -NssmPath: $problem. Pass the win64 nssm.exe from the NSSM 2.24 " +
                 "release, or leave -NssmPath out and this script downloads and checks it.")
         }
-        return $resolved
     }
-    $onPath = Get-Command nssm -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($onPath) {
-        $problem = Get-FilePinProblem -Path $onPath.Source -Expected $NssmExeSha256
-        if (-not $problem) { return $onPath.Source }
-        Write-Warning "Not using the nssm on PATH: $problem. Using the pinned release instead."
-    }
-
-    $binDir = Join-Path $DataDir "bin"
-    $cached = Join-Path $binDir "nssm.exe"
-    if (Test-Path -LiteralPath $cached) {
-        $problem = Get-FilePinProblem -Path $cached -Expected $NssmExeSha256
+    if (Test-Path -LiteralPath $target) {
+        $problem = Get-FilePinProblem -Path $target -Expected $NssmExeSha256
         if ($problem) {
-            throw ("Refusing the cached NSSM: $problem. Only this installer writes that file, from a " +
-                "checked download, so something has changed it since. Find out what, then delete " +
-                "it and re-run to download the pinned release again.")
+            throw ("Refusing the installed NSSM: $problem. Only an administrator can write " +
+                "'$NssmDir', so find out what changed it. Then delete it and re-run.")
         }
-        return $cached
+        return $target
     }
+    if (-not $source) {
+        $onPath = Get-Command nssm -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($onPath) {
+            $problem = Get-FilePinProblem -Path $onPath.Source -Expected $NssmExeSha256
+            if (-not $problem) { $source = $onPath.Source }
+            else {
+                Write-Warning ("Not using the nssm on PATH: $problem. Downloading the pinned release " +
+                    "instead. With no internet access, pass -NssmPath with the win64 nssm.exe from " +
+                    "nssm-2.24.zip.")
+            }
+        }
+    }
+    if ($source) {
+        Copy-Item -LiteralPath $source -Destination $target -Force
+    } else {
+        Save-PinnedNssm -Destination $target
+    }
+    # The COPY is what runs, so the copy is what gets checked. With the download, a mismatch here
+    # means the two pins disagree: a binary pin that does not match the pinned archive is wrong.
+    $problem = Get-FilePinProblem -Path $target -Expected $NssmExeSha256
+    if ($problem) {
+        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        throw "The nssm.exe copied into '$NssmDir' failed its check: $problem."
+    }
+    Write-Host "NSSM installed to $target"
+    return $target
+}
 
+function Save-PinnedNssm {
+    <#
+      Download the pinned NSSM archive, check it against $NssmSha256, and write its win64 nssm.exe to
+      $Destination. The caller checks the written file against $NssmExeSha256.
+    #>
+    param([Parameter(Mandatory)][string]$Destination)
     Write-Host "NSSM not found - downloading $NssmUrl ..."
-    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
     $zip = Join-Path $env:TEMP "nssm-mefor-download.zip"
     $extract = Join-Path $env:TEMP "nssm-mefor-extract"
     [Net.ServicePointManager]::SecurityProtocol =
@@ -209,18 +361,29 @@ function Resolve-Nssm {
     $exe = Get-ChildItem -Path $extract -Recurse -Filter nssm.exe |
         Where-Object { $_.Directory.Name -eq "win64" } | Select-Object -First 1
     if (-not $exe) { throw "win64\nssm.exe not found in the downloaded NSSM archive." }
-    Copy-Item $exe.FullName $cached -Force
+    Copy-Item -LiteralPath $exe.FullName -Destination $Destination -Force
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
-    # The archive passed, so a mismatch here means the two pins disagree: a binary pin that does not
-    # match the binary in the pinned archive is a pin somebody got wrong.
-    $problem = Get-FilePinProblem -Path $cached -Expected $NssmExeSha256
-    if ($problem) {
-        Remove-Item $cached -Force -ErrorAction SilentlyContinue
-        throw "The nssm.exe from the checked NSSM archive failed its own check: $problem."
-    }
-    Write-Host "NSSM installed to $cached"
-    return $cached
+}
+
+function Get-ServiceImageProblem {
+    <#
+      Why the service's registration does not start the nssm.exe at $Path, or "" when it does.
+
+      The registered line is compared whole, quoted or not, with or without arguments after it. It is
+      not split on spaces: C:\Program Files holds one, so a split would cut every default path short.
+      Read from Win32_Service without a WQL filter, because -ServiceName is not validated here and a
+      quote in it would end a WQL literal.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    $svc = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    $line = if ($svc) { "$($svc.PathName)".Trim() } else { "" }
+    $quoted = "`"$Path`""
+    if (($line -eq $Path) -or ($line -eq $quoted) -or
+        $line.StartsWith("$quoted ", [StringComparison]::OrdinalIgnoreCase) -or
+        $line.StartsWith("$Path ", [StringComparison]::OrdinalIgnoreCase)) { return "" }
+    return "'$ServiceName' is registered to start '$line', not the checked copy '$Path'"
 }
 
 function Set-SecureDataDirAcl {
@@ -673,13 +836,21 @@ else { $Config = Resolve-AbsolutePath $Config }
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
 
-# AFTER the normalization: Resolve-Nssm joins "bin" onto -DataDir and caches nssm.exe there, so a
-# relative -DataDir here would download the binary to one directory and register a service pointing at
-# another.
-$NssmPath = Resolve-Nssm -Provided $NssmPath -DataDir $DataDir
-# HELD OPEN UNTIL THE LAST nssm CALL (BACKLOG #2364). Resolve-Nssm checked the copy, but it runs
-# later, and the cache sits where the engine's account can write. While this handle is open no other
-# process can change, rename or delete the file, and the hash is taken again under it.
+$NssmDir = Resolve-AbsolutePath $NssmDir
+
+# AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
+# with that path, so a relative one would be resolved against a different directory later.
+$NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
+# HELD OPEN UNTIL THE LAST nssm CALL (BACKLOG #2364), and taken again under the handle. -NssmDir is
+# administrator-only, which keeps the copy safe between runs; this keeps the copy that was checked
+# the copy that runs. The trap closes it on the way out of a failed run, because an operator who ran
+# this in an open window, as `messagefoundry service install` does with -NoExit, would otherwise
+# keep the file locked until that window closed.
+$NssmLock = $null
+trap {
+    if ($NssmLock) { $NssmLock.Dispose() }
+    break
+}
 try {
     $NssmLock = Lock-PinnedFile -Path $NssmPath -Expected $NssmExeSha256
 } catch {
@@ -853,17 +1024,30 @@ function Stop-ServiceAndConfirm {
 # Detect via Get-Service rather than `nssm status` (which errors to stderr on a missing
 # service and would abort under ErrorActionPreference=Stop).
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+    # CHECKED BEFORE ANYTHING IS STOPPED OR RECONFIGURED (BACKLOG #2364). `nssm set` never changes which
+    # nssm.exe the SCM starts, so a reinstall that only reconfigured would leave the service on the
+    # image it was first registered with, which may sit where the engine's account can write it.
+    $imageProblem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $NssmPath
+    if ($imageProblem) {
+        throw ("$imageProblem. This script will not reconfigure a service whose nssm.exe it has " +
+            "not checked. Remove it with .\uninstall-service.ps1 and re-run.")
+    }
     Write-Host "Service '$ServiceName' exists - stopping and reconfiguring..."
     if (-not (Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $NssmPath)) {
         Write-Warning ("Reconfiguring '$ServiceName' while it is still running. NSSM writes the new " +
             "settings, but the RUNNING process keeps the old ones until it is restarted - so this " +
             "install can report success over a service that is still on the previous configuration, " +
             "including the previous run-as account and the previous paths. Stop it by hand and " +
-            "re-run, or restart it once this finishes, and confirm with 'nssm status $ServiceName'.")
+            "re-run, or restart it once this finishes, and confirm with 'Get-Service $ServiceName'.")
     }
 } else {
     Write-Host "Installing service '$ServiceName'..."
     Invoke-Nssm install $ServiceName $AppExe
+    # NSSM registers the path of the nssm.exe that ran `install`. Read back, not assumed.
+    $imageProblem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $NssmPath
+    if ($imageProblem) {
+        throw "$imageProblem. Remove it with .\uninstall-service.ps1 before starting it."
+    }
 }
 
 Invoke-Nssm set $ServiceName Application $AppExe

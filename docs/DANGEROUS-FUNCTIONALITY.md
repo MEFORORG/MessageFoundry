@@ -325,7 +325,7 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
 | `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
@@ -347,33 +347,37 @@ Other switches on `install-service.ps1` change more than the service:
   keyed by program name. So they affect every process with that name on the machine, not only the
   engine.
 
-**The scripts check every copy of NSSM before they run it.** `install-service.ps1` and
-`uninstall-service.ps1` look for NSSM in three places: `-NssmPath`, then `PATH`, then a copy cached
-in the data directory's `bin` folder. Only when all three miss does the installer download NSSM. It
-checks the download against a fixed SHA-256 hash of the archive. Any copy a script runs, from any
-of those places, must also match a fixed SHA-256 hash of `nssm.exe` itself. The installer refuses a
-`-NssmPath` copy or a cached copy that does not match. It skips a `PATH` copy that does not match,
-and downloads instead. The uninstaller runs no copy that fails, and removes the service with
-`sc.exe` instead. Each message names both hashes. `uninstall-net-helper.ps1` checks its `nssm.exe`
-the same way.
+**The installers run NSSM only from a folder administrators alone can write, and only a checked
+copy.** `install-service.ps1` keeps the service's `nssm.exe` in `-NssmDir`,
+`C:\Program Files\MessageFoundry\nssm` by default. It reads that folder's owner and permissions and
+refuses it when anyone else can write there. It fills the folder from `-NssmPath`, from `PATH`, or
+by downloading NSSM. It checks a download against a fixed SHA-256 hash of the archive. Every copy,
+from any of those places, must also match a fixed SHA-256 hash of `nssm.exe` itself before it is
+copied in. The installer refuses a `-NssmPath` copy that does not match, and a copy already in the
+folder that does not match. It skips a `PATH` copy that does not match, and downloads instead. Each
+message names both hashes. It holds the copy open from the check to its last NSSM call, so no other
+process can change, rename or delete it in between. On a reinstall it refuses a service registered
+to start any other `nssm.exe`.
 
-**The two engine scripts also hold the copy open until they are done with it.** The cache sits in
-the data directory, where the engine's service account can modify files, and a script runs NSSM
-for some seconds after it checks it. So `install-service.ps1` and `uninstall-service.ps1` open the
-copy in a way that stops any other process from changing, renaming or deleting it. They check the
-hash again through that open file, and close it after their last NSSM call. Two gaps remain. The
-service itself runs that cached copy, so the engine's account can still replace it between runs.
-That gains the account nothing, because the service runs as the same account. The second gap is
-an administrator running that copy by hand, for example `nssm restart`. No script checks that
-run. `Restart-Service` does the same job without it.
+The copy used to be cached in the data directory, where the engine's service account can modify
+files. From there, code running as the engine could have replaced it, planted a library beside it,
+or redirected the folder, and the next install would have run the result as administrator. A hash
+check alone would have caught only the first of those three.
+
+**The uninstall scripts run no NSSM at all.** Windows stops the service, and `sc.exe` removes it.
 
 `install-net-helper.ps1` downloads nothing. It copies `mefor-net-helper.exe` from `-HelperSource`,
 and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. `nssm.exe` must match the same
 fixed hash. `mefor-net-helper.exe` must match `-HelperSha256`, a hash the operator has to pass.
 This repository pins none for it, because each release builds the helper again. The script checks
-each file before the copy and again after it, and refuses a mismatch before it starts anything.
-It prints the helper's signature status without requiring one. It then starts the helper as
-LocalSystem.
+each file before the copy. It checks the installed copies again, holds them open until its last
+NSSM call, and deletes both if either fails. It prints the helper's signature status without
+requiring one. It then starts the helper as LocalSystem.
+
+**At least these gaps remain.** An administrator who runs some other `nssm.exe` by hand, such as
+one on `PATH`, runs a copy nothing checked. `Start-Service` and `Restart-Service` need no NSSM.
+`-HelperSha256` is only as good as the channel the operator took it from. `-AllowBroadAcl` lets the
+helper's folder stay writable by others between runs.
 
 It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless `-AppExe`
 names another, to read the address settings. It checks no hash on that program, and it runs it

@@ -1,38 +1,40 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Every service script checks the nssm.exe it runs, whatever its source (BACKLOG #2364).
+"""No service script runs an nssm.exe it has not checked, from a folder the engine can write (#2364).
 
-``install-service.ps1`` used to check NSSM's hash only when it downloaded the archive. A copy it
-found through ``-NssmPath``, on ``PATH`` or cached under ``<DataDir>\\bin`` ran unchecked, as
-administrator, and the cache sits where the engine's own account can write. The helper installer
-checked neither ``nssm.exe`` nor ``mefor-net-helper.exe`` before starting the helper as LocalSystem.
+``install-service.ps1`` used to check NSSM's hash only when it downloaded the archive, and cached the
+binary in ``<DataDir>\\bin``, where the engine's own account has modify rights. A copy from
+``-NssmPath``, ``PATH`` or that cache ran unchecked, as administrator. A hash check alone would not
+have been enough there: from that folder the engine could also plant a DLL beside the binary, or turn
+the folder into a junction after the check. The helper installer checked neither ``nssm.exe`` nor
+``mefor-net-helper.exe`` before starting the helper as LocalSystem.
 
-Four scripts now carry one byte-identical block holding ``$NssmExeSha256``, the SHA-256 of the win64
-``nssm.exe`` inside the pinned archive; ``Get-FilePinProblem``, which each script calls before it
-runs a copy; and ``Lock-PinnedFile``, which holds a copy open against change from its check until
-its last use. This file pins four things:
+What the scripts do now, and what this file pins:
 
-1. **The four copies of the block are identical**, so the four scripts check against one pin. The
-   pin is also not the ARCHIVE pin, which is the easy mistake: ``$NssmSha256`` hashes the zip, and a
-   binary compared against it would be refused every time.
-2. **Each resolver refuses a wrong copy and takes a right one.** The functions are lifted out of the
-   scripts by PowerShell AST and run, the pattern ``tests/test_service_install_manifest.py`` uses.
-   Every refusal has a positive control beside it: a check that refuses everything would pass a
-   refusal-only test. The pin is swapped for the hash of a stand-in file, because the real
-   ``nssm.exe`` is not in this repository; the swap is what makes the positive control possible.
-3. **The lock holds.** A locked file cannot be written by another handle, and a failed lock leaves
-   nothing open.
-4. **Each script's top level uses these in the right order.** The top levels need elevation and a
-   service, so the order is read from the AST: the check before anything is stopped or run, the
-   lock before the first nssm call and released after the last one.
+1. **One pin, two identical copies.** ``install-service.ps1`` and ``install-net-helper.ps1`` share a
+   byte-identical block: ``$NssmExeSha256`` (the win64 ``nssm.exe`` inside the pinned archive, which
+   is NOT the archive's own ``$NssmSha256``), ``Get-FilePinProblem``, ``Lock-PinnedFile`` and
+   ``Get-BroadWriteHolders``.
+2. **The engine installer keeps nssm.exe in an administrator-only folder,** ``-NssmDir``, checks every
+   source against the pin before copying it in, and refuses a folder anyone else can write. The
+   resolver is lifted out by PowerShell AST and run against stand-in files, with the folder reading
+   stubbed, because a test's temp folder is never administrator-only. Every refusal has a positive
+   control beside it.
+3. **The lock holds**: a locked file cannot be written through another handle, and a refused lock
+   leaves nothing open.
+4. **The registration is read back.** ``Get-ServiceImageProblem`` is run against stubbed service
+   records, and a reinstall refuses a service registered to start any other nssm.exe.
+5. **Each top level uses these in order**, read from the AST: check before stop, lock before the
+   first nssm call and released after the last, a trap that releases it on failure.
+6. **The uninstallers run no nssm.exe at all.** The SCM stops the service and ``sc.exe`` removes it.
 
 Everything runs in ONE pwsh process, because this file imports the engine and so runs on every
 engine leg, where each spawn costs about a second.
 
-WHAT THIS DOES NOT TEST: that ``$NssmExeSha256`` is the hash of the real binary. That value was read
-from a copy ``install-service.ps1`` had cached after a checked download; the download path checks the
-extracted binary against it, so a wrong pin fails closed on the first download. The
-``windows-service-smoke`` leg is where that download runs.
+WHAT THIS DOES NOT TEST: that ``$NssmExeSha256`` is the hash of the real binary, and that the SCM
+starts a service registered from ``-NssmDir``. The download path checks the extracted binary against
+the pin, so a wrong pin fails closed on the first download. The ``windows-service-smoke`` leg runs
+that download and that start.
 """
 
 from __future__ import annotations
@@ -61,18 +63,14 @@ pytestmark = pytest.mark.skipif(
     reason="scripts/service not locatable (off-repo / non-editable install)",
 )
 
-_SCRIPTS = (
-    "install-service.ps1",
-    "uninstall-service.ps1",
-    "install-net-helper.ps1",
-    "uninstall-net-helper.ps1",
-)
+_WITH_BLOCK = ("install-service.ps1", "install-net-helper.ps1")
+_WITHOUT_NSSM = ("uninstall-service.ps1", "uninstall-net-helper.ps1")
 _BEGIN = "# BEGIN pinned-hash check"
 _END = "# END pinned-hash check"
 _PIN_RE = re.compile(r'^\$NssmExeSha256\s*=\s*"([^"]*)"', re.M)
 _ARCHIVE_RE = re.compile(r'\$NssmSha256\s*=\s*"([^"]*)"')
 
-# Stand-ins for nssm.exe. Never executed: every function under test only hashes them.
+# Stand-ins for nssm.exe. Never executed: every function under test only hashes or copies them.
 _GOOD = b"stand-in for the pinned nssm.exe\n"
 _BAD = b"stand-in for a planted nssm.exe\n"
 
@@ -106,13 +104,11 @@ def _psq(value: str) -> str:
 # ------------------------------------------------------------------------------ the shared pin
 
 
-def test_the_four_copies_of_the_block_are_identical() -> None:
-    blocks = {name: _block(name) for name in _SCRIPTS}
-    reference = blocks["install-service.ps1"]
-    drifted = sorted(name for name, block in blocks.items() if block != reference)
-    assert not drifted, (
-        f"the pinned-hash block in {drifted} differs from install-service.ps1's. The four copies "
-        "are one definition kept in four places; change all four in the same commit."
+def test_the_two_copies_of_the_block_are_identical() -> None:
+    first, second = (_block(name) for name in _WITH_BLOCK)
+    assert first == second, (
+        "the pinned-hash block in install-net-helper.ps1 differs from install-service.ps1's. The two "
+        "copies are one definition kept in two places; change both in the same commit."
     )
 
 
@@ -131,11 +127,12 @@ def test_the_pin_is_well_formed_and_is_not_the_archive_pin() -> None:
     )
 
 
-def test_no_script_outside_the_block_restates_the_pin() -> None:
-    pin = _PIN_RE.findall(_block("install-service.ps1"))[0]
-    for name in _SCRIPTS:
-        outside = _text(name).replace(_block(name), "")
-        assert pin.lower() not in outside.lower(), (
+def test_no_script_restates_the_pin_outside_the_block() -> None:
+    pin = _PIN_RE.findall(_block("install-service.ps1"))[0].lower()
+    for name in _WITH_BLOCK + _WITHOUT_NSSM:
+        text = _text(name)
+        outside = text.replace(_block(name), "") if name in _WITH_BLOCK else text
+        assert pin not in outside.lower(), (
             f"{name} states the nssm.exe pin outside the shared block. A second spelling is not "
             "guarded by the drift test and goes stale quietly."
         )
@@ -143,16 +140,30 @@ def test_no_script_outside_the_block_restates_the_pin() -> None:
 
 # ------------------------------------------------------------------- one pwsh run for all of it
 
-# Functions lifted out of each script. The block's functions are identical in all four scripts,
-# which the drift test above pins, so taking them from one is taking them from all.
+# Functions lifted out of each script. The block's functions are identical in both installers,
+# which the drift test above pins, so taking them from one is taking them from both.
 _FUNCTIONS = {
-    "install-service.ps1": ["Get-FilePinProblem", "Lock-PinnedFile", "Resolve-Nssm"],
-    "uninstall-service.ps1": ["Resolve-UninstallNssm"],
+    "install-service.ps1": [
+        "Get-FilePinProblem",
+        "Lock-PinnedFile",
+        "Resolve-Nssm",
+        "Save-PinnedNssm",
+        "Get-ServiceImageProblem",
+    ],
     "install-net-helper.ps1": ["Resolve-AbsolutePath", "Resolve-HelperNssm"],
 }
 
-# Top levels whose command order is read back, for the ordering tests.
-_ORDERED = ("install-service.ps1", "uninstall-service.ps1", "install-net-helper.ps1")
+# Stubs, defined AFTER the lifted functions so they win. A test's temp folder is never
+# administrator-only, so the folder reading is set per case; the download must never be reached;
+# the service records are whatever a case says they are.
+_STUBS = """
+  $broadHolders = @()
+  function Get-BroadWriteHolders { param($Path) $broadHolders }
+  function Invoke-WebRequest { throw 'NETWORK TOUCHED' }
+  function icacls { }
+  $services = @()
+  function Get-CimInstance { $services }
+"""
 
 _CASES = """
   # --- Get-FilePinProblem
@@ -162,35 +173,46 @@ _CASES = """
   Invoke-Case 'pin-bad' 'path-none' { Get-FilePinProblem -Path $bad -Expected $NssmExeSha256 }
   Invoke-Case 'pin-missing' 'path-none' {
     Get-FilePinProblem -Path (Join-Path $root 'nope.exe') -Expected $NssmExeSha256 }
-  # --- install-service.ps1 Resolve-Nssm
-  Invoke-Case 'install-provided-good' 'path-none' {
-    Resolve-Nssm -Provided $good -DataDir (Join-Path $root 'data-none') }
+  # --- install-service.ps1 Resolve-Nssm, each case with a folder of its own
+  Invoke-Case 'install-provided-good' 'path-bad' {
+    Resolve-Nssm -Provided $good -NssmDir (Join-Path $root 'home-provided-good') }
   Invoke-Case 'install-provided-bad' 'path-good' {
-    Resolve-Nssm -Provided $bad -DataDir (Join-Path $root 'data-good') }
-  Invoke-Case 'install-path-good' 'path-good' { Resolve-Nssm -DataDir (Join-Path $root 'data-bad') }
-  Invoke-Case 'install-path-bad-cache-good' 'path-bad' {
-    Resolve-Nssm -DataDir (Join-Path $root 'data-good') }
-  Invoke-Case 'install-cache-good' 'path-none' { Resolve-Nssm -DataDir (Join-Path $root 'data-good') }
-  Invoke-Case 'install-cache-bad' 'path-none' { Resolve-Nssm -DataDir (Join-Path $root 'data-bad') }
-  Invoke-Case 'install-path-bad-cache-bad' 'path-bad' {
-    Resolve-Nssm -DataDir (Join-Path $root 'data-bad') }
-  # --- uninstall-service.ps1 Resolve-UninstallNssm
-  Invoke-Case 'uninstall-provided-good' 'path-none' {
-    Resolve-UninstallNssm -Provided $good -Cached (Join-Path $root 'data-none/bin/nssm.exe') }
-  Invoke-Case 'uninstall-provided-bad' 'path-good' {
-    Resolve-UninstallNssm -Provided $bad -Cached (Join-Path $root 'data-good/bin/nssm.exe') }
-  Invoke-Case 'uninstall-path-bad-cache-good' 'path-bad' {
-    Resolve-UninstallNssm -Cached (Join-Path $root 'data-good/bin/nssm.exe') }
-  Invoke-Case 'uninstall-path-good' 'path-good' {
-    Resolve-UninstallNssm -Cached (Join-Path $root 'data-bad/bin/nssm.exe') }
-  Invoke-Case 'uninstall-cache-bad' 'path-none' {
-    Resolve-UninstallNssm -Cached (Join-Path $root 'data-bad/bin/nssm.exe') }
+    Resolve-Nssm -Provided $bad -NssmDir (Join-Path $root 'home-provided-bad') }
+  Invoke-Case 'install-path-good' 'path-good' {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-path-good') }
+  Invoke-Case 'install-path-bad' 'path-bad' {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-path-bad') }
+  Invoke-Case 'install-home-good' 'path-bad' {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-good') }
+  Invoke-Case 'install-home-bad' 'path-good' {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-bad') }
+  Invoke-Case 'install-home-good-provided-bad' 'path-good' {
+    Resolve-Nssm -Provided $bad -NssmDir (Join-Path $root 'home-good') }
+  $broadHolders = @('BUILTIN\\Users (Write)')
+  Invoke-Case 'install-broad-folder' 'path-good' {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-broad') }
+  $broadHolders = @()
   # --- install-net-helper.ps1 Resolve-HelperNssm
   Invoke-Case 'helper-provided-good' 'path-bad' { Resolve-HelperNssm -Provided $good }
   Invoke-Case 'helper-provided-bad' 'path-good' { Resolve-HelperNssm -Provided $bad }
   Invoke-Case 'helper-path-good' 'path-good' { Resolve-HelperNssm }
   Invoke-Case 'helper-path-bad' 'path-bad' { Resolve-HelperNssm }
   Invoke-Case 'helper-none' 'path-none' { Resolve-HelperNssm }
+  # --- Get-ServiceImageProblem, over stubbed service records
+  $img = 'C:\\Program Files\\MessageFoundry\\nssm\\nssm.exe'
+  foreach ($row in @(
+      @{ key = 'image-quoted'; line = ('"' + $img + '"') },
+      @{ key = 'image-unquoted'; line = $img },
+      @{ key = 'image-quoted-args'; line = ('"' + $img + '" -x') },
+      @{ key = 'image-other'; line = '"C:\\ProgramData\\MessageFoundry\\bin\\nssm.exe"' },
+      @{ key = 'image-longer-name'; line = ($img + '.evil.exe') })) {
+    $services = @([pscustomobject]@{ Name = 'Svc'; PathName = $row.line },
+                  [pscustomobject]@{ Name = 'Other'; PathName = ('"' + $img + '"') })
+    $line = $row.line
+    Invoke-Case $row.key 'path-none' { Get-ServiceImageProblem -ServiceName 'Svc' -Path $img }
+  }
+  $services = @([pscustomobject]@{ Name = 'Other'; PathName = ('"' + $img + '"') })
+  Invoke-Case 'image-missing' 'path-none' { Get-ServiceImageProblem -ServiceName 'Svc' -Path $img }
   # --- Lock-PinnedFile. LAST, because the write probes change the files they reach.
   Invoke-Case 'lock-good' 'path-none' {
     $h = Lock-PinnedFile -Path $lockGood -Expected $NssmExeSha256
@@ -204,22 +226,36 @@ _CASES = """
     try { $null = Lock-PinnedFile -Path $lockBad -Expected $NssmExeSha256 } catch { }
     [IO.File]::WriteAllBytes($lockBad, [byte[]](1, 2, 3)); 'released'
   }
+  # Where each resolver case left nssm.exe, and what it holds.
+  $res['homes'] = @{}
+  foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Filter 'home-*')) {
+    $f = Join-Path $d.FullName 'nssm.exe'
+    $res['homes'][$d.Name] = $(if (Test-Path -LiteralPath $f) {
+      (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash } else { '' })
+  }
 """
 
 _AST_PROBES = """
   $ast = @{}
-  foreach ($name in @(__ORDERED__)) {
+  foreach ($name in @('install-service.ps1', 'uninstall-service.ps1', 'install-net-helper.ps1',
+                      'uninstall-net-helper.ps1')) {
     $tree = [System.Management.Automation.Language.Parser]::ParseFile(
       (Join-Path $scripts $name), [ref]$null, [ref]$null)
-    $ast[$name] = @($tree.FindAll({
-        $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
-      Where-Object { $_.CommandElements.Count -gt 0 } |
-      ForEach-Object { @{ name = $_.GetCommandName(); text = $_.Extent.Text;
-        offset = $_.Extent.StartOffset } })
-    # Method calls, for the Dispose() of the lock.
-    $ast["$name::calls"] = @($tree.FindAll({
-        $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) |
-      ForEach-Object { @{ text = $_.Extent.Text; offset = $_.Extent.StartOffset } })
+    $ast[$name] = @{
+      commands = @($tree.FindAll({
+          $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        Where-Object { $_.CommandElements.Count -gt 0 } |
+        ForEach-Object { @{ name = $_.GetCommandName(); first = $_.CommandElements[0].Extent.Text;
+          text = $_.Extent.Text; offset = $_.Extent.StartOffset } })
+      calls = @($tree.FindAll({
+          $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) |
+        ForEach-Object { @{ text = $_.Extent.Text; offset = $_.Extent.StartOffset } })
+      functions = @($tree.FindAll({
+          $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        ForEach-Object { @{ name = $_.Name; start = $_.Extent.StartOffset; end = $_.Extent.EndOffset } })
+      traps = @($tree.EndBlock.Traps | ForEach-Object { $_.Extent.Text })
+      params = @($tree.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    }
   }
   $tree = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $scripts 'install-net-helper.ps1'), [ref]$null, [ref]$null)
@@ -257,16 +293,19 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")
     root = tmp_path_factory.mktemp("nssmpin")
-    for name, data in (("good", _GOOD), ("bad", _BAD), ("lock-good", _GOOD), ("lock-bad", _BAD)):
+    for name, data in (
+        ("good", _GOOD),
+        ("bad", _BAD),
+        ("lock-good", _GOOD),
+        ("lock-bad", _BAD),
+        ("home-good", _GOOD),
+        ("home-bad", _BAD),
+    ):
         (root / name).mkdir()
         (root / name / "nssm.exe").write_bytes(data)
     _stand_in(root / "path-good", _GOOD)
     _stand_in(root / "path-bad", _BAD)
     (root / "path-none").mkdir()
-    for name, data in (("data-good", _GOOD), ("data-bad", _BAD)):
-        (root / name / "bin").mkdir(parents=True)
-        (root / name / "bin" / "nssm.exe").write_bytes(data)
-    (root / "data-none").mkdir()
 
     lines = ["& {", "  $ErrorActionPreference = 'Stop'"]
     for script, names in _FUNCTIONS.items():
@@ -282,31 +321,31 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
             "  }",
         ]
     lines += [
+        _STUBS,
         # The pin is the stand-in's hash, so the positive controls have something to match.
         f"  $NssmExeSha256 = {_psq(_sha(_GOOD))}",
-        # A resolver that reached the download would be a test that touches the network.
-        "  function Invoke-WebRequest { throw 'NETWORK TOUCHED' }",
         f"  $root = {_psq(str(root))}",
         f"  $scripts = {_psq(str(_DIR))}",
         "  $res = @{}",
         "  function Invoke-Case([string]$Key, [string]$PathDir, [scriptblock]$Body) {",
         "    $env:PATH = Join-Path $root $PathDir",
-        "    try {",
-        "      $out = @(& $Body 3>&1)",
-        "      $isWarn = { $_ -is [System.Management.Automation.WarningRecord] }",
-        "      $warn = @($out | Where-Object $isWarn | ForEach-Object { $_.Message })",
-        '      $val = @($out | Where-Object { -not (& $isWarn) } | ForEach-Object { "$_" })',
-        "      $res[$Key] = @{ threw = $false; value = ($val -join '|'); warnings = $warn; error = '' }",
-        "    } catch {",
-        "      $res[$Key] = @{ threw = $true; value = ''; warnings = @(); error = $_.Exception.Message }",
-        "    }",
+        # The throw is turned into output INSIDE the redirection, so a case that warns and then
+        # throws keeps its warnings.
+        "    $out = @(& { try { & $Body } catch { [pscustomobject]@{ Threw = $_.Exception.Message } } } 3>&1)",
+        "    $isWarn = { $_ -is [System.Management.Automation.WarningRecord] }",
+        "    $thrown = @($out | Where-Object { $_.PSObject.Properties['Threw'] })",
+        "    $warn = @($out | Where-Object $isWarn | ForEach-Object { $_.Message })",
+        "    $val = @($out | Where-Object { -not (& $isWarn) -and -not $_.PSObject.Properties['Threw'] } |",
+        '      ForEach-Object { "$_" })',
+        "    $res[$Key] = @{ threw = [bool]$thrown.Count; value = ($val -join '|'); warnings = $warn;",
+        "      error = $(if ($thrown.Count) { $thrown[0].Threw } else { '' }) }",
         "  }",
         "  $good = Join-Path $root 'good/nssm.exe'",
         "  $bad = Join-Path $root 'bad/nssm.exe'",
         "  $lockGood = Join-Path $root 'lock-good/nssm.exe'",
         "  $lockBad = Join-Path $root 'lock-bad/nssm.exe'",
         _CASES,
-        _AST_PROBES.replace("__ORDERED__", ", ".join(_psq(n) for n in _ORDERED)),
+        _AST_PROBES,
         "  $res | ConvertTo-Json -Depth 8 -Compress",
         "}",
     ]
@@ -337,7 +376,7 @@ def _names_both_hashes(message: str) -> None:
 
 
 def _from(value: object, directory: str) -> bool:
-    """Whether a resolved path is the stand-in in ``directory`` (``path-good``, ``data-good/bin``)."""
+    """Whether a resolved path is the nssm in ``directory`` (``good``, ``path-good``, ``home-x``)."""
     parent = Path(str(value)).parent
     return parent.parts[-len(Path(directory).parts) :] == Path(directory).parts
 
@@ -377,61 +416,65 @@ def test_the_lock_holds_a_matching_file_and_releases_a_refused_one(
     )
 
 
-# ------------------------------------------------------------------------------- the resolvers
+# ------------------------------------------------------------- the engine installer's resolver
 
 
-def test_the_installer_takes_a_matching_copy_from_every_source(report: dict[str, Any]) -> None:
-    for key, directory in (
-        ("install-provided-good", "good"),
-        ("install-path-good", "path-good"),
-        ("install-cache-good", "data-good/bin"),
-        ("install-path-bad-cache-good", "data-good/bin"),
+def test_the_installer_copies_a_matching_source_into_its_own_folder(report: dict[str, Any]) -> None:
+    homes = report["homes"]
+    for key, home in (
+        ("install-provided-good", "home-provided-good"),
+        ("install-path-good", "home-path-good"),
+        ("install-home-good", "home-good"),
     ):
         case = _case(report, key)
         assert case["threw"] is False, f"{key} threw: {case['error']}"
-        assert _from(case["value"], directory), f"{key} resolved {case['value']!r}, not {directory}"
+        assert _from(case["value"], home), (
+            f"{key} returned {case['value']!r}, not the copy in {home}"
+        )
+        assert homes[home] == _sha(_GOOD), f"{key}: the copy in {home} is not the checked bytes"
 
 
-def test_the_installer_refuses_a_named_or_cached_copy_that_does_not_match(
+def test_the_installer_refuses_a_named_or_installed_copy_that_does_not_match(
     report: dict[str, Any],
 ) -> None:
-    provided = _case(report, "install-provided-bad")
-    assert provided["threw"] is True, "a wrong -NssmPath copy must be refused, not run"
-    assert "-NssmPath" in str(provided["error"])
-    _names_both_hashes(str(provided["error"]))
-    for key in ("install-cache-bad", "install-path-bad-cache-bad"):
-        cached = _case(report, key)
-        assert cached["threw"] is True, f"{key}: a changed cached copy must be refused"
-        assert "cached" in str(cached["error"])
-        assert "NETWORK TOUCHED" not in str(cached["error"]), f"{key} reached the download"
-        _names_both_hashes(str(cached["error"]))
+    homes = report["homes"]
+    for key, needle in (
+        ("install-provided-bad", "-NssmPath"),
+        ("install-home-bad", "installed"),
+        ("install-home-good-provided-bad", "-NssmPath"),
+    ):
+        case = _case(report, key)
+        assert case["threw"] is True, f"{key}: a copy that fails the check must be refused"
+        assert needle in str(case["error"]), f"{key}: {case['error']}"
+        _names_both_hashes(str(case["error"]))
+    assert homes["home-provided-bad"] == "", "a refused -NssmPath copy was still copied in"
+    assert homes["home-bad"] == _sha(_BAD), "CONTROL FAILED: the tampered installed copy is gone"
 
 
 def test_the_installer_skips_a_path_copy_that_does_not_match(report: dict[str, Any]) -> None:
-    warnings = _case(report, "install-path-bad-cache-good")["warnings"]
-    assert isinstance(warnings, list) and len(warnings) == 1, (
-        f"a mismatched PATH copy must be named in exactly one warning; got {warnings!r}"
-    )
-    assert "PATH" in warnings[0]
+    case = _case(report, "install-path-bad")
+    # It went on to the download, which the stub refuses: proof the PATH copy was not used.
+    assert case["threw"] is True and "NETWORK TOUCHED" in str(case["error"]), case
+    warnings = case["warnings"]
+    assert isinstance(warnings, list) and len(warnings) == 1, warnings
+    assert "PATH" in warnings[0] and "-NssmPath" in warnings[0], warnings[0]
     _names_both_hashes(warnings[0])
+    assert report["homes"]["home-path-bad"] == "", "the mismatched PATH copy was copied in"
 
 
-def test_the_uninstaller_never_runs_a_copy_that_does_not_match(report: dict[str, Any]) -> None:
-    for key, directory in (
-        ("uninstall-provided-good", "good"),
-        ("uninstall-path-good", "path-good"),
-        ("uninstall-path-bad-cache-good", "data-good/bin"),
-    ):
-        assert _from(_case(report, key)["value"], directory), f"positive control: {key}"
+def test_the_installer_refuses_a_folder_others_can_write(report: dict[str, Any]) -> None:
+    case = _case(report, "install-broad-folder")
+    assert case["threw"] is True and "not administrator-only" in str(case["error"]), case
+    assert "BUILTIN\\Users" in str(case["error"]), "the refusal must name who can write there"
+    assert report["homes"]["home-broad"] == "", "nssm.exe was copied into a folder others can write"
 
-    for key in ("uninstall-provided-bad", "uninstall-cache-bad"):
-        case = _case(report, key)
-        # "" means: stop through the SCM and remove with sc.exe. Never fatal here.
-        assert case["threw"] is False, f"{key} threw: {case['error']}"
-        assert case["value"] == "", f"{key} returned a copy that failed the check: {case['value']}"
-        assert case["warnings"], f"{key} refused silently"
-        _names_both_hashes(" ".join(case["warnings"]))
-    assert "Only the installer writes" in " ".join(_case(report, "uninstall-cache-bad")["warnings"])
+
+def test_the_registration_must_start_the_checked_copy(report: dict[str, Any]) -> None:
+    for key in ("image-quoted", "image-unquoted", "image-quoted-args"):
+        assert _case(report, key)["value"] == "", f"positive control {key}: {_case(report, key)}"
+    for key in ("image-other", "image-longer-name", "image-missing"):
+        problem = str(_case(report, key)["value"])
+        assert "is registered to start" in problem, f"{key} was accepted: {problem!r}"
 
 
 def test_the_helper_installer_refuses_every_copy_that_does_not_match(
@@ -450,12 +493,12 @@ def test_the_helper_installer_refuses_every_copy_that_does_not_match(
 # ------------------------------------------------------------------ the top levels, in order
 
 
-def _commands(report: dict[str, Any], script: str) -> list[dict[str, Any]]:
-    commands = report["ast"][script]
-    assert isinstance(commands, list) and commands, (
-        f"CONTROL FAILED: no commands read from {script}"
+def _script(report: dict[str, Any], script: str) -> dict[str, Any]:
+    facts = report["ast"][script]
+    assert isinstance(facts, dict) and facts["commands"], (
+        f"CONTROL FAILED: nothing read from {script}"
     )
-    return commands
+    return facts
 
 
 def _at(entries: list[dict[str, Any]], predicate: Callable[[dict[str, Any]], bool]) -> list[int]:
@@ -466,6 +509,12 @@ def _at(entries: list[dict[str, Any]], predicate: Callable[[dict[str, Any]], boo
 
 def _named(name: str, *needles: str) -> Callable[[dict[str, Any]], bool]:
     return lambda c: c.get("name") == name and all(n in str(c["text"]) for n in needles)
+
+
+def _top_level(facts: dict[str, Any]) -> Callable[[dict[str, Any]], bool]:
+    """Outside every function body: the script's own statements."""
+    spans = [(int(f["start"]), int(f["end"])) for f in facts["functions"]]
+    return lambda c: not any(s <= int(c["offset"]) < e for s, e in spans)
 
 
 def test_helper_sha256_is_required_and_must_be_a_sha256(report: dict[str, Any]) -> None:
@@ -482,7 +531,7 @@ def test_helper_sha256_is_required_and_must_be_a_sha256(report: dict[str, Any]) 
 
 
 def test_the_helper_binary_is_checked_before_anything_is_stopped(report: dict[str, Any]) -> None:
-    commands = _commands(report, "install-net-helper.ps1")
+    commands = _script(report, "install-net-helper.ps1")["commands"]
     check = min(_at(commands, _named("Get-FilePinProblem", "$SourceExe", "$HelperSha256")))
     assert check < min(_at(commands, _named("Stop-Service"))), (
         "mefor-net-helper.exe is checked against -HelperSha256 only after the running helper is "
@@ -491,58 +540,75 @@ def test_the_helper_binary_is_checked_before_anything_is_stopped(report: dict[st
     assert check < min(_at(commands, _named("Copy-Item"))), "the check comes after the copy"
 
 
-def test_both_installed_copies_are_checked_before_anything_runs(report: dict[str, Any]) -> None:
-    commands = _commands(report, "install-net-helper.ps1")
+def test_the_helper_installer_holds_both_installed_copies(report: dict[str, Any]) -> None:
+    facts = _script(report, "install-net-helper.ps1")
+    commands = facts["commands"]
     last_copy = max(_at(commands, _named("Copy-Item")))
-    first_nssm = min(_at(commands, _named("Invoke-HelperNssm")))
+    nssm_runs = _at(commands, _named("Invoke-HelperNssm"))
     for needles in (("$TargetExe", "$HelperSha256"), ("$TargetNssm", "$NssmExeSha256")):
-        for at in _at(commands, _named("Get-FilePinProblem", *needles)):
-            assert last_copy < at < first_nssm, (
-                f"the installed copy check {needles} does not sit between the last copy and the "
-                "first nssm call, so the file the SCM starts as SYSTEM is not the file checked"
+        for at in _at(commands, _named("Lock-PinnedFile", *needles)):
+            assert last_copy < at < min(nssm_runs), (
+                f"the installed copy {needles} is not held between the last copy and the first nssm "
+                "call, so the file the SCM starts as SYSTEM is not the file checked"
             )
+    # A rejected copy is deleted, both binaries, so the registration cannot start it at boot.
+    assert _at(commands, _named("Remove-Item", "$TargetExe", "$TargetNssm"))
+    released = _at(facts["calls"], lambda c: c["text"] == "$held.Dispose()")
+    assert max(released) > max(nssm_runs), "the copies are released before the last nssm call"
+    assert any("$held.Dispose()" in trap for trap in facts["traps"]), (
+        "no trap releases the held copies when the install fails part-way"
+    )
 
 
-@pytest.mark.parametrize(
-    ("script", "resolver", "first_use", "last_use"),
-    [
-        ("install-service.ps1", "Resolve-Nssm", "Stop-ServiceAndConfirm", "Invoke-Nssm"),
-        ("uninstall-service.ps1", "Resolve-UninstallNssm", "Stop-ServiceAndConfirm", None),
-    ],
-)
-def test_the_nssm_copy_is_held_from_its_check_to_its_last_use(
-    report: dict[str, Any], script: str, resolver: str, first_use: str, last_use: str | None
-) -> None:
-    commands = _commands(report, script)
-    resolved = min(_at(commands, _named(resolver)))
+def test_the_engine_installer_holds_its_copy_from_check_to_last_use(report: dict[str, Any]) -> None:
+    facts = _script(report, "install-service.ps1")
+    commands = facts["commands"]
+    resolved = min(_at(commands, _named("Resolve-Nssm")))
     lock = min(_at(commands, _named("Lock-PinnedFile", "$NssmPath", "$NssmExeSha256")))
-    first = min(_at(commands, _named(first_use)))
-    assert resolved < lock < first, (
-        f"{script}: the lock is not taken between {resolver} and the first nssm use, so the copy "
-        "that runs is not held against change from its check"
+    top = _top_level(facts)
+    uses = _at(
+        commands,
+        lambda c: top(c) and c.get("name") in ("Invoke-Nssm", "Stop-ServiceAndConfirm"),
     )
-    uses = _at(commands, _named(last_use)) if last_use else []
-    # uninstall-service.ps1 runs `& $NssmPath remove` directly, a command with no name.
-    uses += _at(commands, lambda c: str(c["text"]).startswith("& $NssmPath"))
-    dispose = _at(report["ast"][f"{script}::calls"], lambda c: "$NssmLock.Dispose()" in c["text"])
-    assert len(dispose) == 1 and dispose[0] > max(uses), (
-        f"{script}: the lock is released before the last nssm call, or more than once"
+    assert resolved < lock < min(uses), "the copy is not held from its check to its first use"
+    dispose = _at(facts["calls"], lambda c: c["text"] == "$NssmLock.Dispose()")
+    # The trap's own Dispose() sits above the lock; the release on the success path comes after it.
+    top_dispose = [d for d in dispose if top({"offset": d}) and d > lock]
+    assert len(top_dispose) == 1 and top_dispose[0] > max(uses), (
+        "the copy is released before the last nssm call, or more than once"
+    )
+    assert any("$NssmLock.Dispose()" in trap for trap in facts["traps"]), (
+        "no trap releases the copy when the install fails part-way"
     )
 
 
-def test_the_helper_uninstaller_gates_nssm_on_the_check() -> None:
-    helper = _text("uninstall-net-helper.ps1")
-    # Starts false, and the passing branch is the ONE place that sets it true.
-    assert helper.count("$useNssm = $true") == 1, "only a passed check may set $useNssm"
-    m = re.search(
-        r"\$useNssm = \$false\s*if \(Test-Path -LiteralPath \$nssmForRemoval\) \{\s*"
-        r"\$problem = Get-FilePinProblem -Path \$nssmForRemoval -Expected \$NssmExeSha256\s*"
-        r"if \(\$problem\) \{(?P<refuse>.*?)\} else \{\s*\$useNssm = \$true\s*\}",
-        helper,
-        re.S,
+def test_the_engine_installer_reads_the_registration_back(report: dict[str, Any]) -> None:
+    facts = _script(report, "install-service.ps1")
+    commands = facts["commands"]
+    top = _top_level(facts)
+    checks = _at(commands, lambda c: top(c) and c.get("name") == "Get-ServiceImageProblem")
+    stop = min(_at(commands, lambda c: top(c) and c.get("name") == "Stop-ServiceAndConfirm"))
+    install = min(_at(commands, _named("Invoke-Nssm", "install $ServiceName")))
+    assert any(at < stop for at in checks), (
+        "a reinstall stops and reconfigures the service before checking which nssm.exe it starts"
     )
-    assert m is not None, "uninstall-net-helper.ps1 no longer gates its nssm on the pinned hash"
-    assert "$useNssm = $true" not in m.group("refuse")
-    assert re.search(r"if \(\$useNssm\) \{\s*& \$nssmForRemoval remove", helper), (
-        "the nssm removal no longer sits under `if ($useNssm)`"
+    assert any(at > install for at in checks), "a fresh registration is not read back"
+
+
+@pytest.mark.parametrize("script", _WITHOUT_NSSM)
+def test_the_uninstallers_run_no_nssm(report: dict[str, Any], script: str) -> None:
+    facts = _script(report, script)
+    assert "NssmPath" not in facts["params"], f"{script} still takes an nssm.exe to run"
+    top = _top_level(facts)
+    for c in facts["commands"]:
+        first = str(c["first"])
+        assert not (top(c) and first.startswith("$") and "nssm" in first.lower()), (
+            f"{script} runs {first} at its top level: {c['text']!r}"
+        )
+    assert _at(facts["commands"], _named("sc.exe", "delete $ServiceName")), (
+        f"CONTROL FAILED: {script} no longer removes the service with sc.exe"
     )
+    if script == "uninstall-service.ps1":
+        assert _at(facts["commands"], _named("Stop-ServiceAndConfirm", '-NssmPath ""')), (
+            "uninstall-service.ps1 no longer stops the service through the SCM"
+        )

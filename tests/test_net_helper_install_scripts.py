@@ -12,7 +12,7 @@ Three of the four are decisions that a later edit would flip without anything no
 1. **The installer downloads nothing and carries no copy of the ARCHIVE pin.** install-service.ps1
    owns the archive URL and its SHA-256, and ``test_service_install_manifest.py`` guards that one.
    The one 64-hex literal it may hold is the pin of the ``nssm.exe`` binary, in the shared block
-   ``tests/test_nssm_pin.py`` keeps identical across four scripts (BACKLOG #2364).
+   ``tests/test_nssm_pin.py`` keeps identical in the two installers (BACKLOG #2364).
 2. **The installer reads [cluster.vip] through the engine, not by parsing TOML.** That is the whole
    of #1523's constraint: the helper refuses any request naming values other than its .conf's, so
    the installer's three values and the engine's three values must be the same three values, and a

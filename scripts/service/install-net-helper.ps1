@@ -23,8 +23,8 @@
     procedure, and it names that same pin.
 
     IT DOES CHECK BOTH BINARIES IT STARTS, because both run as SYSTEM (BACKLOG #2364). nssm.exe must
-    hash to $NssmExeSha256, the pin of the binary inside that archive, which this script carries as
-    one of four copies that tests/test_nssm_pin.py keeps identical. mefor-net-helper.exe must hash
+    hash to $NssmExeSha256, the pin of the binary inside that archive, which this script carries in
+    a block tests/test_nssm_pin.py keeps identical to install-service.ps1's. mefor-net-helper.exe must hash
     to -HelperSha256. That value has no pin in this repository: the helper is built per release and
     per machine, so the hash comes from the build that made the binary - the net-helper workflow's
     job summary, or Get-FileHash over your own `dotnet publish` output before it leaves your hands.
@@ -101,14 +101,13 @@ $ErrorActionPreference = "Stop"
 # for the measurements behind it; set explicitly rather than relied on.
 $PSNativeCommandUseErrorActionPreference = $false
 
-# BEGIN pinned-hash check (kept byte-identical in install-service.ps1, uninstall-service.ps1,
-# install-net-helper.ps1 and uninstall-net-helper.ps1; guarded by tests/test_nssm_pin.py, which fails
-# if the four copies drift)
+# BEGIN pinned-hash check (kept byte-identical in install-service.ps1 and install-net-helper.ps1;
+# guarded by tests/test_nssm_pin.py, which fails if the two copies drift)
 #
 # The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
-# pins as $NssmSha256. Every script checks the copy it is about to run against this value, whichever
-# source the copy came from - -NssmPath, PATH, a cache, or a download (BACKLOG #2364). Only the
-# download used to be checked, so a copy found anywhere else ran unchecked, as administrator.
+# pins as $NssmSha256. Both installers check every nssm.exe they copy or run against this value,
+# whichever source it came from - -NssmPath, PATH, an installed copy, or a download (BACKLOG #2364).
+# Only the download used to be checked. The two uninstallers do not run nssm at all.
 $NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
 
 function Get-FilePinProblem {
@@ -134,17 +133,21 @@ function Lock-PinnedFile {
     <#
       Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
       return the open handle. Throws, with the handle closed, when the file cannot be opened that
-      way or does not match.
+      way or does not match. Dispose the handle once the script no longer runs the file.
 
-      A check alone leaves a gap: the script hashes a copy and runs it later, and a file in a folder
-      another account can write could be swapped in between. While this handle is open it cannot
-      be. Measured 2026-09-29 on Windows 11 under PowerShell 7.6: holding a FileShare.Read handle,
-      this process could still hash the file and run it, and another process's write, rename and
-      delete of it, and a rename of its folder, were all refused. A process already holding the
-      file open for writing makes the open itself fail, which is a refusal too. Dispose the handle
-      when the script no longer runs the file.
+      The folder check is what keeps a copy safe between runs. This keeps the copy that was checked
+      the copy that runs, within one run. Measured 2026-09-29 on Windows 11 under PowerShell 7.6:
+      holding a FileShare.Read handle, this process could still hash the file and run it, and
+      another process's write, rename and delete of it, and a rename of its folder or of that
+      folder's parent, were all refused. A process already holding the file open for writing makes
+      the open itself fail, which is a refusal too.
+
+      THE PATH IS MADE ABSOLUTE FIRST. [IO.File]::Open resolves a relative path against the
+      process's directory, and Get-FileHash against the PowerShell location, so a relative path
+      could lock one file and hash another.
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
     $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $problem = Get-FilePinProblem -Path $Path -Expected $Expected
     if ($problem) {
@@ -152,6 +155,110 @@ function Lock-PinnedFile {
         throw $problem
     }
     return $handle
+}
+
+function Get-BroadWriteHolders {
+    <#
+      Principals who can write $Path, or can make themselves able to, beyond the five that always
+      may. Two arms: the OWNER, and Allow-write entries on the DACL.
+
+      Returns an empty array when the directory is administrator-only, which is what makes "the
+      folder is safe" a reading rather than an assumption.
+
+      NOT install-service.ps1's Get-BroadAclResidue, and deliberately not a copy of it. That one
+      allows the engine's service account, because the engine has to write its data directory; it
+      takes any Allow entry rather than write-class ones, and it has no owner arm. Here nothing
+      outside the five may write at all - whoever can write this folder can replace a binary that
+      an administrator runs, or that later runs as SYSTEM. Same shape, different question; naming them apart keeps a reader from
+      assuming one answers the other's.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
+    # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
+    # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
+    # REFUSAL, and in install-net-helper.ps1 its only escape is -AllowBroadAcl, which downgrades the
+    # whole check to a warning -- so one false positive would disable the gate.
+    $allowed = @(
+        "S-1-5-18",                                                                # SYSTEM
+        "S-1-5-32-544",                                                            # Administrators
+        "S-1-3-0",                                                                 # CREATOR OWNER
+        "S-1-3-4",                                                                 # OWNER RIGHTS
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"           # TrustedInstaller
+    )
+    $rights = [Security.AccessControl.FileSystemRights]
+    # THE TWO GENERIC BITS ARE IN THE MASK ON PURPOSE, and leaving them out is why a first version of
+    # this was quietly weaker than it looked. FileSystemRights names no GENERIC_ALL or GENERIC_WRITE,
+    # and a real Program Files ACL is full of them: measured on Windows 11 26200, five of its
+    # fourteen entries render as the bare numbers 268435456 (GENERIC_ALL) and -1610612736
+    # (GENERIC_READ|GENERIC_EXECUTE). Those are the inherit-only templates that decide what a file
+    # CREATED in the folder gets - which is exactly the binary this install is about to write - and
+    # none of the named bits below intersects them. So a GENERIC_ALL for Users would have passed a
+    # mask built only from the named rights.
+    $genericAll = 0x10000000
+    $genericWrite = 0x40000000
+    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::WriteAttributes -bor
+        $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
+        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
+    $found = @()
+    # RETURNED AS A RESIDUE, NOT THROWN. An unreadable DACL is not "the folder is fine", so it has to
+    # reach the caller - but throwing from here made install-net-helper.ps1's refusal message name
+    # -AllowBroadAcl as the escape when that switch is not consulted until AFTER this call. An operator following
+    # that instruction got the identical refusal: a dead end, and exactly the false-premise defect
+    # the rest of this script is written against. Returned as a finding instead, so the one decision
+    # about -AllowBroadAcl covers all three ways this can come back non-empty.
+    #
+    # -LiteralPath, NOT -Path. Measured: for a directory whose name holds '[' or ']', `Get-Acl -Path`
+    # returns $null WITHOUT raising, even under -ErrorAction Stop - so the catch never fires and the
+    # arms below read a null object.
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
+        return @("the permissions of '$Path' could not be read ($($_.Exception.Message)), so " +
+            "nothing established who can write there")
+    }
+    if ($null -eq $acl) {
+        return @("the permissions of '$Path' could not be read (Get-Acl returned nothing), so " +
+            "nothing established who can write there")
+    }
+
+    # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
+    # a low-privilege owner can rewrite the DACL whatever it says today and then replace a binary
+    # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
+    # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
+    # without it reports a clean folder for exactly that case.
+    #
+    # AND IT TAKES THE WELL-KNOWN ADMIN RIDs TOO, which the literal list cannot cover: that module's
+    # _WIN_ADMIN_RIDS records that the built-in Administrator (500), Domain Admins (512), Schema
+    # Admins (518) and Enterprise Admins (519) vary per domain. Without them a folder an admin ran
+    # `takeown` on, or one restored from a backup, is refused for being owned by an administrator.
+    $ownerSid = $null
+    try {
+        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    } catch { $ownerSid = "$($acl.Owner)" }
+    # COMPARED AS TEXT, NOT CAST. A RID is a 32-bit UNSIGNED value and [int] is signed, so casting
+    # overflows on a real SID: measured, TrustedInstaller's last group is 2271478464 and
+    # `[int]"2271478464"` throws "Value was either too large or too small for an Int32" -- which
+    # under $ErrorActionPreference = "Stop" aborted this whole check on an ordinary Program Files
+    # folder. A string compare answers the only question being asked and cannot overflow.
+    $ownerRid = if ($ownerSid -match '-(\d+)$') { $Matches[1] } else { "" }
+    if (($allowed -notcontains $ownerSid) -and ($ownerRid -notin @("500", "512", "518", "519"))) {
+        $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
+    }
+
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        $name = "$($rule.IdentityReference)"
+        # $allowed holds SIDs only, so an untranslatable identity falls back to its own text and is
+        # REPORTED rather than skipped: a SID nobody can translate is still a grant, and dropping it
+        # would turn a residue into a clean result.
+        $sid = $name
+        try {
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
+    }
+    return ($found | Select-Object -Unique)
 }
 # END pinned-hash check
 
@@ -202,8 +309,8 @@ function Resolve-HelperNssm {
 
       The copy is the point, not a convenience. The registration names an nssm.exe by path, and that
       binary starts a process running as SYSTEM - so it has to live somewhere only administrators can
-      write, beside the helper. net-helper/README.md is explicit that the engine's cached copy under
-      ProgramData is NOT such a place: the engine's own account has modify rights there.
+      write, beside the helper. net-helper/README.md is explicit that ProgramData is NOT such a
+      place: the engine's own account has modify rights there.
 
       Nothing is downloaded here; see this script's header. What is found is checked against
       $NssmExeSha256 and REFUSED on a mismatch, from either source (BACKLOG #2364). There is no
@@ -303,110 +410,6 @@ function Resolve-ClientAccountSid {
             "per-service virtual account only resolves while its service is registered, so " +
             "install the engine's service first, or pass -ClientAccount with the SID.")
     }
-}
-
-function Get-BroadWriteHolders {
-    <#
-      Principals who can write $Path, or can make themselves able to, beyond the five that always
-      may. Two arms: the OWNER, and Allow-write entries on the DACL.
-
-      Returns an empty array when the directory is administrator-only, which is what makes "the
-      folder is safe" a reading rather than an assumption.
-
-      NOT install-service.ps1's Get-BroadAclResidue, and deliberately not a copy of it. That one
-      allows the engine's service account, because the engine has to write its data directory; it
-      takes any Allow entry rather than write-class ones, and it has no owner arm. Here nothing
-      outside the five may write at all - whoever can write this folder can replace a binary that
-      later runs as SYSTEM. Same shape, different question; naming them apart keeps a reader from
-      assuming one answers the other's.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
-    # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
-    # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
-    # REFUSAL whose only escape is -AllowBroadAcl, which downgrades the whole check to a warning --
-    # so one false positive would disable the gate.
-    $allowed = @(
-        "S-1-5-18",                                                                # SYSTEM
-        "S-1-5-32-544",                                                            # Administrators
-        "S-1-3-0",                                                                 # CREATOR OWNER
-        "S-1-3-4",                                                                 # OWNER RIGHTS
-        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"           # TrustedInstaller
-    )
-    $rights = [Security.AccessControl.FileSystemRights]
-    # THE TWO GENERIC BITS ARE IN THE MASK ON PURPOSE, and leaving them out is why a first version of
-    # this was quietly weaker than it looked. FileSystemRights names no GENERIC_ALL or GENERIC_WRITE,
-    # and a real Program Files ACL is full of them: measured on Windows 11 26200, five of its
-    # fourteen entries render as the bare numbers 268435456 (GENERIC_ALL) and -1610612736
-    # (GENERIC_READ|GENERIC_EXECUTE). Those are the inherit-only templates that decide what a file
-    # CREATED in the folder gets - which is exactly the binary this install is about to write - and
-    # none of the named bits below intersects them. So a GENERIC_ALL for Users would have passed a
-    # mask built only from the named rights.
-    $genericAll = 0x10000000
-    $genericWrite = 0x40000000
-    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::WriteAttributes -bor
-        $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
-        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
-    $found = @()
-    # RETURNED AS A RESIDUE, NOT THROWN. An unreadable DACL is not "the folder is fine", so it has to
-    # reach the caller - but throwing from here made the caller's refusal message name -AllowBroadAcl
-    # as the escape when that switch is not consulted until AFTER this call. An operator following
-    # that instruction got the identical refusal: a dead end, and exactly the false-premise defect
-    # the rest of this script is written against. Returned as a finding instead, so the one decision
-    # about -AllowBroadAcl covers all three ways this can come back non-empty.
-    #
-    # -LiteralPath, NOT -Path. Measured: for a directory whose name holds '[' or ']', `Get-Acl -Path`
-    # returns $null WITHOUT raising, even under -ErrorAction Stop - so the catch never fires and the
-    # arms below read a null object.
-    $acl = $null
-    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
-        return @("the permissions of '$Path' could not be read ($($_.Exception.Message)), so " +
-            "nothing established who can write there")
-    }
-    if ($null -eq $acl) {
-        return @("the permissions of '$Path' could not be read (Get-Acl returned nothing), so " +
-            "nothing established who can write there")
-    }
-
-    # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
-    # a low-privilege owner can rewrite the DACL whatever it says today and then replace a binary
-    # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
-    # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
-    # without it reports a clean folder for exactly that case.
-    #
-    # AND IT TAKES THE WELL-KNOWN ADMIN RIDs TOO, which the literal list cannot cover: that module's
-    # _WIN_ADMIN_RIDS records that the built-in Administrator (500), Domain Admins (512), Schema
-    # Admins (518) and Enterprise Admins (519) vary per domain. Without them a folder an admin ran
-    # `takeown` on, or one restored from a backup, is refused for being owned by an administrator.
-    $ownerSid = $null
-    try {
-        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    } catch { $ownerSid = "$($acl.Owner)" }
-    # COMPARED AS TEXT, NOT CAST. A RID is a 32-bit UNSIGNED value and [int] is signed, so casting
-    # overflows on a real SID: measured, TrustedInstaller's last group is 2271478464 and
-    # `[int]"2271478464"` throws "Value was either too large or too small for an Int32" -- which
-    # under $ErrorActionPreference = "Stop" aborted this whole check on an ordinary Program Files
-    # folder. A string compare answers the only question being asked and cannot overflow.
-    $ownerRid = if ($ownerSid -match '-(\d+)$') { $Matches[1] } else { "" }
-    if (($allowed -notcontains $ownerSid) -and ($ownerRid -notin @("500", "512", "518", "519"))) {
-        $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
-    }
-
-    foreach ($rule in $acl.Access) {
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
-        $name = "$($rule.IdentityReference)"
-        # $allowed holds SIDs only, so an untranslatable identity falls back to its own text and is
-        # REPORTED rather than skipped: a SID nobody can translate is still a grant, and dropping it
-        # would turn a residue into a clean result.
-        $sid = $name
-        try {
-            $sid = $rule.IdentityReference.Translate(
-                [Security.Principal.SecurityIdentifier]).Value
-        } catch { }
-        if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
-    }
-    return ($found | Select-Object -Unique)
 }
 
 function Invoke-HelperNssm {
@@ -601,16 +604,30 @@ if (-not $sameFile) {
 # reason and makes confirming it its own numbered step.
 $NssmPath = $TargetNssm
 
-# THE INSTALLED COPIES ARE CHECKED, NOT ONLY THEIR SOURCES (BACKLOG #2364). They are the files the SCM
-# starts as SYSTEM, and a source can change between its check and the copy. The folder check above is
-# what keeps them from changing after this.
-$problem = (@(
-    (Get-FilePinProblem -Path $TargetExe -Expected $HelperSha256),
-    (Get-FilePinProblem -Path $TargetNssm -Expected $NssmExeSha256)
-) -ne "") -join "; "
-if ($problem) {
-    throw ("An installed copy failed its check: $problem. Nothing was started. Remove " +
-        "'$InstallDir' and re-run from files you can match to their hashes.")
+# THE INSTALLED COPIES ARE CHECKED AND HELD, NOT ONLY THEIR SOURCES (BACKLOG #2364). They are what the
+# SCM starts as SYSTEM, and a source can change between its check and the copy. Each is opened against
+# change, hashed under that handle, and held until this script's last nssm call. The folder check
+# keeps them safe between runs; with -AllowBroadAcl that check is only a warning, so the hold is what
+# stands in for it during this one.
+#
+# A COPY THAT FAILS IS DELETED BEFORE THE THROW, both files with it. On a reinstall the helper was
+# stopped and its files copied over, and the registration still starts them at boot, so a rejected
+# file left in place would be the next thing to run as LocalSystem.
+$HelperLocks = @()
+trap {
+    foreach ($held in $HelperLocks) { $held.Dispose() }
+    break
+}
+try {
+    $HelperLocks += Lock-PinnedFile -Path $TargetExe -Expected $HelperSha256
+    $HelperLocks += Lock-PinnedFile -Path $TargetNssm -Expected $NssmExeSha256
+} catch {
+    $problem = $_.Exception.Message
+    foreach ($held in $HelperLocks) { $held.Dispose() }
+    $HelperLocks = @()
+    Remove-Item -LiteralPath $TargetExe, $TargetNssm -Force -ErrorAction SilentlyContinue
+    throw ("An installed copy failed its check: $problem. Both binaries were deleted from " +
+        "'$InstallDir' and nothing was started. Re-run from files you can match to their hashes.")
 }
 
 # The helper reads this with a strict UTF-8 decoder. Written with an explicit BOM-less UTF-8 encoder
@@ -696,6 +713,8 @@ if (-not $NoStart) {
     Write-Host "Starting '$ServiceName'..."
     Invoke-HelperNssm start $ServiceName
 }
+# The last nssm call is above. Released so an open window does not keep the files locked.
+foreach ($held in $HelperLocks) { $held.Dispose() }
 
 Write-Host ""
 Write-Host "Installed '$ServiceName'." -ForegroundColor Green

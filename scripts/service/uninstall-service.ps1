@@ -8,9 +8,15 @@
     Stops the service (Ctrl+C, letting the engine drain connections) and removes its NSSM
     registration.
 
+    IT RUNS NO nssm.exe (BACKLOG #2364). The Service Control Manager stops the service, which NSSM
+    answers with the same Ctrl+C drain `nssm stop` asks for, and sc.exe removes the registration and
+    the NSSM settings stored under it. Any nssm.exe this script could find would be one it has to
+    trust as administrator, and the copy an older install cached under the data directory sits where
+    the engine's own account can write.
+
     Removing the registration does NOT return the host to its pre-install state. The installer
     also grants a user right, writes access-control entries naming the run-as account, turns
-    inheritance off on the data directory, caches an NSSM binary, and (with -SuppressCrashDumps)
+    inheritance off on the data directory, keeps an NSSM binary, and (with -SuppressCrashDumps)
     writes machine-wide Windows Error Reporting keys. None of that is undone here by default, so
     this script reads the host before it removes the registration and prints an inventory of what
     it found still in place, with the command to clear each one.
@@ -29,7 +35,6 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$NssmPath,
     [string]$ServiceName = "MessageFoundry",
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
     # Opt-in: take the "Log on as a service" right back off the run-as account. Default OFF because
@@ -53,99 +58,6 @@ $ErrorActionPreference = "Stop"
 # so the exposure is an operator whose profile sets it, or a future default flip. Set explicitly
 # rather than relied on. Windows PowerShell 5.1 has no such variable; assigning it there is inert.
 $PSNativeCommandUseErrorActionPreference = $false
-
-# BEGIN pinned-hash check (kept byte-identical in install-service.ps1, uninstall-service.ps1,
-# install-net-helper.ps1 and uninstall-net-helper.ps1; guarded by tests/test_nssm_pin.py, which fails
-# if the four copies drift)
-#
-# The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
-# pins as $NssmSha256. Every script checks the copy it is about to run against this value, whichever
-# source the copy came from - -NssmPath, PATH, a cache, or a download (BACKLOG #2364). Only the
-# download used to be checked, so a copy found anywhere else ran unchecked, as administrator.
-$NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
-
-function Get-FilePinProblem {
-    <#
-      Why the file at $Path does not match the pinned SHA-256 $Expected, or "" when it does.
-
-      RETURNED, NOT THROWN, so each caller decides what a mismatch means: refuse to go on, or skip to
-      another source. The message names both hashes, so an operator can compare them against the
-      channel the pin came from. A file that cannot be hashed is a mismatch, never a pass.
-    #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
-    try {
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
-    } catch {
-        return ("'$Path' could not be hashed ($($_.Exception.Message)), so nothing checked it " +
-            "against the pinned SHA-256 $Expected")
-    }
-    if ($actual -ne $Expected) { return "'$Path' has SHA-256 $actual, not the pinned $Expected" }
-    return ""
-}
-
-function Lock-PinnedFile {
-    <#
-      Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
-      return the open handle. Throws, with the handle closed, when the file cannot be opened that
-      way or does not match.
-
-      A check alone leaves a gap: the script hashes a copy and runs it later, and a file in a folder
-      another account can write could be swapped in between. While this handle is open it cannot
-      be. Measured 2026-09-29 on Windows 11 under PowerShell 7.6: holding a FileShare.Read handle,
-      this process could still hash the file and run it, and another process's write, rename and
-      delete of it, and a rename of its folder, were all refused. A process already holding the
-      file open for writing makes the open itself fail, which is a refusal too. Dispose the handle
-      when the script no longer runs the file.
-    #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
-    $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $problem = Get-FilePinProblem -Path $Path -Expected $Expected
-    if ($problem) {
-        $handle.Dispose()
-        throw $problem
-    }
-    return $handle
-}
-# END pinned-hash check
-
-function Resolve-UninstallNssm {
-    <#
-      The nssm.exe to stop and remove the service with, or "" to use the SCM and sc.exe instead.
-
-      No copy runs unless it hashes to $NssmExeSha256 (BACKLOG #2364). The candidates are -NssmPath,
-      or else the nssm on PATH and then the copy the installer cached under <DataDir>\bin. That cache
-      sits where the engine's own account can write, so without the check code running as the engine
-      could plant an nssm.exe for this script to run as administrator.
-
-      A MISMATCH IS NEVER FATAL HERE, unlike in the installer. This script does not need nssm at
-      all: the SCM stops the service and sc.exe removes it. So a copy that fails the check is named
-      in a warning, with both hashes, and not run, and the uninstall still finishes.
-    #>
-    param([string]$Provided, [Parameter(Mandatory)][string]$Cached)
-    $candidates = @()
-    if ($Provided) {
-        if (-not (Test-Path -LiteralPath $Provided)) {
-            Write-Warning "-NssmPath '$Provided' does not exist. Using the SCM instead."
-            return ""
-        }
-        $candidates += @{ Path = $Provided; Where = "named by -NssmPath"; Note = "" }
-    } else {
-        $onPath = Get-Command nssm -CommandType Application -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($onPath) { $candidates += @{ Path = $onPath.Source; Where = "on PATH"; Note = "" } }
-        if (Test-Path -LiteralPath $Cached) {
-            $candidates += @{ Path = $Cached; Where = "the installer cached"; Note = (" Only the " +
-                "installer writes that file, from a checked download, so something has changed it " +
-                "since. Find out what before you delete it.") }
-        }
-    }
-    foreach ($c in $candidates) {
-        $problem = Get-FilePinProblem -Path $c.Path -Expected $NssmExeSha256
-        if (-not $problem) { return $c.Path }
-        Write-Warning "Not running the nssm $($c.Where): $problem.$($c.Note)"
-    }
-    return ""
-}
 
 $principal = [Security.Principal.WindowsPrincipal]::new(
     [Security.Principal.WindowsIdentity]::GetCurrent())
@@ -331,7 +243,7 @@ function Get-UninstallResidueNotice {
         [string]$ConfigDir,
         # Measured from the config dir's own ACL, not assumed from a switch this script never saw.
         [switch]$ConfigInheritanceStripped,
-        # Path of the cached NSSM binary, only when it is actually on disk.
+        # Path of the nssm.exe the registration starts, only when it is actually on disk.
         [string]$CachedNssm,
         # Image names found under the WER ExcludedApplications key.
         [string[]]$WerImages,
@@ -371,8 +283,8 @@ function Get-UninstallResidueNotice {
 
     if ($CachedNssm) {
         $lines += "  NSSM binary      $CachedNssm"
-        $lines += "                   The copy the installer downloaded. Delete it by hand once you"
-        $lines += "                   are sure you are not reinstalling."
+        $lines += "                   The copy the service was registered with. Delete it by hand"
+        $lines += "                   once you are sure you are not reinstalling."
     }
 
     if ($hasAccount) {
@@ -575,8 +487,7 @@ function Remove-AccountAce {
 # a SID once the service it is named for is gone. Reading afterwards would produce an empty inventory
 # that looks exactly like a clean host, which is the failure this whole change is about.
 #
-# IT RUNS ABOVE THE NSSM RESOLUTION because -DataDir is corrected from the registration below, and
-# the cached-nssm path below joins "bin" onto whatever -DataDir holds at that moment.
+# IT RUNS FIRST because -DataDir is corrected from the registration below, before anything uses it.
 #
 # Nothing here throws. A read that fails is recorded in $unreadable and named in the notice, so a
 # thinner list is never mistaken for a shorter one.
@@ -625,24 +536,18 @@ if (-not $PSBoundParameters.ContainsKey('DataDir')) {
     }
 }
 
-# Find nssm: explicit path, PATH, or the auto-provisioned cache, and run none of them that fails the
-# pinned-hash check. With no checked copy, fall back to the SCM and sc.exe.
-$cachedNssm = Join-Path $DataDir "bin\nssm.exe"
-$NssmPath = Resolve-UninstallNssm -Provided $NssmPath -Cached $cachedNssm
-# HELD OPEN UNTIL THE REMOVAL, so the copy that was checked is the copy that runs (BACKLOG #2364). The
-# cache sits where the engine's account can write, and a stop can take many seconds.
-$NssmLock = $null
-if ($NssmPath) {
-    try {
-        $NssmLock = Lock-PinnedFile -Path $NssmPath -Expected $NssmExeSha256
-    } catch {
-        Write-Warning ("Not running '$NssmPath': it could not be held against change and checked " +
-            "($($_.Exception.Message)). Using the SCM instead.")
-        $NssmPath = ""
-    }
+# The nssm.exe the registration starts, for the inventory only: nothing here runs it. Read before the
+# removal, because the registration is where the path lives.
+$cachedNssm = ""
+try {
+    $imagePath = [string](Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction Stop).ImagePath
+    $imageExe = if ($imagePath.Trim().StartsWith('"')) { ($imagePath.Trim() -split '"')[1] }
+                else { $imagePath.Trim() }
+    if ($imageExe -and (Test-Path -LiteralPath $imageExe)) { $cachedNssm = $imageExe }
+} catch {
+    $unreadable += ("the registered image path of '$ServiceName' ($($_.Exception.Message)) - so " +
+        "the nssm.exe it was started with is not named below")
 }
-$haveNssm = [bool]$NssmPath
-if (-not (Test-Path $cachedNssm)) { $cachedNssm = "" }
 
 # WHICH ACCOUNTS CARRY A RESIDUE, DECIDED BY SID RATHER THAN BY SPELLING. The installer writes named
 # grants for any run-as account except LocalSystem, which it covers with the well-known SYSTEM SID
@@ -720,10 +625,10 @@ if ($appExe) {
 }
 
 Write-Host "Stopping '$ServiceName'..."
-# BOTH stop paths - nssm and the SCM fallback - ran without checking anything and without reading the
-# status back, so the removal below proceeded over a service that might still be running (BACKLOG
-# #1558). Stop-ServiceAndConfirm covers both: it takes an empty -NssmPath as "use the SCM".
-$stopped = Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $(if ($haveNssm) { $NssmPath } else { "" })
+# The stop used to run without reading the status back, so the removal below proceeded over a
+# service that might still be running (BACKLOG #1558). Stop-ServiceAndConfirm confirms it, and an
+# empty -NssmPath means "stop through the SCM", which is the only way this script stops it now.
+$stopped = Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath ""
 if (-not $stopped) {
     Write-Warning ("Removing the registration for '$ServiceName' while it is still running. Windows " +
         "marks the service for deletion but the PROCESS keeps running until it exits or the host " +
@@ -734,21 +639,14 @@ if (-not $stopped) {
 
 Write-Host "Removing '$ServiceName'..."
 # $LASTEXITCODE IS CLEARED FIRST HERE TOO, and this is the site where a stale read costs most. A
-# failed LAUNCH never writes the variable, so it keeps the 0 the stop above just left behind, and the
+# failed LAUNCH never writes the variable, so it keeps the 0 an earlier native command left, and the
 # check then passes and the script prints "Removed" over a registration that is still there. Unlike
 # the lockdown, where Get-BroadAclResidue reads the result back, nothing here re-reads: this exit
 # code is the ONLY evidence the removal happened, so it has to be this call's own.
 $global:LASTEXITCODE = $null
-if ($haveNssm) {
-    & $NssmPath remove $ServiceName confirm
-    if ($null -eq $LASTEXITCODE) { throw "nssm remove did not run ('$NssmPath' left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "nssm remove failed (exit $LASTEXITCODE)" }
-} else {
-    & sc.exe delete $ServiceName | Out-Null
-    if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
-}
-if ($NssmLock) { $NssmLock.Dispose() }
+& sc.exe delete $ServiceName | Out-Null
+if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
+if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
 
 Write-Host "Removed '$ServiceName'." -ForegroundColor Green
 

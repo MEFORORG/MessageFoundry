@@ -62,60 +62,6 @@ $ErrorActionPreference = "Stop"
 # for the measurements; set explicitly rather than relied on.
 $PSNativeCommandUseErrorActionPreference = $false
 
-# BEGIN pinned-hash check (kept byte-identical in install-service.ps1, uninstall-service.ps1,
-# install-net-helper.ps1 and uninstall-net-helper.ps1; guarded by tests/test_nssm_pin.py, which fails
-# if the four copies drift)
-#
-# The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
-# pins as $NssmSha256. Every script checks the copy it is about to run against this value, whichever
-# source the copy came from - -NssmPath, PATH, a cache, or a download (BACKLOG #2364). Only the
-# download used to be checked, so a copy found anywhere else ran unchecked, as administrator.
-$NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
-
-function Get-FilePinProblem {
-    <#
-      Why the file at $Path does not match the pinned SHA-256 $Expected, or "" when it does.
-
-      RETURNED, NOT THROWN, so each caller decides what a mismatch means: refuse to go on, or skip to
-      another source. The message names both hashes, so an operator can compare them against the
-      channel the pin came from. A file that cannot be hashed is a mismatch, never a pass.
-    #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
-    try {
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
-    } catch {
-        return ("'$Path' could not be hashed ($($_.Exception.Message)), so nothing checked it " +
-            "against the pinned SHA-256 $Expected")
-    }
-    if ($actual -ne $Expected) { return "'$Path' has SHA-256 $actual, not the pinned $Expected" }
-    return ""
-}
-
-function Lock-PinnedFile {
-    <#
-      Open $Path so that no other process can change, rename or delete it, THEN check its hash, and
-      return the open handle. Throws, with the handle closed, when the file cannot be opened that
-      way or does not match.
-
-      A check alone leaves a gap: the script hashes a copy and runs it later, and a file in a folder
-      another account can write could be swapped in between. While this handle is open it cannot
-      be. Measured 2026-09-29 on Windows 11 under PowerShell 7.6: holding a FileShare.Read handle,
-      this process could still hash the file and run it, and another process's write, rename and
-      delete of it, and a rename of its folder, were all refused. A process already holding the
-      file open for writing makes the open itself fail, which is a refusal too. Dispose the handle
-      when the script no longer runs the file.
-    #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
-    $handle = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $problem = Get-FilePinProblem -Path $Path -Expected $Expected
-    if ($problem) {
-        $handle.Dispose()
-        throw $problem
-    }
-    return $handle
-}
-# END pinned-hash check
-
 $principal = [Security.Principal.WindowsPrincipal]::new(
     [Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -279,8 +225,8 @@ if ($ReleaseAddress) {
 # --- stop and remove --------------------------------------------------------------------------------
 
 # THE SCM, NOT NSSM, AND NOT A THIRD COPY OF Stop-ServiceAndConfirm. That function takes an empty
-# -NssmPath to mean "stop through the SCM" -- uninstall-service.ps1 calls it that way when nssm is
-# absent -- so it WOULD work here, and an earlier version of this comment wrongly said it required
+# -NssmPath to mean "stop through the SCM" -- uninstall-service.ps1 always calls it that way -- so
+# it WOULD work here, and an earlier version of this comment wrongly said it required
 # nssm. The real reason is the copies: it is shared byte-identically between the two engine scripts
 # with a drift test pinning the pair, and a third and fourth copy is a cost this script does not need
 # to pay for a helper that drains nothing. What it must not cost is the PROPERTY, so this does the
@@ -309,31 +255,13 @@ Write-Host "Removing '$ServiceName'..."
 # happened, because nothing below re-reads it. uninstall-service.ps1's removal records the full
 # reasoning and the per-host measurements.
 #
-# THE INSTALLED nssm.exe RUNS ONLY IF IT STILL HASHES TO THE PIN (BACKLOG #2364). The installer checked
-# it and the folder it sits in, but that was at install time, and this script runs it as
-# administrator now. sc.exe removes a registration just as well, so a copy that fails is named with
-# both hashes and left alone, and the removal goes on without it.
-$nssmForRemoval = Join-Path $InstallDir "nssm.exe"
-$useNssm = $false
-if (Test-Path -LiteralPath $nssmForRemoval) {
-    $problem = Get-FilePinProblem -Path $nssmForRemoval -Expected $NssmExeSha256
-    if ($problem) {
-        Write-Warning ("Not running the installed nssm: $problem. The installer checked it, so " +
-            "something has changed it since. Removing the registration with sc.exe instead.")
-    } else {
-        $useNssm = $true
-    }
-}
+# sc.exe, NOT THE INSTALLED nssm.exe (BACKLOG #2364). Removing the registration deletes the NSSM
+# settings stored under it, so nssm adds nothing here, and running it would mean trusting a binary as
+# administrator on the strength of a check made at install time.
 $global:LASTEXITCODE = $null
-if ($useNssm) {
-    & $nssmForRemoval remove $ServiceName confirm
-    if ($null -eq $LASTEXITCODE) { throw "nssm remove did not run ('$nssmForRemoval' left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "nssm remove failed (exit $LASTEXITCODE)" }
-} else {
-    & sc.exe delete $ServiceName | Out-Null
-    if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
-}
+& sc.exe delete $ServiceName | Out-Null
+if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
+if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
 Write-Host "Removed '$ServiceName'." -ForegroundColor Green
 
 # --- what is still here -----------------------------------------------------------------------------

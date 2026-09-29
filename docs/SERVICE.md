@@ -33,15 +33,17 @@ venv interpreter) and the per-connection firewall openings the service needs.
    .venv\Scripts\python.exe -m pip install -e . --no-deps
    ```
    `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
-2. **NSSM** — provisioned automatically. If `nssm.exe` isn't on `PATH` (or passed via
-   `-NssmPath`), `install-service.ps1` downloads the pinned, SHA‑256‑verified release into
-   `<DataDir>\bin\nssm.exe` and uses it. No manual install needed.
-   A copy you already have is used only if its SHA-256 matches the pinned win64 `nssm.exe`
-   from NSSM 2.24. The installer and the uninstaller check every copy before they run it, whichever
-   source it came from. The installer refuses a `-NssmPath` copy or a cached copy that does not
-   match, and names both hashes. A copy on `PATH` that does not match is skipped with a warning, and
-   the installer downloads the pinned release instead. A package manager's `nssm` may be a
-   different build, so it may be skipped this way, and the install still goes on.
+2. **NSSM** — provisioned automatically. `install-service.ps1` keeps the `nssm.exe` the service
+   runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
+   anyone but administrators can write to or owns, because it runs that file as administrator. It
+   fills the folder from `-NssmPath`, from an `nssm` on `PATH`, or by downloading the pinned,
+   SHA‑256‑verified release. No manual install needed.
+   A copy you already have is used only if its SHA-256 matches the pinned win64 `nssm.exe` from
+   NSSM 2.24. The installer refuses a `-NssmPath` copy that does not match, and names both hashes.
+   A copy on `PATH` that does not match is skipped with a warning, and the installer downloads the
+   pinned release instead. A package manager's `nssm` may be a different build, so it may be
+   skipped this way. On a host with no internet access, pass `-NssmPath` with the win64 `nssm.exe`
+   from `nssm-2.24.zip`. The uninstaller runs no `nssm.exe` at all.
 3. **An elevated PowerShell** (Run as Administrator) — required to register a service.
    `messagefoundry service install --env <name>` elevates for you (a UAC prompt) and runs the
    install script below in a visible window so you can read its output.
@@ -190,21 +192,18 @@ snapshot of the old code — run `.venv\Scripts\python.exe -m pip install -e .` 
 ## Start / stop / status
 
 ```powershell
-nssm start  MessageFoundry
-nssm status MessageFoundry
-nssm stop   MessageFoundry      # Ctrl+C -> graceful connection shutdown (up to 15s)
-nssm restart MessageFoundry
+Start-Service   MessageFoundry
+Get-Service     MessageFoundry
+Stop-Service    MessageFoundry   # NSSM answers with Ctrl+C -> graceful connection shutdown (up to 15s)
+Restart-Service MessageFoundry
 ```
 
-If `nssm` isn't on `PATH`, it's the auto-downloaded copy at `<DataDir>\bin\nssm.exe`
-(e.g. `C:\ProgramData\MessageFoundry\bin\nssm.exe`). You can also use the built-in
-`sc.exe` / Services.msc once installed.
-
-Prefer `Start-Service`, `Stop-Service` and `Restart-Service` from an elevated prompt. They ask
-Windows to do the same thing, and the service still gets the same graceful stop. The cached
-`nssm.exe` sits where the engine's own account can write, and nothing checks its hash when you run
-it by hand as administrator. The install and uninstall scripts do check it
-([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8).
+Run them from an elevated prompt. `nssm start`, `nssm stop` and `nssm restart` send the same
+request, and Services.msc or `sc.exe` work too. The service's own `nssm.exe` is in
+`C:\Program Files\MessageFoundry\nssm` (the installer's `-NssmDir`). For a command only NSSM has,
+such as `nssm set`, run that copy. The installer checked its hash and keeps it where only
+administrators can write ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8). An
+`nssm` found anywhere else is a copy nothing has checked.
 
 For a one-click desktop alternative to these commands — engine status at a glance plus
 start/stop/restart, the console, and the log from the notification area — run the
@@ -278,7 +277,8 @@ PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI
 The key is a base64 32-byte secret. Two ways to supply it:
 
 - **Environment (cross-platform default).** Set `MEFOR_STORE_ENCRYPTION_KEY` in the service's
-  environment (`nssm set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`). Simple,
+  environment (`& "C:\Program Files\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`,
+  the copy the installer checked; see [Start / stop / status](#start--stop--status)). Simple,
   but the plaintext key sits in the service environment block, readable by any local administrator.
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
@@ -639,14 +639,16 @@ host-wide — coordinate with whatever else the box runs.
 .\scripts\service\uninstall-service.ps1
 ```
 
-This stops the service and removes its registration. **It does not return the host to its
+This stops the service through Windows and removes its registration with `sc.exe`. It runs no
+`nssm.exe`, so there is no copy for it to trust. **It does not return the host to its
 pre-install state.** The script reads the host before it removes the registration, then prints an
 inventory of what is still there and the command that clears each one. Read that inventory; the
 list below says what it covers.
 
 | Left behind | Why | Clear it with |
 |---|---|---|
-| The `DataDir` tree — logs, message store, and `bin\nssm.exe` if the installer downloaded it | Your data, and the NSSM binary the uninstall just used | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
+| The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
+| The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself once you are sure you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
 | The `SeServiceLogonRight` ("Log on as a service") grant | NSSM's `ObjectName` does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
