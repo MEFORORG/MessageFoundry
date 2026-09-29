@@ -20,9 +20,9 @@ resolved via :func:`render_filename`). The write goes to a temp name then a **re
 name, so a poller on the far side never sees a partial file. A name collision is uniquified (never a
 silent clobber). A transient failure (connect/timeout/transient FTP error) → :class:`DeliveryError`
 (retried); a permanent server refusal (auth failure, no-such-dir, a 5xx-class permanent FTP error) →
-:class:`NegativeAckError` (``permanent=True``), which dead-letters. With ``overwrite`` off,
-the upload first lists the directory to find a free name, and a listing that fails is retried as
-transient, never written blind (BACKLOG #1936). Only a credential fault keeps its permanent class.
+:class:`NegativeAckError` (``permanent=True``), which dead-letters. With ``overwrite`` off, the
+upload first lists the directory to find a free name; :meth:`RemoteFileDestination._unique` states
+what a failed listing does.
 
 **Source** polls ``remote_dir`` for ``pattern`` files, hands each to the pipeline handler, then — only
 after the handler returns — moves the file to ``processed_subdir`` (or deletes it per ``after_read``).
@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are refused (see _validate_common); FTPS/SFTP are the encrypted defaults
 import hashlib
 import io
@@ -65,7 +66,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any, TypeVar
 
 from messagefoundry.config.models import (
@@ -309,6 +310,22 @@ class _RemoteClient(abc.ABC):
     @abc.abstractmethod
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
         """``(name, size)`` for each regular file directly in ``remote_dir`` (no recursion)."""
+
+    def list_names(self, remote_dir: str) -> set[str]:
+        """The name of EVERY entry directly in ``remote_dir``, whatever its type: a directory, a
+        symlink or anything else a server lists, as well as a regular file (BACKLOG #2082).
+
+        The upload's collision check reads this, not :meth:`list_dir`. A same-named symlink or
+        directory is a collision too: the rename that publishes the upload would replace the link,
+        or fail on the directory. The SFTP and FTP clients override this; the default, for a client
+        that can list only regular files, is exactly as wide as :meth:`list_dir`."""
+        return {name for name, _ in self.list_dir(remote_dir)}
+
+    def ensure_dir_and_list_names(self, remote_dir: str) -> tuple[bool, set[str]]:
+        """:meth:`ensure_dir`, then :meth:`list_names`, on ONE connection where the client can
+        (BACKLOG #2082). The connection probe runs both, and two connect bounds in a row can outlast
+        the API's own cap on the probe. The default makes two calls."""
+        return self.ensure_dir(remote_dir), self.list_names(remote_dir)
 
     @abc.abstractmethod
     def retrieve(self, path: str, *, max_bytes: int | None = None) -> bytes:
@@ -576,6 +593,28 @@ class _FtpClient(_RemoteClient):
             out.append((base, int(size)))
         return out
 
+    def list_names(self, remote_dir: str) -> set[str]:
+        return self._op(lambda ftp: self._names(ftp, remote_dir))
+
+    def ensure_dir_and_list_names(self, remote_dir: str) -> tuple[bool, set[str]]:
+        return self._op(lambda ftp: (self._mkd(ftp, remote_dir), self._names(ftp, remote_dir)))
+
+    @staticmethod
+    def _names(ftp: ftplib.FTP, remote_dir: str) -> set[str]:
+        """Every entry's name, of any type (see :meth:`_RemoteClient.list_names`). ``MLSD`` names
+        the directory itself and its parent as ``cdir`` and ``pdir``; those are left out, and so
+        are ``.`` and ``..``. ``NLST`` already names every entry."""
+        try:
+            return {
+                name
+                for name, facts in ftp.mlsd(remote_dir)
+                if name not in (".", "..") and facts.get("type", "").lower() not in ("cdir", "pdir")
+            }
+        except (ftplib.error_perm, ftplib.error_proto):
+            pass
+        names = {posixpath.basename(name) for name in ftp.nlst(remote_dir)}
+        return names - {".", ".."}
+
     def retrieve(self, path: str, *, max_bytes: int | None = None) -> bytes:
         def run(ftp: ftplib.FTP) -> bytes:
             # retrbinary already streams; the sink is what makes the stream BOUNDED — it raises out
@@ -616,16 +655,17 @@ class _FtpClient(_RemoteClient):
         return self._op(run)
 
     def ensure_dir(self, remote_dir: str) -> bool:
-        def run(ftp: ftplib.FTP) -> bool:
-            try:
-                ftp.mkd(remote_dir)
-            except ftplib.error_perm:
-                # already exists (or no permission) — best-effort, like File's mkdir(exist_ok); either
-                # way THIS call did not create it, so the caller must not report a creation.
-                return False
-            return True
+        return self._op(lambda ftp: self._mkd(ftp, remote_dir))
 
-        return self._op(run)
+    @staticmethod
+    def _mkd(ftp: ftplib.FTP, remote_dir: str) -> bool:
+        try:
+            ftp.mkd(remote_dir)
+        except ftplib.error_perm:
+            # already exists (or no permission) — best-effort, like File's mkdir(exist_ok); either
+            # way THIS call did not create it, so the caller must not report a creation.
+            return False
+        return True
 
     def _op(self, fn: Callable[[ftplib.FTP], _T]) -> _T:
         """Connect, run ``fn(ftp)``, always close. A connect fault arrives already classified from
@@ -760,6 +800,78 @@ def _bound_sftp_channel_reads(sftp: Any) -> None:
     sock.settimeout(SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
 
 
+def _start_helper(target: Callable[[], None], name: str) -> None:
+    """Start ``target`` on a daemon thread, or raise a transient :class:`_RemoteError`.
+
+    ``Thread.start`` raises :class:`RuntimeError` when the process cannot make another thread. That
+    is this engine short of a resource, not a fault in the server or the message, so it is transient
+    and the operation is retried (BACKLOG #2082). Left unclassified it escaped ``_op`` raw."""
+    try:
+        threading.Thread(target=target, name=name, daemon=True).start()
+    except RuntimeError as exc:
+        raise _RemoteError(
+            f"SFTP could not start its {name} helper thread: {exc}", permanent=False
+        ) from exc
+
+
+#: Wall-clock bound on an SFTP upload that makes no progress (BACKLOG #2082, ASVS 15.4.4). The same
+#: value as :data:`SFTP_CHANNEL_READ_TIMEOUT_SECONDS`, and like it, it bounds each step, not the
+#: whole transfer. See :class:`_WriteWatchdog`.
+SFTP_WRITE_STALL_SECONDS = 120.0
+
+#: Bytes per step of an SFTP upload: paramiko 5.0.0's ``SFTPFile.MAX_REQUEST_SIZE``, the size of the
+#: write requests it sends anyway, so writing in these steps changes nothing on the wire.
+SFTP_WRITE_CHUNK_BYTES = 32768
+
+
+class _WriteWatchdog:
+    """Closes the SSH client when an upload stops making progress (BACKLOG #2082, ASVS 15.4.4).
+
+    THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACT BELOW IS STATED. Read against paramiko 5.0.0.
+
+    ``Packetizer.write_all`` retries a socket send that timed out, without limit, and gives up only
+    once the packetizer is closed. The channel timeout :func:`_bound_sftp_channel_reads` sets bounds
+    a wait for window space and a wait for the server's reply, but not that loop. So a server that
+    stops reading, and keeps its TCP window shut, would park the worker thread for good.
+
+    The upload writes in :data:`SFTP_WRITE_CHUNK_BYTES` steps and calls :meth:`progress` after each.
+    A helper thread closes the client once :data:`SFTP_WRITE_STALL_SECONDS` pass with no progress.
+    ``Transport.close`` closes the packetizer, so ``write_all`` raises ``EOFError`` on its next turn,
+    and ``_op`` reports the upload as stalled, which is transient. A slow upload that keeps moving
+    resets the bound at every step, so only a stall is cut off."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self._last = time.monotonic()
+        self._done = threading.Event()
+        self.fired = False
+
+    def progress(self) -> None:
+        self._last = time.monotonic()
+
+    @contextlib.contextmanager
+    def watching(self, client: Any) -> Iterator[None]:
+        """Watch ``client`` for the length of the ``with`` block."""
+        self._last = time.monotonic()
+        _start_helper(lambda: self._watch(client), "mefor-sftp-write-watch")
+        try:
+            yield
+        finally:
+            self._done.set()
+
+    def _watch(self, client: Any) -> None:
+        while True:
+            remaining = self._last + self.seconds - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._done.wait(remaining):
+                return
+        if self._done.is_set():
+            return
+        self.fired = True
+        client.close()
+
+
 def _open_sftp_within(client: Any, seconds: float) -> Any:
     """``client.open_sftp()``, refused as a transient :class:`_RemoteError` if it takes longer than
     ``seconds`` (BACKLOG #1936, ASVS 15.4.4).
@@ -802,7 +914,7 @@ def _open_sftp_within(client: Any, seconds: float) -> Any:
         finally:
             done.set()
 
-    threading.Thread(target=_open, name="mefor-sftp-open", daemon=True).start()
+    _start_helper(_open, "mefor-sftp-open")
     if not done.wait(seconds):
         client.close()
         raise _RemoteError(
@@ -1138,12 +1250,24 @@ class _SftpClient(_RemoteClient):
 
         return self._op(run)
 
+    def list_names(self, remote_dir: str) -> set[str]:
+        return self._op(lambda sftp: set(sftp.listdir(remote_dir)))
+
+    def ensure_dir_and_list_names(self, remote_dir: str) -> tuple[bool, set[str]]:
+        return self._op(
+            lambda sftp: (self._ensure(sftp, remote_dir), set(sftp.listdir(remote_dir)))
+        )
+
     def store(self, path: str, data: bytes) -> None:
+        watchdog = _WriteWatchdog(SFTP_WRITE_STALL_SECONDS)
+
         def run(sftp: Any) -> None:
             with sftp.open(path, "wb") as fh:
-                fh.write(data)
+                for start in range(0, len(data), SFTP_WRITE_CHUNK_BYTES):
+                    fh.write(data[start : start + SFTP_WRITE_CHUNK_BYTES])
+                    watchdog.progress()
 
-        self._op(run)
+        self._op(run, watchdog=watchdog)
 
     def rename(self, src: str, dst: str) -> None:
         self._op(lambda sftp: sftp.posix_rename(src, dst))
@@ -1165,34 +1289,70 @@ class _SftpClient(_RemoteClient):
         return self._op(run)
 
     def ensure_dir(self, remote_dir: str) -> bool:
-        def run(sftp: Any) -> bool:
+        return self._op(lambda sftp: self._ensure(sftp, remote_dir))
+
+    @staticmethod
+    def _ensure(sftp: Any, remote_dir: str) -> bool:
+        try:
+            sftp.stat(remote_dir)
+        except FileNotFoundError:
             try:
-                sftp.stat(remote_dir)
-            except FileNotFoundError:
-                try:
-                    sftp.mkdir(remote_dir)
-                except OSError:
-                    return False  # racing creator / no permission — best-effort
-                return True
-            return False  # already there — nothing created
+                sftp.mkdir(remote_dir)
+            except OSError:
+                return False  # racing creator / no permission — best-effort
+            return True
+        return False  # already there — nothing created
 
-        return self._op(run)
+    def _op(self, fn: Callable[[Any], _T], *, watchdog: _WriteWatchdog | None = None) -> _T:
+        """Connect, open an SFTP channel, run ``fn(sftp)``, always close. ``watchdog``, when given,
+        watches the work for a stall (:class:`_WriteWatchdog`); a failure after it fired is
+        reported as a stalled upload, transient, whatever paramiko raised once the client closed."""
+        try:
+            return self._session(fn, watchdog)
+        except _RemoteError as exc:
+            if watchdog is None or not watchdog.fired:
+                raise
+            raise _RemoteError(
+                f"SFTP upload stalled: the server accepted no data for {watchdog.seconds:g}s, "
+                f"so the connection was closed ({exc})",
+                permanent=False,
+            ) from exc
 
-    def _op(self, fn: Callable[[Any], _T]) -> _T:
-        """Connect, open an SFTP channel, run ``fn(sftp)``, always close. A connect fault arrives
-        already classified from :meth:`_connect`; an operation fault is mapped below, a missing path
-        to permanent and connect/IO/timeout to transient."""
+    def _session(self, fn: Callable[[Any], _T], watchdog: _WriteWatchdog | None) -> _T:
+        """:meth:`_op`'s body. A connect fault arrives already classified from :meth:`_connect`.
+        Everything raised after it is mapped below, at least these (BACKLOG #2082 for the last
+        three rows):
+
+        - a missing path is permanent;
+        - an SSH, socket or timeout fault is transient, as a dropped connection is;
+        - ``EOFError`` is transient: the server or the transport closed the channel;
+        - ``paramiko.SFTPError`` is permanent. paramiko raises it when the server's SFTP replies
+          make no sense to it: an unsupported protocol version at the open ("Incompatible sftp
+          protocol"), bytes that are not SFTP ("Garbage packet received", as a login script that
+          prints text produces), or a reply of the wrong type. The same server gives the same
+          answer on a retry;
+        - a helper thread that cannot start is transient (:func:`_start_helper`)."""
         paramiko = _import_paramiko()
         client = self._connect()
         try:
             sftp = _open_sftp_within(client, SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
             _bound_sftp_channel_reads(sftp)
-            try:
-                return fn(sftp)
-            finally:
-                sftp.close()
+            with watchdog.watching(client) if watchdog is not None else contextlib.nullcontext():
+                try:
+                    return fn(sftp)
+                finally:
+                    sftp.close()
+        except (_RemoteError, _RemoteOversize, _RemoteChanged):
+            raise  # already classified, or a content refusal the source handles itself
         except FileNotFoundError as exc:
             raise _RemoteError(f"SFTP path not found: {exc}", permanent=True) from exc
+        except paramiko.SFTPError as exc:
+            raise _RemoteError(f"SFTP protocol error: {exc}", permanent=True) from exc
+        except EOFError as exc:
+            # A bare EOFError has no text, which would leave the operator a message ending in ": ".
+            raise _RemoteError(
+                f"SFTP connection closed: {str(exc) or type(exc).__name__}", permanent=False
+            ) from exc
         except paramiko.SSHException as exc:
             raise _RemoteError(f"SFTP operation failed: {exc}", permanent=False) from exc
         except TimeoutError as exc:
@@ -1402,11 +1562,11 @@ class RemoteFileDestination(DestinationConnector):
         retryable :class:`DeliveryError`. The reclassification is the point: an SFTP/FTP no-such-dir is
         a **permanent** error, so letting the upload fail on its own would dead-letter live traffic over
         a share that is merely unmounted. It costs one extra round trip per delivery, on the opt-in
-        path only. A credential fault is not reclassified (BACKLOG #1936): it keeps its ADR 0095
-        marker and STOPs the lane, where it used to be retried; see :meth:`_list_or_retry`."""
+        path only. A credential fault is not reclassified; see :meth:`_list_or_retry`."""
         if self._validate_directory:
             self._list_or_retry(
-                "is not available, and validate_directory is on so it is never created on send"
+                self._client.list_dir,
+                "is not available, and validate_directory is on so it is never created on send",
             )
             return
         if self._client.ensure_dir(self._remote_dir):
@@ -1416,9 +1576,9 @@ class RemoteFileDestination(DestinationConnector):
                 _redact(self._host, self._remote_dir),
             )
 
-    def _list_or_retry(self, why: str) -> list[tuple[str, int]]:
-        """List ``remote_dir`` on the send path, re-raising a failure as **transient** so the row
-        retries under its retry policy rather than dead-lettering on a no-such-dir or a 550.
+    def _list_or_retry(self, lister: Callable[[str], _T], why: str) -> _T:
+        """List ``remote_dir`` with ``lister`` on the send path, re-raising a failure as **transient**
+        so the row retries under its retry policy rather than dead-lettering on a no-such-dir or a 550.
 
         A credential fault is the exception and is re-raised unchanged: it keeps its ADR 0095 marker,
         so the delivery worker STOPs and retains instead of retrying into an account lockout. So the
@@ -1426,7 +1586,7 @@ class RemoteFileDestination(DestinationConnector):
         limit, or one refusing TLS, is classified before it gets here (BACKLOG #2083,
         :func:`_ftp_connect_refusal`), so it is retried here and never stops the lane."""
         try:
-            return self._client.list_dir(self._remote_dir)
+            return lister(self._remote_dir)
         except _RemoteError as exc:
             if exc.credential_fault:
                 raise
@@ -1458,25 +1618,29 @@ class RemoteFileDestination(DestinationConnector):
             raise
 
     def _unique(self, final: str) -> str:
-        """Return ``final`` or, if a file already exists there, ``name-1.ext``, ``name-2.ext``, …
-        Never clobbers an existing file silently (mirrors the File destination).
+        """Return ``final`` or, if anything already exists there, ``name-1.ext``, ``name-2.ext``, …
+        Never clobbers an existing entry silently (mirrors the File destination).
 
-        Fails closed (BACKLOG #1936): a listing that fails is raised through :meth:`_list_or_retry`,
-        never read as "nothing to collide with". Returning the unsuffixed name there would let the
-        store + rename replace a partner file under ``overwrite=False``. Nothing is written first.
+        **THIS IS THE ONE STATEMENT OF THE RULE (BACKLOG #1936); everything else points here.** With
+        ``overwrite`` off, a listing that fails is never read as "nothing to collide with": it is
+        raised through :meth:`_list_or_retry`, which makes it transient unless it is a credential
+        fault, and nothing is written first. Returning the unsuffixed name there would let the store
+        and rename replace a partner file.
+
+        Every entry counts, not only a regular file (BACKLOG #2082): the rename would replace a
+        same-named symlink, or fail on a same-named directory. So this reads
+        :meth:`_RemoteClient.list_names`.
 
         A missing directory earns no exception. ``_upload`` runs :meth:`_prepare_remote_dir` first,
         which lists it or tries to create it. ``ensure_dir`` is best-effort, so the directory can
         still be missing here, but then the store into it would fail too, so ``final`` never delivered
         that message. What changes is the disposition: the row now retries at this listing instead of
         dead-lettering at the store."""
-        existing = {
-            n
-            for n, _ in self._list_or_retry(
-                "could not be listed to check the upload name for a collision, and overwrite is "
-                "off, so nothing was written"
-            )
-        }
+        existing = self._list_or_retry(
+            self._client.list_names,
+            "could not be listed to check the upload name for a collision, and overwrite is "
+            "off, so nothing was written",
+        )
         base = posixpath.basename(final)
         if base not in existing:
             return final
@@ -1493,16 +1657,15 @@ class RemoteFileDestination(DestinationConnector):
         # message data written. A failure is mapped like send()'s. Under validate_directory the probe
         # LISTS instead of ensuring: "never invent this path" has to hold for the on-demand probe too,
         # or POST /connections/{name}/test would silently repair the typo the toggle exists to catch.
-        # With overwrite off it also LISTS after ensuring (BACKLOG #1936): every such delivery lists
-        # to find a free name and fails closed if it cannot, so a probe that skipped the listing
-        # would pass a write-only directory that no real delivery can use.
+        # With overwrite off it also lists, as every such delivery does (see _unique), and on the
+        # same connection as the ensure, so one connect bound fits the API's cap on the probe (#2082).
         try:
             if self._validate_directory:
                 await asyncio.to_thread(self._client.list_dir, self._remote_dir)
-            else:
+            elif self._overwrite:
                 await asyncio.to_thread(self._client.ensure_dir, self._remote_dir)
-                if not self._overwrite:
-                    await asyncio.to_thread(self._client.list_dir, self._remote_dir)
+            else:
+                await asyncio.to_thread(self._client.ensure_dir_and_list_names, self._remote_dir)
         except _RemoteError as exc:
             if exc.permanent:
                 raise NegativeAckError(

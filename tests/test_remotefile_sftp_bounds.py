@@ -113,11 +113,16 @@ class _FakeAuthException(_FakeSshException):
     """Subclasses the SSH exception, as ``paramiko.AuthenticationException`` does."""
 
 
+class _FakeSftpError(Exception):
+    """Stands in for ``paramiko.SFTPError``, which, like the real one, is not an SSH exception."""
+
+
 class _FakeParamiko:
-    """The two exception classes ``_op`` catches by attribute off the lazily imported module."""
+    """The exception classes ``_op`` catches by attribute off the lazily imported module."""
 
     SSHException = _FakeSshException
     AuthenticationException = _FakeAuthException
+    SFTPError = _FakeSftpError
 
 
 class _UnconnectedSshClient:
@@ -1010,3 +1015,201 @@ def test_real_paramiko_unknown_host_key_stays_permanent(
     assert result.permanent is True, f"a rejected host key is a security stop: {result}"
     assert result.credential_fault is False
     assert "known_hosts" in str(result), str(result)
+
+
+# --- open-path errors are classified (BACKLOG #2082) ------------------------------------------------
+#
+# Before #2082 an EOFError or a paramiko.SFTPError from the session open, and a RuntimeError from
+# starting the helper thread, escaped ``_op`` raw. What each class means is stated once, in
+# ``_SftpClient._session``'s docstring.
+
+
+@pytest.mark.parametrize(
+    ("raised", "permanent", "says"),
+    [
+        (EOFError(), False, "connection closed: EOFError"),
+        (_FakeSftpError("Incompatible sftp protocol"), True, "SFTP protocol error"),
+        (_FakeSftpError("Garbage packet received"), True, "SFTP protocol error"),
+    ],
+    ids=["eof", "incompatible-version", "garbage"],
+)
+def test_an_open_path_error_is_classified(
+    monkeypatch: pytest.MonkeyPatch, raised: BaseException, permanent: bool, says: str
+) -> None:
+    class _FailingOpenSsh(_StubSshClient):
+        def open_sftp(self) -> Any:
+            raise raised
+
+    client = _sftp_client_with(_FailingOpenSsh(None), monkeypatch)
+
+    with pytest.raises(_RemoteError) as caught:
+        client.list_dir("/in")
+
+    assert caught.value.permanent is permanent, str(caught.value)
+    assert caught.value.credential_fault is False
+    assert says in str(caught.value)
+
+
+def test_a_helper_thread_that_cannot_start_is_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``Thread.start`` raises ``RuntimeError`` when the process cannot make another thread. That is
+    the engine short of a resource, so the operation is retried rather than dead-lettered."""
+
+    class _Unstartable:
+        def __init__(self, **kw: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(
+        remotefile, "threading", SimpleNamespace(Thread=_Unstartable, Event=threading.Event)
+    )
+    client = _client_over(_StubSftp(_RecordingChannel()), monkeypatch)
+
+    with pytest.raises(_RemoteError) as caught:
+        client.list_dir("/in")
+
+    assert caught.value.permanent is False
+    assert "helper thread" in str(caught.value)
+
+
+# --- an upload that stops making progress is bounded (BACKLOG #2082) --------------------------------
+#
+# What paramiko does when the server stops reading is stated once, in ``_WriteWatchdog``'s docstring.
+
+#: The stall bound these tests run under, shortened from the shipped 120 s.
+_STALL_BOUND = 1.0
+
+
+class _WriteFile(_StubFile):
+    """An ``SFTPFile`` stand-in for an upload. ``stall_after`` writes, it parks the way
+    ``Packetizer.write_all`` does until the client is closed, then raises ``EOFError`` as that loop
+    does once the packetizer is closed. ``pause`` makes every write slow but live instead."""
+
+    def __init__(
+        self, closed: threading.Event, *, stall_after: int | None = None, pause: float = 0.0
+    ) -> None:
+        super().__init__()
+        self._closed = closed
+        self._stall_after = stall_after
+        self._pause = pause
+        self.written = bytearray()
+        self.writes = 0
+
+    def write(self, data: bytes) -> None:
+        if self._stall_after is not None and self.writes >= self._stall_after:
+            if not self._closed.wait(_PARKED_AFTER):
+                raise AssertionError(
+                    f"the write was still parked after {_PARKED_AFTER:g}s: nothing closed the client"
+                )
+            raise EOFError()
+        time.sleep(self._pause)
+        self.written += data
+        self.writes += 1
+
+
+class _ClosableSsh(_StubSshClient):
+    def __init__(self, sftp: Any, closed: threading.Event) -> None:
+        super().__init__(sftp)
+        self._closed = closed
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._closed.set()
+
+
+def _uploader(fh: _WriteFile, closed: threading.Event, monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setattr(remotefile, "SFTP_WRITE_STALL_SECONDS", _STALL_BOUND)
+    monkeypatch.setattr(remotefile, "SFTP_WRITE_CHUNK_BYTES", 4)
+    ssh = _ClosableSsh(_StubSftp(_RecordingChannel(), fh), closed)
+    return _client_with_ssh(ssh, monkeypatch), ssh
+
+
+def test_an_upload_to_a_server_that_stops_reading_is_refused_transient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before #2082 this test fails at the harness ceiling: the write waits for a close that
+    nothing sends, as ``write_all`` would against a real server that stopped reading."""
+    closed = threading.Event()
+    fh = _WriteFile(closed, stall_after=2)
+    client, ssh = _uploader(fh, closed, monkeypatch)
+
+    started = time.monotonic()
+    with pytest.raises(_RemoteError) as caught:
+        client.store("/in/.a.part", b"0123456789abcdef")
+    elapsed = time.monotonic() - started
+
+    assert caught.value.permanent is False, "a stalled server is live-again-later; retry it"
+    assert "upload stalled" in str(caught.value), str(caught.value)
+    assert elapsed < _STALL_BOUND + 5.0
+    assert bytes(fh.written) == b"01234567"  # it did move, then stopped
+
+
+def test_a_slow_upload_that_keeps_moving_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CONTROL: the bound is per step. Each write here takes half the bound and the whole upload
+    takes well over it, and it completes; the only close is ``_op``'s own.
+
+    Red mutation: bound the whole upload instead of each step (never call ``progress``). The
+    watchdog then closes the client part-way and this test reds."""
+    closed = threading.Event()
+    fh = _WriteFile(closed, pause=_STALL_BOUND * 0.5)
+    client, ssh = _uploader(fh, closed, monkeypatch)
+
+    client.store("/in/.a.part", b"0123456789abcdef")  # four steps, about two bounds in all
+
+    assert bytes(fh.written) == b"0123456789abcdef"
+    assert ssh.close_calls == 1, f"closed {ssh.close_calls} times; only _op should close it"
+
+
+def test_real_paramiko_write_all_spins_until_the_packetizer_is_closed() -> None:
+    """The paramiko fact the watchdog rests on, checked against the real library.
+
+    A peer that never reads leaves ``Packetizer.write_all`` retrying its timed-out sends once the
+    socket buffers fill: the writer stops making progress and does not return. Closing the
+    packetizer, which ``Transport.close`` does, ends it with ``EOFError``. The writes are 32 KiB
+    packets, as an upload's are; one huge send can be taken whole by a Windows loopback socket.
+    SKIPS where the ``[sftp]`` extra is not installed; a skip claims nothing."""
+    pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
+    from paramiko.packet import Packetizer
+
+    ours, peer = socket.socketpair()
+    try:
+        ours.settimeout(0.1)  # what paramiko's Transport sets on its socket
+        packetizer = Packetizer(ours)
+        outcome: list[BaseException | None] = []
+        sent = [0]
+        ceiling = 512 * 1024 * 1024  # far past any socket buffer; reaching it fails the test
+
+        def _write() -> None:
+            try:
+                packet = b"\0" * 32768
+                while sent[0] < ceiling:
+                    packetizer.write_all(packet)
+                    sent[0] += len(packet)
+                outcome.append(None)
+            except BaseException as exc:  # recorded for the assertions below
+                outcome.append(exc)
+
+        writer = threading.Thread(target=_write, daemon=True)
+        writer.start()
+        stalled_at = -1
+        deadline = time.monotonic() + _PARKED_AFTER
+        while time.monotonic() < deadline and writer.is_alive():
+            before = sent[0]
+            time.sleep(0.5)
+            if sent[0] == before:
+                stalled_at = before
+                break
+        assert writer.is_alive(), f"write_all returned against a peer that never reads: {outcome}"
+        assert stalled_at >= 0, "the writer never stopped making progress"
+        time.sleep(0.5)
+        assert writer.is_alive() and sent[0] == stalled_at, "write_all gave up on its own"
+        packetizer.close()
+        writer.join(_PARKED_AFTER)
+        assert not writer.is_alive(), "closing the packetizer did not end write_all"
+        (result,) = outcome
+        assert isinstance(result, EOFError), repr(result)
+    finally:
+        peer.close()
+        ours.close()

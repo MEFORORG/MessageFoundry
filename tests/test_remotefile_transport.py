@@ -1139,6 +1139,7 @@ class _FakeParamiko:
     AutoAddPolicy = _AutoAddPolicy
     SSHException = _SSHException
     AuthenticationException = _AuthException
+    SFTPError = type("SFTPError", (Exception,), {})
 
     class RSAKey:
         @staticmethod
@@ -2398,3 +2399,129 @@ async def test_an_unsettled_file_does_not_charge_the_poll_ceiling(
     await src._poll_once()
     assert h.bodies == [_SETTLE_WHOLE]  # b was read although a sorts ahead of it
     assert "/in/a.hl7" in client.files
+
+
+# --- BACKLOG #2082: every entry is a collision, and the probe uses one connection -------------------
+
+
+class _DropBoxFtp:
+    """An ``ftplib.FTP_TLS`` stand-in over an in-memory drop directory whose ``MLSD`` listing is
+    ``entries``. Records every connection and every command that changes the directory."""
+
+    connections: list[_DropBoxFtp] = []
+    entries: list[tuple[str, dict[str, str]]] = []
+
+    def __init__(self, *, context: Any = None, timeout: float | None = None) -> None:
+        self.stored: list[str] = []
+        self.renamed: list[tuple[str, str]] = []
+        self.made: list[str] = []
+        self.listed = 0
+        _DropBoxFtp.connections.append(self)
+
+    def connect(self, host: str, port: int) -> None:
+        pass
+
+    def auth(self) -> None:
+        pass
+
+    def login(self, *, user: str, passwd: str) -> None:
+        pass
+
+    def prot_p(self) -> None:
+        pass
+
+    def mkd(self, path: str) -> str:
+        self.made.append(path)
+        return path
+
+    def mlsd(self, path: str) -> list[tuple[str, dict[str, str]]]:
+        self.listed += 1
+        return list(_DropBoxFtp.entries)
+
+    def storbinary(self, cmd: str, fp: Any) -> None:
+        self.stored.append(cmd.removeprefix("STOR "))
+
+    def rename(self, src: str, dst: str) -> None:
+        self.renamed.append((src, dst))
+
+    def quit(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _drop_box(
+    monkeypatch: pytest.MonkeyPatch, entries: list[tuple[str, dict[str, str]]]
+) -> type[_DropBoxFtp]:
+    import ftplib as _ftplib
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _DropBoxFtp.connections = []
+    _DropBoxFtp.entries = entries
+    monkeypatch.setattr(_ftplib, "FTP_TLS", _DropBoxFtp)
+    return _DropBoxFtp
+
+
+_MLSD_DOTS = [(".", {"type": "cdir"}), ("..", {"type": "pdir"})]
+
+
+@pytest.mark.parametrize(
+    "entry_type",
+    ["OS.unix=symlink", "dir", "OS.unix=slink:/elsewhere/a.hl7"],
+    ids=["symlink", "directory", "symlink-with-target"],
+)
+async def test_a_same_named_entry_that_is_not_a_file_is_a_collision(
+    monkeypatch: pytest.MonkeyPatch, entry_type: str
+) -> None:
+    """The regular-file listing the source reads leaves these out, so before #2082 the collision
+    check did not see them, and the rename would have replaced a partner's symlink.
+
+    Driven through the shipped ``_FtpClient``, so the MLSD parsing under test is the real one."""
+    box = _drop_box(monkeypatch, [*_MLSD_DOTS, ("msg.hl7", {"type": entry_type})])
+    dest = build_destination(
+        _ftp_dest(tls=True, username="u", password="p", filename="msg.hl7", overwrite=False)
+    )
+    await dest.send(_UPLOAD_BODY)
+    (rename,) = [r for c in box.connections for r in c.renamed]
+    assert rename[1] == "/in/msg-1.hl7", f"the upload was published over the {entry_type} entry"
+
+
+def test_the_source_listing_still_takes_regular_files_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CONTROL: the widening is the collision check's alone. The source's ``list_dir`` must not
+    start offering a symlink or directory for retrieval."""
+    _drop_box(
+        monkeypatch,
+        [
+            *_MLSD_DOTS,
+            ("link.hl7", {"type": "OS.unix=symlink"}),
+            ("sub", {"type": "dir"}),
+            ("a.hl7", {"type": "file", "size": "5"}),
+        ],
+    )
+    client = _ftps_client()
+    assert client.list_dir("/in") == [("a.hl7", 5)]
+    assert client.list_names("/in") == {"link.hl7", "sub", "a.hl7"}
+
+
+def test_sftp_list_names_takes_every_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SFTPClient.listdir`` names every entry; ``listdir_attr`` with ``S_ISREG``, which the source
+    reads, would drop a symlink (``listdir_attr`` reports the link itself, not its target)."""
+
+    class _Listing:
+        def listdir(self, path: str) -> list[str]:
+            return ["link.hl7", "sub", "a.hl7"]
+
+    monkeypatch.setattr(_SftpClient, "_op", lambda self, fn: fn(_Listing()))
+    client = _SftpClient({"host": "sftp.example.com"})
+    assert client.list_names("/in") == {"link.hl7", "sub", "a.hl7"}
+
+
+async def test_the_overwrite_off_probe_uses_one_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe ensures the directory and lists it. On two connections, two connect bounds in a
+    row can outlast the API's cap on the probe; on one, they cannot."""
+    box = _drop_box(monkeypatch, list(_MLSD_DOTS))
+    dest = build_destination(_ftp_dest(tls=True, username="u", password="p", overwrite=False))
+    await dest.test_connection()
+    (conn,) = box.connections
+    assert conn.made == ["/in"] and conn.listed == 1, "the probe must still ensure AND list"
