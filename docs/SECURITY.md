@@ -3114,16 +3114,17 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
   `total_lines` does not count them. Dropping only the lock rows would leave numbered gaps. That
   reader reads the trail, if it may, through `GET /audit`.
 
-**What the ruling does not reach.** At least these channels still differ between a right and a
-wrong candidate, and are open:
+**The visible row's timestamp does not separate them either.** A refused local sign-in's audit rows
+are written after the failure pad, on the same padded slot as the answer, so a refusal by a lock and
+a verified refusal land at the same offset from the request. The failure is still counted before the
+pad, and a caller who drops the request during the pad does not drop the rows.
+
+**What the ruling does not reach.** At least this channel still differs between a right and a
+wrong candidate, and is open:
 
 - **The owner's own later activity.** A live second-step lock refuses the owner's own sign-in, which
   then shows as a refusal where it would have shown as `auth.login_success`. That follows from the
   lock refusing the owner at all.
-- **The visible row's timestamp.** A refusal by a lock writes its `auth.login_failed` row after one
-  dummy password check; a verified refusal writes it after the password check, a TOTP secret read
-  and the counter write. The difference is a few milliseconds of store work, and the answer itself is
-  padded, but the row's `ts` is not.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via
