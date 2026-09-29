@@ -31,7 +31,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
 
@@ -47,7 +47,7 @@ async def _service(store: MessageStore) -> AuthService:
 
 
 async def _make_user(service: AuthService, username: str, *role_ids: str) -> str:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -325,7 +325,7 @@ async def test_crud_requires_users_manage(engine: Engine) -> None:
     service = AuthService(engine.store, AuthSettings())
     await service.initialize()
     # a VIEWER has neither USERS_MANAGE nor USERS_READ
-    viewer_id = await create_local_user_with_password(
+    viewer_id = await create_local_user_chosen(
         service,
         username="viewer",
         password=PW,

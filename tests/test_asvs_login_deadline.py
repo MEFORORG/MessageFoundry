@@ -48,7 +48,7 @@ from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -234,7 +234,7 @@ async def _service(engine: Engine) -> AuthService:
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     for name in ("jane", "locky"):
-        user_id = await create_local_user_with_password(
+        user_id = await create_local_user_chosen(
             service,
             username=name,
             password=PW,
@@ -392,7 +392,7 @@ async def test_every_kerberos_reject_answers_at_one_deadline(
     await service.initialize()
     # A local account colliding with the directory name: the conflict branch, reachable only after a
     # SUCCESSFUL resolve, and therefore the slowest reject on this seam.
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="jdoe",
         password=PW,

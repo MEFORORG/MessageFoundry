@@ -32,7 +32,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 if TYPE_CHECKING:  # the API rig below imports these lazily, inside the tests that use them
     import httpx
@@ -134,7 +134,7 @@ async def _provision_viewer(service: AuthService) -> None:
     """Create the viewer the two API tests below log in as, scoped to the whole estate."""
     from messagefoundry.auth import Role
 
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username="vw",
         password=_VIEWER_PW,
@@ -591,7 +591,7 @@ async def test_status_reports_failed_inbounds_and_scopes_their_names(tmp_path: P
         # 'wide' sees the whole estate; 'narrow' is scoped to 'winner' only, so the FAILED inbound
         # is out of its scope.
         for username, channels in (("wide", [ALL_CHANNELS]), ("narrow", ["winner"])):
-            uid = await create_local_user_with_password(
+            uid = await create_local_user_chosen(
                 service,
                 username=username,
                 password=pw,

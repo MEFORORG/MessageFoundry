@@ -34,7 +34,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import WebAuthnCredential
-from tests._admin_account import create_admin, create_local_user_with_password
+from tests._admin_account import create_admin, create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -79,7 +79,7 @@ def _client(
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

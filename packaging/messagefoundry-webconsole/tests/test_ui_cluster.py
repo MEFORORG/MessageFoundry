@@ -21,7 +21,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_with_password
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.api.models import ClusterNode, ClusterNodeList, ClusterStatus
@@ -405,7 +405,7 @@ async def _console(
             settings or AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
         )
         await service.initialize()
-        user_id = await create_local_user_with_password(
+        user_id = await create_local_user_chosen(
             service,
             username="u",
             password=PW,

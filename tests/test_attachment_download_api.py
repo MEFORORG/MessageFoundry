@@ -49,7 +49,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no vendor terms — satisfies the ASVS policy
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -565,7 +565,7 @@ async def test_ui_delegate_serves_the_sandbox_csp_not_the_console_csp(
     fails the moment a middleware re-ordering puts a /ui CSP writer back on top."""
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username="op",
         password=PW,
@@ -637,7 +637,7 @@ async def _service(engine: Engine) -> AuthService:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

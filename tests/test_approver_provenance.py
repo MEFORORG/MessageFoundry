@@ -36,7 +36,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink, _subject
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _client_with_sink, _hold_replay
 from tests.test_approval_requester_recheck import _Sink as _RecheckSink
@@ -348,7 +348,7 @@ async def test_account_created_notice_goes_to_the_new_accounts_address(engine: E
         security_notifier=notifier,
     )
     await service.initialize()
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="newbie",
         password=PW,

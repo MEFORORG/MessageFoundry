@@ -21,7 +21,7 @@ from messagefoundry.auth.service import AuthService, _allowed_channels
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "Sup3rSecret!!"
 
@@ -452,7 +452,7 @@ async def _admin_service(engine: Engine) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    boss_id = await create_local_user_with_password(
+    boss_id = await create_local_user_chosen(
         service,
         username="boss",
         password=PW,

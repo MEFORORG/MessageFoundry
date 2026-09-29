@@ -54,7 +54,7 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -153,7 +153,7 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _operator(service: AuthService, username: str) -> str:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

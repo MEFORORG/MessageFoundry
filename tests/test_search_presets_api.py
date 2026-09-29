@@ -17,7 +17,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN999^^^H^MR||DOE^JANE\r"
@@ -37,7 +37,7 @@ async def _user(engine: Engine, role: Role, name: str) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username=name,
         password=PW,
@@ -69,7 +69,7 @@ async def test_preset_crud_and_owner_scoping(engine: Engine) -> None:
     from messagefoundry.api import create_app
 
     service = await _user(engine, Role.OPERATOR, "op")
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="op2",
         password=PW,
@@ -343,7 +343,7 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         )
 
         # A NEW person is given the freed username.
-        new_id = await create_local_user_with_password(
+        new_id = await create_local_user_chosen(
             service,
             username="alice",
             password=PW,

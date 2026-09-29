@@ -33,7 +33,7 @@ from messagefoundry.logging_setup import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, satisfies the ASVS policy
 
@@ -112,7 +112,7 @@ def _client(
 
 
 async def _add_user(service: AuthService, username: str, roles: list[str]) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

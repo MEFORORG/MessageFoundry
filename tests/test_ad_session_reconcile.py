@@ -33,7 +33,7 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "Sup3rSecret!!"
 
@@ -658,7 +658,7 @@ async def test_local_sessions_and_signed_out_users_are_never_probed() -> None:
         ldap = _FakeLdap({"jdoe": _principal("jdoe"), "dormant": _principal("dormant")})
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
         await service.initialize()
-        await create_local_user_with_password(
+        await create_local_user_chosen(
             service,
             username="alice",
             password=PW,

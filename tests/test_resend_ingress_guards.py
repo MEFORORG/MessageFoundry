@@ -47,7 +47,7 @@ from messagefoundry.pipeline.ingress_guards import (
 )
 from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore, Stage
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -112,7 +112,7 @@ async def _operator(engine: Engine) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username="op",
         password=PW,

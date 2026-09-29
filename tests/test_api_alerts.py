@@ -25,7 +25,7 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "Sup3rSecret!!"
 
@@ -195,7 +195,7 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

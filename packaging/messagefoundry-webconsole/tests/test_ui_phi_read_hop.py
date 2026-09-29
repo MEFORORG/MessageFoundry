@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_with_password
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -64,7 +64,7 @@ def _client(engine: Engine, service: AuthService, *, secure_hop: bool) -> httpx.
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

@@ -39,7 +39,7 @@ __all__ = [
     "ADMIN_USERNAME",
     "AdminAccount",
     "create_admin",
-    "create_local_user_with_password",
+    "create_local_user_chosen",
     "provision_totp",
     "login_admin",
 ]
@@ -98,10 +98,15 @@ async def login_admin(service: AuthService) -> tuple[Identity, str, str]:
     return out.identity, out.token, admin.password
 
 
-async def create_local_user_with_password(
-    service: AuthService, *, password: str, **kwargs: Any
-) -> str:
+async def create_local_user_chosen(service: AuthService, *, password: str, **kwargs: Any) -> str:
     """Create a local account through ``create_local_user``, then give it ``password``.
+
+    NAMED WITHOUT "password" ON PURPOSE (CodeQL alert 229, BACKLOG #1131). CodeQL's clear-text-
+    logging rule treats the return of any call whose NAME matches its password heuristic as a
+    password. This returns a user id, and under the old name ``create_local_user_with_password`` that
+    id reached ``log.exception`` in ``approvals.py`` and was flagged as a logged password. The same
+    fix as alert 227 (PR 1761): keep "password", "passphrase", "secret", "token", "account" and
+    "cert" out of the name.
 
     ADR 0197 Amendment A made the engine generate every created account's credential, so
     ``create_local_user`` takes no password. Tests written before it need an account whose password

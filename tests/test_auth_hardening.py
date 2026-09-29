@@ -39,7 +39,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
-from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_with_password
+from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -69,7 +69,7 @@ def _client(engine: Engine, service: AuthService, **app_kwargs: object) -> httpx
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

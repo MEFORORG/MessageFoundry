@@ -27,7 +27,7 @@ from messagefoundry.config.settings import AiSettings, AuthSettings, StoreSettin
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -99,7 +99,7 @@ def _client(
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -553,7 +553,7 @@ async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(
     settings = AuthSettings(require_mfa=False, password_extra_context_words=["globex"])
     service = await _service(engine, settings)
     await _add(service, "root", Role.ADMINISTRATOR)
-    carol_id = await create_local_user_with_password(
+    carol_id = await create_local_user_chosen(
         service,
         username="carol",
         password=PW,
@@ -672,7 +672,7 @@ async def test_permission_inspector_flattens_builtin_and_custom(engine: Engine) 
         permissions=["messages:replay"],
         actor="test",
     )
-    subject_id = await create_local_user_with_password(
+    subject_id = await create_local_user_chosen(
         service,
         username="lab",
         password=PW,
@@ -1623,7 +1623,7 @@ async def test_patch_user_preserves_omitted_fields(engine: Engine) -> None:
     # M-20: a partial PATCH (only `disabled`) must NOT null the omitted display_name/email.
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username="jane",
         password=PW,
@@ -1673,7 +1673,7 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
     await _add(service, "vw", Role.VIEWER)
-    carol_id = await create_local_user_with_password(
+    carol_id = await create_local_user_chosen(
         service,
         username="carol",
         password=PW,
@@ -2055,7 +2055,7 @@ async def test_admin_reset_mfa_requires_an_action_bound_proof_and_keeps_the_mfa_
     """
     service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
     await _add(service, "root", Role.ADMINISTRATOR)
-    target = await create_local_user_with_password(
+    target = await create_local_user_chosen(
         service,
         username="mallory",
         password=PW,
@@ -2108,7 +2108,7 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
     )
     # `_add` discards the id it creates, and this test is specifically ABOUT the caller's own id --
     # so root is created the long way, exactly as `_add` does internally, to keep it.
-    root_id = await create_local_user_with_password(
+    root_id = await create_local_user_chosen(
         service,
         username="root",
         password=PW,
@@ -2118,7 +2118,7 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
         actor="test",
     )
     await _clear_must_change(service, root_id)
-    target = await create_local_user_with_password(
+    target = await create_local_user_chosen(
         service,
         username="mallory",
         password=PW,
@@ -2194,7 +2194,7 @@ async def test_login_and_the_must_change_refusal_state_the_deadline_the_gate_ref
     engine: Engine,
 ) -> None:
     service = await _service(engine, _expiring_service_settings())
-    dana_id = await create_local_user_with_password(
+    dana_id = await create_local_user_chosen(
         service,
         username="dana",
         password=PW,
@@ -2233,7 +2233,7 @@ async def test_no_deadline_is_stated_on_login_when_none_is_owed(engine: Engine) 
         engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=0)
     )
     await zero.initialize()
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         zero,
         username="finn",
         password=PW,
@@ -2262,7 +2262,7 @@ async def test_an_account_named_admin_is_told_its_credential_deadline(engine: En
         engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=72)
     )
     await service.initialize()
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="admin",
         password=PW,
@@ -2286,7 +2286,7 @@ async def test_a_deadline_too_far_out_to_render_still_refuses_with_a_403(engine:
         engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=100_000_000)
     )
     await far.initialize()
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         far,
         username="hugo",
         password=PW,
@@ -2342,7 +2342,7 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
     # alone would let that session rotate the lapsed credential, so the temporary password would
     # outlive its deadline through a session minted a second earlier.
     service = await _service(engine, _expiring_service_settings())
-    hal_id = await create_local_user_with_password(
+    hal_id = await create_local_user_chosen(
         service,
         username="hal",
         password=PW,
@@ -2379,7 +2379,7 @@ async def test_a_wrong_password_past_the_deadline_charges_no_lockout(engine: Eng
     # The deadline is checked BEFORE the password, so a guess that could not succeed anyway costs
     # the account nothing. Moving the check after the verify turns this red: the guess would count.
     service = await _service(engine, _expiring_service_settings())
-    jo_id = await create_local_user_with_password(
+    jo_id = await create_local_user_chosen(
         service,
         username="jo",
         password=PW,
@@ -2411,7 +2411,7 @@ async def test_the_deadline_is_asked_again_after_the_password_is_verified(
     # The first check passes, then the deadline passes while the request is inside the verify (as it
     # can while waiting for the per-account re-proof lock). The rotation must still be refused.
     service = await _service(engine, _expiring_service_settings())
-    kit_id = await create_local_user_with_password(
+    kit_id = await create_local_user_chosen(
         service,
         username="kit",
         password=PW,
@@ -2450,7 +2450,7 @@ async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
     # Control for the test above: one second-scale shift of the stamp is the only difference, and on
     # this side of the deadline the same request rotates the credential.
     service = await _service(engine, _expiring_service_settings())
-    ida_id = await create_local_user_with_password(
+    ida_id = await create_local_user_chosen(
         service,
         username="ida",
         password=PW,

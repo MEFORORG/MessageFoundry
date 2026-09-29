@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from _ui_clients import SAME_ORIGIN, create_local_user_with_password
+from _ui_clients import SAME_ORIGIN, create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
@@ -100,7 +100,7 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -721,7 +721,7 @@ async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
         engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
     )
     await service.initialize()
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="newbie",
         password=PW,
@@ -775,7 +775,7 @@ async def test_with_the_requirement_off_a_must_change_account_still_rotates_firs
         ),
     )
     admin = await _must_change_admin(service)
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="newbie",
         password=PW,
@@ -820,7 +820,7 @@ async def test_a_row_that_vanishes_mid_request_does_not_lift_the_confinement(
         ),
     )
     await service.initialize()
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="newbie",
         password=PW,

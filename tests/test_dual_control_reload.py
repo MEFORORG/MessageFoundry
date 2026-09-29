@@ -33,7 +33,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import ApiSettings, ApprovalsSettings, AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 from tests.test_trust_anchors import _block
 
 PW = "a-strong-test-passphrase"
@@ -109,7 +109,7 @@ def _fail_config_reload_audit(monkeypatch: pytest.MonkeyPatch, engine: Engine) -
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

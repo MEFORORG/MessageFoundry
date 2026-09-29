@@ -35,7 +35,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import OutboxStatus
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 # The only label names the exposition is ever allowed to carry (the PHI contract).
 ALLOWED_LABELS = {"connection", "destination", "status", "version", "le"}
@@ -295,7 +295,7 @@ async def _auth_service(engine: Engine) -> AuthService:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

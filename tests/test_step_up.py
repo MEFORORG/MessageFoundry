@@ -22,7 +22,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {
@@ -60,7 +60,7 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add_admin(service: AuthService, username: str) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -305,7 +305,7 @@ async def test_admin_user_update_is_action_bound(engine: Engine) -> None:
     the shared login window; the grant is consumed once, so a second PATCH re-prompts."""
     service = await _service(engine)
     await _add_admin(service, "boss")
-    target_id = await create_local_user_with_password(
+    target_id = await create_local_user_chosen(
         service,
         username="target",
         password=PW,
@@ -341,7 +341,7 @@ async def test_admin_user_update_opt_out_uses_window(engine: Engine) -> None:
     # With require_action_step_up=False the PATCH falls back to the session window (fresh login unlocks).
     service = await _service(engine, AuthSettings(require_action_step_up=False, require_mfa=False))
     await _add_admin(service, "boss")
-    target_id = await create_local_user_with_password(
+    target_id = await create_local_user_chosen(
         service,
         username="target",
         password=PW,
@@ -489,7 +489,7 @@ async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> N
 
 async def test_create_session_stamps_reauth_at(engine: Engine) -> None:
     service = await _service(engine)
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username="u",
         password=PW,

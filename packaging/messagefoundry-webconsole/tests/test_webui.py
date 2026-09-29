@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_with_password
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -79,7 +79,7 @@ def _client(engine: Engine, service: AuthService, *, serve_ui: bool = True) -> h
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -214,7 +214,7 @@ async def test_unprovisioned_operator_is_told_why_the_console_is_empty(engine: E
     banner and not a start-time refusal, which would make a fresh single-operator install
     unbootable for the same condition: asserted here by the page answering 200."""
     service = await _service(engine)
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username="fresh",
         password=PW,
@@ -3943,7 +3943,7 @@ async def test_the_create_form_requires_a_notification_address(engine: Engine) -
 
 async def _add_with_role_ids(service: AuthService, username: str, role_ids: list[str]) -> None:
     """Like _add, but with raw role ids (so a CUSTOM role can be assigned)."""
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -4317,7 +4317,7 @@ async def test_must_change_account_is_confined_to_rotation(engine: Engine) -> No
     # A must-change account: login lands on the rotation page, every other /ui route bounces back
     # there, and completing the rotation releases it (browser-only — no desktop console needed).
     service = await _service(engine)
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="fresh",
         password=PW,
@@ -4760,7 +4760,7 @@ async def test_reauth_confines_must_change_session(engine: Engine) -> None:
     # Review bug [0]: /ui/reauth (GET+POST) must mirror require_ui's must-change confinement — the JSON
     # /me/reauth twin refuses a must-change session, so the /ui gate must not be weaker.
     service = await _service(engine)
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="fresh",
         password=PW,
@@ -4903,7 +4903,7 @@ async def test_mfa_posts_reject_cross_site(engine: Engine) -> None:
 async def test_must_change_confinement_on_posts_and_reauth_continuation(engine: Engine) -> None:
     # Confinement covers POSTs and the /ui/reauth-driven continuation, not just GETs.
     service = await _service(engine)
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="fresh",
         password=PW,
@@ -7584,7 +7584,7 @@ async def test_the_page_after_create_states_the_initial_password_deadline(engine
 async def test_forced_change_page_states_the_deadline_the_gate_refuses_at(engine: Engine) -> None:
     # (d) The one surface the holder always reaches, with no address or mail relay needed.
     service = await _expiring_service(engine)
-    ivan = await create_local_user_with_password(
+    ivan = await create_local_user_chosen(
         service,
         username="ivan",
         password=PW,

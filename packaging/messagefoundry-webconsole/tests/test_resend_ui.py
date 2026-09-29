@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import httpx
-from _ui_clients import create_local_user_with_password
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.api.models import EventInfo, MessageDetail, OutboxInfo
@@ -232,7 +232,7 @@ async def _service(engine: Engine, *, step_up_max_age: int = 300) -> AuthService
 async def _add(
     service: AuthService, username: str, *role_ids: str, channels: list[str] | None = None
 ) -> str:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,

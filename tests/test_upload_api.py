@@ -38,7 +38,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -64,7 +64,7 @@ async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
         engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     )
     await service.initialize()
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username=name,
         password=PW,
@@ -90,7 +90,7 @@ async def _add_user(service: AuthService, role: Role, *, name: str) -> str:
     """Add a SECOND user to an existing AuthService (the cross-operator tests need two principals on
     one app) and return its user_id. Mirrors _make_user's must-change-password clearing, which every
     route depends on."""
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username=name,
         password=PW,

@@ -40,7 +40,7 @@ from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyE
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
-from tests._admin_account import create_local_user_with_password, provision_totp
+from tests._admin_account import create_local_user_chosen, provision_totp
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -67,7 +67,7 @@ def _no_mfa(**overrides: Any) -> AuthSettings:
 
 async def _add_local(service: AuthService, username: str, *, email: str | None = None) -> str:
     """An onboarded local Administrator: the create path, with the forced rotation cleared."""
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -565,7 +565,7 @@ async def test_the_service_refuses_a_malformed_address_before_any_write() -> Non
         await service.initialize()
         for bad in ("", "  ", "a@b.org; c@d.org"):
             with pytest.raises(InvalidNotifyEmail):
-                await create_local_user_with_password(
+                await create_local_user_chosen(
                     service,
                     username="bad",
                     password=PW,

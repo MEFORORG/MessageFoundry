@@ -38,7 +38,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 from tests.test_api_auth import (
     ABSENT_USER_ID,
     _add,
@@ -310,7 +310,7 @@ async def test_bind_refusals(
     if case == "unknown user":
         target = ABSENT_USER_ID
     elif case == "local account":
-        target = await create_local_user_with_password(
+        target = await create_local_user_chosen(
             service,
             username="jlocal",
             password="a-strong-test-passphrase",

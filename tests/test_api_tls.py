@@ -70,7 +70,7 @@ from messagefoundry.pipeline.cert_expiry import (
     certs_from_registry,
 )
 from messagefoundry.pki import IssuerIndex, canonical_dn
-from tests._admin_account import create_local_user_with_password
+from tests._admin_account import create_local_user_chosen
 from tests._approved_key_wrap import approved_pkcs8_pem
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
@@ -1519,7 +1519,7 @@ async def test_resolve_client_cert_identity_positive_and_negative(tmp_path: Path
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        user_id = await create_local_user_with_password(
+        user_id = await create_local_user_chosen(
             service,
             username="svc",
             password="Correct-horse-battery-9",
@@ -1576,7 +1576,7 @@ async def test_a_renamed_account_keeps_its_cert_and_the_name_does_not_move(tmp_p
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        first = await create_local_user_with_password(
+        first = await create_local_user_chosen(
             service,
             username="svc",
             password="Correct-horse-battery-9",
@@ -1592,7 +1592,7 @@ async def test_a_renamed_account_keeps_its_cert_and_the_name_does_not_move(tmp_p
         # The rename. set_user_username is the store's only username write (the directory cache
         # refresh), and it is exactly the event that frees a name for another row.
         await engine.store.set_user_username(first, "svc-old")
-        second = await create_local_user_with_password(
+        second = await create_local_user_chosen(
             service,
             username="svc",
             password="Correct-horse-battery-9",
@@ -1636,7 +1636,7 @@ async def test_disabled_mapped_account_denied_via_cert_path(tmp_path: Path) -> N
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await create_local_user_with_password(
+        uid = await create_local_user_chosen(
             service,
             username="svc",
             password="Correct-horse-battery-9",
@@ -1702,7 +1702,7 @@ async def _cert_app(engine: Engine, **state: Any) -> Any:
     # Idempotent: some cases build two apps over one store (the user then already exists).
     existing = await engine.store.get_user_by_username("svc")
     if existing is None:
-        uid = await create_local_user_with_password(
+        uid = await create_local_user_chosen(
             service,
             username="svc",
             password="Correct-horse-battery-9",
@@ -2377,7 +2377,7 @@ async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     engine = await Engine.create(tmp_path / db, poll_interval=0.02)
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
-    uid = await create_local_user_with_password(
+    uid = await create_local_user_chosen(
         service,
         username="svc",
         password=_SVC_PW,

@@ -38,7 +38,7 @@ from pathlib import Path
 import httpx
 import pytest
 import uvicorn
-from _ui_clients import create_local_user_with_password
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.api.tls import build_api_ssl_context, ensure_api_tls_material
@@ -67,7 +67,7 @@ def _bound_listener() -> socket.socket:
 async def _service(engine: Engine) -> AuthService:
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username="op",
         password=PW,

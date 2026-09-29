@@ -31,7 +31,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-from _ui_clients import create_local_user_with_password
+from _ui_clients import create_local_user_chosen
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
@@ -62,7 +62,7 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await create_local_user_with_password(
+    user_id = await create_local_user_chosen(
         service,
         username=username,
         password=PW,
@@ -181,7 +181,7 @@ async def test_session_status_is_reachable_by_a_confined_must_change_session(
     """The must-change page is authenticated and renders chrome, so its watchdog must work: the probe
     allows the confined session instead of 303ing it into a change-password loop."""
     service = await _service(engine)
-    await create_local_user_with_password(
+    await create_local_user_chosen(
         service,
         username="rotate",
         password=PW,
