@@ -2143,6 +2143,7 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
         == api_security._MUST_CHANGE_EXEMPT_PATHS
     ), "the must-change exempt set moved; restate Table A's must-change row to match"
     assert not lockout_arms("sign_in", password_generated=True)
+    assert lockout_arms("sign_in", password_generated=False)
     assert lockout_arms("second_step", password_generated=True)
     # Item 8: a combined sign-in owes nothing more. ``mfa_required = not combined and ...`` is read
     # from the parsed code, so a comment or docstring cannot keep it green.
@@ -2212,6 +2213,10 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
             assert str(refused.value) == TOTP_REMOVAL_REFUSED
             # ... while the passkey, which is not its last factor, can go.
             assert await service.delete_webauthn_credential(identity, "ninth-sweep-hash")
+            # A local account the requirement does not cover removes TOTP freely.
+            await off.disable_mfa(identity)
+            row = await store.get_user(identity.user_id)
+            assert row is not None and not row.totp_enabled
         finally:
             await store.close()
 
@@ -2228,7 +2233,8 @@ def test_the_ninth_sweep_states_the_local_pathway_after_amendment_a() -> None:
 
     # 1. The must-change CONFINE row names the enrol-first set and the new order.
     confine = _table_a_row("Account state — credential rotation pending")
-    assert "one with no factor rotates first |" not in confine, (
+    conditional = "With the requirement off, an account with no factor rotates first"
+    assert confine.count("no factor rotates first") == confine.count(conditional), (
         "item 1: the must-change row says an account with no factor rotates first, unconditionally"
     )
     for route in ("`POST /me/reauth`", "`GET /me/mfa`", "`POST /me/mfa/enroll`"):
