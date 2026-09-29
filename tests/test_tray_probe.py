@@ -821,6 +821,30 @@ def test_a_pinned_probe_reaches_an_engine_serving_its_minted_pair(
         assert probe_health(client) is HealthProbe.OK
 
 
+def test_the_probe_ignores_a_proxy_from_the_environment(
+    minted_tls_engine: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe reaches this host's own engine directly, never through a web proxy (BACKLOG #300).
+
+    httpx reads ``HTTPS_PROXY`` and ``ALL_PROXY``, and on Windows the system proxy, by default. It
+    does not apply the system proxy's local-address bypass, so a site proxy would take the loopback
+    probe off the host, and the TLS leg to an ``https://`` proxy would run on httpcore's own
+    context, not the narrowed one. RED before the change: the probe went to the dead proxy and read
+    the engine as DOWN."""
+    import socket
+
+    with socket.socket() as dead:
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, f"https://127.0.0.1:{dead_port}")
+    url, cert = minted_tls_engine
+    with make_probe_client(url, cacert=cert) as client:
+        assert probe_health(client) is HealthProbe.OK
+
+
 def test_an_unpinned_probe_cannot_verify_the_minted_pair(
     minted_tls_engine: tuple[str, str],
 ) -> None:
