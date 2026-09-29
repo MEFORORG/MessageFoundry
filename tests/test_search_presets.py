@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import Cipher, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 CRIT = json.dumps({"content": "MRN12345", "target": "raw", "message_type": "ADT^A01"})
@@ -114,3 +114,125 @@ def test_the_queue_lease_column_is_still_named_owner() -> None:
     # asserting a state that predates the change.
     assert "owner_user_id TEXT NOT NULL" in pg
     assert "owner_user_id NVARCHAR(256) NOT NULL" in ms
+
+
+# The search_presets DDL as release v0.3.2 shipped it on SQLite, copied from `git show
+# v0.3.2:messagefoundry/store/store.py` (the table and its index; comments trimmed). Embedded rather
+# than read from the tag at test time: a shallow CI clone carries no tags. 0.3.2 wrote the owner's
+# USERNAME into `owner`; this version keys on the user id in `owner_user_id`.
+V032_SEARCH_PRESETS = """
+CREATE TABLE search_presets (
+    id         TEXT PRIMARY KEY,
+    owner      TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    criteria   TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_used_at REAL
+);
+CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner, name);
+"""
+
+
+async def _seed_v032_store(db: Path, cipher: Cipher) -> None:
+    """Write presets with this version, then move them into the 0.3.2 table under usernames.
+
+    Sealing them first shows the criteria still open after the migration: they are bound to the
+    preset id, which it leaves alone. ``ghost`` matches no account. ``pc`` was last saved before
+    the ``carol`` account existed (created at 1.0), so an earlier holder of that username wrote it;
+    ``pr`` was created then too, but the current ``carol`` saved it again at 2.0. ``system`` is the
+    no-auth identity: its rows cannot be told from a deleted account's named ``system``."""
+    import sqlite3
+
+    s = await MessageStore.open(db, cipher=cipher)
+    try:
+        for uid, name in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
+            await s.create_user(user_id=uid, username=name, auth_provider="local", now=1.0)
+        for pid, owner, name, now in (
+            ("pa", "alice", "ACME ADT", None),
+            ("pb", "bob", "ACME ADT", None),
+            ("pg", "ghost", "orphan", None),
+            ("pc", "carol", "inherited", 0.5),
+            ("pr", "carol", "resaved", 0.5),
+            ("pr", "carol", "resaved", 2.0),
+            ("ps", "system", "no-auth", None),
+        ):
+            await s.upsert_search_preset(
+                preset_id=pid, owner_user_id=owner, name=name, criteria=CRIT, now=now
+            )
+    finally:
+        await s.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT id, owner_user_id, name, criteria, created_at, updated_at, last_used_at"
+            " FROM search_presets"
+        ).fetchall()
+        conn.executescript("DROP TABLE search_presets;" + V032_SEARCH_PRESETS)
+        conn.executemany("INSERT INTO search_presets VALUES (?,?,?,?,?,?,?)", rows)
+        conn.commit()
+        # Positive control: the table really is in the 0.3.2 shape before the open.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(search_presets)")}
+        assert "owner" in cols and "owner_user_id" not in cols
+    finally:
+        conn.close()
+
+
+async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
+    """BACKLOG #1909: a 0.3.2 ``search_presets`` table opens, keeps its owners' presets, and lists
+    and deletes by user id. A preset no current account owned is dropped, not inherited."""
+    db = tmp_path / "v032.db"
+    cipher = make_cipher(generate_key(), write_v2=True)
+    await _seed_v032_store(db, cipher)
+
+    for reopened in (False, True):  # the second open finds nothing to move
+        s = await MessageStore.open(db, cipher=cipher)
+        try:
+            listed = await s.list_search_presets("u-alice")
+            assert [p["id"] for p in listed] == ["pa"]
+            got = await s.get_search_preset(preset_id="pa", owner_user_id="u-alice")
+            assert got is not None and json.loads(got["criteria"]) == json.loads(CRIT)
+            assert [p["id"] for p in await s.list_search_presets("u-bob")] == ["pb"]
+            assert [p["id"] for p in await s.list_search_presets("u-carol")] == ["pr"]
+            assert await s.list_search_presets("system") == []
+            async with s._read() as rdb:
+                cur = await rdb.execute("SELECT id FROM search_presets ORDER BY id")
+                assert [r["id"] for r in await cur.fetchall()] == ["pa", "pb", "pr"]
+            if reopened:
+                await s.delete_user("u-bob")
+                assert await s.list_search_presets("u-bob") == []
+                assert [p["id"] for p in await s.list_search_presets("u-alice")] == ["pa"]
+        finally:
+            await s.close()
+
+
+async def test_a_refused_open_leaves_the_v032_preset_table_untouched(tmp_path: Path) -> None:
+    """BACKLOG #1909: the migration runs in the open's transaction. A store refused for another
+    stale object keeps its 0.3.2 presets table, rows and column name, for the remedy to set aside."""
+    import sqlite3
+
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    db = tmp_path / "v032-refused.db"
+    cipher = make_cipher(generate_key(), write_v2=True)
+    await _seed_v032_store(db, cipher)
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            "DROP INDEX ix_queue_fifo_in_seq; CREATE INDEX ix_queue_fifo_in_seq ON queue(stage);"
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(SchemaMismatchError):
+        await MessageStore.open(db, cipher=cipher)
+
+    conn = sqlite3.connect(db)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(search_presets)")}
+        owners = sorted(r[0] for r in conn.execute("SELECT owner FROM search_presets"))
+    finally:
+        conn.close()
+    assert "owner" in cols and "owner_user_id" not in cols
+    assert owners == ["alice", "bob", "carol", "carol", "ghost", "system"]

@@ -4481,6 +4481,11 @@ _LAST_EVENT_COLUMN = (
 # alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
 _MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
 
+# BACKLOG #1909: the account a 0.3.2 preset row belongs to. See MessageStore._migrate_preset_owner.
+_PRESET_OWNER_MATCH = (
+    "users.username = search_presets.owner AND users.created_at <= search_presets.updated_at"
+)
+
 
 @dataclass(frozen=True)
 class SecretRotationMetaRow:
@@ -6013,6 +6018,8 @@ class MessageStore:
         preset_cols = {row["name"] for row in await cur.fetchall()}
         if preset_cols and "last_used_at" not in preset_cols:
             await db.execute("ALTER TABLE search_presets ADD COLUMN last_used_at REAL")
+        if "owner" in preset_cols and "owner_user_id" not in preset_cols:
+            await MessageStore._migrate_preset_owner(db)
         # BACKLOG #1540: a pre-existing pending_approvals table predates requester_user_id — ALTER it
         # in, nullable (an ALTER cannot add NOT NULL without a default, and there is no name-to-id
         # backfill that is CORRECT: after a rename the stored name may belong to somebody else, so
@@ -6023,6 +6030,32 @@ class MessageStore:
         if "requester_user_id" not in approval_cols:
             await db.execute("ALTER TABLE pending_approvals ADD COLUMN requester_user_id TEXT")
         await MessageStore._migrate_outbox_to_queue(db)
+
+    @staticmethod
+    async def _migrate_preset_owner(db: aiosqlite.Connection) -> None:
+        """Move a 0.3.2 ``search_presets.owner`` column to ``owner_user_id`` (BACKLOG #1909).
+
+        0.3.2 keyed a preset on the owner's USERNAME; this version keys it on ``Identity.user_id``
+        (#1225) under the renamed column (#1232). So a bare rename would keep every row and still
+        orphan it: listing by id finds nothing and ``delete_user`` leaves it behind. Each value is
+        mapped to its account's id first, and only when the account existed at the preset's last
+        save. 0.3.2's ``delete_user`` left a user's presets behind, and a later account given the
+        same username would otherwise inherit them, PHI-shaped criteria included: the defect #1225
+        closed. A preset the new holder saved again is theirs, which is why the test reads
+        ``updated_at``. Every other row is dropped, because nobody could list, recall or delete it.
+        That includes rows of ``system``, the no-auth identity: its id equals its username, but so
+        would a deleted account's that was named ``system``, and the two cannot be told apart.
+        ``criteria`` is sealed against the preset ``id``, which does not change, so no cell is
+        re-encrypted. The rename carries the unique index along with the column. Runs in the open's
+        migration transaction, so a refused open rolls all of it back."""
+        await db.execute(
+            "DELETE FROM search_presets"
+            f" WHERE NOT EXISTS (SELECT 1 FROM users WHERE {_PRESET_OWNER_MATCH})"
+        )
+        await db.execute(
+            f"UPDATE search_presets SET owner = users.id FROM users WHERE {_PRESET_OWNER_MATCH}"
+        )
+        await db.execute("ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id")
 
     @staticmethod
     async def _migrate_outbox_to_queue(db: aiosqlite.Connection) -> None:

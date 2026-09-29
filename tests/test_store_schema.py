@@ -5,7 +5,8 @@
 Every ``CREATE`` in ``_SCHEMA`` is ``IF NOT EXISTS`` and every ``_migrate`` step is an additive guarded
 ``ALTER``, so an object an incompatible version left under an expected name is skipped rather than
 fixed. Before this check, a v0.3.2 store opened cleanly and failed later, at the first preset use, with
-``no such column: owner_user_id``. These tests pin the refusal and the one-sided rule: missing things
+``no such column: owner_user_id``. That table is now migrated in place (BACKLOG #1909), so these tests
+use a stale shape no migration moves. They pin the refusal and the one-sided rule: missing things
 refuse, extra things are tolerated.
 """
 
@@ -25,20 +26,20 @@ from messagefoundry.store.schema_verify import (
 )
 from messagefoundry.store.store import _SCHEMA
 
-# The search_presets DDL as release v0.3.2 shipped it, copied from `git show
-# v0.3.2:messagefoundry/store/store.py` (the table and its index; comments trimmed). Embedded rather than
-# read from the tag at test time: a shallow CI clone carries no tags.
-_V032_SEARCH_PRESETS = """
+# A search_presets table no migration can move: shaped like the v0.3.2 one, but with its owner column
+# named `holder`. The real v0.3.2 table, whose column is `owner`, is now renamed in place (BACKLOG
+# #1909, tests/test_search_presets.py), so it no longer reaches this check.
+_STALE_SEARCH_PRESETS = """
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,
-    owner      TEXT NOT NULL,
+    holder     TEXT NOT NULL,
     name       TEXT NOT NULL,
     criteria   TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     last_used_at REAL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(holder, name);
 """
 
 
@@ -61,15 +62,15 @@ async def test_a_fresh_store_opens_and_reopens(tmp_path: Path) -> None:
     await _fresh(db)
 
 
-async def test_the_v032_search_presets_table_is_refused(tmp_path: Path) -> None:
-    db = tmp_path / "v032.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+async def test_a_stale_search_presets_table_is_refused(tmp_path: Path) -> None:
+    db = tmp_path / "stale.db"
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     text = str(info.value)
     assert "table 'search_presets' is missing column 'owner_user_id'" in text
     assert (
-        "index 'ux_search_presets_owner_name' is on search_presets(owner, name) [unique],"
+        "index 'ux_search_presets_owner_name' is on search_presets(holder, name) [unique],"
         " expected on search_presets(owner_user_id, name) [unique]"
     ) in text
     # The remedy leads, because the paths that print an uncaught error cut it at about 200 chars.
@@ -116,7 +117,7 @@ async def test_a_keyed_refusal_names_a_new_store_key(tmp_path: Path) -> None:
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     db = tmp_path / "keyed.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db, cipher=make_cipher(generate_key()))
     text = str(info.value)
@@ -134,7 +135,7 @@ async def test_a_keyed_store_opened_without_its_key_still_gets_the_new_key_remed
     db = tmp_path / "keyed-then-keyless.db"
     store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
     await store.close()
-    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    _sql(db, "DROP TABLE search_presets;" + _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     assert str(info.value).startswith(f"store {db} {_KEYED_LEAD}")
@@ -147,7 +148,7 @@ async def test_a_cell_bound_store_gets_the_plain_remedy(tmp_path: Path) -> None:
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     db = tmp_path / "cell-bound.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
     assert str(info.value).startswith(
@@ -164,7 +165,7 @@ async def test_a_cell_bound_store_opened_without_its_key_gets_the_plain_remedy(
     db = tmp_path / "cell-bound-then-keyless.db"
     store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
     await store.close()
-    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    _sql(db, "DROP TABLE search_presets;" + _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     assert str(info.value).startswith(
@@ -186,7 +187,7 @@ async def test_a_restored_cell_bound_store_opened_with_its_key_gets_the_plain_re
     store = await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
     await store.close()
     forget_store_salt(db)
-    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    _sql(db, "DROP TABLE search_presets;" + _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
     assert str(info.value).startswith(
@@ -196,7 +197,7 @@ async def test_a_restored_cell_bound_store_opened_with_its_key_gets_the_plain_re
 
 async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:
     db = tmp_path / "plain.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     text = str(info.value)
@@ -206,8 +207,8 @@ async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:
 
 
 async def test_the_refusal_releases_the_file_so_the_remedy_works(tmp_path: Path) -> None:
-    db = tmp_path / "v032.db"
-    _sql(db, _V032_SEARCH_PRESETS)
+    db = tmp_path / "stale.db"
+    _sql(db, _STALE_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError):
         await MessageStore.open(db)
     for suffix in ("", "-wal", "-shm"):
@@ -225,7 +226,7 @@ async def test_a_refusal_rolls_the_migrations_back(tmp_path: Path) -> None:
     _sql(
         db,
         "DROP TABLE search_presets;"
-        + _V032_SEARCH_PRESETS
+        + _STALE_SEARCH_PRESETS
         + "CREATE INDEX ix_queue_fifo_in ON queue(stage, channel_id, created_at);",
     )
     with pytest.raises(SchemaMismatchError):

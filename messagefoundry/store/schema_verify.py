@@ -6,8 +6,8 @@ Every statement in the SQLite schema script is ``CREATE ... IF NOT EXISTS`` and 
 additive ``ALTER ... ADD COLUMN`` behind an existence guard. Both SKIP an object that already exists
 under the expected name, whatever its shape, so a table or index left by an incompatible version
 survives ``open()`` untouched and the first statement that needs the missing column fails much later.
-The measured case is the v0.3.2 ``search_presets`` table, whose ``owner`` column the current code knows
-as ``owner_user_id``.
+The measured case was the v0.3.2 ``search_presets`` table, whose ``owner`` column the current code knows
+as ``owner_user_id``; ``_migrate`` now moves that one table in place (BACKLOG #1909).
 
 This module is the check that runs after the schema script and the migrations. It derives the EXPECTED
 shape by running the same script and migrations on a scratch ``:memory:`` database and reading it back
@@ -19,8 +19,9 @@ The rule is deliberately one-sided. The open refuses a missing table or column, 
 KEY`` that is no longer the table's row id, a missing index, or an index whose name matches but whose
 table, key columns (with their order, collation and direction), uniqueness or partial flag differ. An
 EXTRA column or index is tolerated: a newer build or an operator's own index does not make the store
-unusable. There is no rename and no in-place repair (engine ``CLAUDE.md`` section 0: there is nothing
-deployed to migrate), so the remedy the refusal names is to recreate the store.
+unusable. This check renames and repairs nothing, so the remedy the refusal names is to recreate the
+store. Any in-place move, such as the v0.3.2 preset table (BACKLOG #1909), is a ``_migrate`` step
+that runs before this check.
 """
 
 from __future__ import annotations
