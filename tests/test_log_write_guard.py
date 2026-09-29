@@ -408,18 +408,9 @@ def test_stdout_sink_is_guarded_and_reports_when_the_stream_is_gone(
 # --- configure_logging wiring ------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _restore_process_logging():  # type: ignore[no-untyped-def]
-    """configure_logging replaces the ROOT handlers and publishes a process-wide guard. Snapshot and
-    restore both, so a test here cannot leak a rolled/unwritable sink into the rest of the suite."""
-    root = logging.getLogger()
-    handlers = list(root.handlers)
-    level = root.level
-    guard = active_guard()
-    yield
-    root.handlers[:] = handlers
-    root.setLevel(level)
-    set_active_guard(guard)
+# configure_logging replaces the ROOT handlers and publishes a process-wide guard. The autouse
+# ``_restore_process_logging`` in tests/conftest.py restores both after every test. This module used
+# to define a fixture of the same name, which REPLACED the conftest one here (BACKLOG #2093).
 
 
 def test_configure_logging_installs_a_guarded_file_sink_beside_stdout(tmp_path: Path) -> None:

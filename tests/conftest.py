@@ -28,6 +28,7 @@ import pytest
 from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
+from tests._root_logging import root_logging_restored
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
@@ -402,33 +403,14 @@ def _restore_process_logging() -> Iterator[None]:
     ``audit-verify``/``audit-anchor`` stdout tests in ``tests/test_store_schema.py`` fails on
     ``origin/main`` without this, and passes with it.
 
-    The restore is whole: handlers, root level and active guard, as the four module-level copies in
-    test_logging.py, test_log_spool.py, test_checks.py and test_log_write_guard.py already did for
-    their own modules. pytest re-uses its capture handler instances across phases, so re-adding the
-    snapshot re-adds live handlers, not stale ones. A handler the test added is closed, which releases
-    a forwarder's thread and socket or a log file. A stream handler's close leaves its stream open.
-    """
-    from messagefoundry.logging_guard import active_guard, set_active_guard
+    BACKLOG #2093 widened the restore to filters, because a leaked ``RedactionFilter`` rewrites the
+    record ``caplog`` later reads. ``tests/_root_logging.py`` is the one place that says what is
+    restored, why, and what is not covered.
 
-    root = logging.getLogger()
-    saved = list(root.handlers)
-    saved_set = set(saved)
-    level = root.level
-    guard = active_guard()
-    try:
+    A module fixture with this same name REPLACES this one for that module. Do not add one.
+    """
+    with root_logging_restored():
         yield
-    finally:
-        added = [h for h in root.handlers if h not in saved_set]
-        root.handlers[:] = saved
-        root.setLevel(level)
-        set_active_guard(guard)
-        for handler in added:
-            try:
-                handler.close()
-            except Exception:  # noqa: BLE001 - one bad close must not strand the rest
-                logging.getLogger(__name__).debug(
-                    "closing a leaked log handler failed", exc_info=True
-                )
 
 
 @pytest.fixture(scope="session", autouse=True)
