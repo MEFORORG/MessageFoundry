@@ -522,7 +522,9 @@ def anonymize(msg):
   async, so `state_get(namespace, key, default=None)` reads an in-memory **read-through cache** the
   engine maintains (loaded at startup, updated as writes commit) and publishes around each
   router/transform run — exactly how `code_set()` resolves against an active set. A missing key returns
-  `default` (state is sparse, not a referenced table). **Non-linearization caveat:** a read reflects
+  `default` (state is sparse, not a referenced table). The cache holds each value encrypted and
+  decodes it on every read, so each call returns a fresh copy: changing the returned object does not
+  change the stored state (BACKLOG #1174). **Non-linearization caveat:** a read reflects
   committed state as of its invocation, but is **not** linearized with a concurrent sibling handler's
   write — fine for read-mostly correlation; a race-sensitive read-modify-write within one namespace
   needs author care.
