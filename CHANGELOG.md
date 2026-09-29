@@ -261,6 +261,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   `oidc_acr_values` still loads. With both keys set, a token whose `amr` matches
   `oidc_mfa_amr_values` still passes the gate whatever its `acr`. The `oidc-auth-params` advisory in
   `messagefoundry check` now reports this case as a settings load failure. (`BACKLOG #2032`)
+- **The Vault clients now narrow and verify the TLS leg to an `https://` proxy, and refuse an
+  `http://` Vault behind one.** Both Vault clients (the `vault` secret provider and the store's
+  Vault key provider and Transit cipher) honour `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and, on
+  Windows, the system proxy. Through an `https://` proxy, the leg to the proxy used urllib3's own
+  context, which offered CBC suites off the approved list. It now gets a fresh engine context per
+  connection, narrowed to the approved suites. The engine checks that the leg ran on that context
+  before it sends `CONNECT`, and refuses otherwise. So a proxy that offers only a non-approved suite
+  would now refuse. Verification of that leg is unchanged: it was, and is, checked against the
+  Vault hop's anchor and the proxy's host name. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
+  proxy is refused when the client is built, and again before each send. requests does not verify
+  that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
+  nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
+- **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
+  `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
+  site proxy would have taken the loopback probe off the host and read a running engine as down.
+  The leg to an `https://` proxy also ran on httpcore's own context, not the narrowed one. The probe
+  now ignores proxy settings. (`BACKLOG #300`, ASVS 12.1.2)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
@@ -514,6 +532,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`R`), and names the rights the check counts as write. On POSIX it gives `chmod go-w`. Neither
   fix takes read away. The message now spans several lines. When the engine refuses or warns is
   unchanged. (`BACKLOG #2035`)
+- **The web console explains an uploaded-file action the engine refused, throttled or could not
+  serve.** The browse, resend and delete routes under `/ui/uploaded-logs` showed the engine's raw
+  JSON for any status they did not map. A browse the PHI-read hop guard refused (`403`), a browse
+  over the PHI-read rate limit (`429`), and a browse, resend or delete with no uploads directory
+  configured (`503`) now return to the uploaded-files list with a fixed notice. The `503` also
+  reaches both confirm pages, which now return to the list the same way. The `429` notice says to
+  wait and try again. The bad-criteria retry on browse is covered too. The list page answers `503`
+  as HTML with its own notice. No notice repeats the engine's own text, and the `404` answers are
+  unchanged, so a refused owner check still reads as a missing file. The console's own pacing and
+  permission refusals are not covered.
+  (`BACKLOG #1169`, PR 1506 follow-up A)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now
@@ -1044,6 +1073,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
+  reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
+  account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was
+  wrong, the code was wrong, or both. Before, the reason named the failing factor
+  (`bad_code`/`bad_password`/`bad_password_and_code`). Because the sign-in lock does not refuse a
+  combined sign-in, an `audit:read` holder who is not an administrator (the built-in `AUDITOR` role)
+  could arm a target's sign-in lock, send candidate passwords with any six digits, and read the
+  reason to learn which candidate was right — one request per candidate, up to the global sign-in
+  ceiling of about 86,400 a day, against ADR 0197's design bound of 35. ADR 0197's counting is
+  unchanged: a right password with a wrong code still charges the second-step counter, both wrong
+  still charges the sign-in counter, and which factor verified still reaches the account holder's
+  own lock notice and the `users:manage` lock-state surface. A coarser residual remains: the
+  lock rows a locked second-step counter emits (`auth.account_locked`, `auth.lock_notice`,
+  `auth.login_locked`) still tell the two outcomes apart at `lockout_threshold` requests per
+  candidate; removing them touches the AC-10 lock record, so it is left for an owner/ADR decision.
+  (`BACKLOG #1131`, ASVS 6.1.1)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that

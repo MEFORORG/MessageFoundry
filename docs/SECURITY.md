@@ -2744,14 +2744,26 @@ all mint without one. At sign-in, only a local sign-in that owes no factor, or a
 open it. [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
 is the source of record for what stamps the window later.
 
-**The `acr` the engine asks for is not checked unless it is also required (BACKLOG #2032, open).**
-`[auth].oidc_acr_values` is only a request to the identity provider. The engine compares the returned
-`acr` with `oidc_required_acr_values` alone, and that list is empty by default. So by default the `amr`
-check decides alone. A token with `amr` of `mfa` signs in MFA-verified whether its `acr` is weaker
-than requested or missing. `messagefoundry check` reports a requested `acr` the engine does not
-require as an advisory note. The gate passes on a matching `amr` **or** a matching `acr`. So a
-deploying site that relies on `acr` would need to set `oidc_required_acr_values` and also empty
-`oidc_mfa_amr_values`, whose default is `["mfa"]`.
+**An `acr` request with no required `acr` is refused at load (BACKLOG #2032), but a request that loads can still go unchecked.**
+`[auth].oidc_acr_values` is only a request to the identity provider. The claim gate compares the
+returned `acr` with `oidc_required_acr_values` alone. Settings load checks the pair while
+`oidc_enabled` is on. It refuses a non-blank `oidc_acr_values` if `oidc_required_acr_values` names no
+non-blank value (`AuthSettings._require_oidc_fields` in `config/settings.py`). The gate passes on a
+matching `amr` **or** a matching `acr` (`_check_mfa_gate` in `auth/oidc/claims.py`). So a token whose
+`amr` matches `oidc_mfa_amr_values` (default `["mfa"]`) signs in MFA-verified whatever its `acr`. A
+deploying site that relies on `acr` alone would set `oidc_required_acr_values`, keep
+`oidc_require_mfa_claim` on, and empty `oidc_mfa_amr_values`. At least these requests load and are
+still not checked:
+
+- A requested class that `oidc_required_acr_values` does not list. `messagefoundry check` notes it
+  (`_check_oidc_auth_params` in `checks.py`).
+- Any request while `oidc_require_mfa_claim` is off. The `acr` that comes back is only recorded in the
+  sign-in's success audit row (`AuthService._authenticate_oidc`), and `check` does not flag this case.
+- A whitespace-only `oidc_acr_values`. Load counts it as blank, and the authorization request still
+  carries it.
+
+This paragraph was read against engine commit `df77028b45`. The key's row is in the `[auth]` table of
+[CONFIGURATION.md](CONFIGURATION.md#auth--authentication--rbac).
 
 **What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity
 provider's assertion, not a proof, and the IdP step-up keeps its stated skew residual; both are in
@@ -2790,7 +2802,20 @@ changed is what a campaign costs, and whom:
   escalate, and it does, doubling per cycle to `lockout_max_minutes`: about 35 password guesses on
   the first day and about 5 a day after, while the owner stays out, down from 480. The engine checks
   both factors on every combined sign-in and answers every refusal the same way, in the same padded
-  time, so the caller learns a verdict only when both are right.
+  time, so the caller learns a verdict only when both are right. The `auth.login_failed` row matches:
+  every refused combined sign-in on such an account records the same reason, `bad_credentials`,
+  whichever factor was wrong (BACKLOG #1131). A per-factor slug there was a password oracle to an
+  `audit:read` holder who is not an administrator, since that reader could arm the sign-in lock and
+  read off the trail, one request per candidate, which candidate password was right. The uniform
+  slug removes that per-request oracle; the per-factor failure **count** survives only on the
+  `users:manage` lock-state surface, and the account holder's own out-of-band lock notice still
+  names which factor was right. **A coarser residual remains on the `audit:read` path.** Because the
+  second-step counter is fed only by a right factor, sending one candidate `lockout_threshold` times
+  locks it only when the password was right, and that lock's `auth.account_locked`,
+  `auth.lock_notice` and `auth.login_locked` rows are audit-visible while the live sign-in lock keeps
+  the sign-in counter from emitting any. That is the same oracle at `lockout_threshold` requests per
+  candidate rather than one. Removing it would drop the `auth.account_locked` row AC-10 requires, so
+  it is left as an owner/ADR decision, tracked as the lock-event limb of #1131.
 - **A caller holding one factor** (the password, the TOTP device, or a directory sign-in) feeds the
   second-step counter. That lock refuses every sign-in, and on a local account it doubles per cycle
   too, because one of the owner's two factors is already lost.

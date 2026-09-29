@@ -195,9 +195,10 @@ suite("webview message guard — what it accepts and what it discards", () => {
   });
 
   test("discards a message posted by this document itself", () => {
-    // The source arm. Written against `window`, not `window.parent`: VS Code's webview bridge injects
-    // `window.parent = window` into the extension's document, so a genuine host message has
-    // `ev.source !== window.parent` and a parent-based check would fail closed on every panel.
+    // The source arm. Written against `window`, not `window.parent`: what `window.parent` is inside
+    // the document differs by VS Code version (webviewMessaging.ts, fact 3), while a genuine host
+    // message has `ev.source !== window.parent` on every measured build, so a parent-based check
+    // would fail closed on every panel.
     const h = harness(TOKEN);
     assert.strictEqual(
       h.deliver({ source: h.window, data: { command: "rules", [CHANNEL_FIELD]: TOKEN } }),

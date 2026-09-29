@@ -133,8 +133,9 @@ def security_headers_context(app_state: object, scheme: str) -> bool:
     Deliberately BROADER than :func:`effective_https`, which still SOLELY gates the session cookie's
     Secure flag + ``__Host-`` prefix. Splitting the two lets the header hardening engage over cleartext
     loopback (a trustworthy origin where a conformant browser honours these headers) while the cookie
-    stays the plain ``mf_session``. HSTS is unaffected (the engine emits it only over real https /
-    ``exposure_protected``, never on loopback). Reads only the public ``app.state`` attribute the
+    stays the plain ``mf_session``. HSTS is unaffected: ``api.header_floor.hsts_notable`` decides it,
+    and it is off on the loopback DEFAULT (an IP-literal host and a minted self-signed chain), though a
+    ``localhost`` host under an operator-supplied chain does get it. Reads only the public ``app.state`` attribute the
     engine exposes; imports no engine module (a graceful default keeps it compatible with an older
     engine that predates the ``loopback`` seam).
 
