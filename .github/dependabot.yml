@@ -159,6 +159,32 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
+  # The engine image's digest-pinned base (BACKLOG #1193; why it is pinned and written literally is in
+  # the header of docker/Dockerfile). This entry moves the digest when the registry rebuilds the tag
+  # for a security fix. Without it the pin would freeze the base image.
+  #
+  # IT MOVES THE DIGEST, NOT THE TAG. The `ignore` below blocks major and minor tag bumps for every
+  # image under /docker. A Python 3.15 base needs locks with 3.15 wheels, and compose.yaml's
+  # `postgres:16` cannot read its data volume under a new major, so both stay deliberate changes.
+  #
+  # A FIX ARRIVES SLOWLY. Container images carry no advisory feed here, so there is no security track
+  # to skip the cooldown. A rebuilt base can wait up to a week for the run, then the cooldown, then a
+  # human: no PR from this entry auto-merges, because dependabot-auto-merge.yml does not recognise
+  # the ecosystem and holds it for review. The daily trivy image scan in security.yml reports a
+  # fixable base-image CVE in the meantime.
+  #
+  # It scans /docker only, so docker/smoke/Dockerfile is not covered; that file builds FROM the image
+  # CI just built, which has no registry version to track.
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 5
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
   # The VS Code extension's npm tree (build-time toolchain — the shipped artifact is the esbuild
   # bundle). Surfaces a vulnerable/outdated npm dep as a PR, the same DEP-1 surveillance the uv
   # ecosystem gets; the blocking npm-audit job in security.yml is the fail-closed companion.

@@ -136,10 +136,10 @@ harness = [
 # Microsoft ODBC Driver 18 for SQL Server installed at the OS level (not pip-installable).
 # Lazy-imported, so SQLite-only installs skip it.
 # aioodbc pulls pyodbc transitively; the lock resolves pyodbc 5.3.0 — the newest release and the
-# first to support Python 3.14 (nothing older ships py3.14 wheels). 5.3.0 has an UPSTREAM py3.14
-# parameter-binding segfault against SQL Server 2025 (mkleehammer/pyodbc#1459, still open), which the
-# CI throughput-invariant step works around with scripts/ci/retry-native-crash.sh. When #1459 ships a
-# fix, raise the floor to that pyodbc release here and drop that CI retry wrapper.
+# first to support Python 3.14 (nothing older ships py3.14 wheels). The segfault that CI retries with
+# scripts/ci/retry-native-crash.sh was tied to mkleehammer/pyodbc#1459. That issue is closed, and its
+# root cause is the ODBC driver, not pyodbc, so it is no reason to raise this floor. The upstream
+# reading is recorded once, in docs/RISKY-COMPONENTS.md, section "The sqlserver extra".
 sqlserver = ["aioodbc>=0.5"]
 # PostgreSQL store backend (production server-DB with single-node parity). No OS-level dependency
 # (ships compiled C/Cython wheels). Lazy-imported, so SQLite-only installs skip it.
