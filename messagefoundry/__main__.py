@@ -5572,24 +5572,29 @@ def _controlling_terminal_path() -> str:
 def _open_terminal() -> int:
     """Open the console device for writing, or raise :class:`OSError`. The controlling terminal
     first; on POSIX, the terminal on stdin when there is none. A session started under ``setsid``
-    (for example ``su -c``) has a tty on stdin but no controlling terminal, and ``/dev/tty`` refuses
-    it with ENXIO although the operator is sitting at that very tty."""
+    (for example ``su <user> -c``) has a tty on stdin but no controlling terminal, and ``/dev/tty``
+    refuses it with ENXIO although the operator is sitting at that very tty.
+
+    The fallback DUPLICATES stdin's descriptor rather than re-opening its device by path: under
+    ``su`` the tty still belongs to the operator (mode 620), so the target user cannot open it by
+    name, but the inherited descriptor is already open to it. Binary mode on Windows, so a newline
+    is written as sent."""
     import os
 
     try:
-        return os.open(_controlling_terminal_path(), os.O_WRONLY)
+        return os.open(_controlling_terminal_path(), os.O_WRONLY | getattr(os, "O_BINARY", 0))
     except OSError:
         if sys.platform == "win32" or not sys.stdin.isatty():
             raise
         import contextlib
 
-        stdin_tty: str | None = None
-        # stdin may name no device: ``fileno`` raises on a replaced stream.
+        stdin_fd: int | None = None
+        # stdin may name no descriptor: ``fileno`` raises on a replaced stream.
         with contextlib.suppress(OSError, ValueError):
-            stdin_tty = os.ttyname(sys.stdin.fileno())
-        if stdin_tty is None:
+            stdin_fd = sys.stdin.fileno()
+        if stdin_fd is None or not os.isatty(stdin_fd):
             raise  # the controlling-terminal failure, which is the one the operator can act on
-        return os.open(stdin_tty, os.O_WRONLY)
+        return os.dup(stdin_fd)
 
 
 def _show_on_terminal(text: str) -> None:
@@ -5610,9 +5615,25 @@ def _show_on_terminal(text: str) -> None:
         # A terminal may take a write in pieces; loop until every byte is out, so a recovery code is
         # never silently cut short.
         while data:
-            data = data[os.write(fd, data) :]
+            written = os.write(fd, data)
+            if written <= 0:
+                # A stalled or hung-up terminal can accept nothing without raising; never spin.
+                raise OSError("the console accepted no bytes")
+            data = data[written:]
     finally:
         os.close(fd)
+
+
+def _prompt_on_terminal(text: str) -> None:
+    """Show a prompt or a retry message where the key was shown, so an operator who redirected
+    stderr still sees what the command is waiting for. Raises :class:`_PasswordEntryRefused` when
+    the console is gone, before anything is written."""
+    try:
+        _show_on_terminal(text)
+    except OSError as exc:
+        raise _PasswordEntryRefused(
+            f"the console went away during enrolment ({exc}); nothing was written"
+        ) from exc
 
 
 def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str, float]:
@@ -5621,7 +5642,8 @@ def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str
 
     The key and its URI go to the console device through :func:`_show_on_terminal`, never to stdout
     or stderr: ``--json`` output is stdout, and either stream can be redirected. They are never in
-    argv, a file or a log either. The prompts go to stderr, since they carry nothing secret. The code
+    argv, a file or a log either. The prompts go there too, so they stay visible when stderr is
+    redirected (:func:`_prompt_on_terminal`); a refusal goes to stderr as every refusal does. The code
     is checked with the pure :func:`totp.verify_totp_step` at the configured skew and re-prompted on
     a mistake, all BEFORE the store is opened for writing, so a wrong code writes nothing. Raises
     :class:`_PasswordEntryRefused` with no terminal or no console to show the key on, on an empty
@@ -5651,14 +5673,14 @@ def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str
             "written. Run this from a console."
         ) from exc
     for _ in range(_PROVISION_TOTP_ATTEMPTS):
-        print("Authenticator code: ", end="", file=sys.stderr, flush=True)
+        _prompt_on_terminal("Authenticator code: ")
         code = sys.stdin.readline().strip()
         read_at = _time.time()
         if not code:
             raise _PasswordEntryRefused("empty authenticator code; nothing was written")
         if totp.verify_totp_step(secret, code, now=read_at, window=skew_steps) is not None:
             return secret, code, read_at
-        print("That code did not match. Try the current one.", file=sys.stderr)
+        _prompt_on_terminal("That code did not match. Try the current one.\n")
     raise _PasswordEntryRefused(
         f"{_PROVISION_TOTP_ATTEMPTS} codes did not match; nothing was written. Check that the app "
         "uses SHA-256 (add the account by its URI) and that the device's clock is right, then run "
@@ -6285,6 +6307,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
+    codes_shown = True
     if outcome.recovery_codes:
         # To the console device ONCE, in both output modes: never stdout (the --json body) and never
         # stderr, which can be redirected into a log (CodeQL alert 228, BACKLOG #1131).
@@ -6297,11 +6320,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except OSError as exc:
             # The account is written and signs in with its authenticator app. The codes are not
-            # printed anywhere else, for the reason above.
+            # printed anywhere else, for the reason above; ``recovery_codes_shown`` says so to a
+            # caller reading only the --json body.
+            codes_shown = False
             print(
-                f"WARNING: the recovery codes could not be shown on the console ({exc}). The "
-                "Administrator signs in with its authenticator app; without the codes, a lost "
-                "authenticator needs another Administrator's MFA reset.",
+                f"WARNING: the recovery codes could not be shown on the console ({exc}), and they "
+                "cannot be shown again. The Administrator signs in with its authenticator app. "
+                "Without the codes, a lost authenticator can be reset only by another "
+                "Administrator, so create a second one soon.",
                 file=sys.stderr,
             )
     if args.json:
@@ -6319,6 +6345,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "holder_notice": outcome.holder_notice,
                 # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.
                 "totp_enrolled": totp_secret is not None,
+                # False only when the codes were issued and the console failed before showing them.
+                "recovery_codes_shown": codes_shown,
             },
             compact=True,
         )

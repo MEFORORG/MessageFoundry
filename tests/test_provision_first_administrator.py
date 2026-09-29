@@ -1335,11 +1335,15 @@ def test_the_cli_enrols_totp_and_the_administrator_passes_a_live_lock_with_a_com
     captured = capsys.readouterr()
     body = json.loads(captured.out.strip().splitlines()[-1])
     assert body["ok"] is True and body["totp_enrolled"] is True
+    assert body["recovery_codes_shown"] is True
     streams = captured.out + captured.err
     assert _TERMINAL_SECRET not in streams
-    assert len(terminal.shown) == 2, terminal.shown
-    key_text, codes_text = terminal.shown
+    # The key, the code prompt and the codes, in that order, all on the console device.
+    assert len(terminal.shown) == 3, terminal.shown
+    key_text, prompt_text, codes_text = terminal.shown
     assert _TERMINAL_SECRET in key_text and "otpauth://" in key_text
+    assert prompt_text == "Authenticator code: "
+    assert "Authenticator code" not in streams, "the prompt went to a stream"
     assert "Recovery codes" in codes_text
     codes = [
         line.strip()
@@ -1436,7 +1440,8 @@ def test_recovery_codes_that_cannot_be_shown_are_not_printed_instead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The console fails after the write, at the recovery codes: the command warns, still succeeds
-    (the account is written and has its authenticator), and prints no code to either stream."""
+    (the account is written and has its authenticator), prints no code to either stream, and says
+    so in the --json body, for a caller that reads nothing else."""
     import messagefoundry.__main__ as cli
 
     monkeypatch.chdir(tmp_path)
@@ -1450,11 +1455,30 @@ def test_recovery_codes_that_cannot_be_shown_are_not_printed_instead(
 
     monkeypatch.setattr(cli, "_show_on_terminal", show_the_key_only)
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
     captured = capsys.readouterr()
+    assert json.loads(captured.out.strip().splitlines()[-1])["recovery_codes_shown"] is False
     assert "recovery codes could not be shown" in captured.err
     assert "Recovery codes, shown once" not in captured.out + captured.err
-    assert len(terminal.shown) == 1 and _TERMINAL_SECRET in terminal.shown[0]
+    assert len(terminal.shown) == 2 and _TERMINAL_SECRET in terminal.shown[0]
+
+
+def test_a_console_that_accepts_no_bytes_raises_rather_than_spins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled terminal can return 0 from write(2) without raising. The writer raises then, so
+    the caller refuses or warns instead of looping forever."""
+    import os
+
+    import messagefoundry.__main__ as cli
+
+    real = cli._show_on_terminal.__wrapped__  # type: ignore[attr-defined]
+    device = tmp_path / "console"
+    device.write_text("")
+    monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(device))
+    monkeypatch.setattr(os, "write", lambda _fd, _data: 0)
+    with pytest.raises(OSError, match="accepted no bytes"):
+        real("  key: SYNTHETICKEY\n")
 
 
 def test_no_totp_is_refused_while_mfa_is_required(
