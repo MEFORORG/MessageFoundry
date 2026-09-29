@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 
 from messagefoundry.pipeline import stage_dispatcher
-from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.stage_dispatcher import (
     LaneItemResult,
     LaneResultKind,
@@ -24,6 +23,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
 )
 from messagefoundry.store import ClaimedHeads, Stage
 from messagefoundry.store.store import OutboxItem
+from tests.test_stage_dispatcher import RecordingAlertSink as _Alerts
 
 _MAX = 4
 
@@ -88,14 +88,6 @@ class _ScriptStore:
 
     async def list_fifo_lanes(self, *a: Any, **k: Any) -> list[tuple[str, float]]:
         return []
-
-
-class _Alerts(LoggingAlertSink):
-    def __init__(self) -> None:
-        self.stopped: list[tuple[str, str]] = []
-
-    def connection_stopped(self, name: str, *, detail: str) -> None:
-        self.stopped.append((name, detail))
 
 
 def _dispatcher(
@@ -240,9 +232,9 @@ async def test_a_lane_that_always_kills_its_claimer_is_stopped_and_its_siblings_
         )
         # Stopped at exactly the threshold, with one alert naming the lane.
         assert deaths == {"POISON": 3} and d.respawns == 3
-        assert d.claimer_death_streak("POISON") == 3
+        assert d.claimer_death_streak("POISON") == 0  # the stop spends the streak
         assert len(alerts.stopped) == 1 and alerts.stopped[0][0] == "POISON"
-        assert "killed the claimer 3 consecutive" in alerts.stopped[0][1]
+        assert "after 3 consecutive claimer death(s)" in alerts.stopped[0][1]
         # Its row was released, not lost and not dead-lettered: PENDING, at the head of its lane.
         assert store.pending["POISON"] == ["POISON-1"] and not store.inflight
         assert d.slots_free == _MAX and d.processing_lanes == 0 and d.busy_violations == 0
@@ -257,6 +249,31 @@ async def test_a_lane_that_always_kills_its_claimer_is_stopped_and_its_siblings_
         d.notify_work()
         await _until(lambda: "POISON-1" in processed)
         assert d.claimer_death_streak("POISON") == 0
+    finally:
+        await d.stop()
+
+
+async def test_an_operator_resume_of_a_stopped_lane_starts_a_fresh_death_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop, then the operator's pause and resume (the stop_outbound/start_outbound path). One
+    more death must not re-stop the lane: the budget is fresh, as it is after notify_work."""
+    _fast_respawn(monkeypatch)
+    gate = asyncio.Event()
+    gate.set()
+    processed: list[str] = []
+    store = _ScriptStore({"P": ["P-1"]})
+    alerts = _Alerts()
+    d = _dispatcher(store, {"P"}, processed, gate, alert_sink=alerts, infra_fault_stop_after=2)
+    deaths = _kill_on(d, monkeypatch, {"P": [True, True, True, False]})
+    await d.start()
+    try:
+        await _until(lambda: d.phase("P") is _LanePhase.STOPPED)
+        assert deaths == {"P": 2} and len(alerts.stopped) == 1
+        d.pause_lane("P")
+        d.resume_lane("P")
+        await _until(lambda: processed == ["P-1"])
+        assert deaths == {"P": 3} and len(alerts.stopped) == 1  # the third death did not re-stop it
     finally:
         await d.stop()
 

@@ -581,8 +581,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   never dead-lettered it, and every other lane on that claimer waited through the respawn backoff,
   up to 30 seconds, each time. The dispatcher now counts deaths per lane. After
   `infra_fault_stop_after` in a row it releases the lane's rows, STOPs the lane and raises
-  `connection_stopped`. A reload or recovery broadcast re-arms it. This applies under both
-  `infra_fault_policy` values. (`BACKLOG #2074`)
+  `connection_stopped`. A reload, a recovery broadcast, or an operator stop and start re-arms it
+  with a fresh count. Only a dispatch that hands rows to a worker clears the count, so an empty
+  claim between deaths does not. This applies under both `infra_fault_policy` values.
+  (`BACKLOG #2074`)
 - **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
   whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
   algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal

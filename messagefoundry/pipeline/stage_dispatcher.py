@@ -185,16 +185,11 @@ class _LaneState:
     # rather than a double-book or a poisoned mean. A field on this already-per-lane dataclass (never a
     # new lane→start_ns dict): zero allocation per episode, zero growth with message volume.
     episode_start_ns: int = 0
-    # BACKLOG #2075: this lane holds one of the stage's processing slots. Set where the slot is
-    # reserved (_assemble_chunk) and cleared by the one release that returns it (_release_lane_slot).
-    # The phase alone cannot say this: a lane whose bookkeeping raised after its slot came back is
-    # still CLAIMING, and the respawn's adoption, keyed on CLAIMING, released it a second time.
+    # BACKLOG #2075: this lane holds one of the stage's processing slots. Paired by
+    # _reserve_lane_slot / _release_lane_slot; why the phase cannot say this is at the release.
     slot_held: bool = False
-    # BACKLOG #2074: consecutive claimer deaths raised while this lane was the one being dispatched.
-    # Reset when a dispatch of the lane completes and on the STOPPED→READY re-arm. At
-    # infra_fault_stop_after the replacement's adoption STOPs the lane instead of re-readying it:
-    # release_claimed restores attempts, so the row's own poison ceiling can never trip, and every
-    # death stalls the lane's whole claimer partition through the respawn backoff. In-memory only.
+    # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
+    # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
 
 
@@ -569,19 +564,14 @@ class StageDispatcher:
             # No slot held, no live serializer: pause NOW. A stale ready-deque entry (READY) is skipped
             # at _assemble_chunk (phase != READY); a PARKED backoff timer is cancelled here.
             self._cancel_timer(key)
-            st.phase = _LanePhase.PAUSED
-            st.pause_pending = False
-            st.dirty = False
-            self._fire_paused(key)
+            self._to_paused(key, st)
         elif phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):
             # Mid-episode: defer (a slot is held / a serializer is draining). The terminal transition
             # (PROCESSING) or the empty-claim branch (CLAIMING) routes it to PAUSED and fires. Do NOT
             # touch phase here — the reserved/consumed slot is released at that quiesce point.
             st.pause_pending = True
         else:  # STOPPED — operator intent overrides a content-STOP
-            st.phase = _LanePhase.PAUSED
-            st.pause_pending = False
-            self._fire_paused(key)
+            self._to_paused(key, st)
 
     def resume_lane(self, key: str) -> None:
         """Operator RESUME for a paused lane (sync). Re-arm a fully-PAUSED lane from the head via
@@ -605,6 +595,7 @@ class StageDispatcher:
         if st.phase is not _LanePhase.PAUSED:
             return
         st.pause_pending = False
+        st.claimer_deaths = 0  # an operator re-arm starts a fresh #2074 budget, as notify_work does
         st.phase = _LanePhase.IDLE
         self.mark_ready(key, woken=True)  # IDLE -> READY + enqueue (T2)
         self._sweep_now.set()
@@ -862,8 +853,9 @@ class StageDispatcher:
         and claimed but not dispatched (``lanes`` is the undispatched suffix of the chunk).
 
         A lane a serializer took is skipped; it finishes normally. A lane already moved on (READY,
-        IDLE, PAUSED) is skipped too. Every other lane is still CLAIMING, or PROCESSING with no task,
-        with its slot reserved. It is held CLAIMING: a wake only sets ``dirty`` there, a pause only
+        IDLE, PAUSED) is skipped too. Every other lane is still CLAIMING, or PROCESSING with no task.
+        Its slot is reserved unless the bookkeeping that returned it raised (``slot_held`` says
+        which, BACKLOG #2075), so adoption must never release by phase alone. It is held CLAIMING: a wake only sets ``dirty`` there, a pause only
         sets ``pause_pending``, and the lane is re-readied only after its rows are released
         (:meth:`_adopt_abandoned`). Readying it any earlier would let a pause report the lane
         quiesced while its head is still INFLIGHT."""
@@ -933,12 +925,12 @@ class StageDispatcher:
             if st.pause_pending:
                 self._end_claim(lane, st, end_ns, _LanePhase.PAUSED)
             elif st.claimer_deaths >= self._infra_fault_stop_after:
-                self._quarantine(lane, st, end_ns)
+                self._stop_claimer_killer(lane, st, end_ns)
             else:
-                self._end_claim(lane, st, end_ns, _LanePhase.READY, woken=st.ready_woken)
+                self._end_claim(lane, st, end_ns, _LanePhase.READY)
         claimer.abandoned.clear()
 
-    def _quarantine(self, lane: str, st: _LaneState, end_ns: int) -> None:
+    def _stop_claimer_killer(self, lane: str, st: _LaneState, end_ns: int) -> None:
         """STOP a lane whose dispatch has killed the claimer ``infra_fault_stop_after`` times in a
         row (BACKLOG #2074). Runs in the replacement's adoption, AFTER its rows were released, so
         the lane is STOPPED with nothing in flight and its head PENDING in its original place.
@@ -948,21 +940,29 @@ class StageDispatcher:
         is re-readied at every respawn and kills the next claimer too. ``release_claimed`` restores
         the row's attempts, so ``max_attempts`` never dead-letters it, and every other lane on the
         partition waits out the respawn backoff each time. Unlike the T17 bound this applies under
-        ``retry_forever`` as well, because the cost of retrying lands on the lane's siblings."""
+        ``retry_forever`` as well, because the cost of retrying lands on the lane's siblings.
+
+        The streak resets here, so every re-arm path (``notify_work``, an operator resume from
+        PAUSED) starts a fresh budget. A lane at the threshold is therefore always the lane just
+        charged, never a sibling abandoned behind it. The wording says the deaths were raised WHILE
+        dispatching the lane: a raise from shared machinery in that window is charged to it too."""
         deaths = st.claimer_deaths
-        self._end_claim(lane, st, end_ns, _LanePhase.STOPPED)
+        st.claimer_deaths = 0
         log.error(
-            "StageDispatcher %s lane %s stopped: its dispatch killed the claimer %d consecutive "
-            "time(s); its rows were released, and a reload or re-arm resumes it",
+            "StageDispatcher %s lane %s stopped: %d consecutive claimer death(s) were raised while "
+            "dispatching it; its rows were released, and a reload or re-arm resumes it",
             self._stage.value,
             lane,
             deaths,
         )
-        self._alert_sink.connection_stopped(
+        self._end_claim(
             lane,
+            st,
+            end_ns,
+            _LanePhase.STOPPED,
             detail=(
-                f"{self._stage.value} lane stopped after its dispatch killed the claimer "
-                f"{deaths} consecutive time(s)"
+                f"{self._stage.value} lane stopped after {deaths} consecutive claimer death(s) "
+                f"raised while dispatching it"
             ),
         )
 
@@ -1044,8 +1044,7 @@ class StageDispatcher:
             # is skipped by it). Await-free from this read to the mutation, so no sibling claimer can
             # interleave.
             st.episode_start_ns = now_ns
-            self._slots_free -= 1  # reserve
-            st.slot_held = True
+            self._reserve_lane_slot(st)
             lanes.append(lane)
         return lanes
 
@@ -1078,7 +1077,7 @@ class StageDispatcher:
                 # S_lane DROP (error path): the claim rendered no service — the same exclusion the claim
                 # timer already makes for a raised claim — but the lane WAS occupied for that interval,
                 # so it is booked as `dropped` (occupancy), never as `episode` (service).
-                self._end_claim(lane, st, err_ns, _LanePhase.READY, woken=st.ready_woken)
+                self._end_claim(lane, st, err_ns, _LanePhase.READY)
             # BACKLOG #1844: on a backoff, with the running count (messagefoundry.log_backoff).
             claimer.faults = claimer.faults.record(
                 log,
@@ -1146,6 +1145,10 @@ class StageDispatcher:
                         self._busy_violations += 1  # invariant break — claimed a non-CLAIMING lane
                     st.phase = _LanePhase.PROCESSING
                     self._spawn_serializer(lane, items)
+                    # #2074: only a dispatch that handed rows to a serializer clears the death
+                    # streak. An EMPTY or rearm pass (a lock-timeout abort empties a whole chunk)
+                    # never ran the path that killed the claimer, so it proves nothing.
+                    st.claimer_deaths = 0
                     # A pause_pending lane that claimed items carries pause_pending into the serializer's
                     # terminal transition, which routes it to PAUSED after this <=1 head finishes.
                 elif st.pause_pending:
@@ -1163,7 +1166,7 @@ class StageDispatcher:
                     # They ARE lane occupancy, though (the lane sat reserved across the whole shared claim
                     # round-trip), so they go to `dropped` — discarding them outright is what would make the
                     # negative branch of the ARM 1 test unfalsifiable.
-                    self._end_claim(lane, st, rel_ns, _LanePhase.READY, woken=st.ready_woken)
+                    self._end_claim(lane, st, rel_ns, _LanePhase.READY)
                 else:  # EMPTY
                     # The lane-level books are unchanged: an aborted claim is still an EMPTY claim for
                     # every lane it covered, because that is what happened to each lane. What is NOT
@@ -1174,7 +1177,6 @@ class StageDispatcher:
                         self._end_claim(lane, st, rel_ns, _LanePhase.READY, woken=True)
                     else:  # T12
                         self._end_claim(lane, st, rel_ns, _LanePhase.IDLE)
-                st.claimer_deaths = 0  # the claimer survived this lane's dispatch (#2074)
                 dispatched += 1
         except Exception:
             self._abandon_claim(claimer, lanes[dispatched:], result.by_lane)
@@ -1362,8 +1364,7 @@ class StageDispatcher:
             self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
-            st.phase = _LanePhase.STOPPED
-            self._alert_sink.connection_stopped(lane, detail=f"{self._stage.value} lane stopped")
+            self._to_stopped(lane, st, f"{self._stage.value} lane stopped")
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
@@ -1382,13 +1383,11 @@ class StageDispatcher:
             ):
                 # Bound the persistent fault: STOP the lane (reuse T16). NO store mutation — fix A has
                 # already re-pended the head PENDING (preserved, never dead-lettered); no park.
-                st.phase = _LanePhase.STOPPED
-                self._alert_sink.connection_stopped(
+                self._to_stopped(
                     lane,
-                    detail=(
-                        f"{self._stage.value} lane stopped after {st.infra_error_streak} consecutive "
-                        f"infra faults (ADR 0070 T17)"
-                    ),
+                    st,
+                    f"{self._stage.value} lane stopped after {st.infra_error_streak} consecutive "
+                    f"infra faults (ADR 0070 T17)",
                 )
                 return
             if self._infra_fault_policy == "retry_forever":
@@ -1509,31 +1508,68 @@ class StageDispatcher:
         st.dirty = False
         self._fire_paused(lane)
 
+    def _to_stopped(self, lane: str, st: _LaneState, detail: str) -> None:
+        """STOP a lane and raise ``connection_stopped``. Re-armed only by reload or
+        ``notify_work`` (:meth:`_unpark`), never by a wake or the sweep. The phase is set first and
+        a raising sink is logged, not propagated, as the runner guards the same call: a stop must
+        not also kill the claimer or serializer that reached it."""
+        st.phase = _LanePhase.STOPPED
+        try:
+            self._alert_sink.connection_stopped(lane, detail=detail)
+        except Exception:  # noqa: BLE001 — an alert failure must not undo or escalate the stop
+            log.warning(
+                "StageDispatcher %s alert sink raised on connection_stopped for lane %s",
+                self._stage.value,
+                lane,
+                exc_info=True,
+            )
+
     def _end_claim(
-        self, lane: str, st: _LaneState, end_ns: int, to: _LanePhase, *, woken: bool = False
+        self,
+        lane: str,
+        st: _LaneState,
+        end_ns: int,
+        to: _LanePhase,
+        *,
+        woken: bool | None = None,
+        detail: str = "",
     ) -> None:
         """End a CLAIMING lane's episode without a serializer: return its slot, book the episode as
-        a drop, and move the lane to ``to`` (READY, IDLE or PAUSED).
+        a drop, and move the lane to ``to``. READY uses ``woken``, defaulting to the lane's own
+        ``ready_woken``; STOPPED raises ``connection_stopped`` with ``detail``.
 
-        BACKLOG #2075. The slot goes back FIRST, through :meth:`_release_lane_slot`, which releases
-        at most once per reservation. If the bookkeeping after it raises, the lane is left CLAIMING
-        with its slot already returned, and the claimer dies. The respawn's adoption then finds the
-        lane CLAIMING and ends its claim again, and the second release is a no-op. Releasing last,
-        in a ``finally``, would instead leak the slot for good if the release itself raised after
-        the lane had already left CLAIMING, because nothing would come back for it."""
+        BACKLOG #2075. The slot goes back FIRST, and at most once per reservation. If the bookkeeping
+        after it raises, the lane is left CLAIMING with its slot already returned, and the claimer
+        dies. The respawn's adoption then ends the lane's claim again, and the second release is a
+        no-op. Releasing last, in a ``finally``, would instead leak the slot for good if the release
+        itself raised after the lane had already left CLAIMING, because nothing would come back."""
         self._release_lane_slot(st)
         self._drop_lane_episode(st, end_ns)
         if to is _LanePhase.READY:
-            self._to_ready(lane, woken=woken)
+            self._to_ready(lane, woken=st.ready_woken if woken is None else woken)
         elif to is _LanePhase.PAUSED:
             self._to_paused(lane, st)
+        elif to is _LanePhase.STOPPED:
+            self._to_stopped(lane, st, detail)
         else:
             st.phase = to
 
+    def _reserve_lane_slot(self, st: _LaneState) -> None:
+        """Take one processing slot for ``st`` (T8). The caller has checked the budget. A lane that
+        already holds one would lose a slot for good at its next release, so count it as a
+        ``busy_violations`` invariant break."""
+        if st.slot_held:
+            self._busy_violations += 1
+        self._slots_free -= 1
+        st.slot_held = True
+
     def _release_lane_slot(self, st: _LaneState) -> None:
-        """Return ``st``'s slot if it still holds one, else do nothing (BACKLOG #2075). The flag is
-        cleared only after the release returns, so a release that raises is retried by whichever
-        path next ends the lane's claim."""
+        """Return ``st``'s slot if it still holds one, else do nothing (BACKLOG #2075).
+
+        The phase cannot answer "does this lane hold a slot": a lane whose bookkeeping raised after
+        its slot came back is still CLAIMING, and the respawn's adoption, keyed on CLAIMING, used to
+        release it a second time. The flag is cleared only after the release returns, so a release
+        that raises is retried by whichever path next ends the lane's claim."""
         if st.slot_held:
             self._release_slot()
             st.slot_held = False
@@ -1585,7 +1621,7 @@ class StageDispatcher:
         st = self._states[lane]
         if (
             st.phase is _LanePhase.STOPPED
-        ):  # STOPPED→READY resume only — reset the infra-fault and claimer-death streaks
+        ):  # STOPPED to READY resume only — reset the infra-fault and claimer-death streaks
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
             st.claimer_deaths = 0

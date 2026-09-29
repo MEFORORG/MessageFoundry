@@ -681,6 +681,9 @@ async def test_a_claimer_that_keeps_dying_backs_off_and_never_resets_to_an_immed
     monkeypatch.setattr(stage_dispatcher, "_RESPAWN_STABLE_SECONDS", 0.05)
     store = _LaneStore(["L"])
     d = _dispatcher(store, ["L"], [])
+    # BACKLOG #2074 STOPs a lane that keeps killing its claimer. This test is about the respawn
+    # backoff, so keep the deaths coming for its whole run.
+    d._infra_fault_stop_after = 1000
     delays: list[float] = []
     real_spawn_task = d._spawn_task
 
