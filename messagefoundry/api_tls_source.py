@@ -2,9 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Where the engine's API TLS material comes from, and where it mints its own (ADR 0172).
 
-Stdlib-only, so both :mod:`messagefoundry.api.tls` (which serves with the material) and
+Stdlib-only, so :mod:`messagefoundry.api.tls` (which serves with the material),
 :mod:`messagefoundry.tray` (which must verify it, and by ADR 0113 may not import ``api/`` or
-``config/``) share ONE copy of the rule. Two copies had drifted before: keying the scheme on
+``config/``) and :mod:`messagefoundry.config.settings` (``ApiSettings.serves_plaintext_upstream_hop``,
+which imports it at module top level, so this module must never import ``config/``) share ONE copy
+of the rule. Two copies had drifted before: keying the scheme on
 ``[api].tls_cert_file`` alone read the shipped default as cleartext (BACKLOG #1126).
 """
 

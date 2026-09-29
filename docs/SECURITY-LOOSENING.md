@@ -74,20 +74,21 @@ section reference.
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
+| | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 
-**At least ten of these do not live in `[security]`.** `[store].aad_bind`,
+**At least eleven of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
-`[auth].admin_new_ip_step_up` and `[secret_rotation].enforce_store_key_expiry` sit in their own
-sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+`[auth].admin_new_ip_step_up`, `[secret_rotation].enforce_store_key_expiry` and
+`[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first five are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[secret_rotation]` sections; the per-connection
+first six are named by `security_loosenings()` from the loaded
+`[store]`/`[auth]`/`[secret_rotation]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
 
@@ -536,6 +537,27 @@ This section is kept rather than deleted, because the claim it used to make is t
   `auth.login_new_ip` rows the sign-in signal still writes. That signal has no switch.
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
+### `[api].plaintext_upstream_hop_acknowledged = true` — a plaintext proxy-to-engine hop, taken on by the site
+> **Conditional**, like `allowed_client_networks`. It is reported **only** while `[api].tls_terminated_upstream`
+> is set and no `[api].tls_cert_file` is. With an operator certificate the engine serves that hop over TLS,
+> so the acknowledgement is inert and is not reported. It is refused at load without
+> `tls_terminated_upstream`.
+- **What you lose:** a reverse proxy terminates TLS, and the engine mints no certificate behind it
+  ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
+  decision 3). So the hop from the proxy to the engine is **plaintext**, and the engine does nothing to
+  protect it. At least sign-in credentials, session tokens and PHI reads cross that hop unencrypted.
+- **When acceptable:** the site keeps the hop private by means the engine cannot see: a same-host
+  loopback hop, an isolated network segment, or a host firewall. Without the acknowledgement, `serve`
+  refuses this topology in every mode (BACKLOG #1179).
+- **Compensating controls:** set `[api].tls_cert_file` so the engine serves that hop over TLS, and point
+  the proxy at https with that certificate trusted. Short of that, keep the proxy on the same host.
+  Isolation limits who can read the hop; it does not encrypt it.
+- **Visibility:** each start with the acknowledgement honoured writes a WARNING-level startup **AUDIT**
+  line, and `GET /security/posture` names it. That makes the loosening visible; it protects nothing.
+- **Reversible:** yes. Supply `[api].tls_cert_file` and restart; the acknowledgement then does nothing
+  and may stay. To drop the terminator instead, remove `tls_terminated_upstream`, the acknowledgement
+  and `trusted_proxies` together, or the load refuses.
+
 ### `cleartext_accepted = true` on a connection — a declared cleartext hop
 > **Connection-scoped, unlike every other entry here.** It is not a `[security]` switch; it is a field on
 > one connection — an `outbound(...)` or a `FhirLookup(...)` — declared next to the host it governs, with
@@ -848,6 +870,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
+| `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_hop_attested` (per-connection hop attested secure) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |

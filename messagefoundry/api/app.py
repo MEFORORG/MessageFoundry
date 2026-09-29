@@ -264,6 +264,7 @@ from messagefoundry.config.secretprovider import (
 from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
+    ApiSettings,
     ApprovalsSettings,
     AuthSettings,
     BackupSettings,
@@ -2165,6 +2166,10 @@ def create_app(
         secret_rotation_settings = (
             getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
         )
+        # BACKLOG #1179: [api] carries the plaintext upstream-hop acknowledgement. Read off the
+        # resolved settings serve stashed, the #1989 object; an app built without them (the
+        # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
+        api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
         # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
         # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
         # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
@@ -2211,6 +2216,7 @@ def create_app(
                 unverified_db_hops=db_hops,
                 attested_hops=attested_hops,
                 revocation_attested_hops=revocation_hops,
+                api=api_settings,
                 store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),

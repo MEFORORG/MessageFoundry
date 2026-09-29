@@ -180,6 +180,29 @@ def test_show_reports_store_and_auth_deviations_from_the_whole_file(
     assert "aad_bind" in [entry["switch"] for entry in data["loosenings"]]
 
 
+def test_show_reports_the_plaintext_upstream_hop_acknowledgement(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1179: [api] is resolved from the whole file too, so the acknowledgement is listed."""
+    api = (
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        "plaintext_upstream_hop_acknowledged = true\n"
+    )
+    toml = tmp_path / "mf.toml"
+    toml.write_text(api, encoding="utf-8")
+    data = _show(toml, capsys)
+    assert "plaintext_upstream_hop_acknowledged" in [e["switch"] for e in data["loosenings"]]
+    # Negative control: the same file with an operator certificate serves that hop over TLS, so the
+    # acknowledgement is inert and not listed. The cert paths are never opened by `security show`.
+    toml.write_text(
+        api + 'tls_cert_file = "operator-cert.pem"\ntls_key_file = "operator-key.pem"\n',
+        encoding="utf-8",
+    )
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    assert "plaintext_upstream_hop_acknowledged" not in [e["switch"] for e in data["loosenings"]]
+
+
 def test_show_declares_a_partial_report_when_the_file_will_not_load(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

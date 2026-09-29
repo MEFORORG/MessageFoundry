@@ -36,6 +36,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
     AlertsSettings,
+    ApiSettings,
     AuthSettings,
     SchemaManagement,
     SecretRotationSettings,
@@ -147,6 +148,7 @@ def _loosening_names(store: StoreSettings) -> set[str]:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
