@@ -23,8 +23,10 @@ import base64
 import builtins
 import errno
 import hmac
+import io
 import os
 import stat
+import tarfile
 import tempfile
 import threading
 import time
@@ -214,9 +216,11 @@ class _ReadOnlyDir:
     """Refuse every create or write under one directory, the way a read-only DR share does.
 
     A seam rather than a permission bit: on Windows a directory's read-only attribute does not stop
-    a file being created in it, and a POSIX mode bit does not stop root. It covers every route this
-    module writes by: ``os.mkdir`` (which ``Path.mkdir`` and ``tempfile.mkdtemp`` both use),
-    ``os.open`` with a write flag, and the builtin ``open`` in a write mode."""
+    a file being created in it, and a POSIX mode bit does not stop root. It covers at least these
+    routes: ``os.mkdir`` (which ``Path.mkdir`` and ``tempfile.mkdtemp`` use), ``os.open`` with a
+    write flag, and ``open`` in a write mode through ``builtins``, ``io`` (``Path.open``) and the
+    copy ``tarfile`` took at import. SQLite creates files in C, out of its reach; the listing the
+    other test takes after extraction is what covers that."""
 
     _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 
@@ -229,6 +233,8 @@ class _ReadOnlyDir:
         monkeypatch.setattr(os, "mkdir", self.mkdir)
         monkeypatch.setattr(os, "open", self.os_open)
         monkeypatch.setattr(builtins, "open", self.open)
+        monkeypatch.setattr(io, "open", self.open)
+        monkeypatch.setattr(tarfile, "bltn_open", self.open)
 
     def _check(self, path: object) -> None:
         if isinstance(path, int):
@@ -253,6 +259,28 @@ class _ReadOnlyDir:
         return self._open(file, mode, *a, **kw)  # type: ignore[call-overload]
 
 
+def _is_private(staging: Path) -> bool:
+    """Whether a staging directory admits only its own account: mode 0700 on POSIX; on Windows a
+    protected DACL granting nothing beyond SYSTEM, Administrators and OWNER RIGHTS, owned by this
+    process's own default owner."""
+    if os.name != "nt":
+        return stat.S_IMODE(staging.stat().st_mode) == 0o700
+    from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
+
+    sddl = _read_dacl_sddl(staging, owner=True)
+    dacl = _parse_sddl_dacl(sddl) if sddl else None
+    if dacl is None or not dacl.protected or not dacl.aces:
+        return False
+    if {sid for _t, _f, _r, sid in dacl.aces} - {"S-1-5-18", "S-1-5-32-544", "OW"}:
+        return False
+    probe = staging.parent / "owner-probe"
+    probe.mkdir()
+    try:
+        return dacl.owner == dr_backup._owner_of(probe)
+    finally:
+        probe.rmdir()
+
+
 async def test_a_server_db_verify_passes_against_a_read_only_archive_directory(
     tmp_path, monkeypatch
 ) -> None:
@@ -267,6 +295,8 @@ async def test_a_server_db_verify_passes_against_a_read_only_archive_directory(
     # The guard must bite, or a PASS below would prove nothing about a read-only share.
     with pytest.raises(PermissionError):
         (archive_dir / "probe").mkdir()
+    with pytest.raises(PermissionError):
+        (archive_dir / "probe.tar").open("wb")
     share.refused.clear()
 
     res = await run_restore_verify(str(archive), store_settings=_server_db_settings(key))
@@ -287,8 +317,9 @@ async def test_a_standalone_verify_writes_nothing_beside_the_archive_or_the_stor
     defects 1 and 2: a SQLite verify staged beside `[store].path`, which under the default relative
     path is the current directory, and a server-DB verify staged beside the archive.
 
-    Watched DURING the verify, not only after it: staging that is created and then removed would
-    pass an after-only check while it had held plaintext on the share."""
+    Watched DURING the verify, once the plaintext tar is written and again once the store is
+    extracted, not only after it: staging that is created and then removed would pass an after-only
+    check while it had held plaintext on the share."""
     archive, key = await _archive(tmp_path, config_only=backend == "server-db")
     cwd = tmp_path / "cwd"
     cwd.mkdir()
@@ -299,43 +330,62 @@ async def test_a_standalone_verify_writes_nothing_beside_the_archive_or_the_stor
     )
     watched = {d: _everything_under(d) for d in (archive.parent, cwd)}
     iso = _isolate_os_temp(tmp_path, monkeypatch)
-    during: list[tuple[Path, bool, dict[Path, list[Path]]]] = []
-    real = dr_backup._verify_in_staging
+    stagings: list[tuple[Path, bool]] = []
+    seen: list[dict[Path, list[Path]]] = []
+    real_manifest = dr_backup._read_manifest_from_tar
+    real_count = dr_backup._count_tables
 
-    def spy(staging: Path, **kw: object) -> dr_backup.VerifyResult:
-        mode_ok = os.name == "nt" or stat.S_IMODE(staging.stat().st_mode) == 0o700
-        during.append((staging, mode_ok, {d: _everything_under(d) for d in watched}))
-        return real(staging, **kw)  # type: ignore[arg-type]
+    def manifest(tar_path: Path) -> dict[str, object]:
+        staging = Path(tar_path).parent
+        stagings.append((staging, _is_private(staging)))
+        seen.append({d: _everything_under(d) for d in watched})
+        return real_manifest(tar_path)
 
-    monkeypatch.setattr(dr_backup, "_verify_in_staging", spy)
+    def count(db_path: Path) -> dict[str, int]:
+        seen.append({d: _everything_under(d) for d in watched})
+        return real_count(db_path)
+
+    monkeypatch.setattr(dr_backup, "_read_manifest_from_tar", manifest)
+    monkeypatch.setattr(dr_backup, "_count_tables", count)
     secured = _record_secured(monkeypatch)
 
     res = await run_restore_verify(str(archive), store_settings=settings)
 
     assert res.status == "PASS", res.reason
-    ((staging, mode_ok, seen),) = during
+    ((staging, private),) = stagings
     assert staging.parent == iso.absolute(), staging
     assert staging.name.startswith(dr_backup._VERIFY_STAGING_PREFIX)
-    assert mode_ok, "the staging directory is not owner-only"
-    assert seen == watched
+    assert private, "the staging directory admits more than its own account"
+    assert len(seen) == (1 if backend == "server-db" else 2)
+    assert all(listing == watched for listing in seen)
     assert {p.parent for p in secured} == {staging}
-    assert "archive.tar" in {p.name for p in secured}
+    expected = {"archive.tar"} if backend == "server-db" else {"archive.tar", "extracted_store.db"}
+    assert {p.name for p in secured} == expected
     assert {d: _everything_under(d) for d in watched} == watched
     assert _everything_under(iso) == []
 
 
-async def test_a_standalone_verify_sweeps_what_a_dead_verify_left_in_the_os_temp_dir(
+async def test_a_standalone_verify_sweeps_only_its_own_accounts_dead_staging(
     tmp_path, monkeypatch
 ) -> None:
     """A standalone verify killed mid-run leaves its private directory behind. The next standalone
-    verify on the same account removes it by its lock, and leaves a live sibling's alone."""
+    verify on the same account removes it by its lock, and leaves a live sibling's alone. A dead-looking
+    directory owned by anyone else is never touched: the OS temp dir can be shared, and another account
+    could plant a lock file and a marker there."""
     archive, key = await _archive(tmp_path, config_only=False)
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
     iso = _isolate_os_temp(tmp_path, monkeypatch)
     dead = _abandoned(iso, dr_backup._VERIFY_STAGING_PREFIX)
+    planted = _abandoned(iso, dr_backup._VERIFY_STAGING_PREFIX)
     live = dr_backup._open_staging(iso, dr_backup._VERIFY_STAGING_PREFIX, secure=False)
+    real_owner = dr_backup._owner_of
+
+    def owner(path: Path) -> object | None:
+        return "someone-else" if Path(path) == planted else real_owner(path)
+
+    monkeypatch.setattr(dr_backup, "_owner_of", owner)
     try:
         res = await run_restore_verify(
             str(archive), store_settings=StoreSettings(encryption_key=key)
@@ -343,9 +393,31 @@ async def test_a_standalone_verify_sweeps_what_a_dead_verify_left_in_the_os_temp
         assert res.status == "PASS", res.reason
         assert not dead.exists()
         assert live.path.is_dir()
+        assert (planted / "archive.tar").read_bytes() == b"synthetic plaintext"
     finally:
         assert live.release() is None
-    assert _everything_under(iso) == []
+    assert _everything_under(iso) == [
+        planted,
+        planted / ".lock",
+        planted / ".lock-held",
+        planted / "archive.tar",
+    ]
+
+
+def test_a_standalone_verify_never_falls_back_to_the_current_directory(
+    tmp_path, monkeypatch
+) -> None:
+    """`tempfile` falls back to the current directory when no temp candidate is writable, and under
+    the default relative `[store].path` that is beside the store. The verify refuses it, unless an
+    environment variable names that directory on purpose."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(OSError, match="current directory"):
+        dr_backup._standalone_staging_root()
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    assert dr_backup._standalone_staging_root() == tmp_path.absolute()
 
 
 # --- cleanup on every failure path ----------------------------------------------

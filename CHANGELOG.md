@@ -266,10 +266,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   backup's staging cannot be cleared, the run still succeeds, raises a `backup_failed` alert of kind
   `cleanup`, and names the directory in its audit row and in the `backup` command's output. Staging now needs free space on the data
   volume (about twice the store while it runs). A standalone `restore-verify` and the DR cold-seed
-  activation stage in a private directory under the OS temp dir instead: owner-only, with each
-  staged file secured, and swept by lock at the next standalone verify. They write nothing to the
-  archive's directory or beside `[store].path`, so a read-only DR share verifies. They need about
-  twice the store free on the temp volume, as before. The archive key is
+  activation stage in a private directory under the OS temp dir instead. It is mode 0700 on POSIX,
+  and on Windows it admits the account, SYSTEM and Administrators; each staged file is secured. A
+  directory a killed verify leaves is swept by lock at the next standalone verify run by the same
+  account with the same temp dir, which takes only directories that account owns. They write
+  nothing to the archive's directory or beside `[store].path`, so a read-only DR share verifies.
+  They need about twice the store free on the temp volume, as before. The archive key is
   now picked by comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and
   §8 state what is still unbounded. (`BACKLOG #1174`, `BACKLOG #1721`, `BACKLOG #1167`)
 - **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement

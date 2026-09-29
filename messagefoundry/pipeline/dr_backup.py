@@ -1179,7 +1179,7 @@ def _verify_archive_blocking(
     archive_path: str,
     keys: list[bytes],
     full: bool,
-    staging_root: Path,
+    staging_root: Path | None,
     secure: bool = False,
     allow_unencrypted: bool = False,
     store_settings: object | None = None,
@@ -1188,8 +1188,10 @@ def _verify_archive_blocking(
 
     ``staging_root`` is where the decrypted archive is staged (BACKLOG #1174). A backup's own verify
     passes its build's root, a SQLite store's data directory or ``.mefor-staging`` under the backup
-    destination (see :func:`_staging_root_for`). A standalone verify passes the OS temp dir (see the
-    staging-location block above :class:`_Staging`). ``secure`` locks each staged file to its owner before its first byte,
+    destination (see :func:`_staging_root_for`). A standalone verify passes ``None``: it stages in the
+    OS temp dir, and first sweeps that dir of this account's own abandoned staging (see
+    :func:`_standalone_staging_root` and the staging-location block above :class:`_Staging`).
+    ``secure`` locks each staged file to its owner before its first byte,
     which every case but ``.mefor-staging`` passes.
 
     ``keys`` is the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys") — the
@@ -1218,7 +1220,7 @@ def _verify_archive_blocking(
     the run (see :func:`_open_staging`), which is discarded on every exit path by
     :func:`_discard_verify_staging`. When decrypted bytes survive that, the result says so: a ``PASS``
     becomes ``FAIL``, and any other verdict keeps its status and gains the directory in its reason. Its
-    lock is released either way, so the next backup's sweep removes what survived."""
+    lock is released either way, so the next sweep of the same root removes what survived."""
     try:
         # (1) Pre-decryption key check (only meaningful for an encrypted archive). For a plaintext
         # archive (no codec header) there is no key to mismatch.
@@ -1249,9 +1251,17 @@ def _verify_archive_blocking(
                     reason=f"no resolved key (active or retired) matches archive key_id={header_key_id}",
                 )
 
+        standalone = staging_root is None
+        if staging_root is None:
+            staging_root = _standalone_staging_root()
         work = _open_staging(staging_root, _VERIFY_STAGING_PREFIX, secure=secure)
     except (BackupCodecError, OSError, tarfile.TarError) as exc:
         return _verify_failure(exc)
+    if standalone:
+        # After the key precheck, so a verify that was never going to stage pays for no scan, and
+        # before the decrypt, so a dead run's plaintext is gone before this one needs the space. Only
+        # directories owned as this run's own are taken: the OS temp dir can be shared.
+        _sweep_abandoned_staging(staging_root, owned_like=work.path)
 
     # Everything from here writes decrypted plaintext into the staging directory, so its teardown is
     # explicit and not a `TemporaryDirectory`: that `__exit__` raised when one unlink was refused (on
@@ -1460,7 +1470,8 @@ def _discard_verify_staging(staging: Path) -> str | None:
 #   protected DACL Python 3.13+ writes for that mode (SYSTEM, Administrators, OWNER RIGHTS), with
 #   `_secure_file` on each staged file. Never in the archive's directory, which on a DR box may be
 #   a read-only share with no engine ACL, and never beside `[store].path`, which under the default
-#   relative path is the current directory. Each standalone verify sweeps that temp dir first.
+#   relative path is the current directory. Each standalone verify first sweeps that temp dir of the
+#   directories it owns, and only those, since the temp dir can be shared.
 #
 # Every staging directory holds a lock file, locked for the whole run. A crash or SIGKILL releases the
 # lock with the process, and that is the ONLY proof of abandonment the sweep accepts. Age is not proof:
@@ -1587,7 +1598,7 @@ def _teardown_staging(path: Path) -> str | None:
         except OSError as exc:
             log.warning(
                 "DR staging directory %s survived its teardown and could not be marked for the next "
-                "backup's sweep: %s",
+                "sweep: %s",
                 path,
                 safe_exc(exc),
             )
@@ -1675,15 +1686,63 @@ def _staging_root_for(
     return destination.absolute() / _SERVER_DB_STAGING_DIR, False
 
 
-def _sweep_abandoned_staging(root: Path) -> int:
+def _standalone_staging_root() -> Path:
+    """The OS temp dir, where a standalone verify stages. Raises ``OSError`` rather than fall back to
+    the current directory.
+
+    ``tempfile.gettempdir`` falls back to the current directory when no temp candidate is writable,
+    and under the default relative ``[store].path`` that is beside the store. That fallback is refused
+    unless an environment variable names the directory, which is an operator's own choice."""
+    root = Path(tempfile.gettempdir()).absolute()
+    cwd = os.path.normcase(Path.cwd().absolute())
+    if os.path.normcase(root) == cwd and not any(
+        value and os.path.normcase(Path(value).absolute()) == cwd
+        for value in (os.environ.get(name) for name in ("TMPDIR", "TEMP", "TMP"))
+    ):
+        raise OSError(
+            f"no writable OS temp directory, so the verify will not stage in the current directory "
+            f"{root}; set TMPDIR (TEMP on Windows) to a directory only this account can read"
+        )
+    return root
+
+
+def _owner_of(path: Path) -> object | None:
+    """Who owns ``path``, without following a link: a uid on POSIX, an owner SID on Windows. ``None``
+    when it cannot be read. Compared only with another ``_owner_of`` answer."""
+    if sys.platform != "win32":
+        try:
+            return os.lstat(path).st_uid
+        except OSError:
+            return None
+    from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl, _resolve_sid
+
+    sddl = _read_dacl_sddl(path, owner=True)
+    found = _SDDL_OWNER.search(sddl) if sddl else None
+    return _resolve_sid(found.group(1)) if found else None
+
+
+def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> int:
     """Remove the staging directories under ``root`` that a dead run left behind. Never raises.
 
     A directory is removed only when its lock file exists, its lock can be taken, and it holds the
     marker a run creates once it holds the lock. That set means the run that made it is
     gone: the OS dropped its lock with the process. Everything else is left alone -- a live run holds
     its lock, and a directory with no lock or no marker has not had plaintext written to it. Age is
-    never consulted. Returns how many directories were removed."""
+    never consulted. Returns how many directories were removed.
+
+    ``owned_like`` names a directory this run just created. When given, only a directory with the same
+    owner is a candidate, and nothing is swept if that owner cannot be read. A standalone verify
+    passes it because the OS temp dir can be shared: another account could plant a directory there
+    holding a lock file and a marker, and the teardown must never run on a tree it controls."""
     swept = 0
+    owner: object | None = None
+    if owned_like is not None:
+        owner = _owner_of(owned_like)
+        if owner is None:
+            log.warning(
+                "DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root
+            )
+            return 0
     try:
         entries = list(os.scandir(root))
     except FileNotFoundError:
@@ -1700,6 +1759,8 @@ def _sweep_abandoned_staging(root: Path) -> int:
         except OSError:
             continue
         path = Path(entry.path)
+        if owner is not None and _owner_of(path) != owner:
+            continue  # not this account's: another account's run, or a plant
         try:
             fd = os.open(path / _LOCK_NAME, os.O_RDWR | getattr(os, "O_BINARY", 0))
         except FileNotFoundError:
@@ -1884,19 +1945,14 @@ async def run_restore_verify(
         base64.b64decode(k)
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
-    # A private directory under the OS temp dir, never where the backup runner stages: see the
-    # staging-location block above `_Staging` (BACKLOG #1174).
-    staging_root = Path(tempfile.gettempdir()).absolute()
-    # What a killed standalone verify left there. The backup runner's sweep never looks here, so only
-    # a later standalone verify can remove it. On a shared POSIX `/tmp` another account's directory
-    # is 0700 and cannot be opened, so the sweep logs it and leaves it for that account.
-    await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
+    # `staging_root=None` is a standalone verify: a private directory under the OS temp dir, never
+    # where the backup runner stages. See the staging-location block above `_Staging` (BACKLOG #1174).
     return await asyncio.to_thread(
         _verify_archive_blocking,
         archive_path=archive_path,
         keys=keys,
         full=full,
-        staging_root=staging_root,
+        staging_root=None,
         secure=True,
         allow_unencrypted=allow_unencrypted,
         # Threaded through so a full verify opens the snapshot under the SAME cipher/keyring/provider
@@ -2263,8 +2319,8 @@ def _extract_member(
     on the destination volume, where ``TemporaryDirectory`` inherits whatever the parent grants on
     Windows, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
-    under the inherited ACL for as long as the write takes. The verify path passes it when it stages in
-    a SQLite store's data directory, and leaves it off under ``.mefor-staging`` (BACKLOG #1174).
+    under the inherited ACL for as long as the write takes. The verify path passes it everywhere but
+    ``.mefor-staging`` (BACKLOG #1174).
 
     Path-traversal-safe by construction, NOT by an after-the-fact check: the member's *stored name* is
     never used as a filesystem path — we look the member up by name, then stream its CONTENT to a fixed
