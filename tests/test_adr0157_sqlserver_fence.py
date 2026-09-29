@@ -407,6 +407,39 @@ async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(
     assert (await _events(store, mid2)).count("failed") == 1
 
 
+@pytest.mark.parametrize("nocount", [False, True], ids=["nocount-off", "nocount-on"])
+async def test_a_retry_on_a_row_already_re_pended_still_lands(
+    store: Any, monkeypatch: pytest.MonkeyPatch, nocount: bool
+) -> None:
+    """ADR 0157 Amendment A, widened by owner ruling 2026-09-29. Something else put the row back to
+    PENDING mid-send, due at once and with the claim's ``attempts`` kept, as Postgres's lease sweep
+    does (SQL Server has none, so a direct UPDATE stands in). The late retry must still land: its
+    backoff, its ``failed`` event and its ``last_error``, read from the OUTPUT rowset under either
+    NOCOUNT state. Mutation: narrow the term back to INFLIGHT only."""
+    if nocount:
+        _force_nocount(store, monkeypatch)
+    mid = await _enqueue(store)
+    claimed = await _claim_one(store)
+    async with store._acquire() as conn, store._cursor(conn) as cur:
+        await cur.execute(
+            "UPDATE queue SET status=?, next_attempt_at=?, updated_at=? WHERE id=? AND status=?",
+            (OutboxStatus.PENDING.value, 201.0, 201.0, claimed.id, OutboxStatus.INFLIGHT.value),
+        )
+        await store._commit(conn)
+    row = (await store.outbox_for(mid))[0]
+    assert row["status"] == OutboxStatus.PENDING.value and row["attempts"] == 1  # premise
+
+    retry = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=2)
+    next_at = await store.mark_failed(claimed.id, "late", retry, now=202.0)
+
+    row = (await store.outbox_for(mid))[0]
+    assert row["status"] == OutboxStatus.PENDING.value
+    assert next_at == row["next_attempt_at"] == 207.0  # attempts 1: 5 * 2**0
+    assert row["last_error"] == "late"
+    assert (await _events(store, mid)).count("failed") == 1
+    assert store.fenced_writes == 0
+
+
 async def test_measure_the_zero_match_rowcount_of_the_retry_update(
     store: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
