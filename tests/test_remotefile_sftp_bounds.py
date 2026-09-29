@@ -1078,13 +1078,13 @@ def test_a_helper_thread_that_cannot_start_is_transient(monkeypatch: pytest.Monk
 # What paramiko does when the server stops reading is stated once, in ``_WriteWatchdog``'s docstring.
 
 #: The stall bound these tests run under, shortened from the shipped 120 s.
-_STALL_BOUND = 1.0
+_STALL_BOUND = 2.0
 
 
 class _WriteFile(_StubFile):
     """An ``SFTPFile`` stand-in for an upload. ``stall_after`` writes, it parks the way
-    ``Packetizer.write_all`` does until the client is closed, then raises ``EOFError`` as that loop
-    does once the packetizer is closed. ``pause`` makes every write slow but live instead."""
+    ``Packetizer.write_all`` does until the transport is closed, then raises ``EOFError`` as that
+    loop does once the packetizer is closed. ``pause`` makes every write slow but live instead."""
 
     def __init__(
         self, closed: threading.Event, *, stall_after: int | None = None, pause: float = 0.0
@@ -1100,7 +1100,8 @@ class _WriteFile(_StubFile):
         if self._stall_after is not None and self.writes >= self._stall_after:
             if not self._closed.wait(_PARKED_AFTER):
                 raise AssertionError(
-                    f"the write was still parked after {_PARKED_AFTER:g}s: nothing closed the client"
+                    f"the write was still parked after {_PARKED_AFTER:g}s: nothing closed the "
+                    "transport"
                 )
             raise EOFError()
         time.sleep(self._pause)
@@ -1108,15 +1109,30 @@ class _WriteFile(_StubFile):
         self.writes += 1
 
 
-class _ClosableSsh(_StubSshClient):
-    def __init__(self, sftp: Any, closed: threading.Event) -> None:
-        super().__init__(sftp)
+class _ClosableTransport:
+    """A paramiko ``Transport`` stand-in: closing it is what ends ``write_all``."""
+
+    def __init__(self, closed: threading.Event) -> None:
         self._closed = closed
         self.close_calls = 0
 
     def close(self) -> None:
         self.close_calls += 1
         self._closed.set()
+
+
+class _ClosableSsh(_StubSshClient):
+    def __init__(self, sftp: Any, closed: threading.Event) -> None:
+        super().__init__(sftp)
+        self.transport = _ClosableTransport(closed)
+        self.close_calls = 0
+
+    def get_transport(self) -> _ClosableTransport:
+        return self.transport
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.transport.close()
 
 
 def _uploader(fh: _WriteFile, closed: threading.Event, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -1144,21 +1160,26 @@ def test_an_upload_to_a_server_that_stops_reading_is_refused_transient(
     assert "upload stalled" in str(caught.value), str(caught.value)
     assert elapsed < _STALL_BOUND + 5.0
     assert bytes(fh.written) == b"01234567"  # it did move, then stopped
+    # The watchdog closed the transport, not the client; only _op's finally closes the client.
+    assert ssh.close_calls == 1
+    assert ssh.transport.close_calls == 2
 
 
 def test_a_slow_upload_that_keeps_moving_completes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """CONTROL: the bound is per step. Each write here takes half the bound and the whole upload
-    takes well over it, and it completes; the only close is ``_op``'s own.
+    """CONTROL: the bound is per step. Each write here takes a quarter of the bound and the whole
+    upload takes half as long again as the bound, and it completes; the only close is ``_op``'s own.
 
     Red mutation: bound the whole upload instead of each step (never call ``progress``). The
-    watchdog then closes the client part-way and this test reds."""
+    watchdog then closes the transport part-way and this test reds."""
     closed = threading.Event()
-    fh = _WriteFile(closed, pause=_STALL_BOUND * 0.5)
+    fh = _WriteFile(closed, pause=_STALL_BOUND * 0.25)
     client, ssh = _uploader(fh, closed, monkeypatch)
 
-    client.store("/in/.a.part", b"0123456789abcdef")  # four steps, about two bounds in all
+    body = b"0123456789abcdef01234567"
+    client.store("/in/.a.part", body)  # six steps, about one and a half bounds in all
 
-    assert bytes(fh.written) == b"0123456789abcdef"
+    assert bytes(fh.written) == body
+    assert ssh.transport.close_calls == 1, "the watchdog fired on an upload that kept moving"
     assert ssh.close_calls == 1, f"closed {ssh.close_calls} times; only _op should close it"
 
 
