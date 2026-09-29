@@ -88,6 +88,7 @@ from __future__ import annotations
 import ast
 import functools
 import re
+import subprocess
 import tomllib
 from pathlib import Path
 from typing import NamedTuple
@@ -200,8 +201,48 @@ def _script_hardens(text: str) -> bool:
     return _calls_the_chokepoint(tree) or _reconfigures_stdout(tree)
 
 
-def _python_scripts() -> list[Path]:
-    return sorted(p for p in _SCRIPTS.rglob("*.py") if "__pycache__" not in p.parts)
+@functools.cache
+def _tracked(suffix: str) -> tuple[str, ...]:
+    """Every TRACKED file ending in ``suffix``, repository-relative, in posix form.
+
+    THE SCOPE IS WHAT GIT TRACKS, NOT WHAT IS ON DISK (BACKLOG #1030). A filesystem walk also reads
+    whatever happens to sit under a root on this machine -- an untracked scratch file, a stray
+    ``.venv`` or build output inside ``packaging/``, a sibling session's half-written file -- so the
+    same test could give different answers in two checkouts of one commit. Tracked files are what CI
+    checks out and what a pull request can change.
+
+    THE COST, STATED: a new file is not scanned until it is ``git add``-ed. CI sees it either way.
+
+    Deliberately NOT a ``<root>/**/*.py`` pathspec: that form DROPS every top-level file under the
+    root (measured on the engine, 240 files against 267 at the time). The whole list is read once,
+    unfiltered by git, and filtered here. A git failure raises rather than returning an empty list,
+    because an empty list is the false zero this module exists to refuse.
+    """
+    listing = subprocess.run(
+        ["git", "-C", str(_ROOT), "ls-files", "-z"], capture_output=True, check=True
+    ).stdout.decode("utf-8")
+    return tuple(sorted(p for p in listing.split("\0") if p.endswith(suffix)))
+
+
+@functools.cache
+def _files_under(root: Path, suffix: str = ".py") -> tuple[Path, ...]:
+    """Every tracked ``suffix`` file under ``root``, recursively. THE ONE WALK in this module.
+
+    Every surface -- both scripts halves and every reach root -- goes through this, so no two can
+    disagree about what "under a root" means. Cached, and a TUPLE, so the result cannot be mutated
+    out from under a sibling test that has not run yet. A tracked file deleted from the working tree
+    is left out: there is nothing on disk to read.
+    """
+    prefix = root.relative_to(_ROOT).as_posix() + "/"
+    return tuple(
+        _ROOT / rel
+        for rel in _tracked(suffix)
+        if rel.startswith(prefix) and (_ROOT / rel).is_file()
+    )
+
+
+def _python_scripts() -> tuple[Path, ...]:
+    return _files_under(_SCRIPTS, ".py")
 
 
 def _unencodable(text: str) -> list[str]:
@@ -451,8 +492,8 @@ _HARDENS_PS_CONSOLE = re.compile(
 _RUN_UNDER_WINDOWS_POWERSHELL = frozenset({"service/install-service.ps1"})
 
 
-def _powershell_scripts() -> list[Path]:
-    return sorted(_SCRIPTS.rglob("*.ps1"))
+def _powershell_scripts() -> tuple[Path, ...]:
+    return _files_under(_SCRIPTS, ".ps1")
 
 
 def _hardens_ps_console(path: Path, text: str, raw: bytes) -> bool:
@@ -684,16 +725,6 @@ _LOG_METHODS = frozenset(
 )
 
 
-@functools.cache
-def _modules_under(root: Path) -> tuple[Path, ...]:
-    """Every Python file under ``root``, recursively. Shared by every reach root.
-
-    Cached, because the tests per root would otherwise re-walk the same tree; a TUPLE, so
-    the cached result cannot be mutated out from under a sibling test that has not run yet.
-    """
-    return tuple(sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts))
-
-
 def _dotted(node: ast.expr) -> list[str]:
     """The dotted path of an attribute chain, outermost last. `self._log.warning` -> the 3 parts."""
     parts: list[str] = []
@@ -787,7 +818,7 @@ def _scan_root(root: Path) -> _RootScan:
     two lists. That is not a silent skip; the test that asserts on `unreadable` names it.
     """
     found: dict[str, list[str]] = {"offender": [], "exempted": [], "unreadable": []}
-    for path in _modules_under(root):
+    for path in _files_under(root):
         rel = path.relative_to(_ROOT).as_posix()
         try:
             text = path.read_text(encoding="utf-8")
@@ -1022,7 +1053,11 @@ def test_the_scripts_direct_form_must_set_a_codec_or_an_error_handler() -> None:
 # console.
 #
 # THE ENGINE IS A ROW HERE TOO. Its three tests were hand-written wrappers beside this
-# parametrization until this change; they are rows of it now, so one control governs all nine roots.
+# parametrization until this change; they are rows of it now, so one control governs all ten roots.
+#
+# THIS IS A CENSUS NOW, NOT A FLOOR. `test_every_root_holding_tracked_python_is_gated` below
+# re-derives the set of roots holding tracked Python on every run and fails on one no row names, so
+# the next root is caught by the gate rather than by the next person to read this comment.
 # =================================================================================================
 
 _HARNESS = _ROOT / "harness"
@@ -1085,7 +1120,7 @@ def test_every_reach_scan_actually_covers_something(
     A scan whose file list collapses to nothing reports a clean result forever, and this repository
     has produced a false zero on exactly this census before.
     """
-    found = _modules_under(root)
+    found = _files_under(root)
     nested = [p for p in found if len(p.relative_to(root).parts) > 1]
     print(f"scanned {len(found)} python files under {label}/, {len(nested)} of them nested")
     assert len(found) >= floor, (
@@ -1149,6 +1184,25 @@ def test_a_glyph_planted_in_a_real_file_of_each_root_is_caught(
         verdict = _classify(pin, planted)
         assert verdict is not None, f"{label}/{pin}: the planted glyph was not seen"
         assert verdict[0] in ("offender", "exempted"), f"{label}/{pin}: {verdict[1]}"
+
+
+def test_every_root_holding_tracked_python_is_gated() -> None:
+    """THE SCOPE IS RE-DERIVED ON EVERY RUN, NOT REMEMBERED. PR 1403 named six ungated roots as "at
+    least six", and a seventh, fuzz/, turned up only in a later census. So the census is the test:
+    every top-level directory holding a tracked ``.py`` file must be a reach row or scripts/ (gated
+    on encodability above). A tracked ``.py`` at the repository root itself reads as ``.`` and would
+    need a row of its own.
+    """
+    gated = {label for label, *_rest in _REACH_ROOTS} | {"scripts"}
+    roots = {rel.split("/", 1)[0] if "/" in rel else "." for rel in _tracked(".py")}
+    print(f"top-level roots holding tracked python: {sorted(roots)}")
+    # The census's own control: an instrument that cannot find these two proves nothing by
+    # finding no ungated root.
+    assert {"messagefoundry", "scripts"} <= roots, f"the census is blind: {sorted(roots)}"
+    assert roots <= gated, (
+        f"roots holding tracked python that no gate walks: {sorted(roots - gated)} -- add a row "
+        f"to _REACH_ROOTS, with a floor and pins, rather than widening this set"
+    )
 
 
 def test_this_module_is_not_exempt_from_its_own_gate() -> None:
@@ -1285,7 +1339,7 @@ def test_every_console_entry_point_hardens_at_the_chokepoint() -> None:
     found = {
         p.relative_to(_ROOT).as_posix(): p
         for root in (_ENGINE, _HARNESS)
-        for p in _modules_under(root)
+        for p in _files_under(root)
         if p.name == "__main__.py"
     }
     print(f"entry points scanned: {sorted(found)}")
