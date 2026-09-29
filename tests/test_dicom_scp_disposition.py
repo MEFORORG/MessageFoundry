@@ -42,8 +42,10 @@ _NAME = "IB_DICOM"
 _MIB = 1024 * 1024
 
 _SUCCESS = 0x0000
-_OUT_OF_RESOURCES = 0xA700
 _CANNOT_UNDERSTAND = 0xC000
+#: BACKLOG #2103: a deterministic over-cap refusal, in the Cannot Understand class so no sender reads
+#: it as transient and re-sends an object that would be refused again.
+_REFUSED_OVER_CAP = 0xC001
 
 
 @pytest.fixture
@@ -127,7 +129,7 @@ async def test_an_object_in_the_16_to_128_mib_band_is_refused_to_the_sender(
 
     status = await _send_through_runner(store, data)
 
-    assert status == _OUT_OF_RESOURCES
+    assert status == _REFUSED_OVER_CAP
     assert await _rows(store) == [], "a refused object must not also be recorded as received"
 
 
@@ -189,7 +191,7 @@ async def test_a_small_deflated_object_that_inflates_past_the_parse_ceiling_is_r
     status = await _send_through_runner(store, data)
 
     assert status != _SUCCESS
-    assert status == _OUT_OF_RESOURCES
+    assert status == _REFUSED_OVER_CAP
     assert await _rows(store) == [], "a refused object must not also be recorded as received"
 
 
@@ -219,6 +221,25 @@ def test_the_scp_cap_never_exceeds_the_engine_ingress_ceiling(configured: int | 
     """The shipped 128 MiB default, and an uncapped SCP, both resolve to the engine's binary ingress
     ceiling. An object above it could only ever be recorded ERROR, so the SCP must not accept one."""
     assert _scp(configured)._max_object_bytes == ingress_guards.INGRESS_MAX_BYTES
+
+
+@pytest.mark.parametrize("bad", [-1, "-1"])
+def test_a_negative_cap_is_refused_with_the_scps_own_text(bad: object) -> None:
+    """BACKLOG #2103: the shared ``positive_cap`` refusal says "use None or 0 to disable it". On the SCP
+    neither value disables the cap; both resolve to the engine's ingress ceiling. So the SCP's refusal
+    must say that, and must not send an operator looking for an off switch that does not exist."""
+    with pytest.raises(ValueError) as caught:
+        _scp(bad)  # type: ignore[arg-type]
+    message = str(caught.value)
+    assert "DICOM-SCP source max_object_bytes=" in message
+    assert "disable" not in message.replace("does not disable", "")
+    assert "does not disable" in message
+    assert str(ingress_guards.INGRESS_MAX_BYTES) in message
+
+
+def test_an_unparseable_cap_is_refused_naming_the_setting() -> None:
+    with pytest.raises(ValueError, match="DICOM-SCP source max_object_bytes='lots'"):
+        _scp("lots")  # type: ignore[arg-type]
 
 
 def test_a_cap_below_the_ceiling_is_kept() -> None:

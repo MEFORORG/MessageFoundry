@@ -101,6 +101,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    cap_setting,
     peer_ip_allowed,
     positive_cap,
     register_destination,
@@ -142,13 +143,20 @@ _ENGINE_INGRESS_CEILING_BYTES = DEFAULT_MAX_MESSAGE_BYTES
 #: their own number. The cell stays `partial` on the shipped default and the record says why.
 DEFAULT_MAX_ASSOCIATIONS_PER_SECOND: float | None = None
 
-# DIMSE C-STORE response statuses (DICOM PS3.4 Annex B). Success commits; the failures below all mean
-# "not stored — the SCU should re-send / give up" and never a silent drop.
+# DIMSE C-STORE response statuses (DICOM PS3.4 Annex B, Table B.2-1). Success commits; every failure
+# means "not stored" and is never a silent drop. The CLASS is what tells a sender whether to re-send
+# (BACKLOG #2103). PS3.4 has no "too large" status. Out of Resources (A7xx) says the SCP cannot take
+# the object NOW, and senders, this engine's own SCU among them, retry it. Cannot Understand (Cxxx)
+# says the SCP will not take this object at all, and senders treat it as final. So a refusal that
+# would repeat on a re-send answers Cxxx, and only a failure that may clear answers A7xx.
 _STATUS_SUCCESS = 0x0000
-_STATUS_OUT_OF_RESOURCES = 0xA700  # over-cap, or a commit timeout (re-send)
-_STATUS_CANNOT_UNDERSTAND = (
-    0xC000  # would not decode/re-encode, commit raised, or ingress refused it
-)
+_STATUS_OUT_OF_RESOURCES = 0xA700  # transient: a commit timeout or a commit that raised (re-send)
+_STATUS_CANNOT_UNDERSTAND = 0xC000  # final: would not decode/re-encode, or ingress refused it
+#: Final, and the same class as Cannot Understand: the object is over the SCP's object cap or inflates
+#: past its inflate bound. Both limits are fixed, so a re-send is refused again. The low byte, which
+#: PS3.4 leaves to the SCP, tells this refusal apart from a decode failure in a sender's log. It stays
+#: clear of 0xC211, which pynetdicom answers when a C-STORE handler raises.
+_STATUS_REFUSED_OVER_CAP = 0xC001
 _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist
 
 # A-ASSOCIATE-RJ fields for "busy, retry later" (DICOM PS3.8 section 9.3.4), sent while the engine's
@@ -216,6 +224,29 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     return ctx
 
 
+def _scp_object_cap(value: Any) -> int | None:
+    """Read the SCP's ``max_object_bytes``: a positive int, or ``None`` for ``None``/``0`` in any
+    spelling, which the SCP then resolves to :data:`_ENGINE_INGRESS_CEILING_BYTES`.
+
+    The same rules as :func:`~messagefoundry.transports.base.positive_cap`, with the SCP's own refusal
+    text (BACKLOG #2103). The shared text tells the operator to "use None or 0 to disable it", which is
+    false here: on the SCP neither value disables the cap. Following that advice would leave the SCP
+    at 16 MiB while the operator believed it uncapped."""
+    try:
+        cap = cap_setting(value, int)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"DICOM-SCP source max_object_bytes={value!r} is not a valid int value"
+        ) from exc
+    if cap is not None and not cap > 0:
+        raise ValueError(
+            f"DICOM-SCP source max_object_bytes={value!r} must be above zero. None or 0 does not "
+            "disable the SCP's object cap: either one resolves to the engine's binary ingress ceiling "
+            f"of {_ENGINE_INGRESS_CEILING_BYTES} bytes, and no setting raises the cap above it"
+        )
+    return cap
+
+
 class DicomScpSource(SourceConnector):
     """Inbound C-STORE SCP (ADR 0025 Phase 1). A **listen** source: it binds its own per-node port
     (``[inbound].bind_host`` + the configured ``port``) and ignores ``leader_gate`` (no shared-resource
@@ -246,12 +277,7 @@ class DicomScpSource(SourceConnector):
         # default, and an uncapped SCP, both resolve to the ingress ceiling.
         # None/0 in any spelling reads as uncapped, so a string "0" can no longer reach the inflate
         # bound below as a live zero that refuses every deflated object (BACKLOG #1872).
-        configured = positive_cap(
-            s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
-            int,
-            knob="max_object_bytes",
-            transport="DICOM-SCP source",
-        )
+        configured = _scp_object_cap(s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES))
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
         )
@@ -621,7 +647,7 @@ class DicomScpSource(SourceConnector):
                     len(object_bytes),
                     self._max_object_bytes,
                 )
-                return _STATUS_OUT_OF_RESOURCES
+                return _STATUS_REFUSED_OVER_CAP
             return self._commit(
                 object_bytes, peer_ip=peer_ip, sop_instance=sop_instance, sop_class=sop_class
             )
@@ -651,7 +677,7 @@ class DicomScpSource(SourceConnector):
             raw_bytes,
             self._max_object_bytes,
         )
-        return _STATUS_OUT_OF_RESOURCES
+        return _STATUS_REFUSED_OVER_CAP
 
     def _deflated_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:
         """ASVS 5.2.3 SCP guard. When the accepted context's transfer syntax is Deflated Explicit VR LE,
@@ -678,7 +704,7 @@ class DicomScpSource(SourceConnector):
                 calling_ae,
                 cap,
             )
-            return _STATUS_OUT_OF_RESOURCES
+            return _STATUS_REFUSED_OVER_CAP
         return None
 
     def _commit(
@@ -691,7 +717,10 @@ class DicomScpSource(SourceConnector):
         recorded ``ERROR`` and committed no ingress row. That refusal is a DIMSE failure, never Success
         (BACKLOG #1910). It is Cannot Understand, the status the decode-failure path already answers for
         an object the engine will not take, rather than the Out of Resources a commit timeout answers:
-        the refusal is deterministic, so the same object would be refused again on a re-send."""
+        the refusal is deterministic, so the same object would be refused again on a re-send. A handler
+        that RAISES, or does not answer in time, has committed nothing for a reason that may clear, such
+        as a store that is down, so both answer Out of Resources and the sender re-sends (BACKLOG
+        #2103)."""
         loop, handler = self._loop, self._handler
         if loop is None or handler is None:  # not started / already stopped
             return _STATUS_OUT_OF_RESOURCES
@@ -720,7 +749,7 @@ class DicomScpSource(SourceConnector):
                 sop_instance,
                 safe_exc(exc),
             )
-            return _STATUS_CANNOT_UNDERSTAND
+            return _STATUS_OUT_OF_RESOURCES
         if receipt is None:
             logger.warning(
                 "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR, "

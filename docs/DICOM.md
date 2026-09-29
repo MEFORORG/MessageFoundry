@@ -56,6 +56,25 @@ Data Set *before* it is decoded, so an over-cap object is a DIMSE failure before
 commit; never above the engine's 16 MiB binary ingress ceiling) + DICOM-over-TLS. An object the engine's
 ingress refuses is recorded `ERROR` and answered with a DIMSE failure, never Success (BACKLOG #1910). A non-loopback cleartext SCP is refused at startup unless `serve --allow-insecure-bind`.
 
+**The C-STORE status the SCP answers tells the sender whether to re-send** (BACKLOG #2103). DICOM PS3.4
+Annex B (Table B.2-1) has no "object too large" status. It has two failure classes that matter here.
+**Out of Resources** (`0xA7xx`) says the SCP cannot take the object now; senders, this engine's own SCU
+among them, retry it. **Cannot Understand** (`0xCxxx`) says the SCP will not take this object; senders
+treat it as final. So the SCP answers the final class for a refusal that would repeat on a re-send, and
+Out of Resources only for a failure that may clear.
+
+| Status | Class | When the SCP answers it |
+|---|---|---|
+| `0x0000` | Success | the object is durably committed to the ingress stage |
+| `0xC001` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, or a deflated object inflates past the SCP's inflate bound (the lesser of `max_object_bytes` and 16 MiB, BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
+| `0xC000` | Cannot Understand, final | the object would not decode or re-encode, or the engine's ingress refused it and recorded `ERROR` |
+| `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down, or did not finish within `timeout_seconds`, or the SCP is stopping |
+| `0x0124` | Refused: Not Authorized | the peer IP is not in `source_ip_allowlist` |
+
+The low byte of `0xC001` is the SCP's own choice, which PS3.4 allows inside `0xCxxx`. It separates an
+over-cap refusal from a decode failure in the sender's log, and stays clear of `0xC211`, which
+`pynetdicom` answers when a C-STORE handler raises.
+
 ### Outbound — C-STORE SCU + C-ECHO (`DICOM()` outbound)
 Forward an object to a downstream PACS over a C-STORE association (full Mirth-sender parity). The blocking
 association runs **off the loop**; the C-STORE status is classified onto the engine's retry model:

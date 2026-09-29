@@ -85,8 +85,8 @@ def bounded_inflate_or_error(compressed: bytes | memoryview, *, max_bytes: int) 
       output is discarded, so this costs no memory. It keeps the verdict on a corrupt stream that
       breaks inside the window that crosses the cap: zlib raises first, and the object is left to
       ``dcmread``. Asking for one byte past the cap would call that object a bomb instead, and the
-      SCP answers a bomb with Out of Resources, a status a sender may treat as transient and retry.
-      A corrupt object gets Cannot Understand from the decode path, which it does not retry."""
+      SCP would log it as over its inflate cap rather than as the corrupt object it is. Both are
+      final refusals since BACKLOG #2103, but the log would name the wrong cause."""
     if not compressed:
         return
     try:
