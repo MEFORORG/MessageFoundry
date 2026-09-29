@@ -2477,17 +2477,22 @@ class AuthSettings(_Section):
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at
     # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
-    # that owes no second factor counts as the first verification (sudo-timestamp model); a
-    # directory login (Kerberos, OIDC) does not (BACKLOG #1144). Default 5 minutes.
+    # that owes no second factor counts as the first verification (sudo-timestamp model) unless the
+    # account has signed in before and this address is not among its recent completed sign-ins (at
+    # most 200 rows of each kind and 90 days back; BACKLOG #288, _classify_login_address). That
+    # check fails open on no address or a failed read. A combined password-plus-TOTP sign-in counts
+    # from any address (ADR 0197). A directory login (Kerberos, OIDC) never does (BACKLOG #1144).
+    # Default 5 minutes.
     step_up_max_age_seconds: int = 300
-    # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
-    # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to
-    # that specific action (POST /me/reauth with a matching `purpose`), single-use, instead of riding
-    # the session-wide step-up window. This closes the most-exploitable default: a session hijacked
-    # inside the 300s login-seeded window could otherwise bind an attacker's authenticator with no
-    # fresh proof. It changes ONLY those factor-binding routes; the broad admin/replay/config/purge
-    # routes keep the session-window step-up (7.5.3). Default True is secure-by-default and does not
-    # touch the loopback bind, TLS, or any collector path. Set False to revert to the legacy
+    # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), a fixed set of routes
+    # requires a fresh proof BOUND to that specific action (POST /me/reauth with a matching
+    # `purpose`), single-use, instead of riding the session-wide step-up window: the self-service
+    # factor and session-terminate routes, and the admin user-update, reset-password, reset-mfa and
+    # federated-identity routes (the STEP_UP_ACTION_* constants in auth/service.py; the route list is
+    # in docs/CONFIGURATION.md). This closes the most-exploitable default: a session hijacked inside
+    # the 300s login-seeded window could otherwise bind an attacker's authenticator with no fresh
+    # proof. Every other step-up route keeps the session-window step-up (7.5.3). Default True is
+    # secure-by-default and does not touch the loopback bind, TLS, or any collector path. Set False to revert to the legacy
     # session-window behaviour (0.2.x semantics) — the documented org opt-out.
     require_action_step_up: bool = True
 
@@ -2629,13 +2634,10 @@ class AuthSettings(_Section):
     # `ad_enabled` means DIRECTORY BIND CAPABILITY -- this engine can reach AD and resolve principals.
     # It is what Kerberos SSO, federated OIDC and the session reconciler each depend on, and it is why
     # they all validate against it rather than against the login pathway below (BACKLOG #1137).
+    # There is no switch for a directory-PASSWORD sign-in: that pathway is retired (BACKLOG #1137),
+    # and AuthService._dispatch_login refuses `provider=ad`. A bind as the user survives only as the
+    # step-up re-bind (`_reauth_ad`).
     ad_enabled: bool = False
-    # Whether a user may present an AD password to OUR login form, which we verify by SIMPLE-binding as
-    # them. Split out of `ad_enabled` because the two are different decisions that happened to share a
-    # switch: wanting federated login (which needs the bind) forced you to also expose this
-    # credential-accepting surface, since `oidc_enabled` refuses to validate without `ad_enabled`.
-    # Defaults True so the split alone changes nothing; whether this pathway should survive at all is a
-    # separate question and deliberately not decided here.
     ad_server: str | None = None  # e.g. ldaps://dc1.example.com:636
     ad_domain: str | None = None  # e.g. example.com (UPN suffix)
     ad_user_search_base: str | None = None
@@ -2723,7 +2725,7 @@ class AuthSettings(_Section):
     ad_session_revoke_max_fraction: float = 0.34  # proportional: ...nor more than this share
 
     # Windows SSO (Kerberos/SPNEGO) — passwordless login from a domain-joined client.
-    # Experimental; off by default. Not a supported v0.1 feature — hardening targeted for 0.2.
+    # Experimental; off by default. Needs ad_enabled.
     kerberos_enabled: bool = False
     # Exactly SERVICE/host, e.g. HTTP/host.example.com; no realm suffix. Refused at load otherwise.
     # Unset or empty calls spnego.server() bare: GSSAPI then uses the default keytab, but SSPI
@@ -2776,8 +2778,8 @@ class AuthSettings(_Section):
     # refused. This no longer decides which on-prem account a login reaches: since ADR 0184 the bound
     # (issuer, sub) pair selects it, and the claim is only a hint in the not-bound refusal. It was that
     # control before, because `preferred_username` is neither unique nor stable (OIDC Core §5.7) and is
-    # self-editable on many IdPs. Empty = fall back to [auth].ad_domain; if neither is set,
-    # oidc_enabled is refused at load rather than stripping unchecked. List the alternate UPN suffixes
+    # self-editable on many IdPs. Empty = fall back to [auth].ad_domain; if neither is set while
+    # strip_domain is on, oidc_enabled is refused at load rather than stripping unchecked. List the alternate UPN suffixes
     # of a multi-domain forest here.
     oidc_allowed_username_domains: list[str] = Field(default_factory=list)
     oidc_clock_skew_seconds: int = 60  # wall clock; validator-capped 0..300
