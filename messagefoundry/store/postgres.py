@@ -89,6 +89,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
@@ -6996,6 +6997,7 @@ class PostgresStore:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
 
@@ -7015,6 +7017,13 @@ class PostgresStore:
         if until is not None:
             params.append(until)
             clauses.append(f"ts <= ${len(params)}")
+        if exclude is not None:
+
+            def bind(value: str) -> str:
+                params.append(value)
+                return f"${len(params)}"
+
+            clauses.extend(exclude.clauses(bind))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"

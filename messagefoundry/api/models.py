@@ -882,7 +882,9 @@ class DbInfo(BaseModel):
     journal_mode: str
     messages: int
     events: int
-    audit: int
+    # The audit_log row count. None for a caller without users:manage (BACKLOG #1131): the count
+    # includes the hidden lock rows, so it minus the rows GET /audit returns is their number.
+    audit: int | None
     # SQLite durability mode (PRAGMA synchronous): "normal" (shipped default) or "full"; None on the
     # server backends (a SQLite-only knob). Read-only observability (B7) so a status reader / load run
     # records which durability mode it measured. Defaulted so older clients deserialize unchanged.
@@ -903,7 +905,9 @@ class LogInfo(BaseModel):
     path: str
     # None = unmeasurable (see DbStatus.disk_free_bytes). The two halves fail independently: a
     # readable directory on an unstattable mount yields a size with no free space, and vice versa.
-    size_bytes: int | None  # total bytes of regular files under the log directory (one level)
+    # Total bytes of regular files under the log directory (one level). Also None for a caller
+    # without users:manage (BACKLOG #1131): the total counts the audit copies of hidden lock rows.
+    size_bytes: int | None
     disk_free_bytes: int | None  # free space on the log directory's filesystem
 
 

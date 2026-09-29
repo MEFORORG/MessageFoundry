@@ -39,6 +39,9 @@ log = logging.getLogger(__name__)
 audit_logger = logging.getLogger("messagefoundry.audit")
 audit_logger.setLevel(logging.INFO)
 
+#: Whether this process has logged a tee failure; see the handler in :func:`emit_audit_tee`.
+_TEE_FAILURE_LOGGED = False
+
 
 def emit_audit_tee(
     *,
@@ -134,4 +137,16 @@ def emit_audit_tee(
         ensure_logger_sink(audit_logger)
         audit_logger.info(json.dumps(record, ensure_ascii=False))
     except Exception:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
-        log.warning("off-box audit tee failed for action=%s", action, exc_info=True)
+        # Once per process, and never naming the row (BACKLOG #1131). A line per failed row named
+        # its action, and its COUNT tracked the rows, the hidden lock rows included; ``GET
+        # /logs/tail`` serves this log to ``logs:view``, which the Operator holds without
+        # ``users:manage``. The first failure is what an operator needs: the sink is broken, and
+        # every row is still in the store's ``audit_log``.
+        global _TEE_FAILURE_LOGGED
+        if not _TEE_FAILURE_LOGGED:
+            _TEE_FAILURE_LOGGED = True
+            log.warning(
+                "off-box audit tee failed; the rows are still in the audit_log table, and further "
+                "tee failures in this process are not logged",
+                exc_info=True,
+            )
