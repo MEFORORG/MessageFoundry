@@ -582,6 +582,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A DR backup or standalone `restore-verify` that will not fit now fails before it writes.** A
+  backup checks the free space on its staging and destination volumes after its sweep and before
+  anything is written. It counts the store file and its WAL twice on the staging volume, the
+  archive once on the destination, and all three when the two share a volume. A short run fails
+  with a `backup_failed` alert of the new kind `space` that names the volume and both sizes. A
+  standalone verify needs about twice the archive free under the OS temp dir. Short, it returns
+  `FAIL` with a reason that says the volume, not the archive, is at fault. A volume whose free
+  space cannot be read is not checked. The `cleanup` alert, raised when a good backup's staging
+  cannot be cleared, now uses its own subject, `dr_backup:staging`. It shared `dr_backup` with a
+  failed backup, and so shared its realert throttle: one could silence the other.
+  (`BACKLOG #1174`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

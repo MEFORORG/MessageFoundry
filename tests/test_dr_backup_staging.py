@@ -25,6 +25,7 @@ import errno
 import hmac
 import io
 import os
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -826,7 +827,7 @@ async def test_a_staging_leftover_after_a_good_build_is_alerted_and_audited(
     (row,) = rows
     detail = json.loads(row["detail"])
     assert detail["verify"] == "PASS" and "synthetic" in detail["staging_leftover"]
-    assert [(n, k) for n, k, _d in alerts] == [("dr_backup", "cleanup")]
+    assert [(n, k) for n, k, _d in alerts] == [(dr_backup.CLEANUP_ALERT_SUBJECT, "cleanup")]
 
 
 # --- #1167: the keyring walk visits every key ------------------------------------------
@@ -872,3 +873,111 @@ def test_a_forged_key_id_with_a_lone_surrogate_is_a_non_match(tmp_path) -> None:
     come back as no match -- a clean KEY_MISMATCH -- and not as a UnicodeEncodeError."""
     key = base64.b64decode(generate_key())
     assert dr_backup._select_decrypt_key([key], "\ud800") is None
+
+
+# --- PR 1771 defect 3: free space is checked before anything is written ------------------------
+
+
+class _Usage:
+    def __init__(self, free: int) -> None:
+        self.total, self.used, self.free = free * 10, free * 9, free
+
+
+def _free_space(monkeypatch: pytest.MonkeyPatch, free: int) -> list[Path]:
+    """Report ``free`` bytes on every volume; return the paths asked about."""
+    asked: list[Path] = []
+
+    def usage(path: object) -> _Usage:
+        asked.append(Path(str(path)))
+        return _Usage(free)
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    return asked
+
+
+async def test_a_backup_that_will_not_fit_fails_before_it_writes(tmp_path, monkeypatch) -> None:
+    """The run fails early with kind `space`, naming the volume, and leaves no staging, no archive
+    and no partial file behind. Before, it failed part-way through the write, if at all."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    asked = _free_space(monkeypatch, 1)
+    alerts: list[tuple[str, str, str | None]] = []
+
+    class _Sink:
+        def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
+            alerts.append((name, kind, detail))
+
+        def __getattr__(self, _name: str) -> object:
+            return lambda *a, **k: None
+
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(dest)),
+        store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key),
+        config_dir=None,
+        instance="dev",
+        alert_sink=_Sink(),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(BackupError) as caught:
+            await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "space"
+    assert "free space" in str(caught.value) and "MiB" in str(caught.value)
+    assert asked, "the check never asked the volume"
+    assert [(n, k) for n, k, _d in alerts] == [("dr_backup", "space")]
+    assert _staging_dirs(data_dir) == [] and list(dest.iterdir()) == []
+    assert _everything_under(iso) == []
+
+
+async def test_a_backup_runs_when_free_space_cannot_be_read(tmp_path, monkeypatch) -> None:
+    """An unreadable volume is not a reason to refuse; the write still fails loudly if it must."""
+    data_dir = tmp_path / "data"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+
+    def usage(_path: object) -> _Usage:
+        raise OSError("synthetic: no statfs here")
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    try:
+        result = await _runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and Path(result.archive_path).is_file()
+
+
+def test_two_directories_on_one_volume_add_up(tmp_path, monkeypatch) -> None:
+    """A server-DB store stages under its own destination, so the check must sum the two."""
+    _free_space(monkeypatch, 150)
+    a, b = tmp_path / "staging", tmp_path / "dest"
+    assert dr_backup._space_shortfall([(a, 100)]) is None
+    assert dr_backup._space_shortfall([(b, 100)]) is None
+    shortfall = dr_backup._space_shortfall([(a, 100), (b, 100)])
+    assert shortfall is not None and str(tmp_path) in shortfall
+
+
+async def test_a_standalone_verify_that_will_not_fit_fails_before_it_decrypts(
+    tmp_path, monkeypatch
+) -> None:
+    """The verdict says the volume is at fault, not the archive, and nothing is staged."""
+    archive, key = await _archive(tmp_path, config_only=False)
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    decrypted: list[Path] = []
+    real = dr_backup._verify_in_staging
+
+    def verify(staging: Path, **kw: object) -> object:
+        decrypted.append(staging)
+        return real(staging, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", verify)
+    _free_space(monkeypatch, archive.stat().st_size)  # half of what the decrypt and extract need
+    res = await run_restore_verify(str(archive), store_settings=StoreSettings(encryption_key=key))
+    assert res.status == "FAIL"
+    assert res.reason is not None and "not a fault in it" in res.reason
+    assert decrypted == []
+    assert _everything_under(iso) == []

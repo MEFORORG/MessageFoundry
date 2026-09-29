@@ -207,10 +207,19 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
+#: The subject a ``cleanup`` alert carries (BACKLOG #1174, PR 1771 defect 5). A good run whose
+#: staging could not be cleared is not a failed backup, so it must not share the failed-backup
+#: subject: the notifier keys its realert throttle and the durable alert instance on type plus
+#: subject, so a cleanup alert under ``dr_backup`` would silence a real failure for the cooldown,
+#: or be silenced by one.
+CLEANUP_ALERT_SUBJECT = "dr_backup:staging"
+
+
 class BackupError(RuntimeError):
     """A backup run failed at a named phase (``snapshot``/``encrypt``/``write``/``verify``/
-    ``destination``). The same alert also carries kind ``cleanup``, for a good run whose staging
-    could not be cleared (see :attr:`BackupResult.staging_leftover`). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
+    ``destination``/``space``). The same alert also carries kind ``cleanup``, under
+    :data:`CLEANUP_ALERT_SUBJECT`, for a good run whose staging could not be cleared (see
+    :attr:`BackupResult.staging_leftover`). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
     record it in the ``dr_backup`` ERROR audit row — the message is the ``safe_exc``-scrubbed cause
     (PHI-free)."""
 
@@ -479,6 +488,15 @@ class BackupRunner:
         # a sibling engine shard's live run survives it. Both run off the loop.
         staging_root, secure = self._staging_root(dest_dir)
         await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
+        # After the sweep, which frees what a dead run left, and before anything is written: a run
+        # that cannot fit fails here, naming the volume, not half-way through a multi-GB write.
+        shortfall = await asyncio.to_thread(
+            self._space_shortfall, staging_root, dest_dir, config_only=config_only
+        )
+        if shortfall is not None:
+            raise BackupError(
+                "space", f"not enough free space to stage this backup: it {shortfall}"
+            )
         loop = asyncio.get_running_loop()
         opening = loop.run_in_executor(
             None,
@@ -1042,7 +1060,7 @@ class BackupRunner:
             # operator must still hear about, through the same alert a failed run raises.
             try:
                 self._alert_sink.backup_failed(
-                    "dr_backup", kind="cleanup", detail=result.staging_leftover
+                    CLEANUP_ALERT_SUBJECT, kind="cleanup", detail=result.staging_leftover
                 )
             except Exception:
                 log.warning("DR backup: backup_failed alert sink raised", exc_info=True)
@@ -1097,6 +1115,30 @@ class BackupRunner:
             server_db=self._is_server_db(),
             store_path=path if isinstance(path, str) else None,
             destination=dest_dir,
+        )
+
+    def _space_shortfall(
+        self, staging_root: Path, dest_dir: Path, *, config_only: bool
+    ) -> str | None:
+        """Whether this run fits, as :func:`_space_shortfall` answers it. Runs off the loop.
+
+        The peak, with ``S`` the store file plus its WAL and ``C`` the config bundle: the staging
+        root holds the snapshot and the tar at once (``2S + C``), and so does the backup's own verify
+        later (the decrypted tar and the extracted store); the destination holds the archive
+        (``S + C``, the tar plus a small framing overhead). On one volume that is ``3S + 2C``. The
+        WAL is counted because the snapshot may carry what a checkpoint has not yet moved."""
+        store_bytes = 0
+        path = getattr(self._store, "path", None)
+        if not config_only and isinstance(path, str) and path != ":memory:":
+            store_bytes = _file_size(Path(path)) + _file_size(Path(path + "-wal"))
+        config_bytes = 0
+        if self._settings.include_config and self._config_dir is not None:
+            config_bytes = _tree_size(Path(self._config_dir))
+        return _space_shortfall(
+            [
+                (staging_root, 2 * store_bytes + config_bytes),
+                (dest_dir, store_bytes + config_bytes),
+            ]
         )
 
     def _backend_value(self) -> str:
@@ -1274,16 +1316,33 @@ def _verify_archive_blocking(
             # before the decrypt, so a dead run's plaintext is gone before this one needs the space.
             # Inside this block, so even a fault in the sweep still releases this run's directory.
             _sweep_abandoned_staging(staging_root, owned_like=work.path)
+        # A standalone verify holds the decrypted tar and the extracted store at once, each about the
+        # archive's size (BACKLOG #1174, PR 1771 defect 3). The backup's own verify is covered by the
+        # backup's check, which counts this peak on its staging root.
+        shortfall = (
+            _space_shortfall([(work.path, 2 * _file_size(Path(archive_path)))])
+            if standalone
+            else None
+        )
         try:
-            result = _verify_in_staging(
-                work.path,
-                archive_path=archive_path,
-                encrypted=encrypted,
-                match_key=match_key,
-                full=full,
-                store_settings=store_settings,
-                secure=secure,
-            )
+            if shortfall is not None:
+                # The reason says it is the volume, not the archive, so this FAIL is not read as a
+                # verdict on the archive.
+                result = VerifyResult(
+                    "FAIL",
+                    reason=f"not enough free space to verify this archive (not a fault in it): "
+                    f"it {shortfall}",
+                )
+            else:
+                result = _verify_in_staging(
+                    work.path,
+                    archive_path=archive_path,
+                    encrypted=encrypted,
+                    match_key=match_key,
+                    full=full,
+                    store_settings=store_settings,
+                    secure=secure,
+                )
         except (BackupCodecError, OSError, tarfile.TarError) as exc:
             result = _verify_failure(exc)
     except BaseException as exc:
@@ -1616,6 +1675,71 @@ def _release_when_opened(opening: asyncio.Future[_Staging]) -> None:
         return
     work = opening.result()
     asyncio.get_running_loop().run_in_executor(None, work.release)
+
+
+def _file_size(path: Path) -> int:
+    """The size of ``path``, or 0 when it does not exist or cannot be read."""
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return 0
+
+
+def _tree_size(root: Path) -> int:
+    """The total size of the regular files under ``root``, never following a link, which is also
+    what ``_add_config_dir`` puts in the archive. 0 when ``root`` cannot be walked."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
+    return total
+
+
+def _nearest_existing(path: Path) -> Path:
+    """``path``, or its nearest ancestor that exists: a staging root may not be created yet."""
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return candidate
+    return path
+
+
+def _mib(n: int) -> str:
+    return f"{max(n, 0) / (1024 * 1024):,.0f} MiB"
+
+
+def _space_shortfall(needs: list[tuple[Path, int]]) -> str | None:
+    """A PHI-free sentence naming the first volume without room for what will be written there, or
+    ``None`` when every volume has room (BACKLOG #1174, PR 1771 defect 3).
+
+    ``needs`` pairs each directory with the bytes a run will hold there at its peak. Two directories
+    on one volume add up, which is the case that matters most: a server-DB store stages under its
+    own backup destination. A volume whose free space cannot be read is skipped, not failed: the
+    check exists to fail early and clearly, and a run it cannot judge still fails at the write."""
+    by_volume: dict[int, tuple[Path, int]] = {}
+    for path, needed in needs:
+        existing = _nearest_existing(path.absolute())
+        try:
+            volume = os.stat(existing).st_dev
+        except OSError:
+            continue
+        where, total = by_volume.get(volume, (existing, 0))
+        by_volume[volume] = (where, total + needed)
+    for where, total in by_volume.values():
+        try:
+            free = shutil.disk_usage(where).free
+        except OSError:
+            continue
+        if free < total:
+            return (
+                f"needs about {_mib(total)} free on the volume holding {where}, "
+                f"and {_mib(free)} is free"
+            )
+    return None
 
 
 def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
