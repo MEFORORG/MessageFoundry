@@ -6252,7 +6252,8 @@ def create_app(
 
         ``owns_lease_row`` is the coordinator's ``may_own_lease_row()``: whether ``POST
         /cluster/stepdown`` on this node would send the lease-expiring write (BACKLOG #1988). It is
-        True on a self-fenced node, whose flag is clear while its lease row still names it."""
+        True on a self-fenced node too, whose flag is clear while its lease row still names it. It
+        means "may own": that write is owner-scoped, so it can still match nothing and answer 409."""
         c = engine.coordinator
         clustered = c.is_clustered()
         is_leader = c.is_leader()

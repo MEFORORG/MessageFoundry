@@ -129,13 +129,16 @@ under Changed says why engine 0.4.0 does not work with this console.
 - **The High Availability page offers the stepdown control on a self-fenced node** (`BACKLOG
   #1988`). The engine already drained such a node through the API (`BACKLOG #1508`), but the page
   offered the control only when both leadership signals named the node, so the operator had to use
-  the API. The page now offers it exactly when the engine would drain the node, read from the new
+  the API. The page now offers it when the engine would send the release, read from the new
   `ClusterStatus.owns_lease_row`. It does not guess from `lease_expires_at`, which is on the
-  database clock. A node that has just released its lease, or a standby, stays disabled. On a
-  self-fenced node the page and both confirm pages say the node is releasing a lease it no longer
-  serves, and do not call it a failover in progress. The `409` refusal page now reads "This node
-  holds no lease to release" and names the self-fenced race among the cases where failover already
-  worked. Needs an engine that publishes `owns_lease_row`, so the seam digest moved.
+  database clock. A node that has just released its lease, or a standby, stays disabled. So does a
+  node that has just taken the lease, until its heartbeat shows it, as before. On a node whose flag
+  is clear while it still owns the lease row, the page and both confirm pages say it is releasing a
+  lease it no longer serves, and do not call it a failover in progress. Where the lease already
+  names another node, they say to expect a `409` instead. The `409` refusal page now reads "This
+  node holds no lease to release", and it warns about the healthy successor before it tells the
+  operator to open the console on the leader. The post-stepdown notices say "Leadership lease
+  released". Needs an engine that publishes `owns_lease_row`, so the seam digest moved.
 - **The uploaded-file pages explain a refused, throttled or unavailable action** (`BACKLOG #1169`,
   PR 1506 follow-up A). Browse, resend and delete showed the engine's raw JSON for a status they
   did not map. Two new allow-listed codes cover browse: `browse_hop_refused` (the PHI-read hop

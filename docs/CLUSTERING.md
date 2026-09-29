@@ -194,10 +194,18 @@ false`, `is_leader: true`, `role: "single-node"`, `config_version: 0`, `owns_lea
   "role": "single-node", "config_version": 0, "owns_lease_row": false }
 ```
 
-`owns_lease_row` says whether `POST /cluster/stepdown` on this node would release a lease row. It is
-true while the node leads. It is also true on a self-fenced node: its flag is clear, so it reports
-`standby`, but its lease row still names it. The web console reads this field to decide whether to
-offer the stepdown control. Do not work it out from `lease_expires_at`, which is on the database clock.
+`owns_lease_row` says whether `POST /cluster/stepdown` on this node would send the write that
+releases its lease. It is true at least in these cases:
+
+- while the node leads;
+- on a self-fenced node, whose flag is clear (so it reports `standby`) while its lease row still
+  names it;
+- while an earlier stepdown's release write is owed, after a `503` that could not confirm it.
+
+It means "may own". The write only matches a row that names this node, so if another node has
+already taken the lease, the stepdown releases nothing and answers `409`. The web console reads this
+field to decide whether to offer the stepdown control. Do not work it out from `lease_expires_at`,
+which is on the database clock.
 
 ### `GET /cluster/nodes` — all nodes + the derived leader
 

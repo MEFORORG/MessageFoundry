@@ -1090,10 +1090,12 @@ class ClusterStatus(BaseModel):
     is_leader: bool
     role: str
     config_version: int
-    # Whether a stepdown on this node would release a lease row (BACKLOG #1988): the engine's own
-    # drain test, published so a client never judges lease liveness from ``lease_expires_at``, which
-    # is on the DB clock. True while this node leads, and also on a self-fenced node, whose flag is
-    # clear while its lease row still names it. False after a release that returned, and single-node.
+    # Whether a stepdown on this node would SEND the lease-release write (BACKLOG #1988): the engine's
+    # own drain test, published so a client never judges lease liveness from ``lease_expires_at``,
+    # which is on the DB clock. True at least while this node leads, while it is self-fenced (flag
+    # clear, lease row still naming it) and while an earlier release write is owed. It means "may
+    # own": the write is owner-scoped, so if another node has taken the row the stepdown releases
+    # nothing and answers 409. False after a release that returned, and on a single node.
     owns_lease_row: bool = False
 
 

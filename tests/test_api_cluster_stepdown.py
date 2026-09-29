@@ -125,6 +125,11 @@ class _StandinCoordinator(NullCoordinator):
     def is_clustered(self) -> bool:
         return self._clustered
 
+    def may_own_lease_row(self) -> bool:
+        # What a real coordinator reports outside the self-fence window: a clustered leader owns its
+        # row. NullCoordinator's answer (always False) would publish the opposite for a stand-in leader.
+        return self._clustered and self._leader
+
     async def cluster_members(self) -> list[ClusterMember]:
         self.calls.append("cluster_members")
         if self._members_raise is not None:
@@ -399,11 +404,12 @@ class _SelfFencedCoordinator(_StandinCoordinator):
 @pytest.mark.parametrize(
     ("coord", "role", "owns"),
     [
+        (_StandinCoordinator(clustered=True, leader=True), "primary", True),
         (_StandinCoordinator(clustered=True, leader=False), "standby", False),
         (_SelfFencedCoordinator(clustered=True, leader=False), "standby", True),
         (_StandinCoordinator(clustered=False, leader=True), "single-node", False),
     ],
-    ids=["standby", "self-fenced", "single-node"],
+    ids=["leader", "standby", "self-fenced", "single-node"],
 )
 async def test_cluster_status_publishes_the_engines_own_drain_test(
     tmp_path: Path, coord: _StandinCoordinator, role: str, owns: bool

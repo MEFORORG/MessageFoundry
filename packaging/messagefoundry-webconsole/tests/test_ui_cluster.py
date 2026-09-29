@@ -159,7 +159,16 @@ def test_the_leader_with_cluster_control_is_offered_both_actions() -> None:
             _status(is_leader=False),
             _healthy(),
             True,
-            "Leadership is changing hands",
+            "it has let go of its lease",
+        ),
+        (
+            # The other side of a failover: node-a has just taken the lease and its heartbeat does
+            # not show it yet. The engine would drain it, but the page still describes the failover
+            # that promoted it, so the control waits one heartbeat, as it always did.
+            _status(),
+            _nodes(_node("node-a"), _node("node-b"), leader=None),
+            True,
+            "it has just taken the lease",
         ),
         (
             _status("node-b", is_leader=False),
@@ -168,7 +177,14 @@ def test_the_leader_with_cluster_control_is_offered_both_actions() -> None:
             "open the console on the leader, node-a",
         ),
     ],
-    ids=["single-node", "no-permission", "no-leader", "flag-and-heartbeat-disagree", "standby"],
+    ids=[
+        "single-node",
+        "no-permission",
+        "no-leader",
+        "flag-and-heartbeat-disagree",
+        "just-promoted",
+        "standby",
+    ],
 )
 def test_the_control_is_disabled_with_its_reason_whenever_it_cannot_act(
     cluster: ClusterStatus, nodes: ClusterNodeList, can_control: bool, reason: str
@@ -215,6 +231,8 @@ def test_a_self_fenced_node_is_offered_the_control_with_its_own_wording(
     assert "releases the lease it no longer serves" in html
     assert "its lease row still names it" in html
     assert "Failover in progress" not in html
+    # The heartbeat can still show node-a as leader, so the banner must not say there is none.
+    assert "No live leader" not in html
 
 
 def test_a_self_fenced_node_whose_lease_moved_is_told_what_the_engine_will_answer() -> None:
@@ -240,6 +258,21 @@ def test_the_self_fenced_confirm_says_it_releases_a_lease_not_leadership() -> No
     # The forced page used to say force "does not step down a node that is not the leader", which
     # a self-fenced node, offered this very page, would contradict.
     assert "not the leader" not in forced
+
+
+def test_a_confirm_page_where_the_lease_moved_names_no_successor_as_a_candidate() -> None:
+    """The lease already names node-b, so node-b is the successor. The confirm pages must not
+    promise a handover this stepdown cannot make, nor list node-b as a node that could take over."""
+    moved = _nodes(
+        _node("node-a"), _node("node-b", is_leader=True), leader="node-b", lease_owner="node-b"
+    )
+    for force in (False, True):
+        html = str(pages.stepdown_confirm(_fenced(), moved, force=force))
+        assert "the lease no longer names it" in html, force
+        assert "this node holds no lease" in html, force
+        assert "still holds" not in html, force
+        assert "A standby takes the lease on its next heartbeat" not in html, force
+        assert "node-b" not in html, force
 
 
 def test_a_leaderless_cluster_with_no_candidate_does_not_claim_a_failover() -> None:
@@ -361,6 +394,8 @@ def test_each_refusal_renders_its_own_guidance() -> None:
     # ...while a 409 does, with the one case where it is the failover having worked.
     assert "open the console there" in by_status[409]
     assert "healthy successor" in by_status[409]
+    # The warning comes first: the remedy names the leader, which can be that very successor.
+    assert by_status[409].index("healthy successor") < by_status[409].index("open the console")
     assert "the retry re-sends the write" in by_status[503]
     assert "There is no leadership lease to release" in by_status[400]
 
@@ -369,8 +404,8 @@ def test_the_notice_is_selected_by_code_never_supplied_by_the_query() -> None:
     plain = str(pages.high_availability(_status(), _healthy(), can_control=True))
     released = pages.high_availability(_status(), _healthy(), can_control=True, notice="released")
     drained = pages.high_availability(_status(), _healthy(), can_control=True, notice="drained")
-    assert "Leadership released." in str(released)
-    assert "Leadership released with force" in str(drained)
+    assert "Leadership lease released." in str(released)
+    assert "Leadership lease released with force" in str(drained)
     hostile = pages.high_availability(_status(), _healthy(), can_control=True, notice="<b>x</b>")
     assert str(hostile) == plain
 
@@ -603,7 +638,7 @@ async def test_a_stepdown_through_the_console_reaches_the_engine_and_redirects(
         rows = await _stepdown_rows(engine)
         assert len(rows) == 1 and rows[0]["actor"] == "u"
         assert json.loads(str(rows[0]["detail"]))["force"] is False
-        assert "Leadership released." in (await c.get(r.headers["location"])).text
+        assert "Leadership lease released." in (await c.get(r.headers["location"])).text
 
 
 async def test_a_self_fenced_node_is_drained_through_the_console(tmp_path: Path) -> None:
