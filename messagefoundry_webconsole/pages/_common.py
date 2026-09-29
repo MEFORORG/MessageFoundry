@@ -127,15 +127,12 @@ def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None)
     It lives beside :func:`_pager` rather than in each page that calls it, because the next capped
     listing needs the same sentence and copying it is how the two pagers diverged."""
     if total is None:
-        if shown >= limit:
-            return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
-        return el("p", f"{shown} {noun} shown.", class_="muted")
-    total = max(total, shown)
-    if total > shown and shown >= limit:
-        return el(
-            "p", f"{shown} of {total} {noun} shown, capped at the newest {limit}.", class_="muted"
-        )
-    return el("p", f"{shown} of {total} {noun} shown.", class_="muted")
+        count, capped = f"{shown} {noun}", shown >= limit
+    else:
+        total = max(total, shown)
+        count, capped = f"{shown} of {total} {noun}", total > shown and shown >= limit
+    bound = f", capped at the newest {limit}" if capped else ""
+    return el("p", f"{count} shown{bound}.", class_="muted")
 
 
 # At most this many failed inbounds are named in the heart's reason; the rest become "and N more".

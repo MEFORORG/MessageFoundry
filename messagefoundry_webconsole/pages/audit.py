@@ -38,10 +38,13 @@ def audit_log(data: AuditList, *, limit: int) -> Markup:
     offset nor a count; giving this page a pager is a separate row that has to add both.
 
     THE EXPORT IS NOT THE COMPLETE RECORD EITHER, so the page does not call it one (BACKLOG #1743
-    residual (c)). ``GET /audit/export`` reads the same newest-first query with its own ``limit``
-    and no offset, so it too returns only the newest rows up to that limit. What it adds is a time
-    filter: ``since`` and ``until`` walk it back to older entries. The page states that and no
-    number, because the export's bounds live on the route and a copy here would drift.
+    residual (c)). It is newest-first under its own ``limit`` with no offset; its signature in
+    ``api/auth_routes.py`` ``export_audit`` is the source of record, which is why the page quotes no
+    number. It is a JSON API route, so this console's cookie does not reach it, and the page says
+    so rather than reading as a link the operator can follow.
+
+    The header's "off this page" sentence is scoped to a capped note. Unscoped, it told the reader
+    of a short, complete listing that a missing event was somewhere else.
 
     ``limit`` is passed in rather than re-declared here so the sentence states the bound the query
     actually used — a second copy of the number would be wrong the day either one moved."""
@@ -55,10 +58,12 @@ def audit_log(data: AuditList, *, limit: int) -> Markup:
         el(
             "p",
             "The tamper-evident audit trail (metadata only — no PHI). Most recent first. This page "
-            "shows only the most recent entries, so an older event missing here is off this page, "
-            "not out of the log. The audit export (GET /audit/export, which needs audit:export) is "
-            "capped too: it returns the newest entries up to its own row limit. To reach older "
-            "entries, filter the export by time with since and until.",
+            "shows only the most recent entries. When the note below says the list is capped, an "
+            "older event missing here is off this page, not out of the log. The engine API's audit "
+            "export (GET /audit/export, permission audit:export, called with an API token rather "
+            "than this console session) is capped too: it returns the newest entries up to its "
+            "limit parameter. To reach older entries, raise that limit or set until to an earlier "
+            "time.",
             class_="muted",
         ),
         rows_table(["When", "Actor", "Action", "Channel", "Detail"], rows),
@@ -81,8 +86,9 @@ def security_events(data: SecurityEventsList, *, limit: int) -> Markup:
         el(
             "p",
             "Recent security-relevant activity on your account (sign-ins, lockouts, credential "
-            "changes). Most recent first, and only the most recent — an older event missing here "
-            "is off this page, not absent from the record.",
+            "changes). Most recent first, and only the most recent. When the note below says the "
+            "list is capped, an older event missing here is off this page, not absent from the "
+            "record.",
             class_="muted",
         ),
         rows_table(["When", "Event", "Detail"], rows),

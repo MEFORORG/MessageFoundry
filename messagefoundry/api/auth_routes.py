@@ -1571,8 +1571,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # `limit` rows and nothing older, which is not the full trail and must not be described as one
         # (BACKLOG #1743): this wrapper takes no offset because the store's list_audit has none, so
         # there is no second page to reach and no total to compare against. Filter + CSV export are the
-        # JSON GET /audit surface. The export is capped too (its own `limit`, no offset), so an older
-        # entry is reached by narrowing it with since/until, not by one call. AUDIT_READ is
+        # JSON GET /audit surface. The export is capped too (see export_audit's `limit`, no offset),
+        # so it is not a complete record either. AUDIT_READ is
         # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
         # dependency of its own. The identity it is handed is the page's caller, and it decides which
         # rows that caller may read (BACKLOG #1131).
