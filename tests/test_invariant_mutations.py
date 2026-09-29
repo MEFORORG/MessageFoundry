@@ -251,3 +251,62 @@ def test_a_leftover_backup_is_restored_only_over_its_own_break(
     with pytest.raises(_MOD.LeftoverBackup):
         _MOD.restore_leftovers([row])
     assert target.read_bytes() == b"guard = True\nnew_work = 1\n"
+
+
+# THE NIGHTLY WORKFLOW (limb 5). At least the links below, from a surviving mutation to a person,
+# are pinned, because each breaks silently: the workflow still runs and goes green. That the watched
+# name has a `case` arm in nightly-notice.yml is tests/test_nightly_notice.py's job, not this file's.
+_WORKFLOW = "invariant-mutations.yml"
+
+#: Minutes the job cap must exceed the run step's own timeout by, to cover checkout and install.
+#: The step's timeout concludes `failure`; the job's concludes `cancelled`, which nightly-notice
+#: ignores, so the job cap must never be the one that fires.
+_SETUP_MARGIN_MINUTES = 10
+
+
+def test_the_nightly_workflow_runs_only_on_schedule_and_dispatch() -> None:
+    """A pull-request or queue trigger would put a ten-minute, checkout-editing run on every merge."""
+    from tests._workflow_contexts import triggers_of
+
+    assert set(triggers_of(_WORKFLOW)) == {"schedule", "workflow_dispatch"}
+
+
+def test_the_nightly_workflow_can_go_red_and_reaches_a_person() -> None:
+    """At least these routes from a red run to an issue are closed.
+
+    The runner must run, unconditionally; nothing may turn its red into a pass; a hang must still
+    conclude ``failure``; nightly-notice must watch the workflow; and the context must stay on the
+    never-required list.
+    """
+    from tests._workflow_contexts import context_of, load_workflow, triggers_of
+    from tests.test_required_contexts import _MUST_NOT_BE_REQUIRED
+
+    doc = load_workflow(_WORKFLOW)
+    jobs = doc["jobs"]
+    (job,) = jobs.values()
+    steps = job.get("steps", [])
+    runner = [s for s in steps if "scripts/ci/invariant_mutations.py" in str(s.get("run", ""))]
+    assert len(runner) == 1, "exactly one step must run the mutation runner"
+    run = str(runner[0]["run"])
+
+    # An `if:` skips the step on schedule, and a skipped step lets the job conclude success, which
+    # nightly-notice reads as recovered and CLOSES the open issue.
+    assert "if" not in job, "a job-level `if:` can skip the nightly and read as green"
+    assert "if" not in runner[0], "an `if:` on the run step can skip it and read as green"
+    masked = [s.get("name") for s in steps if s.get("continue-on-error")]
+    assert not job.get("continue-on-error") and not masked, "continue-on-error hides the red"
+    # The runner's exit code must be the step's: pipefail on, never switched off, nothing after `||`.
+    assert "set -euo pipefail" in run
+    assert "set +e" not in run and "set +o pipefail" not in run
+    assert "||" not in run, "anything after `||` can replace the runner's exit code"
+
+    step_cap, job_cap = runner[0].get("timeout-minutes", 0), job.get("timeout-minutes", 0)
+    assert step_cap > 0, "the run step needs its own timeout-minutes"
+    assert step_cap + _SETUP_MARGIN_MINUTES <= job_cap, (step_cap, job_cap)
+
+    assert doc["name"] in triggers_of("nightly-notice.yml")["workflow_run"]["workflows"]
+    for key, j in jobs.items():
+        assert context_of(key, j) in _MUST_NOT_BE_REQUIRED, (
+            f"{context_of(key, j)!r} is not in tests/test_required_contexts.py's "
+            "_MUST_NOT_BE_REQUIRED, so nothing stops it being made a required context."
+        )
