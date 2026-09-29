@@ -87,6 +87,7 @@ _DEK_DEPARTURES = frozenset(
     {
         "5.2 one purpose",
         "8.1.5.2.1 generation",
+        "8.1.5.2.2.1 manual distribution",
         "8.2.4 key derivation",
         "5.3.6 cryptoperiod",
         "7.4 deactivated",
@@ -510,20 +511,25 @@ def test_the_totp_mapping_row_takes_no_cryptoperiod() -> None:
     )
 
 
+def dek_section(doc: str) -> list[str]:
+    """The lines of the DEK mapping subsection, from its heading to the next ``### ``."""
+    lines = doc.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith(_DEK_MAPPING_HEADING)), None)
+    if start is None:
+        return []
+    end = next(
+        (i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.startswith("### ")),
+        len(lines),
+    )
+    return lines[start:end]
+
+
 def dek_clause_rows(doc: str) -> tuple[dict[str, str], list[str]]:
     """The DEK mapping's WRITTEN rows by clause -> whole row, and any clause written twice.
 
     Only lines inside the DEK mapping subsection are read, so a row elsewhere in the doc that
     happens to lead with the same clause can neither stand in for one nor mask an edit to one."""
-    lines = doc.splitlines()
-    start = next((i for i, ln in enumerate(lines) if ln.startswith(_DEK_MAPPING_HEADING)), None)
-    if start is None:
-        return {}, []
-    end = next(
-        (i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.startswith("### ")),
-        len(lines),
-    )
-    section = lines[start:end]
+    section = dek_section(doc)
     firsts = _first_cells(section, _DEK_MAPPING_HEADING)
     rows: dict[str, str] = {}
     for line in section:
@@ -532,6 +538,12 @@ def dek_clause_rows(doc: str) -> tuple[dict[str, str], list[str]]:
             rows.setdefault(cells[0], line)
     twice = sorted({c for c in firsts if firsts.count(c) > 1})
     return rows, twice
+
+
+def _claim_cell(row: str) -> str:
+    """The third cell of a mapping row: the claim about the engine, where a departure belongs."""
+    cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+    return cells[2] if len(cells) > 2 else ""
 
 
 def dek_mapping_problems(doc: str) -> list[str]:
@@ -543,7 +555,7 @@ def dek_mapping_problems(doc: str) -> list[str]:
     problems += [
         f"departure no longer named: {c}"
         for c in sorted(_DEK_DEPARTURES & set(rows))
-        if "**Departure" not in rows[c]
+        if "**Departure" not in _claim_cell(rows[c])
     ]
     return problems
 
@@ -576,13 +588,24 @@ def test_the_dek_mapping_guard_turns_red() -> None:
         for line in lines
     ]
     assert "departure no longer named: 5.2 one purpose" in dek_mapping_problems("\n".join(stripped))
-    # The DEK rows must not count as the other keys' mapping rows, and must not be found without
-    # their own heading.
+    # A departure moved out of the engine-claim column into the site column no longer counts.
+    moved = []
+    for line in lines:
+        if line.startswith(row):
+            cells = line.strip().strip("|").split("|")
+            cells[2] = re.sub(r"\*\*Departure[^*]*\*\*", "", cells[2])
+            cells[3] = cells[3] + " **Departure** "
+            line = "|" + "|".join(cells) + "|"
+        moved.append(line)
+    assert "departure no longer named: 5.2 one purpose" in dek_mapping_problems("\n".join(moved))
     doubled = [line for line in lines for _ in range(2 if line.startswith(row) else 1)]
     assert "clause row written twice: 5.2 one purpose" in dek_mapping_problems("\n".join(doubled))
-    headless = doc.replace(_DEK_MAPPING_HEADING, "### A renamed heading")
+    # Delete the DEK heading: its rows fall under the other-keys mapping. The DEK guard must report
+    # every clause missing, and the other-keys guard must see the clause rows as strays.
+    headless = "\n".join(line for line in lines if not line.startswith(_DEK_MAPPING_HEADING))
     assert "missing clause row: 8.3.4 destruction" in dek_mapping_problems(headless)
-    assert not ({"5.2 one purpose"} & mapping_labels(doc))
+    assert "5.2 one purpose" in mapping_labels(headless) - lifecycle_labels(headless)
+    assert "5.2 one purpose" not in mapping_labels(doc)
 
 
 #: Code symbols the DEK mapping cites, by module. A rename leaves the prose pointing at nothing.
@@ -611,13 +634,13 @@ def test_the_dek_mapping_cites_live_code() -> None:
     from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION
 
     doc = _DOC.read_text(encoding="utf-8")
-    rows, _ = dek_clause_rows(doc)
-    section = "\n".join(rows.values())
+    section = "\n".join(dek_section(doc))
     for rel, names in _DEK_CITED_SYMBOLS.items():
         source = (_ROOT / rel).read_text(encoding="utf-8")
         for name in names:
-            assert re.search(rf"`[^`]*\b{name}\b[^`]*`", doc), (
-                f"{name} is listed here but not cited"
+            # Inside the DEK subsection only, and inside one code span.
+            assert re.search(rf"`[^`\n]*\b{name}\b[^`\n]*`", section), (
+                f"{name} is listed here but the DEK mapping no longer cites it"
             )
             assert re.search(rf"^\s*(?:async\s+)?(?:def|class)\s+{name}\b", source, re.M), (
                 f"{rel} no longer defines {name}, which the DEK mapping cites"
