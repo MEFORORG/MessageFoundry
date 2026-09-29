@@ -914,6 +914,36 @@ async def _run_in_order(writes: Sequence[Callable[[], Awaitable[None]]]) -> None
         await write()
 
 
+async def _sleep_until_write_point(deadline: float) -> None:
+    """Await the monotonic instant a refused sign-in writes its audit rows (BACKLOG #1131).
+
+    Kept apart from :func:`_sleep_until`, which is the answer's pad: tests replace that one to read
+    back the one deadline each seam computes, and this wait is not a second pad."""
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+async def _write_through_cancellation(writes: Sequence[Callable[[], Awaitable[None]]]) -> None:
+    """Run ``writes`` to completion even if the caller is cancelled, then re-raise the cancel.
+
+    Shielded, and awaited again after each cancel, so a repeated cancellation neither abandons the
+    writes nor lets the caller leave (and release the account's queue) before they finish. A write
+    that fails raises as it did when the rows were written inline."""
+    task = asyncio.ensure_future(_run_in_order(writes))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                break
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    task.result()
+
+
 def _local_refusal_detail(reason: str, *, combined: bool) -> str:
     """The ``auth.login_failed`` detail of a refused local credential sign-in (BACKLOG #1131).
 
@@ -2107,30 +2137,38 @@ class AuthService:
         arrived = totp.wall_clock()  # the instant a combined sign-in's code is judged at
         async with self._account_credential_lock(username):
             queued = time.monotonic() - started
-            # A refused local sign-in's audit rows, written AFTER the pad (BACKLOG #1131, Manager
-            # decision 2026-09-28). Written before it, a row's ``ts`` showed how much work its branch
-            # did: a refusal by a live lock does one dummy verify, a verified refusal also reads the
-            # TOTP secret and counts the failure, and only a right candidate arms the second-step
-            # lock. After the pad, every refusal's rows land on its padded slot. The COUNT still
-            # happens before the pad, inside the queue, so counting is unchanged.
+            # A refused local sign-in's audit rows are written at a FIXED point of the padded
+            # window, not as its branch finishes (BACKLOG #1131, Manager decision 2026-09-28).
+            # Written as the branch finished, a row's ``ts``, and the moment it appeared to a reader
+            # polling ``GET /audit``, showed how much work the branch did: a refusal by a live lock
+            # does one dummy verify, a verified refusal also reads the TOTP secret and counts the
+            # failure, and only a right candidate arms the second-step lock. The point is the
+            # equalizer's own floor, half a budget past the attempt's turn in the queue, so the rows
+            # land there on every branch whose work fits in half a budget (the same condition the
+            # answer's slot already rests on), and the answer still goes out on its slot: the
+            # writes run INSIDE the padded window, never after it, so they cannot delay it.
+            # Written after the pad instead, the answer would wait for the writes, and the branches
+            # write different numbers of rows. The COUNT still runs before this, so counting is
+            # unchanged.
             after_pad: list[Callable[[], Awaitable[None]]] = []
-            try:
-                outcome = await self._dispatch_login(
-                    username,
-                    password,
-                    provider=provider,
-                    client=client,
-                    supersedes=supersedes,
-                    totp_code=totp_code,
-                    arrived=arrived,
-                    after_pad=after_pad,
-                )
-                return await self._equalize_failure(outcome, started, seam="login", queued=queued)
-            finally:
-                # In ``finally`` and shielded, so a caller who drops the request during the pad
-                # cannot also drop the audit trail (count-and-log).
-                if after_pad:
-                    await asyncio.shield(_run_in_order(after_pad))
+            outcome = await self._dispatch_login(
+                username,
+                password,
+                provider=provider,
+                client=client,
+                supersedes=supersedes,
+                totp_code=totp_code,
+                arrived=arrived,
+                after_pad=after_pad,
+            )
+            if after_pad:
+                try:
+                    await _sleep_until_write_point(started + queued + _FAILURE_BUDGET_SECONDS / 2)
+                finally:
+                    # A caller who drops the request here does not drop the audit trail
+                    # (count-and-log), and the account's queue is held until the rows are in.
+                    await _write_through_cancellation(after_pad)
+            return await self._equalize_failure(outcome, started, seam="login", queued=queued)
 
     async def _dispatch_login(
         self,
@@ -2220,7 +2258,8 @@ class AuthService:
         pathway, and this is the local pathway with a second factor, not a new one.
 
         **A refusal's audit rows go to ``after_pad``** when the caller passes one, and :meth:`login`
-        writes them after its failure pad, so their ``ts`` does not show which branch refused.
+        writes them at a fixed point inside its failure pad, so their ``ts`` does not show which
+        branch refused.
         Everything else, the failure count included, runs here as before."""
         code = totp_code.strip() if totp_code else ""
 

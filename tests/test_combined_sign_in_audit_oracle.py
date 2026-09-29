@@ -37,6 +37,7 @@ import csv
 import io
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -836,22 +837,26 @@ async def test_the_log_tail_withholds_the_audit_copy_from_a_reader_without_users
 async def test_the_visible_rows_timestamp_does_not_tell_a_lock_refusal_from_a_verified_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RED when: the refusal's ``auth.login_failed`` row is written before the failure pad.
+    """RED when: the refusal's ``auth.login_failed`` row is written as its branch finishes.
 
     A refusal by a live lock does one dummy password check before its row; a verified refusal also
     reads the TOTP secret and counts the failure. The row's ``ts`` then sat nearer the request's
     start on the lock path, and only a right candidate arms the second-step lock. The rows are now
-    written after ``_equalize_failure``'s pad, so both land on the same padded slot.
+    written at the equalizer's floor, half a budget in, on both paths.
+
+    Also RED when: the rows are written AFTER the pad. Then the ANSWER waits for them, and the two
+    paths write different numbers of rows. So this pins the answer's slot too.
 
     Measured the way AC-6's timing arms in ``tests/test_mfa.py`` measure (BACKLOG #1943): a fixed
-    40 ms verify, the failure count slowed by 250 ms so the gap is far wider than the host's jitter,
-    a lowered budget, and the offset read in whole budget slots."""
+    40 ms verify, the failure count slowed by 300 ms so the gap is far wider than the host's jitter
+    and still under half the budget, each audit write slowed by 150 ms, a lowered budget, and both
+    offsets read in whole half-budget units, since that is where the write point sits."""
     import messagefoundry.auth.service as svc
 
-    budget = 0.4
+    budget = 0.8
     monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
 
-    async def slot(second_step_locked: bool) -> int:
+    async def measure(second_step_locked: bool) -> tuple[int, int]:
         store = await _store()
         try:
             service = AuthService(store, _lock_settings())
@@ -875,31 +880,44 @@ async def test_the_visible_rows_timestamp_does_not_tell_a_lock_refusal_from_a_ve
             real_increment = store.increment_login_failure
 
             async def slow_increment(*args: Any, **kwargs: Any) -> Any:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.3)
                 return await real_increment(*args, **kwargs)
+
+            real_record = store.record_audit
+
+            async def slow_record(*args: Any, **kwargs: Any) -> Any:
+                # Each row costs 150 ms, so an answer that waited for the lock path's two rows
+                # would land a half-budget later than the verified path's one.
+                await asyncio.sleep(0.15)
+                return await real_record(*args, **kwargs)
 
             monkeypatch.setattr(service, "_argon2", fixed_wrong)
             monkeypatch.setattr(store, "increment_login_failure", slow_increment)
+            monkeypatch.setattr(store, "record_audit", slow_record)
             steps.next_code()
             started = time.time()
             out = await service.login(ADMIN_USERNAME, "any-candidate", totp_code=steps.wrong_code())
+            answered = time.time() - started
             assert not out.ok
             rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_failed", limit=1)
-            return round((float(rows[0]["ts"]) - started) / budget)
+            row_at = float(rows[0]["ts"]) - started
+            # The row: WHICH half-budget slot it lands in (floor), since the write point is that
+            # slot's start. The answer: rounded to half-budget units, as AC-6 rounds to slots.
+            return math.floor(row_at / (budget / 2)), round(answered / (budget / 2))
         finally:
             await store.close()
 
-    lock_path = await slot(second_step_locked=True)
-    verified_path = await slot(second_step_locked=False)
+    lock_path = await measure(second_step_locked=True)
+    verified_path = await measure(second_step_locked=False)
     assert lock_path == verified_path, (
-        f"the row's time tells the paths apart: lock={lock_path} verified={verified_path}"
+        f"(row, answer) tells the paths apart: lock={lock_path} verified={verified_path}"
     )
-    assert lock_path == 1, lock_path
+    assert lock_path == (1, 2), lock_path
 
 
 async def test_a_cancelled_refusal_still_writes_its_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The rows now wait for the pad, so a caller who drops the request during it must not also
-    drop the audit trail: the count-and-log rule holds for a refused attempt too."""
+    """The rows now wait for a fixed point in the pad, so a caller who drops the request before it
+    must not also drop the audit trail: the count-and-log rule holds for a refused attempt too."""
     import messagefoundry.auth.service as svc
 
     monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", 2.0)
@@ -915,7 +933,7 @@ async def test_a_cancelled_refusal_still_writes_its_rows(monkeypatch: pytest.Mon
         monkeypatch.setattr(service, "_argon2", fixed_wrong)
         before = len(await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_failed"))
         attempt = asyncio.ensure_future(service.login(ADMIN_USERNAME, "wrong"))
-        await asyncio.sleep(0.5)  # well inside the pad, after the verify and the count
+        await asyncio.sleep(0.3)  # after the verify and the count, before the write point
         attempt.cancel()
         with pytest.raises(asyncio.CancelledError):
             await attempt
