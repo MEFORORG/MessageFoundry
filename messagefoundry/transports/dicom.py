@@ -255,12 +255,12 @@ class DicomScpSource(SourceConnector):
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
         )
-        # The deflate guard keeps the CONFIGURED value. The ingress ceiling above measures the
-        # re-encoded bytes, which stay deflated, so it says nothing about how far they inflate;
-        # this bound is a memory bound on the pre-decode inflate and #1910 does not move it.
-        self._max_inflated_bytes: int = (
-            configured if configured is not None else DEFAULT_MAX_INFLATED_BYTES
-        )
+        # BACKLOG #2104: the pre-decode inflate bound is the lesser of the object cap and the codec's
+        # fixed inflate ceiling. The ingress ceiling above measures the re-encoded bytes, which stay
+        # deflated, so it cannot stand in for this bound. But DicomPeek and DicomDataset refuse any
+        # object that inflates past DEFAULT_MAX_INFLATED_BYTES when the router parses it after
+        # commit, so an SCP that let one through would answer Success for an object recorded ERROR.
+        self._max_inflated_bytes: int = min(self._max_object_bytes, DEFAULT_MAX_INFLATED_BYTES)
         self._max_associations = int(s.get("max_associations", 10))
         self._max_pdu_size = int(s.get("max_pdu_size", 16384))
         self._timeout = float(s.get("timeout_seconds", 30.0))
@@ -657,10 +657,9 @@ class DicomScpSource(SourceConnector):
         """ASVS 5.2.3 SCP guard. When the accepted context's transfer syntax is Deflated Explicit VR LE,
         bound-inflate the RAW ``event.request.DataSet`` bytes (BEFORE ``event.dataset`` decodes them) and
         return a DIMSE **failure** status if the object inflates past the cap — else ``None`` (proceed).
-        The bound is the configured ``max_object_bytes``, or the 16 MiB codec default when uncapped. It
-        is NOT clamped to the engine ingress ceiling (BACKLOG #1910): that ceiling measures the
-        re-encoded bytes, which stay deflated. PHI-safe: logs the cap + routing identifiers, never
-        bytes."""
+        The bound is the lesser of the SCP's ``max_object_bytes`` and the codec's 16 MiB inflate ceiling
+        (BACKLOG #2104), because the router's parse refuses anything that inflates further. PHI-safe:
+        logs the cap + routing identifiers, never bytes."""
         transfer_syntax = str(getattr(getattr(event, "context", None), "transfer_syntax", "") or "")
         if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
             return None

@@ -582,6 +582,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **The DICOM server (SCP) now refuses a small deflated object that inflates past 16 MiB.** It bounded
+  the inflate by `max_object_bytes`, 128 MiB at the shipped default, while the codec that parses the
+  object after commit refuses anything past a fixed 16 MiB. So such an object was answered Success
+  and could then only be recorded `ERROR`. The SCP's inflate bound is now the lesser of
+  `max_object_bytes` and 16 MiB, and the object is refused before commit. (`BACKLOG #2104`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

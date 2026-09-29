@@ -234,19 +234,22 @@ def test_scp_shipped_default_refuses_above_the_engine_ingress_ceiling_before_dec
     assert scp._on_c_store(at) == 0xC000, "exactly the ceiling must reach the decode trap"
 
 
-def test_scp_inflate_bound_is_not_clamped_to_the_ingress_ceiling() -> None:
-    # BACKLOG #1910 clamps the OBJECT cap to the 16 MiB ingress ceiling, which measures the re-encoded
-    # bytes. Those stay deflated, so the clamp must not reach the pre-decode INFLATE bound: at the shipped
-    # default a small deflated object that inflates to 40 MiB still passes the guard, as it did before.
-    # The uncapped arm is the control: its inflate bound is the 16 MiB codec default, so the same stream
-    # is refused there, which proves this stream really does inflate past 16 MiB.
+def test_scp_inflate_bound_is_clamped_to_the_codec_inflate_ceiling() -> None:
+    # BACKLOG #2104: the router's DicomPeek/DicomDataset refuse any object that inflates past the codec's
+    # fixed 16 MiB, so at the shipped 128 MiB default a small deflated object that inflates to 40 MiB
+    # must be refused by the SCP before commit, not answered Success and recorded ERROR later. The
+    # 8 MiB stream is the control: it is under the bound, so the guard really does let objects through.
     deflated = "1.2.840.10008.1.2.1.99"
-    stream = make_deflated_bomb_stream(inflated_bytes=40 * 1024 * 1024)
-    event = _FakeStoreEvent(transfer_syntax=deflated, data_set=stream)
-    shipped = _build_scp([])
-    assert shipped._deflated_over_cap(event, peer_ip="127.0.0.1", calling_ae="M") is None
-    uncapped = _build_scp([], max_object_bytes=0)
-    assert uncapped._deflated_over_cap(event, peer_ip="127.0.0.1", calling_ae="M") == 0xA700
+    over = _FakeStoreEvent(
+        transfer_syntax=deflated,
+        data_set=make_deflated_bomb_stream(inflated_bytes=40 * 1024 * 1024),
+    )
+    under = _FakeStoreEvent(
+        transfer_syntax=deflated, data_set=make_deflated_bomb_stream(inflated_bytes=8 * 1024 * 1024)
+    )
+    for scp in (_build_scp([]), _build_scp([], max_object_bytes=0)):
+        assert scp._deflated_over_cap(over, peer_ip="127.0.0.1", calling_ae="M") == 0xA700
+        assert scp._deflated_over_cap(under, peer_ip="127.0.0.1", calling_ae="M") is None
 
 
 async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
