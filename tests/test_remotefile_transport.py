@@ -2448,18 +2448,152 @@ def test_a_tls_demand_on_ftps_is_a_credential_fault(
     assert caught.value.credential_fault is True
 
 
-async def test_a_tls_demand_dead_letters_and_does_not_stop_the_lane(
-    monkeypatch: pytest.MonkeyPatch,
+# --- BACKLOG #2083 fix round 4: a configuration fault stops the lane and keeps the queue -----------
+
+#: Each session-open refusal classed as a configuration fault, with the session kind that meets it.
+_CONFIG_FAULTS = [
+    pytest.param("ftps", "greeting", "550 Access denied for your address", id="greeting"),
+    pytest.param("ftps", "auth", "534 Request denied for policy reason.", id="auth-tls"),
+    pytest.param(
+        "ftps", "prot_p", "536 Requested PROT level not supported by mechanism.", id="prot-p"
+    ),
+    pytest.param("plain", "login", _TLS_DEMANDS[0], id="tls-demand"),
+]
+
+
+def _config_fault_dest(
+    monkeypatch: pytest.MonkeyPatch, kind: str, refuse_at: str, reply: str, **over: Any
+) -> Any:
+    """A real FTP destination whose session open is refused at ``refuse_at`` with ``reply``."""
+    if kind == "ftps":
+        _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
+    else:
+        _scripted_plain_ftp(monkeypatch, refuse_at=refuse_at, reply=reply)
+    return build_destination(
+        _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
+    )
+
+
+@pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)
+async def test_a_configuration_fault_reaches_the_runner_marked_as_one(
+    monkeypatch: pytest.MonkeyPatch, kind: str, refuse_at: str, reply: str
 ) -> None:
-    """Through ``send``: the TLS demand reaches the delivery worker as a permanent
-    :class:`NegativeAckError` with no credential marker, so the row is dead-lettered and the lane is
-    not stopped. Stop-and-retain for a configuration fault is open (BACKLOG #2083, finding 2)."""
-    _scripted_plain_ftp(monkeypatch, refuse_at="login", reply=_TLS_DEMANDS[0])
-    dest = build_destination(_ftp_dest(username="u", password="p", filename="m.hl7"))
+    """Through ``send``: each refusal reaches the delivery worker as a permanent
+    :class:`NegativeAckError` carrying ``config_fault`` and not ``credential_fault``. The marker is
+    what makes the worker stop the lane rather than dead-letter every queued row (fix round 4)."""
+    dest = _config_fault_dest(monkeypatch, kind, refuse_at, reply)
     with pytest.raises(NegativeAckError) as caught:
         await dest.send(_UPLOAD_BODY)
     assert caught.value.permanent is True
-    assert caught.value.credential_fault is False
+    assert caught.value.config_fault is True, "the lane must stop, not dead-letter each row"
+    assert caught.value.credential_fault is False, "no credential was at fault"
+
+
+_E2E_DEST = "OB"
+
+
+async def _e2e_runner(
+    tmp_path: Path, connector: Any, *, batch: bool = False
+) -> tuple[Any, Any, list[str]]:
+    """A store holding three rows queued to ``_E2E_DEST`` and a runner wired to ``connector``, with
+    a recording alert sink. Returns the runner, the sink and the message ids."""
+    from messagefoundry.config.models import BatchConfig, RetryPolicy
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+    from messagefoundry.store import MessageStore
+
+    class _Sink(LoggingAlertSink):
+        def __init__(self) -> None:
+            self.stopped: list[tuple[str, str]] = []
+
+        def connection_stopped(self, name: str, *, detail: str) -> None:
+            self.stopped.append((name, detail))
+
+    store = await MessageStore.open(tmp_path / "config_fault.db")
+    mids = []
+    for n in range(3):
+        body = f"MSH|^~\\&|A|B|C|D|20260810||ADT^A01|MSG{n}|P|2.5\r"
+        mids.append(
+            await store.enqueue_message(
+                channel_id="IB", raw=body, deliveries=[(_E2E_DEST, body)], now=100.0 + n
+            )
+        )
+    sink = _Sink()
+    runner = RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=sink)
+    runner._destinations[_E2E_DEST] = connector
+    runner._retry[_E2E_DEST] = RetryPolicy()
+    runner._simulate[_E2E_DEST] = False
+    if batch:
+        runner._batch[_E2E_DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    return runner, sink, mids
+
+
+async def _queue_rows(runner: Any, mids: list[str]) -> list[tuple[str, int, Any]]:
+    """Each message's outbound row as (status, attempts, last_error), in ``mids`` order."""
+    rows = [r for mid in mids for r in await runner.store.outbox_for(mid)]
+    return [(r["status"], r["attempts"], r["last_error"]) for r in rows]
+
+
+async def test_a_refused_auth_tls_stops_the_lane_and_keeps_the_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A single-row outbound whose FTPS server refuses ``AUTH TLS``. Every queued row would meet the
+    same refusal, so dead-lettering the head would dead-letter them all, one per attempt. Before
+    #2083 the refusal was misread as a credential fault and so stopped the lane; #2083 made it a
+    configuration fault and it dead-lettered. Fix round 4 stops the lane again and keeps the row."""
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome
+    from messagefoundry.store import OutboxStatus
+
+    dest = _config_fault_dest(monkeypatch, "ftps", "auth", "534 Request denied for policy reason.")
+    runner, sink, mids = await _e2e_runner(tmp_path, dest)
+    try:
+        item = await runner.store.claim_next_fifo(_E2E_DEST)
+        assert item is not None
+        outcome, retry_until = await runner._process_delivery_item(_E2E_DEST, item)
+
+        assert outcome is _ItemOutcome.STOPPED
+        assert retry_until is None
+        pending = OutboxStatus.PENDING.value
+        assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every row kept"
+        assert await runner.store.count_dead() == 0
+        assert len(sink.stopped) == 1
+        assert sink.stopped[0][0] == _E2E_DEST
+        assert "configuration fault" in sink.stopped[0][1]
+        assert "credential" not in sink.stopped[0][1]
+        assert ("outbound", _E2E_DEST) in runner._stop_held, "the scheduler must not re-arm it"
+        assert len(_ScriptedFtp.instances) == 1, "stopped after one attempt"
+    finally:
+        await runner.store.close()
+
+
+async def test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The batch twin: a batching outbound hands the whole envelope to one ``send``, so a
+    dead-letter there would empty every member of the batch into the DLQ at once."""
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome
+    from messagefoundry.store import OutboxStatus
+
+    dest = _config_fault_dest(monkeypatch, "ftps", "auth", "534 Request denied for policy reason.")
+    runner, sink, mids = await _e2e_runner(tmp_path, dest, batch=True)
+    try:
+        head = await runner.store.claim_next_fifo(_E2E_DEST)
+        assert head is not None
+        outcome, retry_until = await runner._process_delivery_batch(
+            _E2E_DEST, head, runner._batch[_E2E_DEST]
+        )
+
+        assert outcome is _ItemOutcome.STOPPED
+        assert retry_until is None
+        pending = OutboxStatus.PENDING.value
+        assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every member kept"
+        assert await runner.store.count_dead() == 0
+        assert [name for name, _ in sink.stopped] == [_E2E_DEST]
+        assert "configuration fault" in sink.stopped[0][1]
+        assert ("outbound", _E2E_DEST) in runner._stop_held
+    finally:
+        await runner.store.close()
 
 
 @pytest.mark.parametrize(
@@ -2527,39 +2661,19 @@ async def test_validate_directory_stops_the_lane_only_on_a_refused_credential(
         assert not isinstance(caught.value, NegativeAckError), "a busy server is retried"
 
 
-@pytest.mark.parametrize(
-    ("refuse_at", "reply"),
-    [
-        ("greeting", "550 Access denied for your address"),
-        ("auth", "534 Request denied for policy reason."),
-        ("prot_p", "536 Requested PROT level not supported by mechanism."),
-    ],
-    ids=["greeting", "auth-tls", "prot-p"],
-)
-async def test_validate_directory_retries_a_configuration_fault(
-    monkeypatch: pytest.MonkeyPatch, refuse_at: str, reply: str
+@pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)
+async def test_validate_directory_passes_a_configuration_fault_through(
+    monkeypatch: pytest.MonkeyPatch, kind: str, refuse_at: str, reply: str
 ) -> None:
-    """With ``validate_directory`` on, ``_list_or_retry`` re-raises every fault but a refused
-    credential as transient, so a refused greeting or TLS step is retried there, not dead-lettered.
-    The CHANGELOG entry says so; this pins it."""
-    _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
-    dest = build_destination(
-        _ftp_dest(tls=True, username="u", password="p", validate_directory=True, filename="m.hl7")
-    )
-    with pytest.raises(DeliveryError) as caught:
+    """With ``validate_directory`` on, ``_list_or_retry`` re-raises a directory fault as transient
+    but passes a connection fault through unchanged. Fix round 4 makes a configuration fault a
+    connection fault, so it stops the lane here too, as it does with the toggle off. Retried
+    instead, every row would reconnect into the same refusal until its retry cap dead-lettered it."""
+    dest = _config_fault_dest(monkeypatch, kind, refuse_at, reply, validate_directory=True)
+    with pytest.raises(NegativeAckError) as caught:
         await dest.send(_UPLOAD_BODY)
-    assert not isinstance(caught.value, NegativeAckError), "retried under validate_directory"
-
-
-async def test_validate_directory_retries_a_tls_demand(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The login-step TLS demand is a configuration fault too, so it is retried there as well."""
-    _scripted_plain_ftp(monkeypatch, refuse_at="login", reply=_TLS_DEMANDS[0])
-    dest = build_destination(
-        _ftp_dest(username="u", password="p", validate_directory=True, filename="m.hl7")
-    )
-    with pytest.raises(DeliveryError) as caught:
-        await dest.send(_UPLOAD_BODY)
-    assert not isinstance(caught.value, NegativeAckError), "retried under validate_directory"
+    assert caught.value.config_fault is True
+    assert caught.value.credential_fault is False
 
 
 # --- BACKLOG #2071: the settle gate on the remote source -------------------------------------------

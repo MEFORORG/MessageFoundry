@@ -1717,6 +1717,8 @@ class PipelineSettings(_Section):
     # partner account — reusing the STOP muscle (connection_stopped alert + reload/restart re-arm).
     # "dead_letter" keeps the historical fail-fast behaviour (dead-letter just the offending row and
     # advance). A content-permanent reject (AR/CR, no-such-dir) is UNAFFECTED — it still dead-letters.
+    # It also governs a permanent CONFIGURATION fault (BACKLOG #2083: an FTP server refusing AUTH TLS,
+    # PROT P or the greeting, or demanding TLS of a plain session), which every row would meet alike.
     credential_fault_policy: Literal["stop", "dead_letter"] = Field(default="stop")
 
     # #147 (ADR 0095) per-connection active-window scheduler tick granularity (seconds). The runner

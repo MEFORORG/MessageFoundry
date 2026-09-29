@@ -202,14 +202,45 @@ class _RemoteError(Exception):
     Only auth-refusal sites set it; it is threaded onto the :class:`NegativeAckError` so the delivery
     worker can STOP-and-retain rather than dead-letter the backlog.
 
+    ``config_fault`` (BACKLOG #2083) marks a permanent refusal of the connection's configuration
+    while the FTP session opens: see :func:`_ftp_connect_refusal`. It is threaded the same way, and
+    the worker stops the lane on it too, because every queued row would meet the same refusal.
+
     The connector maps a transient error to :class:`DeliveryError` (retry) and a permanent one to
-    :class:`NegativeAckError` (dead-letter / credential-STOP), so the client layer stays
+    :class:`NegativeAckError` (dead-letter, or a STOP on either marker), so the client layer stays
     transport-detail-only."""
 
-    def __init__(self, message: str, *, permanent: bool, credential_fault: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        permanent: bool,
+        credential_fault: bool = False,
+        config_fault: bool = False,
+    ) -> None:
         super().__init__(message)
         self.permanent = permanent
         self.credential_fault = credential_fault
+        self.config_fault = config_fault
+
+    @property
+    def connection_fault(self) -> bool:
+        """True for a credential or a configuration fault: a fault of the connection, which every
+        row meets alike, rather than of one message or one path."""
+        return self.credential_fault or self.config_fault
+
+    def as_delivery_error(self) -> DeliveryError:
+        """The pipeline error for this failure: a transient one retries, a permanent one is a
+        :class:`NegativeAckError` carrying both markers."""
+        if not self.permanent:
+            return DeliveryError(str(self))
+        return NegativeAckError(
+            str(self),
+            code="remotefile",
+            permanent=True,
+            credential_fault=self.credential_fault,
+            config_fault=self.config_fault,
+        )
 
 
 class _RemoteOversize(Exception):
@@ -571,9 +602,11 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _Re
     These are the 5xx rules. A 4xx is transient, except a 4xx at the login that names the credential
     ("430 Invalid username or password"): :meth:`_FtpClient._connect` makes that a credential fault.
 
-    A permanent fault that is not a credential fault dead-letters the row on the delivery path; only
-    the credential marker stops the lane. With ``validate_directory`` on, :meth:`_list_or_retry`
-    retries it instead.
+    The configuration faults carry ``config_fault`` (fix round 4). Every queued row would meet the
+    same refusal, so on the delivery path the worker stops the lane and keeps the queue, as it does
+    for a credential fault, rather than dead-letter each row in turn. Both follow
+    ``credential_fault_policy``; ``"dead_letter"`` dead-letters instead. :meth:`_list_or_retry`
+    passes both markers through unchanged.
     """
     reply = str(exc)
     if _names_connection_limit(reply, at_login=step == _FTP_LOGIN):
@@ -585,15 +618,21 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _Re
         return _RemoteError(
             f"FTPS server refused {step}, a TLS configuration fault, not a credential fault: {reply}",
             permanent=True,
+            config_fault=True,
         )
     if step == _FTP_LOGIN and not tls and _demands_tls(reply):
         return _RemoteError(
             f"FTP server requires TLS at {step}, a TLS configuration fault, not a credential "
             f"fault: {reply}",
             permanent=True,
+            config_fault=True,
         )
     if step == _FTP_GREETING:
-        return _RemoteError(f"FTP server refused the connection: {reply}", permanent=True)
+        return _RemoteError(
+            f"FTP server refused the connection, a configuration fault: {reply}",
+            permanent=True,
+            config_fault=True,
+        )
     return _RemoteError(f"FTP login refused: {reply}", permanent=True, credential_fault=True)
 
 
@@ -1625,14 +1664,7 @@ class RemoteFileDestination(DestinationConnector):
         try:
             await asyncio.to_thread(self._upload, payload)
         except _RemoteError as exc:
-            if exc.permanent:
-                raise NegativeAckError(
-                    str(exc),
-                    code="remotefile",
-                    permanent=True,
-                    credential_fault=exc.credential_fault,
-                ) from exc
-            raise DeliveryError(str(exc)) from exc
+            raise exc.as_delivery_error() from exc
 
     async def validate_startup(self) -> None:
         """Opt-in at-start directory validation (#114) — the outbound mirror of
@@ -1666,7 +1698,8 @@ class RemoteFileDestination(DestinationConnector):
         retryable :class:`DeliveryError`. The reclassification is the point: an SFTP/FTP no-such-dir is
         a **permanent** error, so letting the upload fail on its own would dead-letter live traffic over
         a share that is merely unmounted. It costs one extra round trip per delivery, on the opt-in
-        path only. A credential fault is not reclassified; see :meth:`_list_or_retry`."""
+        path only. A credential or configuration fault is not reclassified; see
+        :meth:`_list_or_retry`."""
         if self._validate_directory:
             self._list_or_retry(
                 self._client.list_dir,
@@ -1684,15 +1717,17 @@ class RemoteFileDestination(DestinationConnector):
         """List ``remote_dir`` with ``lister`` on the send path, re-raising a failure as **transient**
         so the row retries under its retry policy rather than dead-lettering on a no-such-dir or a 550.
 
-        A credential fault is the exception and is re-raised unchanged: it keeps its ADR 0095 marker,
-        so the delivery worker STOPs and retains instead of retrying into an account lockout. So the
-        marker must mean a refused credential and nothing else: an FTP server at its connection
-        limit, or one refusing TLS, is classified before it gets here (BACKLOG #2083,
-        :func:`_ftp_connect_refusal`), so it is retried here and never stops the lane."""
+        A connection fault is the exception and is re-raised unchanged, keeping its marker, so the
+        delivery worker STOPs and retains. A credential fault would otherwise retry into an account
+        lockout (ADR 0095). A configuration fault, such as a refused ``AUTH TLS``, would otherwise
+        reconnect into the same refusal on every row until each row's retry cap dead-lettered it
+        (BACKLOG #2083, fix round 4). This retry is for a directory that is merely not there yet,
+        which neither fault is. An FTP server at its connection limit carries neither marker
+        (:func:`_ftp_connect_refusal`), so it is retried here and never stops the lane."""
         try:
             return lister(self._remote_dir)
         except _RemoteError as exc:
-            if exc.credential_fault:
+            if exc.connection_fault:
                 raise
             raise _RemoteError(
                 f"REMOTEFILE upload directory {_redact(self._host, self._remote_dir)} {why}: {exc}",
@@ -1714,10 +1749,12 @@ class RemoteFileDestination(DestinationConnector):
         except _RemoteError as exc:
             # A store cut off part-way, by the stall bound (#2082) or a dropped connection, can leave
             # a partial temp behind, one more on every retry. Not after a credential fault: another
-            # login would be one more refused attempt against the partner account. A store that
-            # failed before it connected left no temp, so this costs one more connect and a warning
-            # there; _prepare_remote_dir connected just before, so that case is rare.
-            if not exc.credential_fault:
+            # login would be one more refused attempt against the partner account. Nor after a
+            # configuration fault: it refuses the session open, so no temp was written and another
+            # connect would meet the same refusal (#2083). A store that failed before it connected
+            # for any other reason left no temp, so this costs one more connect and a warning there;
+            # _prepare_remote_dir connected just before, so that case is rare.
+            if not exc.connection_fault:
                 self._remove_temp(tmp, name, "store")
             raise
         try:
@@ -1747,9 +1784,9 @@ class RemoteFileDestination(DestinationConnector):
 
         **THIS IS THE ONE STATEMENT OF THE RULE (BACKLOG #1936); everything else points here.** With
         ``overwrite`` off, a listing that fails is never read as "nothing to collide with": it is
-        raised through :meth:`_list_or_retry`, which makes it transient unless it is a credential
-        fault, and nothing is written first. Returning the unsuffixed name there would let the store
-        and rename replace a partner file.
+        raised through :meth:`_list_or_retry`, which makes it transient unless it is a credential or
+        configuration fault, and nothing is written first. Returning the unsuffixed name there would
+        let the store and rename replace a partner file.
 
         Every entry counts, not only a regular file (BACKLOG #2082): the rename would replace a
         same-named symlink, or fail on a same-named directory. So this reads
@@ -1791,14 +1828,7 @@ class RemoteFileDestination(DestinationConnector):
             else:
                 await asyncio.to_thread(self._client.ensure_dir_and_list_names, self._remote_dir)
         except _RemoteError as exc:
-            if exc.permanent:
-                raise NegativeAckError(
-                    str(exc),
-                    code="remotefile",
-                    permanent=True,
-                    credential_fault=exc.credential_fault,
-                ) from exc
-            raise DeliveryError(str(exc)) from exc
+            raise exc.as_delivery_error() from exc
 
     async def aclose(self) -> None:
         return None  # connect-per-operation — nothing held open
@@ -1886,14 +1916,7 @@ class RemoteFileSource(SourceConnector):
         try:
             await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
-            if exc.permanent:
-                raise NegativeAckError(
-                    str(exc),
-                    code="remotefile",
-                    permanent=True,
-                    credential_fault=exc.credential_fault,
-                ) from exc
-            raise DeliveryError(str(exc)) from exc
+            raise exc.as_delivery_error() from exc
 
     async def validate_startup(self) -> None:
         """Opt-in at-start directory validation (#114). No-op unless ``validate_directory`` is set; then
