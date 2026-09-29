@@ -26,7 +26,9 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-__all__ = ["config_fingerprint", "config_fingerprint_detail"]
+from messagefoundry.credential import constant_time_equal
+
+__all__ = ["config_fingerprint", "config_fingerprint_detail", "fingerprint_matches"]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
 # trail — a fingerprint produced by v1 can never collide with one produced by a later revision.
@@ -105,6 +107,16 @@ def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
     if head is not None:
         detail["git_head"] = head
     return detail
+
+
+def fingerprint_matches(current: object, loaded: str) -> bool:
+    """Whether a recomputed fingerprint equals the loaded one, compared in constant time.
+
+    ASVS 11.2.4 (BACKLOG #1167): never ``==``, which stops at the first differing character. Both
+    digests are public, so this closes a bare compare rather than a leak. Total: a ``current`` that
+    is not a string (a missing key) never matches.
+    """
+    return isinstance(current, str) and constant_time_equal(current, loaded)
 
 
 def _git_head(start: Path) -> str | None:

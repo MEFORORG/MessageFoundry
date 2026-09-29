@@ -716,6 +716,77 @@ async def test_removing_a_passkey_notifies_even_when_another_factor_remains() ->
         await store.close()
 
 
+def _spy_compare_digest(monkeypatch: pytest.MonkeyPatch) -> list[tuple[bytes, bytes]]:
+    """Record every ``hmac.compare_digest`` call's operands, and still answer truthfully."""
+    import hmac
+
+    seen: list[tuple[bytes, bytes]] = []
+    real = hmac.compare_digest
+
+    def spy(a: bytes, b: bytes) -> bool:
+        seen.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+    return seen
+
+
+def _compared_with(seen: list[tuple[bytes, bytes]], value: bytes) -> list[bytes]:
+    """The other operand of every recorded compare that involved ``value``, in either position."""
+    return sorted(b if a == value else a for a, b in seen if value in (a, b))
+
+
+async def test_passkey_removal_compares_every_credential_in_constant_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ASVS 11.2.4 (BACKLOG #1167): the credential lookup walks every passkey with compare_digest.
+
+    It was ``next(c for c in creds if c.credential_id_hash == wanted)``: a search that stopped at the
+    matching slot, over a compare that stopped at the first differing character. Removing the FIRST
+    of two passkeys is the discriminating case, since the old search never reached the second.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token, label="first key")
+        _, token = await _enroll(service, identity, token, label="second key")
+        creds = await store.list_webauthn_credentials(identity.user_id)
+        assert len(creds) == 2
+        wanted = creds[0].credential_id_hash
+
+        seen = _spy_compare_digest(monkeypatch)
+        assert await service.delete_webauthn_credential(identity, wanted) is True
+        against_wanted = _compared_with(seen, wanted.encode("ascii"))
+        assert against_wanted == sorted(c.credential_id_hash.encode("ascii") for c in creds), (
+            "every stored credential must be compared against the presented hash, "
+            f"not only up to the match: {against_wanted}"
+        )
+        left = await store.list_webauthn_credentials(identity.user_id)
+        assert [c.credential_id_hash for c in left] == [creds[1].credential_id_hash]
+    finally:
+        await store.close()
+
+
+def test_challenge_rekey_compares_the_token_hash_in_constant_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ASVS 11.2.4 (BACKLOG #1167): ``ChallengeCache.rekey`` matches session token hashes with
+    ``compare_digest`` over bytes, once per pending entry, and still moves only the matching one."""
+    cache = wa.ChallengeCache()
+    cache.put(("old-hash", "assert"), "alice", b"a")
+    cache.put(("other-hash", "assert"), "bob", b"b")
+
+    seen = _spy_compare_digest(monkeypatch)
+    assert cache.rekey("old-hash", "new-hash") == 1
+    assert _compared_with(seen, b"old-hash") == [b"old-hash", b"other-hash"]
+
+    assert cache.pop(("old-hash", "assert")) is None
+    moved = cache.pop(("new-hash", "assert"))
+    assert moved is not None and moved.challenge == b"a"
+    assert cache.pop(("other-hash", "assert")) is not None
+
+
 async def test_a_racing_removal_of_the_other_passkey_does_not_claim_a_factor_remains() -> None:
     """The notice names the state AFTER the delete, not the one the method read before it.
 

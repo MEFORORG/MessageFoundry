@@ -108,6 +108,39 @@ async def test_provenance_rebaselines_on_reload(client: httpx.AsyncClient, tmp_p
     assert body["fingerprint"] == config_fingerprint(cfg)
 
 
+async def test_provenance_drift_compares_the_digests_in_constant_time(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 11.2.4 (BACKLOG #1167): the drift compare goes through ``hmac.compare_digest`` over bytes.
+
+    A bare ``!=`` stops at the first differing character. The spy records the operands, so this is
+    red while the compare is bare and green once both fingerprints reach ``compare_digest``. A
+    fingerprint the recompute cannot produce must still read as drift, as it did under ``!=``.
+    """
+    import hmac
+
+    import messagefoundry.api.app as app_mod
+
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
+    loaded_fp = config_fingerprint(cfg).encode("ascii")
+
+    seen: list[tuple[object, object]] = []
+    real = hmac.compare_digest
+
+    def spy(a: bytes, b: bytes) -> bool:
+        seen.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+    assert (await client.get("/config/provenance")).json()["drift"] is False
+    assert (loaded_fp, loaded_fp) in seen, f"the drift compare never reached compare_digest: {seen}"
+
+    monkeypatch.setattr(app_mod, "config_fingerprint_detail", lambda _target: {})
+    assert (await client.get("/config/provenance")).json()["drift"] is True
+
+
 async def test_provenance_requires_auth(engine: Engine) -> None:
     # Gated like every read (require(MONITORING_READ)): with no auth attached and allow_no_auth unset,
     # it is fail-closed 503 "authentication is not configured" (security.py) — never served publicly.
