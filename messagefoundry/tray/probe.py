@@ -382,4 +382,9 @@ def make_probe_client(
         timeout=timeout,
         follow_redirects=False,
         verify=pinned if pinned is not None else build_verify(engine_url, cacert),
+        # BACKLOG #300: never through a web proxy. httpx would read HTTPS_PROXY, ALL_PROXY and the
+        # Windows system proxy, without that proxy's local-address bypass, and would run the TLS
+        # leg to an https proxy on httpcore's own context rather than the narrowed one above. The
+        # probe's target is this host's own engine, so no proxy belongs on it.
+        trust_env=False,
     )

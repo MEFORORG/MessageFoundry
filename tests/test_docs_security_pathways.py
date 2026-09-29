@@ -1721,6 +1721,14 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
         assert hasattr(AuthService, name), f"the 6.8.4 fallback cites AuthService.{name}, gone"
     for name in ("_check_auth_time", "_check_mfa_gate"):
         assert f"`{name}`" in block and hasattr(claims_module, name), name
+    # The BACKLOG #2032 paragraph cites the load refusal and the check advisory by name.
+    from messagefoundry import checks as checks_module
+
+    assert "`AuthSettings._require_oidc_fields`" in block
+    assert hasattr(AuthSettings, "_require_oidc_fields")
+    assert "`_check_oidc_auth_params`" in block and hasattr(
+        checks_module, "_check_oidc_auth_params"
+    )
     for slug in ("auth_time_missing", "auth_time_stale", "mfa_claim_missing"):
         assert f"`{slug}`" in block and slug in claims_module.REASONS, slug
     assert f"`{service_module.STEP_UP_NOT_FRESH}`" in block

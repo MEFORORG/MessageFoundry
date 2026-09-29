@@ -227,6 +227,13 @@ engine mints nothing and speaks plaintext behind the proxy. Point `messagefoundr
 proxy, or set it to `http://` — the extension reports the disagreement in its **MessageFoundry
 Engine** log rather than changing your setting for you.
 
+## When a panel's script does not run
+
+The extension's forms and views are webviews, rendered by the browser engine built into your VS Code
+release. Most panels give no warning when their script does not run. What each panel shows in that
+case, and which one does check, is stated in
+[Browser support: the IDE extension's webviews](../docs/BROWSER-SUPPORT.md#the-ide-extensions-webviews).
+
 ## Develop
 
 ```bash
@@ -242,6 +249,10 @@ npm test               # integration tests: launch a headless VS Code (@vscode/t
 command it contributes is registered and runnable. It needs a machine with **no VS Code already
 running** (on Windows a running instance steals the launch args), so it runs on the **Windows `ide`
 leg in CI** (`.github/workflows/ci.yml`) rather than in a dev session that has VS Code open.
+
+The runner (`src/test/runTest.ts`) launches the extension host twice: once at the oldest VS Code the
+`engines.vscode` field allows, and once at the current stable release. For a quicker local run, set
+`MF_IDE_TEST_RUNS` to `floor` or `stable` (or both, comma-separated) to make only those runs.
 
 Then press **F5** ("Run Extension") to launch an Extension Development Host. Open a workspace that
 has a `samples/config` (this repo does). The `messagefoundry` CLI must be importable by
