@@ -459,9 +459,12 @@ def _resend_section(detail: MessageDetail) -> list[object]:
     ]
 
 
-def message_detail(detail: MessageDetail) -> Markup:
+def message_detail(detail: MessageDetail, raw_body: str) -> Markup:
     """A single message: metadata + the AUDITED raw body (escaped inside <pre>) + deliveries/events, plus
-    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress."""
+    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress.
+
+    ``raw_body`` arrives separately from ``detail`` because the engine serves it from its own audited
+    fetch (BACKLOG #2345); the open carries no body."""
     meta = rows_table(
         ["Field", "Value"],
         [
@@ -477,7 +480,7 @@ def message_detail(detail: MessageDetail) -> Markup:
         adjustable=False,
     )
     # The raw body is attacker-influenced HL7 — rendered as escaped text inside <pre>, never as markup.
-    raw = el("pre", detail.raw, class_="raw")
+    raw = el("pre", raw_body, class_="raw")
     outbox = rows_table(
         ["Destination", "Status", "Attempts", "Last error"],
         [[o.destination_name, o.status, o.attempts, o.last_error] for o in detail.outbox],
@@ -636,6 +639,7 @@ def message_edit(
     detail: MessageDetail,
     idempotency_key: str,
     *,
+    original: str,
     raw_value: str | None = None,
     error: str = "",
     mode: str = "reroute",
@@ -650,8 +654,8 @@ def message_edit(
 
     The edited body is attacker-influenced HL7 rendered as escaped ``<textarea>`` text (never markup);
     ``idempotency_key`` is a fresh per-open token so a double-submit of this form is an idempotent no-op.
+    ``original`` is the stored body from the engine's audited body fetch (BACKLOG #2345).
     """
-    original = detail.raw
     shown = original if raw_value is None else raw_value
     is_direct = mode == "direct"
     err = el("p", text(error), class_="banner") if error else Markup("")

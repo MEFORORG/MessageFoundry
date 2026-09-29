@@ -240,12 +240,18 @@ from typing import Any
 #: ``FEDERATED_BINDING_CHANGED`` to tell that 409 apart. An older engine refuses the new keys and a
 #: newer one refuses a body without them, so a skew must fail the handshake. Unnumbered, as above.
 #:
+#: BACKLOG #2345 (ASVS 14.2.6): ``MessageDetail`` lost ``raw``, and ``CoreHandlers`` gained the
+#: REQUIRED ``get_message_body``, the body's own audited fetch. The console's detail, parse-tree and
+#: edit routes now read the body through it. A console expecting ``detail.raw`` against this engine
+#: would AttributeError at render, and a new required field fails the ``UiDeps`` construction, so a
+#: skew must fail the handshake. Unnumbered, as above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "ae83e5f04b29fedd"
+ENGINE_UI_SEAM: str = "65e98b49d7ee4554"
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +272,11 @@ class CoreHandlers:
     list_connections: Callable[..., Awaitable[Any]]
     list_messages: Callable[..., Awaitable[Any]]
     get_message: Callable[..., Awaitable[Any]]
+    # The raw body's own audited fetch (BACKLOG #2345). Its JSON gate is
+    # require_phi_read(MESSAGES_VIEW_RAW), so a /ui route calling it must assert messages:view_raw
+    # with phi=True. The engine records the audit row's surface as "console" itself, from the
+    # matched /ui route, so the console passes none.
+    get_message_body: Callable[..., Awaitable[Any]]
     download_attachment: Callable[
         ..., Awaitable[Any]
     ]  # streaming-attachment download (#149, seam v4)

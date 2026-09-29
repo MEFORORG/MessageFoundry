@@ -318,6 +318,65 @@ async def test_ui_message_detail_audits_like_json(engine: Engine) -> None:
     ), "the /ui raw view must record the same message_view audit as GET /messages/{id}"
 
 
+async def test_ui_body_reads_audit_as_console_body_views(engine: Engine) -> None:
+    """BACKLOG #2345: the detail, parse-tree and edit pages still show the body on load, and each
+    read goes through the engine's audited body fetch tagged ``console``. So does the edit POST's
+    reject arm, which re-renders the pristine body. The parse tree reads the body alone; the other
+    three also open the message (``message_view``). The body really rendering on each page is the
+    control: a page that silently lost it would write no row and render no ``MSH``."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # a fresh login counts as a recent step-up, for the editor
+        page = await c.get(f"/ui/messages/{mid}")
+        assert page.status_code == 200 and "ADT^A01|MSG1" in page.text
+        tree = await c.get(f"/ui/messages/{mid}/parse-tree")
+        assert tree.status_code == 200 and "PID" in tree.text
+        editor = await c.get(f"/ui/messages/{mid}/edit")
+        assert editor.status_code == 200 and "ADT^A01|MSG1" in editor.text
+        # A direct send with no outbound named takes the reject arm before anything is sent.
+        rejected = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": EDITED, "idempotency_key": "k1", "mode": "direct", "to": ""},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        # DOE^JANE is in the stored body only, not in EDITED, so this is the pristine copy.
+        assert rejected.status_code == 400 and "DOE^JANE" in rejected.text
+    rows = [dict(a) for a in await engine.store.list_audit(limit=100)]
+    body_views = [r for r in rows if r["action"] == "message_body_view"]
+    assert [json.loads(r["detail"]) for r in body_views] == [
+        {"message_id": mid, "surface": "console"}
+    ] * 4
+    assert all(r["actor"] == "op" for r in body_views)
+    assert [r["action"] for r in rows].count("message_view") == 3
+
+
+async def test_the_json_body_fetch_refuses_a_forged_console_surface(engine: Engine) -> None:
+    """BACKLOG #2345: ``console`` in the audit row means the web console's in-process call, and the
+    engine writes it itself. The query parameter does not accept it, so an HTTP caller claiming it
+    is refused before any body is read, and no row is written. The ``harness`` request on the same
+    client is the control: the route serves an honest caller."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        token = (await c.post("/auth/login", json={"username": "op", "password": PW})).json()[
+            "token"
+        ]
+        headers = {"Authorization": f"Bearer {token}"}
+        forged = await c.get(f"/messages/{mid}/raw?surface=console", headers=headers)
+        assert forged.status_code == 422 and "MSH|" not in forged.text
+        honest = await c.get(f"/messages/{mid}/raw?surface=harness", headers=headers)
+        assert honest.status_code == 200 and honest.json()["raw"] == ADT
+    body_views = [
+        json.loads(dict(a)["detail"])["surface"]
+        for a in await engine.store.list_audit(limit=100)
+        if dict(a)["action"] == "message_body_view"
+    ]
+    assert body_views == ["harness"]
+
+
 # --- #149 Phase 3b: the attachments panel + audited /ui download --------------
 
 _DOC = b"%PDF-1.4\nsynthetic webconsole document \x00\x01 not real PHI\n%%EOF\n"
@@ -348,19 +407,18 @@ def test_message_detail_renders_attachments_panel() -> None:
         message_type="ADT^A01",
         status="processed",
         error=None,
-        raw="MSH|skel",
         outbox=[],
         events=[],
         attachments=[AttachmentInfo(id=ref, content_type="application/pdf", total_bytes=2048)],
     )
-    html = str(message_detail(detail))
+    html = str(message_detail(detail, "MSH|skel"))
     assert "Attachments" in html
     assert "application/pdf" in html
     assert f"/ui/messages/m1/attachments/{ref}" in html  # the download link
     assert "2.0 KiB" in html  # human size
 
     empty = detail.model_copy(update={"attachments": []})
-    assert "Attachments" not in str(message_detail(empty))
+    assert "Attachments" not in str(message_detail(empty, "MSH|skel"))
 
 
 async def test_ui_attachment_download_round_trips_and_audits(engine: Engine) -> None:

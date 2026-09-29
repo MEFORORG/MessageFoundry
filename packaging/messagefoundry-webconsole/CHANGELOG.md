@@ -76,6 +76,12 @@ under Changed says why engine 0.4.0 does not work with this console.
     shown in UTC.
 
 ### Changed
+- **The message detail, parse-tree and edit pages read the body through its own audited fetch**
+  (`BACKLOG #2345`, ASVS 14.2.6). The engine's single-message open no longer carries the raw body,
+  so each page calls the new `get_message_body` handler, which records the read's surface as `console`. Every body read now writes
+  a `message_body_view` audit row; opening the message still writes `message_view`. The pages still
+  show the body on load; asking for an explicit act first is `BACKLOG #2346`. The engine UI seam
+  moved, so pair this console with an engine carrying the same change.
 - **The federated-identity screen's Link, Relink and Unlink send the pair the page showed to the
   engine, and the engine decides whether it is stale** (`BACKLOG #2026`). The POSTs pass their
   hidden `shown_issuer` and `shown_subject` as the new required `expected_issuer` and

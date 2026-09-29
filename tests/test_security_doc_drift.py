@@ -80,9 +80,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #1562 part B added one JSON route, POST /approvals/{approval_id}/resolve, and no /ui route.
 # BACKLOG #2021 added one JSON route, POST /users/directory -- an administrator creating the
 # directory mirror row a federated binding needs, with no Kerberos sign-in -- and no /ui route.
-_ROUTES_DEFAULT = 114
-_ROUTES_WITH_DOCS = 118
-_ROUTES_WITH_UI = 229
+# BACKLOG #2345 (ASVS 14.2.6) added one JSON route, GET /messages/{message_id}/raw -- the raw body's
+# own audited fetch, split from the open -- and no /ui route: the console calls it in-process.
+_ROUTES_DEFAULT = 115
+_ROUTES_WITH_DOCS = 119
+_ROUTES_WITH_UI = 230
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -216,9 +218,6 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
             "id",
             "message_type",
             "outbox",
-            # PHI, deliberately NOT per-property: the whole body rides the route's messages:view_raw
-            # gate (documented in the doc's whole-body table).
-            "raw",
             "received_at",
             "source_type",
             "status",
@@ -269,6 +268,10 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     "DeadLetterList": "envelope: limit/offset/total + DeadLetterRow rows (mapped)",
     "DeadLetterReplayResult": "requeued count only",
     "EditResendResult": "ids + routing decision, no body",
+    "MessageBody": (
+        "raw IS PHI but rides GET /messages/{id}/raw's messages:view_raw whole-body gate (documented "
+        "in the doc's whole-body table), plus message_id; BACKLOG #2345"
+    ),
     "MessageList": "envelope: limit/offset/total + MessageSummary rows (mapped)",
     "MessageResponses": "envelope: message_id + CapturedResponseInfo rows (mapped)",
     "MessageSearchResults": "envelope: counters + MessageSummary rows (mapped)",
@@ -1682,8 +1685,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 91 -> 93: BACKLOG #1143's PUT and DELETE /users/{user_id}/federated-identity, users:manage.
     # 93 -> 94: BACKLOG #1562 part B's POST /approvals/{approval_id}/resolve, approvals:approve.
     # 94 -> 95: BACKLOG #2021's POST /users/directory, users:manage.
-    assert len(gated) == 95, (
-        f"{len(gated)} permission-gated routes, not 95 — update the doc's totals."
+    # 95 -> 96: BACKLOG #2345's GET /messages/{message_id}/raw, messages:view_raw.
+    assert len(gated) == 96, (
+        f"{len(gated)} permission-gated routes, not 96 — update the doc's totals."
     )
 
 

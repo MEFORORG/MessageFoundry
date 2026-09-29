@@ -187,11 +187,14 @@ class ParseTreeView(QTreeWidget):
 @dataclass(frozen=True)
 class _DetailSnapshot:
     """One off-thread message-detail read, applied on the main thread. ``message_id`` lets a stale
-    result (superseded by a newer ``load``) be dropped; ``error`` set ⇒ the read failed."""
+    result (superseded by a newer ``load``) be dropped; ``error`` set means a read failed. ``raw`` is
+    the body, which the engine serves from its own audited fetch (BACKLOG #2345). It is required, so
+    a success path cannot forget it: ``None`` means the body fetch failed, and ``error`` says why."""
 
     message_id: str
     detail: MessageDetail | None
     error: str | None
+    raw: str | None
 
 
 class MessageDetailPanel(QWidget):
@@ -261,9 +264,22 @@ class MessageDetailPanel(QWidget):
     def _fetch(self, message_id: str) -> _DetailSnapshot:
         """Runs on a worker thread — only blocking I/O, no widget access."""
         try:
-            return _DetailSnapshot(message_id, self._poll.get_message(message_id), None)
+            detail = self._poll.get_message(message_id)
         except ApiError as exc:
-            return _DetailSnapshot(message_id, None, str(exc))
+            return _DetailSnapshot(message_id, None, str(exc), None)
+        # The body is its own audited act (BACKLOG #2345). This panel still shows it as soon as a
+        # row is selected; waiting for an explicit operator act is BACKLOG #2346.
+        if message_id != self._pending_id:
+            # A newer load() or a clear() superseded this one while the open ran. Fetching the body
+            # now would write a message_body_view row for a body nobody will see; _apply drops this.
+            return _DetailSnapshot(message_id, detail, None, None)
+        try:
+            body = self._poll.get_message_body(message_id, surface="harness")
+        except ApiError as exc:
+            # The open already succeeded and was audited, so show it and report the body failure
+            # (a 429 from the PHI-read budget, say) rather than discarding both.
+            return _DetailSnapshot(message_id, detail, str(exc), None)
+        return _DetailSnapshot(message_id, detail, None, body.raw)
 
     def _apply(self, snap: _DetailSnapshot) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
@@ -271,9 +287,9 @@ class MessageDetailPanel(QWidget):
             return  # a newer load() (or a clear()) superseded this result
         if snap.error is not None:
             self.error.emit(snap.error)
-            return
         detail = snap.detail
-        assert detail is not None
+        if detail is None:
+            return
         message_id = snap.message_id
         self._message_id = message_id
         self._replay.setEnabled(True)
@@ -290,8 +306,13 @@ class MessageDetailPanel(QWidget):
                 else ""
             )
         )
-        self._tree.show_message(detail.raw)
-        self._raw.setPlainText(detail.raw.replace("\r", "\n"))
+        if snap.raw is None:
+            # The body fetch failed; its error was emitted above. Show no stale body.
+            self._tree.clear()
+            self._raw.clear()
+        else:
+            self._tree.show_message(snap.raw)
+            self._raw.setPlainText(snap.raw.replace("\r", "\n"))
 
         self._outbox.setRowCount(len(detail.outbox))
         for r, o in enumerate(detail.outbox):
