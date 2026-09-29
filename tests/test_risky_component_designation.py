@@ -18,21 +18,31 @@ classifies only the names that closure adds to the core one.
 tier 1 is an argument for a reviewer. Whether it appears in exactly one of the two tables is a fact,
 and a dependency bump that adds a package nobody classified is exactly the drift this catches.
 
+The page also reads every component on ASVS's own examples of a risky component (maintenance,
+support, vulnerability history), from a dated snapshot of public PyPI and OSV data:
+``security/risky-component-readings.json``, written by ``scripts/security/component_readings.py``.
+The tests for it need NO network. They hold the snapshot to the population, re-derive each verdict
+from its recorded readings, and hold the page's tables, counts and dates to the snapshot. None of
+them reads today's date, so none goes red when the re-read date passes.
+
 Each test names the mutation that must turn it RED.
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 from packaging.utils import canonicalize_name
 
-from scripts.security import runtime_closure
+from scripts.security import component_readings, runtime_closure
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "RISKY-COMPONENTS.md"
@@ -46,13 +56,17 @@ _SQLSERVER_CLOSURE = _ROOT / "security" / "runtime-closure-sqlserver.txt"
 _SQLSERVER_LOCK = _ROOT / "docker" / "locks" / "requirements-sqlserver.lock"
 #: Each closure file and its lock, in the order the regenerator rewrites them.
 _PAIRS = ((_CLOSURE, _CORE_LOCK), (_SQLSERVER_CLOSURE, _SQLSERVER_LOCK))
+#: The dated public-metadata snapshot the ASVS-example section is held to (BACKLOG #1189).
+_READINGS = _ROOT / "security" / "risky-component-readings.json"
 
 #: The headings that bound the page's two classified regions. The core tables run from the tier 1
-#: heading to the sqlserver heading; the sqlserver tables from there to the closing sections.
+#: heading to the sqlserver heading; the sqlserver tables from there to the ASVS reading.
 _CORE_START = "## Tier 1 — hostile input"
 _CORE_SPLIT = "## Assessed and NOT designated"
 _SQLSERVER_START = "## The `sqlserver` extra"
 _SQLSERVER_SPLIT = "### Assessed and NOT designated"
+#: The ASVS-example reading (BACKLOG #1189, ground 2) runs from here to the closing sections.
+_ASVS_START = "## Risky by ASVS's own examples, read from public data"
 _END = "## What this page is not"
 
 #: A distribution named in a markdown table cell as `name`. The designation tables put the
@@ -74,18 +88,9 @@ def _closure_lines(path: Path = _CLOSURE) -> list[str]:
 def _closure_pins(path: Path = _CLOSURE) -> dict[str, str]:
     """Name to version for every pin in a tracked runtime closure file (the core one by default).
 
-    A name listed twice fails here. A dict keeps only the last line, so a stale first line would
-    stay in the file for a reader to find while every comparison passed.
+    A name listed twice fails here, in the reader the readings generator shares.
     """
-    pins: dict[str, str] = {}
-    for line in _closure_lines(path):
-        if "==" not in line:
-            continue
-        name, _, version = line.partition("==")
-        key = runtime_closure.canonical_name(name)
-        assert key not in pins, f"{path.name} lists {key} twice"
-        pins[key] = version.strip()
-    return pins
+    return runtime_closure.closure_pins(path)
 
 
 def _closure() -> set[str]:
@@ -152,13 +157,14 @@ def _classified(start: str, split: str, end: str) -> tuple[set[str], set[str]]:
     return _table_names(head), _table_names(tail.partition("\n#")[0])
 
 
-def _region(start: str, end: str) -> str:
+def _region(start: str, end: str, page: str | None = None) -> str:
     """The page text between two whole-line headings, each given without its newlines.
 
     Both must be present once, start first, or a missing end would stretch the region to the end
-    of the page and let a figure anywhere below satisfy a check meant for one section.
+    of the page and let a figure anywhere below satisfy a check meant for one section. ``page``
+    defaults to the tracked page; a positive control passes a broken copy instead.
     """
-    text = "\n" + _DOC.read_text(encoding="utf-8")
+    text = "\n" + (_DOC.read_text(encoding="utf-8") if page is None else page)
     first, last = f"\n{start}\n", f"\n{end}\n"
     for line in (first, last):
         assert text.count(line) == 1, f"{_DOC.name} must carry {line.strip()!r} once"
@@ -179,7 +185,7 @@ def _designated_and_excluded() -> tuple[set[str], set[str]]:
 
 def _sqlserver_designated_and_excluded() -> tuple[set[str], set[str]]:
     """The names the ``sqlserver`` section classifies, split at its not-designated heading."""
-    return _classified(_SQLSERVER_START, _SQLSERVER_SPLIT, _END)
+    return _classified(_SQLSERVER_START, _SQLSERVER_SPLIT, _ASVS_START)
 
 
 def test_the_closure_file_parses_and_is_not_empty() -> None:
@@ -327,7 +333,7 @@ def test_the_sqlserver_counts_printed_on_the_page_are_the_real_ones() -> None:
     assert added == len(_sqlserver_additions()), "the sqlserver tables do not sum to the additions"
     core = len(_closure())
     total = len(_closure_pins(_SQLSERVER_CLOSURE))
-    section = _region(_SQLSERVER_START, _END)
+    section = _region(_SQLSERVER_START, _ASVS_START)
     sentence = (
         f"{len(designated)} plus {len(excluded)} is {added}, and {core} plus {added} is {total}"
     )
@@ -452,7 +458,9 @@ def test_dependabot_does_not_write_the_closure_file(path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "path", [_DOC, _CLOSURE, _CORE_LOCK, _SQLSERVER_CLOSURE, _SQLSERVER_LOCK], ids=lambda p: p.name
+    "path",
+    [_DOC, _CLOSURE, _CORE_LOCK, _SQLSERVER_CLOSURE, _SQLSERVER_LOCK, _READINGS],
+    ids=lambda p: p.name,
 )
 def test_the_tracked_paths_exist(path: Path) -> None:
     """RED when: any file the guard grades or grades against is deleted or moved.
@@ -589,3 +597,278 @@ def test_the_regenerator_rewrites_a_drifted_sqlserver_closure(tmp_path: Path) ->
     )
     assert run.returncode == 0, run.stderr
     assert closure.read_text(encoding="utf-8") == text
+
+
+# --- The ASVS-example reading (BACKLOG #1189, ASVS 15.1.4 ground 2) ----------------------------------
+#
+# ASVS 5.0.0 V15.1 gives as examples of a risky component one that is "poorly maintained,
+# unsupported, at the end-of-life stage, or have a history of significant vulnerabilities". The page
+# reads every component on those examples from a dated snapshot, in a section the generator renders.
+# Everything below is offline: the snapshot is a tracked file, and nothing here calls the network.
+
+#: Each ASVS example's subsection in the rendered section, and the subsection after it.
+_AXIS_SECTIONS = (
+    ("maintenance", "### Poorly maintained", "### Unsupported or end of life"),
+    ("support", "### Unsupported or end of life", "### A history of significant vulnerabilities"),
+    (
+        "advisory_history",
+        "### A history of significant vulnerabilities",
+        "### Not risky on any of the three",
+    ),
+)
+_RERENDER = "python scripts/security/component_readings.py --render-only"
+
+
+def _snapshot() -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(_READINGS.read_text(encoding="utf-8"))
+    return data
+
+
+def _readings(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Name to reading. A name read twice fails here rather than being silently overwritten."""
+    out: dict[str, dict[str, Any]] = {}
+    for reading in data["readings"]:
+        assert reading["name"] not in out, f"{_READINGS.name} reads {reading['name']} twice"
+        out[reading["name"]] = reading
+    return out
+
+
+def _designated() -> set[str]:
+    """Every name the tiers designate: the core tables' and the sqlserver section's."""
+    return _designated_and_excluded()[0] | _sqlserver_designated_and_excluded()[0]
+
+
+def _stated_facts_drift(page: str, data: dict[str, Any]) -> list[str]:
+    """Where the page's dates, counts and flagged names disagree with the snapshot.
+
+    Computed here from the snapshot and read with this module's own table parser, NOT through the
+    generator's renderer, so a renderer that printed a wrong figure consistently is still caught.
+    """
+    readings = _readings(data)
+    section = _region(_ASVS_START, _END, page)
+    flat = " ".join(section.split())
+    problems = []
+    stamp = f"**Snapshot date: {data['snapshot_date']}. Re-read by: {data['reread_by']}.**"
+    if stamp not in flat:
+        problems.append(f"the page does not state {stamp!r}")
+    size = len(readings)
+    counts = {
+        axis: sum(r["risky"][axis] for r in readings.values()) for axis, _, _ in _AXIS_SECTIONS
+    }
+    clean = sum(not any(r["risky"].values()) for r in readings.values())
+    sentence = (
+        f"**{size - clean} of {size} are risky on at least one example: {counts['maintenance']} on "
+        f"maintenance, {counts['support']} on support, and {counts['advisory_history']} on "
+        f"vulnerability history. {clean} are not. {size - clean} plus {clean} is {size}.**"
+    )
+    if sentence not in flat:
+        problems.append(f"the page does not state {sentence!r}")
+    for axis, start, end in _AXIS_SECTIONS:
+        named = _table_names(_region(start, end, page))
+        flagged = {n for n, r in readings.items() if r["risky"][axis]}
+        if named != flagged:
+            problems.append(f"{axis}: page names {sorted(named)}, snapshot {sorted(flagged)}")
+    return problems
+
+
+def test_the_readings_snapshot_parses_and_is_not_empty() -> None:
+    """RED when: the snapshot is emptied, or its shape changes under the tests below.
+
+    THE POSITIVE CONTROL FOR THE SNAPSHOT TESTS. A snapshot that parsed to no readings would make
+    "every verdict follows" hold vacuously.
+    """
+    data = _snapshot()
+    readings = _readings(data)
+    assert len(readings) >= 20, f"{_READINGS.name} parsed to {len(readings)} readings"
+    assert {"hl7", "cryptography", "pyodbc"} <= readings.keys()
+    dt.date.fromisoformat(data["snapshot_date"])
+    assert set(data["criteria"]) == set(component_readings.criteria()), (
+        "the snapshot records a different criterion set from the generator's"
+    )
+    assert all(set(r["risky"]) == set(component_readings.AXES) for r in readings.values())
+
+
+def test_every_population_member_has_exactly_one_reading() -> None:
+    """RED when: a closure name has no reading, a reading names a non-member, or core is misflagged.
+
+    Names only, never versions. The readings are dated to the pins of the snapshot day, and a lock
+    bump that moved a version would otherwise turn every Dependabot pull request red.
+    """
+    data = _snapshot()
+    readings = _readings(data)
+    assert data["population"] == _SQLSERVER_CLOSURE.relative_to(_ROOT).as_posix()
+    population = set(_closure_pins(_SQLSERVER_CLOSURE))
+    missing = sorted(population - readings.keys())
+    assert not missing, f"no reading for {missing}; run scripts/security/component_readings.py"
+    stray = sorted(readings.keys() - population)
+    assert not stray, f"{_READINGS.name} reads {stray}, which the assessed closure does not carry"
+    core = _closure()
+    wrong_core = sorted(n for n, r in readings.items() if r["in_core"] != (n in core))
+    assert not wrong_core, f"in_core is wrong for {wrong_core}"
+
+
+def test_every_verdict_follows_from_its_readings() -> None:
+    """RED when: a recorded verdict is not what the recorded criteria give on the recorded readings.
+
+    This is what makes the criterion checkable. A hand-edited verdict, or a criterion changed in the
+    generator without a re-run, fails here.
+    """
+    data = _snapshot()
+    as_of = dt.date.fromisoformat(data["snapshot_date"])
+    wrong = {
+        name: reading["risky"]
+        for name, reading in _readings(data).items()
+        if component_readings.classify(reading, as_of, data["criteria"]) != reading["risky"]
+    }
+    assert not wrong, f"these verdicts do not follow from their readings: {wrong}"
+
+
+def test_the_verdict_rederivation_can_fail() -> None:
+    """RED when: ``classify`` stops seeing a change on any axis.
+
+    THE POSITIVE CONTROL FOR THE TEST ABOVE. Each mutation turns one axis on for a component the
+    snapshot reads as clean, so a ``classify`` that returned the stored verdict, or nothing, fails.
+    """
+    data = _snapshot()
+    as_of = dt.date.fromisoformat(data["snapshot_date"])
+    clean = next(r for r in _readings(data).values() if not any(r["risky"].values()))
+    rules = data["criteria"]
+    assert component_readings.classify(clean, as_of, rules) == dict.fromkeys(
+        component_readings.AXES, False
+    )
+    significant = {"id": "GHSA-test", "severity": "HIGH", "published": as_of.isoformat()}
+    mutations: list[tuple[str, dict[str, Any]]] = [
+        ("maintenance", {"newest_upload": "2000-01-01"}),
+        ("support", {"project_status": "archived"}),
+        ("support", {"pinned_yanked": True}),
+        ("support", {"development_status": [rules["inactive_classifier"]]}),
+        ("advisory_history", {"advisories": [significant]}),
+    ]
+    for axis, change in mutations:
+        assert component_readings.classify({**clean, **change}, as_of, rules)[axis], change
+
+
+def test_the_reread_date_is_the_stated_interval_after_the_snapshot() -> None:
+    """RED when: the re-read date is not the generator's interval after the snapshot date.
+
+    This compares two recorded dates with each other. It never reads today's date: a test that did
+    would go red on every unrelated pull request once the re-read date passed.
+    """
+    data = _snapshot()
+    gap = dt.date.fromisoformat(data["reread_by"]) - dt.date.fromisoformat(data["snapshot_date"])
+    assert gap == dt.timedelta(days=component_readings.REREAD_INTERVAL_DAYS)
+
+
+def test_the_generator_reads_the_same_designation_as_this_guard() -> None:
+    """RED when: the generator's reading of the tiers and this module's disagree.
+
+    The rendered section's "Designated above" column comes from the generator's parser, and the
+    closure tests above use this module's. Two parsers of one page must agree, or the section and
+    the tiers describe different pages.
+    """
+    labels = component_readings.designation_labels(_DOC.read_text(encoding="utf-8"))
+    assert set(labels) == _designated()
+    assert labels["hl7"] == "tier 1" and labels["pyodbc"] == "the `sqlserver` extra"
+
+
+def test_the_rendered_section_is_the_tracked_one() -> None:
+    """RED when: the section between the markers is not what the snapshot and the tiers render.
+
+    A hand edit, a re-read whose page was not committed, or a tier change after the last render all
+    fail here. The fix needs no network.
+    """
+    page = _DOC.read_text(encoding="utf-8")
+    expected = component_readings.render_section(
+        _snapshot(), component_readings.designation_labels(page)
+    )
+    assert component_readings.section_of(page) == expected, (
+        f"the readings section in {_DOC.name} is stale or hand-edited. Re-render: {_RERENDER}"
+    )
+
+
+def test_the_page_states_the_snapshot_dates_counts_and_names() -> None:
+    """RED when: the page's dates, counts or flagged names drift from the snapshot.
+
+    Independent of the renderer: see ``_stated_facts_drift``.
+    """
+    drift = _stated_facts_drift(_DOC.read_text(encoding="utf-8"), _snapshot())
+    assert not drift, "the readings section disagrees with its snapshot:\n  " + "\n  ".join(drift)
+
+
+def test_the_section_checks_can_fail() -> None:
+    """RED when: either section check stops seeing a changed snapshot or a changed page.
+
+    THE POSITIVE CONTROL FOR THE TWO TESTS ABOVE. The mutations are built from the snapshot, not
+    from today's figures, so they survive the next re-read.
+    """
+    page = _DOC.read_text(encoding="utf-8")
+    data = _snapshot()
+    labels = component_readings.designation_labels(page)
+    tracked = component_readings.section_of(page)
+    assert tracked == component_readings.render_section(data, labels)
+    assert not _stated_facts_drift(page, data)
+
+    flagged = next(r for r in data["readings"] if r["risky"]["maintenance"])
+    flipped = {
+        **data,
+        "readings": [
+            {**r, "risky": {**r["risky"], "maintenance": False}} if r is flagged else r
+            for r in data["readings"]
+        ],
+    }
+    moved = {**data, "reread_by": "2099-01-01"}
+    for changed in (flipped, moved):
+        assert component_readings.render_section(changed, labels) != tracked
+        assert _stated_facts_drift(page, changed)
+    unlabelled = {k: v for k, v in labels.items() if k != flagged["name"]}
+    assert component_readings.render_section(data, unlabelled) != tracked
+    row = next(ln for ln in tracked.splitlines() if ln.startswith(f"| `{flagged['name']}` |"))
+    assert _stated_facts_drift(page.replace(row + "\n", ""), data)
+
+
+def test_the_generator_reads_a_component_from_fake_replies() -> None:
+    """RED when: the generator misreads PyPI or OSV, or double-counts an aliased advisory.
+
+    Fake replies in the APIs' shapes, so this needs no network. The OSV reply carries one flaw twice,
+    as a GHSA and as its PYSEC twin, and a withdrawn record that must not count.
+    """
+    as_of = dt.date(2026, 1, 1)
+
+    def upload(day: str, yanked: bool = False) -> list[dict[str, Any]]:
+        return [{"upload_time_iso_8601": f"{day}T00:00:00Z", "yanked": yanked}]
+
+    replies: dict[str, Any] = {
+        "https://pypi.org/pypi/demo/json": {
+            "info": {
+                "version": "2.0",
+                "classifiers": ["Development Status :: 7 - Inactive", "Topic :: Other"],
+                "requires_python": ">=3.9",
+            },
+            "releases": {"1.0": upload("2020-01-01", True), "2.0": upload("2023-06-01")},
+        },
+        "https://pypi.org/simple/demo/": {"project-status": {"status": "active"}},
+    }
+    osv = [
+        {"id": "GHSA-aaaa", "aliases": ["CVE-1"], "published": "2025-02-01T00:00:00Z",
+         "database_specific": {"severity": "HIGH"}},
+        {"id": "PYSEC-1", "aliases": ["CVE-1"], "published": "2025-01-01T00:00:00Z"},
+        {"id": "GHSA-gone", "published": "2025-01-01T00:00:00Z", "withdrawn": "2025-02-01",
+         "database_specific": {"severity": "CRITICAL"}},
+    ]  # fmt: skip
+
+    def fetch(url: str, body: bytes | None) -> Any:
+        if url == component_readings.OSV_QUERY:
+            assert body is not None
+            return {"vulns": [] if "version" in json.loads(body) else osv}
+        return replies[url]
+
+    reading = component_readings.read_component(
+        "demo", "1.0", in_core=True, as_of=as_of, fetch=fetch
+    )
+    assert reading["newest_upload"] == "2023-06-01"
+    assert reading["pinned_yanked"] is True
+    assert reading["development_status"] == ["Development Status :: 7 - Inactive"]
+    assert reading["advisories"] == [
+        {"id": "GHSA-aaaa", "severity": "HIGH", "published": "2025-01-01"}
+    ]
+    assert reading["risky"] == {"maintenance": True, "support": True, "advisory_history": True}
