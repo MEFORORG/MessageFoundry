@@ -25,6 +25,13 @@ instrument work, not this module's; do not read a green here as "every key has a
 The DEK has no table row: its lifecycle is the ``Store-key management policy`` bullet list, so the
 label :data:`_DEK` counts as governed only while that heading AND each of its five lifecycle bullets
 (:data:`_DEK_BULLETS`) are present with text after the bullet's lead.
+
+**The SP 800-57 mapping is held to the same floor.** Every lifecycle label except the DEK must also
+have a row in the ``NIST SP 800-57 mapping for the other keys`` table, and every row there must name a
+lifecycle label. That table sits before ``### Rotation schedule``, inside the window
+:func:`lifecycle_labels` scans, so its rows lead with a PLAIN label: a bold one would be read as a
+second lifecycle row for the same key and hide a deleted one. This checks that each key HAS a mapping
+row, not that the row maps it correctly; that is the reviewer's job.
 """
 
 from __future__ import annotations
@@ -48,6 +55,9 @@ _DEK_BULLETS = (
 )
 _LIFECYCLE_HEADING = "### Key management for the other keys the engine loads or mints"
 _NEXT_HEADING = "### Rotation schedule"
+#: The NIST SP 800-57 mapping for the non-DEK keys. It sits inside the lifecycle scan window, so its
+#: rows lead with a PLAIN label: a bold one would count as a lifecycle row and mask a deleted one.
+_MAPPING_HEADING = "### NIST SP 800-57 mapping for the other keys"
 
 #: A cell or bullet counts as written only if it holds a letter or digit, not just a dash.
 _WORD = re.compile(r"\w")
@@ -260,6 +270,39 @@ def uncovered(doc: str) -> list[str]:
     )
 
 
+def mapping_labels(doc: str) -> set[str]:
+    """The key labels the SP 800-57 mapping table gives a row to.
+
+    Every table row under :data:`_MAPPING_HEADING`, up to the next ``### `` heading, whose first
+    cell is a plain (not bold) label, skipping the header row. A row counts only if it has at least
+    four cells and every cell has text, so a row emptied down to its label does not count as mapped.
+    """
+    lines = doc.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith(_MAPPING_HEADING)), None)
+    if start is None:
+        return set()
+    end = next(
+        (i for i, line in enumerate(lines[start + 1 :], start + 1) if line.startswith("### ")),
+        len(lines),
+    )
+    labels: set[str] = set()
+    for i in range(start + 1, end):
+        line = lines[i]
+        if not line.startswith("| ") or line.startswith("| **") or re.match(r"^\|\s*-", line):
+            continue
+        if i + 1 < end and re.match(r"^\|\s*-", lines[i + 1]):
+            continue  # the header row: the separator follows it
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) >= 4 and all(_WORD.search(cell) for cell in cells):
+            labels.add(cells[0])
+    return labels
+
+
+def unmapped(doc: str) -> list[str]:
+    """Lifecycle labels other than the DEK with no row in the SP 800-57 mapping table."""
+    return sorted(lifecycle_labels(doc) - {_DEK} - mapping_labels(doc))
+
+
 def test_the_inventory_and_the_doc_were_actually_read() -> None:
     """Liveness receipt: an empty INVENTORY or an unparsed doc would turn every check below green."""
     inventory = _inventory()
@@ -349,3 +392,63 @@ def test_a_no_key_reason_is_a_sentence() -> None:
     """An exclusion whose reason is empty is where real key material gets parked."""
     thin = sorted(path for path, reason in _NO_KEY.items() if len(reason.split()) < 5)
     assert not thin, f"_NO_KEY entries with no real reason: {thin}"
+
+
+def test_every_lifecycle_key_has_an_sp800_57_mapping_row() -> None:
+    """ASVS 11.1.1's "follows a key management standard" limb, at the floor the lifecycle rows set.
+
+    Every key with a lifecycle row, except the store DEK (whose policy carries its own heading
+    claim), must have a row in the NIST SP 800-57 mapping. Mutation: delete the SFTP client key's
+    mapping row. Red: ``SFTP client key``.
+    """
+    doc = _DOC.read_text(encoding="utf-8")
+    assert {_SFTP, _TOTP, _ANON_SALT} <= mapping_labels(doc), (
+        f"mapping parse found only {sorted(mapping_labels(doc))}; the table or its heading moved"
+    )
+    missing = unmapped(doc)
+    assert not missing, (
+        f"lifecycle key(s) with no SP 800-57 mapping row: {missing}. Add a row under "
+        f"'{_MAPPING_HEADING}' in docs/ASVS-L2-PHASE0-CHANGES.md."
+    )
+
+
+def test_every_mapping_row_names_a_lifecycle_key() -> None:
+    """The reverse: a mapping row whose label matches no lifecycle row maps a key the policy does not
+    govern, or carries a typo that would let the real key go unmapped unnoticed."""
+    doc = _DOC.read_text(encoding="utf-8")
+    strays = sorted(mapping_labels(doc) - lifecycle_labels(doc))
+    assert not strays, f"SP 800-57 mapping row(s) naming no lifecycle key: {strays}"
+
+
+def test_deleting_a_mapping_row_turns_the_guard_red() -> None:
+    """The mutation, run in-process. Deleting a mapping row, or emptying one down to its label, must
+    be reported; a bold-labelled row must not count as a mapping row."""
+    lines = _DOC.read_text(encoding="utf-8").splitlines()
+    assert not unmapped("\n".join(lines)), (
+        "the unmutated doc must be clean for this to mean anything"
+    )
+    for label in (_SFTP, _TOTP, _ANON_SALT):
+        kept = [line for line in lines if not line.startswith(f"| {label} |")]
+        assert len(kept) == len(lines) - 1, (
+            f"expected one mapping row for {label!r}; the label moved"
+        )
+        assert label in unmapped("\n".join(kept)), (
+            f"deleting the {label!r} mapping row stayed green"
+        )
+    row = f"| {_SFTP} |"
+    emptied = [f"{row} - | - | - |" if line.startswith(row) else line for line in lines]
+    assert _SFTP in unmapped("\n".join(emptied)), "a mapping row emptied to its label stayed green"
+    bolded = [
+        line.replace(row, f"| **{_SFTP}** |", 1) if line.startswith(row) else line for line in lines
+    ]
+    assert _SFTP in unmapped("\n".join(bolded)), "a bold-labelled mapping row counted as mapped"
+
+
+def test_the_totp_mapping_row_takes_no_cryptoperiod() -> None:
+    """BACKLOG #1931 (owner ruling 2026-09-27): the TOTP secret is exempt from a calendar lifetime.
+    Its mapping row must say so and cite the ruling, rather than borrow a 5.3.6 cryptoperiod."""
+    doc = _DOC.read_text(encoding="utf-8")
+    row = next((line for line in doc.splitlines() if line.startswith(f"| {_TOTP} |")), "")
+    assert "**Cryptoperiod: none.**" in row and "#1931" in row, (
+        "the TOTP mapping row must state it has no cryptoperiod and cite BACKLOG #1931"
+    )
