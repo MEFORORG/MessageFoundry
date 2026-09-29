@@ -294,6 +294,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   passphrase. An unencrypted bundle with no MAC (`-nomac`) still loads with no passphrase, since
   nothing in it comes from a password. A bundle with an approved MAC now needs `MEFOR_PFX_PASSWORD`
   even when its bags are clear. The refusal gives the `openssl` re-export commands. (`BACKLOG #1352`)
+- **BREAKING: the `Http()` listener answers 400 to a request that repeats its credential header.**
+  That header is `intake_api_key_header` under `intake_auth="api_key"` and `Authorization` under
+  `"bearer"`. In the shipped code the listener kept the last copy. So `x-api-key: wrong` then
+  `x-api-key: <key>` was accepted, while a front end reading the first copy saw a wrong key. The
+  listener now refuses the request before it compares any credential. Identical copies are refused
+  too, and `x_api_key` counts as a copy of `x-api-key`. The refusal is charged and audited like a
+  wrong key, and it never names the header or its value. `docs/SECURITY.md` Table B, intake
+  authentication row, states the rule. (`BACKLOG #2051`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
