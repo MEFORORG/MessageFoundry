@@ -322,7 +322,8 @@ def test_a_value_that_keeps_the_control_on_is_not_a_loosening(field: str, value:
 
 
 def test_the_threshold_ceiling_is_nists() -> None:
-    """NIST SP 800-63B (rev. 3, 5.2.2) caps consecutive failed attempts on one account at 100."""
+    """A pin, so an edit to the constant is a visible decision: NIST SP 800-63B-4 section 3.2.2 (5.2.2
+    in rev. 3) caps consecutive failed attempts on one account at 100."""
     assert LOCKOUT_THRESHOLD_CEILING == 100
 
 
@@ -360,6 +361,17 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
 
     no_global = AuthSettings(login_rate_limit_global=0)
     assert admitted(no_global, addresses=50) == 200  # a spread spray is never refused
+
+    # The values the registry does NOT name, because each refuses more: none may admit more than
+    # the default does.
+    for window in (float("nan"), float("inf")):
+        unpruned = AuthSettings(login_rate_limit_window_seconds=window)
+        assert admitted(unpruned, addresses=1) <= 10
+        assert admitted(unpruned, addresses=50) <= 60
+        assert admitted(unpruned, addresses=1, ceremony=True) <= 10
+    assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1) <= 10
+    assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1, ceremony=True) <= 10
+    assert admitted(AuthSettings(login_rate_limit_global=-1), addresses=50) <= 60
 
 
 @pytest.mark.parametrize("escalate", [True, False])

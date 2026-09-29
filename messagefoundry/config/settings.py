@@ -6089,7 +6089,8 @@ def _reconcile_effective_bind(settings: ServiceSettings) -> None:
 
 
 #: The most consecutive failed attempts NIST SP 800-63B lets a verifier allow on one account before
-#: it acts (rev. 3, section 5.2.2, "Rate Limiting (Throttling)"). A ``[auth].lockout_threshold``
+#: it acts (SP 800-63B-4 section 3.2.2, "Rate Limiting (Throttling)"; section 5.2.2 in the superseded
+#: rev. 3 set the same number). A ``[auth].lockout_threshold``
 #: above it is named by :func:`security_loosenings` (BACKLOG #1131): a large enough threshold never
 #: arms, which is the lockout turned off in all but name.
 LOCKOUT_THRESHOLD_CEILING = 100
@@ -6501,7 +6502,7 @@ def security_loosenings(
             out.append(
                 (
                     "lockout_threshold",
-                    f"an account locks only after {auth.lockout_threshold} consecutive failures, "
+                    f"no account lock is set before {auth.lockout_threshold} consecutive failures, "
                     f"above the {LOCKOUT_THRESHOLD_CEILING} that NIST SP 800-63B allows -- that "
                     "many wrong guesses at one account's password or second factor are checked "
                     "before any lock is set, and a session may fail that many re-proofs before it "

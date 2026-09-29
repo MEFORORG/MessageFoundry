@@ -564,8 +564,8 @@ This section is kept rather than deleted, because the claim it used to make is t
   limits are what slow it. With the per-address limit off, one client may try as fast as the all-clients
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
   of addresses the attacker holds. With the ceremony limit off, a session holder guessing a password at
-  re-auth meets only the per-session cap, and a second factor at the console's sign-in step is guessed at
-  no set rate.
+  re-auth meets no rate limit, only the per-session cap and the account's lockout (each failed re-proof
+  counts toward it), and a second factor at the console's sign-in step is guessed at no set rate.
 - **When acceptable:** load testing on a host no untrusted client can reach. A reverse proxy or web
   application firewall in front of the engine can replace the per-address and all-clients limits, but it
   cannot replace the per-user ceremony limit, which keys on the signed-in user. Prefer **raising** a limit
@@ -580,7 +580,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > lock is still set at `lockout_threshold` failures, but it ends the moment it is set, on the sign-in and
 > the second-step counter alike. No `lockout_threshold` is read as off, since `0` or less locks on the
 > *first* failure. A large one never arms in practice, though, so a threshold above the **100**
-> consecutive failures that NIST SP 800-63B allows (rev. 3, section 5.2.2) is reported as well.
+> consecutive failures that NIST SP 800-63B allows (SP 800-63B-4 section 3.2.2, and rev. 3 section
+> 5.2.2 before it) is reported as well.
 - **What you lose:** at `lockout_minutes` of `0` or less, a run of wrong guesses at one account's password
   or second factor is never refused by a lock. The failures are still counted and audited. Each session is
   still revoked after `lockout_threshold` failed re-proofs, because that cap does not read
@@ -949,7 +950,7 @@ carried from that drive-to-pass, not re-derived here.**
 
 - [OWASP Application Security Verification Standard v5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) — chapter structure.
 - [NIST SP 800-53 Rev. 5, Security and Privacy Controls](https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final) — control catalog (SC-7, SC-8, SC-28, SC-13, IA-2, AC-12, AC-4, AU-2, AU-3, SI-12, RA-2, AC-6, AC-7).
-- [NIST SP 800-63B, Digital Identity Guidelines: Authentication and Lifecycle Management](https://pages.nist.gov/800-63-3/sp800-63b.html) — section 5.2.2, the ceiling of 100 consecutive failed attempts that `[auth].lockout_threshold` is checked against.
+- [NIST SP 800-63B-4, Digital Identity Guidelines: Authentication and Authenticator Management](https://pages.nist.gov/800-63-4/sp800-63b.html) — section 3.2.2 (section 5.2.2 in the superseded rev. 3), the ceiling of 100 consecutive failed attempts that `[auth].lockout_threshold` is checked against.
 - [NIST SP 800-66 Rev. 2, Implementing the HIPAA Security Rule](https://csrc.nist.gov/pubs/sp/800/66/r2/final) — Appendix D HIPAA → 800-53r5 crosswalk.
 - [45 CFR §164.312 — Technical safeguards](https://www.hhs.gov/hipaa/for-professionals/security/index.html) (HHS).
 - [CISA — Secure by Design](https://www.cisa.gov/securebydesign) — secure defaults + the loosening-guide model.
