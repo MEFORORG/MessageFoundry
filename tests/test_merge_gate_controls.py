@@ -1181,7 +1181,7 @@ def test_the_muting_detector_fires_on_a_synthetic_floor() -> None:
     correct annotation."""
     assert _muted("bandit -r . -ll --skip B101", "bandit") == [r"(?<!\w)-l{1,3}(?!\w)"]
     assert _muted("npm audit --package-lock-only --audit-level=high", "npm") == [r"--audit-level"]
-    assert _muted("bandit -r . --skip B101,B110,B311,B404,B608 --exclude ./tests", "bandit") == []
+    assert _muted("bandit -r . --skip B101,B110,B404,B608 --exclude ./tests", "bandit") == []
     assert _muted("npm audit --package-lock-only", "npm") == []
 
 

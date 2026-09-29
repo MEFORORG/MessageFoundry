@@ -100,6 +100,16 @@ under Changed says why engine 0.4.0 does not work with this console.
   holds the new value and the one-value rule above still applies.
 
 ### Fixed
+- **The uploaded-file pages explain a refused, throttled or unavailable action** (`BACKLOG #1169`,
+  PR 1506 follow-up A). Browse, resend and delete showed the engine's raw JSON for a status they
+  did not map. Two new allow-listed codes cover browse: `browse_hop_refused` (the PHI-read hop
+  guard's `403`) and `browse_throttled` (the PHI-read rate limit's `429`, whose notice says to wait
+  and retry). For the `503` every handler answers with no uploads directory, browse, resend, delete
+  and both confirm pages redirect with the fixed code `uploads_unavailable`. That code has no banner
+  entry: the list page answers `503` as HTML and renders its own notice, so a listing that loads
+  never claims the store is missing. No engine text is reflected, and the `404` answers are
+  unchanged. The upload form, and the console's own pacing and permission refusals, are not
+  covered. No seam change.
 - **The second-factor page states when a temporary password stops working** (`BACKLOG #2009`, ASVS
   6.4.5). A reset holder with a second factor reaches `/ui/mfa` before the forced password page,
   and that page said nothing about the deadline. It now states the same instant the password page

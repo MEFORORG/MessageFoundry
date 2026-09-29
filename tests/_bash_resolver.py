@@ -28,9 +28,12 @@ failures.
 
 from __future__ import annotations
 
+import atexit
 import os
+import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 #: ``bash`` exits **127** when it cannot FIND the thing it was asked to run and **126** when it found
@@ -115,12 +118,98 @@ def probe_env(bash: Path, env: dict[str, str] | None = None) -> dict[str, str]:
     ships ``curl.exe`` in ``mingw64/bin``, and a stub that lost to it sent a release-age check to the
     live network. Prepending here would shadow the caller's stub and defeat that control silently.
     Appending cannot: it only adds a fallback behind everything the caller already chose.
+
+    ***ONE ADDITION AHEAD OF THE APPEND: A SHIM THAT ANSWERS ONLY ``bash``.*** A bash or POSIX child
+    that runs ``bash`` by name, or a ``#!/usr/bin/env bash`` stub, resolves it against this PATH. A
+    NATIVE Windows grandchild uses PATHEXT, never sees the extensionless shim, and is not covered. On a Windows
+    box with WSL installed, ``C:\\Windows\\System32`` holds the WSL launcher and sits ahead of any
+    appended entry, so the grandchild lands in another filesystem namespace. Measured 2026-09-28
+    (owner instruction of that date): a ``gh`` stub exited 127 with "No such file or directory", and a
+    nested ``bash -c`` ran nothing. So when a DIFFERENT bash sits earlier on PATH, a directory holding
+    one file, ``bash``, which execs THIS interpreter, goes immediately before that entry.
+
+    It is a shim and not the interpreter's own directory because that directory holds every GNU
+    utility too: moving it would re-rank ``sort``, ``find``, ``curl`` and the rest against everything
+    after the insertion point. The shim re-ranks one name. Every entry ahead of the other bash stays
+    ahead, so a prepended stub directory still wins -- UNLESS the stub is itself a ``bash``. Nothing
+    here can tell a deliberate ``bash`` stub from the WSL launcher, so a caller stubbing ``bash`` must
+    build its own PATH rather than call this.
     """
     child = dict(env) if env is not None else dict(os.environ)
     own = str(bash.parent)
     current = child.get("PATH", "")
-    child["PATH"] = current + os.pathsep + own if current else own
+    entries = current.split(os.pathsep) if current else []
+    shadow = _first_other_bash(entries, bash)
+    if shadow is not None:
+        entries.insert(shadow, str(_bash_shim(bash)))
+    entries.append(own)
+    child["PATH"] = os.pathsep.join(entries)
     return child
+
+
+#: One shim directory per interpreter per import of this module, removed at exit. A hard kill that
+#: skips atexit leaves one small directory in the temp dir.
+_SHIMS: dict[str, Path] = {}
+_SHIM_PREFIX = "mf-bash-shim-"
+
+
+def _bash_shim(bash: Path) -> Path:
+    """A directory whose only file is a ``bash`` that execs ``bash``.
+
+    ``/bin/sh`` rather than the interpreter's own path in the shebang, because that path has a space
+    in it on Windows (``C:/Program Files/Git``) and a shebang cannot quote one. The exec line can.
+    """
+    key = str(bash)
+    shim = _SHIMS.get(key)
+    if shim is None:
+        shim = Path(tempfile.mkdtemp(prefix=_SHIM_PREFIX))
+        atexit.register(shutil.rmtree, shim, True)
+        script = shim / "bash"
+        script.write_text(
+            f'#!/bin/sh\nexec {shlex.quote(bash.as_posix())} "$@"\n', encoding="utf-8", newline="\n"
+        )
+        script.chmod(0o755)
+        _SHIMS[key] = shim
+    return shim
+
+
+def _first_other_bash(entries: list[str], bash: Path) -> int | None:
+    """Index of the first PATH entry that would answer ``bash`` with a DIFFERENT binary, or None.
+
+    Stops where the right bash already wins by PATH order: the interpreter's own directory under any
+    spelling, or the shim this module made for THIS interpreter. Skips empty and relative entries,
+    which name the CHILD's working directory, not this process's.
+    """
+
+    def norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path))
+
+    stops = {norm(str(bash.parent))}
+    if str(bash) in _SHIMS:
+        stops.add(norm(str(_SHIMS[str(bash)])))
+    # `bash.exe` answers `bash` only on Windows; a POSIX PATH search never appends an extension.
+    names = ("bash.exe", "bash") if os.name == "nt" else ("bash",)
+    for index, entry in enumerate(entries):
+        if not entry or not os.path.isabs(entry):
+            continue
+        if norm(entry) in stops:
+            return None
+        for name in names:
+            candidate = os.path.join(entry, name)
+            # lexists, NOT is_file: is_file swallows a failed stat and answers False, and an
+            # app-execution alias such as WindowsApps\bash.exe is a reparse point that still
+            # answers `bash` by name.
+            if not os.path.lexists(candidate) or os.path.isdir(candidate):
+                continue
+            if os.name != "nt" and not os.access(candidate, os.X_OK):
+                continue  # bash's own PATH search skips a file it cannot execute
+            try:
+                if os.path.samefile(candidate, bash):
+                    return None  # our own interpreter, under another spelling, already leads
+            except OSError:
+                pass  # cannot prove it is the same binary, so it may shadow ours
+            return index
+    return None
 
 
 def _probe(
@@ -136,11 +225,14 @@ def _probe(
     """
     probe = tmp_path / _PROBE_NAME
     probe.write_text(_PROBE_TOKEN + "\n", encoding="utf-8")
+    # OUTSIDE the try: probe_env may write a shim, and a temp-dir failure there is a HARNESS fault.
+    # Caught below, it would read as "this interpreter cannot see the file" -- a false namespace verdict.
+    child_env = probe_env(bash, env)
     try:
         out = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
             [str(bash), "-c", f"cat {_PROBE_NAME}"],
             cwd=str(tmp_path),
-            env=probe_env(bash, env),
+            env=child_env,
             capture_output=True,
             timeout=_TIMEOUT,
             check=False,

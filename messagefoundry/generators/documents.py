@@ -52,7 +52,7 @@ def synthetic_pdf(*, n_bytes: int | None = None, seed: str = "mefor-pdf") -> byt
     if n_bytes is not None:
         pad = n_bytes - len(parts) - len(_PDF_TRAILER)
         if pad > 0:
-            parts += random.Random(seed).randbytes(pad)
+            parts += random.Random(seed).randbytes(pad)  # nosec B311 (fixture filler, seeded)
     parts += _PDF_TRAILER
     return bytes(parts)
 
