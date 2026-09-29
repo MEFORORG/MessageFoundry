@@ -582,6 +582,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
+  The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
+  dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
+  pause the stopped lane and the next open resume it, retrying the fault every window. The
+  dispatcher now reports every STOP to the runner, which holds the lane until a real re-arm.
+  (`BACKLOG #2072`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

@@ -461,6 +461,75 @@ async def test_a_pooled_broadcast_that_re_arms_a_stopped_lane_ends_its_hold(
         await runner.stop()
 
 
+async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # BACKLOG #2072. The pooled ADR 0070 T17 bound STOPs a lane whose dispatch keeps raising, and it
+    # decides that inside the dispatcher, so no runner STOP site recorded a hold. The window close
+    # then paused the STOPPED lane (a pooled pause overwrites STOPPED), and the next open resumed it:
+    # the fault the STOP was bounding was retried at every window.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB_FEED", MLLP(port=_free_port()), router="r"))
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB_SCHED", m))
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SCHED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+            schedule=schedule,
+        )
+    )
+    sink = _StopSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        claim_mode="pooled",
+        alert_sink=sink,
+        infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
+        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+    )
+    attempts = 0
+
+    async def _infra_fault(name: str, item: object) -> object:
+        # Raised from the delivery body, so it escapes the adapter: a T17 machinery fault, not a
+        # delivery failure the body resolves.
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("store handoff fault")
+
+    await runner.start()
+    try:
+        runner._process_delivery_item = _infra_fault  # type: ignore[method-assign,assignment]
+        await store.enqueue_ingress(channel_id="IB_FEED", raw=RAW)
+        runner.notify_work()
+        out = runner._dispatchers[Stage.OUTBOUND]
+        await _wait_until(lambda: out.stopped("OB_SCHED"))
+        assert attempts == 1
+        assert ("outbound", "OB_SCHED") in runner._stop_held
+
+        clock.set(_OUT_OF_WINDOW)  # the window closes...
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        clock.set(_NEXT_WINDOW)  # ...and the next one opens
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        await asyncio.sleep(0.3)  # time for a re-armed lane to claim the re-pended head
+
+        assert attempts == 1  # the lane was not re-armed, so the fault was not retried
+        assert out.stopped("OB_SCHED")
+
+        # Control: a real re-arm (the pooled broadcast a reload or replay sends) lifts the hold and
+        # the head is claimed again. Without this arm, "one attempt" could mean a lane that never
+        # re-claims anything.
+        runner.notify_work()
+        assert ("outbound", "OB_SCHED") not in runner._stop_held
+        await _wait_until(lambda: attempts == 2)
+    finally:
+        await runner.stop()
+
+
 def _raising_router(m: object) -> list[str]:
     raise RuntimeError("router bug")
 

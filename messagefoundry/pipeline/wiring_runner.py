@@ -1295,8 +1295,9 @@ class RegistryRunner:
         self._schedule_tick = schedule_tick
         self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
         self._schedule_workers: dict[tuple[Direction, str], asyncio.Task[None]] = {}
-        # Lanes halted by a STOP that only an operator may lift: a credential fault (#109) or the
-        # internal-error STOP policy. The scheduler reads this so a window close or open never undoes
+        # Lanes halted by a STOP that only an operator may lift: a credential fault (#109), the
+        # internal-error STOP policy, or a pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault
+        # bound, the #2074 claimer-death bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
         # one (see _schedule_holds, which also names every path that clears a record). Keyed by
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
@@ -2804,12 +2805,39 @@ class RegistryRunner:
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
         """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
-        credential fault or the internal-error STOP policy). Called at the STOP site as its last step
+        credential fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
+        claimer-death STOP via :meth:`_pooled_stop_hold`). Called at the STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
-        to hold. The scheduler reads it through :meth:`_schedule_holds`."""
-        self._stop_held.add((kind, name))
-        self._stop_hold_logged.discard((kind, name))
+        to hold. The scheduler reads it through :meth:`_schedule_holds`.
+
+        Idempotent: a pooled content STOP reaches here twice, once from its own site and once from
+        the dispatcher's STOPPED hook (:meth:`_pooled_stop_hold`), and the second call must not
+        re-arm the scheduler's once-per-hold notice."""
+        key = (kind, name)
+        if key in self._stop_held:
+            return
+        self._stop_held.add(key)
+        self._stop_hold_logged.discard(key)
+
+    def _pooled_stop_hold(self, stage: Stage) -> Callable[[str], None] | None:
+        """The ``on_lane_stopped`` hook for ``stage``'s dispatcher: hold every lane it STOPs.
+
+        The runner-side STOP sites call :meth:`_hold_for_operator` themselves, but two pooled STOPs
+        are decided inside the dispatcher and no runner code sees them: the ADR 0070 T17 infra-fault
+        bound (``infra_fault_policy="stop"``) and the #2074 claimer-death bound. Unheld, the scheduler
+        parked such an outbound at the window close (a pause turns STOPPED into PAUSED) and resumed
+        it at the next open, retrying the fault the STOP was bounding; an inbound's listener came
+        back up over a lane nothing drains (BACKLOG #2072). None for a stage with no hold direction
+        (RESPONSE)."""
+        kind = _HOLD_DIRECTION.get(stage)
+        if kind is None:
+            return None
+
+        def _hold(lane: str) -> None:
+            self._hold_for_operator(lane, kind)
+
+        return _hold
 
     def _release_operator_hold(self, name: str, kind: Direction) -> None:
         """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar
@@ -4476,6 +4504,7 @@ class RegistryRunner:
             # Connection controls: only the OUTBOUND dispatcher signals per-lane quiescence back to the
             # runner (the pause primitive is outbound-only) so 'stopped' means zero in-flight.
             on_lane_paused=(self._mark_outbound_quiesced if stage is Stage.OUTBOUND else None),
+            on_lane_stopped=self._pooled_stop_hold(stage),
             empty_counter=self._empty_claims,
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,

@@ -352,6 +352,7 @@ class StageDispatcher:
         stop_event: asyncio.Event | None = None,
         alert_sink: AlertSink | None = None,
         on_lane_paused: Callable[[str], None] | None = None,
+        on_lane_stopped: Callable[[str], None] | None = None,
         empty_counter: _EmptyClaimObserver | None = None,
         clock: Callable[[], float] | None = None,
         call_later: _CallLater | None = None,
@@ -386,6 +387,11 @@ class StageDispatcher:
         # this to set its per-outbound quiescence Event, so 'stopped' means zero in-flight (not merely
         # pause-requested). None keeps PR3/tests self-contained.
         self._on_lane_paused = on_lane_paused
+        # Fired (if set) each time a lane reaches STOPPED, whichever STOP put it there: a content STOP
+        # (T16), the ADR 0070 T17 infra-fault bound, or the #2074 claimer-death bound. The runner wires
+        # it to its operator hold, so an active-window scheduler never re-arms a lane only an operator
+        # may lift. The last two are decided HERE, so no runner code sees them happen (BACKLOG #2072).
+        self._on_lane_stopped = on_lane_stopped
         self._clock: Callable[[], float] = clock or time.time
         self._call_later = call_later  # resolved to loop.call_later at start() when None
         # Pooled T17 (infra/machinery-fault) bound (ADR 0070 fix B). Policy "stop" STOPs a persistently
@@ -1512,7 +1518,11 @@ class StageDispatcher:
         """STOP a lane and raise ``connection_stopped``. Re-armed only by reload or
         ``notify_work`` (:meth:`_unpark`), never by a wake or the sweep. The phase is set first and
         a raising sink is logged, not propagated, as the runner guards the same call: a stop must
-        not also kill the claimer or serializer that reached it."""
+        not also kill the claimer or serializer that reached it.
+
+        ``on_lane_stopped`` runs AFTER the alert and whether or not the alert raised: here a raising
+        sink does not undo the STOP, so the lane is stopped either way and must be held either way.
+        It is guarded the same way, for the same reason."""
         st.phase = _LanePhase.STOPPED
         try:
             self._alert_sink.connection_stopped(lane, detail=detail)
@@ -1523,6 +1533,16 @@ class StageDispatcher:
                 lane,
                 exc_info=True,
             )
+        if self._on_lane_stopped is not None:
+            try:
+                self._on_lane_stopped(lane)
+            except Exception:  # noqa: BLE001 — a hook failure must not undo or escalate the stop
+                log.warning(
+                    "StageDispatcher %s on_lane_stopped raised for lane %s",
+                    self._stage.value,
+                    lane,
+                    exc_info=True,
+                )
 
     def _end_claim(
         self,
