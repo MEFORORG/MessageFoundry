@@ -1044,6 +1044,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
+  reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
+  account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was
+  wrong, the code was wrong, or both. Before, the reason named the failing factor
+  (`bad_code`/`bad_password`/`bad_password_and_code`). Because the sign-in lock does not refuse a
+  combined sign-in, an `audit:read` holder who is not an administrator (the built-in `AUDITOR` role)
+  could arm a target's sign-in lock, send candidate passwords with any six digits, and read the
+  reason to learn which candidate was right — one request per candidate, up to the global sign-in
+  ceiling of about 86,400 a day, against ADR 0197's design bound of 35. ADR 0197's counting is
+  unchanged: a right password with a wrong code still charges the second-step counter, both wrong
+  still charges the sign-in counter, and which factor verified still reaches the account holder's
+  own lock notice and the `users:manage` lock-state surface. A coarser residual remains: the
+  lock rows a locked second-step counter emits (`auth.account_locked`, `auth.lock_notice`,
+  `auth.login_locked`) still tell the two outcomes apart at `lockout_threshold` requests per
+  candidate; removing them touches the AC-10 lock record, so it is left for an owner/ADR decision.
+  (`BACKLOG #1131`, ASVS 6.1.1)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
