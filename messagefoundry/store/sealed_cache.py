@@ -141,9 +141,13 @@ def _canonical(key: object) -> bytes:
     for part in parts:
         # Every backend keys its caches by str. repr() is a fallback for any other hashable, where
         # equal-but-differently-repr'd keys would still fail closed rather than read wrongly.
-        text = str.__str__(part) if isinstance(part, str) else repr(part)
+        # A per-part tag keeps a str part apart from a non-str part with the same text.
+        if isinstance(part, str):
+            tag, text = b"S", str.__str__(part)
+        else:
+            tag, text = b"R", repr(part)
         raw = text.encode("utf-8", "surrogatepass")
-        out.append(len(raw).to_bytes(4, "big") + raw)
+        out.append(tag + len(raw).to_bytes(4, "big") + raw)
     return b"".join(out)
 
 

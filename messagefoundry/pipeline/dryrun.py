@@ -601,7 +601,14 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
             view[spec.name] = {
                 k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
             }
-        except (CodeSetError, TypeError):
+        except CodeSetError:
+            continue
+        except TypeError:
+            # The live sync would refuse to commit this set, so the preview omits it too; say why, or
+            # a later read reports a missing set rather than an unencodable one. Names the set only.
+            log.warning(
+                "dry-run: reference set %r holds a value the store cannot encode", spec.name
+            )
             continue
     return view
 

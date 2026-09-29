@@ -573,7 +573,7 @@ def _snapshot(view: Mapping[Any, Any]) -> Mapping[Any, Any]:
     if callable(copier):
         try:
             snap = copier()
-        except AttributeError:  # a proxy over a mapping with no copy()
+        except (AttributeError, TypeError):  # a proxy over a mapping with no plain copy()
             snap = None
         if isinstance(snap, Mapping):
             return snap

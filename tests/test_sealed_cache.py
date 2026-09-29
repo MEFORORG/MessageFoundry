@@ -167,6 +167,10 @@ def test_length_prefixed_key_parts_do_not_collide() -> None:
         cache[("a", "bc")]
 
 
+def test_a_str_part_and_a_non_str_part_with_the_same_text_do_not_share_aad() -> None:
+    assert sealed_cache._canonical(("ns", "1")) != sealed_cache._canonical(("ns", 1))
+
+
 def test_discard_removes_without_decrypting(count_opens: list[int]) -> None:
     cache = new_state_cache()
     cache[("ns", "k")] = SECRET
