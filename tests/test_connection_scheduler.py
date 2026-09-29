@@ -992,9 +992,20 @@ async def test_a_window_open_that_cannot_bind_is_recorded_and_alerted_once(
 
         assert not runner.inbound_running("IB_SCHED")
         assert sink.stopped == ["IB_SCHED"]  # one alert, not one per tick
-        tracebacks = [r for r in caplog.records if r.exc_info is not None]
+        tracebacks = [
+            r for r in caplog.records if r.exc_info is not None and "IB_SCHED" in r.getMessage()
+        ]
         assert len(tracebacks) == 1, [r.getMessage() for r in tracebacks]
         assert not [r for r in caplog.records if "reconcile failed" in r.getMessage()]
+
+        # A reload outside the window is the recovery the alert names. With no bind to clear the
+        # record, it drops it, and the next open finds the port still held and alerts again.
+        clock.set(_utc(2026, 7, 14, 18))
+        await runner.reload(_scheduled_inbound_graph(port, schedule))
+        assert runner.inbound_failed("IB_SCHED") is None
+        clock.set(_utc(2026, 7, 15, 9))
+        await _wait_until(lambda: runner.inbound_failed("IB_SCHED") is not None)
+        assert sink.stopped == ["IB_SCHED", "IB_SCHED"]
 
         # Control: the other process lets the port go, and the next tick binds it and clears the
         # failed status. Without this arm, "one alert" could mean a scheduler that stopped trying.

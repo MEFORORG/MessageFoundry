@@ -2881,9 +2881,11 @@ class RegistryRunner:
             # its calendar and closes the window cleanly.
             if not self._auto_start_enabled(name, kind):
                 return
-            # A retry of a start already recorded failed says so once, in _record_failed, not per tick.
+            # An inbound retrying a start already recorded failed said so once, in _record_failed.
             log.log(
-                logging.DEBUG if (kind, name) in self._failed else logging.INFO,
+                logging.DEBUG
+                if kind == "inbound" and (kind, name) in self._failed
+                else logging.INFO,
                 "schedule: %s connection %r entering active window — starting",
                 kind,
                 name,
@@ -2916,11 +2918,15 @@ class RegistryRunner:
         another process took meanwhile is first found here, after the reload has committed. Before
         this, the error reached :meth:`_schedule_worker`, which logged a traceback every tick and
         recorded nothing an operator reads as status. The next tick still retries, and a bind that
-        succeeds clears the record. A retry that fails the same way is logged at DEBUG only; a
-        different reason is recorded and alerted afresh."""
-        if self._failed.get(("inbound", name)) == safe_exc(exc):
+        succeeds clears the record. While the record stands, a retry that fails is logged at DEBUG
+        only, whatever its reason: keying on the reason text would re-alert every tick on an error
+        whose message varies. A reload clears the record (see :meth:`reload`), so the next window
+        open alerts afresh."""
+        if ("inbound", name) in self._failed:
             log.debug(
-                "schedule: inbound connection %r still cannot start; retrying next tick", name
+                "schedule: inbound connection %r still cannot start (%s); retrying next tick",
+                name,
+                safe_exc(exc),
             )
             return
         self._record_failed(name, exc, kind="inbound")
@@ -5435,10 +5441,14 @@ class RegistryRunner:
                     # this listener, and it is parked. Step 1 unbound it with every other source, so
                     # re-binding it here opened the partner port until the scheduler's next tick
                     # parked it again, up to a whole tick later (BACKLOG #2069). Its workers are
-                    # still re-armed below, so any backlog drains (AC-3).
+                    # still re-armed below, so any backlog drains (AC-3). A failed record a window
+                    # open left is dropped: the reload is the recovery its alert names, and with no
+                    # bind here to clear it, it would hold the status at failed until the next open.
+                    # That open re-records and re-alerts if the cause is still there.
                     if ic.schedule is not None and not ic.schedule.is_active(
                         self._schedule_clock()
                     ):
+                        self._failed.pop(("inbound", ic.name), None)
                         continue
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
