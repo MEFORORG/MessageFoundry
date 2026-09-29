@@ -3784,6 +3784,45 @@ async def test_reset_mfa_and_revoke_sessions_roundtrip(engine: Engine) -> None:
             assert r.headers["location"] == f"/ui/users/{uid}", action
 
 
+@pytest.mark.parametrize("action", ["reset-mfa", "reset-password"])
+async def test_a_refused_issue_on_the_console_keeps_the_account_and_the_grant(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    """ADR 0197 Amendment A, Manager decision 2026-09-29: when no credential can be issued, the
+    console's reset renders the refusal, changes nothing, and gives back the grant its gate spent,
+    so the same grant opens the action once the generator can issue again."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth import service as service_module
+
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            admin_write_min_interval_seconds=0,  # the retry is machine-speed (PR 1781, #2301)
+            password_extra_context_words=["globex"],
+        ),
+    )
+    await service.initialize()
+    await _add(service, "u2", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u2")
+        before = await service.store.get_user(uid)
+        await _mint_action(c, f"/ui/users/{uid}/{action}")
+        monkeypatch.setattr(
+            service_module,
+            "secrets",
+            SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
+        )
+        r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 400 and "password_extra_context_words" in r.text
+        after = await service.store.get_user(uid)
+        assert after == before, "a refused issue changed the account"
+        monkeypatch.undo()
+        r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200, "the refunded grant did not open the action"
+
+
 async def test_delete_user_roundtrip_and_self_guard(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u2", Role.VIEWER)

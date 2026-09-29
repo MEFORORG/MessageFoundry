@@ -185,6 +185,14 @@ takes no password; a request that sends one is refused (422). The engine generat
 credential, returns it once as `temp_password`, and flags it `must_change_password`. The web console's
 create form has no password field and shows the credential once.
 
+**If no credential can be generated, nothing changes.** A site context-word list
+(`[auth].password_extra_context_words`) broad enough that no generated credential clears the policy
+makes account creation and both resets answer 503. Each generates the credential before it writes
+anything, so the account, its factors and its sessions are untouched, and the single-use step-up
+grant the route spent is given back. The engine tries the generator once at start and logs an ERROR
+if it fails, and `messagefoundry verify` reports the same as `auth.credential_generation`. Neither
+refuses to start.
+
 **The factor reset issues one too.** `POST /users/{user_id}/reset-mfa` on a local account writes a
 generated credential **first**, then clears the TOTP key, the recovery codes and every passkey and
 revokes the sessions, then writes the same credential again. It returns the credential once, and

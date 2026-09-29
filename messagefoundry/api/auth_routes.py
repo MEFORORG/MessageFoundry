@@ -1175,6 +1175,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_PASSWORD, Permission.USERS_MANAGE)
         ),
+        session: str | None = Depends(bearer_token),
     ) -> PasswordResetResponse:
         """Admin password reset (ASVS 6.4.6 / WP-L3-12): issue a one-time, must-change credential the
         administrator never keeps. Returned **once** for out-of-band delivery; the affected user is also
@@ -1198,6 +1199,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             raise HTTPException(code, detail) from exc
         except TemporaryPasswordUnavailable as exc:
+            # Raised before any write, so the account is untouched; the grant the gate spent is
+            # given back, so a request that changed nothing costs no proof (ADR 0197 Amendment A,
+            # Manager decision 2026-09-29; the refund's docstring says what it can and cannot buy).
+            # ``session`` is the caller's token: the bearer on this plane, passed explicitly by the
+            # console, which calls this handler in-process.
+            service.refund_action_step_up(
+                session if isinstance(session, str) else None, STEP_UP_ACTION_ADMIN_RESET_PASSWORD
+            )
             # A site setting, not a bad request, so a 503 like this module's other server-side
             # refusals. It is mapped rather than left to the generic handler, which says only
             # "internal error": the message names the setting to fix, and the web console renders
@@ -1214,6 +1223,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_MFA, Permission.USERS_MANAGE)
         ),
+        session: str | None = Depends(bearer_token),
     ) -> MfaResetResponse:
         """Admin MFA reset (lost authenticator + no recovery codes): clear the user's TOTP enrollment
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
@@ -1246,7 +1256,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         try:
             issued = await service.admin_reset_mfa(user_id, actor=identity.username)
         except TemporaryPasswordUnavailable as exc:
-            # As on the password reset: raised before any write, so the factors are untouched.
+            # As on the password reset: raised before any write, so the factors and sessions are
+            # untouched, and the spent grant is given back.
+            service.refund_action_step_up(
+                session if isinstance(session, str) else None, STEP_UP_ACTION_ADMIN_RESET_MFA
+            )
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except ValueError as exc:
             detail = str(exc)

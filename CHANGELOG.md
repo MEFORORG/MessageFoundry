@@ -23,7 +23,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   engine warns about, and audits, every covered account that still has a chosen password and no
   TOTP, and every TOTP key it cannot decrypt; `messagefoundry verify` reports the same as
   `auth.lockable_accounts`. The `users.password_generated` column is added on all three backends.
-  (`BACKLOG #1131`, ASVS 6.1.1)
+  If `[auth].password_extra_context_words` is so broad that no generated credential clears the
+  policy, creating an account and both resets answer 503 and change nothing, and a spent step-up
+  grant is given back; the engine logs an ERROR at start and `verify` fails
+  `auth.credential_generation`. `provision-admin` shows the TOTP key and recovery codes on the
+  controlling terminal only, never on stdout or stderr. (`BACKLOG #1131`, ASVS 6.1.1)
 - **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
   lists terms such as an organization, product, project or department name. They join the shipped
   `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`

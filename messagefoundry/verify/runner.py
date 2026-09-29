@@ -8,7 +8,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
-from messagefoundry.verify.checks import check_lockable_accounts, run_host_checks
+from messagefoundry.verify.checks import (
+    check_credential_generation,
+    check_lockable_accounts,
+    run_host_checks,
+)
 from messagefoundry.verify.model import CheckResult, Status
 from messagefoundry.verify.smoke import (
     check_store_connectivity,
@@ -219,6 +223,9 @@ def run_verify(
             results.append(check_store_connectivity(settings.store))
             # ADR 0197 Amendment A, AC-A9: the census of accounts with no way past a lock.
             results.append(check_lockable_accounts(settings.store, settings.auth))
+            # ADR 0197 Amendment A, Manager decision 2026-09-29: a sibling check, not part of the
+            # census -- it is about the policy, not about any account.
+            results.append(check_credential_generation(settings.auth))
 
     if "smoke" in selected:
         if smoke_mode == "self":

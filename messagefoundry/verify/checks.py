@@ -388,6 +388,37 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
     )
 
 
+def check_credential_generation(auth: AuthSettings) -> CheckResult:
+    """ADR 0197 Amendment A, Manager decision 2026-09-29: can the engine issue a temporary credential
+    under the configured password policy? Account creation, the password reset and the factor reset
+    all need one, and a pathological ``[auth].password_extra_context_words`` list can make the
+    generator fail every time. The same probe the engine runs at start; this reports it before the
+    service is started. No store, no secret printed: the generated value is discarded."""
+    from messagefoundry.auth.policy import PasswordPolicy
+    from messagefoundry.auth.service import (
+        _PROBE_USERNAME,
+        TemporaryPasswordUnavailable,
+        generate_policy_password,
+    )
+
+    rid, title = "auth.credential_generation", "Temporary credentials can be issued"
+    if not auth.enabled:
+        return CheckResult(rid, title, Status.SKIP, "sign-in is off, so no credential is issued")
+    try:
+        generate_policy_password(PasswordPolicy.from_settings(auth), username=_PROBE_USERNAME)
+    except TemporaryPasswordUnavailable as exc:
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"{exc}. Creating an account, resetting a password and resetting an account's factors "
+            "will answer 503 until it is fixed.",
+        )
+    return CheckResult(
+        rid, title, Status.PASS, "a generated credential clears the configured password policy"
+    )
+
+
 def run_host_checks(*, ports: dict[str, int], writable_dir: Path) -> list[CheckResult]:
     """Run every host/environment check and return their results (order is stable)."""
     return [

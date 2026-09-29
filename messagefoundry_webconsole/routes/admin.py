@@ -52,6 +52,7 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
     require_ui_step_up_action,
+    session_token,
 )
 from .._service import _service
 from ..pages.admin import (
@@ -489,7 +490,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # newer engine would read `expires_at` off an older one and raise AttributeError at
             # reset time — the exact skew SUPPORTED_ENGINE_SEAMS exists to refuse loudly at startup.
             result: PasswordResetResponse = await admin.reset_user_password(
-                user_id, service=service, identity=identity
+                # The cookie session, so a refused issue refunds the grant the gate spent.
+                user_id,
+                service=service,
+                identity=identity,
+                session=session_token(request),
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
@@ -520,7 +525,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         assert_same_origin(request)
         try:
             reset: MfaResetResponse = await admin.reset_user_mfa(
-                user_id, service=service, identity=identity
+                user_id, service=service, identity=identity, session=session_token(request)
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:

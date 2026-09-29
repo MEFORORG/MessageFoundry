@@ -214,7 +214,7 @@ def test_startup_is_silent_when_screening_is_turned_off(
 #
 # #1438 above made an unusable corpus REFUSE a password. That is right for every password a person
 # chooses and wrong for exactly one caller, the temporary-credential generator -- whose reasoning is
-# stated at its own call site in `AuthService._generate_policy_password`, not repeated here.
+# stated at its own call site in `generate_policy_password` (auth/service.py), not repeated here.
 #
 # WHAT THESE ARMS ADD is the pairing. A blanket suppression passes the positive arms and fails the
 # controls, and that contrast is the only thing that can tell this targeted fix apart from the
@@ -343,7 +343,7 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     bundled_corpus: Callable[[Sequence[str] | None], None], empty_store: MessageStore
 ) -> None:
     """`admin_reset_password` reaches the same generator, so the same suppression covers it. Worth its
-    own arm because it was the SECOND caller of `_generate_policy_password`, and is now the only one:
+    own arm because it was the SECOND caller of `generate_policy_password`, and is now the only one:
     a fix applied at the retired first-run call rather than inside the generator would have failed
     this one. The pairing arm above mints through the same reset, so the two overlap; this arm keeps
     the length check.
@@ -369,7 +369,7 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
 #: bulk-import path, or a route copying the kwarg to quieten a red corpus leg -- and silently stop
 #: screening an operator-supplied password with all thirteen arms above still green. Neither measured
 #: mutation detects that shape, because both mutate the gate rather than adding a caller.
-_BREACH_SUPPRESSION_CALL_SITES = {"messagefoundry/auth/service.py": ("_generate_policy_password",)}
+_BREACH_SUPPRESSION_CALL_SITES = {"messagefoundry/auth/service.py": ("generate_policy_password",)}
 
 
 def _suppression_call_sites() -> dict[str, tuple[str, ...]]:
@@ -414,4 +414,4 @@ def test_the_call_site_scanner_would_notice_a_new_suppression() -> None:
     """
     found = _suppression_call_sites()
     assert found, "the scanner found no suppression at all -- it has stopped measuring"
-    assert "_generate_policy_password" in found["messagefoundry/auth/service.py"]
+    assert "generate_policy_password" in found["messagefoundry/auth/service.py"]

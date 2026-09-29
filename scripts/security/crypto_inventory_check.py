@@ -1444,8 +1444,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/verify/runner.py": frozenset({"tls_context:via messagefoundry.verify.smoke"}),
     # ADR 0197 Amendment A (AC-A9): the lockable-account census computes one TOTP code per enabled
     # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is
-    # discarded and never compared.
-    "messagefoundry/verify/checks.py": frozenset({"mac:via messagefoundry.auth.service"}),
+    # discarded and never compared. ``check_credential_generation`` (Manager decision 2026-09-29)
+    # draws one temporary credential from the CSPRNG through the same generator the engine issues
+    # with, to prove the policy leaves one to issue; the value is discarded.
+    "messagefoundry/verify/checks.py": frozenset(
+        {"csprng:via messagefoundry.auth.service", "mac:via messagefoundry.auth.service"}
+    ),
     "messagefoundry_webconsole/routes/account.py": frozenset(
         {"hash:via messagefoundry.auth.tokens"}
     ),

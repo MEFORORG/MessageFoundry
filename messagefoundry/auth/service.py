@@ -157,7 +157,7 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     half. THIS FUNCTION deliberately does not stop the engine -- HL7 flow does not depend on password
     screening, and bricking a message engine over an auth data asset would trade a contained failure for
     an outage. The engine's own ``serve`` lifespan no longer stops either, since BACKLOG #1447: a FIRST
-    run used to fail there, and :meth:`AuthService._generate_policy_password` now suppresses this screen
+    run used to fail there, and :func:`generate_policy_password` now suppresses this screen
     on its own candidate -- see that call for why. Stated as that ONE path rather than as "nothing
     anywhere": the ``provision-admin`` CLI still refuses on this, as an error message since Wave 2.
 
@@ -622,12 +622,79 @@ class TemporaryPasswordUnavailable(RuntimeError):
 #: the name: at least "password", "passphrase", "secret", "token", "account" and "cert".
 _RESET_GENERATION_ATTEMPTS = 64
 
+#: The username the startup generator probe screens against: synthetic, long, and unlike any real
+#: account name, so the own-username clause cannot be the reason the probe fails.
+_PROBE_USERNAME = "mf-startup-credential-probe"
+
 
 def _temporary_password_chars(min_length: int) -> int:
     """The generated password's length: the policy minimum, but never under 32 characters.
     ``token_urlsafe`` carries 6 bits per character, so 32 characters keep the 192-bit floor of BACKLOG
     #1172, and any longer minimum carries more."""
     return max(32, min_length)
+
+
+def generate_policy_password(policy: PasswordPolicy, *, username: str | None = None) -> str:
+    """A random password that satisfies the active policy — so an administrator-issued temporary
+    credential is held to the same bar operators are. ``token_urlsafe(n)`` yields about 1.33 times
+    n characters, cut to :func:`_temporary_password_chars`, so the length is at least
+    ``min_length``. The loop covers a context hit or an opt-in character-class requirement a given
+    token happens to miss.
+
+    Every clause except the breach screen, which is suppressed per-call for the reason stated at
+    the call below (BACKLOG #1447).
+
+    ``username`` is the account the password is for, so the own-username clause applies too.
+
+    Raises :class:`TemporaryPasswordUnavailable` when no candidate clears the policy. It never
+    returns an unscreened password. The old last-resort return appended ``aA1!`` without a screen,
+    so a site context word inside it would have issued a credential the policy refuses (BACKLOG
+    #1132)."""
+    # At least 32 CHARACTERS (192 bits). token_urlsafe's argument is a byte count and min_length
+    # is a CHARACTER count, so the bytes are derived from the characters: 3 bytes make 4
+    # characters, and the cut below never pads, so a short byte count would silently lower the
+    # entropy floor (BACKLOG #1172).
+    chars = _temporary_password_chars(policy.min_length)
+    length = -(-chars * 3 // 4)  # ceiling: enough bytes for `chars` characters
+    # The suffixed form exists only for an opt-in character class the bare token happens to miss.
+    # With every class rule off it cannot help: the bare token then fails only on a context word
+    # or the username, and the suffix keeps either one.
+    class_rules = (
+        policy.require_uppercase
+        or policy.require_lowercase
+        or policy.require_digit
+        or policy.require_symbol
+    )
+    for _ in range(_RESET_GENERATION_ATTEMPTS):
+        token = secrets.token_urlsafe(length)[:chars]
+        # The bare token first. The suffixed form is screened like the token: a site term can sit
+        # inside it too.
+        candidates = (token, token + "aA1!") if class_rules else (token,)
+        # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
+        # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
+        # contain it -- the breach clause is inert on this input by construction. Honouring
+        # `check_breached` here therefore converts a screen that can never FIRE into one that
+        # always BLOCKS: the corpus load raises on an unusable install (BACKLOG #1438). While this
+        # also generated the first-run account (retired by ADR 0183), the raise escaped an
+        # unguarded lifespan call and the engine did not start at all.
+        #
+        # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
+        # operator- or user-supplied password, where the corpus is the whole point and refusing is
+        # right -- so do NOT widen this to the policy field or the `[auth]` setting.
+        for candidate in candidates:
+            if not policy.violations(candidate, username=username, suppress_breach_check=True):
+                return candidate
+    _log.error(
+        "no temporary password cleared the password policy in %d tries; the likely cause is "
+        "[auth].password_extra_context_words holding so many short terms that nearly every "
+        "random string contains one, which would refuse most passphrases too",
+        _RESET_GENERATION_ATTEMPTS,
+    )
+    raise TemporaryPasswordUnavailable(
+        "could not generate a temporary password that clears the password policy; check "
+        "[auth].password_extra_context_words for short or very common terms, then restart the "
+        "engine, which reads [auth] only at start"
+    )
 
 
 # Characters that let one address field name more than one mailbox, or smuggle a display name or a
@@ -1607,6 +1674,10 @@ class AuthService:
         # same accepted per-process caveat). Minted ONLY by reauth(purpose=...) — never by login or
         # verify_mfa — so a login-seeded step-up window can't authorize a durable factor-binding action.
         self._action_step_up_grants: dict[tuple[str, str], float] = {}
+        # Grants spent by ``has_action_step_up`` whose route then failed BEFORE any side effect, kept
+        # so ``refund_action_step_up`` can restore them with their ORIGINAL deadline (ADR 0197
+        # Amendment A, Manager decision 2026-09-29). Bounded and pruned like the live grants.
+        self._spent_action_step_up_grants: dict[tuple[str, str], float] = {}
         # One in-flight post-session re-proof per account (BACKLOG #1138): user_id -> [lock, users].
         # Process-local like the caches above; an entry lives only while someone holds or awaits it.
         self._reproof_locks: dict[str, _KeyedLock] = {}
@@ -1849,67 +1920,9 @@ class AuthService:
             )
 
     def _generate_policy_password(self, username: str | None = None) -> str:
-        """A random password that satisfies the active policy — so an administrator-issued temporary
-        credential is held to the same bar operators are. ``token_urlsafe(n)`` yields about 1.33 times
-        n characters, cut to :func:`_temporary_password_chars`, so the length is at least
-        ``min_length``. The loop covers a context hit or an opt-in character-class requirement a given
-        token happens to miss.
-
-        Every clause except the breach screen, which is suppressed per-call for the reason stated at
-        the call below (BACKLOG #1447).
-
-        ``username`` is the account the password is for, so the own-username clause applies too.
-
-        Raises :class:`TemporaryPasswordUnavailable` when no candidate clears the policy. It never
-        returns an unscreened password. The old last-resort return appended ``aA1!`` without a screen,
-        so a site context word inside it would have issued a credential the policy refuses (BACKLOG
-        #1132)."""
-        # At least 32 CHARACTERS (192 bits). token_urlsafe's argument is a byte count and min_length
-        # is a CHARACTER count, so the bytes are derived from the characters: 3 bytes make 4
-        # characters, and the cut below never pads, so a short byte count would silently lower the
-        # entropy floor (BACKLOG #1172).
-        policy = self._policy
-        chars = _temporary_password_chars(policy.min_length)
-        length = -(-chars * 3 // 4)  # ceiling: enough bytes for `chars` characters
-        # The suffixed form exists only for an opt-in character class the bare token happens to miss.
-        # With every class rule off it cannot help: the bare token then fails only on a context word
-        # or the username, and the suffix keeps either one.
-        class_rules = (
-            policy.require_uppercase
-            or policy.require_lowercase
-            or policy.require_digit
-            or policy.require_symbol
-        )
-        for _ in range(_RESET_GENERATION_ATTEMPTS):
-            token = secrets.token_urlsafe(length)[:chars]
-            # The bare token first. The suffixed form is screened like the token: a site term can sit
-            # inside it too.
-            candidates = (token, token + "aA1!") if class_rules else (token,)
-            # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
-            # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
-            # contain it -- the breach clause is inert on this input by construction. Honouring
-            # `check_breached` here therefore converts a screen that can never FIRE into one that
-            # always BLOCKS: the corpus load raises on an unusable install (BACKLOG #1438). While this
-            # also generated the first-run account (retired by ADR 0183), the raise escaped an
-            # unguarded lifespan call and the engine did not start at all.
-            #
-            # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
-            # operator- or user-supplied password, where the corpus is the whole point and refusing is
-            # right -- so do NOT widen this to the policy field or the `[auth]` setting.
-            for candidate in candidates:
-                if not policy.violations(candidate, username=username, suppress_breach_check=True):
-                    return candidate
-        _log.error(
-            "no temporary password cleared the password policy in %d tries; the likely cause is "
-            "[auth].password_extra_context_words holding so many short terms that nearly every "
-            "random string contains one, which would refuse most passphrases too",
-            _RESET_GENERATION_ATTEMPTS,
-        )
-        raise TemporaryPasswordUnavailable(
-            "could not generate a temporary password that clears the password policy; check "
-            "[auth].password_extra_context_words for short or very common terms, then restart the "
-            "engine, which reads [auth] only at start"
-        )
+        """:func:`generate_policy_password` under this service's policy. Raises
+        :class:`TemporaryPasswordUnavailable` when no candidate clears it."""
+        return generate_policy_password(self._policy, username=username)
 
     async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:
         """True iff some enabled administrator other than ``exclude_id`` exists.
@@ -5258,6 +5271,12 @@ class AuthService:
             if h == old_hash:
                 del self._action_step_up_grants[(h, action)]
                 self._action_step_up_grants[(new_hash, action)] = deadline
+        # The spent-grant record too (ADR 0197 Amendment A): a refund after a rotation must land on
+        # the hash that still authenticates, not the retired one.
+        for (h, action), deadline in list(self._spent_action_step_up_grants.items()):
+            if h == old_hash:
+                del self._spent_action_step_up_grants[(h, action)]
+                self._spent_action_step_up_grants[(new_hash, action)] = deadline
         self._webauthn_challenges.rekey(old_hash, new_hash)
         seen = self._new_ip_seen.pop(old_hash, None)
         if seen is not None:
@@ -6276,8 +6295,48 @@ class AuthService:
         now = time.monotonic()
         self._prune_action_step_up_grants(now)
         # pop = single-use: the grant is gone whether or not it was still live (a stale pop is harmless).
-        deadline = self._action_step_up_grants.pop((hash_token(token), action), None)
-        return deadline is not None and deadline > now
+        key = (hash_token(token), action)
+        deadline = self._action_step_up_grants.pop(key, None)
+        live = deadline is not None and deadline > now
+        if live:
+            assert deadline is not None
+            self._remember_spent_grant(key, deadline, now)
+        return live
+
+    def _remember_spent_grant(self, key: tuple[str, str], deadline: float, now: float) -> None:
+        expired = [k for k, d in self._spent_action_step_up_grants.items() if d <= now]
+        for k in expired:
+            del self._spent_action_step_up_grants[k]
+        if key not in self._spent_action_step_up_grants and (
+            len(self._spent_action_step_up_grants) >= _ACTION_STEP_UP_GRANT_MAX
+        ):
+            oldest = min(
+                self._spent_action_step_up_grants, key=self._spent_action_step_up_grants.__getitem__
+            )
+            del self._spent_action_step_up_grants[oldest]
+        self._spent_action_step_up_grants[key] = deadline
+
+    def refund_action_step_up(self, token: str | None, action: str) -> bool:
+        """Give back the step-up grant this session spent on ``action``, when the route it opened
+        then failed BEFORE any side effect (ADR 0197 Amendment A, Manager decision 2026-09-29).
+
+        The action-bound gate runs as a route dependency, so it spends the single-use grant before
+        the handler can learn that no credential can be issued. Without a refund, a request that
+        changed nothing would still cost the administrator their proof. What the refund buys is a
+        retry IN THE SAME PROCESS -- the case of a borderline list that fails at random. Fixing
+        ``[auth].password_extra_context_words`` needs a restart, which forgets every grant anyway.
+
+        It restores only a grant this process actually spent, and only with its ORIGINAL deadline,
+        so it can never mint a grant, never extend one, and never restore one that has expired. A
+        second refund of the same grant finds nothing. Returns whether a grant was restored."""
+        if not token:
+            return False
+        key = (hash_token(token), action)
+        deadline = self._spent_action_step_up_grants.pop(key, None)
+        if deadline is None or deadline <= time.monotonic():
+            return False
+        self._action_step_up_grants[key] = deadline
+        return True
 
     async def _reauth_ad(self, username: str, password: str, *, object_id: str) -> _DirectoryRebind:
         """Re-verify an AD credential via a live directory re-bind (no session adopted).
@@ -6629,6 +6688,29 @@ class AuthService:
     async def lockable_account_census(self) -> LockableAccountCensus:
         """:func:`lockable_account_census` over this service's store and settings."""
         return await lockable_account_census(self._store, self._settings)
+
+    async def probe_credential_generation(self) -> bool:
+        """Run the temporary-credential generator once, at startup, under the configured policy and a
+        synthetic username (ADR 0197 Amendment A, Manager decision 2026-09-29, prompted by PR 1761).
+
+        Account creation, the password reset and the factor reset all issue a generated credential.
+        Since BACKLOG #1132 the generator screens the site's own context words, and a pathological
+        ``[auth].password_extra_context_words`` list can make it fail every time. Those paths refuse
+        harmlessly (they generate before any write, and the route refunds the spent step-up grant),
+        but an operator should learn of it at start, not at the first account creation. So this logs
+        an ERROR and returns ``False``; it never raises and never refuses the start. The credential
+        is discarded. A borderline list can still pass this one run and fail a later one."""
+        try:
+            generate_policy_password(self._policy, username=_PROBE_USERNAME)
+        except TemporaryPasswordUnavailable:
+            _log.error(
+                "startup probe: the engine could not generate a temporary credential under the "
+                "configured password policy, so creating an account, resetting a password and "
+                "resetting an account's factors will all answer 503. The likely cause is "
+                "[auth].password_extra_context_words; remove short or very common terms and restart"
+            )
+            return False
+        return True
 
     async def report_lockable_account_census(self) -> LockableAccountCensus:
         """Run :meth:`lockable_account_census` at startup: WARN and write one audit row when it
