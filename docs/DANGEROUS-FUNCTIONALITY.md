@@ -318,6 +318,25 @@ the modules where any code reads input from outside the engine, whichever call t
 The second holds the ones that read only what the engine wrote itself or an operator supplied. The
 third table lists hand-written parsers the patterns cannot see, found by reading the code.
 
+**One rule decides a hand-over.** Some modules only hand outside input to other code. Such a module
+is in the first table when it hands the input to a parser. A parser here is a format library, a
+module under `parsing/`, or a module in the hand-read table. The module is in the second table when
+it hands the input only to other engine code, which picks the parser. A module that does both is in
+the first table. The rule places at least these modules:
+
+- `pipeline/wiring_runner.py`, first. It hands each received body to `pipeline/ingress_guards.py`,
+  and an HL7 body to `parsing/peek.py`.
+- `pipeline/dryrun.py`, first. It reads fixture files itself, and hands bodies to `parsing/`.
+- `store/store.py`, `store/postgres.py` and `store/sqlserver.py`, first. Each hands a stored
+  message body to `parsing/binary.py`.
+- `transports/loopback.py` and `transports/passthrough.py`, second. They hand their bodies to the
+  engine's intake.
+- `__main__.py`, second. It hands at least dry-run fixtures to `pipeline/dryrun.py` and
+  `pipeline/dryrun_trace.py`, a Corepoint export to `corepoint_import.py`, and a backup to
+  `pipeline/dr_backup.py`.
+- `auth/service.py`, second. It hands an identity provider's token to `auth/oidc/`, and a passkey
+  response to `auth/webauthn.py`. The first table's identity provider and passkey rows cover them.
+
 The scan leaves some parsing out on purpose, and it has limits:
 
 - `tomllib` is not in pattern 1. It reads at least service settings, connection files, environment
@@ -341,7 +360,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Input | Where it comes from | Modules |
 |---|---|---|
 | Inbound connectors | Whatever a sender or a polled source delivers. `transports/http_listener.py` reads the HTTP request line and headers itself. | `transports/file.py`, `transports/http_listener.py`, `transports/remotefile.py`, `transports/tcp.py`, `transports/x12.py`, `transports/database.py` |
-| The intake path | The shared ingress code that hands each received body to the parsers below | `pipeline/wiring_runner.py` |
+| The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py` |
+| Dry-run fixtures | The sample and batch files a dry run reads, such as the `--messages` files of `messagefoundry dryrun`. A fixture may be captured traffic. `read_fixture` reads each file, and `split_messages` hands a batch file to `parsing/split.py` to split. The scan's match in this module is different: a JSON decode of a value it encoded a moment before. | `pipeline/dryrun.py` |
+| A stored message body, when retention strips its documents | The body a sender delivered, decrypted from the store. Each backend's retention pass hands it to `parsing/binary.py`, in the hand-read table below, to strip its embedded documents. The scan's matches here are different: JSON the engine wrote itself. | `store/store.py`, `store/postgres.py`, `store/sqlserver.py` |
 | HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
 | JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
@@ -370,7 +391,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches, and the dry-run's copy of a state write or reference value in the form the live engine returns | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/dryrun.py` |
+| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
 | It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
@@ -383,6 +404,8 @@ The scan leaves some parsing out on purpose, and it has limits:
 | MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
 | HL7 batch files, split into messages | `parsing/split.py` |
 | The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
+| An inbound text body, decoded with its connection's declared character set and checked for NUL bytes and size, before the HL7 peek or a Router sees it. A binary body is only size-checked and base64-carried. | `pipeline/ingress_guards.py` |
+| Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
 
