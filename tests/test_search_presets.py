@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import Cipher, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 CRIT = json.dumps({"content": "MRN12345", "target": "raw", "message_type": "ADT^A01"})
@@ -134,28 +134,28 @@ CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner, name);
 """
 
 
-async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
-    """BACKLOG #1909: a 0.3.2 ``search_presets`` table opens, keeps its presets, and lists and
-    deletes by user id.
+async def _seed_v032_store(db: Path, cipher: Cipher) -> None:
+    """Write presets with this version, then move them into the 0.3.2 table under usernames.
 
-    The presets are sealed by this version first and then moved into the 0.3.2 table under their
-    owners' usernames, so the test also shows the sealed criteria still open after the move: they
-    are bound to the preset id, which the migration leaves alone. ``ghost`` matches no account."""
+    Sealing them first shows the criteria still open after the migration: they are bound to the
+    preset id, which it leaves alone. ``ghost`` matches no account. ``pc`` predates the ``carol``
+    account (created at 1.0), so it belonged to an earlier holder of that username. ``system`` is
+    the no-auth identity, whose id equals its username."""
     import sqlite3
 
-    db = tmp_path / "v032.db"
-    cipher = make_cipher(generate_key(), write_v2=True)
     s = await MessageStore.open(db, cipher=cipher)
     try:
-        await s.create_user(user_id="u-alice", username="alice", auth_provider="local", now=1.0)
-        await s.create_user(user_id="u-bob", username="bob", auth_provider="local", now=1.0)
-        for pid, owner, name in (
-            ("pa", "alice", "ACME ADT"),
-            ("pb", "bob", "ACME ADT"),
-            ("pg", "ghost", "orphan"),
+        for uid, name in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
+            await s.create_user(user_id=uid, username=name, auth_provider="local", now=1.0)
+        for pid, owner, name, now in (
+            ("pa", "alice", "ACME ADT", None),
+            ("pb", "bob", "ACME ADT", None),
+            ("pg", "ghost", "orphan", None),
+            ("pc", "carol", "inherited", 0.5),
+            ("ps", "system", "no-auth", None),
         ):
             await s.upsert_search_preset(
-                preset_id=pid, owner_user_id=owner, name=name, criteria=CRIT
+                preset_id=pid, owner_user_id=owner, name=name, criteria=CRIT, now=now
             )
     finally:
         await s.close()
@@ -175,6 +175,14 @@ async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
     finally:
         conn.close()
 
+
+async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
+    """BACKLOG #1909: a 0.3.2 ``search_presets`` table opens, keeps its owners' presets, and lists
+    and deletes by user id. A preset no current account owned is dropped, not inherited."""
+    db = tmp_path / "v032.db"
+    cipher = make_cipher(generate_key(), write_v2=True)
+    await _seed_v032_store(db, cipher)
+
     for reopened in (False, True):  # the second open finds nothing to move
         s = await MessageStore.open(db, cipher=cipher)
         try:
@@ -183,12 +191,45 @@ async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
             got = await s.get_search_preset(preset_id="pa", owner_user_id="u-alice")
             assert got is not None and json.loads(got["criteria"]) == json.loads(CRIT)
             assert [p["id"] for p in await s.list_search_presets("u-bob")] == ["pb"]
+            assert await s.list_search_presets("u-carol") == []
+            assert [p["id"] for p in await s.list_search_presets("system")] == ["ps"]
             async with s._read() as rdb:
                 cur = await rdb.execute("SELECT id FROM search_presets ORDER BY id")
-                assert [r["id"] for r in await cur.fetchall()] == ["pa", "pb"]
+                assert [r["id"] for r in await cur.fetchall()] == ["pa", "pb", "ps"]
             if reopened:
                 await s.delete_user("u-bob")
                 assert await s.list_search_presets("u-bob") == []
                 assert [p["id"] for p in await s.list_search_presets("u-alice")] == ["pa"]
         finally:
             await s.close()
+
+
+async def test_a_refused_open_leaves_the_v032_preset_table_untouched(tmp_path: Path) -> None:
+    """BACKLOG #1909: the migration runs in the open's transaction. A store refused for another
+    stale object keeps its 0.3.2 presets table, rows and column name, for the remedy to set aside."""
+    import sqlite3
+
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    db = tmp_path / "v032-refused.db"
+    cipher = make_cipher(generate_key(), write_v2=True)
+    await _seed_v032_store(db, cipher)
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            "DROP INDEX ix_queue_fifo_in_seq; CREATE INDEX ix_queue_fifo_in_seq ON queue(stage);"
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(SchemaMismatchError):
+        await MessageStore.open(db, cipher=cipher)
+
+    conn = sqlite3.connect(db)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(search_presets)")}
+        owners = sorted(r[0] for r in conn.execute("SELECT owner FROM search_presets"))
+    finally:
+        conn.close()
+    assert "owner" in cols and "owner_user_id" not in cols
+    assert owners == ["alice", "bob", "carol", "ghost", "system"]

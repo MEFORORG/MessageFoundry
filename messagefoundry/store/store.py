@@ -4481,6 +4481,12 @@ _LAST_EVENT_COLUMN = (
 # alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
 _MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
 
+# BACKLOG #1909: the account a 0.3.2 preset row belongs to. See MessageStore._migrate_preset_owner.
+_PRESET_ACCOUNT = (
+    "SELECT 1 FROM users WHERE users.username = search_presets.owner"
+    " AND users.created_at <= search_presets.created_at"
+)
+
 
 @dataclass(frozen=True)
 class SecretRotationMetaRow:
@@ -6033,20 +6039,21 @@ class MessageStore:
         0.3.2 keyed a preset on the owner's USERNAME; this version keys it on ``Identity.user_id``
         (#1225) under the renamed column (#1232). So a bare rename would keep every row and still
         orphan it: listing by id finds nothing and ``delete_user`` leaves it behind. Each value is
-        mapped to its account's id first. A row whose username matches no account belongs to a user
-        0.3.2 deleted without its presets; nobody can list, recall or delete it, so it is dropped
-        rather than left holding a username in an id column. ``criteria`` is sealed against the
-        preset ``id``, which does not change, so no cell is re-encrypted. The rename carries the
-        unique index along with the column. Runs in the open's migration transaction."""
-        cur = await db.execute(
-            "DELETE FROM search_presets"
-            " WHERE NOT EXISTS (SELECT 1 FROM users WHERE users.username = search_presets.owner)"
+        mapped to its account's id first, and only to an account created no later than the preset.
+        0.3.2's ``delete_user`` left a user's presets behind, and a later account given the same
+        username would otherwise inherit them, PHI-shaped criteria included: the defect #1225
+        closed. Every other row is dropped, because nobody could list, recall or delete it. The one
+        exception is ``system``, the no-auth identity, whose id equals its username. ``criteria`` is
+        sealed against the preset ``id``, which does not change, so no cell is re-encrypted. The
+        rename carries the unique index along with the column. Runs in the open's migration
+        transaction, so a refused open rolls all of it back."""
+        await db.execute(
+            f"DELETE FROM search_presets WHERE owner <> 'system' AND NOT EXISTS ({_PRESET_ACCOUNT})"
         )
-        if cur.rowcount > 0:
-            log.info("search_presets: dropped %d preset(s) owned by no account", cur.rowcount)
         await db.execute(
             "UPDATE search_presets"
             " SET owner = (SELECT id FROM users WHERE users.username = search_presets.owner)"
+            f" WHERE EXISTS ({_PRESET_ACCOUNT})"
         )
         await db.execute("ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id")
 

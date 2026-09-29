@@ -3765,16 +3765,22 @@ async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> 
             )
         return {r["column_name"] for r in rows}
 
-    await store.create_user(user_id="u-alice", username="alice", auth_provider="local", now=1.0)
-    await store.create_user(user_id="u-bob", username="bob", auth_provider="local", now=1.0)
+    for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
+        await store.create_user(user_id=uid, username=uname, auth_provider="local", now=1.0)
     try:
-        for pid, owner, name in (
-            ("pa", "alice", "ACME ADT"),
-            ("pb", "bob", "ACME ADT"),
-            ("pg", "ghost", "orphan"),
+        for pid, owner, name, now in (
+            ("pa", "alice", "ACME ADT", None),
+            ("pb", "bob", "ACME ADT", None),
+            ("pg", "ghost", "orphan", None),
+            ("pc", "carol", "inherited", 0.5),  # predates the carol account: an earlier holder's
+            ("ps", "system", "no-auth", None),  # the no-auth identity: its id is its username
         ):
             await store.upsert_search_preset(
-                preset_id=pid, owner_user_id=owner, name=name, criteria='{"target": "raw"}'
+                preset_id=pid,
+                owner_user_id=owner,
+                name=name,
+                criteria='{"target": "raw"}',
+                now=now,
             )
         async with store._pool.acquire() as conn:
             await conn.execute("ALTER TABLE search_presets RENAME COLUMN owner_user_id TO owner")
@@ -3788,11 +3794,13 @@ async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> 
 
         assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
         assert [p["id"] for p in await store.list_search_presets("u-bob")] == ["pb"]
+        assert await store.list_search_presets("u-carol") == []
+        assert [p["id"] for p in await store.list_search_presets("system")] == ["ps"]
         got = await store.get_search_preset(preset_id="pa", owner_user_id="u-alice")
         assert got is not None and json.loads(got["criteria"]) == {"target": "raw"}
         async with store._pool.acquire() as conn:
             ids = [r["id"] for r in await conn.fetch("SELECT id FROM search_presets ORDER BY id")]
-        assert ids == ["pa", "pb"]  # the orphan is gone, nothing else is
+        assert ids == ["pa", "pb", "ps"]  # the two orphans are gone, nothing else is
 
         await store.delete_user("u-bob")
         assert await store.list_search_presets("u-bob") == []

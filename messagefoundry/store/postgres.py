@@ -750,19 +750,21 @@ _SCHEMA: list[str] = [
         last_used_at DOUBLE PRECISION
     )""",
     # BACKLOG #1909: a 0.3.2 table keys presets on the owner's USERNAME in a column named `owner`. Map
-    # each value to its account id, drop a row whose username matches no account (nobody can reach
-    # it), then rename; the rename carries the unique index. See the SQLite _migrate_preset_owner for
-    # the reasoning. plpgsql plans each statement on first execution, so the branch that names `owner`
-    # never fails on a table without it. In _SCHEMA, so it runs under provision-schema (ADR 0192) and
-    # `auto` alike, and adding it moved _schema_hash(): an already-opened 0.3.2 DB runs the batch again.
+    # each value to the id of an account created no later than the preset, drop every other row but
+    # the no-auth `system` identity's, then rename; the rename carries the unique index. The SQLite
+    # _migrate_preset_owner gives the reasons. plpgsql plans each statement on first execution, so the
+    # branch that names `owner` never fails on a table without it. In _SCHEMA, so it runs under
+    # provision-schema (ADR 0192) and `auto` alike, and adding it moved _schema_hash(): an
+    # already-opened 0.3.2 DB runs the batch again.
     "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns"
     " WHERE table_schema = current_schema() AND table_name = 'search_presets'"
     " AND column_name = 'owner') AND NOT EXISTS (SELECT 1 FROM information_schema.columns"
     " WHERE table_schema = current_schema() AND table_name = 'search_presets'"
     " AND column_name = 'owner_user_id') THEN"
-    " DELETE FROM search_presets p WHERE NOT EXISTS"
-    " (SELECT 1 FROM users u WHERE u.username = p.owner);"
-    " UPDATE search_presets p SET owner = u.id FROM users u WHERE u.username = p.owner;"
+    " DELETE FROM search_presets p WHERE p.owner <> 'system' AND NOT EXISTS (SELECT 1 FROM users u"
+    " WHERE u.username = p.owner AND u.created_at <= p.created_at);"
+    " UPDATE search_presets p SET owner = u.id FROM users u"
+    " WHERE u.username = p.owner AND u.created_at <= p.created_at;"
     " ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id;"
     " END IF; END $$",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
