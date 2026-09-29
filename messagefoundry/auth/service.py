@@ -386,8 +386,8 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`. Also the
 #: reason a federated login refuses an already-bound id-less row, and a reconciliation pass skips one
 #: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id, and an AD step-up
-#: re-bind or ``verify_mfa`` directory check on a row with none. Deliberately absent from the browser layer's code map, so it shows as
-#: generic.
+#: re-bind or ``verify_mfa`` directory check on a row with none. Deliberately absent from the
+#: browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
 #: The closed-set reason a directory answer is refused with when it names another directory object
@@ -5659,16 +5659,12 @@ class AuthService:
                 # else whose password would then step this session up. Refused before the directory
                 # is asked, so no password leaves the engine and nothing is charged -- the caller
                 # did not guess wrong.
-                return _Reproof(
-                    ok=False,
-                    user=user,
-                    reason=DIRECTORY_OBJECT_ID_MISSING,
-                    directory_unconfirmed=True,
+                verdict, reason = None, DIRECTORY_OBJECT_ID_MISSING
+            else:
+                rebind = await self._reauth_ad(
+                    user.username, password, object_id=user.directory_object_id
                 )
-            rebind = await self._reauth_ad(
-                user.username, password, object_id=user.directory_object_id
-            )
-            verdict, reason = rebind.verdict, rebind.reason
+                verdict, reason = rebind.verdict, rebind.reason
         else:
             verdict = user.password_hash is not None and await self._argon2(
                 verify_password, user.password_hash, password
