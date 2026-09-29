@@ -6805,10 +6805,23 @@ def create_app(
         # GUARDED import (Option B): the web console is an optional package, so the engine imports +
         # boots + serves the JSON API without it. It is required only when serve_ui is on, and a missing
         # install fails LOUD at startup here — never a mid-request 500. (The absent path is exercised by
-        # tests/test_webconsole_absent.py, which shadows the import.)
+        # tests/test_webconsole_absent.py, which shadows the import; the installed-but-broken path by
+        # tests/test_webconsole_import_failure.py.)
         try:
             from messagefoundry_webconsole import assert_engine_seam, mount_ui
-        except ImportError as exc:  # pragma: no cover
+        except ImportError as exc:
+            from messagefoundry.api._webconsole_import import (
+                console_import_failure,
+                console_is_absent,
+            )
+
+            # BACKLOG #1907: an INSTALLED console that fails to import (an old wheel missing a name
+            # this engine imports, or one whose own import chain breaks) is not "not installed". It
+            # raises here, before assert_engine_seam can name the mismatch, so name it instead.
+            if not console_is_absent(exc):
+                raise RuntimeError(
+                    f"serve_ui requires the web console, and {console_import_failure(exc)}"
+                ) from exc
             # ASVS 15.2.4: this string is an INSTALL INSTRUCTION the operator will paste, so what it
             # names has to be true. It once named a `webconsole` EXTRA that pyproject does not declare,
             # so the command simply failed. It now names the DISTRIBUTION, whose name has been
