@@ -462,26 +462,34 @@ _FTP_CONNECTION_LIMIT = re.compile(
     re.IGNORECASE,
 )
 
-#: Words that mark a reply as being about the credential or the account, even when it also names a
-#: limit. A reply carrying one anywhere is not read as a connection limit, so it keeps the
-#: credential-fault class. Most start at a word boundary, so "entries" is not "tries". Two
-#: busy-server words are left out on purpose: "retry" ("please retry later") and "permitted" ("no
-#: more than 10 users permitted"). "Rejected" and "denied" stay in, although a busy server says them
-#: too: such a reply stops the lane, the cheaper of the two errors. "lock" and "auth" match inside a
-#: word, so "blocked", "unlock", "Unauthorized" and "unauthenticated" count (BACKLOG #2083, fix
-#: round 3); anchored, each of those read as a busy server and retried the login into a lockout.
+#: Words that mark a login reply as being about the credential or the account, even when it also
+#: names a limit. A login reply carrying one anywhere keeps the credential-fault class. Most start at
+#: a word boundary, so "entries" is not "tries". "lock" and "auth" match inside a word, so "blocked",
+#: "unlock" and "Unauthorized" count too (BACKLOG #2083, fix round 3).
+#:
+#: Two busy-server words are left out on purpose: "retry" ("please retry later") and "permitted"
+#: ("no more than 10 users permitted"). Others a busy server also says stay in: "denied",
+#: "rejected", "refused", "not allowed", and a banner's "Unauthorized access". Such a reply stops the
+#: lane, the cheaper of the two errors; see :func:`_names_connection_limit`.
 _FTP_CREDENTIAL_WORDS = re.compile(
     r"lock|auth"
-    r"|\b(?:attempt|fail|passw|incorrect|invalid|tries\b|retries\b|den(?:y|ied)\b|reject|disabl"
-    r"|expir|cred|wrong\b|bad\b|unknown|not\s+found|suspend|bann?ed\b|revok|deactivat|forbid)",
+    r"|\b(?:attempt|fail|passw|incorrect|invalid|tries\b|retries\b|den(?:y|ies|ied|ying|ial)\b"
+    r"|reject|refus|disabl|disallow|not\s+allowed|prohibit|inactiv|expir|cred|wrong\b|bad\b"
+    r"|unknown|unsuccess|not\s+found|not\s+logged\s+in|suspend|bann?ed\b|blacklist|revo[kc]"
+    r"|deactivat|forbid)",
     re.IGNORECASE,
 )
+
+#: The ``AUTH TLS`` command named in a reply ("must use AUTH TLS first"). It is a TLS command, not a
+#: credential word, so it is taken out before the credential words are looked for.
+_FTP_AUTH_COMMAND = re.compile(r"\bAUTH\s+(?:TLS|SSL)\b", re.IGNORECASE)
 
 #: A reply line that names TLS and says it is required: vsftpd's "530 Non-anonymous sessions must
 #: use encryption.", ProFTPD's "550 SSL/TLS required on the control channel", FileZilla's "You have
 #: to use FTP over TLS" and IIS's "534 Policy requires SSL.". Both halves must be on one line.
-_FTP_TLS_NAMED = re.compile(r"\b(?:ssl|tls|ftps|encrypt\w*)\b", re.IGNORECASE)
-_FTP_TLS_REQUIRED = re.compile(r"\b(?:requir\w*|must|mandatory|have\s+to|only)\b", re.IGNORECASE)
+#: "only" is left out: "530 Login for SSL-VPN users only" refuses an account, not a plain session.
+_FTP_TLS_NAMED = re.compile(r"\b(?:ssl|tls|ftps|encrypt)", re.IGNORECASE)
+_FTP_TLS_REQUIRED = re.compile(r"\b(?:requir\w*|must|mandatory|have\s+to)\b", re.IGNORECASE)
 
 
 def _last_reply_line(reply: str) -> str:
@@ -490,62 +498,72 @@ def _last_reply_line(reply: str) -> str:
     return lines[-1] if lines else ""
 
 
-def _names_connection_limit(reply: str) -> bool:
-    """True when an FTP reply names a connection limit and says nothing about the credential.
+def _names_credential(reply: str) -> bool:
+    """True when a reply carries a credential or account word anywhere (``_FTP_CREDENTIAL_WORDS``)."""
+    return bool(_FTP_CREDENTIAL_WORDS.search(_FTP_AUTH_COMMAND.sub(" ", reply)))
 
-    **An ambiguous 530 falls to the credential fault (BACKLOG #2083).** RFC 959 gives 530 for "not
-    logged in", whatever the reason, so only the text can tell a busy server from a wrong password,
-    and servers word it freely. Where the text does not plainly name a connection limit, the reply
-    is read as a credential refusal and the lane stops (ADR 0095). The two errors do not cost the
-    same. Reading a busy server as a bad password stops one lane on this engine, with every message
-    kept, until an operator resumes it. Reading a bad password as a busy server retries the login on
-    every delivery, and a partner that locks an account after a few failures would lock it. That
-    lockout is on the partner's system, where no operator here can undo it.
 
-    So the test is narrow on purpose. The limit phrase must be on the reply's last line, the one
-    that carries the final code, since the earlier lines of a multi-line reply are often a banner.
-    And no word about the credential or the account may appear anywhere in the reply."""
-    return bool(_FTP_CONNECTION_LIMIT.search(_last_reply_line(reply))) and not (
-        _FTP_CREDENTIAL_WORDS.search(reply)
-    )
+def _names_connection_limit(reply: str, *, at_login: bool) -> bool:
+    """True when an FTP reply names a connection limit, and, at the login, says nothing about the
+    credential.
+
+    **An ambiguous 530 at the login falls to the credential fault (BACKLOG #2083).** RFC 959 gives
+    530 for "not logged in", whatever the reason. So only the text can tell a busy server from a
+    wrong password, and servers word it freely. At the login, a reply that does not plainly name a
+    limit is read as a credential refusal, and the lane stops (ADR 0095). Two narrow exceptions are
+    a limit and a TLS demand; see :func:`_ftp_connect_refusal`.
+
+    The two errors do not cost the same. Reading a busy server as a bad password stops one lane on
+    this engine, with every message kept, until an operator resumes it. Reading a bad password as a
+    busy server retries the login on every delivery. A partner that locks an account after a few
+    failures would lock it, on its own system, where no operator here can undo it.
+
+    So the test is narrow on purpose. The limit phrase must be on the reply's last line, which
+    carries the final code; earlier lines are often a banner. At the login, no credential word may
+    appear anywhere in the reply. Before the login no credential has been sent, so the words are
+    not looked for there."""
+    if not _FTP_CONNECTION_LIMIT.search(_last_reply_line(reply)):
+        return False
+    return not (at_login and _names_credential(reply))
 
 
 def _demands_tls(reply: str) -> bool:
-    """True when a login refusal says the server requires TLS, and says nothing about the credential.
+    """True when a login refusal says the server requires TLS, and says nothing about the
+    credential.
 
-    Such a server refuses the login of a plain session whatever the credential, so the fault is the
-    connection's TLS setting (BACKLOG #2083, fix round 3). It is held to the same narrow test as
-    :func:`_names_connection_limit`: the demand must be on the last line, and a credential word
-    anywhere keeps the credential-fault class."""
+    Such a server refuses a plain session's login whatever the credential, so the fault is the
+    connection's TLS setting (BACKLOG #2083, fix round 3). The caller asks only for a plain session;
+    an FTPS control channel is already TLS. The test is as narrow as the limit test: the demand must
+    be on the last line, and a credential word anywhere keeps the credential-fault class."""
     last = _last_reply_line(reply)
     return (
         bool(_FTP_TLS_NAMED.search(last))
         and bool(_FTP_TLS_REQUIRED.search(last))
-        and not _FTP_CREDENTIAL_WORDS.search(reply)
+        and not _names_credential(reply)
     )
 
 
-def _ftp_connect_refusal(step: str, exc: ftplib.error_perm) -> _RemoteError:
+def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _RemoteError:
     """Classify a 5xx reply received while opening an FTP session (BACKLOG #2083).
 
-    - A reply naming a connection limit is **transient**, at whatever step it arrives: the server is
-      busy, and a later attempt gets in. See :func:`_names_connection_limit` for how an ambiguous
-      reply falls.
+    - A reply naming a connection limit is **transient**: the server is busy, and a later attempt
+      gets in. See :func:`_names_connection_limit` for how an ambiguous login reply falls.
     - A refusal of ``AUTH TLS`` or ``PBSZ``/``PROT P`` is a **configuration** fault: permanent, and
       not a credential fault. The server does not offer the TLS this connection asks for, so no
       retry helps and no credential was at fault.
-    - A login refusal that says the server requires TLS is the same configuration fault; see
-      :func:`_demands_tls`.
+    - On a plain session, a login refusal that says the server requires TLS is the same
+      configuration fault; see :func:`_demands_tls`.
     - A refusal of the greeting, before any credential is sent, is permanent and not a credential
       fault either.
     - Any other refusal at the login is a **credential** fault (#109, ADR 0095), so the delivery
       worker stops the lane rather than retrying into an account lockout.
 
-    A permanent fault that is not a credential fault dead-letters the row on the delivery path. It
-    does not stop the lane, since only the credential marker does that today.
+    A permanent fault that is not a credential fault dead-letters the row on the delivery path; only
+    the credential marker stops the lane. With ``validate_directory`` on, :meth:`_list_or_retry`
+    retries it instead.
     """
     reply = str(exc)
-    if _names_connection_limit(reply):
+    if _names_connection_limit(reply, at_login=step == _FTP_LOGIN):
         return _RemoteError(
             f"FTP server refused {step} at its connection limit (retried): {reply}",
             permanent=False,
@@ -555,7 +573,7 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm) -> _RemoteError:
             f"FTPS server refused {step}, a TLS configuration fault, not a credential fault: {reply}",
             permanent=True,
         )
-    if step == _FTP_LOGIN and _demands_tls(reply):
+    if step == _FTP_LOGIN and not tls and _demands_tls(reply):
         return _RemoteError(
             f"FTP server requires TLS at {step}, a TLS configuration fault, not a credential "
             f"fault: {reply}",
@@ -618,7 +636,7 @@ class _FtpClient(_RemoteClient):
                 ftp.prot_p()  # encrypt the data channel, not just the control channel
         except ftplib.error_perm as exc:
             ftp.close()
-            raise _ftp_connect_refusal(step, exc) from exc
+            raise _ftp_connect_refusal(step, exc, tls=self._tls) from exc
         except ftplib.all_errors as exc:  # connect/timeout/4xx/protocol/OSError -- transient
             ftp.close()
             raise _RemoteError(f"FTP connect failed: {exc}", permanent=False) from exc

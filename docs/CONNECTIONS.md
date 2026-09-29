@@ -1175,14 +1175,15 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   rejection stays permanent, and an authentication refusal stays a credential fault that stops the
   lane (ADR 0095). How the connector tells the two apart, and which paramiko bounds apply, is stated
   once, in `remotefile._sftp_slow_peer`'s docstring.
-- **A busy FTP server is retried; only a refused login stops the lane (BACKLOG #2083).** While an
-  FTP session opens, a 5xx reply is classed by its step and its text. A reply naming a connection
-  limit is **transient**. A refused greeting, `AUTH TLS`, `PBSZ` or `PROT P` is a **permanent**
-  configuration fault, and so is a login refusal that says the server requires TLS. Such a fault
-  dead-letters the message and does not stop the lane. Any other login refusal is a credential fault
-  that stops the lane (ADR 0095). With `validate_directory` on, every one of these but the credential
-  fault is retried instead. The rules are stated once, in `remotefile._ftp_connect_refusal`. Why an
-  unclear 530 counts as a refused login is in `remotefile._names_connection_limit`.
+- **A busy FTP server is retried; only a credential fault stops the lane (BACKLOG #2083).** While
+  an FTP session opens, a 5xx reply is classed by its step and its text. A reply naming a connection
+  limit is **transient**. A refused `AUTH TLS`, `PBSZ` or `PROT P` is a **permanent** TLS
+  configuration fault. So is a plain session's login refusal that says the server requires TLS. A
+  refused greeting is permanent too. Each of these dead-letters the message and does not stop the
+  lane. Any other login refusal is a credential fault. Under the default `credential_fault_policy`,
+  it stops the lane (ADR 0095). With `validate_directory` on, every fault but the credential fault is
+  retried instead. The rules are stated once, in `remotefile._ftp_connect_refusal`. Why an unclear
+  530 counts as a credential fault is in `remotefile._names_connection_limit`.
 - **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
   `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
   nothing else. A server missing either fails the handshake with a permanent `SFTP connection
