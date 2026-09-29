@@ -25,6 +25,7 @@ import errno
 import hmac
 import io
 import os
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -160,20 +161,21 @@ async def test_backup_and_verify_stage_in_the_sqlite_data_dir_and_leave_nothing(
     assert _everything_under(iso) == []
 
 
-def test_a_server_db_store_stages_under_the_destination_unsecured(tmp_path) -> None:
+def test_a_server_db_store_stages_under_the_destination_secured(tmp_path) -> None:
     """A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
-    destination. The engine applies no ACL there, and docs/PHI.md records that as a gap."""
+    destination, secured like a SQLite store's data dir (BACKLOG #1174). It used to be unsecured,
+    which docs/PHI.md recorded as a gap."""
     dest = tmp_path / "dest"
     root, secure = dr_backup._staging_root_for(
         server_db=True, store_path=str(tmp_path / "ignored.db"), destination=dest
     )
     assert root == dest.absolute() / ".mefor-staging"
-    assert secure is False
+    assert secure is True
     # An in-memory SQLite store has no data directory either.
     root, secure = dr_backup._staging_root_for(
         server_db=False, store_path=":memory:", destination=dest
     )
-    assert root == dest.absolute() / ".mefor-staging" and secure is False
+    assert root == dest.absolute() / ".mefor-staging" and secure is True
     # A SQLite store on disk stages beside itself, secured.
     root, secure = dr_backup._staging_root_for(
         server_db=False, store_path=str(tmp_path / "data" / "msg.db"), destination=dest
@@ -826,7 +828,7 @@ async def test_a_staging_leftover_after_a_good_build_is_alerted_and_audited(
     (row,) = rows
     detail = json.loads(row["detail"])
     assert detail["verify"] == "PASS" and "synthetic" in detail["staging_leftover"]
-    assert [(n, k) for n, k, _d in alerts] == [("dr_backup", "cleanup")]
+    assert [(n, k) for n, k, _d in alerts] == [(dr_backup.CLEANUP_ALERT_SUBJECT, "cleanup")]
 
 
 # --- #1167: the keyring walk visits every key ------------------------------------------
@@ -872,3 +874,261 @@ def test_a_forged_key_id_with_a_lone_surrogate_is_a_non_match(tmp_path) -> None:
     come back as no match -- a clean KEY_MISMATCH -- and not as a UnicodeEncodeError."""
     key = base64.b64decode(generate_key())
     assert dr_backup._select_decrypt_key([key], "\ud800") is None
+
+
+# --- PR 1771 defect 3: free space is checked before anything is written ------------------------
+
+
+class _Usage:
+    def __init__(self, free: int) -> None:
+        self.total, self.used, self.free = free * 10, free * 9, free
+
+
+def _free_space(monkeypatch: pytest.MonkeyPatch, free: int) -> list[Path]:
+    """Report ``free`` bytes on every volume; return the paths asked about."""
+    asked: list[Path] = []
+
+    def usage(path: object) -> _Usage:
+        asked.append(Path(str(path)))
+        return _Usage(free)
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    return asked
+
+
+async def test_a_backup_that_will_not_fit_fails_before_it_writes(tmp_path, monkeypatch) -> None:
+    """The run fails early with kind `space`, naming the volume, and leaves no staging, no archive
+    and no partial file behind. Before, it failed part-way through the write, if at all."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    asked = _free_space(monkeypatch, 1)
+    alerts: list[tuple[str, str, str | None]] = []
+
+    class _Sink:
+        def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
+            alerts.append((name, kind, detail))
+
+        def __getattr__(self, _name: str) -> object:
+            return lambda *a, **k: None
+
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(dest)),
+        store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key),
+        config_dir=None,
+        instance="dev",
+        alert_sink=_Sink(),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(BackupError) as caught:
+            await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "space"
+    assert "free space" in str(caught.value) and "MiB" in str(caught.value)
+    assert asked, "the check never asked the volume"
+    assert [(n, k) for n, k, _d in alerts] == [("dr_backup", "space")]
+    assert _staging_dirs(data_dir) == [] and list(dest.iterdir()) == []
+    assert _everything_under(iso) == []
+
+
+async def test_a_backup_runs_when_free_space_cannot_be_read(tmp_path, monkeypatch) -> None:
+    """An unreadable volume is not a reason to refuse; the write still fails loudly if it must."""
+    data_dir = tmp_path / "data"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+
+    def usage(_path: object) -> _Usage:
+        raise OSError("synthetic: no statfs here")
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    try:
+        result = await _runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and Path(result.archive_path).is_file()
+
+
+def test_two_directories_on_one_volume_add_up(tmp_path, monkeypatch) -> None:
+    """A server-DB store stages under its own destination, so the check must sum the two."""
+    _free_space(monkeypatch, 150)
+    a, b = tmp_path / "staging", tmp_path / "dest"
+    assert dr_backup._space_shortfall([(a, 100)]) is None
+    assert dr_backup._space_shortfall([(b, 100)]) is None
+    shortfall = dr_backup._space_shortfall([(a, 100), (b, 100)])
+    assert shortfall is not None and str(tmp_path) in shortfall
+
+
+async def test_a_standalone_verify_that_will_not_fit_fails_before_it_decrypts(
+    tmp_path, monkeypatch
+) -> None:
+    """The verdict says the volume is at fault, not the archive, and nothing is staged."""
+    archive, key = await _archive(tmp_path, config_only=False)
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    decrypted: list[Path] = []
+    real = dr_backup._verify_in_staging
+
+    def verify(staging: Path, **kw: object) -> object:
+        decrypted.append(staging)
+        return real(staging, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", verify)
+    _free_space(monkeypatch, archive.stat().st_size)  # half of what the decrypt and extract need
+    res = await run_restore_verify(str(archive), store_settings=StoreSettings(encryption_key=key))
+    assert res.status == "FAIL"
+    assert res.reason is not None and "not a fault in it" in res.reason
+    assert decrypted == []
+    assert _everything_under(iso) == []
+
+
+async def test_a_backup_is_checked_again_with_the_snapshots_real_size(
+    tmp_path, monkeypatch
+) -> None:
+    """The first check counts the store file only. The second, once the snapshot exists, asks for the
+    tar and the archive still to come, and a refusal there still releases the staging directory."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    calls = [0]
+
+    def usage(_path: object) -> _Usage:
+        calls[0] += 1
+        # Room for the first check, none left for the second.
+        return _Usage(10**12 if calls[0] <= 1 else 1)
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, dest, key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "space"
+    assert "finish this backup" in str(caught.value)
+    assert calls[0] >= 2
+    assert _staging_dirs(data_dir) == [] and list(dest.iterdir()) == []
+    assert _everything_under(iso) == []
+
+
+def test_the_first_check_leaves_an_idle_wal_out(tmp_path, monkeypatch) -> None:
+    """SQLite keeps a WAL file at its high-water size, so counting it refused runs that fit."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "msg.db").write_bytes(b"x" * 1000)
+    (data_dir / "msg.db-wal").write_bytes(b"x" * 100_000)
+
+    class _Store:
+        path = str(data_dir / "msg.db")
+
+    needs: list[list[tuple[Path, int]]] = []
+    monkeypatch.setattr(dr_backup, "_space_shortfall", lambda n: needs.append(n))
+    runner = BackupRunner(
+        _Store(),  # type: ignore[arg-type]
+        BackupSettings(enabled=True, destination=str(tmp_path / "dest")),
+        store_settings=StoreSettings(path=str(data_dir / "msg.db")),
+        config_dir=None,
+        instance="dev",
+    )
+    runner._space_shortfall(data_dir, tmp_path / "dest", config_only=False)
+    assert [n for _p, n in needs[0]] == [2000, 1000]
+
+
+# --- server-DB staging is owner-only, or the run refuses ----------------------------------------
+
+
+def test_a_secured_staging_directory_is_private(tmp_path) -> None:
+    work = dr_backup._open_staging(tmp_path / ".mefor-staging", "mefor-backup-", secure=True)
+    try:
+        assert dr_backup._staging_is_private(work.path)
+    finally:
+        work.release()
+
+
+def test_a_directory_others_can_open_is_not_private(tmp_path) -> None:
+    """The control: the check can say no. A plain `mkdir` inherits its parent's access on Windows,
+    and a 0755 directory admits group and other on POSIX."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if os.name != "nt":
+        plain.chmod(0o755)
+    assert not dr_backup._staging_is_private(plain)
+
+
+def test_a_staging_directory_that_is_not_private_is_removed_and_refused(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / ".mefor-staging"
+    monkeypatch.setattr(dr_backup, "_staging_is_private", lambda _p: False)
+    with pytest.raises(dr_backup.StagingNotPrivateError, match="not owner-only"):
+        dr_backup._open_staging(root, "mefor-backup-", secure=True)
+    assert list(root.iterdir()) == []
+
+
+async def test_a_backup_on_a_volume_that_will_not_keep_staging_private_fails_cleanly(
+    tmp_path, monkeypatch
+) -> None:
+    """The run fails with a reason naming the directory, and nothing is staged or published."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    monkeypatch.setattr(dr_backup, "_staging_is_private", lambda _p: False)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, dest, key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "write"
+    assert "not owner-only" in str(caught.value)
+    assert _staging_dirs(data_dir) == [] and list(dest.iterdir()) == []
+    assert _everything_under(iso) == []
+
+
+def _verify_staging_not_private(path: Path) -> bool:
+    """Private for a build's staging, not for a verify's."""
+    return not path.name.startswith(dr_backup._VERIFY_STAGING_PREFIX)
+
+
+async def test_a_backups_own_verify_refused_for_privacy_does_not_quarantine_the_archive(
+    tmp_path, monkeypatch
+) -> None:
+    """The volume is at fault, not the archive: the run fails as `write`, the archive stays at its
+    staging name unpublished, and nothing is renamed `.failed`."""
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    data_dir = tmp_path / "data"
+    dest = tmp_path / "dest"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    monkeypatch.setattr(dr_backup, "_staging_is_private", _verify_staging_not_private)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, dest, key).run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "write"
+    assert "not verified" in str(caught.value)
+    # The failure record keeps 200 characters; the archive's location must be inside them.
+    assert dr_backup._STAGING_SUFFIX in str(caught.value)[:200]
+    names = [p.name for p in dest.iterdir()]
+    assert len(names) == 1 and names[0].endswith(dr_backup._STAGING_SUFFIX), names
+    assert not any(n.endswith(dr_backup._FAILED_SUFFIX) for n in names)
+    assert _staging_dirs(data_dir) == []
+    assert _everything_under(iso) == []
+
+
+async def test_a_standalone_verify_refused_for_privacy_blames_the_volume(
+    tmp_path, monkeypatch
+) -> None:
+    archive, key = await _archive(tmp_path, config_only=False)
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    monkeypatch.setattr(dr_backup, "_staging_is_private", lambda _p: False)
+    res = await run_restore_verify(str(archive), store_settings=StoreSettings(encryption_key=key))
+    assert res.status == "FAIL"
+    assert res.reason is not None and "not a fault in the archive" in res.reason
+    assert "TMPDIR" in res.reason
+    assert _everything_under(iso) == []

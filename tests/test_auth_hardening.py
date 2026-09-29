@@ -144,11 +144,11 @@ async def test_summary_redacted_for_caller_without_view_summary(engine: Engine) 
         op_msg = (await c.get("/messages", headers=op)).json()["messages"][0]
         vw_msg = (await c.get("/messages", headers=vw)).json()["messages"][0]
         # The LIST is the census surface, so an authorized operator sees the summary MASKED here
-        # (ASVS 14.2.6); only an explicit per-message reveal lifts it (BACKLOG #2346). `error` is not a masked
-        # property, so it comes through complete in the same response -- which is what keeps this a
-        # test of the mask rather than of redaction.
+        # (ASVS 14.2.6); only an explicit per-message reveal lifts it (BACKLOG #2346). The error text
+        # is masked whole on the list too (BACKLOG #2436), and the viewer's nulls below are what
+        # keep this a test of redaction as well as of the mask.
         assert op_msg["summary"] == "MRN **** · ****"
-        assert op_msg["error"] == "bad PID-5: DOE^JANE"
+        assert op_msg["error"] == "****"
         assert vw_msg["summary"] is None  # redacted: viewer lacks messages:view_summary
         assert vw_msg["error"] is None  # error text is PHI-gated the same way (low-8)
 

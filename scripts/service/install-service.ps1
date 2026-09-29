@@ -19,6 +19,11 @@
 [CmdletBinding()]
 param(
     [string]$NssmPath,
+    # Where the nssm.exe the service runs is kept (BACKLOG #2364). It must be a folder only
+    # administrators can write, and the script refuses one that is not: this script runs that file as
+    # administrator, and the SCM starts it as the service account. Not under -DataDir, where the
+    # engine's own account has modify rights.
+    [string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm",
     [string]$ServiceName = "MessageFoundry",
     [string]$AppExe,
     [string]$Config,
@@ -77,46 +82,461 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Pinned NSSM release, auto-downloaded if not already present (so end users need no manual setup).
+# $NssmSha256 is the hash of the ARCHIVE, so it can check a download and nothing else. The hash of the
+# nssm.exe inside it is $NssmExeSha256, in the pinned-hash block below, and that is the one every
+# copy is checked against before it runs.
 $NssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
 $NssmSha256 = "727D1E42275C605E0F04ABA98095C38A8E1E46DEF453CDFFCE42869428AA6743"
 
-function Resolve-Nssm {
-    param([string]$Provided, [string]$DataDir)
+# BEGIN pinned-hash check (kept byte-identical in install-service.ps1 and install-net-helper.ps1;
+# guarded by tests/test_nssm_pin.py, which fails if the two copies drift)
+#
+# The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
+# pins as $NssmSha256. Both installers check every nssm.exe they copy or run against this value,
+# whichever source it came from - -NssmPath, PATH, an installed copy, or a download (BACKLOG #2364).
+# Only the download used to be checked. The two uninstallers do not run nssm at all. The block also
+# carries the folder check and the registration read-back, which both installers need.
+$NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
 
-    if ($Provided) {
-        if (-not (Test-Path $Provided)) { throw "NSSM not found at: $Provided" }
-        return (Resolve-Path $Provided).Path
+function Get-FilePinProblem {
+    <#
+      Why the file at $Path does not match the pinned SHA-256 $Expected, or "" when it does.
+
+      RETURNED, NOT THROWN, so each caller decides what a mismatch means: refuse to go on, or skip to
+      another source. The message names both hashes, so an operator can compare them against the
+      channel the pin came from. A file that cannot be hashed is a mismatch, never a pass.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    try {
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+    } catch {
+        return ("'$Path' could not be hashed ($($_.Exception.Message)), so nothing checked it " +
+            "against the pinned SHA-256 $Expected")
     }
-    $onPath = Get-Command nssm -ErrorAction SilentlyContinue
-    if ($onPath) { return $onPath.Source }
-
-    $binDir = Join-Path $DataDir "bin"
-    $cached = Join-Path $binDir "nssm.exe"
-    if (Test-Path $cached) { return $cached }
-
-    Write-Host "NSSM not found - downloading $NssmUrl ..."
-    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-    $zip = Join-Path $env:TEMP "nssm-mefor-download.zip"
-    $extract = Join-Path $env:TEMP "nssm-mefor-extract"
-    [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $NssmUrl -OutFile $zip -UseBasicParsing
-    $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
-    if ($hash -ne $NssmSha256) {
-        Remove-Item $zip -Force -ErrorAction SilentlyContinue
-        throw "NSSM download failed integrity check (got $hash, expected $NssmSha256)."
-    }
-    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
-    Expand-Archive -Path $zip -DestinationPath $extract -Force
-    $exe = Get-ChildItem -Path $extract -Recurse -Filter nssm.exe |
-        Where-Object { $_.Directory.Name -eq "win64" } | Select-Object -First 1
-    if (-not $exe) { throw "win64\nssm.exe not found in the downloaded NSSM archive." }
-    Copy-Item $exe.FullName $cached -Force
-    Remove-Item $zip -Force -ErrorAction SilentlyContinue
-    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "NSSM installed to $cached"
-    return $cached
+    if ($actual -ne $Expected) { return "'$Path' has SHA-256 $actual, not the pinned $Expected" }
+    return ""
 }
+
+
+function Get-BroadWriteHolders {
+    <#
+      Principals who can write $Path, or can make themselves able to, beyond the five that always
+      may. Two arms: the OWNER, and Allow-write entries on the DACL.
+
+      Returns an empty array when the directory is administrator-only, which is what makes "the
+      folder is safe" a reading rather than an assumption.
+
+      NOT install-service.ps1's Get-BroadAclResidue, and deliberately not a copy of it. That one
+      allows the engine's service account, because the engine has to write its data directory; it
+      takes any Allow entry rather than write-class ones, and it has no owner arm. Here nothing
+      outside the five may write at all - whoever can write this folder can replace a binary that
+      an administrator runs, or that later runs as SYSTEM. Same shape, different question; naming them apart keeps a reader from
+      assuming one answers the other's.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
+    # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
+    # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
+    # REFUSAL, and in install-net-helper.ps1 its only escape is -AllowBroadAcl, which downgrades the
+    # whole check to a warning -- so one false positive would disable the gate.
+    $allowed = @(
+        "S-1-5-18",                                                                # SYSTEM
+        "S-1-5-32-544",                                                            # Administrators
+        "S-1-3-0",                                                                 # CREATOR OWNER
+        "S-1-3-4",                                                                 # OWNER RIGHTS
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"           # TrustedInstaller
+    )
+    $rights = [Security.AccessControl.FileSystemRights]
+    # THE TWO GENERIC BITS ARE IN THE MASK ON PURPOSE, and leaving them out is why a first version of
+    # this was quietly weaker than it looked. FileSystemRights names no GENERIC_ALL or GENERIC_WRITE,
+    # and a real Program Files ACL is full of them: measured on Windows 11 26200, five of its
+    # fourteen entries render as the bare numbers 268435456 (GENERIC_ALL) and -1610612736
+    # (GENERIC_READ|GENERIC_EXECUTE). Those are the inherit-only templates that decide what a file
+    # CREATED in the folder gets - which is exactly the binary this install is about to write - and
+    # none of the named bits below intersects them. So a GENERIC_ALL for Users would have passed a
+    # mask built only from the named rights.
+    $genericAll = 0x10000000
+    $genericWrite = 0x40000000
+    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::WriteAttributes -bor
+        $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
+        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
+    $found = @()
+    # RETURNED AS A RESIDUE, NOT THROWN. An unreadable DACL is not "the folder is fine", so it has to
+    # reach the caller - but throwing from here made install-net-helper.ps1's refusal message name
+    # -AllowBroadAcl as the escape when that switch is not consulted until AFTER this call. An operator following
+    # that instruction got the identical refusal: a dead end, and exactly the false-premise defect
+    # the rest of this script is written against. Returned as a finding instead, so the one decision
+    # about -AllowBroadAcl covers all three ways this can come back non-empty.
+    #
+    # -LiteralPath, NOT -Path. Measured: for a directory whose name holds '[' or ']', `Get-Acl -Path`
+    # returns $null WITHOUT raising, even under -ErrorAction Stop - so the catch never fires and the
+    # arms below read a null object.
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
+        return @("the permissions of '$Path' could not be read ($($_.Exception.Message)), so " +
+            "nothing established who can write there")
+    }
+    if ($null -eq $acl) {
+        return @("the permissions of '$Path' could not be read (Get-Acl returned nothing), so " +
+            "nothing established who can write there")
+    }
+
+    # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
+    # a low-privilege owner can rewrite the DACL whatever it says today and then replace a binary
+    # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
+    # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
+    # without it reports a clean folder for exactly that case.
+    #
+    # AND IT TAKES THE WELL-KNOWN ADMIN RIDs TOO, which the literal list cannot cover: that module's
+    # _WIN_ADMIN_RIDS records that the built-in Administrator (500), Domain Admins (512), Schema
+    # Admins (518) and Enterprise Admins (519) vary per domain. Without them a folder an admin ran
+    # `takeown` on, or one restored from a backup, is refused for being owned by an administrator.
+    $ownerSid = $null
+    try {
+        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    } catch { $ownerSid = "$($acl.Owner)" }
+    # COMPARED AS TEXT, NOT CAST. A RID is a 32-bit UNSIGNED value and [int] is signed, so casting
+    # overflows on a real SID: measured, TrustedInstaller's last group is 2271478464 and
+    # `[int]"2271478464"` throws "Value was either too large or too small for an Int32" -- which
+    # under $ErrorActionPreference = "Stop" aborted this whole check on an ordinary Program Files
+    # folder. A string compare answers the only question being asked and cannot overflow.
+    $ownerRid = if ($ownerSid -match '-(\d+)$') { $Matches[1] } else { "" }
+    if (($allowed -notcontains $ownerSid) -and ($ownerRid -notin @("500", "512", "518", "519"))) {
+        $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
+    }
+
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        $name = "$($rule.IdentityReference)"
+        # $allowed holds SIDs only, so an untranslatable identity falls back to its own text and is
+        # REPORTED rather than skipped: a SID nobody can translate is still a grant, and dropping it
+        # would turn a residue into a clean result.
+        $sid = $name
+        try {
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
+    }
+    return ($found | Select-Object -Unique)
+}
+function Get-ServiceImageProblem {
+    <#
+      Why the service's registration does not start "$Path", quoted, or "" when it does.
+
+      QUOTED OR NOTHING. An unquoted path with a space in it is CWE-428: the SCM tries each prefix
+      that ends at a space, so C:\Program Files\... is first tried as C:\Program.exe. NSSM 2.24
+      registers its own path unquoted, so Set-ServiceImage quotes it, and this accepts only that.
+      Arguments after the quoted path are allowed. Read from the service's registry key with
+      -LiteralPath, so the service name is never parsed as a wildcard or a query.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    $line = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $line = "$((Get-ItemProperty -LiteralPath $key -Name ImagePath -ErrorAction Stop).ImagePath)".Trim()
+    } catch { }
+    $quoted = "`"$Path`""
+    if (($line -eq $quoted) -or $line.StartsWith("$quoted ", [StringComparison]::OrdinalIgnoreCase)) {
+        return ""
+    }
+    return "'$ServiceName' is registered to start '$line', not the checked copy $quoted"
+}
+
+function Set-ServiceImage {
+    <#
+      Point the service's registration at "$Path", quoted, and read it back. Throws when it cannot.
+
+      This is what makes the checked copy the one the SCM starts. `nssm set` never changes the
+      image path, `nssm install` writes it unquoted, and a registration from an earlier install can
+      name any nssm.exe at all. Win32_Service.Change calls ChangeServiceConfig, which the SCM
+      applies at once; editing ImagePath in the registry would wait for a reboot. It is not passed
+      through sc.exe because Windows PowerShell 5.1 does not escape the quotes inside a native
+      argument.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    if (-not (Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path)) { return }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its image path cannot be set." }
+    $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ PathName = "`"$Path`"" }
+    if ($result.ReturnValue -ne 0) {
+        throw ("Could not point '$ServiceName' at `"$Path`": Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    $problem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path
+    if ($problem) { throw "$problem, although Win32_Service.Change reported success." }
+}
+function Set-ServiceAccount {
+    <#
+      Set the account a service runs as through the SCM, and read it back. Throws when it cannot.
+
+      NOT `nssm set ObjectName`. NSSM 2.24, the build this repository pins, refuses a virtual account.
+      Measured on both hosted Windows runners in CI run 36590581708 (2026-09-29): "Invalid account
+      name!" and "Setting ObjectName requires both a username and password", exit 6. Win32_Service.
+      Change calls ChangeServiceConfig, which takes all three forms the installers use.
+
+      THE PASSWORD ARGUMENT DEPENDS ON THE ACCOUNT. ChangeServiceConfig wants lpPassword NULL for a
+      virtual or managed account, so StartPassword is left out of the call for those rather than sent
+      as "". LocalSystem and the two NT AUTHORITY service accounts take an empty string. Any other
+      account takes the -Password it was given.
+
+      THE PASSWORD NEVER REACHES A MESSAGE (BACKLOG #1573). It arrives as a SecureString and becomes
+      plaintext only inside the argument table of the one call, which is emptied in `finally`. Every
+      message here is built from the account name and a return code. When a password was passed, a
+      failed call's own exception text is left out too, because nothing guarantees it does not echo
+      its arguments.
+
+      THE NAME IS CANONICALISED FIRST, as `nssm set ObjectName` did: a bare user name or a UPN is
+      translated to its SID and back, to the DOMAIN\user form ChangeServiceConfig wants and stores.
+      A name that does not translate yet, such as a virtual account before its service exists, is
+      sent as given.
+
+      A FAILURE DISABLES THE SERVICE before the throw. The script stops there, before the data
+      directory is locked down, and a fresh registration would otherwise start at the next boot as
+      NSSM's default, LocalSystem.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$Account,
+        [SecureString]$Password
+    )
+    $fail = {
+        param([string]$Why)
+        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+        throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
+    }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its run-as account cannot be set." }
+    $builtin = $Account -match '^(\.\\)?LocalSystem$|^NT AUTHORITY\\(LocalService|NetworkService|SYSTEM)$'
+    if (-not $builtin) {
+        try {
+            $Account = ([Security.Principal.NTAccount]$Account).Translate(
+                [Security.Principal.SecurityIdentifier]).Translate([Security.Principal.NTAccount]).Value
+        } catch { }
+    }
+    $arguments = @{ StartName = $Account }
+    if ($builtin) { $arguments['StartPassword'] = "" }
+    $bstr = [IntPtr]::Zero
+    $result = $null
+    $failure = $null
+    try {
+        if ($Password) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+            $arguments['StartPassword'] = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        }
+        $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments $arguments -ErrorAction Stop
+    } catch {
+        $failure = if ($Password) { "the call failed" } else { $_.Exception.Message }
+    } finally {
+        $arguments.Remove('StartPassword')
+        if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    }
+    if ($failure) {
+        & $fail "Could not set '$ServiceName' to run as '$Account' (Win32_Service.Change: $failure)."
+    }
+    if ($result.ReturnValue -ne 0) {
+        & $fail ("Could not set '$ServiceName' to run as '$Account': Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    # Read back from the service's own key. The SCM keeps a ".\" prefix when it was given one, so the
+    # two sides are compared without it.
+    $stored = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $stored = "$((Get-ItemProperty -LiteralPath $key -Name ObjectName -ErrorAction Stop).ObjectName)"
+    } catch { }
+    if (($stored -replace '^\.\\', '') -ne ($Account -replace '^\.\\', '')) {
+        & $fail ("'$ServiceName' runs as '$stored', not '$Account', although Win32_Service.Change " +
+            "reported success.")
+    }
+}
+# END pinned-hash check
+
+function Set-AdminOnlyAcl {
+    <#
+      Make a folder or file this script created administrator-only: inheritance off, SYSTEM and
+      Administrators full control, Users and Authenticated Users read and execute, and Administrators
+      as the owner.
+
+      A NEW FOLDER IS NOT ADMINISTRATOR-ONLY BY DEFAULT on every host. Under the "Object creator"
+      default-owner policy its owner is the individual operator, and Program Files' inheritable
+      CREATOR OWNER entry gives that operator full control of it. Measured by the 2026-09-29 review
+      of this change: a child of a folder carrying CREATOR OWNER:(OI)(CI)(IO)F gets
+      '<creator>:(I)(F)'. Either one is a write path Get-BroadWriteHolders refuses. So the ACL is set
+      rather than inherited. Best-effort: the check that follows reads the result either way.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $grants = @("*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX",
+        "*S-1-5-11:(OI)(CI)RX")
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $grants = @("*S-1-5-18:F", "*S-1-5-32-544:F", "*S-1-5-32-545:RX", "*S-1-5-11:RX")
+    }
+    & icacls $Path /inheritance:r /grant:r @grants | Out-Null
+    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
+}
+
+function Get-NssmHomeProblem {
+    <#
+      Who, other than administrators, could replace $File: through the file itself, its folder, or
+      any folder above that up to, not including, the drive root. "" when nobody.
+
+      THE PARENTS COUNT. Whoever can delete or rename a folder's child can move the checked folder
+      aside and put their own in its place. The drive root is left out because Windows lets
+      Authenticated Users create folders there by default, which moves nothing that already exists.
+    #>
+    param([Parameter(Mandatory)][string]$File)
+    $found = @()
+    if (Test-Path -LiteralPath $File) { $found += @(Get-BroadWriteHolders -Path $File) }
+    $dir = Split-Path -Parent $File
+    while ($dir -and (Split-Path -Parent $dir)) {
+        $found += @(Get-BroadWriteHolders -Path $dir | ForEach-Object { "$_ on '$dir'" })
+        $dir = Split-Path -Parent $dir
+    }
+    return ($found -join "; ")
+}
+
+function Resolve-Nssm {
+    <#
+      The nssm.exe this install runs, and registers the service with: the copy in -NssmDir, a folder
+      only administrators can write (BACKLOG #2364).
+
+      WHY A FOLDER OF ITS OWN. The registration names an nssm.exe by path, and this script runs that
+      file as administrator. It used to be cached in <DataDir>\bin, where the engine's own account
+      has modify rights. From there, code running as the engine could replace the file, plant a DLL
+      beside it, or turn the folder into a junction, for the next install to run as administrator. A
+      hash check sees only the first of those three. So the copy lives where only administrators can
+      write, and Get-NssmHomeProblem reads that from the file, its folder and the folders above,
+      rather than assuming it. With nobody else able to write there, nothing can change the copy
+      between this check and its use.
+
+      Every source is checked against $NssmExeSha256 before it is copied in:
+        installed  the copy already in -NssmDir. Used as it is when it passes, and REFUSED when it
+                   does not, because only an administrator can have changed it.
+        -NssmPath  refused on a mismatch. The operator named that file.
+        PATH       skipped with a warning on a mismatch. A package manager's nssm may be another
+                   build, which is ordinary and not an attack.
+        download   the archive is checked against $NssmSha256, then its nssm.exe against the pin.
+
+      TWO COPIES THAT PASS THE PIN ARE THE SAME BYTES, so a passing installed copy is never
+      overwritten. That also means a reinstall never copies over the image a running service holds
+      open.
+    #>
+    param([string]$Provided, [Parameter(Mandatory)][string]$NssmDir)
+
+    # Every folder this call creates gets an administrator-only ACL. A folder that already existed is
+    # left as it is: its permissions are the operator's choice, and the check below reads them.
+    $missing = @()
+    $probe = $NssmDir
+    while ($probe -and -not (Test-Path -LiteralPath $probe)) {
+        $missing = @($probe) + $missing
+        $probe = Split-Path -Parent $probe
+    }
+    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
+    foreach ($dir in $missing) { Set-AdminOnlyAcl -Path $dir }
+    $target = Join-Path $NssmDir "nssm.exe"
+    $refuse = {
+        param($holders)
+        throw ("'$target' is not administrator-only: $holders. Whoever can write there can replace " +
+            "the nssm.exe this script runs as administrator, or plant a DLL beside it. Pass " +
+            "-NssmDir with a folder under Program Files, or fix its permissions, and re-run.")
+    }
+    $holders = Get-NssmHomeProblem -File $target
+    if ($holders) { & $refuse $holders }
+
+    $source = $null
+    if ($Provided) {
+        if (-not (Test-Path -LiteralPath $Provided)) { throw "NSSM not found at: $Provided" }
+        $source = (Resolve-Path -LiteralPath $Provided).Path
+        $problem = Get-FilePinProblem -Path $source -Expected $NssmExeSha256
+        if ($problem) {
+            throw ("Refusing -NssmPath: $problem. Pass the win64 nssm.exe from the NSSM 2.24 " +
+                "release, or leave -NssmPath out and this script downloads and checks it.")
+        }
+    }
+    if (Test-Path -LiteralPath $target) {
+        $problem = Get-FilePinProblem -Path $target -Expected $NssmExeSha256
+        if ($problem) {
+            throw ("Refusing the installed NSSM: $problem. Only an administrator can write " +
+                "'$NssmDir', so find out what changed it. Then delete it and re-run.")
+        }
+        return $target
+    }
+    if (-not $source) {
+        $onPath = Get-Command nssm -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($onPath) {
+            $problem = Get-FilePinProblem -Path $onPath.Source -Expected $NssmExeSha256
+            if (-not $problem) { $source = $onPath.Source }
+            else {
+                Write-Warning ("Not using the nssm on PATH: $problem. Downloading the pinned release " +
+                    "instead. With no internet access, pass -NssmPath with the win64 nssm.exe from " +
+                    "nssm-2.24.zip.")
+            }
+        }
+    }
+    if ($source) {
+        Copy-Item -LiteralPath $source -Destination $target -Force
+    } else {
+        Save-PinnedNssm -Destination $target
+    }
+    # The new file's owner follows the same default-owner policy as a new folder, so it is set too.
+    Set-AdminOnlyAcl -Path $target
+    # The COPY is what runs, so the copy is what gets checked. With the download, a mismatch here
+    # means the two pins disagree: a binary pin that does not match the pinned archive is wrong.
+    $problem = Get-FilePinProblem -Path $target -Expected $NssmExeSha256
+    $holders = Get-NssmHomeProblem -File $target
+    if ($problem -or $holders) {
+        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        if ($holders) { & $refuse $holders }
+        throw "The nssm.exe copied into '$NssmDir' failed its check: $problem."
+    }
+    Write-Host "NSSM installed to $target"
+    return $target
+}
+
+function Save-PinnedNssm {
+    <#
+      Download the pinned NSSM archive, check it against $NssmSha256, and write its win64 nssm.exe to
+      $Destination. The caller checks the written file against $NssmExeSha256.
+    #>
+    param([Parameter(Mandatory)][string]$Destination)
+    Write-Host "NSSM not found - downloading $NssmUrl ..."
+    # GetTempPath, not $env:TEMP. The variable is unset on Linux pwsh, where the tests lift this
+    # function, and Join-Path refuses a null. On Windows GetTempPath reads TMP, then TEMP, then falls
+    # back to the profile, so it names the same folder.
+    #
+    # A NEW FOLDER OF ITS OWN FOR EVERY RUN, created without -Force so an existing one is an error. The
+    # fixed names this used before could be pre-created by another user wherever the temp folder is
+    # shared - C:\Windows\Temp when this runs as SYSTEM - and a recursive delete of a planted junction
+    # there would follow it. The pins still check what comes out; this keeps the cleanup to our own
+    # files.
+    $temp = [IO.Path]::GetTempPath()
+    $work = Join-Path $temp ("nssm-mefor-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $work | Out-Null
+    try {
+        $zip = Join-Path $work "nssm-2.24.zip"
+        $extract = Join-Path $work "extract"
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $NssmUrl -OutFile $zip -UseBasicParsing
+        $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
+        if ($hash -ne $NssmSha256) {
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            throw "NSSM download failed integrity check (got $hash, expected $NssmSha256)."
+        }
+        Expand-Archive -Path $zip -DestinationPath $extract
+        $exe = Get-ChildItem -Path $extract -Recurse -Filter nssm.exe |
+            Where-Object { $_.Directory.Name -eq "win64" } | Select-Object -First 1
+        if (-not $exe) { throw "win64\nssm.exe not found in the downloaded NSSM archive." }
+        Copy-Item -LiteralPath $exe.FullName -Destination $Destination -Force
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 
 function Set-SecureDataDirAcl {
     <#
@@ -458,7 +878,7 @@ function Test-GmsaInstalled {
 function Set-ServiceLogonRight {
     <#
       Grant the SeServiceLogonRight ("Log on as a service") user right to $Account via the LOCAL security
-      policy (#99). NSSM's ObjectName assigns the account but does NOT grant this right the way the SCM UI
+      policy (#99). Setting the account (Set-ServiceAccount) does NOT grant this right the way the SCM UI
       does, so a gMSA / dedicated account otherwise fails to start with error 1069. Implemented with the
       built-in secedit (no extra module): export USER_RIGHTS, append the account SID to
       SeServiceLogonRight if missing, re-import. Best-effort: resolves the SID, warns and returns on any
@@ -568,10 +988,11 @@ else { $Config = Resolve-AbsolutePath $Config }
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
 
-# AFTER the normalization: Resolve-Nssm joins "bin" onto -DataDir and caches nssm.exe there, so a
-# relative -DataDir here would download the binary to one directory and register a service pointing at
-# another.
-$NssmPath = Resolve-Nssm -Provided $NssmPath -DataDir $DataDir
+$NssmDir = Resolve-AbsolutePath $NssmDir
+
+# AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
+# with that path, so a relative one would be resolved against a different directory later.
+$NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
 
 if (-not (Test-Path $AppExe)) {
     throw "Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, or pass -AppExe."
@@ -597,11 +1018,16 @@ function Invoke-Nssm {
     <#
       Run nssm and FAIL CLOSED on a non-zero exit, naming the subcommand that failed.
 
-      The failure message joins the arguments because for 17 of the 18 call sites that is exactly what
-      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). The 18th passes the
-      service-account password as a positional argument, and a joined message there puts a cleartext
-      password into the thrown message, the console, and the $Error record it leaves behind (BACKLOG
-      #1573).
+      The failure message joins the arguments because for its ordinary call sites that is exactly what
+      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). One call used to pass
+      the service-account password as a positional argument, and a joined message there put a
+      cleartext password into the thrown message, the console, and the $Error record it leaves behind
+      (BACKLOG #1573).
+
+      NO CALL SITE PASSES -Secret NOW. The password call was `nssm set ObjectName`, which NSSM 2.24
+      refuses for a virtual account, so the run-as account moved to Set-ServiceAccount, which carries
+      its own #1573 guard (BACKLOG #2364). The parameter stays, with its tests, so that a future nssm
+      call carrying a secret has a redacting form to use rather than a joined one.
 
       So the secret is a SEPARATE, NAME-ONLY parameter and the message is built from $NssmArgs, which
       never holds it. The redaction is therefore a property of how the message is CONSTRUCTED - there
@@ -744,11 +1170,25 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
             "settings, but the RUNNING process keeps the old ones until it is restarted - so this " +
             "install can report success over a service that is still on the previous configuration, " +
             "including the previous run-as account and the previous paths. Stop it by hand and " +
-            "re-run, or restart it once this finishes, and confirm with 'nssm status $ServiceName'.")
+            "re-run, or restart it once this finishes, and confirm with 'Get-Service $ServiceName'.")
     }
 } else {
     Write-Host "Installing service '$ServiceName'..."
     Invoke-Nssm install $ServiceName $AppExe
+}
+
+# THE REGISTRATION IS POINTED AT THE CHECKED COPY, QUOTED, AND READ BACK (BACKLOG #2364). `nssm set`
+# never changes which nssm.exe the SCM starts: a fresh `nssm install` writes its own path unquoted,
+# and a service from an earlier install may name any nssm.exe at all, where anyone could have
+# changed it. Nothing here runs that earlier binary; the stop above went through the checked copy.
+# On failure the service is set to Disabled before the throw, so a registration this script could
+# not make safe does not start at the next boot.
+try {
+    Set-ServiceImage -ServiceName $ServiceName -Path $NssmPath
+} catch {
+    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+    throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled so it cannot start from an " +
+        "unchecked image. Remove it with .\uninstall-service.ps1 and re-run.")
 }
 
 Invoke-Nssm set $ServiceName Application $AppExe
@@ -784,7 +1224,7 @@ if (-not $ServiceAccount -and -not $AllowLocalSystem) {
         "password). Pass -AllowLocalSystem to run as LocalSystem, or -ServiceAccount for a gMSA / " +
         "dedicated account instead (docs/SERVICE.md 'Least-privilege service account').")
 }
-# TWO VALUES, NEVER ONE (BACKLOG #1553). $RunAsObjectName is what NSSM is told to run the service as;
+# TWO VALUES, NEVER ONE (BACKLOG #1553). $RunAsObjectName is what the SCM is told to run the service as;
 # $ServiceAccount stays "the account that needs an EXPLICIT ACL grant", and is EMPTY for LocalSystem.
 # They must not be collapsed: Set-SecureDataDirAcl already grants *S-1-5-18, which IS LocalSystem, so
 # adding a named "LocalSystem" grant is redundant and can make icacls exit non-zero.
@@ -792,31 +1232,23 @@ $RunAsObjectName = if ($ServiceAccount) { $ServiceAccount } else { "LocalSystem"
 
 if ($ServiceAccount) {
     # gMSA preflight (#99): verify the account is installed + usable on this host, then grant it the
-    # "Log on as a service" right BEFORE registering (NSSM's ObjectName does not grant it). Both steps
+    # "Log on as a service" right BEFORE registering (setting the account does not grant it). Both steps
     # degrade gracefully on a non-domain box and never abort the install.
     if ((Test-LooksLikeGmsa -Account $ServiceAccount) -and -not $SkipGmsaPreflight) {
         Test-GmsaInstalled -Account $ServiceAccount
     }
-    if (-not $ServiceAccountPassword) {
-        # A password-less account (gMSA / virtual / managed) still needs SeServiceLogonRight granted (a
-        # password account is granted it implicitly by the SCM when NSSM sets the password). Best-effort.
-        Set-ServiceLogonRight -Account $ServiceAccount
-    }
+    # EVERY named account needs SeServiceLogonRight, a password account too. This skipped password
+    # accounts while `nssm set ObjectName` granted the right to them itself. Set-ServiceAccount goes
+    # through the SCM, which grants nothing (BACKLOG #2364). Best-effort, and idempotent.
+    Set-ServiceLogonRight -Account $ServiceAccount
     if ($ServiceAccountPassword) {
-        # Convert the SecureString to plaintext only here - NSSM's ObjectName takes a plain password.
-        # -Secret keeps it out of the failure message Invoke-Nssm throws on a non-zero exit (#1573):
-        # passed positionally it would be joined into that message, the console, and the $Error record.
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ServiceAccountPassword)
-        try {
-            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-            Invoke-Nssm -Secret $plain set $ServiceName ObjectName $RunAsObjectName
-        } finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
+        # The SecureString goes to Set-ServiceAccount as it is. It becomes plaintext only inside that
+        # function's one call to the SCM, and no message it builds can carry it (BACKLOG #1573).
+        Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName -Password $ServiceAccountPassword
     } else {
-        # Virtual / managed accounts (e.g. "NT SERVICE\MessageFoundry", a gMSA) take no password. NSSM
-        # wants a gMSA's ObjectName with a trailing '$' and no password.
-        Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
+        # Virtual / managed accounts (e.g. "NT SERVICE\MessageFoundry", a gMSA) take no password, and
+        # a gMSA keeps its trailing '$'. Through the SCM, because NSSM 2.24 refuses these outright.
+        Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName
     }
     Write-Host "  Account: $RunAsObjectName" -ForegroundColor Green
 } else {
@@ -834,7 +1266,7 @@ if ($ServiceAccount) {
     #
     # It also makes NSSM's create-time default irrelevant. Whether that default really is LocalSystem
     # was never measured; setting the value explicitly removes the need to know.
-    Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
+    Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName
     Write-Warning ("Service will run as LocalSystem (most-privileged) - acknowledged via " +
         "-AllowLocalSystem. The default is now the least-privilege virtual account " +
         "'NT SERVICE\$ServiceName' (no password); prefer it or a gMSA for production. See docs/SERVICE.md " +
@@ -910,7 +1342,9 @@ Write-Host "  Logs   : $StdoutLog"
 Write-Host "           $StderrLog"
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  $NssmPath start $ServiceName"
+# Start-Service needs no nssm.exe, so an operator following this never runs a copy nobody checked
+# (BACKLOG #2364).
+Write-Host "  Start-Service '$ServiceName'"
 # The engine ALWAYS serves TLS (BACKLOG #1276 part A, ADR 0172): with no [api].tls_cert_file
 # configured it mints a self-signed pair beside the store database on first start. So the health
 # probe is https, and it must trust that certificate - printing the old plaintext `curl http://...`
@@ -920,5 +1354,5 @@ Write-Host "  curl.exe --cacert `"$GeneratedCert`" https://${ListenHost}:${Port}
 Write-Host ("           (that PEM is the placeholder pair the engine mints on first start. With your " +
     "own [api].tls_cert_file configured, verify against THAT chain instead - the generated pair is " +
     "never created.)")
-Write-Host "  Stop:      $NssmPath stop $ServiceName"
+Write-Host "  Stop:      Stop-Service '$ServiceName'"
 Write-Host "  Uninstall: .\uninstall-service.ps1"

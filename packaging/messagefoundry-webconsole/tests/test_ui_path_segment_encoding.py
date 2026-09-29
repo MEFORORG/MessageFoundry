@@ -359,7 +359,8 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
     body route for the id before the slash, which is the same request as linking that route directly:
     the id is read back through ``get_message``, which 404s on a miss, and all three routes run the
     same ``messages:view_raw`` gate with ``phi=True``. So the absorption reveals nothing a direct link
-    would not, and skips no gate.
+    would not, and skips no gate. ``/ui/messages/{id}/errors`` (BACKLOG #2436) is the same shape
+    with the error text revealed, under the same gate, so the same reading holds.
 
     A new pair is not automatically a defect. It is a site somebody has to read, and nothing else in
     the tree would report it.
@@ -400,6 +401,7 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
         ("GET", "/ui/messages/{message_id}", "/ui/messages/search/layered"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/body"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/edit"),
+        ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/errors"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/resend-confirm"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/summary"),

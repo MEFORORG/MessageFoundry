@@ -30,7 +30,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.field_authz import PHI_FIELDS, redact_unauthorized
+from messagefoundry.api.field_authz import PHI_FIELDS, redact_unauthorized, revealable
 from messagefoundry.api.models import MessageDetail, MessageSummary
 from messagefoundry.api.phi_gate import GATEABLE_PROPERTIES, PhiGatedModel
 from messagefoundry.auth import Identity, Permission
@@ -94,7 +94,7 @@ def test_a_freshly_built_phi_model_serializes_its_gated_properties_as_null() -> 
     released = redact_unauthorized(
         _summary(),
         _identity(Permission.MESSAGES_VIEW_SUMMARY),
-        revealed=frozenset({"summary", "metadata"}),
+        revealed=revealable(MessageSummary, summary=True, error_text=True),
     )
     emitted = released.model_dump(mode="json")
     assert emitted["summary"] == _SUMMARY
@@ -161,7 +161,7 @@ async def test_a_route_that_forgets_redact_unauthorized_denies_rather_than_expos
         return redact_unauthorized(
             _detail(),
             _identity(Permission.MESSAGES_VIEW_SUMMARY),
-            revealed=frozenset({"summary", "metadata"}),
+            revealed=revealable(MessageDetail, summary=True, error_text=True),
         )
 
     transport = httpx.ASGITransport(app=app)

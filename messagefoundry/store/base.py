@@ -435,7 +435,12 @@ class QueueStore(StoreLifecycle, Protocol):
     def state_view(self) -> Mapping[tuple[str, str], Any]:
         """A read-only view of the engine-maintained transform-state read-through cache (ADR 0005):
         ``{(namespace, key): decoded_value}``. The runner publishes it around each router/transform run
-        so a Handler's synchronous ``state_get(...)`` resolves. Reflects writes as they commit."""
+        so a Handler's synchronous ``state_get(...)`` resolves. Reflects writes as they commit.
+
+        Every shipped backend holds the cache SEALED (BACKLOG #1174,
+        :mod:`messagefoundry.store.sealed_cache`): a read decrypts one value and returns a fresh copy.
+        Take a frozen copy with :func:`~messagefoundry.store.sealed_cache.point_in_time`; ``dict(view)``
+        would decrypt every entry."""
         ...
 
     # --- reference sets (ADR 0006 Tier 1) ------------------------------------

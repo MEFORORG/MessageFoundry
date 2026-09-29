@@ -75,7 +75,17 @@ of volatile fields (MSH-7, MSH-10).**
   dry-runs it (`--show-phi`, so expected/actual bodies are full), compares each case's new deliveries
   against its stored `expected` via `compareMessages`, and **deletes the temp directory in a
   `finally`** — PHI on disk is transient and cleaned, never left behind. Pass/fail is shown per case;
-  a failing case opens the expected-vs-actual before/after diff.
+  a click on a case shows its expected-vs-actual differences (see *Reveal on click*).
+- **Reveal on click (amended 2026-09-29, BACKLOG #2437, ASVS 14.2.6, owner ruling R13).** The run
+  view shows each case's name, PASS or FAIL, and disposition. It shows no field value and no error
+  text. The host keeps each case's differences and error. The webview asks for one case when the
+  developer clicks that case's Details button, and the host posts only that case. The webview shows
+  at most one case's values at a time. It clears them on Back, and when another case or view opens.
+  The host drops the held values when the panel re-renders or closes, or when any collection is
+  saved or deleted. A run still in flight at any of those points is dropped too. So is an older
+  run that finishes after a newer one starts. One case at a time is the view's rule, not the host's:
+  the host answers a well-formed request for any held case. The webview runs only this extension's
+  own script, under a nonce CSP.
 - **PHI notice.** The collections UI carries a one-line notice steering authors to synthetic,
   de-identified cases (ADR 0030) and stating that bodies are stored machine-locally in workspace
   state.
@@ -98,6 +108,10 @@ existing Load / before-after / Coverage-Profiling panes and the `--show-phi` pos
 - **AC-4** — THE SYSTEM SHALL persist case bodies only in machine-local `workspaceState` — never in a
   repo-tracked file and never in `globalState` (Settings-Sync-eligible). *(Design/review-enforced; the
   storage key is `workspaceState`-scoped in `testBench.ts`.)*
+- **AC-5** — WHEN a collection run completes, THE SYSTEM SHALL show each case's name, PASS or FAIL, and
+  disposition, and no difference value or error text. WHEN the developer clicks one case, THE SYSTEM
+  SHALL show that case's differences and error, and no other case's.
+  → `ide/src/test/suite/test-bench-webview.test.ts`, `ide/src/test/suite/test-collections.test.ts`
 
 ## Options considered
 

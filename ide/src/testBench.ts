@@ -18,8 +18,10 @@ import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView
 import { testBenchScript } from "./testBenchWebview";
 import { openChannel, postToWebview } from "./webviewMessaging";
 import {
-  compareCase,
-  type DeliveryComparison,
+  judgeCollectionRun,
+  pickCaseDetail,
+  type CaseRerun,
+  type CaseRunDetail,
   type TestCase,
   type TestCollection,
 } from "./testCollections";
@@ -56,6 +58,7 @@ type Incoming =
   | { command: "listCollections" }
   | { command: "saveCollection" }
   | { command: "runCollection"; name: string }
+  | { command: "caseDetail"; run: number; index: number }
   | { command: "deleteCollection"; name: string };
 
 function esc(s: string): string {
@@ -84,6 +87,13 @@ export class TestBench {
   private rows: DryRunRow[] = [];
   private pickPaths: string[] = []; // the files last loaded — re-run under --trace on demand
   private traces: TraceEntry[] | null = null; // lazily fetched, aligned 1:1 with `rows` by index
+  // The last collection run's per-case differences and errors, held back from the webview until one
+  // case is asked for (ADR 0121, "Reveal on click"). `id` names the run a request must match.
+  private lastRun: { id: number; details: CaseRunDetail[] } | null = null;
+  // Bumped by every event that must drop a held run, and by every run start. A run holds and posts
+  // its result only if the generation it started under is still current, so a run in flight across
+  // a re-render, close, save or delete, or overtaken by a newer run, holds nothing.
+  private viewGen = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -98,7 +108,14 @@ export class TestBench {
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true },
     );
-    this.panel.onDidDispose(() => (this.panel = undefined), null, this.context.subscriptions);
+    this.panel.onDidDispose(
+      () => {
+        this.panel = undefined;
+        this.dropRun();
+      },
+      null,
+      this.context.subscriptions,
+    );
     this.panel.webview.onDidReceiveMessage((m: Incoming) => void this.onMessage(m));
     this.render();
   }
@@ -120,6 +137,8 @@ export class TestBench {
       await this.withCollections(() => this.saveCollection());
     } else if (m.command === "runCollection") {
       await this.withCollections(() => this.runCollection(m.name));
+    } else if (m.command === "caseDetail") {
+      await this.showCaseDetail(m.run, m.index);
     } else if (m.command === "deleteCollection") {
       await this.withCollections(() => this.deleteCollection(m.name));
     }
@@ -244,6 +263,7 @@ export class TestBench {
       expected: r.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
     }));
     map[name] = { name, cases };
+    this.dropRun();
     await this.storeCollections(map);
     await this.postCollections();
     void vscode.window.showInformationMessage(
@@ -265,6 +285,7 @@ export class TestBench {
       return;
     }
     delete map[name];
+    this.dropRun();
     await this.storeCollections(map);
     await this.postCollections();
   }
@@ -279,16 +300,21 @@ export class TestBench {
     if (!this.panel) {
       return;
     }
+    const panel = this.panel;
+    const gen = ++this.viewGen;
+    // The load is async now (SecretStorage, BACKLOG #1174). The generation is taken first, so the
+    // check after the dry-run also drops a run whose view moved on during the load.
     const coll = (await this.loadCollections())[name];
     const cwd = workspaceDir();
     if (!coll || !cwd) {
       return;
     }
+    const caseFile = (i: number): string => `case_${String(i).padStart(4, "0")}.hl7`;
     let tmpDir: string | undefined;
     try {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-testbench-"));
       const files = coll.cases.map((c, i) => {
-        const file = path.join(tmpDir as string, `case_${String(i).padStart(4, "0")}.hl7`);
+        const file = path.join(tmpDir as string, caseFile(i));
         fs.writeFileSync(file, c.input, "utf8");
         return file;
       });
@@ -302,25 +328,22 @@ export class TestBench {
           byBase.set(path.basename(row.path), row);
         }
       }
-      const results = coll.cases.map((c, i) => {
-        const row = byBase.get(`case_${String(i).padStart(4, "0")}.hl7`);
-        const actual = row ? row.deliveries.map((d) => ({ to: d.to, payload: d.payload })) : [];
-        const cmp = compareCase(c.expected, actual);
-        return {
-          name: c.name,
-          pass: row ? cmp.pass : false,
-          disposition: row?.disposition ?? "NO RESULT",
-          error: row?.error ?? (row ? null : "no dry-run row produced for this case"),
-          deliveries: cmp.deliveries as DeliveryComparison[],
-        };
+      if (this.panel !== panel || this.viewGen !== gen) {
+        return; // the view moved on while the dry-run ran (see viewGen): hold nothing
+      }
+      const reruns = coll.cases.map((_c, i): CaseRerun | undefined => {
+        const row = byBase.get(caseFile(i));
+        return row ? { disposition: row.disposition, error: row.error ?? null, deliveries: row.deliveries } : undefined;
       });
-      const passed = results.filter((r) => r.pass).length;
-      await postToWebview(this.panel.webview, {
+      const run = judgeCollectionRun(coll.cases, reruns);
+      this.lastRun = { id: gen, details: run.details };
+      await postToWebview(panel.webview, {
         type: "collectionRun",
         name,
-        passed,
-        total: results.length,
-        results,
+        run: gen,
+        passed: run.passed,
+        total: run.summaries.length,
+        results: run.summaries,
       });
     } catch (e) {
       void vscode.window.showErrorMessage(`MessageFoundry: collection run failed — ${String(e)}`);
@@ -334,6 +357,15 @@ export class TestBench {
         }
       }
     }
+  }
+
+  /** Post one case's differences and error, for a `caseDetail` request (ADR 0121, "Reveal on click"). */
+  private async showCaseDetail(run: unknown, index: unknown): Promise<void> {
+    const detail = pickCaseDetail(this.lastRun, run, index);
+    if (!this.panel || !detail) {
+      return;
+    }
+    await postToWebview(this.panel.webview, { type: "caseDetail", run, index, ...detail });
   }
 
   /**
@@ -500,7 +532,14 @@ export class TestBench {
     });
   }
 
+  /** Forget the held run, and make any run still in flight hold nothing when it lands. */
+  private dropRun(): void {
+    this.viewGen++;
+    this.lastRun = null;
+  }
+
   private render(): void {
+    this.dropRun(); // a new document has no run view to ask for it
     if (this.panel) {
       this.panel.webview.html = this.html(this.panel.webview);
     }
@@ -625,6 +664,7 @@ export class TestBench {
     .case { padding: 6px 0; border-bottom: 1px solid var(--vscode-panel-border); }
     .case .hd { display: flex; align-items: baseline; gap: 8px; }
     .case .hd .cn { font-size: 13px; }
+    .case .hd button { margin-left: auto; padding: 1px 8px; }
     .case .diffs { margin: 4px 0 0 12px; font-size: 12px; color: var(--vscode-descriptionForeground); }
     .case .diffs code { font-family: var(--vscode-editor-font-family, monospace); }
     .case .diffs .del { color: var(--vscode-testing-iconFailed, #f85149); }
