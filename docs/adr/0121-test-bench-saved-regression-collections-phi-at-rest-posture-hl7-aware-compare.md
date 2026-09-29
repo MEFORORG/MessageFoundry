@@ -76,6 +76,13 @@ of volatile fields (MSH-7, MSH-10).**
   against its stored `expected` via `compareMessages`, and **deletes the temp directory in a
   `finally`** — PHI on disk is transient and cleaned, never left behind. Pass/fail is shown per case;
   a failing case opens the expected-vs-actual before/after diff.
+- **Reveal on click (amended 2026-09-29, BACKLOG #2437, ASVS 14.2.6, owner ruling R13).** The run
+  view shows each case's name, PASS or FAIL, and disposition, and no field value or error text. The
+  host keeps each case's differences and error, and posts one case's only when the webview asks for
+  that case, which it does when the developer clicks that case's Details button. The webview shows
+  at most one case's values at a time, and clears them on Back or when another case opens. The host
+  drops the held values when the panel re-renders or closes, or when the run's collection is
+  deleted.
 - **PHI notice.** The collections UI carries a one-line notice steering authors to synthetic,
   de-identified cases (ADR 0030) and stating that bodies are stored machine-locally in workspace
   state.

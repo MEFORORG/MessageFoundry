@@ -22,6 +22,7 @@ export function testBenchScript(token: string): string {
     let sbs = (vscode.getState() || {}).sbs || false; // remembered layout choice
     let traceMode = (vscode.getState() || {}).traceMode || 'coverage'; // 'coverage' | 'profile'
     let lastTrace = null; // the most recent trace detail, so the toggle can re-render it
+    let wantCase = null; // the run case the developer last asked to see, as { run, index }; null: none
 
     // Stringifies first, so a number reaching innerHTML goes through the same escape as a string.
     // Quotes too, matching the host-side esc(): a value must not be able to leave an attribute.
@@ -232,17 +233,17 @@ export function testBenchScript(token: string): string {
         '<span class="del">' + (esc(d.before) || '∅') + '</span> &rarr; ' +
         '<span class="ins">' + (esc(d.after) || '∅') + '</span></div>';
     }
-    // RUN VIEW (ASVS 14.2.6, BACKLOG #2437). A run shows each case's name, PASS or FAIL, and
-    // disposition, and no field value. A case's differences and error arrive from the host only when
-    // that case's Details button is clicked, and showing one case clears any other, so this page holds
-    // at most one case's values at a time. The DOM keys cases on their index, never on a name.
+    // RUN VIEW: pass or fail per case, and one case's values at a time on a click (ADR 0121, "Reveal
+    // on click"). The DOM keys cases on their index, never on a name.
     function renderCollectionRun(msg){
+      wantCase = null;
       const cases = msg.results.map((r, i) => {
         const badge = r.pass ? '<span class="badge pass">PASS</span>' : '<span class="badge fail">FAIL</span>';
         return '<div class="case"><div class="hd">' + badge + '<span class="cn">' + esc(r.name) +
           '</span><span class="note">' + esc(r.disposition) + '</span>' +
-          '<button data-case-detail="' + i + '">Details</button></div>' +
-          '<div data-case-slot="' + i + '"></div></div>';
+          '<button data-case-detail="' + i + '" aria-expanded="false" aria-controls="case-slot-' + i +
+          '" aria-label="Details for ' + esc(r.name) + '">Details</button></div>' +
+          '<div id="case-slot-' + i + '" data-case-slot="' + i + '"></div></div>';
       }).join('');
       const allPass = msg.passed === msg.total;
       const summary = '<span class="badge ' + (allPass ? 'pass' : 'fail') + '">' + esc(msg.passed) + ' / ' + esc(msg.total) + ' passed</span>';
@@ -252,12 +253,23 @@ export function testBenchScript(token: string): string {
       for (const b of detail.querySelectorAll('button[data-case-detail]')) {
         const index = Number(b.dataset.caseDetail);
         b.addEventListener('click', () => {
-          const slot = caseSlot(run, index);
-          // A second click on an open case closes it, without asking the host again.
-          if (slot && slot.innerHTML) { slot.innerHTML = ''; return; }
+          // A second click on the case already asked for closes it, and drops any reply still coming.
+          if (wantCase && wantCase.run === run && wantCase.index === index) { closeCase(); return; }
+          closeCase();
+          wantCase = { run, index };
           vscode.postMessage({ command: 'caseDetail', run, index });
         });
       }
+    }
+    // Clear the one case on show, if any, and forget the request for it.
+    function closeCase(){
+      if (wantCase) {
+        const slot = caseSlot(wantCase.run, wantCase.index);
+        if (slot) slot.innerHTML = '';
+        const btn = detail.querySelector('button[data-case-detail="' + esc(wantCase.index) + '"]');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      }
+      wantCase = null;
     }
     // The slot for one case of one run, or null when the view no longer shows that run.
     function caseSlot(run, index){
@@ -265,9 +277,11 @@ export function testBenchScript(token: string): string {
       return view ? view.querySelector('[data-case-slot="' + esc(index) + '"]') : null;
     }
     function renderCaseDetail(m){
+      // Only the reply to the latest request renders: a reply for a case since closed or replaced,
+      // or for a run no longer on screen, is dropped.
+      if (!wantCase || wantCase.run !== m.run || wantCase.index !== m.index) return;
       const slot = caseSlot(m.run, m.index);
-      if (!slot) return; // a stale reply: the run it belongs to is no longer on screen
-      for (const other of detail.querySelectorAll('[data-case-slot]')) other.innerHTML = '';
+      if (!slot) return;
       const notes = m.deliveries.map((d) => {
         if (d.status === 'missing') return '<div class="diffs">Expected delivery to <code>' + esc(d.to) + '</code> was not produced.</div>';
         if (d.status === 'unexpected') return '<div class="diffs">Unexpected delivery to <code>' + esc(d.to) + '</code>.</div>';
@@ -276,6 +290,8 @@ export function testBenchScript(token: string): string {
       }).join('');
       const err = m.error ? '<div class="diffs">' + esc(m.error) + '</div>' : '';
       slot.innerHTML = (err + notes) || '<div class="diffs">No differences.</div>';
+      const btn = detail.querySelector('button[data-case-detail="' + esc(m.index) + '"]');
+      if (btn) btn.setAttribute('aria-expanded', 'true');
     }
 
     function saveState(){ vscode.setState({ sbs, traceMode }); }
@@ -284,6 +300,7 @@ export function testBenchScript(token: string): string {
     document.getElementById('collections').addEventListener('click', () => vscode.postMessage({ command: 'listCollections' }));
     document.getElementById('savecoll').addEventListener('click', () => vscode.postMessage({ command: 'saveCollection' }));
     back.addEventListener('click', () => {
+      closeCase(); // a revealed case's values do not stay behind in the hidden view
       detail.style.display='none'; results.style.display=''; lastTrace=null;
       back.hidden=true; layout.hidden=true; tracetoggle.hidden=true;
     });

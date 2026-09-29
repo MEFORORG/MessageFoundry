@@ -8,6 +8,7 @@ import {
   DEFAULT_VOLATILE_FIELDS,
   isVolatile,
   judgeCollectionRun,
+  pickCaseDetail,
   type ExpectedDelivery,
 } from "../../testCollections";
 
@@ -171,5 +172,36 @@ suite("testCollections.judgeCollectionRun — summaries carry no values", () => 
     assert.deepStrictEqual([d.before, d.after], ["SMITH", "JONES"]);
     assert.strictEqual(run.details[2].error, "no dry-run row produced for this case");
     assert.strictEqual(run.details[2].deliveries[0].status, "missing");
+  });
+});
+
+// The host half of ADR 0121 "Reveal on click": which detail, if any, a caseDetail request gets.
+suite("testCollections.pickCaseDetail — the host answers only a request for a held case", () => {
+  const details = [
+    { error: null, deliveries: [] },
+    { error: "boom", deliveries: [] },
+  ];
+  const held = { id: 4, details };
+
+  test("a request naming the held run and one of its cases gets that one case", () => {
+    assert.strictEqual(pickCaseDetail(held, 4, 1), details[1]);
+    assert.strictEqual(pickCaseDetail(held, 4, 0), details[0]);
+  });
+
+  test("anything else gets nothing", () => {
+    const refused: [string, unknown, unknown, typeof held | null][] = [
+      ["no run held", 4, 0, null],
+      ["another run", 3, 0, held],
+      ["a string run id", "4", 0, held],
+      ["an index past the end", 4, 2, held],
+      ["a negative index", 4, -1, held],
+      ["a fractional index", 4, 0.5, held],
+      ["a string index", 4, "0", held],
+      ["an inherited property as the index", 4, "length", held],
+      ["no index", 4, undefined, held],
+    ];
+    for (const [why, run, index, h] of refused) {
+      assert.strictEqual(pickCaseDetail(h, run, index), null, why);
+    }
   });
 });

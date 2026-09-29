@@ -18,6 +18,7 @@ import { testBenchScript } from "./testBenchWebview";
 import { openChannel, postToWebview } from "./webviewMessaging";
 import {
   judgeCollectionRun,
+  pickCaseDetail,
   type CaseRerun,
   type CaseRunDetail,
   type TestCase,
@@ -85,10 +86,9 @@ export class TestBench {
   private rows: DryRunRow[] = [];
   private pickPaths: string[] = []; // the files last loaded — re-run under --trace on demand
   private traces: TraceEntry[] | null = null; // lazily fetched, aligned 1:1 with `rows` by index
-  // The last collection run's per-case differences and errors. They stay here, in the host, and one
-  // case's go to the webview only when that case is clicked (ASVS 14.2.6, BACKLOG #2437). `id` names
-  // the run, so a click on a run the view no longer shows reveals nothing.
-  private lastRun: { id: number; details: CaseRunDetail[] } | null = null;
+  // The last collection run's per-case differences and errors, held back from the webview until one
+  // case is asked for (ADR 0121, "Reveal on click"). `id` names the run a request must match.
+  private lastRun: { id: number; name: string; details: CaseRunDetail[] } | null = null;
   private runSeq = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
@@ -220,6 +220,9 @@ export class TestBench {
       return;
     }
     delete map[name];
+    if (this.lastRun?.name === name) {
+      this.lastRun = null;
+    }
     await this.storeCollections(map);
     await this.postCollections();
   }
@@ -234,16 +237,18 @@ export class TestBench {
     if (!this.panel) {
       return;
     }
+    const panel = this.panel;
     const coll = this.loadCollections()[name];
     const cwd = workspaceDir();
     if (!coll || !cwd) {
       return;
     }
+    const caseFile = (i: number): string => `case_${String(i).padStart(4, "0")}.hl7`;
     let tmpDir: string | undefined;
     try {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-testbench-"));
       const files = coll.cases.map((c, i) => {
-        const file = path.join(tmpDir as string, `case_${String(i).padStart(4, "0")}.hl7`);
+        const file = path.join(tmpDir as string, caseFile(i));
         fs.writeFileSync(file, c.input, "utf8");
         return file;
       });
@@ -257,22 +262,17 @@ export class TestBench {
           byBase.set(path.basename(row.path), row);
         }
       }
+      if (this.panel !== panel) {
+        return; // the panel closed or was replaced while the dry-run ran: hold nothing
+      }
       const reruns = coll.cases.map((_c, i): CaseRerun | undefined => {
-        const row = byBase.get(`case_${String(i).padStart(4, "0")}.hl7`);
-        return row
-          ? {
-              disposition: row.disposition,
-              error: row.error ?? null,
-              deliveries: row.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
-            }
-          : undefined;
+        const row = byBase.get(caseFile(i));
+        return row ? { disposition: row.disposition, error: row.error ?? null, deliveries: row.deliveries } : undefined;
       });
       const run = judgeCollectionRun(coll.cases, reruns);
       const id = ++this.runSeq;
-      this.lastRun = { id, details: run.details };
-      // Pass or fail per case, and nothing else: each case's field values and error text stay in
-      // `lastRun` until that one case is clicked (showCaseDetail).
-      await postToWebview(this.panel.webview, {
+      this.lastRun = { id, name, details: run.details };
+      await postToWebview(panel.webview, {
         type: "collectionRun",
         name,
         run: id,
@@ -294,27 +294,13 @@ export class TestBench {
     }
   }
 
-  /**
-   * Post ONE case's differences and error, for the case the developer clicked in the run view. The
-   * webview never holds another case's values, because the host never sends them (ASVS 14.2.6,
-   * BACKLOG #2437). A click naming a run other than the last one, or no case in it, posts nothing.
-   */
+  /** Post one case's differences and error, for a `caseDetail` request (ADR 0121, "Reveal on click"). */
   private async showCaseDetail(run: unknown, index: unknown): Promise<void> {
-    const last = this.lastRun;
-    if (!this.panel || !last || run !== last.id || !Number.isSafeInteger(index)) {
+    const detail = pickCaseDetail(this.lastRun, run, index);
+    if (!this.panel || !detail) {
       return;
     }
-    const detail = last.details[index as number];
-    if (!detail) {
-      return;
-    }
-    await postToWebview(this.panel.webview, {
-      type: "caseDetail",
-      run: last.id,
-      index,
-      error: detail.error,
-      deliveries: detail.deliveries,
-    });
+    await postToWebview(this.panel.webview, { type: "caseDetail", run, index, ...detail });
   }
 
   /**
@@ -482,6 +468,7 @@ export class TestBench {
   }
 
   private render(): void {
+    this.lastRun = null; // a new document has no run view to ask for it
     if (this.panel) {
       this.panel.webview.html = this.html(this.panel.webview);
     }

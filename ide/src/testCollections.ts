@@ -198,7 +198,7 @@ export interface CaseRunSummary {
   disposition: string;
 }
 
-/** The part shown only when that one case is clicked (ASVS 14.2.6, BACKLOG #2437). */
+/** The part shown only when that one case is clicked (ADR 0121, "Reveal on click"). */
 export interface CaseRunDetail {
   error: string | null;
   deliveries: DeliveryComparison[];
@@ -212,10 +212,10 @@ export interface CollectionRunResult {
 }
 
 /**
- * Judge every case of a collection against its rerun, and split each result in two. A summary carries
- * no `before`/`after` value and no error text, so the host can post all of them. A detail carries the
- * differences and the error, and the host posts one only when its case is clicked. `reruns[i]` is case
- * `i`'s rerun, or `undefined` when the dry-run produced no row for it, which fails the case.
+ * Judge every case of a collection against its rerun, and split each result in two: summaries, which
+ * carry no `before`/`after` value and no error text, and details, which carry both (ADR 0121, "Reveal
+ * on click"). `reruns[i]` is case `i`'s rerun, or `undefined` when the dry-run produced no row for it,
+ * which fails the case.
  */
 export function judgeCollectionRun(
   cases: readonly TestCase[],
@@ -238,4 +238,20 @@ export function judgeCollectionRun(
     });
   });
   return { passed: summaries.filter((s) => s.pass).length, summaries, details };
+}
+
+/**
+ * The detail to post for a `caseDetail` request, or `null` to post nothing. The request comes from the
+ * webview, so both fields are untrusted: `run` must name the held run, and `index` must be an integer
+ * naming one of its cases.
+ */
+export function pickCaseDetail(
+  held: { id: number; details: readonly CaseRunDetail[] } | null,
+  run: unknown,
+  index: unknown,
+): CaseRunDetail | null {
+  if (!held || run !== held.id || typeof index !== "number" || !Number.isSafeInteger(index)) {
+    return null;
+  }
+  return index >= 0 && index < held.details.length ? held.details[index] : null;
 }
