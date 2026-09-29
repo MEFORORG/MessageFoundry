@@ -45,10 +45,10 @@ The transform worker decrypts a routed row and hands the Handler the whole body 
 off-by-default detach described below. A Router receives the whole message too: `route_only` in
 `pipeline/dryrun.py` builds the same parsed payload a Handler gets. The body's plaintext lives in
 memory, as immutable Python strings and in every copy the Router's or Handler's own code makes, for
-as long as that code and the garbage collector keep it. That memory is the engine process's, or
-the per-inbound worker process's under `sandbox = "subprocess"`. By default, the persisted copy is
+as long as that code and the garbage collector keep it. That memory is the engine process's, and
+also the per-inbound worker process's under `[sandbox].mode = "subprocess"`. By default, the persisted copy is
 re-encrypted by the store cipher on every write (`store/crypto.py`); `[security].allow_unencrypted_phi`
-is the audited keyless opt-out.
+is the audited keyless opt-out (a second flag under strict enforcement).
 
 ### Where minimization is enforced
 
@@ -77,7 +77,7 @@ at least these; it is not complete.
    consumed in the same transaction that writes the next stage's rows (CLAUDE.md §2), so the queue
    does not keep a message open between stages. This does not hold for the correlation
    read-through caches: on `main` the state and reference caches hold decrypted values for the
-   store's lifetime. #1174 part C, in review and not on `main`, makes them decrypt on each read.
+   store's lifetime by default. #1174 part C, in review and not on `main`, makes them decrypt on each read.
 
 One more surface exists and is deliberately **not** counted here. An inbound's
 `stream_threshold_bytes` detaches an over-threshold document into the encrypted attachment store
