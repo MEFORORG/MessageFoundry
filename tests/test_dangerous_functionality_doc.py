@@ -31,9 +31,10 @@ Section 7's parser tables are held to a scan too (BACKLOG #1190): every parse si
 the page names find, over the engine and the web console's Python, must sit in exactly one of the
 first two tables, and neither may name a site the scan does not find. The third table names parsers
 found by reading the code; each must exist and must not be a site the scan finds, and nothing here
-says it is complete. The patterns the page states must be the ones the detector uses. Which table a site belongs in is a
-judgement about where its input comes from, and no check here reads that. Section 9's claim about
-which extension file builds markup with ``innerHTML`` is pinned to a file that exists and does.
+says it is complete. The patterns the page states must be the ones the detector uses. Which table a
+site belongs in is a judgement about where its input comes from, and no check here reads that.
+Section 9's claim about which extension file builds markup with ``innerHTML`` is pinned to a file
+that exists and does.
 
 The start detector covers at least the names in ``_SUBPROCESS_FUNCS``, ``_START_FORMS``,
 ``_OS_EXEC_RE`` and ``_ATTRIBUTE_STARTS``. Its known limits: it cannot see a start hidden behind
@@ -1027,8 +1028,17 @@ _JSON_DECODES = frozenset({"json.loads", "json.load"})
 _JSON_HELPER = json_loads_or_refusal.__name__
 _JSON_METHOD = "json"
 
-#: Pattern 3: form and mail decodes, by the called name.
-_FORM_DECODES = frozenset({"parse_qs", "parse_qsl", "message_from_bytes", "message_from_string"})
+#: Pattern 3: form, header and mail decodes, by the called name.
+_FORM_DECODES = frozenset(
+    {
+        "parse_qs",
+        "parse_qsl",
+        "parse_http_list",
+        "parse_keqv_list",
+        "message_from_bytes",
+        "message_from_string",
+    }
+)
 
 #: Pattern 4: a bytes method that tokenizes, when its first argument is a bytes literal, and any
 #: ``unpack`` family call. ``startswith`` and ``endswith`` test bytes without splitting them, so they
@@ -1092,7 +1102,8 @@ def _parse_sites(sources: Mapping[str, str]) -> set[str]:
 
 
 def _parser_scan_sources() -> dict[str, str]:
-    """The engine's modules, and the web console's under their package name, as the page writes them."""
+    """The engine's modules, and the web console's under their package name, as the page names
+    them."""
     console = {f"{_CONSOLE_PREFIX}{rel}": source for rel, source in _console_python().items()}
     return {**_package_sources(), **console}
 
@@ -1116,9 +1127,10 @@ def _unit_exists(unit: str) -> bool:
 
 
 def _parser_drift(text: str, live: set[str]) -> list[str]:
-    """The first two tables must name exactly the sites the scan finds, each once. The third names
-    parsers found by reading the code: each must exist, and none may be a site the scan finds, or it
-    belongs in the first two."""
+    """The first two tables together must name exactly the sites the scan finds, and no site may be
+    in both. A site may sit in several rows of one table. The third names parsers found by reading
+    the code: each must exist, and none may be a site the scan finds, or it belongs in the first
+    two."""
     section = _section(text, 7)
     outside = _table_units(section, _OUTSIDE_HEADER)
     left_out = _table_units(section, _LEFT_OUT_HEADER)
@@ -1133,8 +1145,8 @@ def _parser_drift(text: str, live: set[str]) -> list[str]:
         problems.append(f"the scan finds {unlisted}, which section 7's first two tables omit")
     if both := outside & left_out:
         problems.append(f"section 7 puts {sorted(both)} in both of its first two parser tables")
-    if found := by_hand & live:
-        problems.append(f"section 7's hand-read table names {sorted(found)}, which the scan finds")
+    if found := sorted(unit for unit in by_hand if _parse_unit(unit) in live):
+        problems.append(f"section 7's hand-read table names {found}, which the scan finds")
     if missing := sorted(unit for unit in by_hand if not _unit_exists(unit)):
         problems.append(f"section 7's hand-read table names {missing}, which do not exist")
     return problems
@@ -1169,7 +1181,7 @@ _DETECTOR_PATTERNS = [
 
 def _innerhtml_file_problems(text: str, sources: Mapping[str, str]) -> list[str]:
     """Each file section 9 names as building markup with ``innerHTML`` must exist under ``ide/src``
-    and write HTML into its page, by the sink pattern section 10 uses."""
+    and write ``innerHTML``, by the sink pattern section 10 uses."""
     claim = re.search(r"markup with `innerHTML`, at least in (.+?)\.\s", _section(text, 9), re.S)
     assert claim is not None, "section 9 no longer names the files that build markup with innerHTML"
     names = re.findall(r"`([\w/]+\.ts)`", claim.group(1))
@@ -1180,8 +1192,12 @@ def _innerhtml_file_problems(text: str, sources: Mapping[str, str]) -> list[str]
         source = sources.get(name)
         if source is None:
             problems.append(f"section 9 names {name}, which is not in ide/src")
-        elif not _console_sink_count({name: source}):
-            problems.append(f"section 9 names {name}, which writes no HTML into its page")
+        elif not any(
+            "innerHTML" in sink
+            for line in _script_code_lines(source)
+            for sink in (match.group(0) for match in _HTML_SINK_RE.finditer(line))
+        ):
+            problems.append(f"section 9 names {name}, which writes no innerHTML")
     return problems
 
 
@@ -1288,7 +1304,10 @@ def test_parser_table_drift_is_reported() -> None:
     )
     # One site in both tables.
     assert _parser_drift(
-        _replace_once(text, "`redaction.py` |", "`redaction.py`, `api/multipart.py` |"), live
+        _replace_once(
+            text, "`phi_log_silencer.py` |", "`phi_log_silencer.py`, `api/multipart.py` |"
+        ),
+        live,
     )
     # A planted parser the page does not name.
     sources["pipeline/new_parser.py"] = (
@@ -1300,7 +1319,7 @@ def test_parser_table_drift_is_reported() -> None:
         _parser_drift(_replace_once(text, _LEFT_OUT_HEADER, "| Why | Modules |"), live)
     # The hand-read table may not name a site the scan finds, or a file that does not exist.
     hand_row = "| `parsing/split.py` |"
-    for extra in ("`redaction.py`", "`nope.py`"):
+    for extra in ("`api/multipart.py`", "`parsing/x12/interchange.py`", "`nope.py`"):
         broken = _replace_once(text, hand_row, f"| `parsing/split.py`, {extra} |")
         assert _parser_drift(broken, live), extra
 
@@ -1315,3 +1334,6 @@ def test_innerhtml_file_drift_is_reported() -> None:
         _replace_once(text, named, "at least in `testBench.ts`."), sources
     )
     assert _innerhtml_file_problems(_replace_once(text, named, "at least in `nope.ts`."), sources)
+    # A file that writes HTML another way no longer backs the sentence's innerHTML claim.
+    other_sink = {**sources, "testBenchWebview.ts": "el.insertAdjacentHTML('beforeend', x);\n"}
+    assert _innerhtml_file_problems(text, other_sink)
