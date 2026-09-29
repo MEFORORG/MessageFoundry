@@ -81,6 +81,7 @@ from messagefoundry.store.crypto import (
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
+from messagefoundry.store.schema_verify import SchemaMismatchError
 
 __all__ = [
     "BackupRunner",
@@ -1340,7 +1341,9 @@ def _verify_in_staging(
         # (cipher + migrations) to prove it restores, decrypt + authenticate its PHI, then
         # discard it.
         full_status, full_msg, decrypted_cells = _full_open_check(
-            snap, _as_store_settings(store_settings)
+            snap,
+            _as_store_settings(store_settings),
+            engine_version=str(manifest.get("engine_version") or ""),
         )
         if full_status != "PASS":
             return VerifyResult(
@@ -1485,7 +1488,9 @@ def _integrity_check(db_path: Path) -> tuple[bool, str]:
     return ok, "ok" if ok else "; ".join(results)[:500]
 
 
-def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, str, int]:
+def _full_open_check(
+    snap: Path, settings: StoreSettings | None, *, engine_version: str = ""
+) -> tuple[str, str, int]:
     """Open the snapshot through the real ``open_store`` path, then decrypt + authenticate its PHI.
     Returns ``(status, message, decrypted_cells)`` — the ``VerifyResult`` status this leg earned, so the
     caller can hand it straight on. Heavier; only run for ``full_restore_verify``.
@@ -1509,7 +1514,11 @@ def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, s
     ``backend`` is the one other substitution. The extracted member is a SQLite file by construction
     (``Store.snapshot_to`` writes one, and the integrity/row-count steps above already read it with
     ``sqlite3``), so an instance that has since moved to a server DB must still verify its older SQLite
-    archive against SQLite rather than dialling Postgres/SQL Server with a file path."""
+    archive against SQLite rather than dialling Postgres/SQL Server with a file path.
+
+    ``engine_version`` is the manifest's, named in the refusal of a snapshot this build cannot open
+    (BACKLOG #2101). The store's own remedy for that case, recreating the store, is wrong here: the
+    archive is not damaged, and what restores it is the version that wrote it."""
     from messagefoundry.store.base import open_store
 
     if settings is None:
@@ -1551,11 +1560,35 @@ def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, s
         # encrypted store, and they reach this before the decrypt pass below ever runs. Same cause,
         # same verdict — an absent keyring, not a bad archive.
         return "KEY_MISMATCH", safe_exc(exc), 0
+    except SchemaMismatchError as exc:
+        return "FAIL", _incompatible_snapshot(exc, engine_version), 0
     except Exception as exc:  # a restore that won't even open is the thing we're trying to catch
         return "FAIL", safe_exc(exc), 0
     if not ok:
         return "FAIL", msg, 0
     return _decrypt_check(snap, snap_settings)
+
+
+def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str:
+    """The restore-verify refusal of a snapshot this build's schema cannot open (BACKLOG #2101).
+
+    The store's own message tells an operator to move the store aside and recreate it, and for an
+    encrypted store to change its key first. Neither applies to an archive, so this names the
+    version to restore it with instead. The remedy leads and the differences follow, so a short
+    display loses only the detail."""
+    # The manifest is inside the authenticated archive, but it is still a string this build did not
+    # write, so only a short, printable version label is quoted back.
+    version = "".join(c for c in engine_version[:40] if c.isprintable())
+    wrote = f"engine {version!r}" if version else "the engine version that wrote it"
+    if exc.differences:
+        tail = f"Differences: {'; '.join(exc.differences)}."
+    else:
+        tail = f"The schema step failed: {exc.cause or ''}."
+    return (
+        "the archive's store is from an incompatible version, so this build cannot open it: restore"
+        f" it with {wrote}. The archive itself decrypted and passed its integrity and row-count"
+        f" checks. {tail}"
+    )
 
 
 def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:

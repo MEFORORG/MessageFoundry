@@ -37,8 +37,10 @@ __all__ = [
     "IndexShape",
     "SchemaMismatchError",
     "SchemaShape",
+    "is_schema_step_error",
     "live_schema_differences",
     "read_schema_shape",
+    "run_schema_step",
     "schema_differences",
     "verify_live_schema",
 ]
@@ -108,7 +110,19 @@ class SchemaMismatchError(sqlite3.DatabaseError):
 
     A ``sqlite3.DatabaseError`` so the CLI's store-open handler reports it as "could not open" and
     exits 2, the code it keeps apart from a negative finding (BACKLOG #1670).
+
+    ``differences`` lists what the check found missing, one clause each. It is empty when the schema
+    script or a migration itself failed (BACKLOG #2101), and then ``cause`` holds that failure's text.
+    Both are kept apart from the message so a caller whose remedy differs, such as a restore-verify
+    of an old backup, can word its own refusal without parsing this one.
     """
+
+    def __init__(
+        self, message: str, *, differences: tuple[str, ...] = (), cause: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.differences = differences
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -317,8 +331,52 @@ async def verify_live_schema(
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
         raise SchemaMismatchError(
-            f"store {path} {_remedy(counts_under_dek)} Differences: " + "; ".join(problems) + "."
+            f"store {path} {_remedy(counts_under_dek)} Differences: " + "; ".join(problems) + ".",
+            differences=tuple(problems),
         )
+
+
+def is_schema_step_error(exc: BaseException) -> bool:
+    """Whether ``exc``, raised by the schema script or a migration, says the store's shape is wrong.
+
+    Only SQLite's generic ``SQLITE_ERROR`` counts, which is what a missing or clashing table, column
+    or index raises. A busy or locked file, a read-only file, an I/O error, a full disk and a corrupt
+    file each carry their own primary code, and none of them is fixed by recreating the store, so
+    each keeps its own error rather than getting this remedy (BACKLOG #2101)."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and isinstance(code, int)
+        and code & 0xFF == sqlite3.SQLITE_ERROR
+    )
+
+
+async def run_schema_step(
+    db: aiosqlite.Connection,
+    step: Awaitable[object],
+    *,
+    path: object,
+    counts_under_dek: bool | None,
+) -> None:
+    """Await the schema script or the migrations, turning a shape failure into a refusal.
+
+    A failure :func:`is_schema_step_error` accepts is raised as :class:`SchemaMismatchError`, from
+    the original so the driver's text stays in the chain (BACKLOG #2101). It carries the remedy a
+    verify refusal carries, chosen the same way: a statement that fails on an existing object's
+    shape is the same incompatible version the verify reports, found one step earlier. Any other
+    failure propagates unchanged."""
+    try:
+        await step
+    except Exception as exc:
+        if not is_schema_step_error(exc):
+            raise
+        if counts_under_dek is None:
+            counts_under_dek = await _counts_under_a_dek(db)
+        cause = str(exc)
+        raise SchemaMismatchError(
+            f"store {path} {_remedy(counts_under_dek)} The schema step failed: {cause}.",
+            cause=cause,
+        ) from exc
 
 
 async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:

@@ -432,3 +432,166 @@ async def test_a_table_whose_name_starts_with_sqlite_is_still_read(tmp_path: Pat
         await db.close()
         await _await_connection_worker_exit(db)
     assert shape.columns == {"sqlitex_meta": frozenset({"a"})}
+
+
+# --- BACKLOG #2101 item 1: a failing schema step gets the same refusal and remedy ------------------
+
+
+async def test_a_schema_script_failure_is_a_schema_mismatch_with_the_remedy(tmp_path: Path) -> None:
+    """``messages`` exists but lacks the columns the script's own indexes name, so a ``CREATE INDEX IF
+    NOT EXISTS`` in the script fails. That used to surface as the driver's bare "no such column"."""
+    db = tmp_path / "script.db"
+    _sql(db, "CREATE TABLE messages (id TEXT PRIMARY KEY);")
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    text = str(info.value)
+    assert text.startswith(f"store {db} is from an incompatible version; recreate it:"), text
+    assert "The schema step failed: no such column" in text, text
+    assert info.value.differences == ()
+    assert info.value.cause is not None and "no such column" in info.value.cause
+    assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+
+
+async def test_a_migration_failure_is_a_schema_mismatch_and_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "migrate.db"
+    await _fresh(db)
+
+    async def _failing_migrate(conn: object) -> None:
+        # One real change first, so the rollback is observable, then a real SQLITE_ERROR.
+        await conn.execute("CREATE TABLE probe_rolled_back (x TEXT)")  # type: ignore[attr-defined]
+        await conn.execute("ALTER TABLE no_such_table ADD COLUMN x TEXT")  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(MessageStore, "_migrate", staticmethod(_failing_migrate))
+    with pytest.raises(SchemaMismatchError, match="The schema step failed: no such table"):
+        await MessageStore.open(db)
+    conn = sqlite3.connect(db)
+    try:
+        left = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'probe_rolled_back'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert left == [], "the failed migration was not rolled back"
+
+
+def test_only_a_schema_shaped_error_is_wrapped(tmp_path: Path) -> None:
+    """A locked, read-only or I/O failure is not fixed by recreating the store, so it must keep its
+    own error. Each exception here is a real one from SQLite, so its error code is SQLite's own."""
+    from messagefoundry.store.schema_verify import is_schema_step_error
+
+    db = tmp_path / "codes.db"
+    _sql(db, "CREATE TABLE t (x TEXT);")
+    conn = sqlite3.connect(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as missing:
+            conn.execute("SELECT nope FROM t")
+    finally:
+        conn.close()
+    assert is_schema_step_error(missing.value)
+
+    ro = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as readonly:
+            ro.execute("INSERT INTO t VALUES ('x')")
+    finally:
+        ro.close()
+    assert not is_schema_step_error(readonly.value)
+
+    holder = sqlite3.connect(db, isolation_level=None)
+    other = sqlite3.connect(db, timeout=0)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(sqlite3.OperationalError) as locked:
+            other.execute("SELECT * FROM t")
+    finally:
+        holder.execute("ROLLBACK")
+        other.close()
+        holder.close()
+    assert not is_schema_step_error(locked.value)
+    assert not is_schema_step_error(RuntimeError("no sqlite code at all"))
+
+
+# --- BACKLOG #2101 item 2: the forensic subcommands and a store this build refuses ------------------
+
+
+def _incompatible_store(db: Path) -> None:
+    """A real store with one audit row, then an index given the wrong columns: the open refuses it.
+    Not the v0.3.2 search_presets case, which a later migration may learn to repair."""
+    import asyncio
+
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            await store.record_audit("seed", actor="test")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    _sql(
+        db,
+        "DROP INDEX ix_messages_control; CREATE INDEX ix_messages_control ON messages(control_id);",
+    )
+
+
+@pytest.fixture
+def _no_at_rest_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_audit_keyless_chain_flagged import _AT_REST_ENV
+
+    for name in _AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.usefixtures("_no_at_rest_env")
+@pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
+def test_the_audit_commands_read_a_store_this_build_refuses(
+    tmp_path: Path, command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """They open read-only, so the audit log of an incompatible store can still be verified and
+    anchored, and the store is not touched."""
+    from messagefoundry.__main__ import main
+
+    db = tmp_path / "incompatible.db"
+    _incompatible_store(db)
+    before = db.read_bytes()
+
+    rc = main([command, "--db", str(db)])
+
+    out = capsys.readouterr()
+    assert rc == 0, (out.out, out.err)
+    assert out.out.startswith("OK: verified 1" if command == "audit-verify" else "1:"), out.out
+    assert db.read_bytes() == before, f"{command} wrote to the store it was reading"
+
+
+@pytest.mark.usefixtures("_no_at_rest_env")
+def test_backup_refuses_a_store_this_build_refuses_and_says_why(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``backup`` must open writable (it records a dr_backup audit row), so it refuses, and it names
+    the copy an operator can take instead and the two commands that do open such a store."""
+    from messagefoundry.__main__ import main
+
+    db = tmp_path / "incompatible.db"
+    _incompatible_store(db)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+
+    rc = main(
+        [
+            "backup",
+            "--config",
+            str(cfg),
+            "--db",
+            str(db),
+            "--destination",
+            str(tmp_path / "dest"),
+            "--json",
+        ]
+    )
+
+    assert rc == 2
+    text = capsys.readouterr().out
+    assert "is from an incompatible version" in text, text
+    assert "dr_backup audit row" in text and "`audit-verify`" in text, text
+    assert not (tmp_path / "dest").exists() or not any((tmp_path / "dest").iterdir())

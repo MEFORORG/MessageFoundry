@@ -6414,7 +6414,12 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreGrantsMissingError,
+        StoreNotFoundError,
+        open_store,
+    )
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
     # succeeding, and refusing it early keeps a typo from costing a store open.
@@ -6432,9 +6437,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # A SQLite store would otherwise be CREATED (or schema-migrated) on open: a compliance job
-    # pointed at a typo'd path, or at the zero-byte file a touch/failed copy leaves behind, would
-    # get a fresh empty DB and report "OK: verified 0 audit row(s)" forever (M-31, #1669).
+    # A SQLite store was once CREATED (or schema-migrated) on open: a compliance job pointed at a
+    # typo'd path, or at the zero-byte file a touch/failed copy leaves behind, got a fresh empty DB
+    # and reported "OK: verified 0 audit row(s)" forever (M-31, #1669). The read-only open below
+    # (#1780) now does neither, but it would still read a zero-byte file as a database with an
+    # unreadable log, so this names "no audit_log table" as the question it is.
     refused = _refuse_a_store_that_is_not_an_audit_log(
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
@@ -6444,8 +6451,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
         return refused
 
     async def run() -> tuple[bool, str | None, int]:
+        # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
+        # this build does not match, so a store an incompatible version wrote can still be verified.
         store = await open_store(
             settings.store,
+            read_only=True,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
@@ -6461,7 +6471,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     try:
         ok, message, count = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        StoreGrantsMissingError,
+    ) as exc:  # #1916; #1780: a server database with no store, or no row grants. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6504,7 +6518,12 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, open_store
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreGrantsMissingError,
+        StoreNotFoundError,
+        open_store,
+    )
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -6515,9 +6534,9 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # The SAME guard as _audit_verify, and it matters MORE here: opening a SQLite store creates or
-    # migrates it, so a typo'd path or a zero-byte file would mint a fresh empty DB and print `0:` —
-    # an anchor OF NOTHING, which a later verify against the wrong database would happily confirm.
+    # The SAME guard as _audit_verify, and it matters MORE here: before the read-only open (#1780) a
+    # typo'd path or a zero-byte file minted a fresh empty DB and printed `0:` — an anchor OF
+    # NOTHING, which a later verify against the wrong database would happily confirm.
     # Unlike the verify twin this keeps exit 0 on a REAL store whose log is legitimately empty:
     # anchoring a fresh instance as `0:` is a supported workflow (#328), not a defect to refuse. On a
     # store with no key it needs the audited at-rest opt-out, as every command does (#1916).
@@ -6532,8 +6551,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         return refused
 
     async def run() -> tuple[int, str]:
+        # Read-only, as audit-verify opens it (BACKLOG #1780, #2101).
         store = await open_store(
             settings.store,
+            read_only=True,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
@@ -6543,7 +6564,11 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     try:
         count, head = run_guarded(run())
-    except KeylessAuditChainRefused as exc:  # #1916: could not start
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        StoreGrantsMissingError,
+    ) as exc:  # #1916, #1780, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -6904,6 +6929,7 @@ def _backup(args: argparse.Namespace) -> int:
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
     from messagefoundry.store.base import KeylessAuditChainRefused, StoreNotFoundError, open_store
+    from messagefoundry.store.schema_verify import SchemaMismatchError
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -6958,6 +6984,17 @@ def _backup(args: argparse.Namespace) -> int:
     except (StoreNotFoundError, KeylessAuditChainRefused, _UnauditableWrite) as exc:
         # #1780, #1916: could not start, so exit 2 like #1670 below
         _emit_error(str(exc), as_json=args.json)
+        return 2
+    except SchemaMismatchError as exc:
+        # BACKLOG #2101: refused, and by design. A backup opens the store WRITABLE because it
+        # records a `dr_backup` audit row in it, even on failure, so it cannot take the read-only
+        # open audit-verify and audit-anchor use. Say so, and name the copy that needs no open.
+        _emit_error(
+            f"{exc} backup refuses it because it opens the store writable to record its dr_backup"
+            " audit row. To keep a copy first, stop the service and copy the store file with its"
+            " -wal and -shm files; `audit-verify` and `audit-anchor` open it read-only.",
+            as_json=args.json,
+        )
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)

@@ -129,6 +129,7 @@ from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.schema_verify import (
     live_schema_differences,
+    run_schema_step,
     verify_live_schema,
 )
 
@@ -4899,8 +4900,15 @@ class MessageStore:
         cls, db: aiosqlite.Connection, path: str | Path, *, counts_under_dek: bool | None
     ) -> None:
         """Run the schema script and the migrations, verify the result, then tighten the file's
-        permissions: the writable half of :meth:`open`."""
-        await db.executescript(_SCHEMA)
+        permissions: the writable half of :meth:`open`.
+
+        A statement in the script or a migration that fails on the live store's shape is raised as
+        :class:`SchemaMismatchError` with the same remedy the verify gives (BACKLOG #2101), rather
+        than as the driver's bare text. Any other failure, such as a locked or read-only file, keeps
+        its own error, because recreating the store would not fix it."""
+        await run_schema_step(
+            db, db.executescript(_SCHEMA), path=path, counts_under_dek=counts_under_dek
+        )
         # BACKLOG #1586: the migrations run in ONE transaction, so an interrupted run leaves no
         # trace. Outside one, each ALTER ... ADD COLUMN commits on its own, and a failure before
         # its paired backfill leaves the column present -- the next open's column-missing guard
@@ -4910,7 +4918,10 @@ class MessageStore:
         # _writer_txn rolls back on BaseException; the lock is a fresh one because nothing else
         # can reach this connection yet.
         async with _writer_txn(db, asyncio.Lock()):
-            await cls._migrate(db)
+            # A refusal raised here is inside the transaction, so the migrations roll back.
+            await run_schema_step(
+                db, cls._migrate(db), path=path, counts_under_dek=counts_under_dek
+            )
             # BACKLOG #1720: every CREATE is IF NOT EXISTS and every migration is additive, so an
             # object an incompatible version left under an expected name was skipped, not fixed.
             # Checked before the commit, so a refusal rolls the migrations back.
