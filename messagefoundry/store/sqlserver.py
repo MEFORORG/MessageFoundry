@@ -9028,8 +9028,8 @@ class SqlServerStore:
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
         """See the base contract: returns ``next_attempt_at`` on the retry branch, whether or not the
-        row was still INFLIGHT to re-pend, and ``None`` when dead-lettered/missing (the runner arms the
-        per-lane retry wake on a float, WS-C)."""
+        row was still INFLIGHT or PENDING to re-pend, and ``None`` when dead-lettered/missing (the
+        runner arms the per-lane retry wake on a float, WS-C)."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9050,19 +9050,25 @@ class SqlServerStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
+                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT, turning a permitted
                 # duplicate into a forbidden strand. Amendment A (BACKLOG #2078, #2348) gives the retry
-                # branch a STATUS term instead: it re-pends only a row still INFLIGHT, so a late worker
-                # cannot re-pend a row that is already DONE, DEAD or CANCELLED. A row it declines is not
-                # INFLIGHT, so it cannot strand one. A match is read from the OUTPUT rowset, never from
-                # cursor.rowcount, for the reason _exec_terminal gives.
+                # branch a STATUS term instead, widened by owner ruling 2026-09-29: it re-pends a row
+                # that is INFLIGHT or PENDING, so a late worker cannot re-pend a row that is already
+                # DONE, DEAD or CANCELLED, and a row something else re-pended still takes this attempt's
+                # backoff, event and last_error. A row it declines is terminal, so it cannot strand
+                # one. A match is read from the OUTPUT rowset, never from cursor.rowcount, for the
+                # reason _exec_terminal gives.
                 retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    (
+                        _RESOLVE_OUTPUT,
+                        " AND status IN (?, ?)",
+                        (OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+                    )
                     if retrying
                     else self._resolve_guard()
                 )
@@ -9081,9 +9087,9 @@ class SqlServerStore:
                     *guard_params,
                 )
                 if retrying:
-                    # Not through _exec_terminal: a miss here is a no-op, never a fence. It writes
-                    # nothing, not even the 'failed' event, and still returns the retry time so a row
-                    # something else left PENDING gets its wake.
+                    # Not through _exec_terminal: a miss here is a no-op, never a fence. A miss is a
+                    # terminal (or vanished) row. It writes nothing, not even the 'failed' event, and
+                    # still returns the retry time, as Amendment A's ruling item 3 chose.
                     await cur.execute(sql, params)
                     if not await cur.fetchall():
                         await self._commit(conn)
@@ -9120,8 +9126,9 @@ class SqlServerStore:
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
         all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
-        On the retry branch a member no longer INFLIGHT is skipped and keeps its own state (ADR 0157
-        Amendment A); the shared retry time still comes back when every member was skipped."""
+        On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
+        own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
+        when every member was skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9144,17 +9151,23 @@ class SqlServerStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                        retry.backoff_seconds
+                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
                 # rolls all N back, matching the all-or-nothing contract the docstring promises.
-                # Amendment A, as mark_failed: on the retry branch a member no longer INFLIGHT is
-                # skipped, event and all, and the members still INFLIGHT re-pend together.
+                # Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a terminal
+                # member is skipped, event and all, and the INFLIGHT and PENDING members re-pend
+                # together to the one shared deadline.
                 retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    (
+                        _RESOLVE_OUTPUT,
+                        " AND status IN (?, ?)",
+                        (OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+                    )
                     if retrying
                     else self._resolve_guard()
                 )

@@ -4,7 +4,8 @@
 // extension commands. Every action is live; the `soon` flag renders a "soon" badge for any action
 // still queued in the backlog. Monitoring + engine run/stop deliberately live in the Console, not here.
 import * as vscode from "vscode";
-import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
+import { openChannel, postToWebview } from "./webviewMessaging";
+import { homeScript } from "./homeWebview";
 
 interface Action {
   id: string; // command id
@@ -152,44 +153,7 @@ export class HomeView implements vscode.WebviewViewProvider {
            placeholder="Find connection, handler, router, transform…" value="${esc(initialFilter)}" />
   </div>
   ${groups}
-  <script nonce="${n}">
-    const vscode = acquireVsCodeApi();${guardScript(token)}
-    // Persistent filter box for the Connections tree (drives graph.setFilter → also the #228
-    // Definitions). Debounced so each keystroke doesn't re-project the tree; two-way synced with the
-    // funnel command via an inbound 'setFilter' message.
-    const search = document.getElementById('search');
-    let filterTimer;
-    search.addEventListener('input', () => {
-      clearTimeout(filterTimer);
-      filterTimer = setTimeout(() => vscode.postMessage({ command: 'filter', text: search.value }), 150);
-    });
-    search.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && search.value) {
-        search.value = '';
-        vscode.postMessage({ command: 'filter', text: '' });
-      }
-    });
-    ${WEBVIEW_GUARD_NOTE}
-    window.addEventListener('message', (e) => {
-      const d = mfTrusted(e);
-      if (d && d.command === 'setFilter' && d.text !== search.value) {
-        search.value = d.text;
-      }
-    });
-    const state = vscode.getState() || {};
-    const collapsed = state.collapsed || (state.collapsed = {});
-    for (const d of document.querySelectorAll('details.group')) {
-      const key = d.dataset.key;
-      // Persisted choice wins; otherwise fall back to the group's declared default (Setup ships closed).
-      d.open = (key in collapsed) ? !collapsed[key] : (d.dataset.default === 'open');
-      d.addEventListener('toggle', () => {
-        collapsed[key] = !d.open;
-        vscode.setState(state);
-      });
-    }
-    for (const b of document.querySelectorAll('button.action')) {
-      b.addEventListener('click', () => vscode.postMessage({ command: 'run', id: b.dataset.cmd }));
-    }
+  <script nonce="${n}">${homeScript(token)}
   </script>
 </body>
 </html>`;

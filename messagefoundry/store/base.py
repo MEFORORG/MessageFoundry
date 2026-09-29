@@ -813,11 +813,12 @@ class QueueStore(StoreLifecycle, Protocol):
         idle backstop, the retry re-claim no longer rides a short poll) — and ``None`` when the row
         dead-lettered or no longer exists (nothing to re-claim).
 
-        The retry branch re-pends a row only while it is still ``inflight`` (ADR 0157 Amendment A,
-        BACKLOG #2078, #2348). A row that some other writer already made DONE, DEAD, CANCELLED or
-        PENDING is left exactly as it is, and no ``failed`` event is written. The call still returns
-        the retry time, so a row something else left PENDING still gets its retry wake; an early
-        wake claims nothing. The DEAD branch carries no status term (ADR 0157 C2)."""
+        The retry branch re-pends a row only while it is ``inflight`` or ``pending`` (ADR 0157
+        Amendment A, BACKLOG #2078, #2348, widened by owner ruling 2026-09-29). So a row a lease sweep
+        or another writer already re-pended still takes this attempt's backoff, ``failed`` event and
+        ``last_error``. A row some other writer already made DONE, DEAD or CANCELLED is left exactly
+        as it is, and no ``failed`` event is written. The call still returns the retry time on that
+        miss; an early wake claims nothing. The DEAD branch carries no status term (ADR 0157 C2)."""
         ...
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
@@ -841,7 +842,8 @@ class QueueStore(StoreLifecycle, Protocol):
         applied identically to every member, so all N re-pend to the same ``next_attempt_at`` (re-claimed
         as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. Returns
         the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered. On the
-        retry branch a member no longer ``inflight`` is skipped, event and all, as in
+        retry branch a terminal member (neither ``inflight`` nor ``pending``) is skipped, event and
+        all, as in
         :meth:`mark_failed`, and the shared retry time is returned even when every member was
         skipped."""
         ...

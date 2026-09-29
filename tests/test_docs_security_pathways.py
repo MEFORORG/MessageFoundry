@@ -21,6 +21,7 @@ import asyncio
 import functools
 import inspect
 import itertools
+import logging
 import re
 import textwrap
 import typing
@@ -39,8 +40,11 @@ from messagefoundry.auth import service as service_module
 from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthProvider, AuthService, _directory_login_refusal
+from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import ApiSettings, AuthSettings
-from messagefoundry.config.wiring import Http
+from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.wiring import Http, WiringError
+from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, lockout_escalates
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -2023,4 +2027,72 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     ):
         assert token in configuration, (
             f"docs/CONFIGURATION.md must state {token!r} (BACKLOG #1133)."
+        )
+
+
+def test_the_eighth_sweep_names_both_ways_past_the_intake_revocation_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ASVS 6.1.3 was held at partial a seventh time (BACKLOG #1133, vault PR 2064) on one cell.
+
+    The HTTP intake row's Revocation cell said an ``mtls_subject`` listener under enforcement "must
+    also set ``tls_crl_file``, or it is refused at start". ``check_inbound_revocation`` has a second
+    way past that refusal: a per-connection ``tls_revocation_attested`` with its mandatory reason,
+    which starts the listener and logs a WARNING carrying the reason instead. The code is probed
+    first, so a change to the gate reds here before the cell can drift from it.
+    """
+    settings = {"tls": True, "tls_cert_file": "c.pem", "tls_ca_file": "ca.pem"}
+    enforcing = HopPosture(enforcing=True)
+
+    def gate(**fields: Any) -> None:
+        check_inbound_revocation(
+            Source(type=ConnectorType.HTTP, name="intake-in", **fields),
+            "intake-in",
+            posture=enforcing,
+        )
+
+    with pytest.raises(WiringError):
+        gate(settings=settings)
+    gate(settings={**settings, "tls_crl_file": "crl.pem"})
+    reason = "the partner PKI checks revocation at its gateway"
+    # The fragment log_attested_crossing writes; the cell quotes it so an operator can grep for it.
+    marker = "on operator attestation"
+    with caplog.at_level(logging.WARNING):
+        gate(
+            settings=settings,
+            tls_revocation_attested=True,
+            tls_revocation_attested_reason=reason,
+        )
+    crossings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and marker in r.getMessage() and reason in r.getMessage()
+    ]
+    assert len(crossings) == 1, (
+        f"an attested mTLS listener no longer starts with exactly one WARNING reading {marker!r}; "
+        "check_inbound_revocation or log_attested_crossing changed, so restate the HTTP intake "
+        "Revocation cell in docs/SECURITY.md to match."
+    )
+
+    companion = next(
+        t
+        for t in _tables(_section())
+        if t[0][:2] == ["Pathway", "Phishing resistance"] and "Revocation" in t[0]
+    )
+    intake = next(r for r in companion[1:] if r[0] == "**HTTP intake**")
+    cell = " ".join(intake[-1].split())
+    assert "must also set `tls_crl_file`, or it is refused at start" not in cell, (
+        "the HTTP intake Revocation cell claims a CRL is the only way past the enforcing refusal "
+        "again; check_inbound_revocation also honours tls_revocation_attested (BACKLOG #1133)."
+    )
+    for token in (
+        "`tls_crl_file`",
+        "`tls_revocation_attested = true`",
+        "`tls_revocation_attested_reason`",
+        f"each start logs a WARNING that reads `{marker}` and carries the reason",
+    ):
+        assert token in cell, (
+            f"the HTTP intake Revocation cell must state {token!r}: the enforcing refusal clears on "
+            "a CRL file or on the revocation attestation, and the attestation is logged "
+            "(BACKLOG #1133)."
         )

@@ -27,8 +27,9 @@ operators, so this page covers them too.
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
 
-**A separate, non-public document holds the consolidated third-party risky-component table.** That
-withholding is policy, not oversight. This page is the in-tree highlight and stands on its own.
+**Third-party components have their own page.** [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) says
+which dependencies are designated risky, and why. This page covers the engine's own code and stands
+on its own.
 
 ## The short version
 
@@ -40,7 +41,7 @@ withholding is policy, not oversight. This page is the in-tree highlight and sta
 | 4 | Starting processes | 11 modules | Varies, see below |
 | 5 | Calling native libraries | 16 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
-| 7 | Parsing hostile input | HL7, X12, DICOM, XML, archives | On -- this is the product |
+| 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
 | 9 | Processes, terminals and webview scripts | VS Code extension | Runs the CLI on open and on save, once you trust the workspace |
 | 10 | Writing server-built HTML into the page | Web console | On |
@@ -264,7 +265,8 @@ pool, so an impersonated identity cannot leak into unrelated work. `RevertToSelf
 
 ## 7. The parsers accept input an attacker chooses
 
-Inbound HL7, X12, DICOM, XML and archives all arrive from outside. `CLAUDE.md` states the rule
+Message payloads, partner replies, uploaded files, browser requests and archives all arrive from
+outside. The tables below list at least the parsers that read them. `CLAUDE.md` states the rule
 this follows:
 **treat all message content as untrusted data, never as instructions.**
 
@@ -288,6 +290,97 @@ real clinical requirement for a paper control.
 - A pinned pydicom floor in ADR 0025 that excludes a known path-traversal issue.
 - Directory-listing names from a remote share checked as single safe path components before they
   are joined, so a partner cannot return a traversal sequence.
+
+**How the parser list is found.** A test reads the code, so the list comes from the tree rather
+than from memory. You can re-run the same scan over `messagefoundry/` and
+`messagefoundry_webconsole/`. A module is a parse site when its syntax tree holds at least one of
+these:
+
+1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml`, `xml`,
+   `xmlschema`, `signxml`, `pydicom`, `pynetdicom`, `pyx12`, `fhir.resources`, `fhirpathpy`,
+   `cbor2`, `webauthn`, `csv`, `email.parser`, `email.feedparser`, `pickle`, `marshal` or
+   `shelve`.
+2. A JSON decode: a call to `json.loads`, `json.load` or the engine's `json_loads_or_refusal`, or
+   any `.json()` method call.
+3. A form, header or mail decode: a call to `parse_qs`, `parse_qsl`, `parse_http_list`,
+   `parse_keqv_list`, `message_from_bytes` or `message_from_string`.
+4. A hand-written byte parser: `split`, `rsplit`, `partition`, `rpartition`, `find`, `rfind`,
+   `index` or `rindex` called with a bytes literal first, or any `unpack`, `unpack_from` or
+   `iter_unpack` call.
+5. An inbound connector: a call to `register_source`.
+
+A hit inside a codec package under `parsing/`, such as `parsing/xml/`, counts for the whole package.
+Every parse site the scan finds sits in exactly one of the first two tables below. The first holds
+the modules where any code reads input from outside the engine, whichever call the scan matched.
+The second holds the ones that read only what the engine wrote itself or an operator supplied. The
+third table lists hand-written parsers the patterns cannot see, found by reading the code.
+
+The scan leaves some parsing out on purpose, and it has limits:
+
+- `tomllib` is not in pattern 1. It reads at least service settings, connection files, environment
+  value files, de-identification rules, the tray's settings and code sets. Of those, only a code set
+  is known to come from another system. `config/code_sets.py` is in the first table through its
+  `csv` import.
+- Libraries parse their own wire: uvicorn's HTTP server, the HTTP clients, TLS and `ldap3`. FastAPI
+  decodes every other API request body as JSON, and checks it against a model before a route sees
+  it. [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) covers those libraries. The engine's own HTTP
+  inbound listener is hand-written, and it is in the first table.
+- A hand-written parser that makes none of these calls is missed by the scan. The third table holds
+  the ones found by reading, and there may be more. A parser passed as a value rather than called,
+  as in `asyncio.to_thread(json.loads, raw)`, is missed too. Parsing inside your own Routers and
+  Handlers is yours (section 1).
+- Archives and compressed streams have a scan of their own, in the list after these tables.
+
+**Parsers that read input from outside the engine.**
+
+| Input | Where it comes from | Modules |
+|---|---|---|
+| Inbound connectors | Whatever a sender or a polled source delivers. `transports/http_listener.py` reads the HTTP request line and headers itself. | `transports/file.py`, `transports/http_listener.py`, `transports/remotefile.py`, `transports/tcp.py`, `transports/x12.py`, `transports/database.py` |
+| The intake path | The shared ingress code that hands each received body to the parsers below | `pipeline/wiring_runner.py` |
+| HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
+| MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
+| JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
+| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply | `parsing/message.py`, `parsing/xml/`, `transports/soap.py` |
+| X12 | An inbound whose content type is `x12` | `parsing/x12/` |
+| DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
+| A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |
+| Captured traffic | The messages the de-identification tools read | `anon/hl7.py` |
+| An SVG attachment inside a stored message | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
+| An uploaded file | The body of `POST /uploads`, or of `POST /ui/uploaded-logs/upload`, which the same handler serves. `api/multipart.py` is a hand-written `multipart/form-data` parser (ADR 0134), and its own comment calls each part's header block attacker-supplied. The route needs the files-upload permission and step-up authentication. | `api/app.py`, `api/multipart.py`, `uploads.py` |
+| Code sets | Files in the config directory, and the exports from another system that the reference sync re-reads | `config/code_sets.py` |
+| The sandbox child's replies | The child runs your Routers and Handlers, so the parent treats what it sends back as untrusted | `pipeline/sandbox.py`, `pipeline/_sandbox_codec.py` |
+| Partner and service replies | A partner's HTTP reply headers, a REST peer's Digest challenge, a FHIR server, a DICOMweb server, a SMART token endpoint, the AI provider | `transports/bounded_read.py`, `transports/rest.py`, `transports/fhir.py`, `transports/dicomweb.py`, `transports/smart.py`, `transports/ai_broker.py` |
+| Text a remote peer sizes | A reply field, a traceback or an error text, clamped and redacted before it is logged or shown | `redaction.py` |
+| Replies from an engine address | Whatever answers at the address a client is given. It is meant to be the engine, but nothing proves that before the parse. | `apiclient/client.py`, `tray/probe.py`, `verify/smoke.py` |
+| Identity provider replies | The OpenID Connect token response and key set, and an ID token's header and claims | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
+| A passkey response | A browser sends JSON with CBOR (Concise Binary Object Representation) inside. The `webauthn` library, from the optional `[webauthn]` extra, decodes the CBOR. | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py` |
+| Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
+| A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `corepoint_import.py` |
+| A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
+
+**Parse sites left out, and why.**
+
+| Why it is left out | Modules |
+|---|---|
+| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `api/approvals.py`, `api/auth_routes.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
+| It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
+| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata and a restore token file | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py` |
+| It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
+| It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py` |
+
+**Hand-written parsers the patterns cannot see.**
+
+| What it parses | Modules |
+|---|---|
+| MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
+| HL7 batch files, split into messages | `parsing/split.py` |
+| The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
+| The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
+| The reply from a network time server | `logging_setup.py` |
+| The certificate a TLS client presents, read again to find its issuer | `pki.py` |
+
+The first two tables rest on a judgement about where each input comes from, and the test cannot
+check that judgement. Re-read a row when its module changes what it reads.
 
 **Archives and compressed streams are parsed too.** A small input can expand into a huge one, and
 an archive names its own members, so each reader below bounds both. These modules import an archive
@@ -436,7 +529,7 @@ allows only a web address before it reaches the operating system.
 **Webviews.** Each script-enabled page carries a Content Security Policy with `default-src 'none'`
 and a fresh nonce on `script-src`. So only the scripts the extension rendered into that page run.
 `configEditors.ts` reuses the connection and code-set pages rather than building its own. Some page
-scripts build markup with `innerHTML`, at least in `testBench.ts`. The policy blocks inline event
+scripts build markup with `innerHTML`, at least in `testBenchWebview.ts`. The policy blocks inline event
 handlers, so markup injected that way cannot run script of its own.
 
 A page script can also ask the extension to act. The Home view runs any VS Code command whose id
@@ -493,8 +586,8 @@ loader in the engine, which executes every config module again.
 native library, or import by name, that is dangerous functionality in your deployment and belongs
 in your own documentation.
 
-**The consolidated third-party component table.** Withheld by policy. Per-library decisions that
-matter to a deploying operator are recorded in the ADRs cited above.
+**Third-party components.** [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) designates the risky ones.
+Per-library decisions that matter to a deploying operator are recorded in the ADRs cited above.
 
 **The published test harness.** `messagefoundry-harness` is a tool for testing an engine, not part
 of a deployment. It does start processes. It is out of this page's scope, which is a choice about
@@ -512,14 +605,19 @@ reads the code and fails when one of these no longer matches it:
   `shell=True`;
 - the section 5 module list: a new `ctypes` import, and every library load must name its library
   with a literal;
+- the section 7 parser tables: a parse site the five patterns find that the first two tables omit,
+  a site in both, or a name there the scan does not find. A hand-read parser must exist, and the
+  scan must not find it. The five patterns the page states must be the ones the test uses;
 - the section 7 archive list: a new module that imports an archive or compression library;
 - the section 8 table: a script added to or removed from `scripts/service/`, or one with no
   administrator check;
 - the section 9 table: each count in it. It also fails on any `child_process` call other than
-  `execFile`, any VS Code task, and any use of `cluster`, `worker_threads` or `process.dlopen`;
+  `execFile`, any VS Code task, and any use of `cluster`, `worker_threads` or `process.dlopen`, and
+  when a file its `innerHTML` sentence names is missing or writes no HTML into its page;
 - section 10: the count of HTML writes. It also checks that the console's Python starts no
   process, imports no `ctypes` or archive library, and imports nothing by name.
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
-Nothing checks what a script grants, what holds a site, or sections 1, 2, 3 and 6. Keep that prose
-true by hand.
+Some things no test checks. They include what a script grants, what holds a site, and sections 1,
+2, 3 and 6. In section 7, no test checks which table a parse site belongs in, or whether the
+hand-read table is complete. Keep that prose true by hand.

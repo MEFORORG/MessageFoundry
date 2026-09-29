@@ -105,6 +105,16 @@ def _msg_filters(
     )
 
 
+def _open_href(message_id: str, summary: str | None) -> str:
+    """Where a list or search row's link goes (BACKLOG #2346, ASVS 14.2.6).
+
+    The link text is the masked summary when there is one, so the click is aimed at it and lands on
+    ``/summary``, the route that reveals it (``routes.core.UI_MESSAGE_REVEALS``). A row with no
+    summary reads "(view)", and that click is aimed at nothing to reveal, so it opens the bare page."""
+    base = f"/ui/messages/{_seg(message_id)}"
+    return f"{base}/summary" if summary else base
+
+
 def messages(
     data: MessageList | None,
     *,
@@ -161,7 +171,7 @@ def messages(
             el("span", m.status, class_=f"status status-{m.status}"),
             m.control_id,
             # A link to the audited detail view; the summary text is escaped by the builder.
-            el("a", m.summary or "(view)", href=f"/ui/messages/{m.id}"),
+            el("a", m.summary or "(view)", href=_open_href(m.id, m.summary)),
         ]
         for m in data.messages
     ]
@@ -350,7 +360,7 @@ def message_search(
                 m.message_type,
                 el("span", m.status, class_=f"status status-{m.status}"),
                 m.control_id,
-                el("a", m.summary or "(view)", href=f"/ui/messages/{m.id}"),
+                el("a", m.summary or "(view)", href=_open_href(m.id, m.summary)),
             ]
             for m in results.messages
         ]
@@ -459,9 +469,27 @@ def _resend_section(detail: MessageDetail) -> list[object]:
     ]
 
 
-def message_detail(detail: MessageDetail) -> Markup:
+def message_detail(
+    detail: MessageDetail, raw_body: str | None, *, summary_revealed: bool
+) -> Markup:
     """A single message: metadata + the AUDITED raw body (escaped inside <pre>) + deliveries/events, plus
-    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress."""
+    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress.
+
+    ``raw_body`` arrives separately from ``detail`` because the engine serves it from its own audited
+    fetch (BACKLOG #2345); the open carries no body. ``None`` means this route did not ask for it, so
+    the page offers "Show raw message" instead (BACKLOG #2346, ASVS 14.2.6). ``summary_revealed``
+    says whether this route asked the engine to reveal the summary; when it did not, the Summary
+    row offers "Reveal" beside the masked value. Neither link is a toggle: each is its own audited request."""
+    msg = _seg(detail.id)
+    summary_cell: object = detail.summary
+    if not summary_revealed and detail.summary:
+        # The masked value is still escaped by the builder: masking is not sanitizing.
+        summary_cell = el(
+            "span",
+            detail.summary,
+            " ",
+            el("a", "Reveal", href=f"/ui/messages/{msg}/summary", class_="muted"),
+        )
     meta = rows_table(
         ["Field", "Value"],
         [
@@ -471,13 +499,28 @@ def message_detail(detail: MessageDetail) -> Markup:
             ["Type", detail.message_type],
             ["Control ID", detail.control_id],
             ["Status", detail.status],
-            ["Summary", detail.summary],
+            ["Summary", summary_cell],
             ["Error", detail.error],
         ],
         adjustable=False,
     )
     # The raw body is attacker-influenced HL7 — rendered as escaped text inside <pre>, never as markup.
-    raw = el("pre", detail.raw, class_="raw")
+    # Absent until the operator asks for it: the link is the explicit act, and /body is a separate,
+    # separately audited request, so opening the page to check a delivery never renders the body.
+    raw = (
+        el("pre", raw_body, class_="raw")
+        if raw_body is not None
+        else el(
+            "p",
+            el("a", "Show raw message", href=f"/ui/messages/{msg}/body", class_="btn-link"),
+            " ",
+            el(
+                "span",
+                "Shows the full body, including patient identifiers. Each view is audited.",
+                class_="muted",
+            ),
+        )
+    )
     outbox = rows_table(
         ["Destination", "Status", "Attempts", "Last error"],
         [[o.destination_name, o.status, o.attempts, o.last_error] for o in detail.outbox],
@@ -636,6 +679,7 @@ def message_edit(
     detail: MessageDetail,
     idempotency_key: str,
     *,
+    original: str,
     raw_value: str | None = None,
     error: str = "",
     mode: str = "reroute",
@@ -650,8 +694,8 @@ def message_edit(
 
     The edited body is attacker-influenced HL7 rendered as escaped ``<textarea>`` text (never markup);
     ``idempotency_key`` is a fresh per-open token so a double-submit of this form is an idempotent no-op.
+    ``original`` is the stored body from the engine's audited body fetch (BACKLOG #2345).
     """
-    original = detail.raw
     shown = original if raw_value is None else raw_value
     is_direct = mode == "direct"
     err = el("p", text(error), class_="banner") if error else Markup("")
