@@ -26,7 +26,13 @@ from cryptography.hazmat.primitives.serialization.pkcs12 import PKCS12PrivateKey
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.__main__ import main
-from tests._approved_key_wrap import approved_pfx, pkcs12_bundle
+from tests._approved_key_wrap import (
+    approved_pfx,
+    clear_pfx,
+    pkcs12_bundle,
+    with_pbmac1,
+    with_pkcs12_kdf_mac,
+)
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 _UTC = datetime.UTC
@@ -70,11 +76,10 @@ def _make_pfx(
 ) -> bytes:
     # An encrypted bundle is written at the approved wrap: PBES2 bags and a PBMAC1 MAC at the floor.
     # `cert import` refuses BestAvailableEncryption, whose MAC is keyed by the PKCS#12 KDF (#1352).
+    # An unencrypted one carries no MAC: NoEncryption's own MAC is a PKCS#12-KDF one, refused too.
     if password:
         return approved_pfx(key, cert, password, cas)
-    return pkcs12.serialize_key_and_certificates(
-        b"mefor", key, cert, cas, serialization.NoEncryption()
-    )
+    return clear_pfx(key, cert, cas)
 
 
 def _pem(cert: x509.Certificate) -> bytes:
@@ -234,6 +239,83 @@ def test_import_refuses_a_weak_bundle_before_decrypting_it(
     assert why in err and "-pbmac1_pbkdf2" in err
     assert password not in err
     assert not (out / "key.pem").exists()
+
+
+_CLEAR_PASS = "synthetic-clear-pass"
+_CLEAR_WEAK_MACS = {"md5": "MAC over MD5", "sha1": "MAC over SHA-1", "sha256": "rather than PBMAC1"}
+
+
+def _clear_bags_with_mac(key: PKCS12PrivateKeyTypes, cert: x509.Certificate, mac: str) -> bytes:
+    """Unencrypted bags, as ``openssl pkcs12 -keypbe NONE -certpbe NONE`` writes them, with ``mac``."""
+    clear = pkcs12.serialize_key_and_certificates(
+        b"x", key, cert, None, serialization.NoEncryption()
+    )
+    pw = _CLEAR_PASS.encode()
+    if mac == "pbmac1":
+        return with_pbmac1(clear, pw, iterations=600_000)
+    return with_pkcs12_kdf_mac(clear, pw, mac_hash=mac, iterations=2048)
+
+
+@pytest.mark.parametrize(("mac", "why"), sorted(_CLEAR_WEAK_MACS.items()))
+def test_import_refuses_a_weak_mac_over_unencrypted_bags(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    mac: str,
+    why: str,
+) -> None:
+    # BACKLOG #1352. Nothing in these bundles is encrypted, but the MAC derives its key from the
+    # passphrase through the PKCS#12 KDF, so an MD5 or SHA-1 one ran on import before this.
+    key, cert = _make_cert()
+    pfx_path = tmp_path / "clear.pfx"
+    pfx_path.write_bytes(_clear_bags_with_mac(key, cert, mac))
+    monkeypatch.setenv("MEFOR_PFX_PASSWORD", _CLEAR_PASS)
+    out = tmp_path / "o"
+
+    assert main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out)]) == 2
+    err = capsys.readouterr().err
+    assert why in err and "-pbmac1_pbkdf2" in err
+    assert _CLEAR_PASS not in err
+    assert not (out / "key.pem").exists()
+
+
+@pytest.mark.parametrize("mac", sorted(_CLEAR_WEAK_MACS))
+def test_the_weak_clear_bundles_load_when_the_check_is_disarmed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    mac: str,
+) -> None:
+    # The control that makes the refusals above mean something: each bundle is real and opens with
+    # its passphrase, so the check is the only thing that stops the import.
+    monkeypatch.setattr("messagefoundry.pki.refuse_weak_pkcs12", lambda *a, **k: None)
+    key, cert = _make_cert()
+    pfx_path = tmp_path / "clear.pfx"
+    pfx_path.write_bytes(_clear_bags_with_mac(key, cert, mac))
+    monkeypatch.setenv("MEFOR_PFX_PASSWORD", _CLEAR_PASS)
+    out = tmp_path / "o"
+
+    assert main(["cert", "import", "--pfx", str(pfx_path), "--out-dir", str(out)]) == 0
+    capsys.readouterr()
+    assert (out / "key.pem").exists()
+
+
+def test_import_accepts_unencrypted_bags_under_an_approved_mac_or_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The approved controls, over the same unencrypted bags: a PBMAC1 MAC at the floor with its
+    # passphrase, and no MAC at all with none.
+    key, cert = _make_cert()
+    monkeypatch.setenv("MEFOR_PFX_PASSWORD", _CLEAR_PASS)
+    pbmac1 = tmp_path / "pbmac1.pfx"
+    pbmac1.write_bytes(_clear_bags_with_mac(key, cert, "pbmac1"))
+    assert main(["cert", "import", "--pfx", str(pbmac1), "--out-dir", str(tmp_path / "a")]) == 0
+    monkeypatch.delenv("MEFOR_PFX_PASSWORD")
+    no_mac = tmp_path / "nomac.pfx"
+    no_mac.write_bytes(clear_pfx(key, cert))
+    assert main(["cert", "import", "--pfx", str(no_mac), "--out-dir", str(tmp_path / "b")]) == 0
+    capsys.readouterr()
+    assert (tmp_path / "a" / "key.pem").exists() and (tmp_path / "b" / "key.pem").exists()
 
 
 def test_import_accepts_the_approved_bundle_with_a_ca_chain(

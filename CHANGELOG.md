@@ -264,6 +264,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
+  encrypted.** Before, the MAC was checked only when something in the bundle was encrypted, so an
+  `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle with an MD5 or SHA-1 MAC loaded. That
+  MAC still derives its key from the passphrase through the PKCS#12 KDF, so it is now refused like
+  any MAC that is not PBMAC1 at the PBKDF2 floor. An unencrypted bundle with no MAC still loads,
+  since nothing in it comes from a password. The refusal gives the `openssl` re-export command.
+  (`BACKLOG #1352`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before

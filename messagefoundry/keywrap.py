@@ -29,7 +29,9 @@ PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written ei
 
 PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC rule: only a PBMAC1
 MAC at the PBKDF2 floor passes, because any other MAC is keyed by the PKCS#12 KDF, which Appendix C
-does not list (:func:`pkcs12_wrap_refusal`). SSH keys cannot reach an approved derivation at all,
+does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
+encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
+passes. SSH keys cannot reach an approved derivation at all,
 so the SFTP connector refuses an encrypted one outright (:func:`ssh_key_encrypted`). A database
 driver's own client key (libpq ``sslkey``) is checked as a key file before the driver opens it.
 
@@ -468,8 +470,9 @@ _MAX_BAG_DEPTH: Final = 4
 _REEXPORT: Final = (
     "Re-export it with OpenSSL 3.4 or later: openssl pkcs12 -export -keypbe AES-256-CBC "
     f"-certpbe AES-256-CBC -iter {_SHA256_FLOOR} -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 "
-    "-in <cert> -inkey <key> -out <new pfx>. Or skip PKCS#12: give the certificate and an "
-    "unencrypted or approved-wrap PKCS#8 key as PEM files"
+    "-in <cert> -inkey <key> -out <new pfx>. A bundle with unencrypted bags is held to the same MAC "
+    "rule: a PBMAC1 MAC at that floor, or none. Or skip PKCS#12: give the certificate and an unencrypted or approved-wrap PKCS#8 "
+    "key as PEM files"
 )
 
 
@@ -605,15 +608,17 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
             return True, "holds a PKCS#12 part this engine does not recognise"
         if problem is not None:
             return True, problem
-    # The MAC is judged only when something is encrypted. Over clear bags its key guards no secret:
-    # guessing the password it is keyed by reveals nothing the bundle does not already show. An
-    # encrypted bundle with no MAC at all is refused: the floor says it must carry a PBMAC1 MAC.
-    if encrypted:
-        if len(parts) != 3:
-            return True, "carries no MAC; an encrypted bundle needs a PBMAC1 MAC"
+    # A MAC is judged whether or not anything is encrypted (BACKLOG #1352). Over clear bags it still
+    # derives a key from the passphrase and checks it, so an MD5 or SHA-1 MAC runs the passphrase
+    # through a disallowed hash and lets it be guessed offline, and that passphrase is often reused.
+    # A clear bundle with NO MAC passes: nothing in it derives a key from any password, so there is
+    # no derivation to judge, as with an unencrypted PEM key. An encrypted one without a MAC fails.
+    if len(parts) == 3:
         problem = _mac_problem(der, parts[2])
         if problem is not None:
             return True, problem
+    elif encrypted:
+        return True, "carries no MAC; an encrypted bundle needs a PBMAC1 MAC"
     return encrypted, None
 
 
@@ -629,7 +634,8 @@ def pkcs12_wrap_refusal(
     Refused: a MAC over MD5 or SHA-1, any MAC keyed by the PKCS#12 KDF rather than PBMAC1, a PBMAC1
     or PBES2 derivation under the Appendix C floor, the SHA-1 PKCS#12 PBE and PBES1 bag schemes,
     anything this reader cannot walk, an encrypted bundle with no MAC, and an encrypted bundle with
-    no passphrase. Same rules for the message as :func:`key_wrap_refusal`: the setting and the
+    no passphrase. The MAC rules apply over clear bags too (BACKLOG #1352); a clear bundle with no
+    MAC passes. Same rules for the message as :func:`key_wrap_refusal`: the setting and the
     reason, never the bundle's bytes."""
     if _too_large(pfx):
         return (

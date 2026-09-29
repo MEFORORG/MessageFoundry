@@ -40,6 +40,7 @@ from tests._approved_key_wrap import (
     PBKDF2,
     SCRYPT,
     approved_pfx,
+    clear_pfx,
     integer,
     octets,
     oid,
@@ -49,8 +50,9 @@ from tests._approved_key_wrap import (
     seq,
     tlv,
     with_pbmac1,
+    with_pkcs12_kdf_mac,
+    without_mac,
 )
-from tests._approved_key_wrap import _tlv_at as tlv_at
 
 _PASSPHRASE = "synthetic-test-passphrase"  # a fixture value, not a secret
 
@@ -702,24 +704,62 @@ def _p12_refusal(pfx: bytes, *, given: bool = True) -> str | None:
     return keywrap.pkcs12_wrap_refusal(pfx, setting="s", unlock_setting="u", passphrase_given=given)
 
 
-def test_an_unencrypted_pkcs12_bundle_passes_whatever_its_mac(material: Material) -> None:
-    # Over clear bags the MAC's key guards no secret, so its PKCS#12-KDF derivation is not judged.
+def _clear_bags(material: Material) -> bytes:
+    """cryptography's NoEncryption bundle: unencrypted bags, whatever MAC a caller then puts on."""
     cert = _p12_cert(material.key)
-    clear = pkcs12.serialize_key_and_certificates(
+    return pkcs12.serialize_key_and_certificates(
         b"x", material.key, cert, None, serialization.NoEncryption()
     )
-    assert _p12_refusal(clear, given=False) is None
+
+
+@pytest.mark.parametrize(
+    ("mac", "why"),
+    [
+        ("md5", "MAC over MD5"),
+        ("sha1", "MAC over SHA-1"),
+        ("sha256", "rather than PBMAC1"),
+        ("nopass-sha256", "rather than PBMAC1"),
+        ("pbmac1-2048", "2048 iterations"),
+        ("pbmac1-sha1", "PBKDF2-HMAC-SHA-1"),
+    ],
+)
+def test_a_weak_mac_over_unencrypted_bags_is_refused(
+    material: Material, mac: str, why: str
+) -> None:
+    # BACKLOG #1352. The MAC still derives its key from the passphrase when no bag is encrypted,
+    # so it is judged the same way. "nopass-sha256" is cryptography's NoEncryption output as
+    # written: a PKCS#12-KDF MAC over SHA-256 under an empty passphrase.
+    clear = _clear_bags(material)
+    pw = b"synthetic-pfx"
+    bundle = {
+        "md5": lambda: with_pkcs12_kdf_mac(clear, pw, mac_hash="md5", iterations=2048),
+        "sha1": lambda: with_pkcs12_kdf_mac(clear, pw, mac_hash="sha1", iterations=2048),
+        "sha256": lambda: with_pkcs12_kdf_mac(clear, pw, mac_hash="sha256", iterations=2048),
+        "nopass-sha256": lambda: clear,
+        "pbmac1-2048": lambda: with_pbmac1(clear, pw, iterations=2048),
+        "pbmac1-sha1": lambda: with_pbmac1(clear, pw, iterations=600_000, prf="sha1"),
+    }[mac]()
+    for given in (True, False):
+        refusal = _p12_refusal(bundle, given=given)
+        assert refusal is not None and why in refusal, (given, refusal)
+        assert "-pbmac1_pbkdf2" in refusal
+
+
+def test_unencrypted_bags_pass_with_an_approved_mac_or_with_none(material: Material) -> None:
+    # The controls for the refusals above, over the SAME clear bags: only the MacData differs.
+    clear = _clear_bags(material)
+    assert _p12_refusal(with_pbmac1(clear, b"synthetic-pfx", iterations=600_000)) is None
+    # No MacData at all: nothing in the bundle is derived from a password, so there is no
+    # derivation to judge, as with an unencrypted PEM key. No passphrase is needed either.
+    assert _p12_refusal(without_mac(clear), given=False) is None
+    assert _p12_refusal(clear_pfx(material.key, _p12_cert(material.key)), given=False) is None
 
 
 def test_an_encrypted_pkcs12_bundle_with_no_mac_is_refused(material: Material) -> None:
     # The approved bundle is the control: the same bytes with only the MacData dropped must flip.
     approved = approved_pfx(material.key, _p12_cert(material.key), b"synthetic-pfx")
     assert _p12_refusal(approved) is None
-    outer_start, _ = tlv_at(approved, 0)
-    _, after_version = tlv_at(approved, outer_start)
-    _, after_auth_safe = tlv_at(approved, after_version)
-    no_mac = seq(approved[outer_start:after_auth_safe])
-    refusal = _p12_refusal(no_mac)
+    refusal = _p12_refusal(without_mac(approved))
     assert refusal is not None and "carries no MAC" in refusal
 
 
