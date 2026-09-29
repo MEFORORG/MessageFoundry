@@ -8944,12 +8944,17 @@ class SqlServerStore:
         matches no index and full-scanned the queue on every open — with N engines opening against
         one shared (ghost-bloated) store, a measured contributor to the WS-B co-start lock convoy
         (LCK_M_IX/X storms). The ownership filter rides that same seek as a residual chunked ``IN``
-        predicate (no index hints). Iterating the enum keeps a future stage automatically covered."""
+        predicate (no index hints). Iterating the enum keeps a future stage automatically covered.
+
+        The count is the ``OUTPUT inserted.id`` rowset's length, never ``cursor.rowcount`` (BACKLOG
+        #2097). Under a session-wide ``SET NOCOUNT ON`` the driver reports ``-1`` per statement, which
+        summed to ``-4`` on the hosted SQL Server legs. The rowset holds only the re-pended rows, a
+        set bounded by what was claimed, and ADR 0157 Inc 3 reads its fenced resolves the same way."""
         now = time.time() if now is None else now
         stages = [stage] if stage is not None else [s.value for s in Stage]
         sql = (
             "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?, owner=NULL,"
-            " lease_expires_at=NULL WHERE status=? AND stage=?"
+            " lease_expires_at=NULL OUTPUT inserted.id WHERE status=? AND stage=?"
         )
         recovered = 0
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -8960,7 +8965,7 @@ class SqlServerStore:
                             sql,
                             (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
                         )
-                        recovered += cur.rowcount
+                        recovered += len(await cur.fetchall())
                         continue
                     lane_col, names = owned_lane_scope(st, owned)
                     ordered = sorted(names)
@@ -8978,12 +8983,12 @@ class SqlServerStore:
                                 *chunk,
                             ),
                         )
-                        recovered += cur.rowcount
+                        recovered += len(await cur.fetchall())
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return int(recovered)
+        return recovered
 
     # --- streaming attachments (#149, ADR 0105 Phase 4 — SQL Server parity) --------------------------
     # Byte-for-byte behavioral parity with the SQLite reference (store/store.py): content-addressed

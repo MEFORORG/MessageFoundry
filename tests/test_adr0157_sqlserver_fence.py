@@ -24,7 +24,6 @@ is a separate ledger item.
 from __future__ import annotations
 
 import os
-import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -329,8 +328,9 @@ def _force_nocount(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
                 # Before this restore existed, a LATER test's freshly opened store read
                 # reset_stale_inflight() as -4 (-1 per stage) on both SQL Server legs. The suspected
                 # route is the ODBC driver manager reusing the physical connection with its session
-                # options; that is NOT measured. The count check in the recovery test below is the
-                # control that says whether this restore is what cleared it.
+                # options; that is NOT measured here. BACKLOG #2097 moved the measurement to the
+                # BACKLOG-2097-NOCOUNT probe in test_sqlserver_store.py, and made the count
+                # independent of NOCOUNT.
                 await cur.execute("SET NOCOUNT OFF;")
 
     monkeypatch.setattr(store, "_cursor", nocount_cursor)
@@ -449,17 +449,13 @@ async def test_a_failed_repend_is_collected_by_the_successors_promotion_reset(
         successor.set_leader_epoch(6, lease_key=_LEASE_KEY)
         # What promotion runs on SQL Server. now= is explicit because the reset stamps
         # next_attempt_at=now, and the claim below runs on the fixed test clock. The proof is the
-        # ROW STATE, not the returned count: that count is built from cursor.rowcount, which reads
-        # -1 per stage whenever the session has NOCOUNT on (see the report on PR 1576).
-        recovered = await successor.reset_stale_inflight(now=250.0)
+        # ROW STATE, not the returned count. The ADR0157-INC3-RESET-COUNT warning that once read
+        # that count was retired by BACKLOG #2097, which moved the count to an OUTPUT rowset and
+        # the NOCOUNT reading to test_sqlserver_store.py's BACKLOG-2097-NOCOUNT probe.
+        await successor.reset_stale_inflight(now=250.0)
         assert (await successor.outbox_for(mid))[0]["status"] == OutboxStatus.PENDING.value
         taken = await successor.claim_next_fifo("OB1", now=300.0)
         assert taken is not None and taken.id == claimed.id
-        if recovered != 1:
-            # The control for _force_nocount's restore, reported without failing: the count is a
-            # pre-existing reset_stale_inflight behaviour, not this increment's. Grep the CI
-            # warnings summary for the marker. 1 means the session reached here with NOCOUNT off.
-            warnings.warn(f"ADR0157-INC3-RESET-COUNT {recovered} (expected 1)", stacklevel=1)
         await successor.mark_done(taken.id)
         assert await _ledger_count(store, taken.id) == 1
     finally:
