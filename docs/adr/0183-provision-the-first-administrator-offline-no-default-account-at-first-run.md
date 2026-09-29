@@ -572,7 +572,9 @@ asks again on a wrong one, up to five times. Only then does it write. `provision
 takes the key, the code and the instant it was read, and checks the code again against that instant.
 Then it writes the row, the password, the TOTP key with its step consumed, the recovery codes, the
 address, and the role **last**. The recovery codes print once, to the terminal. The key and codes go
-to stderr, never into `--json` output, argv, a file or a log. `--no-totp` skips it, and is refused
+to the console device itself (`CONOUT$` on Windows, `/dev/tty` elsewhere), never to stdout or
+stderr, which a redirect can put in a file or a log, and never into `--json` output or argv. With no
+console to open, the command refuses before any write (CodeQL alert 228). `--no-totp` skips it, and is refused
 while `[security].require_mfa` is on; the service refuses a call with no key in that posture too.
 
 **This keeps the write order this ADR chose.** The role is still last, so every interruption leaves a

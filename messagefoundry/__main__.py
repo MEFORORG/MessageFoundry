@@ -5564,16 +5564,36 @@ class _PasswordEntryRefused(RuntimeError):
 _PROVISION_TOTP_ATTEMPTS = 5
 
 
+def _controlling_terminal_path() -> str:
+    """The device that IS the operator's console, whatever stdout and stderr were redirected to."""
+    return "CONOUT$" if sys.platform == "win32" else "/dev/tty"
+
+
+def _show_on_terminal(text: str) -> None:
+    """Write ``text`` to the controlling terminal itself, never to stdout or stderr (ADR 0197
+    Amendment A, N-A; CodeQL alert 228, BACKLOG #1131).
+
+    For what the operator must see and nothing may keep: the new TOTP key, its URI and the recovery
+    codes. Stdout carries ``--json``, and either stream can be redirected into a file, a service
+    wrapper's log or a CI capture, which is where the alert said the key could land. Opening the
+    console device writes to the screen and nowhere else. Raises :class:`OSError` when the process
+    has no console, so a caller can refuse rather than fall back to a stream."""
+    with open(_controlling_terminal_path(), "w", encoding="utf-8") as console:
+        console.write(text)
+        console.flush()
+
+
 def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str, float]:
     """Generate a TOTP secret in memory, show it, and read back a code that proves it (ADR 0197
     Amendment A, N-A). Returns ``(secret, code, instant the code was read)``.
 
-    Everything goes to STDERR, never stdout: ``--json`` output is stdout, and the secret must never
-    be in it. It is never in argv, a file or a log either. The code is checked with the pure
-    :func:`totp.verify_totp_step` at the configured skew and re-prompted on a mistake, all BEFORE
-    the store is opened for writing, so a wrong code writes nothing. Raises
-    :class:`_PasswordEntryRefused` with no terminal, on an empty code, or after
-    :data:`_PROVISION_TOTP_ATTEMPTS` wrong codes."""
+    The key and its URI go to the console device through :func:`_show_on_terminal`, never to stdout
+    or stderr: ``--json`` output is stdout, and either stream can be redirected. They are never in
+    argv, a file or a log either. The prompts go to stderr, since they carry nothing secret. The code
+    is checked with the pure :func:`totp.verify_totp_step` at the configured skew and re-prompted on
+    a mistake, all BEFORE the store is opened for writing, so a wrong code writes nothing. Raises
+    :class:`_PasswordEntryRefused` with no terminal or no console to show the key on, on an empty
+    code, or after :data:`_PROVISION_TOTP_ATTEMPTS` wrong codes."""
     import time as _time
 
     from messagefoundry.auth import totp
@@ -5584,15 +5604,20 @@ def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str
             "interactively. Run this from a console."
         )
     secret = totp.generate_secret()
-    print(
-        "\nEnrol an authenticator app for this Administrator now (ADR 0197). Add this account to "
-        "the app by its URI, which names the algorithm, then type the 6-digit code it shows. The "
-        "codes use SHA-256: an app that takes only the key must be set to SHA-256, or its codes "
-        "will never match.\n"
-        f"  key: {secret}\n"
-        f"  URI: {totp.otpauth_uri(secret, username)}\n",
-        file=sys.stderr,
-    )
+    try:
+        _show_on_terminal(
+            "\nEnrol an authenticator app for this Administrator now (ADR 0197). Add this account "
+            "to the app by its URI, which names the algorithm, then type the 6-digit code it shows. "
+            "The codes use SHA-256: an app that takes only the key must be set to SHA-256, or its "
+            "codes will never match.\n"
+            f"  key: {secret}\n"
+            f"  URI: {totp.otpauth_uri(secret, username)}\n"
+        )
+    except OSError as exc:
+        raise _PasswordEntryRefused(
+            f"could not open the console to show the authenticator key ({exc}); nothing was "
+            "written. Run this from a console."
+        ) from exc
     for _ in range(_PROVISION_TOTP_ATTEMPTS):
         print("Authenticator code: ", end="", file=sys.stderr, flush=True)
         code = sys.stdin.readline().strip()
@@ -6229,14 +6254,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
     if outcome.recovery_codes:
-        # To the terminal (stderr) ONCE, in both output modes, and never into the --json body.
-        print(
-            "\nRecovery codes, shown once. Each signs in once in place of an authenticator code. "
-            "Store them somewhere safe, then clear this terminal's scrollback:\n  "
-            + "\n  ".join(outcome.recovery_codes)
-            + "\n",
-            file=sys.stderr,
-        )
+        # To the console device ONCE, in both output modes: never stdout (the --json body) and never
+        # stderr, which can be redirected into a log (CodeQL alert 228, BACKLOG #1131).
+        try:
+            _show_on_terminal(
+                "\nRecovery codes, shown once. Each signs in once in place of an authenticator "
+                "code. Store them somewhere safe, then clear this terminal's scrollback:\n  "
+                + "\n  ".join(outcome.recovery_codes)
+                + "\n"
+            )
+        except OSError as exc:
+            # The account is written and signs in with its authenticator app. The codes are not
+            # printed anywhere else, for the reason above.
+            print(
+                f"WARNING: the recovery codes could not be shown on the console ({exc}). The "
+                "Administrator signs in with its authenticator app; without the codes, a lost "
+                "authenticator needs another Administrator's MFA reset.",
+                file=sys.stderr,
+            )
     if args.json:
         _print_json(
             {

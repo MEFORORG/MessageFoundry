@@ -639,3 +639,12 @@ def _provision_admin_enrols_a_synthetic_authenticator(monkeypatch: pytest.Monkey
     # The real prompt, for the tests that drive it: ``cli._enrol_totp_at_terminal.__wrapped__``.
     _stub.__wrapped__ = cli._enrol_totp_at_terminal  # type: ignore[attr-defined]
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", _stub)
+
+    # The recovery codes go to the console DEVICE (CodeQL alert 228), which pytest cannot capture: on
+    # a developer's machine the real one would print them onto the screen running the suite. Dropped
+    # here; the tests of the enrolment record what reaches it in their own body.
+    def _drop(text: str) -> None:
+        return None
+
+    _drop.__wrapped__ = cli._show_on_terminal  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "_show_on_terminal", _drop)

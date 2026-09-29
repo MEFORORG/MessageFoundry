@@ -1273,11 +1273,16 @@ _TERMINAL_SECRET = PROVISION_TOTP_SECRET
 
 
 class _Terminal:
-    """A console for the TOTP prompt: ``isatty`` True, and ``readline`` answers the queued codes."""
+    """A console for the TOTP prompt: ``isatty`` True, ``readline`` answers the queued codes, and
+    ``shown`` records what reached the console device (``_show_on_terminal``)."""
 
     def __init__(self, codes: list[str]) -> None:
         self._codes = codes
         self.asked = 0
+        self.shown: list[str] = []
+
+    def show(self, text: str) -> None:
+        self.shown.append(text)
 
     def isatty(self) -> bool:
         return True
@@ -1301,6 +1306,7 @@ def _drive_the_real_prompt(
     monkeypatch.setattr(totp, "generate_secret", lambda: _TERMINAL_SECRET)
     terminal = _Terminal(codes if codes is not None else [totp.totp(_TERMINAL_SECRET)])
     monkeypatch.setattr(sys, "stdin", terminal)
+    monkeypatch.setattr(cli, "_show_on_terminal", terminal.show)
     queued = [_PASSWORD, _PASSWORD]
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: queued.pop(0))
     return terminal
@@ -1311,26 +1317,32 @@ def test_the_cli_enrols_totp_and_the_administrator_passes_a_live_lock_with_a_com
 ) -> None:
     """AC-A5: provision-admin under the shipped require_mfa leaves TOTP ON before the role, and the
     new Administrator has option E's way past: with the sign-in lock live, a combined sign-in works.
-    The --json body carries no secret and no recovery code; the codes went to the terminal once."""
+    The key and the recovery codes went to the console device once each, and to neither stream: not
+    stdout, which carries the --json body, and not stderr, which a redirect can put in a log (CodeQL
+    alert 228). RED against the stderr print this replaced."""
     from messagefoundry.auth import totp
 
     monkeypatch.chdir(tmp_path)
     key = _key_in_this_shell(monkeypatch)
-    _drive_the_real_prompt(monkeypatch)
+    terminal = _drive_the_real_prompt(monkeypatch)
     db = tmp_path / "provision.db"
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
     captured = capsys.readouterr()
     body = json.loads(captured.out.strip().splitlines()[-1])
     assert body["ok"] is True and body["totp_enrolled"] is True
-    assert _TERMINAL_SECRET not in captured.out
-    assert "Recovery codes" in captured.err and _TERMINAL_SECRET in captured.err
+    streams = captured.out + captured.err
+    assert _TERMINAL_SECRET not in streams
+    assert len(terminal.shown) == 2, terminal.shown
+    key_text, codes_text = terminal.shown
+    assert _TERMINAL_SECRET in key_text and "otpauth://" in key_text
+    assert "Recovery codes" in codes_text
     codes = [
         line.strip()
-        for line in captured.err.split("Recovery codes", 1)[1].splitlines()[1:]
+        for line in codes_text.split("Recovery codes", 1)[1].splitlines()[1:]
         if line.startswith("  ") and line.strip()
     ]
-    assert codes, captured.err
-    assert not any(code in captured.out for code in codes)
+    assert codes, codes_text
+    assert not any(code in streams for code in codes)
 
     async def check() -> None:
         cipher = make_cipher(key)
@@ -1372,6 +1384,71 @@ def test_a_wrong_code_at_the_prompt_writes_nothing(
     assert terminal.asked == 5
     assert "nothing was written" in capsys.readouterr().err
     assert not db.exists()
+
+
+def test_the_key_goes_to_the_console_device_and_nowhere_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CodeQL alert 228: the real ``_show_on_terminal`` writes to the device
+    ``_controlling_terminal_path`` names, here pointed at a file, and prints nothing to either
+    stream."""
+    import messagefoundry.__main__ as cli
+
+    real = cli._show_on_terminal.__wrapped__  # type: ignore[attr-defined]
+    device = tmp_path / "console"
+    monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(device))
+    real("  key: SYNTHETICKEY\n")
+    assert device.read_text(encoding="utf-8") == "  key: SYNTHETICKEY\n"
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+
+
+def test_with_no_console_the_key_is_not_shown_and_nothing_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No console device to open: the command refuses before any store write, and the key does not
+    fall back to a stream."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    real = cli._show_on_terminal.__wrapped__  # type: ignore[attr-defined]
+    terminal = _drive_the_real_prompt(monkeypatch)
+    monkeypatch.setattr(cli, "_show_on_terminal", real)
+    missing = tmp_path / "no-such-dir" / "console"
+    monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(missing))
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    captured = capsys.readouterr()
+    assert "could not open the console" in captured.err
+    assert _TERMINAL_SECRET not in captured.out + captured.err
+    assert terminal.asked == 0
+    assert not db.exists()
+
+
+def test_recovery_codes_that_cannot_be_shown_are_not_printed_instead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The console fails after the write, at the recovery codes: the command warns, still succeeds
+    (the account is written and has its authenticator), and prints no code to either stream."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    terminal = _drive_the_real_prompt(monkeypatch)
+
+    def show_the_key_only(text: str) -> None:
+        if "Recovery codes" in text:
+            raise OSError("synthetic console loss")
+        terminal.show(text)
+
+    monkeypatch.setattr(cli, "_show_on_terminal", show_the_key_only)
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "recovery codes could not be shown" in captured.err
+    assert "Recovery codes, shown once" not in captured.out + captured.err
+    assert len(terminal.shown) == 1 and _TERMINAL_SECRET in terminal.shown[0]
 
 
 def test_no_totp_is_refused_while_mfa_is_required(
