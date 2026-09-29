@@ -14,8 +14,8 @@ data is exposed during processing, and ensure that data is encrypted immediately
 soon as feasible."*
 
 BACKLOG #1174 researched whether the engine can honestly pass it. Its finding, and the owner-ruled
-ceiling, is that it cannot, and that the honest terminal state is a recorded partial. The row owes
-one thing this ADR supplies: **the written decision on the Handler boundary.**
+ceiling, is that it cannot, and that the honest terminal state is a recorded partial. One thing the
+row owes is **the written decision on the Handler boundary**, and this ADR is that decision.
 
 The boundary is the product. [`CLAUDE.md`](../../CLAUDE.md) §1 defines a Handler this way:
 
@@ -23,13 +23,14 @@ The boundary is the product. [`CLAUDE.md`](../../CLAUDE.md) §1 defines a Handle
 > transforms**, then hands it to one or more *outbound* connections.
 
 And §4 says what a Handler does with it: it "filters → transforms (via
-[`Message`](messagefoundry/parsing/message.py)) → returns `Send`s to outbound connections." A Handler
+[`Message`](../../messagefoundry/parsing/message.py)) → returns `Send`s to outbound connections." A Handler
 is arbitrary Python written by the site. It may read any field, rebuild any segment, and send any
 part of the message anywhere. A transform that could see only some fields would be a different
 product.
 
-The #1174 research also names what would **not** be an honest pass. Narrowing the Handler contract
-is one. Counting the zeroization of the cipher's own buffers as "encrypted after use" is another.
+The #1174 research forbids proposing to narrow the Handler contract. It also names a move that
+would **not** be an honest pass: counting the zeroization of the cipher's own buffers as
+"encrypted after use".
 
 ## Decision
 
@@ -40,23 +41,31 @@ listed below, which sit outside the Handler.
 ### What a Handler receives
 
 The transform worker decrypts a routed row and hands the Handler the whole body as a parsed
-`Message` (HL7) or a `RawMessage` (other formats). No setting narrows it. The body's plaintext
-lives in engine memory, as immutable Python strings and in every copy the Handler's own code makes,
-for as long as that code and the garbage collector keep it. The persisted copy is re-encrypted by
-the store cipher on every write (`store/crypto.py`).
+`Message` (HL7) or a `RawMessage` (other formats). No setting narrows it, apart from the
+off-by-default detach described below. A Router receives the whole message too: `route_only` in
+`pipeline/dryrun.py` builds the same parsed payload a Handler gets. The body's plaintext lives in
+memory, as immutable Python strings and in every copy the Router's or Handler's own code makes, for
+as long as that code and the garbage collector keep it. That memory is the engine process's, or
+the per-inbound worker process's under `sandbox = "subprocess"`. By default, the persisted copy is
+re-encrypted by the store cipher on every write (`store/crypto.py`); `[security].allow_unencrypted_phi`
+is the audited keyless opt-out.
 
 ### Where minimization is enforced
 
 Each of these was read against the tree on 2026-09-29, at engine `origin/main` `8d389ad7b`. The list is
 at least these; it is not complete.
 
-1. **The router hot path reads named fields only.** Routing reads fields through the tolerant peek
-   (`parsing/peek.py`) rather than building the full object model. The strict `hl7apy` model is
-   opt-in per connection (`docs/PHI.md` §3, "Peek, not full-parse, on the hot path").
-2. **PHI in API responses is withheld by default.** `api/phi_gate.py` defines `PhiGatedModel`. A
-   gated property serializes as `null` until something explicitly releases it for that instance,
+1. **The strict object model is built only on request.** Ingress reads the control id, message
+   type and summary through the tolerant peek (`parsing/peek.py`), and the strict `hl7apy` model is
+   opt-in per connection. This is narrower than it sounds: the Router itself still receives the
+   whole parsed message, as a Handler does. (`docs/PHI.md` §3's bullet "Peek, not full-parse, on
+   the hot path" says routing reads only the fields a Router asks for, which overstates this.)
+2. **Gated PHI properties in API responses are withheld by default.** `api/phi_gate.py` defines
+   `PhiGatedModel`. A property in its `GATEABLE_PROPERTIES` (summary, error, metadata, last_error,
+   detail) serializes as `null` in JSON until something explicitly releases it for that instance,
    and the release set defaults empty. `redact_unauthorized` in `api/field_authz.py` is what
-   releases it, and only what the caller holds.
+   releases it, and only what the caller holds. The raw body is not a gated property: its route
+   is permission-gated instead (`messages:view_raw`).
 3. **`dryrun` redacts bodies unless asked.** `--show-phi` is off by default (`__main__.py`,
    the `dryrun` parser). Without it the CLI prints `<redacted N chars; pass --show-phi>` in place of
    each body. The trace (`pipeline/dryrun_trace.py`, `_safe_value`) turns every assigned local and
@@ -64,9 +73,11 @@ at least these; it is not complete.
    shows live values redacted by default.
 4. **PHI-bearing API responses are not cached.** `api/app.py` serves `Cache-Control: no-store` on
    the `/ui` pages and on every route in `_NO_STORE_PREFIXES` and `_NO_STORE_ROUTE_PATHS`.
-5. **The staged queue drops each row at handoff.** Each stage's row is consumed in the same
-   transaction that writes the next stage's rows (CLAUDE.md §2), so the queue does not keep a
-   message open between stages.
+5. **The staged queue drops each row at handoff, on the message path.** Each stage's row is
+   consumed in the same transaction that writes the next stage's rows (CLAUDE.md §2), so the queue
+   does not keep a message open between stages. This does not hold for the correlation
+   read-through caches: on `main` the state and reference caches hold decrypted values for the
+   store's lifetime. #1174 part C, in review and not on `main`, makes them decrypt on each read.
 
 One more surface exists and is deliberately **not** counted here. An inbound's
 `stream_threshold_bytes` detaches an over-threshold document into the encrypted attachment store
@@ -81,7 +92,7 @@ Three grounds. Any one is enough.
 
 1. **The verb asks for encryption after use.** Every mechanism available to a CPython process is
    destruction at best, such as overwriting a buffer. Destruction is not encryption. OWASP removed the
-   overwrite-sensitive-memory requirement in the 4.x to 5.0 cull and kept this one.
+   overwrite-sensitive-memory requirement in the 4.x to 5.0 cull, while 5.0 includes this one.
 2. **The engine cannot list the copies.** A Handler is the site's own Python. Every split, slice,
    regex group and f-string it writes makes a new immutable object the engine never sees. A control
    that cannot list what it covers cannot claim to cover it.
@@ -114,12 +125,14 @@ surfaces this ADR relies on. Each links to an existing test that already guards 
 1. **Keep the whole-message Handler, enforce minimization outside it, record 11.7.2 as partial.**
    It matches the product and makes no claim the code cannot back. **CHOSEN.**
 2. **Hand a Handler only the fields it declares.** Rejected: it narrows the product's core contract,
-   and #1174 names it as the move that would not be an honest pass.
+   and #1174 forbids proposing it.
 3. **Wipe plaintext `str` objects after each transform.** Rejected: it is destruction, not
-   encryption (ground 1); it cannot reach the Handler's own copies (ground 2); and a wiped string
-   still matches its old `hash()`, which corrupts any dict holding it.
+   encryption (ground 1); it cannot reach the Handler's own copies (ground 2); and #1174 measured
+   that a wiped string still matches its old `hash()` and still retrieves its old dict value, which
+   leaves the object inconsistent.
 4. **Re-score 11.7.2 on the strength of a nearby control** (the no-store directive, the retention
-   purge, the detach seam, or the sealed read-through caches of BACKLOG #1174 part C). Rejected:
+   purge, the detach seam, or the per-read decrypt of the caches that #1174 part C proposes).
+   Rejected:
    none of them is the clinical body in engine memory, which is the verb's subject.
 
 ## Consequences
@@ -134,9 +147,11 @@ exposure is the in-use residual `docs/PHI.md` §3 describes, which §10 carries 
 deployment requirement.
 
 **Out of scope** — The ASVS record's own wording (the vault scorecard cell, a record act); the
-decrypted in-process caches (BACKLOG #1185, and #1174 part C, which seals them); host-level memory
-protection.
+decrypted in-process caches (BACKLOG #1185, and #1174 part C, in review); host-level memory
+protection; correcting `docs/PHI.md` §3's peek bullet.
 
 ## To resolve on acceptance
 
-- [ ] The owner confirms the Handler boundary stated here, which #1174 says is theirs to bless.
+- [ ] The owner confirms the Handler boundary stated here. #1174 says the record already blesses
+      a written boundary decision as an outcome; asking the owner to confirm this one is this ADR's
+      choice, not the row's.
