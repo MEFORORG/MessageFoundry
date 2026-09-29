@@ -103,9 +103,20 @@ not a TOML key**; there is no `[api]` or `[security]` equivalent:
 setx MEFOR_TLS_REVOCATION_ATTESTED 1        # per-session: PowerShell $env:MEFOR_TLS_REVOCATION_ATTESTED="1"
 ```
 
-Under NSSM put it on the service, not in an interactive shell —
-`nssm set MessageFoundry AppEnvironmentExtra MEFOR_TLS_REVOCATION_ATTESTED=1` (see
-[`SERVICE.md`](SERVICE.md)). Setting it is **you taking responsibility for revocation**: the engine
+Under NSSM put it on the service, not in an interactive shell. Run the `nssm.exe` the installer
+checked, by its full path, not a bare `nssm` from `PATH`. The path below is the default
+`-NssmDir`; if you installed with another, use that folder:
+
+```powershell
+& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_TLS_REVOCATION_ATTESTED=1
+Restart-Service MessageFoundry
+```
+
+**That `set` replaces the service's whole list of extra variables.** Add any other variable the
+service needs to the same call. [`SERVICE.md`](SERVICE.md#start--stop--status) says how, and how to
+keep the store key out of that list.
+
+Setting it is **you taking responsibility for revocation**: the engine
 performs no OCSP/CRL check of its own (stdlib `ssl` has no fetch), so the certificate this listener
 presents must be backed by a revocation-checking PKI — short-lived / ACME-rotated certs, an
 OCSP-must-staple issuer, or a trust store that consults CRLs. If you cannot make that claim
