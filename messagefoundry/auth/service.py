@@ -6047,12 +6047,15 @@ class AuthService:
         renamed account still steps up. **This costs no extra directory read:** each call is the
         same one round trip it was, keyed on the id instead of the name.
 
-        Each answer is still checked against ``object_id``, because the entry's own id is read
-        separately from the search that found it. An answer carrying no readable id is ``None`` with
-        reason ``directory_object_id_missing``, and one about another object is ``None`` with
-        ``directory_identity_conflict``. Neither is counted. A refused bind is counted once the
-        id-keyed lookup finds the entry, because that bind was judged against this account. ``object_id`` is required, so no caller
-        can re-bind a row that has none; :meth:`_reproof_serialized` refuses that row first."""
+        The entry's own id is read separately from the search that found it. ``LdapAuthenticator``
+        refuses an id-keyed entry that does not read back the id it was found by, before any bind
+        (BACKLOG #2027), so such an entry answers ``None`` from both calls here and is not counted.
+        Each answer is still checked against ``object_id``, for any other directory implementation:
+        an answer carrying no readable id is ``None`` with reason ``directory_object_id_missing``,
+        and one about another object is ``None`` with ``directory_identity_conflict``. Neither is
+        counted. A refused bind is counted once the id-keyed lookup finds the entry, because that
+        bind was judged against this account. ``object_id`` is required, so no caller can re-bind a
+        row that has none; :meth:`_reproof_serialized` refuses that row first."""
         if self._ldap is None:
             return _DirectoryRebind(None)
         try:
@@ -6075,7 +6078,9 @@ class AuthService:
             return _DirectoryRebind(None)
         # Found by the row's own id, so the bind that failed was judged against this account: it
         # counts, whatever id the entry reads back. Not counting an unreadable one would let a
-        # held session send the DC unlimited guesses past the per-session cap.
+        # held session send the DC unlimited guesses past the per-session cap. (LdapAuthenticator
+        # never binds such an entry, and answers None for it here, so it reaches this only through
+        # another directory implementation.)
         return _DirectoryRebind(None) if known is None else _DirectoryRebind(False)
 
     async def has_recent_step_up(self, token: str | None) -> bool:

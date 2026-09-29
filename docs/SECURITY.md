@@ -794,7 +794,11 @@ tuple: they act only on the caller's own account.
 > principal carries no `objectGUID` is now refused as `directory_object_id_missing`, and so are an
 > AD step-up re-bind and `verify_mfa`'s directory check on a row with none; no such refusal counts
 > toward the lockout. The re-bind binds the entry its search finds by the row's `objectGUID`, never
-> by the name. The engine warns once per distinct cause -- the attribute absent, or present in a
+> by the name. Every lookup keyed on a row's `objectGUID` also refuses an entry whose own
+> `objectGUID` is absent, unreadable or another object's, before any password bind: the re-bind,
+> the federated re-resolve, the IdP step-up, `verify_mfa`'s check and the reconciler all read such
+> an entry as `undetermined`, so none of them takes another account's entry as this row's. The
+> engine warns once per distinct cause -- the attribute absent, or present in a
 > shape it cannot read -- so a site on that path learns why its sign-ins fail. **At least one reader
 > still asks about an id-less row by its name:** the session reconciler, on a row with no federated
 > binding. A directory that reissued the name answers for its new holder there. `verify_mfa` asked

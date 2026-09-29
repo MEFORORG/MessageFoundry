@@ -61,8 +61,9 @@ class ProbeOutcome(Enum):
     #: exactly as :attr:`ABSENT` does: it strikes, and revokes at the threshold.
     DISABLED = "disabled"
     #: The entry was found and its ``userAccountControl`` was absent, empty or not an integer
-    #: (BACKLOG #1639). A single one beside readable answers strikes and revokes like :attr:`ABSENT`;
-    #: a wave of them is held (ADR 0195, :func:`hold_engaged`).
+    #: (BACKLOG #1639), or its ``objectGUID`` did not read back the id it was found by (BACKLOG
+    #: #2027). A single one beside readable answers strikes and revokes like :attr:`ABSENT`; a wave
+    #: of them is held (ADR 0195, :func:`hold_engaged`).
     UNDETERMINED = "undetermined"
     #: The lookup matched nothing, or an id-keyed probe held a stored ``objectGUID`` that could not
     #: be parsed, so no search ran. **Ambiguous**: deleted, moved out of the search base, or a search

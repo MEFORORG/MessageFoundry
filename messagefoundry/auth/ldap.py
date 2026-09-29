@@ -102,7 +102,8 @@ class DirectoryAnswer(Enum):
     DISABLED = "disabled"
     #: The entry was found and ``userAccountControl`` was absent, empty or not an integer. Refused
     #: like a disabled account on every sign-in path (BACKLOG #1639); told apart here so the
-    #: reconciler can hold a wave of them (ADR 0195) instead of revoking it.
+    #: reconciler can hold a wave of them (ADR 0195) instead of revoking it. Also an id-keyed
+    #: lookup whose entry does not read back the id it was found by (BACKLOG #2027).
     UNDETERMINED = "undetermined"
 
 
@@ -597,6 +598,17 @@ class LdapAuthenticator:
         This is the lookup a **renamed** account needs. A name-keyed search asks a question the
         directory stopped answering the moment the name changed, and its "no match" is the same answer
         it gives for a deleted or disabled account -- so a rename read as an offboarding.
+
+        **THE ENTRY MUST READ BACK THE ID IT WAS FOUND BY (BACKLOG #2027, ADR 0184 AC-5).** The entry's
+        own ``objectGUID`` is read separately from the filter that found it. An entry whose id is
+        absent, unreadable, or another object's is not provably the account asked about, so it is
+        answered :attr:`DirectoryAnswer.UNDETERMINED`, as an unreadable ``userAccountControl`` is.
+        Checked here, once, because every id-keyed answer comes through here: ``authenticate``'s
+        bind entry, and ``probe_principal`` and ``resolve_principal``, which serve the step-up legs,
+        the federated re-resolve and the session reconciler. So ``authenticate`` never binds the
+        password as such an entry, and the reconciler never reads another entry's name as a rename.
+        UNDETERMINED rather than NOT_FOUND so the reconciler holds a wave of them (ADR 0195): an
+        access change that hides ``objectGUID`` from the service account hits every entry at once.
         """
         value = object_guid_filter_value(object_id)
         if value is None:
@@ -604,9 +616,16 @@ class LdapAuthenticator:
             # a search with no filter, or one falling back to the name, would report on a different
             # question than the one asked. The reconciler reads it as ABSENT (ADR 0195 rule item 1).
             return _Lookup(DirectoryAnswer.NOT_FOUND)
-        return self._search_user(
+        found = self._search_user(
             conn, f"({_OBJECT_GUID_ATTR}={value})", fallback_username=fallback_username
         )
+        if found.info is not None and found.info["object_id"] != normalise_object_guid(object_id):
+            if found.info["object_id"] is not None:
+                # An absent or unreadable id already warned in _object_guid. The value is not
+                # logged: it identifies a directory account.
+                _warn_once_about_object_guid("another object's id on the entry found by it")
+            return _Lookup(DirectoryAnswer.UNDETERMINED)
+        return found
 
     def _resolve_groups(self, conn: Any, user_dn: str, member_of: list[str]) -> frozenset[str]:
         import ldap3
