@@ -509,8 +509,9 @@ async def test_the_body_fetch_requires_view_raw_and_channel_scope(engine: Engine
 async def test_detail_disposition_text_visible_to_operator_and_audited(engine: Engine) -> None:
     # #120: get_message gates error/last_error/event-detail on view_summary and audits the view, but an
     # Operator (holds view_summary + view_raw) must still SEE them — the redaction must not strip an
-    # authorized caller's disposition text. The null path (view_raw without view_summary) is unit-tested
-    # in test_field_authz; no built-in role holds that combo, so it isn't reachable end-to-end.
+    # authorized caller's disposition text. Since BACKLOG #2436 they see it on the reveal_errors act,
+    # and a plain open masks it. The null path (view_raw without view_summary) is unit-tested in
+    # test_field_authz; no built-in role holds that combo, so it isn't reachable end-to-end.
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     retry = RetryPolicy(max_attempts=1, backoff_seconds=1, backoff_multiplier=1)
@@ -522,6 +523,9 @@ async def test_detail_disposition_text_visible_to_operator_and_audited(engine: E
     async with _client(engine, service) as c:
         op = _auth((await _login(c, "op")).json()["token"])
         r = await c.get(f"/messages/{mid}", headers=op)
+        assert r.status_code == 200
+        assert r.json()["outbox"][0]["last_error"] == "****"
+        r = await c.get(f"/messages/{mid}?reveal_errors=true", headers=op)
         assert r.status_code == 200
         assert r.json()["outbox"][0]["last_error"] == "delivery rejected by partner"
     actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]

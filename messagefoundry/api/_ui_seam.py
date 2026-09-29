@@ -252,6 +252,9 @@ from typing import Any
 #: not #2346 would pass the handshake with this console and then fail each message page with a
 #: TypeError. Neither is released, so no such pair can ship, but the gate does not see it.
 #:
+#: BACKLOG #2436 (ASVS 14.2.6, owner ruling R12): ``get_message`` gained a second keyword,
+#: ``reveal_errors``, on the same terms and with the same blind spot. The digest did not move.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
@@ -277,7 +280,8 @@ class CoreHandlers:
 
     list_connections: Callable[..., Awaitable[Any]]
     list_messages: Callable[..., Awaitable[Any]]
-    # Takes ``reveal_summary`` (BACKLOG #2346); the console sets it from its per-route reveal table.
+    # Takes ``reveal_summary`` (BACKLOG #2346) and ``reveal_errors`` (BACKLOG #2436); the console
+    # sets both from its per-route reveal table.
     get_message: Callable[..., Awaitable[Any]]
     # The raw body's own audited fetch (BACKLOG #2345). Its JSON gate is
     # require_phi_read(MESSAGES_VIEW_RAW), so a /ui route calling it must assert messages:view_raw

@@ -26,7 +26,8 @@ at the endpoint, by the coarser whole-body ``messages:view_raw`` gate — not by
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import TypeVar
 
 from pydantic import BaseModel
@@ -103,6 +104,49 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
 #: a field whose grammar is not yet fixed, and the detail route's reveal still returns it whole.
 MASKED_UNTIL_REVEALED: frozenset[str] = frozenset({"summary", "metadata"})
 
+#: Free-text error-tier properties, masked WHOLE until their own reveal act (BACKLOG #2436, ASVS
+#: 14.2.6, owner ruling R12). The engine scrubs these strings, and the scrubber is not
+#: de-identification: an identifier it missed would show on a page opened to check a delivery.
+#:
+#: **Keyed by model, not by property name, unlike** :data:`MASKED_UNTIL_REVEALED`. By name,
+#: ``detail`` would also catch ``CapturedResponseInfo.detail`` on ``/responses``, a different datum
+#: (the partner's reply note) with no reveal act of its own, so it is left out on purpose.
+#:
+#: The list rows are IN, although they have no reveal of their own. ``MessageSummary.error`` on the
+#: message list and search is the same stored ``messages.error`` as ``MessageDetail.error``, and a
+#: ``DeadLetterRow`` is one of the message's outbox rows. Left complete there, a bulk list would hand
+#: out exactly the text the open masks, so the per-message reveal would guard nothing. Each is
+#: revealed by opening its message with the error-text act, one audited request per message.
+#:
+#: Masked whole with :data:`_MASK`, never through :func:`mask_for_display`. That function reads the
+#: composed-summary grammar, so free text with a comma in it would come back as initials.
+ERROR_TEXT_MASKED_UNTIL_REVEALED: Mapping[type[BaseModel], frozenset[str]] = MappingProxyType(
+    {
+        MessageSummary: frozenset({"error"}),
+        MessageDetail: frozenset({"error"}),
+        OutboxInfo: frozenset({"last_error"}),
+        EventInfo: frozenset({"detail"}),
+        DeadLetterRow: frozenset({"last_error"}),
+    }
+)
+
+
+def revealable(model_cls: type[BaseModel], *, summary: bool, error_text: bool) -> frozenset[str]:
+    """The masked properties of ``model_cls`` that the caller's explicit acts lift, for one call.
+
+    ``summary`` is the summary reveal (BACKLOG #2346); ``error_text`` is the error-tier reveal
+    (BACKLOG #2436). They are separate acts, so each lifts only its own set. Built here from the
+    two tables rather than spelled at a call site, so a property added to either table for a model
+    the detail route redacts is revealed by its act without a second edit. That is not true of a
+    LIST model: nothing passes a reveal for ``MessageSummary`` or ``DeadLetterRow``, whose text is
+    revealed by opening the message. A new list row added to a table needs that path too. Only
+    properties the model actually gates are returned, so every name is readable on an instance."""
+    out: frozenset[str] = MASKED_UNTIL_REVEALED if summary else frozenset()
+    if error_text:
+        out |= ERROR_TEXT_MASKED_UNTIL_REVEALED.get(model_cls, frozenset())
+    return out.intersection(gated_properties(model_cls))
+
+
 #: What a masked run is replaced with. ASCII on purpose (the no-glyph rule), and a fixed width so
 #: the mask never leaks the length of what it hides.
 _MASK = "****"
@@ -178,7 +222,9 @@ def redact_unauthorized(  # noqa: UP047
     A route that never calls it returns ``null`` for all of them.
 
     **Authorization is not reveal (ASVS 14.2.6).** A permitted property in
-    :data:`MASKED_UNTIL_REVEALED` is display-masked unless this call names it in ``revealed``. That
+    :data:`MASKED_UNTIL_REVEALED`, or in this model's row of
+    :data:`ERROR_TEXT_MASKED_UNTIL_REVEALED`, is display-masked unless this call names it in
+    ``revealed``; :func:`revealable` builds that set from the caller's acts. That
     is two decisions, not one: the permission says the caller MAY see such values, the reveal says
     they asked for THIS record's.
 
@@ -196,10 +242,12 @@ def redact_unauthorized(  # noqa: UP047
     # with what is actually serialized. The serializer alone would leave the attribute populated.
     withheld: dict[str, object | None] = {prop: None for prop in gated if prop not in allowed}
     masked: set[str] = set()
-    for prop in allowed & MASKED_UNTIL_REVEALED - revealed:
+    error_text = ERROR_TEXT_MASKED_UNTIL_REVEALED.get(type(model), frozenset())
+    for prop in allowed & ((MASKED_UNTIL_REVEALED | error_text) - revealed):
         value = getattr(model, prop, None)
         if isinstance(value, str) and value:
-            withheld[prop] = mask_for_display(value)
+            # Free error text has no grammar to keep, so it is hidden whole (BACKLOG #2436).
+            withheld[prop] = _MASK if prop in error_text else mask_for_display(value)
             masked.add(prop)
     out = model.model_copy(update=withheld)
     if isinstance(out, PhiGatedModel):
