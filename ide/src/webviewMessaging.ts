@@ -28,6 +28,11 @@
 //      path is itself proof the origin is a tuple origin: an opaque origin could not be addressed
 //      this way at all. That is what makes `ev.origin === window.origin` a real comparison rather
 //      than the vacuous `"null" === "null"` it would be under an opaque origin.
+//      THE GUARD DOES NOT REST ON THIS FACT. It was read on one build and measured on two, and
+//      `engines.vscode ^1.95.0` has an open top, so no set of measured builds covers the range. The
+//      guard therefore refuses every message while `window.origin` is `"null"` (or not a string at
+//      all). On a build that served an opaque origin, every panel would discard every message and fail
+//      closed, rather than admit every opaque poster. That holds by construction, not by measurement.
 //   3. What `window.parent` is inside the extension's document DEPENDS ON THE VS CODE VERSION, so no
 //      check may rest on it. The 1.135.0 bridge read above injects
 //      `window.parent = window; window.top = window; window.frameElement = null;`. The BACKLOG #1123
@@ -41,6 +46,9 @@
 //      measured.
 //
 // WHAT EACH RECEIVER CHECKS, and the limits of each:
+//   * `window.origin` is a tuple origin. Checked first: when it is the opaque `"null"`, the guard
+//     discards the message before any other arm runs (fact 2 says why this cannot rest on a
+//     measurement). The cost is a panel that shows nothing on such a build, which is the safe failure.
 //   * `ev.origin === window.origin`. A same-origin test whose comparand the document reads from its
 //     OWN browsing context, not out of the incoming event. The embedder fixed that value and no
 //     poster can change it, which is what distinguishes this from a sender-supplied comparand. It
@@ -188,12 +196,16 @@ export function embedJson(value: unknown): string {
  */
 export function guardScript(token: string): string {
   return `
-    // The trust boundary for this panel — what these three checks rest on is in webviewMessaging.ts.
+    // The trust boundary for this panel — what these checks rest on is in webviewMessaging.ts.
     const MF_CHANNEL = ${embedJson(token)};
     function mfTrusted(ev) {
+      // An opaque origin reads as the string 'null', and then the origin test below would compare
+      // 'null' with 'null' and pass for every opaque poster. Refuse everything instead, on any build.
+      if (typeof window.origin !== 'string' || window.origin === 'null') { return null; }
       // Same-origin. window.origin is this document's own, not read out of the event.
       if (ev.origin !== window.origin) { return null; }
-      // Not a same-document post. NOT window.parent: VS Code shadows that to window itself.
+      // Not a same-document post. NOT window.parent: it differs by VS Code build (undefined at 1.95.0,
+      // where the bridge deletes it; window itself at 1.139.1), so no check may rest on it.
       if (ev.source === window) { return null; }
       const d = ev.data;
       if (!d || typeof d !== 'object' || d.${CHANNEL_FIELD} !== MF_CHANNEL) { return null; }

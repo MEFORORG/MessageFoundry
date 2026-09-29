@@ -12,7 +12,7 @@ import {
 
 // ASVS 3.5.5 (BACKLOG #1123) — the discard half of the webview trust boundary.
 //
-// The guard is three arms (origin, source, channel token) and the ACCEPT case is the control that
+// The guard is four arms (a tuple own-origin, origin, source, channel token) and the ACCEPT case is the control that
 // keeps them honest: a guard that discarded EVERY message would satisfy every discard test here and
 // prove nothing, so the accept case is asserted first and again at the end of the discard suite.
 //
@@ -71,14 +71,14 @@ interface Harness {
  * a receiver in a second script could not see it and the harness would be testing a shape the
  * extension does not have.
  */
-function harness(token: string): Harness {
+function harness(token: string, url = "https://localhost/"): Harness {
   const scriptErrors: unknown[] = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on("jsdomError", (e: unknown) => scriptErrors.push(e));
   const dom = new JSDOM("<!DOCTYPE html><body></body>", {
     runScripts: "dangerously",
     virtualConsole,
-    url: "https://localhost/",
+    url,
   });
   const window = dom.window;
   const script = window.document.createElement("script");
@@ -226,6 +226,31 @@ suite("webview message guard — what it accepts and what it discards", () => {
     }
     // An array IS an object, so what rejects it is the token check rather than the typeof check.
     assert.strictEqual(h.deliver({ data: [TOKEN] }), null);
+  });
+
+  test("discards EVERY message while the page's own origin is opaque", () => {
+    // The opaque-origin arm, which holds by construction rather than by a measured VS Code build.
+    // Under an opaque origin window.origin reads "null", a poster at any opaque origin also reads
+    // "null", and the same-origin test would pass for all of them. The guard must refuse instead.
+    // Every message here is otherwise perfect: same "origin" as the page, not self-posted, right token.
+    const opaque = harness(TOKEN, "about:blank");
+    assert.strictEqual(opaque.window.origin, "null", "the harness did not produce an opaque origin");
+    for (const data of [
+      { command: "rules", rules: [], [CHANNEL_FIELD]: TOKEN },
+      { command: "error", message: "x", [CHANNEL_FIELD]: TOKEN },
+      { type: "map", nodes: [], edges: [], [CHANNEL_FIELD]: TOKEN },
+    ]) {
+      assert.strictEqual(opaque.deliver({ origin: "null", data }), null, `accepted ${String(data.command ?? data.type)}`);
+      // Nor does naming some OTHER origin get past it.
+      assert.strictEqual(opaque.deliver({ origin: "https://localhost", data }), null);
+    }
+
+    // THE CONTROL: the identical message at a tuple origin is accepted, so the discard above is the
+    // opaque-origin arm and not a harness that rejects everything.
+    const tuple = harness(TOKEN);
+    assert.notStrictEqual(tuple.window.origin, "null");
+    const got = tuple.deliver({ data: { command: "rules", rules: [], [CHANNEL_FIELD]: TOKEN } });
+    assert.ok(got, "the same message at a tuple origin must be accepted");
   });
 
   test("the harness can tell accept from discard", () => {
