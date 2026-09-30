@@ -19,7 +19,14 @@ from typing import Any
 import pytest
 
 from messagefoundry.parsing import validate
-from messagefoundry.parsing.validate import _CHOICE_PROBE, _choice_fix_needed, _references
+from messagefoundry.parsing.validate import (
+    _CHOICE_PROBE,
+    _SEQUENCES_LABELLED_CHOICE,
+    _TWO_ALTERNATIVES_PROBE,
+    _choice_error,
+    _choice_fix_needed,
+    _references,
+)
 
 _PID = "PID|1||12345^^^HOSP^MR||DOE^JOHN||19800101|M"
 # ORC-7 is filled because v2.3 makes it required; later versions do not care.
@@ -76,25 +83,69 @@ def test_two_alternatives_in_one_choice_group_are_rejected(version: str) -> None
     assert any("Only one child allowed for choice group" in e for e in result.errors), result.errors
 
 
-def _has_choice_group(ref: tuple[Any, ...]) -> bool:
-    if ref[0] == "choice":
-        return True
-    return any(_has_choice_group(child[1]) for child in ref[1] if child[3] == "GRP")
+def test_a_sequence_hl7apy_labels_choice_keeps_all_its_parts() -> None:
+    """RSP_E22_QUERY_ACK is QAK then QPD, both required. hl7apy's table calls it a choice, so an
+    "exactly one of" rule applied to every choice would reject every valid RSP^E22. Unaided
+    hl7apy accepts this message; the shim must not start rejecting it."""
+    result = validate(
+        _msg(_msh("RSP^E22", "2.6"), "MSA|AA|MSG000", "QAK|Q1|OK", "QPD|E22^Auth^HL70471|Q1")
+    )
+    assert result.ok, result.errors
+
+
+def _choice_groups() -> dict[str, list[tuple[Any, ...]]]:
+    """Every group any shipped hl7apy table labels ``choice``, with its alternatives."""
+    import hl7apy
+
+    found: dict[str, list[tuple[Any, ...]]] = {}
+    for hl7_version in hl7apy.SUPPORTED_LIBRARIES:
+        for name, ref in hl7apy.load_library(hl7_version).GROUPS.items():
+            if ref[0] == "choice":
+                found.setdefault(name, []).extend(tuple(alt) for alt in ref[1])
+    return found
+
+
+def test_the_choice_group_census_still_matches_the_shim() -> None:
+    """Goes red when hl7apy's tables change under the shim.
+
+    Every entry of the sequence list must still be labelled choice somewhere, or it is stale.
+    Every other choice group must be a plain list of alternatives, each present exactly once.
+    An optional or repeating alternative is the mark of a sequence mislabelled as a choice,
+    which is how the listed ones were found; and ``_choice_error`` relies on no alternative
+    needing more than one occurrence.
+    """
+    groups = _choice_groups()
+    assert len(groups) > 50, len(groups)  # the control: the census really read the tables
+    assert set(_SEQUENCES_LABELLED_CHOICE) <= set(groups)
+    for name, alternatives in groups.items():
+        if name not in _SEQUENCES_LABELLED_CHOICE:
+            assert {alt[2] for alt in alternatives} == {(1, 1)}, name
 
 
 def test_every_shipped_structure_table_takes_the_rewrite() -> None:
-    """``validate`` falls back to unaided hl7apy if the rewrite cannot read a table, which would
-    bring the bug back for that structure without a sound. This walks every message structure of
-    every HL7 version hl7apy ships, so a table shape the rewrite does not know fails here."""
+    """``validate`` falls back to unaided hl7apy, with a warning, if the rewrite cannot read a
+    table. This walks every message structure of every HL7 version hl7apy ships, so a table
+    shape the rewrite does not know fails here instead."""
     import hl7apy
 
     rewritten = 0
     for hl7_version in hl7apy.SUPPORTED_LIBRARIES:
         for structure in hl7apy.load_library(hl7_version).MESSAGES:
-            _original, ref = _references(structure, "Message", hl7_version)
-            assert not _has_choice_group(ref), (hl7_version, structure)
+            _references(structure, "Message", hl7_version)
             rewritten += 1
     assert rewritten > 1000, rewritten  # the control: the loop really walked the tables
+
+
+def test_an_empty_choice_group_is_reported() -> None:
+    """The parser never builds an empty group from message text, so this arm is reached only
+    through hl7apy's element API. It keeps the branch honest."""
+    from hl7apy import load_reference
+    from hl7apy.core import Group
+
+    name = "ORM_O01_OBRRQDRQ1RXOODSODT_SUPPGRP"
+    error = _choice_error(Group(name, version="2.5.1"), load_reference(name, "Group", "2.5.1"))
+    assert error is not None
+    assert error.startswith(f"Missing required child for choice group {name}")
 
 
 def test_hl7apy_still_has_the_bug_so_the_shim_is_still_on() -> None:
@@ -116,5 +167,6 @@ def test_hl7apy_still_has_the_bug_so_the_shim_is_still_on() -> None:
     with pytest.raises(ValidationError, match="Missing required child ORM_O01_OBRRQDRQ1RXOODSODT"):
         Validator.validate(probe)
     assert _choice_fix_needed()
-    # The control: the engine accepts the same probe, so it is a valid message.
+    # The control: the engine accepts the valid probe and rejects the two-alternative one.
     assert validate(_CHOICE_PROBE).ok
+    assert not validate(_TWO_ALTERNATIVES_PROBE).ok
