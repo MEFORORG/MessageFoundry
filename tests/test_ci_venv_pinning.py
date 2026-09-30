@@ -2304,9 +2304,9 @@ def test_the_step_that_runs_a_release_tool_also_installs_it(workflow: str) -> No
     """The step running `python -m build` / `cyclonedx_py` / `sigstore` must install the lock ITSELF.
 
     THE INVARIANT THE SITE COUNT CANNOT STATE. `LOCK_INSTALLED_TOOLCHAINS` asserts that `release.yml`
-    holds exactly six `--require-hashes -r ci/locks/release-tools.lock` lines, and that is an AGGREGATE:
-    a refactor that drops the harness build's install and adds one to some new step keeps the total at
-    six and stays green, with the harness wheel then built by whatever `build` the runner happened to
+    holds exactly seven `--require-hashes -r ci/locks/release-tools.lock` lines, and that is an
+    AGGREGATE: a refactor that drops the harness build's install and adds one to some new step keeps the total at
+    seven and stays green, with the harness wheel then built by whatever `build` the runner happened to
     have. The count sees a number; this sees the pairing, and it names the offending STEP rather than
     reporting that a number moved.
 
@@ -2327,7 +2327,7 @@ def test_the_step_that_runs_a_release_tool_also_installs_it(workflow: str) -> No
         if not any(_RELEASE_TOOLS_LOCK in ln for ln in _installs_in(run)):
             offenders.append(f"{label} runs {used} but does not install {_RELEASE_TOOLS_LOCK}")
     print(f"[ci-venv-pinning] {workflow}: {checked} step(s) run a release tool")
-    # Non-vacuity: `security.yml` runs its two SBOM steps, `release.yml` six. A zero here means the
+    # Non-vacuity: `security.yml` runs its two SBOM steps, `release.yml` seven. A zero here means the
     # scan stopped matching, which must not read as "no offenders".
     assert checked > 0, (
         f"{workflow} has no step invoking {list(_RELEASE_TOOL_MODULES)} — either the release path was "
