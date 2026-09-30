@@ -447,6 +447,15 @@ jobs:
         if: runner.os == 'Linux'
         run: python scripts/quality/stale_repo_slug_check.py
 
+      # Changelog fragments (BACKLOG #2080). A pull request adds its entry as a file under
+      # changelog.d/ instead of editing CHANGELOG.md, and the release pull request folds them in.
+      # A misnamed or malformed fragment fails HERE, on its own pull request, rather than at release.
+      # DELIBERATELY NOT PATHS-FILTERED, for the reason the steps above give: a fragment is .md, so a
+      # pull request adding only a fragment is docs-only and would skip a filtered step. Stdlib only.
+      - name: Changelog fragments well-formed
+        if: runner.os == 'Linux'
+        run: python scripts/release/changelog_fragments.py check
+
       # BACKLOG #1226. The screen shipped and NOTHING RAN IT, so it read as coverage and produced
       # none -- a username reaching a WHERE clause was found three times by accident and zero times
       # on purpose. --baseline is what makes this step able to FAIL without turning the screen into
