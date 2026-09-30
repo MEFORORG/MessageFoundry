@@ -1433,6 +1433,45 @@ function Find-SubstitutionEnd([string]$Text, [int]$At, [string]$Convention, [int
     -1
 }
 
+# IS EVERY PROGRAM ON A HEREDOC'S OPENING LINE ONE THAT CANNOT RUN THE BODY? (BACKLOG #1072)
+#
+# Asked of the RAW text of the logical line that opened one or more heredocs, and only by the per-line
+# view's data-body exclusion (see Get-SegmentView). A yes lets that view skip the body lines; a no keeps
+# today's reading, which scans them raw.
+#
+# AN ALLOWLIST OF PROGRAMS KNOWN NOT TO RUN THEIR INPUT, NEVER A LIST OF ONES THAT DO. Get-FlagOwner's
+# interpreter list is the wrong instrument here: it has to be complete to be safe, and it is not --
+# `source /dev/stdin <<'EOF'` and `at now <<'EOF'` both run the body and neither is on it. An unknown
+# program answers no, and no costs only the over-deny this change removes, never a hole.
+#
+#   * The command that OWNS a heredoc must be `cat` or `tee`, which copy their input and run nothing.
+#     `git commit -F - <<'EOF'` is left out on purpose: a git alias can be a shell command that reads
+#     stdin, so git reading a body is not provably data. It keeps its over-deny.
+#   * Every OTHER command on the line must be one of a short list that cannot run a file just written
+#     either, so `cat <<'EOF' > s.sh && ./s.sh` and `cat <<'EOF' | bash` answer no.
+#
+# THE SPLIT IS DELIBERATELY CRUDE, AND CRUDE FAILS CLOSED. Pieces break on every separator character,
+# quoted or not, and on `(` and a backtick, so a separator inside a quoted word or a substitution only
+# makes a piece start with something off the list. The first word of a piece is its program, after
+# `NAME=value` prefixes; a leading redirection, a keyword such as `if`, or a quoted program name is not
+# on the list, so each answers no. `>&` and `<&` are redirections, not separators.
+function Test-HeredocLineIsDataOnly([string]$Line) {
+    $owners = @('cat', 'tee')
+    $others = @('cat', 'tee', 'echo', 'printf', 'git', 'gh', 'mkdir', 'cd', 'ls', 'true')
+    $sawOwner = $false
+    foreach ($piece in ($Line -split '[;|()`\r\n]|(?<![<>])&')) {
+        $toks = @($piece -split '\s+' | Where-Object { $_ -and $_ -notmatch '^[A-Za-z_][A-Za-z0-9_]*=' })
+        if ($toks.Count -eq 0) { continue }
+        $name = (($toks[0] -split '[\\/]')[-1] -replace '(?i)\.exe$', '').ToLowerInvariant()
+        if ($piece.Contains('<<')) {
+            if ($owners -notcontains $name) { return $false }
+            $sawOwner = $true
+        }
+        elseif ($others -notcontains $name) { return $false }
+    }
+    $sawOwner
+}
+
 # THE COMMAND'S LOGICAL LINES: a newline INSIDE a quoted span does not end a line (BACKLOG #1429).
 #
 # Get-ScannableSegments splits on newlines before any quoting is considered, so a quoted span crossing
@@ -1494,7 +1533,8 @@ function Find-SubstitutionEnd([string]$Text, [int]$At, [string]$Convention, [int
 # why it is a second view: every rule reaches a segment through a continue-or-deny loop, so the
 # per-line segments still deny exactly what they denied before. The ANSI-C and nesting shapes are
 # pinned as must-stay rows for that reason.
-function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest) {
+function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest,
+    [System.Collections.Generic.List[int]]$DataBodyLines = $null) {
     $posix = $Convention -eq 'posix'
     $pwsh = $Convention -eq 'pwsh'
     if (-not ($posix -or $pwsh)) { return @($Text -split '\r?\n') }
@@ -1516,6 +1556,11 @@ function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest)
     $complexSpan = $false
     # Positions past which a here-string terminator is already known to be absent, per quote.
     $noTerminatorFrom = @{}
+    # Where the current logical line began in $Text, and a running newline count, for the data-body
+    # line numbers handed back through $DataBodyLines (BACKLOG #1072).
+    $lineStart = 0
+    $nlAt = 0
+    $nlCount = 0
     $n = $Text.Length
     $i = 0
     while ($i -lt $n) {
@@ -1547,8 +1592,17 @@ function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest)
         if ($ch -eq "`n") {
             $line = $sb.ToString().TrimEnd([char]13); [void]$sb.Clear(); $i++
             if ($unmodelled) { $out.AddRange([string[]]@($line -split '\r?\n')) } else { $out.Add($line) }
+            # Only asked when a caller wants the data-body lines, and only of a line the model followed.
+            $dataLine = $null -ne $DataBodyLines -and $heredocs.Count -gt 0 -and -not $unmodelled -and
+                (Test-HeredocLineIsDataOnly $Text.Substring($lineStart, $i - 1 - $lineStart))
             $unmodelled = $false
             foreach ($h in $heredocs) {
+                if ($dataLine) {
+                    $nlCount += ($Text.Substring($nlAt, $i - $nlAt).Split("`n").Count - 1); $nlAt = $i
+                }
+                $bodyFirst = $nlCount
+                $bodyLines = 0
+                $terminated = $false
                 # An unterminated body runs to the end of the text, as bash reads it.
                 $body = [System.Text.StringBuilder]::new()
                 while ($i -lt $n) {
@@ -1558,14 +1612,19 @@ function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest)
                     $i = $e + 1
                     $bare = $line.TrimEnd([char]13)
                     if ($h.Tabs) { $bare = $bare.TrimStart([char]9) }
-                    if ($bare -ceq $h.Word) { break }
+                    if ($bare -ceq $h.Word) { $terminated = $true; break }
                     [void]$body.Append($line).Append("`n")
+                    $bodyLines++
                 }
                 if ($h.Conv -ne 'none') {
                     $nested.AddRange([string[]]@(Split-LogicalLines $body.ToString() $h.Conv -NoNest))
                 }
+                elseif ($dataLine -and $h.Quoted -and $terminated) {
+                    for ($k = 0; $k -lt $bodyLines; $k++) { $DataBodyLines.Add($bodyFirst + $k) }
+                }
             }
             $heredocs.Clear()
+            $lineStart = [Math]::Min($i, $n)
             foreach ($x in $nested) { if ($x.Trim()) { $out.Add($x) } }
             $nested.Clear()
             continue
@@ -1596,14 +1655,18 @@ function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest)
             # The delimiter word, quotes and backslashes removed, as bash compares it.
             $word = [System.Text.StringBuilder]::new()
             $wq = [char]0
+            # Any quoting in the word, a quote or a backslash, turns expansion OFF in the body.
+            $quotedWord = $false
             while ($j -lt $n -and $Text[$j] -ne "`n") {
                 $c = $Text[$j]
                 if ($wq -ne [char]0) {
                     if ($c -eq $wq) { $wq = [char]0 } else { [void]$word.Append($c) }
                     $j++; continue
                 }
-                if ($c -eq "'" -or $c -eq '"') { $wq = $c; $j++; continue }
-                if ($c -eq '\' -and $j + 1 -lt $n) { [void]$word.Append($Text[$j + 1]); $j += 2; continue }
+                if ($c -eq "'" -or $c -eq '"') { $wq = $c; $quotedWord = $true; $j++; continue }
+                if ($c -eq '\' -and $j + 1 -lt $n) {
+                    [void]$word.Append($Text[$j + 1]); $quotedWord = $true; $j += 2; continue
+                }
                 if ([char]::IsWhiteSpace($c) -or ';&|<>()'.IndexOf($c) -ge 0) { break }
                 [void]$word.Append($c); $j++
             }
@@ -1611,6 +1674,7 @@ function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest)
                 # Which program reads the body: the text of this line before `<<` is its command.
                 $heredocs.Add([pscustomobject]@{
                     Word = $word.ToString(); Tabs = $tabs; Conv = (Get-FlagOwner $sb.ToString())
+                    Quoted = $quotedWord
                 })
                 [void]$sb.Append($Text.Substring($i, $j - $i))
                 $i = $j
@@ -1681,6 +1745,43 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
     # PHYSICAL lines, unless the caller handed down LOGICAL ones -- which only the second view at
     # the end of this function does (BACKLOG #1429).
     $lines = @(if ($null -ne $LogicalLines) { $LogicalLines } else { $folded -split '\r?\n' })
+
+    # A DATA HEREDOC'S BODY IS NOT A COMMAND, AND THIS VIEW USED TO READ IT AS ONE (BACKLOG #1072).
+    # `cat <<'EOF' > notes.txt` whose body quotes a disarm line refused under rule 3c, and the same
+    # body quoting `git reset --hard` refused under rule 3 -- on the fleet's own documentation and
+    # commit-message tooling. The logical view below already left such a body out; this view scanned
+    # every body line raw. The lines Split-LogicalLines reports as a data body are blanked here, in
+    # place, so line numbers hold. The blanked text also drops out of each later line's Prior, which is
+    # right: it never ran, so it cannot have set anything a later line inherits.
+    #
+    # THIS IS THE ONE PLACE THE SECOND VIEW'S MODEL CAN REMOVE A PER-LINE DENY, so it is fenced four
+    # ways, and each fence is a must-trip row in tests/test_worktree_gate_control_plane.py. A body is
+    # blanked only when ALL of these hold; anything else keeps the raw reading:
+    #   1. the delimiter word is QUOTED (`<<'EOF'`, `<<"EOF"`, `<<\EOF`), so the shell expands nothing
+    #      in the body -- an unquoted body's `$( )` and backtick RUN;
+    #   2. the body is TERMINATED by a line the shell accepts, so the model is not guessing its end;
+    #   3. the opening line was followed by the quote model rather than handed back as physical lines;
+    #   4. Test-HeredocLineIsDataOnly says every program on the opening line is one that cannot run it.
+    # A body the model mis-places, because a quote it reads differently from bash hides or invents a
+    # `<<`, is what this fencing cannot see. That is at least the residual set Split-LogicalLines
+    # already lists as not modelled.
+    #
+    # WHAT STAYS OPEN, deliberately: a body written to a file and run on a LATER line
+    # (`cat <<'EOF' > s.sh` then `bash s.sh`). That is the same reach `echo '<gated>' > s.sh` already
+    # has -- a quoted span is blanked before any rule reads it -- so this adds no new class of bypass.
+    # Only the Bash tool's convention models a heredoc, so nothing changes for any other tool.
+    $physicalLines = $lines
+    $logical = $null
+    if ($null -eq $LogicalLines -and $Convention -eq 'posix' -and $lines.Count -gt 1 -and
+        $folded.Length -le 100000 -and $folded.Contains('<<')) {
+        $dataBodyLines = [System.Collections.Generic.List[int]]::new()
+        $logical = @(Split-LogicalLines $folded $Convention -DataBodyLines $dataBodyLines)
+        if ($dataBodyLines.Count -gt 0) {
+            # A COPY, so the comparison with the logical view below still reads the physical lines.
+            $lines = [string[]]$lines.Clone()
+            foreach ($k in $dataBodyLines) { if ($k -lt $lines.Count) { $lines[$k] = '' } }
+        }
+    }
 
     # ONE LEVEL of interpreter recursion -- and the flag is recognised by a RULE, never by a list of
     # spellings. What stood here was a fixed list of literals (`-c|-lc|-ec|-Command|-EncodedCommand` plus
@@ -2179,7 +2280,8 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
     # APPENDED AFTER EVERY EXISTING SEGMENT, AND ADDITIVE, for the reason the cmd view above gives:
     # every rule reaches a segment through a continue-or-deny loop, and rule 3's first-verb bookkeeping
     # sees exactly what it saw. So a place where Split-LogicalLines models the shell WRONGLY can cost a
-    # missed straddle or a false deny here, and never a deny the per-line view already had.
+    # missed straddle or a false deny here, and never a deny the per-line view already had -- with ONE
+    # fenced exception, the data-heredoc bodies blanked near the top of this function (BACKLOG #1072).
     #
     # ONLY WHEN IT CAN DIFFER. A single-line command, one with no quote character at all, or one whose
     # logical lines are its physical lines would repeat the view above for nothing, on a hook that runs
@@ -2192,8 +2294,8 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
     # =================================================================================================
     if ($null -eq $LogicalLines -and $lines.Count -gt 1 -and $folded.Length -le 100000 -and
         $folded.IndexOfAny([char[]]"'`"") -ge 0) {
-        $logical = @(Split-LogicalLines $folded $Convention)
-        if (($logical -join [char]0) -cne ($lines -join [char]0)) {
+        if ($null -eq $logical) { $logical = @(Split-LogicalLines $folded $Convention) }
+        if (($logical -join [char]0) -cne ($physicalLines -join [char]0)) {
             Get-SegmentView $Cmd $Convention -LogicalLines $logical
         }
     }
