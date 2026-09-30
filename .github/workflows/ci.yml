@@ -356,10 +356,14 @@ jobs:
           # closes it: `tests/` runs here and nowhere else, so this is the only install line that can
           # exercise it, and the extra costs six small pure-Python wheels already pinned in the lock.
           # It also lets mypy type-check the urllib3 replica against the real py.typed library.
+          # [sftp] (paramiko, already pinned in the lock) so the real-paramiko tests RUN rather than
+          # importorskip-skipping (BACKLOG #2084). Without it a paramiko bump could reword a message a
+          # fix matches on, and CI would stay green. MEFOR_REQUIRE_SFTP_EXTRA on the pytest step arms
+          # tests/test_sftp_extra_on_ci_leg.py, which fails if this extra is dropped.
           # + the browser ops console as a second editable wheel (Option B) so the moved /ui tests
           # (tests/test_webui.py etc. now import messagefoundry_webconsole) run on this full-suite leg.
           # It is NOT a published extra yet (would break uv lock), so install it by path.
-          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault]" -e packaging/messagefoundry-webconsole
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp]" -e packaging/messagefoundry-webconsole
 
       # ruff (lint + format) and mypy are PLATFORM-INDEPENDENT results — a ruff/format outcome is
       # identical on every OS, and mypy's platform-specific branches are covered by running it for
@@ -854,6 +858,8 @@ jobs:
           # BACKLOG #1260: empty on purpose -- see the comment above the run line. The wrapper's
           # default clause names the database-leg crash classes, neither established for this leg.
           RETRY_NATIVE_CRASH_CAUSE: ""
+          # BACKLOG #2084: this leg installs [sftp]; the guard test fails if paramiko cannot import.
+          MEFOR_REQUIRE_SFTP_EXTRA: "1"
         # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
         # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
         # excluding it; without this subtraction the SAME 356 tests would then run TWICE on every leg.
