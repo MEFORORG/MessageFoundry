@@ -116,7 +116,9 @@ jobs:
       # release pull request runs `changelog_fragments.py assemble`. The release notes below are read
       # from CHANGELOG.md alone, so a fragment still in the tree at the tag would be missing from them.
       # READ-ONLY: this step refuses; it never assembles or commits, because a job holding publish
-      # credentials must not write to the repository. It runs first, before anything is built.
+      # credentials must not write to the repository. It runs first, before anything is built. It
+      # binds EVERY engine tag, a `-rc` pre-release included, since each publishes notes from
+      # CHANGELOG.md; changelog.d/README.md gives the release order.
       - name: Changelog fragments assembled (none left behind at the tag)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: python scripts/release/changelog_fragments.py check --no-pending

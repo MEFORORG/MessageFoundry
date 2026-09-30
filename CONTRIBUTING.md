@@ -53,6 +53,8 @@ maintainer.)
    [changelog.d/README.md](changelog.d/README.md) has the rules and an example. Check it with
    `python scripts/release/changelog_fragments.py check`. The release pull request folds every
    fragment into `CHANGELOG.md` with `python scripts/release/changelog_fragments.py assemble`.
+   This is the engine's changelog. A web console change still goes straight into
+   `packaging/messagefoundry-webconsole/CHANGELOG.md`.
 5. **Run the gates** — a change isn't ready until these pass (the PySide6 harness/Qt tests need the
    offscreen platform):
    ```powershell

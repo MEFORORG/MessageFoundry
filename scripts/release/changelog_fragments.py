@@ -9,12 +9,16 @@ so nearly every pull request conflicted with nearly every other, and each confli
 hand. A hand resolution can drop an entry and still pass every check (``docs/WORKTREES.md``,
 "Resolving a conflict").
 
-A pull request now adds ONE NEW FILE under ``changelog.d/`` instead. Two new files never conflict.
-The release pull request runs ``assemble``, which appends every fragment to the ``[Unreleased]``
-section and deletes the fragments, in the same commit that renames that section to the version.
+A pull request now adds ONE NEW FILE under ``changelog.d/`` instead. Two pull requests adding
+DIFFERENT files do not conflict; two that pick the same name still do, which is why a taken name
+takes a suffix. The release pull request runs ``assemble`` BEFORE it renames ``[Unreleased]`` to the
+version: ``assemble`` appends every fragment under ``[Unreleased]`` and deletes the fragments.
 
-WHY IN-REPO AND NOT towncrier. The job is about a hundred lines of stdlib. A new dependency costs a
-vet note, a lock entry and a supply-chain review (CLAUDE.md section 7); this costs none of them.
+WHY IN-REPO AND NOT towncrier. The job is a couple of hundred lines of stdlib. A new dependency
+costs a vet note, a lock entry and a supply-chain review (CLAUDE.md section 7); this costs none.
+
+SCOPE. The ENGINE changelog only. The web console is separately versioned and keeps its own
+``packaging/messagefoundry-webconsole/CHANGELOG.md``, edited directly as before.
 
 FRAGMENT RULES. The name is ``<name>.<category>.md``:
 
@@ -25,30 +29,33 @@ FRAGMENT RULES. The name is ``<name>.<category>.md``:
 
 The body is one or more Markdown bullets. Every non-blank line starts with ``- `` or with
 whitespace (a continuation), and no line may start with ``#``: a heading inside a fragment would
-split the section it lands in.
+split the section it lands in. A relative link must start with ``../`` so it resolves from
+``changelog.d/``; ``assemble`` drops that ``../`` so it resolves from the repository root, where
+``CHANGELOG.md`` lives. Text is otherwise copied byte for byte, trailing spaces included.
 
-``changelog.d/README.md`` is the one other file allowed in the directory. Any other name is an
-ERROR, never skipped: a misnamed fragment that ``assemble`` quietly ignored would drop its entry
-from the release notes, which is the loss this script exists to prevent.
+``changelog.d/README.md`` is the one other file allowed in the directory, and dot-files (editor swap
+files, ``.DS_Store``) are ignored. Any other name is an ERROR, never skipped: a misnamed fragment
+that ``assemble`` quietly ignored would drop its entry from the release notes.
 
 Usage::
 
-    python scripts/release/changelog_fragments.py check               # tests; any time
-    python scripts/release/changelog_fragments.py pr-check --base-changelog <file>  # ci.yml, a PR
+    python scripts/release/changelog_fragments.py check               # the tests; any time
+    python scripts/release/changelog_fragments.py pr-check --base-changelog FILE  # ci.yml
     python scripts/release/changelog_fragments.py check --no-pending  # release.yml, on a tag
     python scripts/release/changelog_fragments.py assemble            # the release PR
 
-``pr-check`` compares the pull request's ``CHANGELOG.md`` with the base branch's. A pull request
-that adds a version heading while fragments remain is refused: that is a release pull request that
-forgot ``assemble``, caught before the tag rather than after it. A pull request that edits
-``CHANGELOG.md`` without adding a version heading gets a WARNING, never a failure, because pull
-requests opened before this change still edit it and turning them red would buy nothing.
+``pr-check`` compares a pull request's ``CHANGELOG.md`` with its base's. It REFUSES a pull request
+that adds a version heading while fragments remain, or while ``[Unreleased]`` still holds entries
+(the fragments were assembled after the rename, so the release notes would miss them). It WARNS,
+never fails, on a pull request that edits ``CHANGELOG.md`` without adding a version heading: pull
+requests opened before this change still edit it, and turning them red would buy nothing.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import subprocess  # nosec B404 - fixed argv, no shell
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -58,8 +65,8 @@ FRAGMENT_DIR = "changelog.d"
 CHANGELOG = "CHANGELOG.md"
 README = "README.md"
 
-#: Keep a Changelog 1.1.0's six headings, in its order. The order decides where a NEW heading goes
-#: when ``[Unreleased]`` has none for that category yet; an existing heading is never moved.
+#: Keep a Changelog 1.1.0's six headings, in its order. A NEW heading is placed before the first
+#: existing heading of a later category; an existing heading is never moved.
 CATEGORIES: dict[str, str] = {
     "added": "Added",
     "changed": "Changed",
@@ -75,6 +82,9 @@ _VERSION_HEADING = re.compile(r"^## \[(?!Unreleased\])([^\]]+)\]", re.MULTILINE)
 #: A Markdown link reference definition at column 0, e.g. ``[0.4.0]: https://...``. The compare
 #: links at the foot of the file are not part of any section, so a section never runs into them.
 _LINK_DEF = re.compile(r"^\[[^\]]+\]:\s")
+#: An inline link target, and the targets that are NOT relative paths: a scheme, an anchor, or rooted.
+_LINK_TARGET = re.compile(r"\]\(([^)\s]+)")
+_NOT_RELATIVE = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|#|/)")
 
 
 class Fragment(NamedTuple):
@@ -96,6 +106,19 @@ def _sort_key(fragment: Fragment) -> tuple[int, int, str]:
     return (1, 0, fragment.name)
 
 
+def _link_problems(number: int, line: str) -> list[str]:
+    problems: list[str] = []
+    for target in _LINK_TARGET.findall(line):
+        if _NOT_RELATIVE.match(target):
+            continue
+        if not target.startswith("../") or target.startswith("../../"):
+            problems.append(
+                f"line {number}: relative link {target!r} must start with exactly one '../' "
+                f"(written from {FRAGMENT_DIR}/; assemble drops it for {CHANGELOG})"
+            )
+    return problems
+
+
 def _body_problems(body: str) -> list[str]:
     """One message per faulty line. The first non-blank line must be a bullet; later ones may also
     be indented continuations."""
@@ -112,6 +135,7 @@ def _body_problems(body: str) -> list[str]:
             problems.append(
                 f"line {number} is neither a bullet ('- ') nor an indented continuation"
             )
+        problems.extend(_link_problems(number, line))
         seen_content = True
     return problems if seen_content else ["is empty"]
 
@@ -126,7 +150,7 @@ def load(fragment_dir: Path) -> list[Fragment]:
     fragments: list[Fragment] = []
     problems: list[str] = []
     for path in sorted(fragment_dir.iterdir()):
-        if path.name == README:
+        if path.name == README or path.name.startswith("."):
             continue
         where = f"{FRAGMENT_DIR}/{path.name}"
         match = _NAME.match(path.name)
@@ -153,11 +177,13 @@ def load(fragment_dir: Path) -> list[Fragment]:
     return sorted(fragments, key=_sort_key)
 
 
-def _bullet_lines(fragments: list[Fragment]) -> list[str]:
-    lines: list[str] = []
-    for fragment in fragments:
-        lines.extend(line.rstrip() for line in fragment.body.strip("\n").splitlines())
-    return lines
+def rendered(fragment: Fragment) -> list[str]:
+    """The fragment's lines as they land in ``CHANGELOG.md``: verbatim, less one ``../`` per link."""
+    body = _LINK_TARGET.sub(
+        lambda m: "](" + (m.group(1)[3:] if m.group(1).startswith("../") else m.group(1)),
+        fragment.body.strip("\n"),
+    )
+    return body.splitlines()
 
 
 def _section_end(lines: list[str], start: int) -> int:
@@ -174,44 +200,59 @@ def _last_content(lines: list[str], start: int, end: int) -> int:
     return end
 
 
-def assemble_text(changelog: str, fragments: list[Fragment]) -> str:
-    """``changelog`` with every fragment appended under ``## [Unreleased]``.
-
-    Each category's bullets go at the END of that category's FIRST ``###`` subsection, after every
-    existing bullet, so nothing already there moves. A category with no subsection gets a new one at
-    the end of the section. Raises :class:`FragmentError` if ``[Unreleased]`` is not there exactly once.
-    """
-    if not fragments:
-        return changelog
-    lines = changelog.split("\n")
+def _unreleased(lines: list[str]) -> int:
     heads = [i for i, line in enumerate(lines) if line.rstrip() == _UNRELEASED]
     if len(heads) != 1:
         raise FragmentError(
             f"{CHANGELOG} must hold exactly one '{_UNRELEASED}' line; found {len(heads)}"
         )
-    head = heads[0]
+    return heads[0]
+
+
+def assemble_text(changelog: str, fragments: list[Fragment]) -> str:
+    """``changelog`` with every fragment appended under ``## [Unreleased]``.
+
+    Each category's lines go at the END of that category's FIRST ``###`` subsection, after its
+    existing bullets, so nothing already there moves. A category with no subsection gets a new one,
+    placed before the first heading of a later category (Keep a Changelog order), else at the end.
+    Raises :class:`FragmentError` if ``[Unreleased]`` is not there exactly once, or if a fragment's
+    text is already in the changelog -- a second run after a partial delete would duplicate it.
+    """
+    if not fragments:
+        return changelog
+    lines = changelog.split("\n")
+    head = _unreleased(lines)
+    padded = "\n" + changelog.replace("\r\n", "\n") + "\n"
+    already = [f for f in fragments if "\n" + "\n".join(rendered(f)) + "\n" in padded]
+    if already:
+        raise FragmentError(
+            f"already in {CHANGELOG}, so assembling again would duplicate them; delete these:\n  "
+            + _listing(already)
+        )
+    order = list(CATEGORIES)
     for category, title in CATEGORIES.items():
         chosen = [f for f in fragments if f.category == category]
         if not chosen:
             continue
-        bullets = _bullet_lines(chosen)
+        block_lines = [line for f in chosen for line in rendered(f)]
         end = _section_end(lines, head)
-        heading = next(
-            (i for i in range(head + 1, end) if lines[i].rstrip() == f"### {title}"), None
-        )
+        titles = {
+            i: lines[i].rstrip()[4:] for i in range(head + 1, end) if lines[i].startswith("### ")
+        }
+        heading = next((i for i, t in titles.items() if t == title), None)
         if heading is not None:
-            sub_end = next(
-                (i for i in range(heading + 1, end) if lines[i].startswith(("### ", "## "))), end
-            )
+            sub_end = next((i for i in titles if i > heading), end)
             at = _last_content(lines, heading + 1, sub_end)
-            lines[at:at] = bullets
-        else:
-            at = _last_content(lines, head + 1, end)
-            block = ["", f"### {title}", *bullets]
-            # With no blank line left before the next heading, add one so the two stay apart.
-            if at == end < len(lines):
-                block.append("")
-            lines[at:at] = block
+            lines[at:at] = block_lines
+            continue
+        later = {CATEGORIES[c] for c in order[order.index(category) + 1 :]}
+        target = next((i for i, t in titles.items() if t in later), end)
+        at = _last_content(lines, head + 1, target)
+        block = ["", f"### {title}", *block_lines]
+        # With no blank line left before the next heading, add one so the two stay apart.
+        if at == target < len(lines):
+            block.append("")
+        lines[at:at] = block
     return "\n".join(lines)
 
 
@@ -221,8 +262,24 @@ def new_versions(base: str, head: str) -> list[str]:
     return [version for version in _VERSION_HEADING.findall(head) if version not in known]
 
 
+def _unreleased_entries(changelog: str) -> int:
+    """How many non-blank, non-heading lines ``[Unreleased]`` holds; 0 without the heading."""
+    lines = changelog.split("\n")
+    heads = [i for i, line in enumerate(lines) if line.rstrip() == _UNRELEASED]
+    if len(heads) != 1:
+        return 0
+    body = lines[heads[0] + 1 : _section_end(lines, heads[0])]
+    return sum(1 for line in body if line.strip() and not line.startswith("#"))
+
+
 def _listing(fragments: list[Fragment]) -> str:
     return "\n  ".join(f"{FRAGMENT_DIR}/{f.path.name}" for f in fragments)
+
+
+_ORDER_HINT = (
+    "Undo the rename, run `python scripts/release/changelog_fragments.py assemble`, THEN rename "
+    f"'{_UNRELEASED}' to the version and add a fresh empty one above it."
+)
 
 
 def pr_check(root: Path, base_changelog: str) -> int:
@@ -236,8 +293,17 @@ def pr_check(root: Path, base_changelog: str) -> int:
     if added and fragments:
         print(
             f"this pull request adds version heading(s) {', '.join(added)} to {CHANGELOG} while "
-            f"{len(fragments)} fragment(s) remain, so that release would miss them. Run `python "
-            f"scripts/release/changelog_fragments.py assemble` first:\n  {_listing(fragments)}",
+            f"{len(fragments)} fragment(s) remain, so that release would miss them. "
+            f"{_ORDER_HINT}\n  {_listing(fragments)}",
+            file=sys.stderr,
+        )
+        return 1
+    stranded = _unreleased_entries(head)
+    if added and stranded:
+        print(
+            f"this pull request adds version heading(s) {', '.join(added)}, but '{_UNRELEASED}' "
+            f"still holds {stranded} line(s), so that release's notes would miss them. They were "
+            f"probably assembled after the rename. Move them under the new version. {_ORDER_HINT}",
             file=sys.stderr,
         )
         return 1
@@ -251,14 +317,37 @@ def pr_check(root: Path, base_changelog: str) -> int:
     return 0
 
 
+def _untracked(root: Path) -> set[str]:
+    """Fragment paths git does not track. Empty when ``root`` is not a git checkout."""
+    try:
+        out = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+            ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", FRAGMENT_DIR],
+            cwd=root,
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+    return {name for name in out.decode("utf-8", "replace").split("\0") if name}
+
+
 def assemble(root: Path, *, dry_run: bool = False) -> list[Fragment]:
     """Fold ``root/changelog.d`` into ``root/CHANGELOG.md``, then delete the fragments.
 
-    The changelog is written BEFORE any fragment is deleted, so a failed write loses nothing.
+    Refuses an UNTRACKED fragment: a leftover draft from another branch would otherwise be
+    announced and then deleted. The changelog is written BEFORE any fragment is deleted, so a
+    failed write loses nothing.
     """
     fragments = load(root / FRAGMENT_DIR)
     if not fragments:
         return []
+    loose = _untracked(root)
+    untracked = [f for f in fragments if f"{FRAGMENT_DIR}/{f.path.name}" in loose]
+    if untracked:
+        raise FragmentError(
+            "not tracked by git, so no merged pull request added them; commit or remove:\n  "
+            + _listing(untracked)
+        )
     changelog_path = root / CHANGELOG
     with changelog_path.open(encoding="utf-8", newline="") as handle:
         text = handle.read()
@@ -305,8 +394,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.no_pending and fragments:
                 print(
                     f"{len(fragments)} changelog fragment(s) were never assembled, so the release "
-                    f"notes would miss them. Run `python scripts/release/changelog_fragments.py "
-                    f"assemble` in the release pull request:\n  {_listing(fragments)}",
+                    f"notes would miss them. Cut a release pull request that runs `python "
+                    f"scripts/release/changelog_fragments.py assemble` before renaming "
+                    f"'{_UNRELEASED}', then tag again:\n  {_listing(fragments)}",
                     file=sys.stderr,
                 )
                 return 1

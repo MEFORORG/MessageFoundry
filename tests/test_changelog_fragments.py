@@ -13,7 +13,8 @@ two workflows that call the script, so the gate cannot be wired to nothing.
 from __future__ import annotations
 
 import importlib.util
-import re
+import shutil
+import subprocess  # nosec B404 - fixed argv, no shell
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -255,6 +256,62 @@ def test_one_faulty_line_gets_one_message(tmp_path: Path) -> None:
     assert str(caught.value).count("line 1") == 1, str(caught.value)
 
 
+def test_relative_links_are_written_from_changelog_d_and_land_from_the_root(tmp_path: Path) -> None:
+    body = "- see [a](../docs/A.md), [b](https://example.invalid/x) and [c](#anchor)\n"
+    root = _repo(tmp_path, {"6.fixed.md": body})
+    cf.assemble(root)
+    text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "[a](docs/A.md), [b](https://example.invalid/x) and [c](#anchor)" in text
+
+
+@pytest.mark.parametrize("target", ["docs/A.md", "../../A.md", "./A.md"])
+def test_a_relative_link_not_written_from_changelog_d_is_refused(
+    tmp_path: Path, target: str
+) -> None:
+    root = _repo(tmp_path, {"6.fixed.md": f"- see [a]({target})\n"})
+    with pytest.raises(cf.FragmentError, match="relative link"):
+        cf.load(root / "changelog.d")
+
+
+def test_a_new_heading_keeps_keep_a_changelog_order() -> None:
+    changelog = "## [Unreleased]\n\n### Fixed\n- f\n\n## [0.1.0]\n"
+    frag = cf.Fragment(Path("1.added.md"), "1", "added", "- a\n")
+    out = cf.assemble_text(changelog, [frag])
+    assert out == "## [Unreleased]\n\n### Added\n- a\n\n### Fixed\n- f\n\n## [0.1.0]\n"
+
+
+def test_trailing_spaces_survive_assembly() -> None:
+    frag = cf.Fragment(Path("1.added.md"), "1", "added", "- one  \n  two\n")
+    out = cf.assemble_text(_CHANGELOG, [frag])
+    assert "- one  \n  two\n" in out
+
+
+def test_a_fragment_already_in_the_changelog_is_refused() -> None:
+    """A second run after a partial delete would otherwise duplicate the entry."""
+    frag = cf.Fragment(Path("1.fixed.md"), "1", "fixed", "- existing fixed\n")
+    with pytest.raises(cf.FragmentError, match="already in"):
+        cf.assemble_text(_CHANGELOG, [frag])
+
+
+def test_dot_files_are_ignored(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {".DS_Store": "x", ".2080.fixed.md.swp": "x"})
+    assert cf.load(root / "changelog.d") == []
+
+
+def test_an_untracked_fragment_is_refused_and_nothing_is_written(tmp_path: Path) -> None:
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not on PATH")
+    root = _repo(tmp_path, {"1.fixed.md": "- tracked\n"})
+    subprocess.run([git, "init", "-q"], cwd=root, check=True)  # nosec B603
+    subprocess.run([git, "add", "CHANGELOG.md", "changelog.d"], cwd=root, check=True)  # nosec B603
+    (root / "changelog.d" / "2.fixed.md").write_text("- stray draft\n", encoding="utf-8")
+    with pytest.raises(cf.FragmentError, match="not tracked") as caught:
+        cf.assemble(root)
+    assert "2.fixed.md" in str(caught.value) and "1.fixed.md" not in str(caught.value)
+    assert (root / "CHANGELOG.md").read_text(encoding="utf-8") == _CHANGELOG
+
+
 # --- the pull-request check against the base branch -------------------------------------------------
 
 _RELEASED = _CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n## [0.5.0] - 2026-10-01\n")
@@ -277,6 +334,16 @@ def test_pr_check_refuses_a_new_version_heading_while_fragments_remain(
     status, _, err = _pr_check(tmp_path, {"9.fixed.md": "- f\n"}, _RELEASED, capsys)
     assert status == 1
     assert "0.5.0" in err and "changelog.d/9.fixed.md" in err
+
+
+def test_pr_check_refuses_entries_left_under_unreleased_after_the_rename(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Running assemble AFTER the rename files the entries above the new version, not in it."""
+    late = _RELEASED.replace("## [Unreleased]\n", "## [Unreleased]\n\n### Fixed\n- late entry\n", 1)
+    status, _, err = _pr_check(tmp_path, {}, late, capsys)
+    assert status == 1
+    assert "still holds 1 line" in err
 
 
 def test_pr_check_passes_an_assembled_release_without_a_warning(
@@ -322,30 +389,26 @@ def test_the_live_fragments_assemble_into_the_live_changelog_without_moving_a_li
     after = cf.assemble_text(before, fragments)
     assert _is_subsequence(before.split("\n"), after.split("\n"))
     for fragment in fragments:
-        assert fragment.body.strip() in after
+        assert "\n".join(cf.rendered(fragment)) in after
 
 
 def test_ci_checks_every_pull_request_and_release_refuses_leftovers() -> None:
-    """The gate must be wired: an assembler nothing calls protects nothing."""
+    """The gate must be wired: an assembler nothing calls protects nothing. This module's own
+    membership of ci.yml's docs-only lane is pinned in tests/test_doc_guards_lane.py."""
     yaml = pytest.importorskip("yaml")
-    ci_text = (_REPO / ".github" / "workflows" / "ci.yml").read_text("utf-8")
 
     def steps(workflow: str, job: str) -> list[dict[str, Any]]:
         data = yaml.safe_load((_REPO / ".github" / "workflows" / workflow).read_text("utf-8"))
         return [s for s in data["jobs"][job]["steps"] if isinstance(s, dict)]
-
-    # A fragment-only pull request is docs-only and skips the suite, so this module must be in the
-    # docs-only lane. Parsed the way tests/test_doc_guards_lane.py parses it.
-    doc_guards = re.search(r'DOC_GUARDS="([^"]+)"', ci_text)
-    assert doc_guards is not None, "DOC_GUARDS is no longer a double-quoted assignment in ci.yml"
-    assert "tests/test_changelog_fragments.py" in doc_guards.group(1).split()
 
     ci = [
         s for s in steps("ci.yml", "test") if "changelog_fragments.py pr-check" in str(s.get("run"))
     ]
     assert len(ci) == 1, "ci.yml's test job must run the base-branch check exactly once"
     guard = str(ci[0].get("if") or "")
-    assert "pull_request" in guard and "code" not in guard, "PR-only, and not skipped on docs-only"
+    assert "code" not in guard, "the base-branch check must not be skipped on docs-only PRs"
+    for event in ("pull_request", "merge_group"):
+        assert event in guard, f"the base-branch check must run on {event}"
 
     release = steps("release.yml", "release")
     names = [str(s.get("name") or s.get("uses")) for s in release]

@@ -3,7 +3,11 @@
 Add your changelog entry here as a new file. Do not edit `CHANGELOG.md` in a pull request.
 
 Every pull request used to edit the same `## [Unreleased]` section of `CHANGELOG.md`, so nearly
-every pair of open pull requests conflicted there. Two new files never conflict.
+every pair of open pull requests conflicted there. Two pull requests that add different files do
+not conflict. Two that pick the same file name still do, so pick a name nobody else will.
+
+This folder is for the engine's changelog only. A web console change still goes straight into
+`packaging/messagefoundry-webconsole/CHANGELOG.md`, which has its own version and release.
 
 ## Write a fragment
 
@@ -13,6 +17,8 @@ every pair of open pull requests conflicted there. Two new files never conflict.
 3. For `<category>`, use one of `added`, `changed`, `deprecated`, `removed`, `fixed` or `security`.
 4. Write the entry as one or more Markdown bullets, the same text you would have put in
    `CHANGELOG.md`. Indent continuation lines. Do not add a heading.
+5. Start each relative link with `../`, such as `[PHI.md](../docs/PHI.md)`. That form works from
+   this folder, and the release step drops the `../` so it works from `CHANGELOG.md` too.
 
 If the name is already taken, for example by an earlier pull request for the same item, add a
 suffix: `2080-docs.fixed.md`.
@@ -35,17 +41,22 @@ failing, when a pull request edits `CHANGELOG.md` directly.
 
 ## At release
 
-The release pull request folds the fragments into `CHANGELOG.md` and deletes them:
+Every engine tag needs this step first, a pre-release tag such as `v0.5.0-rc1` included.
 
-```
-python scripts/release/changelog_fragments.py assemble
-```
+1. In the release pull request, run
+   `python scripts/release/changelog_fragments.py assemble`. It adds each fragment to
+   `CHANGELOG.md` and deletes it.
+2. Then rename `[Unreleased]` to the version, and add a fresh, empty `[Unreleased]` above it.
 
-Each entry goes at the end of the matching `###` heading under `## [Unreleased]`, after every
-entry already there. Then the release pull request renames `[Unreleased]` to the version, as
-before. CI fails a pull request that adds a version heading while any fragment is left in this
-folder, and the release workflow refuses to publish a tag in that state. The release notes are
-read from `CHANGELOG.md`, so they would miss the fragment.
+Run them in that order. If you rename first, the entries land under the new `[Unreleased]` and miss
+the release notes.
 
-This file is the only file here that is not a fragment. Any other misnamed file fails the check,
-rather than being skipped and lost at release.
+Each entry goes at the end of the first `###` heading of its category under `[Unreleased]`. A
+category with no heading gets a new one, in Keep a Changelog order.
+
+CI fails a release pull request that still has fragments. It also fails one whose new
+`[Unreleased]` is not empty. The release workflow refuses to publish a tag while any fragment
+remains, because it reads the release notes from `CHANGELOG.md` alone.
+
+Files whose names start with a dot are ignored. Any other file here that is not named like a
+fragment fails the check, so it cannot be skipped and lost at release.

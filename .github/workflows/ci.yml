@@ -455,19 +455,28 @@ jobs:
       # needs the BASE branch: it REFUSES a pull request that adds a `## [x.y.z]` heading while
       # fragments remain (a release pull request that forgot `assemble`; release.yml's tag guard is
       # the backstop), and WARNS, never fails, on a pull request that still edits CHANGELOG.md.
-      # Not paths-filtered: a pull request touching only .md is docs-only. Stdlib only.
-      # THE BASE IS THE MERGE COMMIT'S FIRST PARENT, not the base branch's tip. A pull_request run
-      # checks out refs/pull/N/merge, built against the base as it was then; the tip can have moved
+      # Not paths-filtered: a pull request touching only .md is docs-only. Stdlib only. It runs in
+      # merge_group too, so a fragment merged after a release pull request's last PR run still stops
+      # that release in the queue rather than at the tag.
+      # THE BASE IS THE CHECKED-OUT COMMIT'S FIRST PARENT, not the base branch's tip. Both events
+      # check out a merge commit built against the base as it was then; the tip can have moved
       # since, and diffing against it would warn on every pull request whose base gained an entry.
       # Measured on this branch: main gained 37 CHANGELOG.md lines in 8 commits, and a tip diff
-      # warned on a branch that never touched the file. If the parent cannot be read, the step warns
-      # and passes rather than wedging a required leg on a fetch.
+      # warned on a branch that never touched the file. The parent is read off the commit object and
+      # fetched into a THROWAWAY repository: a shallow fetch into this checkout can move its shallow
+      # boundary under later steps (see "Refused commit subjects"). If it cannot be read, the step
+      # warns and passes rather than wedging a required leg on a fetch.
       - name: Changelog fragments against the base branch
-        if: runner.os == 'Linux' && github.event_name == 'pull_request'
+        if: runner.os == 'Linux' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
         run: |
           base_copy="$RUNNER_TEMP/base-CHANGELOG.md"
-          if git fetch --no-tags --depth=2 origin "$GITHUB_SHA" \
-             && git show "$GITHUB_SHA^1:CHANGELOG.md" > "$base_copy"; then
+          scratch="$RUNNER_TEMP/changelog-base"
+          # No pipe: under `-o pipefail` an early-exiting reader can fail the step on SIGPIPE.
+          git cat-file -p HEAD > "$RUNNER_TEMP/head-commit"
+          parent=$(awk '/^parent /{print $2; exit}' "$RUNNER_TEMP/head-commit")
+          if [ -n "$parent" ] && git init -q "$scratch" \
+             && git -C "$scratch" fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$parent" \
+             && git -C "$scratch" show "$parent:CHANGELOG.md" > "$base_copy"; then
             python scripts/release/changelog_fragments.py pr-check --base-changelog "$base_copy"
           else
             echo "::warning::could not read the base CHANGELOG.md; release.yml's tag guard is the backstop"

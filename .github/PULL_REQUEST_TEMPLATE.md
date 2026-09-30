@@ -40,7 +40,8 @@ Implements: BACKLOG #
 - [ ] Uses **Connection / Router / Handler** vocabulary; no new declarative "channel" element; no
       GUI/web-framework imports in the engine packages; no Black.
 - [ ] Docs updated if behavior or configuration changed.
-- [ ] A user-visible change adds a fragment under `changelog.d/` (see its README) and does **not**
-      edit `CHANGELOG.md`, which only the release pull request changes.
+- [ ] A user-visible engine change adds a fragment under `changelog.d/` (see its README) and does
+      **not** edit `CHANGELOG.md`, which only the release pull request changes. A web console
+      change still edits `packaging/messagefoundry-webconsole/CHANGELOG.md` directly.
 - [ ] Maintainers only: if this completes a planned item, its status banner is updated where the
       ledger lives. Nothing in this repository can check that — the ledger is not here.
