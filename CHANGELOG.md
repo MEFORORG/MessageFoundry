@@ -1343,6 +1343,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **LDAPS to Active Directory would no longer fail closed on Python 3.15, and it narrows TLS 1.3.**
+  On an interpreter with `SSLContext.set_ciphersuites`, the approved list drops
+  `TLS_AES_128_GCM_SHA256`. ldap3 builds its own TLS context and could not narrow TLS 1.3, so the
+  engine refused to build the AD authenticator there. The engine now builds the LDAPS context
+  itself: a new `ldap3.Tls` subclass, `messagefoundry.auth.ldap_tls.NarrowedTls`, wraps each
+  connection with a context from `tls_policy.assert_ldap3_tls_suites`, which now returns a factory.
+  That context loads the CA as ldap3 did and carries the posture every engine-built client hop
+  has: the approved TLS 1.2 suites, the approved TLS 1.3 suites and the SHA-224-free signature
+  schemes where the interpreter allows them, the key-exchange pin and a TLS 1.2 floor. ldap3's own
+  host name check still runs after the handshake. `ciphers=` is no longer passed to ldap3.
+  Python 3.14 is unchanged on the wire: its TLS 1.3 gap is recorded, not closed. A followed
+  referral still gets a plain ldap3 context. (`BACKLOG #2494`, owner ruling R3 of
+  2026-09-27, ADR 0188 amendment of 2026-09-30)
 - **On Python 3.15 the engine stops offering SHA-224 TLS signature schemes.** Every context the
   engine narrows drops `rsa_pkcs1_sha224`, `ecdsa_sha224` and `dsa_sha224` through
   `SSLContext.set_server_sigalgs`. Read from the OpenSSL source, not yet measured on 3.15, that one
@@ -1353,8 +1366,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   three SHA-224 schemes; `rsa_pss_rsae_*` now comes before `rsa_pss_pss_*`. A build that refuses
   the ML-DSA names still drops SHA-224, without ML-DSA, and logs a warning once. Python 3.14 is
   unchanged. A 3.15
-  on an OpenSSL older than 3.4 pins nothing and logs a warning once. The LDAPS hop is not reached.
-  (`BACKLOG #1171`, ASVS 11.4.1, owner ruling 2026-09-29)
+  on an OpenSSL older than 3.4 pins nothing and logs a warning once. The LDAPS hop was not
+  reached; since BACKLOG #2494, above, it is. (`BACKLOG #1171`, ASVS 11.4.1, owner ruling 2026-09-29)
 - **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
   reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
   account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was
