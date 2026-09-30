@@ -404,7 +404,7 @@ cross-subnet listener:
 > shipped 2026-07-10; see [`CONFIGURATION.md`](CONFIGURATION.md)). It is **opt-in and defaults to
 > `false`** — a deployment that sets nothing gets nothing. **Turn it on** for any multi-subnet AG.
 >
-> ⚠️ Two reasons it does **not** yet replace the DNS-side configuration below.
+> **CAUTION:** Two reasons it does **not** yet replace the DNS-side configuration below.
 > **(1) It is unit-tested but has never been exercised against a live cross-subnet AG** (#100's own
 > validation is still outstanding — it needs the SQL AG rig), so the keyword is not yet a
 > substitute for a workaround that is known to work. **(2) It covers the STORE connection only** —
