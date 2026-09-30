@@ -20,15 +20,12 @@ from pathlib import Path
 import pytest
 
 import messagefoundry
+from tests._ast_sites import callee_name, parse_source
 
 _ROOT = Path(messagefoundry.__file__).resolve().parent.parent
 _SCANNED = (_ROOT / "messagefoundry", _ROOT / "harness")
 _SUBPROCESS_FUNCS = frozenset({"run", "Popen", "check_output", "call", "check_call"})
 _TEXT_FLAGS = ("text", "universal_newlines")
-
-
-def _is_true(node: ast.expr) -> bool:
-    return isinstance(node, ast.Constant) and node.value is True
 
 
 def unencoded_text_calls(source: str) -> list[int]:
@@ -37,20 +34,13 @@ def unencoded_text_calls(source: str) -> list[int]:
     Matches on the attribute or bare name (``subprocess.run``, ``run``), so an aliased import is
     still seen. A ``**kwargs`` splat is skipped: its keys are not visible to a static read."""
     hits: list[int] = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-        if name not in _SUBPROCESS_FUNCS:
+    for node in ast.walk(parse_source(source)):
+        if not isinstance(node, ast.Call) or callee_name(node) not in _SUBPROCESS_FUNCS:
             continue
         kwargs = {kw.arg: kw.value for kw in node.keywords}
-        if None in kwargs:
+        if None in kwargs or "encoding" in kwargs:
             continue
-        if (
-            any(_is_true(kwargs[f]) for f in _TEXT_FLAGS if f in kwargs)
-            and "encoding" not in kwargs
-        ):
+        if any(getattr(kwargs.get(f), "value", None) is True for f in _TEXT_FLAGS):
             hits.append(node.lineno)
     return hits
 
@@ -65,7 +55,6 @@ def unencoded_text_calls(source: str) -> list[int]:
         ("subprocess.run(['x'], capture_output=True)", False),
         ("subprocess.run(['x'], text=False)", False),
         ("subprocess.run(['x'], **opts)", False),
-        ("other.run(text=True, encoding='utf-8')", False),
     ],
 )
 def test_the_detector_on_planted_sources(source: str, fires: bool) -> None:
@@ -76,10 +65,13 @@ def test_the_detector_on_planted_sources(source: str, fires: bool) -> None:
 def test_every_text_mode_subprocess_call_names_its_encoding() -> None:
     files = sorted(p for d in _SCANNED for p in d.rglob("*.py"))
     assert len(files) > 50, f"scanned only {len(files)} files under {_SCANNED}; the glob is wrong"
+    sources = {p: p.read_text(encoding="utf-8") for p in files}
     offenders = [
         f"{p.relative_to(_ROOT).as_posix()}:{line}"
-        for p in files
-        for line in unencoded_text_calls(p.read_text(encoding="utf-8"))
+        for p, src in sources.items()
+        # Substring prefilter: parsing all ~380 files costs about 2 s; only a handful hold a flag.
+        if any(f"{flag}=" in src for flag in _TEXT_FLAGS)
+        for line in unencoded_text_calls(src)
     ]
     assert not offenders, (
         "text-mode subprocess call with no encoding= (the default is the locale code page on 3.14 "

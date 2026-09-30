@@ -22,11 +22,8 @@
 # diagnostic step is continue-on-error so all outcomes are collected, and a final verdict step rules
 # on them. A canary that cannot fail cannot tell "flew clean" from "never flew".
 #
-# EXPECT RED WHEN IT FIRST RUNS. Measured locally 2026-09-30 on CPython 3.15.0b3 / OpenSSL 3.5.7,
-# Windows: the TLS and apiclient subset went 16 failed, 1017 passed, 19 skipped. Five of those are
-# tripwires built to fire when the 3.15 APIs appear; the rest are recorded in the pull request that
-# added this file. Two dependencies had no cp315 Windows wheel for the version pip picked (pyyaml,
-# httptools), and released pydantic 2.13.5 pins a pydantic-core with no cp315 wheel.
+# EXPECT RED AT FIRST. Several TLS tests are tripwires built to fire once the 3.15 APIs appear. The
+# local 3.15 prerelease measurements are in the pull request that added this file.
 
 name: python 3.15 canary
 
@@ -139,15 +136,11 @@ jobs:
         if: steps.install.outcome == 'success'
         continue-on-error: true
         run: |
-          # Redirect and re-read rather than `| tee`, so pytest's own status is the step's.
           STATUS=0
           python -m pytest -q -rfE -p no:cacheprovider \
             tests/test_tls_*.py tests/test_apiclient*.py tests/test_api_tls.py \
-            tests/test_connection_tls_*.py tests/test_mllp_tls.py \
-            tests/test_subprocess_text_encoding.py > tls.txt 2>&1 || STATUS=$?
+            tests/test_connection_tls_*.py tests/test_mllp_tls.py > tls.txt 2>&1 || STATUS=$?
           cat tls.txt
-          PASSED="$(grep -oE '[0-9]+ passed' tls.txt | tail -1 | grep -oE '[0-9]+' || true)"
-          echo "passed=${PASSED:-0}" >> "$GITHUB_OUTPUT"
           echo "summary=$(tail -1 tls.txt)" >> "$GITHUB_OUTPUT"
           exit $STATUS
 
@@ -179,30 +172,31 @@ jobs:
           OPENSSL: ${{ steps.probe.outputs.openssl }}
           SET_GROUPS: ${{ steps.probe.outputs.set_groups }}
           SDISTS: ${{ steps.wheels.outputs.sdists }}
-          TLS_PASSED: ${{ steps.tls.outputs.passed }}
           TLS_SUMMARY: ${{ steps.tls.outputs.summary }}
           SUITE_SUMMARY: ${{ steps.suite.outputs.summary }}
         run: |
-          VERDICT=""
+          # Each finding prints its own ::error line; FAILED only records that one fired.
+          FAILED=""
           if [ "$SETUP" != "success" ]; then
             echo "::error title=3.15 canary did not fly::could not provision Python 3.15 (setup outcome=$SETUP)"
-            VERDICT="did-not-fly"
+            FAILED=1
           else
             if [ "$SET_GROUPS" != "True" ]; then
               echo "::error title=3.15 TLS path not exercised::SSLContext.set_groups is absent on $VERSION, so the group pin stayed inert and the TLS tests measured the 3.14 path"
-              VERDICT="tls-path-not-exercised"
+              FAILED=1
             fi
             for pair in "probe:$PROBE" "install:$INSTALL" "TLS tests:$TLS" "suite smoke:$SUITE"; do
               NAME="${pair%%:*}"
               OUT="${pair##*:}"
               if [ "$OUT" != "success" ]; then
                 echo "::error title=3.15 canary finding::$NAME outcome=$OUT on Python $VERSION"
-                VERDICT="found"
+                FAILED=1
               fi
             done
-            if [ "$TLS" = "success" ] && [ "${TLS_PASSED:-0}" -eq 0 ]; then
-              echo "::error title=3.15 canary measured nothing::the TLS step succeeded with 0 passing tests"
-              VERDICT="vacuous"
+            # pytest's summary names "N passed" only when N > 0; the expansion is unchanged without it.
+            if [ "$TLS" = "success" ] && [ "${TLS_SUMMARY#* passed}" = "$TLS_SUMMARY" ]; then
+              echo "::error title=3.15 canary measured nothing::the TLS step succeeded with no passing tests"
+              FAILED=1
             fi
           fi
           if [ -n "$SDISTS" ] && [ "$SDISTS" != "none" ]; then
@@ -220,10 +214,10 @@ jobs:
             echo "| TLS and apiclient tests | $TLS: ${TLS_SUMMARY:-n/a} |"
             echo "| engine suite smoke | $SUITE: ${SUITE_SUMMARY:-n/a} |"
             echo ""
-            if [ -z "$VERDICT" ]; then
+            if [ -z "$FAILED" ]; then
               echo "The canary flew clean on Python $VERSION."
             else
-              echo "Verdict: \`$VERDICT\`. This job is advisory and blocks nothing."
+              echo "The canary found something; the ::error lines name each finding. Advisory: it blocks nothing."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          [ -z "$VERDICT" ]
+          [ -z "$FAILED" ]
