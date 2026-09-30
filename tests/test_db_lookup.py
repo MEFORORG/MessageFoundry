@@ -120,7 +120,9 @@ def _patch_pool(
     """Replace the module-level _make_pool so the executor gets a fake pool (no aioodbc, no DB)."""
     pool = _FakePool(_FakeCursor(rows or [], columns or [], error, max_batch))
 
-    async def fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> _FakePool:
+    async def fake_make_pool(
+        dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
+    ) -> _FakePool:
         return pool
 
     monkeypatch.setattr(database, "_make_pool", fake_make_pool)
@@ -570,7 +572,9 @@ async def test_audit_query_runs_via_autocommit_readonly_pool(
     seen: dict[str, bool] = {}
     real_pool = _patch_pool(monkeypatch, rows=[], columns=["npi"])
 
-    async def spy_make_pool(dsn: str, pool_max: int, *, autocommit: bool):  # type: ignore[no-untyped-def]
+    async def spy_make_pool(
+        dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
+    ):  # type: ignore[no-untyped-def]
         seen["autocommit"] = autocommit
         return real_pool
 
@@ -639,7 +643,9 @@ async def test_a_pool_open_failure_is_a_lookup_error(
 ) -> None:
     opens = 0
 
-    async def failing_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> Any:
+    async def failing_make_pool(
+        dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
+    ) -> Any:
         nonlocal opens
         opens += 1
         raise _FakeDriverError(
