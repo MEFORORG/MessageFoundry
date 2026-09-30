@@ -24,6 +24,15 @@ it directly is the only way the number stays honest as the grammar moves.
              this to unrecognized control rows only, which is the looser reading.
   editable = action / lookup / send -- the kinds that expose enabled param inputs.
 
+ARGUMENT MODES ARE A SEPARATE BUCKET (ADR 0076 Amendment E, E.9; BACKLOG #237). At `--contract 2`
+the lens also reports each typed argument's input mode: `static` (a literal), `templated` (a bounded
+interpolation over message reads, writable in the Steps view) or `dynamic` (any other expression,
+read-only). E.9 requires templated arguments to be counted in their own bucket rather than folded
+into the editable numerator, so a templated write cannot flatter the figure above without converting
+anything. They are: `argument_modes` counts arguments, never rows, and nothing in it feeds
+`editable_rows` or `editable_pct`. At the default `--contract 1` the lens sends no modes, so the
+bucket is absent and every other figure is what it always was.
+
 PHI. `lens parse` is a static `ast` parse that never imports or executes a config module, and no
 message ever enters this path. The scan reads only code and emits only counts and file names, so it
 is safe to run against a production estate. Pass `--anonymize` when sending results anywhere.
@@ -59,15 +68,19 @@ def config_modules(root: Path) -> list[Path]:
     )
 
 
-def parse_module(py: Path, python: str, cwd: Path) -> tuple[dict | None, str]:
+def parse_module(py: Path, python: str, cwd: Path, contract: int = 1) -> tuple[dict | None, str]:
     """Return (parsed JSON, error). `encoding=` is REQUIRED, not cosmetic.
 
     `text=True` alone decodes with the LOCALE default, which is cp1252 on a stock Windows box;
     config modules are UTF-8, so the decode raises inside subprocess's reader thread and stdout
     comes back None -- a refusal that reads as "this estate has no handlers".
     """
+    argv = [python, "-m", "messagefoundry", "lens", "parse", str(py), "--json"]
+    if contract != 1:
+        # Only a non-default contract is passed, so the default argv is exactly what it always was.
+        argv += ["--contract", str(contract)]
     proc = subprocess.run(  # nosec B603 - fixed argv, no shell, interpreter is operator-supplied
-        [python, "-m", "messagefoundry", "lens", "parse", str(py), "--json"],
+        argv,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -81,6 +94,25 @@ def parse_module(py: Path, python: str, cwd: Path) -> tuple[dict | None, str]:
         return json.loads(proc.stdout), ""
     except json.JSONDecodeError as exc:
         return None, f"non-JSON output ({exc})"
+
+
+#: The three argument modes, in report order (ADR 0076 Amendment E).
+ARGUMENT_MODES = ("static", "templated", "dynamic")
+
+
+def tally_argument_modes(row: dict) -> Counter[str]:
+    """Count one row's typed arguments by the input mode the lens reported for each.
+
+    The modes come from the row's `param_modes`, exactly as `lens parse` sent them; nothing here
+    classifies an argument, for the same reason the module docstring gives for driving the shipped
+    parser. A row with no `param_modes` (contract 1, or a kind with no typed arguments) counts
+    nothing. A mode string outside :data:`ARGUMENT_MODES` is counted under its own name, so a newer
+    lens's mode shows up in the report rather than vanishing.
+    """
+    modes = row.get("param_modes")
+    if not isinstance(modes, dict):
+        return Counter()
+    return Counter(str(mode) for mode in modes.values())
 
 
 def classify_code_row(first_stmt: str) -> str:
@@ -108,6 +140,15 @@ def classify_code_row(first_stmt: str) -> str:
     if "(" in line and line.split("(", 1)[0].replace(".", "_").isidentifier():
         return "bare helper call"
     return "other"
+
+
+def _argument_mode_report(arg_modes: Counter[str]) -> dict[str, int]:
+    """The three known modes in order, zeros included, then any mode a newer lens reported."""
+    report = {mode: arg_modes[mode] for mode in ARGUMENT_MODES}
+    report.update(
+        {mode: count for mode, count in sorted(arg_modes.items()) if mode not in ARGUMENT_MODES}
+    )
+    return report
 
 
 def _label(py: Path, root: Path, anonymize: bool, seen: dict[str, str]) -> str:
@@ -140,6 +181,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--anonymize", action="store_true", help="replace file names with stable opaque indices"
     )
+    ap.add_argument(
+        "--contract",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="the lens row contract to measure (default 1, the figure #1764 reports); 2 adds note "
+        "and route rows, @router defs, and the per-argument mode bucket (ADR 0076 E.9)",
+    )
     ap.add_argument("--json", dest="as_json", action="store_true", help="emit JSON")
     args = ap.parse_args(argv)
 
@@ -149,6 +198,10 @@ def main(argv: list[str] | None = None) -> int:
 
     kinds: Counter[str] = Counter()
     causes: Counter[str] = Counter()
+    # E.9's own bucket: arguments by mode. Kept apart from `kinds`, and never read by the editable
+    # figure below, so a templated argument is counted here and only here.
+    arg_modes: Counter[str] = Counter()
+    saw_modes = False
     files = handlers = zero_editable = fully_typed = 0
     code_per_handler: list[int] = []
     opaque_per_handler: list[int] = []
@@ -157,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for py in config_modules(args.config_dir):
         files += 1
-        out, err = parse_module(py, args.python, args.cwd)
+        out, err = parse_module(py, args.python, args.cwd, args.contract)
         if out is None:
             refusals.append(
                 {"file": _label(py, args.config_dir, args.anonymize, labels), "reason": err}
@@ -172,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
             rows = handler.get("rows", [])
             n_edit = n_opaque = n_code = 0
             for row in rows:
+                arg_modes.update(tally_argument_modes(row))
+                saw_modes = saw_modes or isinstance(row.get("param_modes"), dict)
                 if row.get("kind") == "code":
                     start = row.get("line_start")
                     end = row.get("line_end", start)
@@ -225,6 +280,10 @@ def main(argv: list[str] | None = None) -> int:
         else None,
         "max_code_rows_in_one_handler": max(code_per_handler, default=None),
         "strict_control": args.strict_control,
+        "contract": args.contract,
+        # ADR 0076 E.9: arguments by input mode, a bucket of its own. None when the lens sent no
+        # modes (contract 1), so an absent bucket is never read as "no templated arguments".
+        "argument_modes": _argument_mode_report(arg_modes) if saw_modes else None,
         "refusals": refusals,
     }
 
@@ -265,6 +324,14 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  -> helper-descent candidates    : {descent:>5}  {pct(descent, total_code)} of code rows"
         )
+    report = result["argument_modes"]
+    if isinstance(report, dict):
+        total_args = sum(report.values())
+        print("\nargument modes (a bucket of its own, never in the EDITABLE figure; ADR 0076 E.9):")
+        for mode, count in report.items():
+            print(f"  {mode:<24} {count:>6}  {pct(count, total_args)}")
+    elif args.contract == 1:
+        print("\nargument modes: not measured at --contract 1 (pass --contract 2)")
     if refusals:
         print("\nparse refusals (whole-file: the lens steps aside to the text editor):")
         for refusal in refusals:
