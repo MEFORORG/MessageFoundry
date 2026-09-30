@@ -694,6 +694,7 @@ async def _run_one_step(
             audit_live=audit_live,
             audit_final=audit_final,
             reload_account=reload_account,
+            per_lane_wake=_effective_per_lane_wake(node_env),
         )
     finally:
         for task in sampler_tasks:
@@ -712,6 +713,25 @@ async def _run_one_step(
             await poller.close()
         with contextlib.suppress(Exception):
             await node.stop()
+
+
+def _effective_per_lane_wake(node_env: Mapping[str, str]) -> bool | None:
+    """The ``per_lane_wake`` value the step's engine runs with, as the engine's own parser reads it.
+
+    Recorded so a harvest can check the pin rather than trust it (BACKLOG #2013). `_node_env` writes
+    the pin, but "effective" means what the engine resolves from that environment, so the engine's
+    parser reads it here. Only the ``MEFOR_PIPELINE_*`` keys go in: they alone decide this value, and
+    an unrelated section that fails to validate must not fail the step at this point. None, logged,
+    when even those keys do not parse; the engine would refuse to start on them too.
+    """
+    from messagefoundry.config.settings import load_settings
+
+    pipeline_env = {k: v for k, v in node_env.items() if k.startswith("MEFOR_PIPELINE_")}
+    try:
+        return load_settings(environ=pipeline_env).pipeline.per_lane_wake
+    except (ValueError, OSError) as exc:
+        log.warning("connscale: could not read the effective per_lane_wake: %s", exc)
+        return None
 
 
 def _build_corpus(profile: ConnScaleProfile, ids: ControlIds) -> Corpus:
@@ -1451,6 +1471,7 @@ def _build_record(
     audit_final: IntakeAudit | None = None,
     reload_account: _ReloadAccount | None = None,
     fd_probe_root_pid: int | None = None,
+    per_lane_wake: bool | None = None,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1579,6 +1600,7 @@ def _build_record(
         reload_reconnect_timeout_s=None if ra is None else ra.reconnect_timeout_s,
         reload_not_applied=None if ra is None else ra.not_applied,
         rate_window=RATE_WINDOW,
+        per_lane_wake=per_lane_wake,
     )
 
 

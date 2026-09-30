@@ -37,8 +37,12 @@ THE THREE RULES THAT MAKE IT A HARVEST RATHER THAN A SAMPLE.
    Anything else is excluded and counted by reason.
 
 THE JOIN. An artifact names its leg but not its attempt, and a re-run attempt is a separate engine
-run. So each artifact is joined to the same-leg job whose run time contains the artifact's creation
-time, across every attempt. An artifact no job window contains is listed as unjoined, not guessed.
+run. Since BACKLOG #2013 the payload's ``context`` names its own run, run attempt and workflow job
+key. Where it does, the artifact joins the one same-leg job of that attempt, and a payload naming
+another run, another job key or an attempt its leg has no job in is listed as unjoined. An older
+payload names none of them, so it is joined to the same-leg job whose run time contains the
+artifact's creation time, across every attempt. An artifact no job window contains is listed as
+unjoined, not guessed.
 
 A HARVESTER FAILURE IS NOT A CI FAILURE. A download that fails twice, or an artifact that has
 expired, is ``reader_error``: the artifact's record proves the sweep wrote a payload, so its loss says
@@ -47,8 +51,11 @@ never added to the unknown-and-adverse count build 2 will grade. So is a run lis
 hit the API's 1,000-result limit. A re-run attempt of "failed jobs only" lists each untouched leg a
 second time under a new id with the same run time; that copy is counted once, not twice.
 
-WHAT IT DOES NOT CHECK. The #1415 prerequisite that ``MEFOR_PIPELINE_PER_LANE_WAKE`` is pinned for
-every counted run is not observable in the payload. The output says so on every run.
+THE WAKE PIN. #1415 requires ``MEFOR_PIPELINE_PER_LANE_WAKE`` pinned to false for every counted
+run. Since BACKLOG #2013 the payload's ``context.per_lane_wake`` records the value the engine ran
+with. A payload recording any other value is excluded, by reason. The pin reads VERIFIED only when
+every harvested job's payload records false; an older payload records nothing, so a harvest that
+counts one says NOT VERIFIED.
 
 AUTH. Every call goes through ``gh api``, so the token stays inside gh's own login. This script
 never reads, prints or stores one.
@@ -95,6 +102,11 @@ POST_2024_RATE_WINDOW = "in_hold_excl_drain_reload_tail"
 #: payload counts only from a run created after it. This is a fact about the data, not the
 #: inclusion window, which is always an argument.
 WITH_TAIL_FLOOR = datetime(2026, 9, 1, 13, 1, 20, tzinfo=UTC)
+#: The workflow job key (``GITHUB_JOB``) of the jobs that write the payload. The jobs API does not
+#: return it, so it can only rule a payload out: one naming another key came from another job.
+TEST_JOB_KEY = "test"
+#: The ``per_lane_wake`` value the harness pins for every step (``runner._node_env``), as text.
+PINNED_PER_LANE_WAKE = "false"
 #: The three OS legs #1415 names. A leg missing from a harvest is flagged, never silently absent.
 EXPECTED_OS_LEGS = ("ubuntu-latest", "windows-2022", "windows-2025")
 
@@ -248,6 +260,54 @@ def classify(
     return WITH_TAIL, "rate_window absent, after PR 729"
 
 
+def _context(payload: dict[str, Any]) -> dict[str, Any]:
+    ctx = payload.get("context")
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def _named(value: Any) -> str | None:
+    """A context value as text, or ``None`` where the payload recorded none (``-`` is a local run)."""
+    return None if value is None or value == "-" else str(value)
+
+
+def payload_run_attempt(payload: dict[str, Any]) -> int | None:
+    """The run attempt the payload says wrote it, or ``None`` when it names no usable one."""
+    named = _named(_context(payload).get("run_attempt"))
+    if named is None or not named.isdecimal():
+        return None
+    attempt = int(named)
+    return attempt if attempt >= 1 else None
+
+
+def payload_per_lane_wake(payload: dict[str, Any]) -> str | None:
+    """The ``per_lane_wake`` the payload says its engine ran with, or ``None`` when it records none."""
+    return _named(_context(payload).get("per_lane_wake"))
+
+
+def exact_join(
+    run_id: int, payload: dict[str, Any], jobs: Sequence[dict[str, Any]]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The same-leg job the payload names itself, or why none of them is it (BACKLOG #2013).
+
+    ``(None, None)`` means the payload names no attempt to join on, so the caller falls back to the
+    time join. A named run or job key is checked even then, since either rules the payload out.
+    """
+    ctx = _context(payload)
+    named_run = _named(ctx.get("run_id"))
+    if named_run is not None and named_run != str(run_id):
+        return None, f"payload names run {named_run}, not this one"
+    named_job = _named(ctx.get("job"))
+    if named_job is not None and named_job != TEST_JOB_KEY:
+        return None, f"payload names job {named_job!r}, not {TEST_JOB_KEY!r}"
+    attempt = payload_run_attempt(payload)
+    if attempt is None:
+        return None, None
+    matches = [j for j in jobs if int(j.get("run_attempt") or 1) == attempt]
+    if len(matches) == 1:
+        return matches[0], None
+    return None, f"payload names run attempt {attempt}; its leg has {len(matches)} jobs in it"
+
+
 @dataclass(frozen=True)
 class BaseReading:
     """One lane's base reading from one job. ``value`` is ``None`` when null or non-finite."""
@@ -283,6 +343,8 @@ class JobOutcome:
     run_attempt: int
     job_id: int
     artifact_id: int | None
+    #: The payload's ``context.per_lane_wake``; ``None`` when it records none (BACKLOG #2013).
+    per_lane_wake: str | None = None
 
 
 @dataclass
@@ -454,6 +516,9 @@ def harvest_run(api: Api, repo: str, run: dict[str, Any], acc: Harvest) -> None:
         jobs_by_leg.setdefault(leg, []).append(listed_job)
 
     artifact_by_job: dict[int, dict[str, Any]] = {}
+    # Read before the join, because a payload that names its own attempt joins by that (#2013).
+    # Kept, so the job's own read below does not download it a second time.
+    payloads: dict[int, dict[str, Any] | str] = {}
     for artifact in _paged(api, f"{base}/artifacts", {}, "artifacts"):
         leg = leg_of_artifact(str(artifact.get("name", "")))
         if leg is None:
@@ -461,7 +526,20 @@ def harvest_run(api: Api, repo: str, run: dict[str, Any], acc: Harvest) -> None:
         if not jobs_by_leg.get(leg):
             acc.unjoined_artifacts.append(_unjoined(run_id, artifact, "no job for its leg"))
             continue
-        job = _join(artifact, jobs_by_leg[leg])
+        job: dict[str, Any] | None = None
+        refused: str | None = None
+        if not artifact.get("expired"):
+            artifact_id = int(artifact["id"])
+            if artifact_id not in payloads:
+                payloads[artifact_id] = _read_payload(api, repo, artifact)
+            payload = payloads[artifact_id]
+            if isinstance(payload, dict):
+                job, refused = exact_join(run_id, payload, jobs_by_leg[leg])
+        if refused is not None:
+            acc.unjoined_artifacts.append(_unjoined(run_id, artifact, refused))
+            continue
+        if job is None:
+            job = _join(artifact, jobs_by_leg[leg])
         if job is None:
             acc.unjoined_artifacts.append(_unjoined(run_id, artifact, "no job window contains it"))
             continue
@@ -478,7 +556,7 @@ def harvest_run(api: Api, repo: str, run: dict[str, Any], acc: Harvest) -> None:
         acc.runs_without_test_jobs.append(run_id)
     for leg, jobs in sorted(jobs_by_leg.items()):
         for job in jobs:
-            acc.jobs.append(_harvest_job(api, repo, run, leg, job, artifact_by_job, acc))
+            acc.jobs.append(_harvest_job(api, repo, run, leg, job, artifact_by_job, acc, payloads))
 
 
 def _harvest_job(
@@ -489,6 +567,7 @@ def _harvest_job(
     job: dict[str, Any],
     artifact_by_job: dict[int, dict[str, Any]],
     acc: Harvest,
+    payloads: dict[int, dict[str, Any] | str] | None = None,
 ) -> JobOutcome:
     job_id = int(job["id"])
     conclusion = str(job.get("conclusion") or job.get("status") or "unknown")
@@ -497,7 +576,9 @@ def _harvest_job(
     run_created = parse_time(run["created_at"])
     with_tail_until = parse_time(acc.with_tail_until) if acc.with_tail_until else None
 
-    def outcome(status: str, reason: str, population: str | None = None) -> JobOutcome:
+    def outcome(
+        status: str, reason: str, population: str | None = None, pin: str | None = None
+    ) -> JobOutcome:
         return JobOutcome(
             leg=leg,
             conclusion=conclusion,
@@ -508,6 +589,7 @@ def _harvest_job(
             run_attempt=attempt,
             job_id=job_id,
             artifact_id=None if artifact is None else int(artifact["id"]),
+            per_lane_wake=pin,
         )
 
     def adverse(reason: str) -> JobOutcome:
@@ -525,7 +607,8 @@ def _harvest_job(
         # The artifact record proves the sweep wrote a payload (the upload ignores a missing file),
         # so expiry says when this harvest ran, not how CI went. It is an incomplete read.
         return outcome(READER_ERROR, "artifact expired")
-    payload = _read_payload(api, repo, artifact)
+    held = (payloads or {}).get(int(artifact["id"]))
+    payload = held if held is not None else _read_payload(api, repo, artifact)
     if payload == READER_ERROR:
         return outcome(READER_ERROR, "artifact download failed")
     if isinstance(payload, str):
@@ -533,6 +616,12 @@ def _harvest_job(
     population, reason = classify(payload, run_created, with_tail_until)
     if population is None:
         return outcome(EXCLUDED, reason)
+    pin = payload_per_lane_wake(payload)
+    if pin is not None and pin != PINNED_PER_LANE_WAKE:
+        # A different engine: the flag moves both terms of the predicted floor (BACKLOG #2013).
+        return outcome(
+            EXCLUDED, f"per_lane_wake {pin!r}, not the pinned {PINNED_PER_LANE_WAKE!r}", None, pin
+        )
     rows = _base_readings(payload)
     if rows is None:
         return adverse("payload carries no usable herd_floor readings")
@@ -553,7 +642,7 @@ def _harvest_job(
                 artifact_created_at=created,
             )
         )
-    return outcome(HARVESTED, reason, population)
+    return outcome(HARVESTED, reason, population, pin)
 
 
 def harvest(
@@ -701,6 +790,27 @@ def _cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
+def pin_verified(result: Harvest) -> bool:
+    """True only when there are harvested jobs and every one's payload records the pinned value."""
+    harvested = [j for j in result.jobs if j.status == HARVESTED]
+    return bool(harvested) and all(j.per_lane_wake == PINNED_PER_LANE_WAKE for j in harvested)
+
+
+def _pin_line(result: Harvest) -> str:
+    harvested = [j for j in result.jobs if j.status == HARVESTED]
+    if pin_verified(result):
+        return (
+            f"MEFOR_PIPELINE_PER_LANE_WAKE pin: VERIFIED; all {len(harvested)} harvested job(s) "
+            f"record {PINNED_PER_LANE_WAKE}."
+        )
+    recorded = sum(1 for j in harvested if j.per_lane_wake is not None)
+    return (
+        f"MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; {recorded} of "
+        f"{len(harvested)} harvested job(s) record it, and a payload from before BACKLOG #2013 "
+        "does not."
+    )
+
+
 def is_complete(result: Harvest) -> bool:
     """False when this harvester, not CI, left something unread or unlisted."""
     return not result.listing_may_be_truncated and not any(
@@ -727,7 +837,7 @@ def render_markdown(result: Harvest) -> str:
         f"{result.runs_from_other_repos}",
         f"carried-over job copies from re-run attempts, counted once: "
         f"{result.carried_over_job_copies}",
-        "MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; the payload does not record it.",
+        _pin_line(result),
         "",
     ]
     if result.listing_may_be_truncated:
@@ -791,7 +901,7 @@ def to_json_dict(result: Harvest) -> dict[str, Any]:
     return {
         **asdict(result),
         "complete": is_complete(result),
-        "per_lane_wake_pin_verified": False,
+        "per_lane_wake_pin_verified": pin_verified(result),
         "cells": [asdict(c) for c in summarise(result)],
     }
 

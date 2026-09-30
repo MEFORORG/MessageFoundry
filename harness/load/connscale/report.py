@@ -81,6 +81,21 @@ def records_rate_window(records: Iterable[ConnScaleRecord]) -> str | None:
     return "|".join(windows)
 
 
+def per_lane_wake_pin(records: Iterable[ConnScaleRecord]) -> str:
+    """The run's effective ``per_lane_wake``, for a payload context, as text (BACKLOG #2013).
+
+    ``"false"`` or ``"true"`` when every record recorded that value. ``"mixed"`` when they disagree,
+    and ``"-"`` when any record did not record one, or there are none: a pin is proven only where
+    every step says so, so one unsaid step leaves the run unproven.
+    """
+    values = {r.per_lane_wake for r in records}
+    if not values or None in values:
+        return "-"
+    if len(values) > 1:
+        return "mixed"
+    return "true" if values.pop() else "false"
+
+
 # The shared rule (harness/_spreadsheet.py) — this module used to carry its own copy, and was the one
 # writer with no formula-injection test at all, which is how the copies drifted unnoticed.
 _CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
@@ -285,12 +300,18 @@ class ConnScaleRecord:
     # #2024, so two records compare only where this matches. None means not recorded: a record
     # built by hand, or read from an older artifact.
     rate_window: str | None = None
+    # The `per_lane_wake` value this step's engine ran with, as the engine's own settings parser
+    # reads the environment the harness gave it (BACKLOG #2013). It moves both terms of the
+    # predicted herd floor, so #1415 needs it pinned across every counted run. None means not
+    # recorded: a two-box cell, a record built by hand, or an older artifact.
+    per_lane_wake: bool | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
             "claim_mode": self.claim_mode,
             "fuse_thread_hops": self.fuse_thread_hops,
             "batch_handoff_statements": self.batch_handoff_statements,
+            "per_lane_wake": self.per_lane_wake,
             "sweep_mode": self.sweep_mode,
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),

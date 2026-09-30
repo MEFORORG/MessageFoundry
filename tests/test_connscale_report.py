@@ -298,3 +298,30 @@ def test_a_mix_of_windows_is_shown_as_a_mix() -> None:
     assert records_rate_window([swept, swept]) == RATE_WINDOW
     assert records_rate_window([swept, bracket]) == f"{HOLD_BRACKET_RATE_WINDOW}|{RATE_WINDOW}"
     assert records_rate_window([swept, unsaid]) == f"{RATE_WINDOW}|unrecorded"
+
+
+# --- BACKLOG #2013: each step records the per_lane_wake its engine resolved ------------------------
+
+
+def test_the_effective_per_lane_wake_is_what_the_engine_parser_reads() -> None:
+    from harness.load.connscale.runner import _effective_per_lane_wake
+
+    pinned = {"MEFOR_PIPELINE_PER_LANE_WAKE": "false", "MEFOR_STORE_PATH": "x.db"}
+    assert _effective_per_lane_wake(pinned) is False
+    assert _effective_per_lane_wake({"MEFOR_PIPELINE_PER_LANE_WAKE": "true"}) is True
+    # A value the engine's parser refuses is not recorded as either answer.
+    assert _effective_per_lane_wake({"MEFOR_PIPELINE_PER_LANE_WAKE": "sometimes"}) is None
+
+
+def test_the_run_pin_is_proven_only_where_every_step_records_the_same_value() -> None:
+    from harness.load.connscale.report import per_lane_wake_pin
+
+    off = dataclasses.replace(_swept(), per_lane_wake=False)
+    on = dataclasses.replace(off, per_lane_wake=True)
+    unsaid = _swept()
+    assert per_lane_wake_pin([off, off]) == "false"
+    assert per_lane_wake_pin([on]) == "true"
+    assert per_lane_wake_pin([off, on]) == "mixed"
+    assert per_lane_wake_pin([off, unsaid]) == "-"
+    assert per_lane_wake_pin([]) == "-"
+    assert off.to_json_dict()["per_lane_wake"] is False
