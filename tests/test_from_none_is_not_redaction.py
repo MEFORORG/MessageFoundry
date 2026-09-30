@@ -59,7 +59,8 @@ it). And so is a body-holding error that propagates unwrapped (``RawMessage.json
 error out until #2085), or one caught behind a helper, such as the environment values loader. Frame locals are also
 out of scope: the raised exception's own
 ``__traceback__`` reaches the same frame whether or not the chain is cut, so ``from None`` could never
-have hidden them either. The scan covers ``messagefoundry/`` only; ``tee/`` and ``harness/`` are not
+have hidden them either. The scan covers ``messagefoundry/`` and ``messagefoundry_toolkit/`` (ADR 0201
+moves engine code there); ``tee/`` and ``harness/`` are not
 the engine package, and the web console had no ``from None`` site on 2026-09-26.
 
 **Key shape.** ``<path>::<enclosing qualname>::<caught type>::<raised callable>``, with a count. No line
@@ -86,6 +87,9 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
+# ADR 0201 moves authoring code out of messagefoundry/ into its toolkit sibling. A module that
+# moves must not leave this scan, so both roots are walked.
+_ENGINE_ROOTS = (_PKG, _ROOT / "messagefoundry_toolkit")
 
 _SAFE = "SAFE -- "
 _UNSAFE = "UNSAFE -- finding, fix pending: "
@@ -381,6 +385,14 @@ def _scan(root: Path, base: Path) -> Counter[str]:
     return found
 
 
+def _scan_engine() -> Counter[str]:
+    """The real census: the engine package and the toolkit package it hands authoring code to."""
+    found: Counter[str] = Counter()
+    for root in _ENGINE_ROOTS:
+        found.update(_scan(root, _ROOT))
+    return found
+
+
 def _assert_classified(found: Counter[str], allowed: tuple[_Allowed, ...]) -> None:
     """The gate, over a named census, so the controls below can drive it into failure."""
     listed: Counter[str] = Counter()
@@ -409,7 +421,7 @@ def _assert_classified(found: Counter[str], allowed: tuple[_Allowed, ...]) -> No
 
 
 def test_every_from_none_is_classified() -> None:
-    _assert_classified(_scan(_PKG, _ROOT), _ALLOWED)
+    _assert_classified(_scan_engine(), _ALLOWED)
 
 
 def test_the_scan_is_armed() -> None:
@@ -417,7 +429,7 @@ def test_the_scan_is_armed() -> None:
 
     The census on 2026-09-26 was 50, and 47 once the three UNSAFE sites were fixed. Those three are
     driven, chain and all, by ``tests/test_refusals_carry_no_chain.py``."""
-    found = _scan(_PKG, _ROOT)
+    found = _scan_engine()
     assert sum(found.values()) >= 40, found
 
 
@@ -508,7 +520,7 @@ def test_a_planted_unlisted_site_fails_the_gate(tmp_path: Path) -> None:
     found = _scan(tmp_path / "messagefoundry", tmp_path)
     assert found == Counter({_PLANTED_KEY: 1})
     with pytest.raises(AssertionError) as caught:
-        _assert_classified(_scan(_PKG, _ROOT) + found, _ALLOWED)
+        _assert_classified(_scan_engine() + found, _ALLOWED)
     assert _PLANTED_KEY in str(caught.value)
 
 
@@ -516,13 +528,13 @@ def test_a_stale_entry_fails_the_gate() -> None:
     """Fixing a site without deleting its entry must red, or the list stops being a census."""
     ghost = _Allowed("messagefoundry/nowhere.py::gone::KeyError::X", _SAFE + "a site now fixed")
     with pytest.raises(AssertionError) as caught:
-        _assert_classified(_scan(_PKG, _ROOT), (*_ALLOWED, ghost))
+        _assert_classified(_scan_engine(), (*_ALLOWED, ghost))
     assert ghost.key in str(caught.value)
 
 
 def test_a_second_raise_at_a_listed_key_fails_the_gate() -> None:
     """A count, not a set: a new raise in an already-listed function is still a new site."""
-    real = _scan(_PKG, _ROOT)
+    real = _scan_engine()
     key = "messagefoundry/transports/base.py::build_source::KeyError::ValueError"
     assert real[key] == 1
     with pytest.raises(AssertionError) as caught:
@@ -585,7 +597,7 @@ def test_the_five_pre_1209_shapes_are_all_flagged(rel: str) -> None:
     keys = Counter(_scan_source(_PRE_1209[rel], f"messagefoundry/{rel}"))
     assert keys, f"the scanner is blind to the pre-1209 shape of {rel}"
     with pytest.raises(AssertionError) as caught:
-        _assert_classified(_scan(_PKG, _ROOT) + keys, _ALLOWED)
+        _assert_classified(_scan_engine() + keys, _ALLOWED)
     missed = sorted(k for k in keys if k not in str(caught.value))
     assert not missed, f"the gate failed, but not over these pre-1209 sites: {missed}"
 
@@ -790,7 +802,7 @@ def _real_body_scan() -> tuple[Counter[str], int]:
     body-holding handlers visited (the armed floor)."""
     found: Counter[str] = Counter()
     handlers = 0
-    for path in sorted(_PKG.rglob("*.py")):
+    for path in sorted(p for root in _ENGINE_ROOTS for p in root.rglob("*.py")):
         scanner = _BodyScanner(path.relative_to(_ROOT).as_posix())
         scanner.visit(ast.parse(path.read_text(encoding="utf-8")))
         found.update(scanner.keys)

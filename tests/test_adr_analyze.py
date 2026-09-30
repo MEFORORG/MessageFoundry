@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
-from messagefoundry.adr_analyze import analyze_adrs
+from messagefoundry_toolkit.__main__ import main
+from messagefoundry_toolkit.adr_analyze import analyze_adrs
 
 
 def _repo(tmp_path: Path) -> tuple[Path, Path]:

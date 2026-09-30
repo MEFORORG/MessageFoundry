@@ -1733,6 +1733,72 @@ async def test_a_second_attempt_answers_on_a_slot_its_own_work_does_not_move(
         await store.close()
 
 
+@pytest.mark.parametrize("queued", [False, True], ids=["alone", "queued"])
+async def test_a_refusals_answer_slot_does_not_depend_on_its_audit_write_time(
+    monkeypatch: pytest.MonkeyPatch, queued: bool
+) -> None:
+    """RED when (the ``queued`` arm): a refused sign-in reads the clock for its answer's slot AFTER
+    its audit writes. The ``alone`` arm is a control that passes either way: it pins that the write
+    room keeps an attempt that did not queue in slot 1 on both names.
+
+    BACKLOG #2467, ASVS 6.3.8. A refused local sign-in writes its audit rows at a fixed point, the
+    equaliser's floor, and a refusal by a live lock writes two rows where an unknown name writes
+    one. Read after those writes, the clock carried their length into the answer's slot. Alone, the
+    floor sits half a budget before the boundary. Queued, the caller who sends a second attempt on
+    the name picks how far past the floor the next boundary sits, so it can put that boundary
+    between the end of one row and the end of two.
+
+    Unlike the test above, this slows ``_audit`` and not the failure count: the count runs before
+    the write point, the rows after it. The verify is a fixed 20 ms sleep and each row costs 120 ms.
+    The queued attempt starts so its next boundary sits 180 ms past its floor, between one row
+    (120 ms) and two (240 ms). The margins are 60 ms each way, wider than this host's jitter."""
+    import messagefoundry.auth.service as svc
+
+    store = await _store()
+    try:
+        # Alone, the budget only has to hold the write point plus two rows inside slot 1; queued,
+        # it must also leave a quarter budget of room above two rows.
+        budget, row, margin = (1.6 if queued else 0.8), 0.12, 0.18
+        monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
+        service = AuthService(store, AuthSettings(lockout_threshold=50, lockout_minutes=15))
+        identity, _, _ = await login_admin(service)
+        await _set_sign_in_lock(store, identity.user_id)
+
+        async def fixed_wrong(fn: Any, *args: Any) -> Any:
+            await asyncio.sleep(0.02)
+            return False
+
+        real_audit = service._audit
+
+        async def slow_audit(*args: Any, **kwargs: Any) -> None:
+            await asyncio.sleep(row)
+            await real_audit(*args, **kwargs)
+
+        monkeypatch.setattr(service, "_argon2", fixed_wrong)
+        monkeypatch.setattr(service, "_audit", slow_audit)
+
+        async def slot(name: str, error: str) -> int:
+            first = None
+            if queued:
+                first = asyncio.ensure_future(service.login(name, "wrong"))
+                await asyncio.sleep(budget / 2 + margin)
+                # Still inside its padded answer, so it holds the name's queue: the second waits.
+                assert not first.done(), "the first attempt answered early; this proves nothing"
+            started = time.monotonic()
+            out = await service.login(name, "wrong")
+            took = time.monotonic() - started
+            assert not out.ok and out.error == error, out
+            if first is not None:
+                assert not (await first).ok
+            return round(took / budget)
+
+        locked = await slot(ADMIN_USERNAME, "account locked")
+        unknown = await slot("no-such-operator", "invalid credentials")
+        assert locked == unknown, f"the answer's slot depends on the name: {locked} vs {unknown}"
+    finally:
+        await store.close()
+
+
 class _TickingClock:
     """A stand-in for the ``totp`` module's ``time`` that starts at ``instant`` and then moves with
     the real monotonic clock, so a real wait in the queue carries the TOTP step forward."""

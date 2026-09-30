@@ -391,6 +391,8 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 service rate and exits 0 even when the reconcile fails, because a
 #                                 machine too slow to keep up is the finding, not an error. See #320.
 #   freethread-smoke.yml       -- a 3.14t canary; informational only.
+#   py315-canary.yml           -- a Python 3.15 readiness canary; advisory, allowed to go red. No
+#                                 merge_group trigger, so required it would wedge the queue.
 #   manifest-lint.yml          -- paths-filtered to the k8s manifests.
 #   nightly / path-gated legs  -- server-DB store, load/throughput, service-smoke, DICOM/FHIR
 #                                 breadth: they do not run on every PR (required-but-absent trap).

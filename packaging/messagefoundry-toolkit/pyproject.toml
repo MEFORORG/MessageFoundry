@@ -1,0 +1,80 @@
+[build-system]
+# EXACT `==`, in lockstep with the engine's table. The reason is stated once, above that table in the
+# root pyproject.toml.
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+# Third sibling distribution: the MessageFoundry TOOLKIT (ADR 0201, BACKLOG #1192, ASVS 15.2.3). It
+# carries the authoring and development commands that `messagefoundry/cli_surface.py` (`CLI_TIERS`)
+# marks `toolkit`, so a production install of the engine neither includes that code nor exposes those
+# commands. The import package messagefoundry_toolkit/ lives at the REPO ROOT, beside
+# messagefoundry_webconsole/ and harness/, so a checkout imports it with no install; this build pulls
+# it into the wheel via force-include. The ENGINE wheel does NOT contain it.
+#
+# DEV AND CI DO NOT INSTALL THIS DISTRIBUTION. An editable install of a force-included tree is a
+# frozen copy in site-packages that wins the import over the checkout (ADR 0201 section 1 measured
+# it on the web console). The engine's own editable install already puts the repository root on the
+# import path, so `python -m messagefoundry_toolkit` runs the checkout. Only the packaging-build CI
+# job and the release build this wheel. tests/test_toolkit_cli.py pins that the checkout answers.
+
+[tool.hatch.version]
+path = "../../messagefoundry/__init__.py"  # lockstep: single source of truth is the engine's __version__
+
+[project]
+name = "messagefoundry-toolkit"
+dynamic = ["version"]
+description = "Authoring and development tooling for MessageFoundry, kept out of the engine wheel (ADR 0201)"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "MessageFoundry Foundation, LLC and contributors" }]
+keywords = ["hl7", "healthcare", "integration", "authoring", "development", "tooling"]
+classifiers = [
+    "Development Status :: 4 - Beta",  # Early Access (lockstep with the engine)
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development",
+    "Topic :: Communications",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+]
+dependencies = [
+    # PINNED EXACTLY, AT THE ENGINE'S OWN VERSION, like the harness (BACKLOG #1585). The toolkit calls
+    # engine internals with no stable seam between them: `config.impact`, the registry loader, the
+    # signatures `lens_schema` reads from `actions` and `diagnostics`, and the shared CLI shell in
+    # `messagefoundry.cli_common`. `[tool.hatch.version].path` above reads the engine's __init__.py,
+    # so the two versions match by construction and `==` states that fact.
+    #
+    # SO A VERSION BUMP IS AT LEAST THREE EDITS: messagefoundry/__init__.py, the harness pin and this line.
+    # tests/test_packaging.py::test_the_toolkit_pins_the_engine_at_the_version_it_ships_with is the
+    # gate. The pin alone does not hold the pair together, because `pip install -U messagefoundry`
+    # upgrades past it with a warning and exit 0, so the toolkit also compares the two installed
+    # versions at startup and refuses a mismatch (ADR 0201 AC-4).
+    #
+    # THE TOOLKIT DECLARES NOTHING ELSE. Its third-party imports are core engine dependencies, so the
+    # exact pin makes the engine's set the toolkit's. At least these, from an AST scan (ADR 0201
+    # section 1): `hl7apy` (hl7schema, hl7structures, generators), `hl7` (anon/hl7.py) and
+    # `defusedxml` (corepoint_import). A change to the engine's core set must be checked against them.
+    "messagefoundry==0.4.0",
+]
+
+[project.scripts]
+messagefoundry-toolkit = "messagefoundry_toolkit.__main__:main"
+
+[project.urls]
+Homepage = "https://messagefoundry.org/"
+Source = "https://github.com/MEFORORG/MessageFoundry"
+# Contributing, not Issues: CONTRIBUTING.md states the routes (BACKLOG #1755).
+Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTING.md"
+
+[tool.hatch.build.targets.wheel]
+# The import package is two levels up (the repo root); pull the whole tree into the wheel, one
+# whole-directory mapping as the web console does. A whole-directory map ships every file under it,
+# a nested CLAUDE.md included, because hatchling filters no force-included file by `exclude` (the
+# harness table records the measurement). None exists here. The guards are
+# tests/test_packaging.py::test_no_packaged_wheel_force_includes_the_repository_instructions and,
+# on the built wheel, scripts/release/forbidden_members.py.
+force-include = { "../../messagefoundry_toolkit" = "messagefoundry_toolkit" }

@@ -128,6 +128,7 @@ from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     DeadLetterReplayResult,
     DeadLetterRow,
+    DeadLetterTarget,
     DrActionResult,
     DrActivateRequest,
     DrStatus,
@@ -3513,6 +3514,16 @@ def create_app(
         total = await engine.store.count_dead(
             channel_id=channel_id, destination_name=destination_name, allowed_channels=allowed
         )
+        # The two replay fields are defined on DeadLetterList. Both reads carry the list's scope.
+        targets = await engine.store.list_replay_targets(
+            channel_id=channel_id, destination_name=destination_name, allowed_channels=allowed
+        )
+        # A filtered set is a subset of the scope, so a non-empty one already answers the flag.
+        replayable_in_scope = bool(targets)
+        if not replayable_in_scope and (channel_id is not None or destination_name is not None):
+            replayable_in_scope = bool(
+                await engine.store.list_replay_targets(allowed_channels=allowed)
+            )
         dead = [_dead_row(r) for r in rows]
         # Same centralized per-property PHI gate as /messages (WP-9): messages:view_summary unlocks the
         # patient-identifying `summary` and the delivery `last_error` (which can quote field values —
@@ -3525,7 +3536,14 @@ def create_app(
             await request.app.state.summary_auditor.note(
                 engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
-        return DeadLetterList(total=total, limit=limit, offset=offset, dead_letters=dead)
+        return DeadLetterList(
+            total=total,
+            limit=limit,
+            offset=offset,
+            dead_letters=dead,
+            replay_targets=[DeadLetterTarget(channel_id=c, destination_name=d) for c, d in targets],
+            replayable_in_scope=replayable_in_scope,
+        )
 
     @app.post(
         "/dead-letters/replay", response_model=DeadLetterReplayResult | PendingApprovalResponse

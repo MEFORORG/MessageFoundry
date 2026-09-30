@@ -8,8 +8,14 @@ connector's fate returns to the owner. The 2026-08-21 decision packet's critic n
 an engine-shaped client, with the shipped hardening assertion passing, completed a handshake whose
 peer signature was PKCS#1 v1.5. This module records, per gated context, which signature schemes it
 OFFERS (client side) and which one it CHOOSES (server side), and it goes red when the rsa_pkcs1
-offer shrinks or widens. It narrows no signature algorithm and raises no protocol floor; both are
-interop-priced owner calls.
+offer shrinks or widens. It narrows no signature algorithm and raises no protocol floor itself.
+
+ONE NARROWING IS NOW BUILT, AND IT IS SHA-224 ONLY. This module said both of those were
+interop-priced owner calls. The owner ruled on SHA-224 on 2026-09-29 (BACKLOG #1171, ASVS 11.4.1):
+build it now behind a feature check, so an engine on Python 3.15 stops offering the SHA-224 schemes
+at once, while 3.14 keeps today's behaviour. ``tls_policy.narrow_signature_algorithms`` is the one
+statement of what it does and what it cannot reach; the last section below measures it. The rsa_pkcs1
+SHA-2 schemes and the protocol floor are still owner calls, and nothing here narrows them.
 
 WHY BYTE-LEVEL ON BOTH SIDES. CPython 3.14 exposes no signature-algorithm seam on ``SSLContext``:
 no setter, and no way to read which scheme a handshake used (``set_client_sigalgs``,
@@ -102,6 +108,13 @@ ECDSA_SECP256R1_SHA256 = 0x0403
 ECDSA_SECP384R1_SHA384 = 0x0503
 
 RSA_PKCS1_MD5 = 0x0101
+DSA_SHA224 = 0x0302
+ECDSA_SHA224 = 0x0303
+
+#: Every SHA-224 signature scheme in the RFC 5246 registry: the set BACKLOG #1171 removes.
+SHA224_SCHEMES = frozenset({RSA_PKCS1_SHA224, DSA_SHA224, ECDSA_SHA224})
+#: The ML-DSA schemes OpenSSL 3.5 adds through a provider, which ``ssl.get_sigalgs`` does not list.
+MLDSA_SCHEMES = frozenset({0x0904, 0x0905, 0x0906})
 
 #: At least the RSA PKCS#1 v1.5 codepoints of the RFC 5246 and RFC 8446 registries, MD5 included.
 #: Each is PKCS#1 v1.5, the padding ASVS 11.3.1 names.
@@ -761,8 +774,10 @@ def test_destination_offers_rsa_pkcs1_at_tls12(
     A TLS 1.2 client must accept a ServerKeyExchange signed with any scheme it offered (RFC 5246
     section 7.4.1.4.1), so offering these is accepting a PKCS#1 v1.5 handshake signature from a
     peer that picks one. At TLS 1.3 these codepoints are valid only for certificate signatures.
-    Goes red the day a client-side pin (``set_client_sigalgs``, Python 3.15) removes them, or a
-    lowered security level adds SHA-1."""
+    Goes red the day a pin removes them, or a lowered security level adds SHA-1. On a client
+    context the pin that shapes this offer is ``set_server_sigalgs`` (Python 3.15), not
+    ``set_client_sigalgs``: see ``tls_policy.narrow_signature_algorithms``. The SHA-224 pin it now
+    applies keeps this tripwire green, because the ceiling admits SHA-224 absent."""
     ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
     reading = client_offer(ctx)
     assert not offer_problems(reading), f"{site}: {offer_problems(reading)}"
@@ -812,10 +827,289 @@ def test_the_hello_parser_round_trips_an_offer_it_did_not_come_from() -> None:
 def test_the_runtime_still_has_no_signature_algorithm_seam() -> None:
     """TRIPWIRE, in the ``harden_kex_groups`` style. CPython 3.15 adds ``set_client_sigalgs`` and
     ``set_server_sigalgs``. When this goes red, a real pin excluding rsa_pkcs1 has become possible
-    and the 11.3.1 disposition should be re-read. It is asserted unconditionally on purpose."""
+    and the 11.3.1 disposition should be re-read. It is asserted unconditionally on purpose.
+
+    It is also the signal that the SHA-224 pin (BACKLOG #1171) has started acting. The SHA-224
+    section below then runs its 3.15 branch, and its readings are the first measurement of it."""
     for name in ("set_client_sigalgs", "set_server_sigalgs"):
         assert not hasattr(ssl.SSLContext, name), (
             f"ssl.SSLContext.{name} exists on this interpreter, so the TLS 1.2 handshake signature "
-            f"surface of ASVS 11.3.1 is now configurable (BACKLOG #1168). Re-read the record."
+            f"surface of ASVS 11.3.1 is now configurable (BACKLOG #1168), and the SHA-224 pin of "
+            f"BACKLOG #1171 is live. Re-read both records."
         )
     assert hasattr(ssl.SSLContext, "set_ciphers"), "control: the attribute probe itself works"
+
+
+# --- the SHA-224 pin (BACKLOG #1171, owner ruling 2026-09-29) -----------------------------------------
+
+#: Shaped like ``ssl.get_sigalgs()`` on OpenSSL 3.5: IANA names in libssl's table order, the three
+#: SHA-224 schemes included. One is upper-cased to prove the match ignores case.
+_CATALOGUE = (
+    "ecdsa_secp256r1_sha256",
+    "ecdsa_sha224",
+    "ecdsa_sha1",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "RSA_PKCS1_SHA224",
+    "dsa_sha256",
+    "dsa_sha224",
+)
+_CATALOGUE_WITHOUT_SHA224 = (
+    "ecdsa_secp256r1_sha256:ecdsa_sha1:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:dsa_sha256"
+)
+#: The first list tried: ML-DSA put back at the front with OpenSSL's ``?`` prefix.
+_PINNED_MARKED = "?mldsa65:?mldsa87:?mldsa44:" + _CATALOGUE_WITHOUT_SHA224
+#: The second: the same names without the prefix, for a build that refuses ``?``.
+_PINNED_PLAIN = "mldsa65:mldsa87:mldsa44:" + _CATALOGUE_WITHOUT_SHA224
+
+
+class _SigalgCapableContext(ssl.SSLContext):
+    """A stand-in for a CPython 3.15 context: a real context that also has ``set_server_sigalgs``.
+    It records every list it is handed, and refuses (as OpenSSL does, with ``ssl.SSLError``) any
+    list for which ``refuse`` returns True, so each fallback arm can be driven."""
+
+    sigalg_calls: list[str]
+
+    def refuse(self, sigalgs: str) -> bool:
+        return False
+
+    def set_server_sigalgs(self, sigalgs: str) -> None:
+        self.sigalg_calls = [*getattr(self, "sigalg_calls", []), sigalgs]
+        if self.refuse(sigalgs):
+            raise ssl.SSLError("unrecognized signature algorithm")
+
+
+class _RefusesThePrefix(_SigalgCapableContext):
+    def refuse(self, sigalgs: str) -> bool:
+        return "?" in sigalgs
+
+
+class _RefusesMlDsa(_SigalgCapableContext):
+    def refuse(self, sigalgs: str) -> bool:
+        return "mldsa" in sigalgs
+
+
+@pytest.fixture
+def catalogue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``ssl.get_sigalgs`` returning :data:`_CATALOGUE`, with the per-process cache emptied on both
+    sides so no reading leaks into another test."""
+    monkeypatch.setattr(ssl, "get_sigalgs", lambda: list(_CATALOGUE), raising=False)
+    tls_policy._sigalgs_without_sha224.cache_clear()
+    yield
+    tls_policy._sigalgs_without_sha224.cache_clear()
+
+
+def _pin_acts_here() -> bool:
+    """Whether the pin acts on this interpreter, asked of the pin itself on a throwaway context."""
+    return tls_policy.narrow_signature_algorithms(ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_the_pin_passes_openssls_catalogue_minus_sha224_in_order() -> None:
+    """The first list: ML-DSA marked with ``?`` in front, then the catalogue in its own order."""
+    ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    assert tls_policy.narrow_signature_algorithms(ctx) is True
+    assert ctx.sigalg_calls == [_PINNED_MARKED]
+    # Control: the catalogue did hold three SHA-224 names, so the filter removed something.
+    assert sum("sha224" in n.lower() for n in _CATALOGUE) == 3
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_a_build_refusing_the_prefix_gets_ml_dsa_plain() -> None:
+    ctx = _RefusesThePrefix(ssl.PROTOCOL_TLS_CLIENT)
+    assert tls_policy.narrow_signature_algorithms(ctx) is True
+    assert ctx.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN]
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_a_build_refusing_ml_dsa_still_drops_sha224_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ML-DSA alone never fails closed: the list without it is applied, with one warning."""
+    monkeypatch.setattr(tls_policy, "_SIGALGS_MLDSA_WARNED", False)
+    first, second = _RefusesMlDsa(ssl.PROTOCOL_TLS_CLIENT), _RefusesMlDsa(ssl.PROTOCOL_TLS_CLIENT)
+    with caplog.at_level("WARNING", logger=tls_policy.logger.name):
+        assert tls_policy.narrow_signature_algorithms(first) is True
+        assert tls_policy.narrow_signature_algorithms(second) is True
+    assert first.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN, _CATALOGUE_WITHOUT_SHA224]
+    warned = [r for r in caplog.records if "ML-DSA" in r.getMessage()]
+    assert len(warned) == 1, [r.getMessage() for r in warned]
+
+
+def test_ml_dsa_already_in_the_catalogue_is_not_added_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later OpenSSL may list ML-DSA itself, even only some of it. Then its own list and order
+    are passed as they are, once, and nothing is put in front."""
+    listed = ["mldsa65", "rsa_pkcs1_sha256", "rsa_pkcs1_sha224", "mldsa87", "mldsa44"]
+    monkeypatch.setattr(ssl, "get_sigalgs", lambda: list(listed), raising=False)
+    tls_policy._sigalgs_without_sha224.cache_clear()
+    ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        assert tls_policy.narrow_signature_algorithms(ctx) is True
+    finally:
+        tls_policy._sigalgs_without_sha224.cache_clear()
+    assert ctx.sigalg_calls == ["mldsa65:rsa_pkcs1_sha256:mldsa87:mldsa44"]
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_both_narrowing_routes_reach_the_pin() -> None:
+    """The default narrowing and the operator-string route both pin, so no seam can skip it."""
+    default = _SigalgCapableContext(ssl.PROTOCOL_TLS_SERVER)
+    tls_policy.narrow_to_approved_suites(default)
+    operator = _SigalgCapableContext(ssl.PROTOCOL_TLS_SERVER)
+    tls_policy.apply_operator_tls_ciphers(operator, "ECDHE-ECDSA-AES256-GCM-SHA384")
+    assert default.sigalg_calls == [_PINNED_MARKED]
+    assert operator.sigalg_calls == [_PINNED_MARKED]
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_the_pin_reaches_the_inner_truststore_context() -> None:
+    """truststore forwards only the methods it names; the pin must reach the context that
+    handshakes. The outer wrapper is a real ``ssl.SSLContext``, so on 3.15 a call on it would
+    succeed and change nothing."""
+    truststore = pytest.importorskip("truststore")
+    ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    assert hasattr(ctx, "_ctx"), "truststore moved its inner context; re-derive the pin"
+    inner = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx._ctx = inner
+    assert tls_policy.narrow_signature_algorithms(ctx) is True
+    assert inner.sigalg_calls == [_PINNED_MARKED]
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_a_build_refusing_every_list_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only a refusal of the list WITHOUT ML-DSA fails closed, after both ML-DSA lists were tried.
+    No ML-DSA warning is logged, because it would say SHA-224 was removed when it was not."""
+
+    class _Refusing(_SigalgCapableContext):
+        def refuse(self, sigalgs: str) -> bool:
+            return True
+
+    monkeypatch.setattr(tls_policy, "_SIGALGS_MLDSA_WARNED", False)
+    ctx = _Refusing(ssl.PROTOCOL_TLS_CLIENT)
+    with (
+        caplog.at_level("WARNING", logger=tls_policy.logger.name),
+        pytest.raises(RuntimeError, match="without SHA-224"),
+    ):
+        tls_policy.narrow_signature_algorithms(ctx)
+    assert ctx.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN, _CATALOGUE_WITHOUT_SHA224]
+    assert not [r for r in caplog.records if "ML-DSA" in r.getMessage()]
+    assert tls_policy._SIGALGS_MLDSA_WARNED is False
+
+
+def test_a_catalogue_of_only_sha224_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing left once SHA-224 is gone is a refusal, not the "cannot list" no-op."""
+    monkeypatch.setattr(ssl, "get_sigalgs", lambda: ["rsa_pkcs1_sha224"], raising=False)
+    tls_policy._sigalgs_without_sha224.cache_clear()
+    ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        with pytest.raises(RuntimeError, match="no scheme left once SHA-224 is removed"):
+            tls_policy.narrow_signature_algorithms(ctx)
+    finally:
+        tls_policy._sigalgs_without_sha224.cache_clear()
+    assert getattr(ctx, "sigalg_calls", []) == []
+
+
+def test_an_unreadable_catalogue_pins_nothing_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 3.15 linked to an OpenSSL older than 3.4: the setter exists, the catalogue raises."""
+
+    def unreadable() -> list[str]:
+        raise NotImplementedError("Getting signature algorithms requires OpenSSL 3.4 or later.")
+
+    monkeypatch.setattr(ssl, "get_sigalgs", unreadable, raising=False)
+    monkeypatch.setattr(tls_policy, "_SIGALGS_PIN_WARNED", False)
+    tls_policy._sigalgs_without_sha224.cache_clear()
+    try:
+        ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
+        with caplog.at_level("WARNING", logger=tls_policy.logger.name):
+            assert tls_policy.narrow_signature_algorithms(ctx) is False
+            assert tls_policy.narrow_signature_algorithms(ctx) is False
+    finally:
+        tls_policy._sigalgs_without_sha224.cache_clear()
+    assert getattr(ctx, "sigalg_calls", []) == [], "a list was applied from no catalogue"
+    warned = [r for r in caplog.records if "SHA-224" in r.getMessage()]
+    assert len(warned) == 1, [r.getMessage() for r in warned]
+
+
+def test_without_the_setter_nothing_is_called(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 3.14 branch: no setter, so the catalogue is never read and ``False`` is the report.
+
+    Driven with a stand-in that has no setter on any interpreter, and with a real context where the
+    real one has none, which is CPython 3.14."""
+    reads: list[int] = []
+
+    def spy() -> list[str]:
+        reads.append(1)
+        return list(_CATALOGUE)
+
+    monkeypatch.setattr(ssl, "get_sigalgs", spy, raising=False)
+    tls_policy._sigalgs_without_sha224.cache_clear()
+
+    class _NoSetter:
+        pass
+
+    try:
+        assert tls_policy.narrow_signature_algorithms(_NoSetter()) is False  # type: ignore[arg-type]
+        if not hasattr(ssl.SSLContext, "set_server_sigalgs"):
+            real = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            assert tls_policy.narrow_signature_algorithms(real) is False
+            tls_policy.narrow_to_approved_suites(real)
+    finally:
+        tls_policy._sigalgs_without_sha224.cache_clear()
+    assert reads == [], "the catalogue was read on a runtime that cannot apply it"
+
+
+def _version_matched_stock(ctx: ssl.SSLContext) -> ssl.SSLContext:
+    """A stock client context with ``ctx``'s protocol bounds, the control for its offer."""
+    stock = ssl.create_default_context()
+    stock.minimum_version = ctx.minimum_version
+    stock.maximum_version = ctx.maximum_version
+    return stock
+
+
+@pytest.mark.parametrize("site", _params(_CLIENT_SITES))
+def test_destination_sha224_offer_follows_the_runtime(
+    site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
+) -> None:
+    """Where the pin acts, no SHA-224 scheme is offered, and the offer shrinks by SHA-224 only:
+    the ML-DSA schemes the catalogue omits are put back. Where it cannot act, which is 3.14, the
+    offer equals a stock context's with the same protocol bounds, whole and in order."""
+    ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
+    offered = client_offer(ctx).sigalgs
+    stock = client_offer(_version_matched_stock(ctx)).sigalgs
+    if _pin_acts_here():
+        assert not set(offered) & SHA224_SCHEMES, f"{site}: SHA-224 still offered: {offered}"
+        assert set(offered) <= set(stock), f"{site}: the pin widened the offer"
+        dropped = set(stock) - set(offered)
+        assert dropped <= SHA224_SCHEMES, f"{site}: also dropped {sorted(dropped)}"
+        kept_mldsa = set(stock) & MLDSA_SCHEMES
+        assert kept_mldsa <= set(offered), f"{site}: ML-DSA left the offer"
+    else:
+        assert offered == stock, f"{site}: the offer moved on a runtime with no pin"
+
+
+@pytest.mark.parametrize("site", _params(_SERVER_SITES))
+def test_listener_sha224_signature_follows_the_runtime(
+    site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
+) -> None:
+    """A TLS 1.2 peer offering only rsa_pkcs1_sha224. A stock server context with the same RSA
+    certificate is the control: it must sign with SHA-224, so a refusal from the listener is the
+    pin's doing. Where the pin acts the listener refuses; where it cannot, it does what stock does."""
+    cert, key = rsa_identity
+    ctx, _ = build_site(site, Kit(cert, key, monkeypatch), captured)
+    stock_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    stock_ctx.load_cert_chain(cert, key)
+    stock = server_choice(stock_ctx, [RSA_PKCS1_SHA224])
+    assert stock.chosen == RSA_PKCS1_SHA224, (
+        f"control: a stock server did not sign SHA-224: {stock}"
+    )
+    reading = server_choice(ctx, [RSA_PKCS1_SHA224])
+    if _pin_acts_here():
+        assert reading.chosen is None and reading.refusal is not None, f"{site}: {reading}"
+    else:
+        assert reading.chosen == RSA_PKCS1_SHA224, f"{site}: {reading}"

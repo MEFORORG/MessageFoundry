@@ -87,7 +87,10 @@ def _check_attr(paths: list[str]) -> dict[str, dict[str, str]]:
 
 @pytest.fixture(scope="module")
 def shipped_paths() -> list[str]:
-    paths = _tracked("messagefoundry") + list(SHIPPED_ROOT_FILES)
+    # The toolkit ships in its own wheel (ADR 0201), so its tree is shipped text on the same terms.
+    paths = (
+        _tracked("messagefoundry") + _tracked("messagefoundry_toolkit") + list(SHIPPED_ROOT_FILES)
+    )
     assert len(paths) > 100, f"expected the package to have many tracked files, got {len(paths)}"
     return paths
 
