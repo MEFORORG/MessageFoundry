@@ -1132,6 +1132,20 @@ class QueueStore(StoreLifecycle, Protocol):
         allowed_channels: Sequence[str] | None = None,
     ) -> int: ...
 
+    async def list_replay_targets(
+        self,
+        *,
+        channel_id: str | None = None,
+        destination_name: str | None = None,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """The distinct ``(channel_id, destination_name)`` pairs for which :meth:`replay_dead`
+        would re-queue at least one row, sorted, under the :meth:`count_dead` filters and
+        ``allowed_channels`` scope. So a dead row whose body retention erased, or a pass-through
+        marker, names no pair: replay skips both. ``GET /dead-letters`` returns this set as
+        ``DeadLetterList.replay_targets`` (BACKLOG #1743 step 2)."""
+        ...
+
     async def outbox_for(self, message_id: str) -> Sequence[Row]: ...
 
     async def outbox_payloads_for(self, message_id: str) -> Sequence[Row]:

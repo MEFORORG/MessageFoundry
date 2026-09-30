@@ -1,0 +1,31 @@
+# HELP messagefoundry_build_info Build metadata; constant 1, version carried as a label.
+# TYPE messagefoundry_build_info gauge
+messagefoundry_build_info{version="test"} 1.0
+# HELP messagefoundry_messages_received_total Messages received on an inbound connection (process lifetime).
+# TYPE messagefoundry_messages_received_total counter
+# HELP messagefoundry_messages_errored_total Messages that failed intake/validation on an inbound connection (process lifetime).
+# TYPE messagefoundry_messages_errored_total counter
+# HELP messagefoundry_deliveries_total Messages delivered to an outbound connection (process lifetime).
+# TYPE messagefoundry_deliveries_total counter
+# HELP messagefoundry_deliveries_dead_total Outbound deliveries that dead-lettered (process lifetime).
+# TYPE messagefoundry_deliveries_dead_total counter
+# HELP messagefoundry_queue_depth Current pending + inflight outbound rows for a destination.
+# TYPE messagefoundry_queue_depth gauge
+# HELP messagefoundry_oldest_pending_age_seconds Age (seconds) of the oldest queued outbound row for a destination.
+# TYPE messagefoundry_oldest_pending_age_seconds gauge
+# HELP messagefoundry_outbox_status Current count of outbound rows by status.
+# TYPE messagefoundry_outbox_status gauge
+# HELP messagefoundry_in_pipeline Current not-done rows across every stage (ingress + routed + outbound).
+# TYPE messagefoundry_in_pipeline gauge
+messagefoundry_in_pipeline 0.0
+# HELP messagefoundry_store_committed_txns_total Physical store transactions committed (process lifetime).
+# TYPE messagefoundry_store_committed_txns_total counter
+messagefoundry_store_committed_txns_total 0.0
+# HELP messagefoundry_store_body_copies_total Raw/payload body strings durably written to the store (process lifetime).
+# TYPE messagefoundry_store_body_copies_total counter
+messagefoundry_store_body_copies_total 0.0
+# HELP messagefoundry_store_fenced_writes_total Terminal queue resolves rejected by the leader-epoch fence (process lifetime).
+# TYPE messagefoundry_store_fenced_writes_total counter
+messagefoundry_store_fenced_writes_total 0.0
+# HELP messagefoundry_delivery_latency_seconds Delivery latency (updated_at - created_at) over done outbound rows.
+# TYPE messagefoundry_delivery_latency_seconds histogram

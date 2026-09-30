@@ -1063,6 +1063,8 @@ def _git_commit_sha() -> str | None:
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",  # a hex SHA; explicit so the decode does not follow the locale
+            errors="replace",
             timeout=5,
             check=True,
         )
