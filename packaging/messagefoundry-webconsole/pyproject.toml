@@ -39,8 +39,11 @@ classifiers = [
 ]
 dependencies = [
     # The engine: the console mounts onto its FastAPI app and reuses its JSON handlers, DTOs, security
-    # deps, and the pure parsing lib. A PEP 508 compat RANGE is ideal (messagefoundry>=X,<Y); a bare
-    # dep is fine for now — the ENGINE_UI_SEAM handshake (assert_engine_seam) is the runtime backstop.
+    # deps, and the pure parsing lib. BARE ON MAIN ON PURPOSE: each console release sets a FLOOR with
+    # no ceiling here (messagefoundry>=X, RELEASE.md step 2; docs/WEBCONSOLE-PACKAGE.md says why). A
+    # floor on main would name an engine release that does not exist yet, and the editable installs in
+    # CI would not resolve. release.yml's release-webconsole job refuses a wheel built without one. The
+    # ENGINE_UI_SEAM handshake (assert_engine_seam) guards the upper side at startup.
     "messagefoundry",
 ]
 

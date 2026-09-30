@@ -259,7 +259,7 @@ fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64
 # second wheel (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin
 # in-process via mount_ui. That wheel IS on PyPI: the first webconsole-v* release claimed the name on
 # 2026-07-29. There is still no [webconsole] extra here, because re-adding it is an owner release step
-# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a compat range and a re-lock). Until
+# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a floor, no ceiling, and a re-lock). Until
 # then it installs as its own distribution; CI and a checkout use
 # `-e packaging/messagefoundry-webconsole`. With the package absent, serve refuses an explicit
 # serve_web_console=true and degrades a default-on console to JSON-only with a warning (__main__).
