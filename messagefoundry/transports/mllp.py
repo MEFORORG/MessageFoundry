@@ -503,9 +503,9 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
     try:
         return reencode_with_separators(payload, (field_sep, comp, rep, sub, esc))
     except (IndexError, ValueError) as exc:
-        # ValueError covers a body with no leading MSH/FHS/BHS (HL7ParseError) and a header whose own
-        # separators repeat. IndexError covers a header too truncated to read MSH-1/MSH-2 ("MSH",
-        # "MSH\rPID|1", "MSH|\rPID|1"; BACKLOG #1601). A non-HL7 body simply cannot be
+        # ValueError covers HL7ParseError (no leading MSH/FHS/BHS, or a header too truncated to read
+        # MSH-1/MSH-2: "MSH", "MSH\rPID|1", "MSH|\rPID|1"; BACKLOG #1601) and a header whose own
+        # separators repeat. IndexError is defensive. A non-HL7 body simply cannot be
         # delimiter-rewritten — surface it, don't corrupt. safe_exc names the type.
         raise ValueError(
             f"cannot re-encode delimiters: payload is not parseable HL7 ({safe_exc(exc)})"

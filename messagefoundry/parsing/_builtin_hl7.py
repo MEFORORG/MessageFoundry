@@ -75,7 +75,8 @@ __all__ = [
 
 
 class HL7ParseError(ValueError):
-    """The text does not begin with an ``MSH``, ``FHS`` or ``BHS`` segment, so it is not HL7 v2.
+    """The text is not readable HL7 v2: it does not begin with an ``MSH``, ``FHS`` or ``BHS``
+    segment, or a header is too short to hold its encoding characters.
 
     Raised by :func:`parse`. Its text is fixed and quotes nothing from the body, because callers
     pass it on to a sender or a log and the body can carry PHI.
@@ -160,6 +161,9 @@ def _parse_msh(msh_line: str, seps: tuple[str, str, str, str, str]) -> Segment:
     return {"id": msh_line[:3], "fields": fields}
 
 
+_SHORT_HEADER = "message header is too short to read its encoding characters"
+
+
 def parse(norm: str) -> ParsedMessage:
     """Parse a ``\\r``-normalized HL7 string into a :class:`ParsedMessage`.
 
@@ -177,6 +181,10 @@ def parse(norm: str) -> ParsedMessage:
     lines = strmsg.split("\r")
     if lines[0][:3] not in ("MSH", "FHS", "BHS"):
         raise HL7ParseError("message does not start with an MSH, FHS or BHS segment")
+    # A header too short to hold MSH-1 and one encoding character ("MSH", "MSH|") cannot be read at
+    # all. That is bad input, not a parser fault, so it is the same contract error (BACKLOG #1601).
+    if len(lines[0]) < 5:
+        raise HL7ParseError(_SHORT_HEADER)
     seps = _extract_separators(lines[0])
 
     field_sep = seps[0]
@@ -189,6 +197,8 @@ def parse(norm: str) -> ParsedMessage:
             continue
         if line[:3] in ("MSH", "BHS", "FHS"):
             # A further header-style line (e.g. a stray MSH) also splits eagerly.
+            if len(line) < 4:
+                raise HL7ParseError(_SHORT_HEADER)
             segments.append(_parse_msh(line, seps))
             continue
         # The segment id is the token before the first field separator — python-hl7 derives it the
@@ -222,8 +232,8 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
 def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
     """List index of the ``occurrence``-th (1-based) segment with ``seg_id``, or None if absent.
 
-    Tolerant scan (mirrors python-hl7's ``Message._segment_obj`` / ``str(segment[0])`` iteration the
-    legacy ``Message`` read+presence path uses): a blank segment is skipped, never an error. The
+    Tolerant scan (mirrors the ``str(segment[0])`` iteration python-hl7's legacy ``Message`` read and
+    presence path used): a blank segment is skipped, never an error. The
     *raising* scan python-hl7 does for ``segment()``/``extract_field``/whole-field assignment lives in
     :func:`raise_if_blank_segment_scan`.
     """
@@ -846,7 +856,7 @@ def set_field(
     (``msg["SEG.Fn"] = …`` → the raising ``segments()`` scan): a blank segment anywhere makes it raise
     ``IndexError``, a fieldless bare segment is skipped (so a bare ``PID`` before a populated one edits
     the populated), and a zero-match raises ``KeyError`` — all for byte-parity. A later occurrence uses
-    the tolerant ``_segment_obj`` path (counts the bare segment, no blank-raise). (The ``Message`` write
+    the tolerant :func:`_segment_index` scan (counts the bare segment, no blank-raise). (The ``Message`` write
     guard's tolerant presence check runs first, so a wholly-absent target is already a ``KeyError``.)
     """
     if occurrence == 1:

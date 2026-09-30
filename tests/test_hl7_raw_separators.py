@@ -276,8 +276,8 @@ async def test_send_with_flag_fails_loud_on_non_hl7() -> None:
 
 @pytest.mark.parametrize("truncated", ["MSH\rPID|1", "MSH|\rPID|1", "MSH"])
 async def test_send_with_flag_maps_a_truncated_header_to_a_delivery_error(truncated: str) -> None:
-    # BACKLOG #1601's sibling: these headers raise IndexError inside the built-in parser (python-hl7,
-    # since retired, raised AssertionError on some), which the send() catch used to miss. The port is closed, so a
+    # BACKLOG #1601's sibling: these headers raised AssertionError or IndexError inside the parsers,
+    # which the send() catch used to miss. The built-in parser now refuses them as HL7ParseError. The port is closed, so a
     # DeliveryError naming the emit proves the failure came before any I/O.
     dest = MLLPDestination(
         Destination(

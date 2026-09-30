@@ -245,14 +245,19 @@ With no second parser, a fault now takes the same path as any unparseable messag
 | `Peek.parse`, parser fault | fell back to python-hl7 | raises `HL7PeekError("could not parse HL7 message (<ErrorClass>)")` |
 | `Message.parse`, parser fault | fell back to python-hl7 | raises the same `HL7PeekError` |
 | `Message.parse`, no leading `MSH`/`FHS`/`BHS` | raised python-hl7's `hl7.ParseException` | raises `HL7PeekError`, a `ValueError` |
+| Either surface, a header too short to read (`MSH`, `MSH\|`) | an `IndexError`, handled as a fault | raises `HL7PeekError`, not logged as a fault |
 
 The listener already NAKs an `HL7PeekError` with AR and records the message as `ERROR` before any
 ingress row. So a fault is counted and logged, and the sender learns it was refused. The reliability
 and count-and-log invariants of CLAUDE.md section 2 hold without a second parser.
 
 The refusal names only the error's class. It is raised after the exception handler, so the parser's
-own error, whose text is not vetted, is not on the chain (BACKLOG #2085). The log line is `ERROR`,
-carries the class name only, and has no traceback. A traceback's messages can quote the body.
+own error, whose text is not vetted, is not on the chain (BACKLOG #2085). The log line is `ERROR`
+and carries the class name and the file and line of each frame, and no traceback text. A
+traceback's messages can quote the body; a file name and line number cannot.
+
+A header too short to hold MSH-1 and an encoding character is bad input, not a fault. The parser
+refuses it as its own contract error, so it is not logged as one (BACKLOG #1601's shapes).
 
 Two routes need no second parser to stay safe:
 
@@ -263,7 +268,8 @@ Two routes need no second parser to stay safe:
   reaches the parser at all. `test_expansion_budget_breach_never_reaches_the_parser` pins that.
 
 Handler authors see one change: `Message.parse` on a non-HL7 body raises `HL7PeekError`, a
-`ValueError`, where it raised `hl7.ParseException`, which was not one.
+`ValueError`, where it raised `hl7.ParseException`, which was not one. The CHANGELOG marks it
+BREAKING.
 
 ### Parity now rests on a frozen oracle
 

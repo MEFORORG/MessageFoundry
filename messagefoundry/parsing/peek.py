@@ -19,7 +19,9 @@ so :func:`normalize` collapses them to ``\\r`` before parsing.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import traceback
 from dataclasses import dataclass
 
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
@@ -204,8 +206,9 @@ def parse_or_refuse(text: str) -> _builtin_hl7.ParsedMessage:
     :meth:`Peek.parse` and :meth:`Message.parse <messagefoundry.parsing.message.Message.parse>` share.
 
     ``text`` is normalized, budget-checked and free of blank lines already. A body with no leading
-    ``MSH``/``FHS``/``BHS`` is refused with the parser's own fixed text. Any other error is a fault in
-    the parser, not a property of the message (ADR 0054 amendment). It is refused through the same
+    ``MSH``/``FHS``/``BHS``, or a header too short to read, is refused with the parser's own fixed
+    text. Any other error is a fault in the parser, not a property of the message (ADR 0054
+    amendment). It is refused through the same
     ``HL7PeekError`` the listener NAKs and records as ``ERROR``, so the message is counted and logged,
     never accepted and dropped.
 
@@ -220,7 +223,13 @@ def parse_or_refuse(text: str) -> _builtin_hl7.ParsedMessage:
         refused = str(exc)  # fixed text, quotes nothing from the body
     except Exception as exc:  # noqa: BLE001 — any other error here is a parser fault
         refused = f"could not parse HL7 message ({type(exc).__name__})"
-        logger.error("built-in HL7 parse faulted with %s; message refused", type(exc).__name__)
+        # Where it failed, as file:line of each frame, and never the error's own text: a location
+        # locates the bug and carries no body.
+        frames = traceback.extract_tb(exc.__traceback__)
+        where = " < ".join(f"{os.path.basename(f.filename)}:{f.lineno}" for f in reversed(frames))
+        logger.error(
+            "built-in HL7 parse faulted with %s at %s; message refused", type(exc).__name__, where
+        )
     raise HL7PeekError(refused)
 
 

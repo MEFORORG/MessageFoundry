@@ -594,7 +594,22 @@ def test_a_parser_fault_is_refused_as_a_contract_error(
     records = _fault_records(caplog)
     assert len(records) == 1 and records[0].levelno == logging.ERROR
     assert records[0].exc_info is None
+    # The log locates the fault by file:line, here the stand-in's own frame, and quotes nothing.
+    assert "test_builtin_hl7_hardening.py:" in records[0].getMessage()
     assert _PHI_MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("parse", [Peek.parse, Message.parse], ids=["peek", "message"])
+@pytest.mark.parametrize("body", ["MSH\rPID|1\r", "MSH|\rPID|1\r", "MSH|^~\\&|A\rMSH\r"])
+def test_a_header_too_short_to_read_is_refused_without_a_fault_log(
+    parse: object, body: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #1601's shapes are bad input, not a parser fault: the parser refuses them as its own
+    # contract error, so nothing is logged as a fault.
+    with caplog.at_level(logging.WARNING), pytest.raises(HL7PeekError) as excinfo:
+        parse(body)  # type: ignore[operator]
+    assert str(excinfo.value) == "message header is too short to read its encoding characters"
+    assert _fault_records(caplog) == []
 
 
 @pytest.mark.parametrize("parse", [Peek.parse, Message.parse], ids=["peek", "message"])
