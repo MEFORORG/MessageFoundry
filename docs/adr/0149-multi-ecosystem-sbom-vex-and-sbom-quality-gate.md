@@ -171,10 +171,11 @@ pip, each with a license, version and PackageURL, including `colorama` 0.4.6 and
 - The Windows scratch venv takes the Linux step's shape: made with `--without-pip` and filled by the
   outer interpreter's pip through `--python`, so the venv's seeded pip is not listed as an engine
   component. Every path to it is absolute: a relative `--python` path fails on Windows with WinError 2.
-- `sbom_finalize.py --sys-platform` records the platform in each engine SBOM as the `metadata.properties`
-  entry `messagefoundry:resolved-for:sys_platform` (`linux` or `win32`). The two files share a root
-  component, so without it only the filename told them apart. It is a label; nothing checks the
-  components against it.
+- `sbom_finalize.py --record-sys-platform` records the finalizing interpreter's own `sys.platform` in
+  each engine SBOM, as the `metadata.properties` entry `messagefoundry:resolved-for:sys_platform`
+  (`linux` or `win32`). The two files share a root component, so without it only the filename told
+  them apart. The helper runs in the same step as the install, so the value names the runner that
+  resolved the lock. It is not a check on the components.
 
 **Options considered.**
 

@@ -26,11 +26,12 @@ Two gaps remain that this closes:
   3. The engine ships TWO Python SBOMs, one resolved on Linux and one on Windows, because the core
      lock carries ``sys_platform`` markers and the two component sets differ. Both carry the same root
      component, so nothing inside either file said which platform it describes; only the filename did,
-     and a filename does not survive ingestion into an inventory tool. --sys-platform records the
-     PEP 508 ``sys_platform`` value the environment was resolved for as a ``metadata.properties``
-     entry named ``messagefoundry:resolved-for:sys_platform``. It is a LABEL, not a check: this helper
-     never inspects the components, so it cannot tell whether the label is true. The workflow's
-     ``runs-on`` is what makes it true.
+     and a filename does not survive ingestion into an inventory tool. --record-sys-platform writes
+     THIS interpreter's ``sys.platform`` (the PEP 508 ``sys_platform``: ``linux``, ``win32``) as a
+     ``metadata.properties`` entry named ``messagefoundry:resolved-for:sys_platform``. Read from the
+     interpreter rather than typed by the caller, so it is true by construction wherever the helper
+     runs on the same runner as the environment it finalizes, which is how every workflow calls it.
+     It still never inspects the components.
 
 It then asserts the CycloneDX invariants and the CISA/NTIA-relevant metadata are present: a genuinely
 broken SBOM (wrong bomFormat / no specVersion) exits non-zero so a release can't ship it; softer gaps
@@ -52,7 +53,7 @@ from typing import Any
 _LIFECYCLE_SPECS = {"1.5", "1.6", "1.7"}
 # CycloneDX lifecycle phase enum (1.5+). "build" is the phase these SBOMs are produced in.
 _PHASES = {"design", "pre-build", "build", "post-build", "operations", "discovery", "decommission"}
-# The metadata.properties name --sys-platform writes. Namespaced to this project: the `cdx:` prefix is
+# The metadata.properties name --record-sys-platform writes. Namespaced to this project: the `cdx:` prefix is
 # reserved for CycloneDX's own property taxonomy.
 PLATFORM_PROPERTY = "messagefoundry:resolved-for:sys_platform"
 
@@ -91,11 +92,11 @@ def main(argv: list[str] | None = None) -> int:
         "file and set it (used for the Python SBOM's dynamic-version root component).",
     )
     ap.add_argument(
-        "--sys-platform",
-        default=None,
-        metavar="VALUE",
-        help="Record the PEP 508 sys_platform the environment was resolved for (e.g. linux, win32) "
-        f"as the metadata property {PLATFORM_PROPERTY}, replacing any earlier value.",
+        "--record-sys-platform",
+        action="store_true",
+        help="Record this interpreter's sys.platform (e.g. linux, win32) as the metadata property "
+        f"{PLATFORM_PROPERTY}, replacing any earlier value. Run it on the runner that resolved the "
+        "environment.",
     )
     args = ap.parse_args(argv)
 
@@ -153,14 +154,14 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     # --- (3) label the platform the environment was resolved for ------------------------------------
-    if args.sys_platform is not None:
+    if args.record_sys_platform:
         props = metadata.get("properties")
         kept = [
             p
             for p in (props if isinstance(props, list) else [])
             if not (isinstance(p, dict) and p.get("name") == PLATFORM_PROPERTY)
         ]
-        metadata["properties"] = [*kept, {"name": PLATFORM_PROPERTY, "value": args.sys_platform}]
+        metadata["properties"] = [*kept, {"name": PLATFORM_PROPERTY, "value": sys.platform}]
 
     # --- soft assertions: warn (sbomqs scores these), never fail the build --------------------------
     if not _tools_present(metadata):
@@ -185,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         f"sbom_finalize: {args.sbom.name} — CycloneDX {spec}, "
         f"primary={name}@{version}, lifecycle={metadata.get('lifecycles')}, "
         f"components={len(doc.get('components', []))}"
-        + (f", sys_platform={args.sys_platform}" if args.sys_platform is not None else "")
+        + (f", sys_platform={sys.platform}" if args.record_sys_platform else "")
     )
     return 0
 

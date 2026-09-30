@@ -141,16 +141,19 @@ def _platform_values(doc: dict) -> list[str]:
     ]
 
 
-def test_sys_platform_is_recorded_as_a_metadata_property(tmp_path: Path):
+def test_sys_platform_is_recorded_from_the_running_interpreter(tmp_path: Path, monkeypatch):
     """The Linux and Windows engine SBOMs share a root component, so the label is what tells them
-    apart once the filename is gone."""
+    apart once the filename is gone. It comes from ``sys.platform``, never from the caller."""
+    monkeypatch.setattr(sbom_finalize.sys, "platform", "win32")
     p = _write_bom(tmp_path)
-    assert sbom_finalize.main([str(p), "--sys-platform", "win32"]) == 0
+    assert sbom_finalize.main([str(p), "--record-sys-platform"]) == 0
     assert _platform_values(_read(p)) == ["win32"]
 
 
-def test_sys_platform_replaces_rather_than_appends_and_keeps_other_properties(tmp_path: Path):
-    """A re-run with another value must leave ONE label, or a consumer reads two platforms."""
+def test_sys_platform_replaces_rather_than_appends_and_keeps_other_properties(
+    tmp_path: Path, monkeypatch
+):
+    """A re-run must leave ONE label, or a consumer reads two platforms."""
     p = _write_bom(
         tmp_path,
         metadata={
@@ -158,8 +161,10 @@ def test_sys_platform_replaces_rather_than_appends_and_keeps_other_properties(tm
             "properties": [{"name": "other:prop", "value": "kept"}],
         },
     )
-    assert sbom_finalize.main([str(p), "--sys-platform", "linux"]) == 0
-    assert sbom_finalize.main([str(p), "--sys-platform", "win32"]) == 0
+    monkeypatch.setattr(sbom_finalize.sys, "platform", "linux")
+    assert sbom_finalize.main([str(p), "--record-sys-platform"]) == 0
+    monkeypatch.setattr(sbom_finalize.sys, "platform", "win32")
+    assert sbom_finalize.main([str(p), "--record-sys-platform"]) == 0
     doc = _read(p)
     assert _platform_values(doc) == ["win32"]
     assert {"name": "other:prop", "value": "kept"} in doc["metadata"]["properties"]

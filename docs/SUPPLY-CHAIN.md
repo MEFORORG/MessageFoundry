@@ -53,8 +53,9 @@ signs and attests it like the Linux one.
 
 Each file also records its platform inside the file. Look for the `metadata.properties` entry named
 `messagefoundry:resolved-for:sys_platform`. Its value is `linux` or `win32`. This helps once the file
-has been renamed or loaded into an inventory tool. The value is a label the build writes; nothing
-checks the component list against it.
+has been renamed or loaded into an inventory tool. The build reads the value from the Python that ran
+on the same machine as the install, so it names that machine's platform. It is not a check on the
+component list.
 
 The container image SBOM above covers the Linux container as a whole. The engine's Linux SBOM covers
 only the Python packages the engine needs.

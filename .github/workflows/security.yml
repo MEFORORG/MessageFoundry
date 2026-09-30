@@ -522,7 +522,7 @@ jobs:
             --output-format JSON --output-file sbom-python.cdx.json
           # Declare the SBOM lifecycle (CISA "Build" type) + backfill the hatchling-dynamic root version.
           python scripts/security/sbom_finalize.py sbom-python.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --sys-platform linux
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
       - name: Generate the VS Code extension SBOM (npm, install-free)
         # if: always() so a Python-SBOM failure above doesn't skip this independent generator.
         if: always()
@@ -572,12 +572,9 @@ jobs:
     # Two hash-locked installs and one SBOM render.
     # Advisory and schedule-only, so a cap that fires here costs a nightly, not a merge.
     timeout-minutes: 20
-    # The Windows twin of the engine SBOM above. The core lock's sys_platform markers resolve
-    # differently on win32 (colorama and sspilib in, uvloop out), and the engine deploys as a Windows
-    # service as well as in the Linux container, so release.yml ships a second, Windows-resolved SBOM
-    # from its `sbom-windows` job. This job is that job's pre-tag dry-run, exactly as `sbom` above is
-    # for the Linux step. docs/SUPPLY-CHAIN.md and ADR 0149's 2026-09-30 amendment carry the decision.
-    # A separate job rather than a matrix leg of `sbom`, because that job's npm and sbomqs steps are
+    # The Windows twin of the engine SBOM above, and the pre-tag dry-run for release.yml's
+    # `sbom-windows` job, exactly as `sbom` is for the Linux step. Why the engine ships a second,
+    # Windows-resolved SBOM is ADR 0149's 2026-09-30 amendment. A separate job rather than a matrix leg of `sbom`, because that job's npm and sbomqs steps are
     # Linux-only and would each need a platform guard.
     continue-on-error: true
     # Same gate as `sbom`, for the same reason: the SBOM derives from a committed lockfile.
@@ -602,7 +599,7 @@ jobs:
             --pyproject pyproject.toml --mc-type application \
             --output-format JSON --output-file sbom-python-windows.cdx.json
           python scripts/security/sbom_finalize.py sbom-python-windows.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --sys-platform win32
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
       - name: Upload the Windows SBOM artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

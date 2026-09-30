@@ -113,6 +113,7 @@ in ADR 0034 §3, which is why it is still in `RELEASE_PINNED_TOOLS`.
 
 from __future__ import annotations
 
+import functools
 import re
 import tomllib
 from pathlib import Path
@@ -224,6 +225,11 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
 
     BOTH RUNNERS since the Windows-resolved SBOM (ADR 0149's 2026-09-30 amendment): the Windows venv's
     interpreter is ``"$RUNNER_TEMP/sbomenv/Scripts/python.exe"``, so the pattern takes either layout.
+
+    The venv, once pip-less, must be filled the one way that works: by the OUTER pip's ``--python``,
+    from the hashed core lock, at an ABSOLUTE path. Installing through the venv's own pip would fail,
+    and the easy "fix" is to drop ``--without-pip``. Measured on Windows: a RELATIVE ``--python`` path
+    fails with WinError 2 and installs nothing.
     """
     shell = _executed_shell(_sbom_step_run(workflow, runner))
     scanned = re.search(
@@ -249,6 +255,25 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
     )
     assert not [ln for ln in code if re.search(r"\bensurepip\b", ln)], (
         f"{workflow}'s SBOM step runs ensurepip, which re-seeds the pip `--without-pip` kept out"
+    )
+    own_pip = [
+        ln
+        for ln in code
+        if re.search(
+            rf"{re.escape(venv)}/(?:bin|Scripts)/(?:pip|python(?:\.exe)?\s+-m\s+pip)\b", ln
+        )
+    ]
+    assert not own_pip, f"{workflow} installs through the pip-less venv's own pip: {own_pip}"
+    core = [ln for ln in _installs_in(shell) if "docker/locks/requirements-core.lock" in ln]
+    assert len(core) == 1, f"{workflow}'s {runner} SBOM step installs the core lock {core}"
+    assert re.search(rf'--python\s+"?{re.escape(venv)}/\S+\s+install\b', core[0]), (
+        f"{workflow} does not fill {venv} through the outer pip's `--python`: {core[0]!r}"
+    )
+    assert "--require-hashes" in core[0], (
+        f"{workflow}: core lock install without hashes: {core[0]!r}"
+    )
+    assert venv.startswith(("/", "$RUNNER_TEMP/")), (
+        f"{workflow}'s SBOM venv path {venv!r} is relative; `pip --python` fails on it on Windows"
     )
 
 
@@ -1414,6 +1439,7 @@ def _installs_in(run_body: str) -> tuple[str, ...]:
     )
 
 
+@functools.cache
 def _sbom_steps(workflow: str) -> dict[str, str]:
     """``{runner: run body}`` for every step in ``workflow`` that builds the engine CycloneDX SBOM.
 
@@ -1421,27 +1447,25 @@ def _sbom_steps(workflow: str) -> dict[str, str]:
     the paired steps are deliberately named differently -- `release.yml` ships its SBOM and
     `security.yml` rehearses it -- and a name is also the one thing here that may be reworded freely.
 
-    KEYED BY THE JOB'S `runs-on`, and each runner may own exactly one such step. Until 2026-09-30 each
-    file held exactly one SBOM step and this helper asserted that; the Windows-resolved SBOM added a
-    second per file, and pairing them by runner is what stops a Linux step being compared against a
-    Windows one, or two Linux steps hiding a missing Windows twin.
+    KEYED BY THE JOB'S `runs-on`, exactly one step per runner. Pairing by runner is what stops a Linux
+    step being compared against a Windows one, or two Linux steps hiding a missing Windows twin.
+    Cached because every parametrized SBOM case reads the same two files; callers must not mutate it.
     """
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load((_WORKFLOWS / workflow).read_text(encoding="utf-8"))
-    found: dict[str, list[str]] = {}
-    for job in (doc.get("jobs") or {}).values():
-        for step in job.get("steps") or []:
-            run = step.get("run")
-            if isinstance(run, str) and "cyclonedx_py environment" in run:
-                found.setdefault(str(job.get("runs-on")), []).append(run)
-    assert set(found) == set(_SBOM_RUNNERS), (
-        f"{workflow} builds the engine SBOM on {sorted(found)}, expected exactly "
-        f"{list(_SBOM_RUNNERS)}. Re-point this twin check rather than letting it compare the wrong "
-        f"pair of steps."
+    pairs = [
+        (str(job.get("runs-on")), step["run"])
+        for job in (doc.get("jobs") or {}).values()
+        for step in job.get("steps") or []
+        if isinstance(step.get("run"), str) and "cyclonedx_py environment" in step["run"]
+    ]
+    # One sorted comparison catches a missing runner and a doubled one alike.
+    assert sorted(runner for runner, _ in pairs) == sorted(_SBOM_RUNNERS), (
+        f"{workflow} builds the engine SBOM on {sorted(r for r, _ in pairs)}, expected exactly one "
+        f"step on each of {list(_SBOM_RUNNERS)}. Re-point this twin check rather than letting it "
+        f"compare the wrong pair of steps."
     )
-    doubled = {runner: len(runs) for runner, runs in found.items() if len(runs) != 1}
-    assert not doubled, f"{workflow} has more than one SBOM step on one runner: {doubled}"
-    return {runner: runs[0] for runner, runs in found.items()}
+    return dict(pairs)
 
 
 def _sbom_step_run(workflow: str, runner: str) -> str:
@@ -1633,46 +1657,3 @@ def test_the_release_signing_toolchain_is_installed_from_a_hashed_lock() -> None
         "deliberate, restore an equivalent guard in the same commit -- otherwise the lock is inert "
         "and the signing step is back to resolving unhashed dependencies at tag time."
     )
-
-
-# --- the Windows-resolved engine SBOM fills its pip-less venv from the OUTER pip ------------------
-
-
-def test_the_windows_sbom_venv_is_filled_by_the_outer_pip_through_an_absolute_path() -> None:
-    """The Windows half of the seeded-pip rule, and the one Windows-only way it breaks.
-
-    `test_sbom_scan_venv_is_created_without_a_seeded_pip` already holds both runners' venvs to
-    `--without-pip`. This adds what only the Windows step needs:
-
-    1. nothing installs through the VENV's own pip, in either spelling -- with no pip there it would
-       fail, and the easy "fix" is to drop the flag;
-    2. the core lock is installed through the OUTER pip's `--python`, with `--require-hashes`, and the
-       interpreter path is absolute (`$RUNNER_TEMP`): measured on Windows, a RELATIVE `--python` path
-       fails with WinError 2 and installs nothing. The Linux step's `/tmp/sbomenv` is absolute by
-       construction, which is why this is Windows-only.
-    """
-    checked = 0
-    for workflow in ("release.yml", "security.yml"):
-        body = _sbom_step_run(workflow, "windows-latest")
-        code = [
-            ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")
-        ]
-        own_pip = [
-            ln for ln in code if re.search(r"sbomenv/Scripts/(?:pip|python\.exe\s+-m\s+pip)\b", ln)
-        ]
-        assert not own_pip, f"{workflow} installs through the pip-less venv's own pip: {own_pip}"
-        core = [ln for ln in code if "docker/locks/requirements-core.lock" in ln]
-        assert len(core) == 1, (
-            f"{workflow}'s Windows SBOM step installs the core lock {len(core)} times"
-        )
-        assert re.search(
-            r'--python\s+"\$RUNNER_TEMP/sbomenv/Scripts/python\.exe"\s+install\b', core[0]
-        ), (
-            f"{workflow} does not install the core lock through the outer pip's --python, into an "
-            f"absolute venv path: {core[0]!r}"
-        )
-        assert "--require-hashes" in core[0], (
-            f"{workflow}: core lock install without hashes: {core[0]!r}"
-        )
-        checked += 1
-    assert checked == 2

@@ -76,14 +76,10 @@ jobs:
   sbom-windows:
     # The Windows-resolved engine SBOM, built HERE and signed by the `release` job below.
     #
-    # WHY A SECOND SBOM. docker/locks/requirements-core.lock carries sys_platform markers: colorama and
-    # sspilib install only on win32, uvloop only off it. `cyclonedx-py environment` inventories what
-    # is INSTALLED, so the Linux SBOM in the `release` job lists uvloop and omits the other two. The
-    # engine deploys as a Windows service (docs/SERVICE.md) as well as in the Linux container, so a
-    # deploying site on Windows would receive an SBOM that names a package it does not run and misses
-    # two it does. Only a Windows interpreter resolves the markers the way a Windows install does, so
-    # this job runs on a Windows runner rather than faking the markers on Linux. docs/SUPPLY-CHAIN.md
-    # and ADR 0149's 2026-09-30 amendment carry the decision and the alternatives.
+    # WHY A SECOND SBOM: the core lock's sys_platform markers install a different package set on
+    # win32, and the engine also deploys as a Windows service, so the Linux SBOM would be wrong for a
+    # Windows site. Only a Windows interpreter resolves those markers as a Windows install does. The
+    # decision and the rejected alternatives are in ADR 0149's 2026-09-30 amendment.
     #
     # SPLIT FROM `release` ON PURPOSE. This job holds `contents: read` and nothing else: no id-token,
     # no attestations, no write. It produces bytes, and the privileged job signs and attests them.
@@ -127,7 +123,7 @@ jobs:
             --pyproject pyproject.toml --mc-type application \
             --of JSON -o messagefoundry-sbom-windows.cdx.json
           python scripts/security/sbom_finalize.py messagefoundry-sbom-windows.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --sys-platform win32
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
 
       - name: Hand the Windows SBOM to the signing job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -537,7 +533,7 @@ jobs:
           # the root component's version (hatchling-dynamic, so --pyproject leaves it null). Exits non-zero
           # on a structurally broken BOM, failing the release before it ships one.
           python scripts/security/sbom_finalize.py messagefoundry-sbom.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --sys-platform linux
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
 
       - name: Fetch the Windows-resolved SBOM from the sbom-windows job
         # Built on a Windows runner by the unprivileged job above. It lands beside the Linux SBOM and

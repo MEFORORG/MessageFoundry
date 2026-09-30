@@ -222,6 +222,7 @@ def test_release_load_bearing_canaries_present() -> None:
 #: The Windows-resolved engine SBOM, built by the unprivileged `sbom-windows` job and shipped by the
 #: `release` job beside the Linux one (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30 amendment).
 _WINDOWS_SBOM = "messagefoundry-sbom-windows.cdx.json"
+_ENGINE_SBOMS = ("messagefoundry-sbom.cdx.json", _WINDOWS_SBOM)
 
 
 def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one() -> None:
@@ -237,10 +238,10 @@ def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one()
       release cannot proceed without the file or ship one from a skipped job;
     - its upload refuses a missing file, rather than failing two jobs later at the download;
     - the ``release`` job downloads it, and it is signed, SLSA-attested, attached to the GitHub
-      release and uploaded as a workflow artifact -- the four places the Linux SBOM goes.
+      release and uploaded as a workflow artifact. Both engine SBOMs are held to those four sinks, so
+      neither can drop out of one while the other still reaches it.
     """
-    yaml = pytest.importorskip("yaml")
-    jobs = (yaml.safe_load(_release()) or {}).get("jobs") or {}
+    jobs = _jobs()
     win, rel = jobs.get("sbom-windows"), jobs.get("release")
     assert win and rel, "release.yml lost its `sbom-windows` or `release` job"
 
@@ -296,15 +297,16 @@ def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one()
             lambda st: str(st.get("uses", "")).startswith("actions/upload-artifact@")
         ),
     }
-    missing = [sink for sink, text in sinks.items() if _WINDOWS_SBOM not in text]
-    assert not missing, f"the Windows SBOM does not reach: {missing}"
+    missing = [(f, sink) for f in _ENGINE_SBOMS for sink, text in sinks.items() if f not in text]
+    assert not missing, f"an engine SBOM does not reach these sinks: {missing}"
     # The Sigstore bundle must ride along wherever the file does, or an operator cannot verify it.
     unbundled = [
-        sink
+        (f, sink)
+        for f in _ENGINE_SBOMS
         for sink in ("GitHub release assets", "workflow artifact upload")
-        if f"{_WINDOWS_SBOM}.sigstore" not in sinks[sink]
+        if f"{f}.sigstore" not in sinks[sink]
     ]
-    assert not unbundled, f"the Windows SBOM ships without its Sigstore bundle in: {unbundled}"
+    assert not unbundled, f"an engine SBOM ships without its Sigstore bundle: {unbundled}"
 
 
 #: The two halves every publish/release guard in release.yml must carry.
