@@ -21,11 +21,20 @@ from collections.abc import Callable
 from importlib import metadata
 
 from messagefoundry import __version__
-from messagefoundry.cli_common import Dispatch, _emit_error, _print_json, _safe_print, run_cli
+from messagefoundry.cli_common import (
+    Dispatch,
+    _emit_error,
+    _print_json,
+    _safe_print,
+    argv_wants_json,
+    run_cli,
+)
+from messagefoundry.cli_surface import TOOLKIT_COMMAND
 from messagefoundry.console_streams import harden_console_streams
 
-#: The two distributions whose versions must match (ADR 0201 section 1).
-TOOLKIT_DISTRIBUTION = "messagefoundry-toolkit"
+#: The two distributions whose versions must match (ADR 0201 section 1). The toolkit's distribution
+#: and command share one name, held in ``cli_surface`` so the engine's refusal names the same one.
+TOOLKIT_DISTRIBUTION = TOOLKIT_COMMAND
 ENGINE_DISTRIBUTION = "messagefoundry"
 
 
@@ -38,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     if mismatch is not None:
         # Exit 2, the usage-error code, and not 1: no command ran, so no command's result is being
         # reported. _emit_error keeps the JSON-XOR-text rule, and its own return value is 1.
-        _emit_error(mismatch, as_json="--json" in args)
+        _emit_error(mismatch, as_json=argv_wants_json(args))
         return 2
     return run_cli(args, _build_parser)
 
@@ -78,10 +87,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     Building has no side effect, as with the engine's builder, so a test can read the toolkit's
     command surface without running ``main()``. The map returned is :data:`_DISPATCH` itself.
     """
-    parser = argparse.ArgumentParser(prog="messagefoundry-toolkit", description=__doc__)
-    parser.add_argument(
-        "--version", action="version", version=f"{TOOLKIT_DISTRIBUTION} {__version__}"
-    )
+    parser = argparse.ArgumentParser(prog=TOOLKIT_COMMAND, description=__doc__)
+    parser.add_argument("--version", action="version", version=f"{TOOLKIT_COMMAND} {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     adr_analyze = sub.add_parser(

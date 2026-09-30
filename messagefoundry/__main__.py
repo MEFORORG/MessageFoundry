@@ -22,6 +22,7 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
@@ -41,8 +42,11 @@ from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR
     _OperatorJsonError,
     _print_json,
     _safe_print,
+    argv_wants_json,
+    first_command,
     run_cli,
 )
+from messagefoundry.cli_surface import CLI_TIERS, TOOLKIT_COMMAND  # pure data, stdlib-only imports
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
@@ -132,21 +136,16 @@ def _floor_error_code(args: argparse.Namespace) -> str | None:
     return None
 
 
-#: The name of the separate command that runs the toolkit rows of ``CLI_TIERS`` (ADR 0201).
-#: Hyphenated on purpose: it is the command and distribution name, never the import package, which
-#: no file under ``messagefoundry/`` may name (tests/test_dependency_boundaries.py).
-_TOOLKIT_COMMAND = "messagefoundry-toolkit"
-
-
+@functools.cache
 def _moved_toolkit_commands() -> frozenset[str]:
     """The top-level toolkit rows of ``CLI_TIERS`` that this engine does not register (ADR 0201).
 
     Keyed on "not registered here", not on the tier alone. While a slice has moved some toolkit rows
     and not others, the engine still runs the rows it carries. ``cli_surface`` is pure data with no
-    engine imports, so reading it here costs nothing and loads no toolkit code.
+    engine imports, so reading it here costs nothing and loads no toolkit code. Cached: both the
+    pre-parse check and the ``--help`` epilog read it, and neither the table nor the dispatch keys
+    change in a process.
     """
-    from messagefoundry.cli_surface import CLI_TIERS
-
     return frozenset(
         row
         for row, tier in CLI_TIERS.items()
@@ -155,13 +154,9 @@ def _moved_toolkit_commands() -> frozenset[str]:
 
 
 def _moved_toolkit_command(argv: Sequence[str]) -> str | None:
-    """The moved toolkit command ``argv`` asks for, or None.
-
-    The first argument that is not an option is the subcommand, because the engine's top-level
-    options (``--help`` and ``--version``) take no value. This runs before parsing, so a moved
-    command gets the line naming ``messagefoundry-toolkit`` instead of argparse's "invalid choice".
-    """
-    command = next((arg for arg in argv if not arg.startswith("-")), None)
+    """The moved toolkit command ``argv`` asks for, or None. Read before parsing, so a moved command
+    gets the line naming the toolkit command instead of argparse's "invalid choice"."""
+    command = first_command(argv)
     return command if command in _moved_toolkit_commands() else None
 
 
@@ -170,19 +165,17 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
 
     Exit 2, the argparse usage-error code, because the engine does not have this command at all.
     ``_emit_error`` writes JSON to stdout or one line to stderr, never both, and its own return value
-    is 1, so it is not returned. JSON mode is ``--json`` anywhere in the arguments, or ``lens``,
-    whose children take JSON mode from ``set_defaults`` and have no flag.
+    is 1, so it is not returned. ``argv_wants_json`` is the one pre-parse JSON rule both commands use.
 
     The line names no install command. The toolkit distribution is not yet on PyPI, and
     tests/test_install_instruction_provenance.py refuses shipped text that tells a user to install
     an unclaimed name.
     """
-    as_json = "--json" in argv or command == "lens"
     _emit_error(
         f"`{command}` is not a messagefoundry command. It is an authoring command: run it as "
-        f"`{_TOOLKIT_COMMAND} {command}`, from the separate {_TOOLKIT_COMMAND} distribution at "
+        f"`{TOOLKIT_COMMAND} {command}`, from the separate {TOOLKIT_COMMAND} distribution at "
         f"this engine's version, {__version__}.",
-        as_json=as_json,
+        as_json=argv_wants_json(argv),
     )
     return 2
 
@@ -204,7 +197,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         prog="messagefoundry",
         description=__doc__,
         epilog=f"Authoring commands ({moved}) are not in this command. Run them as "
-        f"`{_TOOLKIT_COMMAND} <command>`, from the separate {_TOOLKIT_COMMAND} distribution.",
+        f"`{TOOLKIT_COMMAND} <command>`, from the separate {TOOLKIT_COMMAND} distribution.",
     )
     parser.add_argument(
         "--version",

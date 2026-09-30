@@ -34,9 +34,10 @@ off the engine's entry point must change those guides in the same change.
 WHICH COMMAND REGISTERS WHICH ROWS (ADR 0201). Two parsers register rows: the engine's
 ``messagefoundry`` command, and the separate ``messagefoundry-toolkit`` command from the
 distribution of that name. A row's key is the same string on either command. ADR 0201 moves the
-toolkit rows one slice at a time. Slice 2 moved ``adr-analyze``; every other toolkit row is still
-registered on the engine's command and still packed in its wheel. The engine refuses a top-level
-toolkit row it no longer registers, with a line naming the toolkit command.
+toolkit rows one slice at a time, from slice 2 on; until the last one moves, some toolkit rows are
+still registered on the engine's command and still packed in its wheel. The engine refuses a top-level
+toolkit row it no longer registers, with a line naming the toolkit command. Which rows have moved is
+read off the two parsers, never kept here.
 
 ``tests/test_cli_surface.py`` builds both real parsers and fails when a subcommand has no row, when a
 row names no subcommand, when a group breaks the rule above, when the toolkit rows stop matching the
@@ -54,9 +55,14 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final, Literal
 
-__all__ = ["CLI_TIERS", "Tier"]
+__all__ = ["CLI_TIERS", "TOOLKIT_COMMAND", "Tier"]
 
 Tier = Literal["production", "toolkit"]
+
+#: The command, and the distribution, that run the ``toolkit`` rows (ADR 0201). Hyphenated on purpose:
+#: it is never the import package, which no file under ``messagefoundry/`` may name
+#: (``tests/test_dependency_boundaries.py``). Both commands read it from here.
+TOOLKIT_COMMAND: Final = "messagefoundry-toolkit"
 
 
 CLI_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(

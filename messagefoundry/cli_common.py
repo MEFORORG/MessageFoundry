@@ -23,13 +23,13 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import configure_stderr_logging
 
-__all__ = ["Dispatch", "run_cli"]
+__all__ = ["Dispatch", "argv_wants_json", "first_command", "run_cli"]
 
 #: A command's top-level subcommand names, each mapped to the handler that runs it.
 Dispatch = Mapping[str, Callable[[argparse.Namespace], int]]
@@ -157,6 +157,28 @@ def run_cli(
             return 1
         code = floor_code(args) if floor_code is not None else None
         return _emit_error(text, as_json=True, code=code)
+
+
+#: Subcommands whose output is JSON with no ``--json`` flag: ``lens`` children take JSON mode from
+#: ``set_defaults``, and the IDE parses what they print.
+_JSON_BY_DEFAULT = frozenset({"lens"})
+
+
+def first_command(argv: Sequence[str]) -> str | None:
+    """The subcommand ``argv`` names, read BEFORE parsing: its first argument that is not an option.
+
+    Both commands' top-level options (``--help``, ``--version``) take no value, so nothing an
+    option consumes can be mistaken for the subcommand."""
+    return next((arg for arg in argv if not arg.startswith("-")), None)
+
+
+def argv_wants_json(argv: Sequence[str]) -> bool:
+    """Whether a refusal made BEFORE parsing must answer as JSON (ADR 0201 section 3).
+
+    ``--json`` anywhere in the arguments, or a subcommand that is JSON by default. One rule for every
+    pre-parse refusal on either command, so a toolkit ``lens`` refused for a version mismatch answers
+    the IDE the same way the engine's refusal of a moved ``lens`` does."""
+    return "--json" in argv or first_command(argv) in _JSON_BY_DEFAULT
 
 
 def _safe_print(line: str) -> None:

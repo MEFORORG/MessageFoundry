@@ -194,15 +194,8 @@ def test_main_parses_with_the_builder(monkeypatch: pytest.MonkeyPatch) -> None:
         parser.add_subparsers(dest="command", required=True).add_parser("only-in-the-plant")
         return parser, {"only-in-the-plant": handler}
 
-    # main() installs both process-wide exception hooks. Setting each to its current value makes
-    # the context put it back afterwards, so nothing leaks into later tests. The stream hardening
-    # cannot be undone, so it is skipped at both of its call sites, main() and run_cli().
-    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
-    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
-    monkeypatch.setattr(cli_module, "harden_console_streams", lambda **_kw: None)
-    monkeypatch.setattr(cli_common, "harden_console_streams", lambda **_kw: None)
     monkeypatch.setattr(cli_module, "_build_parser", planted)
-    assert cli_module.main(["only-in-the-plant"]) == 7
+    assert _run_engine(monkeypatch, ["only-in-the-plant"]) == 7
     assert ran == ["only-in-the-plant"]
 
 
@@ -334,7 +327,11 @@ def test_a_production_row_on_the_toolkit_command_is_named(
 
 
 def _run_engine(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
-    """Run the engine's ``main()`` without leaking its process-wide changes into later tests."""
+    """Run the engine's ``main()`` without leaking its process-wide changes into later tests.
+
+    main() installs both process-wide exception hooks. Setting each to its current value makes the
+    context put it back afterwards. The stream hardening cannot be undone, so it is skipped at both
+    of its call sites, main() and run_cli()."""
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
     monkeypatch.setattr(cli_module, "harden_console_streams", lambda **_kw: None)

@@ -807,5 +807,19 @@ INSTALL-GUIDE text written in slice 4 should say so.
       2, and the brief said 3.
 - [x] The owner accepts the release-order trade in section 1: the toolkit uploads before the engine.
       Resolved 2026-09-29 by the owner's acceptance.
-- [ ] The build confirms the helper module's name (`cli_common.py` is a placeholder), and reads
-      Warehouse's pending-publisher behaviour before relying on it.
+- [x] The build confirms the helper module's name (`cli_common.py` is a placeholder), and reads
+      Warehouse's pending-publisher behaviour before relying on it. Resolved by slices 1 and 2. Slice
+      1 kept the name `messagefoundry/cli_common.py`. Slice 2 read two sources on 2026-09-30:
+      - **Warehouse.** docs.pypi.org, *Creating a PyPI project with a Trusted Publisher*: a pending
+        publisher *"does not create a project or reserve a project's name until it is actually used
+        to publish"*, and another user registering the name first invalidates it. Warehouse's
+        `warehouse/oidc/views.py` on `main`, `mint_token`: it looks for a matching PENDING publisher
+        first, and when one matches it creates the project and reifies the publisher at the token
+        exchange, before any upload. So the second review's reading holds: any token exchange from
+        `release.yml` whose claims match the pending publisher claims the name, which is the safe
+        direction. Read through a fetch that summarised the code, not line by line; the design
+        still relies only on the upload.
+      - **hatchling 1.32.4**, `builders/wheel.py` from the build cache: `force_include_editable` is
+        a build-data key defaulting to empty (`get_default_build_data`), which only a hook can set,
+        and both editable paths, `build_editable_detection` and `build_editable_explicit` (the
+        `dev-mode-dirs` one), add the force-included files. The second review's reading holds.

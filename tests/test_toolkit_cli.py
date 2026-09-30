@@ -88,7 +88,7 @@ def _run_toolkit(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
 
 def _mismatched(monkeypatch: pytest.MonkeyPatch) -> None:
     versions = {"messagefoundry": "0.5.0", "messagefoundry-toolkit": "0.4.0"}
-    monkeypatch.setattr(toolkit_cli.metadata, "version", _metadata(versions))
+    monkeypatch.setattr(metadata, "version", _metadata(versions))
 
 
 def test_main_refuses_a_mismatched_pair_before_any_command(
@@ -115,14 +115,16 @@ def test_main_refuses_a_mismatched_pair_as_json_under_json(
 
 
 def test_main_runs_when_the_pair_matches(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     """Control for the two refusals above: the same command, a matching pair, and it runs."""
     versions = {"messagefoundry": "0.4.0", "messagefoundry-toolkit": "0.4.0"}
-    monkeypatch.setattr(toolkit_cli.metadata, "version", _metadata(versions))
-    adr_dir = _REPO / "docs" / "adr"
+    monkeypatch.setattr(metadata, "version", _metadata(versions))
+    adr_dir = tmp_path / "adr"
+    adr_dir.mkdir()
+    (adr_dir / "0001-one.md").write_text("# 0001 - One\n\n- **Status:** Proposed\n", "utf-8")
     assert _run_toolkit(monkeypatch, ["adr-analyze", "--adr-dir", str(adr_dir), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["adrs"]
+    assert [r["adr_id"] for r in json.loads(capsys.readouterr().out)["adrs"]] == ["0001"]
 
 
 # --- The command itself ------------------------------------------------------------------------
@@ -143,11 +145,27 @@ def test_toolkit_help_names_its_commands_and_encodes_on_a_legacy_codepage(
         pytest.fail(f"toolkit --help is not cp1252-encodable: U+{ord(bad):04X} {bad!r}")
 
 
-def test_python_dash_m_runs_the_toolkit() -> None:
+#: One fresh interpreter answers two questions, because a cold start is the cost here. It runs the
+#: package the way ``python -m`` does (``runpy.run_module`` IS what ``-m`` calls), then reports which
+#: engine modules that loaded. A fresh process, because this one already imported the engine CLI.
+_DASH_M_PROBE = """
+import runpy, sys
+sys.argv = ["messagefoundry-toolkit", "--help"]
+try:
+    runpy.run_module("messagefoundry_toolkit", run_name="__main__", alter_sys=True)
+except SystemExit as exc:
+    code = exc.code
+print("PROBE", code, "messagefoundry.__main__" in sys.modules,
+      "messagefoundry.cli_common" in sys.modules, file=sys.stderr)
+"""
+
+
+def test_python_dash_m_runs_the_toolkit_without_the_engine_cli_module() -> None:
     """``python -m messagefoundry_toolkit`` is how dev and CI run it, since neither installs the
-    distribution and so neither has the console script."""
+    distribution and so neither has the console script. And ADR 0201 section 2: the shared helpers
+    live in ``messagefoundry.cli_common``, so the toolkit never imports ``messagefoundry.__main__``."""
     proc = subprocess.run(
-        [sys.executable, "-m", "messagefoundry_toolkit", "--help"],
+        [sys.executable, "-c", _DASH_M_PROBE],
         capture_output=True,
         text=True,
         timeout=120,
@@ -155,18 +173,5 @@ def test_python_dash_m_runs_the_toolkit() -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert "messagefoundry-toolkit" in proc.stdout and "adr-analyze" in proc.stdout
-
-
-def test_the_toolkit_never_imports_the_engine_cli_module() -> None:
-    """ADR 0201 section 2: the shared helpers live in ``messagefoundry.cli_common`` so the toolkit
-    never imports ``messagefoundry.__main__``. A fresh process, because this test process has
-    already imported it through other tests."""
-    probe = (
-        "import sys, messagefoundry_toolkit.__main__\n"
-        "print('messagefoundry.__main__' in sys.modules, 'messagefoundry.cli_common' in sys.modules)\n"
-    )
-    out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True, timeout=120
-    ).stdout.split()
-    # The second value is the control: the probe does see the modules the toolkit really imports.
-    assert out == ["False", "True"]
+    # --help exits 0. The last value is the control: the probe sees the modules the toolkit imports.
+    assert "PROBE 0 False True" in proc.stderr, proc.stderr

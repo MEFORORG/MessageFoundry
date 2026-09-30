@@ -186,6 +186,14 @@ def _normalise(part: str) -> str:
     return part.rstrip(". ").casefold()
 
 
+def _parts(member: str) -> list[str]:
+    """``member``'s path components, split on BOTH ``/`` and ``\\``, empty ones dropped.
+
+    ONE copy for every rule below, so an evasion closed in the split is closed for all of them.
+    :func:`forbidden` says why both separators count and why empty components drop out."""
+    return [p for p in member.replace("\\", "/").split("/") if p]
+
+
 def forbidden(member: str) -> str | None:
     """Why ``member`` is forbidden, or ``None``.
 
@@ -201,7 +209,7 @@ def forbidden(member: str) -> str | None:
     Empty components (a trailing slash on a directory entry, a leading ``/``, a doubled separator)
     drop out.
     """
-    parts = [p for p in member.replace("\\", "/").split("/") if p]
+    parts = _parts(member)
     if not parts:
         return None
     for part in parts[:-1]:
@@ -222,7 +230,7 @@ def development_content(member: str) -> str | None:
     Split and normalised exactly as :func:`forbidden` is, so every evasion that function closes
     (backslash separators, trailing dots and spaces, case) is closed here by the same code.
     """
-    parts = [p for p in member.replace("\\", "/").split("/") if p]
+    parts = _parts(member)
     if not parts:
         return None
     for part in parts:
@@ -248,7 +256,7 @@ def split_violation(member: str, dist: str) -> str | None:
     writes into the engine's package directory is the split-package shape ADR 0201 rejects. Every
     other distribution passes. Split and normalised exactly as :func:`forbidden` is.
     """
-    parts = [_normalise(p) for p in member.replace("\\", "/").split("/") if p]
+    parts = [_normalise(p) for p in _parts(member)]
     if not parts:
         return None
     if dist == ENGINE_DISTRIBUTION:
