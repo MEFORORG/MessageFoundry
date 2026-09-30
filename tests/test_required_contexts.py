@@ -103,6 +103,9 @@ _MUST_NOT_BE_REQUIRED = (
     # The security.txt renewal reminder (BACKLOG #277). Schedule and dispatch only, so it never
     # reports on a pull request: required, it would wedge every one.
     "security.txt Expires is not near",
+    # The nightly mutation list over the invariant tests (BACKLOG #1746). Schedule and dispatch only,
+    # so it never reports on a pull request: required, it would wedge every one.
+    "invariant mutations (nightly)",
 )
 
 

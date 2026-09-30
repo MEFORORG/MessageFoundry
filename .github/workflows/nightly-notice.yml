@@ -70,6 +70,11 @@ name: Nightly failure notice
 # nothing. Why it is a workflow of its own rather than a job in Security or DAST is recorded once, in
 # that workflow's header.
 #
+# `Invariant mutations` WAS ADDED FOR BACKLOG #1746. It runs the bounded mutation list over the named
+# invariant tests on a nightly cron and by hand, never on a pull request, so like DAST its red has no
+# other place to appear. A surviving mutation means a test that names a property cannot see it broken,
+# and a finding nobody receives is the silence this file exists to end.
+#
 # A WATCHED WORKFLOW MUST HAVE A `schedule:` TRIGGER. The job below fires only when the completed
 # run's event was `schedule`, so watching a workflow with no cron adds a name that can never match:
 # dead config that reads as coverage. `tests/test_nightly_notice.py` pins this for every watched name.
@@ -85,7 +90,7 @@ name: Nightly failure notice
 # every input arrives through `env:` and nothing here interpolates `${{ }}` into the script.
 on:
   workflow_run:
-    workflows: ["CI", "Security", "DAST", "Stalled PRs", "Required workflow state", "security.txt renewal"]
+    workflows: ["CI", "Security", "DAST", "Stalled PRs", "Required workflow state", "security.txt renewal", "Invariant mutations"]
     types: [completed]
 
 # Read-only by default; the one job that writes escalates to `issues: write` and nothing else.
@@ -223,6 +228,23 @@ jobs:
             than a year.
           - Anything else (exit 2, or a failed runner step): the reminder could not read the date.
             That is a fix to the file or the script, and the date may be nowhere near."
+              ;;
+            "Invariant mutations")
+              # A SURVIVED ROW AND AN ERROR ROW NEED DIFFERENT FIXES, and one run can hold both, so the
+              # body sends the reader to the summary. The tokens below are the ones the runner prints;
+              # its exit codes are defined once, in its docstring, and not repeated here.
+              DETAIL="Here that covers the bounded mutation list over the named invariant tests
+          (\`scripts/ci/invariant_mutations.toml\`, run by \`scripts/ci/invariant_mutations.py\`).
+          READ THE RUN SUMMARY. It prints one \`KILLED\`, \`SURVIVED\` or \`ERROR\` line per row it
+          finished, and a finished run ends with a \`# ran N mutation(s)\` line.
+
+          - A \`SURVIVED\` row: its tests stayed green with the engine deliberately broken, so they
+            cannot see the property they name. Strengthen the tests; do not delete the row.
+          - An \`ERROR\` row or an \`error:\` line: the run could not judge. The line names the
+            cause, for example a test not green before the break or a \`find\` string that
+            refactoring moved. Reproduce it with \`--only <id>\`.
+          - No \`# ran\` line and no \`error:\` line: the run step timed out or never started. The
+            first row missing from the list is the one that hung. Read the step that failed."
               ;;
           esac
 
