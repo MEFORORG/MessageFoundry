@@ -275,6 +275,13 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
     assert venv.startswith(("/", "$RUNNER_TEMP/")), (
         f"{workflow}'s SBOM venv path {venv!r} is relative; `pip --python` fails on it on Windows"
     )
+    # The platform label is what tells the Linux and Windows SBOMs apart once the filename is gone,
+    # and the install twin check above cannot see a finalize line drop it on one side only.
+    finalize = [ln for ln in shell.replace("\\\n", " ").splitlines() if "sbom_finalize.py" in ln]
+    assert len(finalize) == 1, f"{workflow}'s {runner} SBOM step finalizes {len(finalize)} times"
+    assert "--record-sys-platform" in finalize[0].split(), (
+        f"{workflow}'s {runner} SBOM is finalized without --record-sys-platform: {finalize[0]!r}"
+    )
 
 
 # --- the release path: every named package must carry a version ------------------------------------

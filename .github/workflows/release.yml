@@ -599,6 +599,7 @@ jobs:
           sbomqs score -b messagefoundry-sbom.cdx.json
           sbomqs score -b messagefoundry-sbom-windows.cdx.json
           sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
+          sbomqs compliance --ntia messagefoundry-sbom-windows.cdx.json || true
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |
@@ -728,7 +729,10 @@ jobs:
         # with the implicit success(); release-harness is `needs: release` and release-webconsole is
         # gated on a mutually exclusive ref), so the singular wording is the finding.
         # Every OTHER failure mode keeps the always() behaviour this step exists for: a build, sign,
-        # SBOM, release or publish failure still uploads whatever dist/ holds.
+        # SBOM, release or publish failure still uploads whatever dist/ holds. ONE EXCEPTION sits
+        # outside this job: when the `sbom-windows` job fails, `needs:` skips this whole job, so a
+        # dry run uploads nothing. That job's own log names the cause, and a release that cannot
+        # produce the Windows SBOM must not ship, so the trade is taken deliberately.
         # DELIBERATELY THE WHOLE STEP'S OUTCOME, not just its leak branch. The gate exits non-zero
         # from several paths and only one of them is "a member is outside the allowlist" — the rest
         # are "the listing did not succeed / did not cover the file / is not our archive". Narrowing

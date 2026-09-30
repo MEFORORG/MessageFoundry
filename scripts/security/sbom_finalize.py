@@ -53,8 +53,8 @@ from typing import Any
 _LIFECYCLE_SPECS = {"1.5", "1.6", "1.7"}
 # CycloneDX lifecycle phase enum (1.5+). "build" is the phase these SBOMs are produced in.
 _PHASES = {"design", "pre-build", "build", "post-build", "operations", "discovery", "decommission"}
-# The metadata.properties name --record-sys-platform writes. Namespaced to this project: the `cdx:` prefix is
-# reserved for CycloneDX's own property taxonomy.
+# The metadata.properties name --record-sys-platform writes. Namespaced to this project: the `cdx:`
+# prefix is reserved for CycloneDX's own property taxonomy.
 PLATFORM_PROPERTY = "messagefoundry:resolved-for:sys_platform"
 
 
@@ -156,6 +156,12 @@ def main(argv: list[str] | None = None) -> int:
     # --- (3) label the platform the environment was resolved for ------------------------------------
     if args.record_sys_platform:
         props = metadata.get("properties")
+        if props is not None and not isinstance(props, list):
+            print(
+                f"::warning::sbom_finalize: metadata.properties is a {type(props).__name__}, not a "
+                "list; replacing it with the platform label alone",
+                file=sys.stderr,
+            )
         kept = [
             p
             for p in (props if isinstance(props, list) else [])

@@ -574,8 +574,9 @@ jobs:
     timeout-minutes: 20
     # The Windows twin of the engine SBOM above, and the pre-tag dry-run for release.yml's
     # `sbom-windows` job, exactly as `sbom` is for the Linux step. Why the engine ships a second,
-    # Windows-resolved SBOM is ADR 0149's 2026-09-30 amendment. A separate job rather than a matrix leg of `sbom`, because that job's npm and sbomqs steps are
-    # Linux-only and would each need a platform guard.
+    # Windows-resolved SBOM is ADR 0149's 2026-09-30 amendment. A separate job rather than a matrix
+    # leg of `sbom`, because that job's npm and sbomqs steps are Linux-only and would each need a
+    # platform guard.
     continue-on-error: true
     # Same gate as `sbom`, for the same reason: the SBOM derives from a committed lockfile.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
