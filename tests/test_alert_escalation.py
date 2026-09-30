@@ -1,25 +1,27 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Alert escalation tiers, schedule-aware rules, and content-triggered alerts (BACKLOG #81, ADR 0133).
+"""Alert escalation tiers and schedule-aware rules (BACKLOG #81, ADR 0133).
 
 Covers: occurrence-driven escalation over the base rule (severity/transports climb by count, persisted
-tier), schedule-aware `decide` (a scheduled rule applies only in its window), and the PHI-free
-`content_match` event whose re-emit (a transform re-run) folds idempotently into one instance via the
-existing (event_type, connection) throttle/dedup — the purity / at-least-once reconciliation.
+tier), schedule-aware `decide` (a scheduled rule applies only in its window), and the refusal of the
+retracted D3 `content_match` event type and `content_label` filter (BACKLOG #1504).
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime
+import textwrap
 from datetime import time as dtime
 from pathlib import Path
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
+
 from messagefoundry.config.models import ActiveWindow, Schedule
-from messagefoundry.config.settings import AlertRule, AlertSeverity, EscalationTier
+from messagefoundry.config.settings import AlertRule, AlertSeverity, EscalationTier, load_settings
 from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
-from messagefoundry.store.store import MessageStore
 
 
 class _RecordingTransport:
@@ -158,54 +160,42 @@ def test_schedule_aware_decide() -> None:
     )  # default (rule not applied out of window)
 
 
-def test_content_label_routing() -> None:
-    # A rule can route a content_match event by its (non-PHI) label.
-    rule = AlertRule(
-        event_type="content_match",
-        connection="*",
-        severity=AlertSeverity.CRITICAL,
-        content_label="STAT",
+# --- D3 retracted: content_match and content_label are refused -----------------
+# ADR 0133 D3 is retracted (BACKLOG #1504); the ruling and the reason are in the ADR's "Retraction of
+# D3" bullet. Nothing could ever emit the event, so a rule naming it is refused like every other
+# retired event type: an alert author must not route a signal that cannot fire.
+
+
+def test_rule_refuses_the_retracted_content_match_event() -> None:
+    with pytest.raises(ValidationError, match="event_type"):
+        AlertRule(event_type="content_match")
+
+
+def test_rule_refuses_the_retracted_content_label_filter() -> None:
+    # AlertRule is extra="forbid", so the removed label filter is refused rather than ignored.
+    with pytest.raises(ValidationError, match="content_label"):
+        AlertRule(content_label="STAT")  # type: ignore[call-arg]
+
+
+def test_service_config_naming_content_match_is_refused(tmp_path: Path) -> None:
+    # The same refusal at the operator's surface: a [[alerts.rules]] entry in the service config.
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(
+        textwrap.dedent("""\
+            [alerts]
+            webhook_url = "https://alerts.example.org/hook"
+
+            [[alerts.rules]]
+            event_type = "content_match"
+            severity = "critical"
+            """),
+        encoding="utf-8",
     )
-    rs = AlertRuleSet([rule])
-    assert rs.decide({"type": "content_match", "connection": "IB_X", "label": "STAT"}).severity == (
-        "critical"
-    )
-    # a different label does not match this rule → default
-    assert (
-        rs.decide({"type": "content_match", "connection": "IB_X", "label": "routine"}).severity
-        == "warning"
-    )
+    # Pin the event_type validator's own message, not just the echoed input value.
+    with pytest.raises(ValidationError, match=r"event_type must be one of .*got 'content_match'"):
+        load_settings(config_path=svc, environ={})
 
 
-# --- AC-3 / AC-4: content-triggered alerts + purity reconciliation -----------
-
-
-async def test_content_match_event_is_phi_free() -> None:
-    # AC-3: content_match carries ONLY connection + label + optional rule id — never a matched field value.
-    t = _RecordingTransport("t")
-    sink = NotifierAlertSink([t])
-    sink.content_match("IB_LAB", label="STAT order", rule_id="R1")
-    await _drain(sink)
-    (e,) = t.events
-    assert e["type"] == "content_match" and e["connection"] == "IB_LAB"
-    assert e["label"] == "STAT order" and e["rule_id"] == "R1"
-    # the whole payload is a CLOSED non-PHI key set — no message body / matched value can be present.
-    assert set(e) <= {"type", "connection", "label", "rule_id", "ts", "severity"}
-
-
-async def test_content_match_reemit_is_idempotent(tmp_path: Path) -> None:
-    # AC-4: a transform RE-RUN re-emits content_match for the same (connection); the (event_type,
-    # connection) upsert folds it into the ONE open instance (count bumps, no 2nd row) — the purity /
-    # at-least-once reconciliation (ADR 0133 D3).
-    store = await MessageStore.open(tmp_path / "a.db")
-    try:
-        sink = NotifierAlertSink([], store=store, realert_seconds=0.0)
-        sink.content_match("IB_LAB", label="STAT")
-        sink.content_match("IB_LAB", label="STAT")  # the at-least-once re-run
-        await _drain_state(sink)
-        rows = await store.list_active_alert_instances()
-        assert len(rows) == 1
-        assert rows[0].event_type == "content_match" and rows[0].count == 2
-        assert rows[0].reason == "STAT"  # the non-PHI label, never a matched value
-    finally:
-        await store.close()
+def test_notifier_offers_no_content_match_emitter() -> None:
+    # The emit method went with the event type; re-adding it without an ADR fails here.
+    assert not hasattr(NotifierAlertSink, "content_match")
