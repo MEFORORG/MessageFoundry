@@ -37,12 +37,13 @@ restart is the safe remediation an operator actually wants).
 **Amendment (BACKLOG #1898, 2026-09-30).** `control_action` is now allowed only with a connection-scoped
 `event_type`: the set `_ALERT_CONTROL_EVENT_TYPES` in
 [`config/settings.py`](../../messagefoundry/config/settings.py). `AlertRule` refuses the pair at config
-load for `"any"` and every other type. `NotifierAlertSink._emit` also skips the action, logged, for an
-event outside the set. The other types put a stand-in in `connection`, such as a username or a DB path.
-A stand-in that fits the connection-name grammar would have restarted an unrelated connection.
-`content_match` is left out until an engine caller exists. A `control_target`, when set, must be a
-connection name on a rule that has a `control_action`. One gap stays open: two emitters raise
-`connection_stopped` with a stand-in, and the settings comment on the set names them.
+load for `"any"` and every other type. The other types put a stand-in in `connection`, such as a bare
+username, `store` or a cert label. A stand-in that fits the connection-name grammar would have
+restarted an unrelated connection. A `control_target`, when set, must be a connection name on a rule
+that has a `control_action`. `NotifierAlertSink._emit` also skips the action, logged, for an event
+outside the set; that reaches only a rule built past the validator. At least two gaps stay open, and
+the comment on the set names them: stand-ins raised under `connection_stopped`, and an inbound or
+outbound name reaching the restart for the other side.
 
 ### §2 — The sink is DECOUPLED from the runner: an INJECTED async callback
 

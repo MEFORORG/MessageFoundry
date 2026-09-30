@@ -155,9 +155,10 @@ class AlertSink(Protocol):
         so each bound is its own instance and a drained backlog cannot resolve a low-disk pause. It
         names no node: both bounds measure the one shared store, and a cluster node id changes on
         every restart, so a node-keyed instance could never be resolved by the next start. It is not
-        a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898), and
-        its colon keeps ``name`` outside the connection-name grammar as a second line. Carries
-        counts and sizes only: no message content, no PHI. Raised when a pause
+        a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898).
+        Its colon also keeps ``name`` outside the connection-name grammar, which guards only the
+        default target, never a rule's ``control_target``. Carries counts and sizes only: no
+        message content, no PHI. Raised when a pause
         starts and again about every five minutes while it holds, as :meth:`queue_buildup` is, so a
         notifier's re-alert, escalation and suspend logic see a condition that persists. Emitted by
         :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor`;
@@ -265,7 +266,8 @@ class AlertSink(Protocol):
 
         ``name`` is ``approval:<approval id>``, the key :meth:`approval_approver_provenance` uses. It
         is not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG
-        #1898), and its colon keeps ``name`` outside the connection-name grammar as a second line.
+        #1898). Its colon also keeps ``name`` outside the connection-name grammar, which guards
+        only the default target, never a rule's ``control_target``.
         The prefix does not hide the event from rules: a catch-all rule still matches it for
         severity, routing and mute. Repeated early tries on one request fold into one instance.
         Nothing resolves the instance when the request is later decided, so an operator resolves
@@ -282,7 +284,8 @@ class AlertSink(Protocol):
         request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
         went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. It is
         not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898),
-        and the colon keeps ``name`` outside the connection-name grammar as a second line.
+        and the colon keeps ``name`` outside the connection-name grammar, which guards only the
+        default target, never a rule's ``control_target``.
         ``changed`` holds one or more of
         ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
         operation key and the slugs only: no username, no params, no PHI. The

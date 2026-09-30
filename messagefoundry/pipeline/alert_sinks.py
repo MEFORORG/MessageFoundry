@@ -1276,9 +1276,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 target = decision.control_target or str(event["connection"])
                 self._dispatch_control(decision.control_action, target)
             else:
-                # BACKLOG #1898: AlertRule refuses this pair at load; this guard covers a rule built
-                # some other way and a future emitter. The event's `connection` is a stand-in key
-                # here, so a restart aimed at it, or at control_target, is never dispatched.
+                # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never reaches
+                # here. This covers only a rule built past that validator (model_construct). It checks
+                # the event TYPE and cannot see a stand-in raised under an allowed type (see the
+                # KNOWN GAPS on _ALERT_CONTROL_EVENT_TYPES).
                 log.warning(
                     "alert control_action %s skipped: event type %r is not connection-scoped",
                     decision.control_action,

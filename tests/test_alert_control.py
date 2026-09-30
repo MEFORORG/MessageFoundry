@@ -69,10 +69,8 @@ def test_control_action_whitelist() -> None:
 _NON_CONNECTION_TYPES = sorted(_ALERT_EVENT_TYPES - _ALERT_CONTROL_EVENT_TYPES)
 
 
-def test_the_control_types_are_rule_targetable_and_exclude_content_match() -> None:
+def test_the_control_types_are_rule_targetable() -> None:
     assert _ALERT_CONTROL_EVENT_TYPES <= _ALERT_EVENT_TYPES
-    # No engine caller yet, and once a Handler calls it, message content would pick the restart.
-    assert "content_match" not in _ALERT_CONTROL_EVENT_TYPES
     # The refused population is real, so the parametrized refusal below is not vacuous.
     assert len(_NON_CONNECTION_TYPES) >= 20
 

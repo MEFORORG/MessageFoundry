@@ -92,8 +92,8 @@ def disk_resume_at(floor_bytes: int) -> int:
 def intake_alert_subject(reason: str) -> str:
     """The alert subject for one bound: ``intake:<reason>``. One per bound, so a drained backlog
     cannot resolve a low-disk pause. ``intake_paused`` is not connection-scoped, so no rule's
-    ``control_action`` fires on it (BACKLOG #1898); the colon keeps the subject out of the
-    connection-name grammar as a second line."""
+    ``control_action`` fires on it (BACKLOG #1898). The colon also keeps the subject out of the
+    connection-name grammar, which guards only the default target, never a ``control_target``."""
     return f"intake:{reason}"
 
 
