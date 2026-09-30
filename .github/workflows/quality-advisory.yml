@@ -27,17 +27,16 @@ name: quality-advisory
 #                                                         in the step summary of the nightly cron.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
-# TWO LEDGER-HYGIENE JOBS USED TO STAND HERE, AND NEITHER DOES NOW. CORRECTED 2026-09-30 (BACKLOG
-# #1342). This paragraph used to open "TWO JOBS HERE ARE NOT RUBRIC SIGNALS" and describe
-# `dangling-citations` (BACKLOG #1431) and `verdict-divergence` (BACKLOG #1342) as live jobs. Both
-# retired with the ledger (BACKLOG #1250), along with `deferral-resolution` (BACKLOG #1527). The note
-# at the top of `jobs:` records why they were removed rather than left running. Every job in this
-# file is now a rubric signal, or the `liveness` check on those signals.
+# THE LEDGER-HYGIENE JOBS THIS PARAGRAPH DESCRIBED ARE GONE FROM THIS FILE. CORRECTED 2026-09-30
+# (BACKLOG #1342). It used to open "TWO JOBS HERE ARE NOT RUBRIC SIGNALS" and describe two ledger
+# checks as live jobs here. They left this repository with the ledger; the note at the top of `jobs:`
+# names them and says why they were removed rather than left running. Every job in this file is now
+# a rubric signal, or the `liveness` check on those signals.
 #
 # Why they lived here still holds for any future check of that kind. Their natural sibling,
 # backlog-hygiene.yml, is the wrong home: that workflow's only job IS a required context, so a step
-# added there could block every merge. This file is the repository's one place where a check can
-# report without being able to gate.
+# added there could block every merge. This file is one place where a check can report without being
+# able to gate. Promoting such a check to blocking is an owner decision.
 #
 # WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
 # assumed, and the measurements are recorded here so a future session does not "helpfully" add a SARIF

@@ -426,9 +426,11 @@ Two results, and the second is the one that matters:
       practice.
       **CORRECTED 2026-09-30 (BACKLOG #1215).** One premise of that 2026-08-06 rationale is now false:
       *"the code is unmerged"*. `scripts/hooks/mail-drain.ps1` and `scripts/hooks/mail-watch.ps1` are
-      both on `main`. This note does not re-measure the *"never delivered mail in real use"* premise,
-      and it does not re-decide anything. Whether the decision still holds is part of the
-      contradiction below, which stays the owner's.
+      both on `main`. This note does not re-measure the *"never delivered mail in real use"* premise.
+      The evidence bearing on it is item 3 of the correction under §"Status and what gates wiring".
+      Nothing is re-decided here. Whether the decision still holds is part of the contradiction
+      below, which stays the owner's. The quote below cites `install-coordination.ps1:305`; that line
+      has moved, so find the row by searching for `mail-watch.ps1`.
   > **THE SHIPPED STATE CONTRADICTS THIS DECISION (measured 2026-08-25, BACKLOG #1215).**
   > `scripts/hooks/mail-watch.ps1` is wired at `Stop` in TWO installed config roots, and
   > `install-coordination.ps1:305` carries a row for it (`Marker = $WAKE_MARKER`, `Async = $true`)
@@ -446,6 +448,9 @@ Two results, and the second is the one that matters:
       resolves nothing outside a worktree holding this branch"*. That stopped being true once
       `scripts/hooks/mail-drain.ps1` reached `main`. `scripts/coord/install-coordination.ps1` wires it
       at both `SessionStart` and `Stop`. Its hook shim looks for the script in the primary checkout
-      first and the calling worktree second, so a session on a branch without the script still runs
-      the primary's copy. This note is about where the script resolves. It records no approval under
-      [BACKLOG #1028](../BACKLOG.md); §"Status and what gates wiring" says none is recorded.
+      first and the calling worktree second. So a session on a branch without the script still runs
+      the primary checkout's copy, as current as that checkout's last pull of `main`. The installer
+      also wires every config root it finds, not only the default one this box names. This note says
+      where the script resolves and where it is wired. It does not say whether the approval this box
+      records counts as approval under [BACKLOG #1028](../BACKLOG.md), which
+      §"Status and what gates wiring" says is not recorded. That question stays the owner's.
