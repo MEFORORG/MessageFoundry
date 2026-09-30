@@ -764,27 +764,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   trusted or not sent, that scheme is `http`, so the redirect would point a client at plaintext.
   `create_app` now sets `redirect_slashes=False`. Use `/ui`, not `/ui/`, in a bookmark or a proxy
   rule. (`BACKLOG #1968`)
-- **A DATABASE connection's `connect_timeout` now bounds the SQL Server login.** The SQL Server
-  preset used to write it into the connection string as `Connection Timeout`, which ODBC Driver 18
-  ignores, so the setting did nothing. It now reaches the driver as its login timeout, at least on
-  `Database(...)`, `DatabasePoll(...)`, `DatabaseLookup(...)` and `DatabaseRef(...)`. The `generic`
-  dialect is unchanged and still gets no login timeout from the engine. The value must be a whole
-  number of seconds, at least 1. The first three refuse any other value when the connection is
-  built. `DatabaseRef` refuses a literal value when declared, but an `env()` value only at each sync,
-  so `messagefoundry check` does not catch that case. (`BACKLOG #2089`)
-- **The DICOM server (SCP) now refuses a small deflated object that inflates past 16 MiB.** It bounded
-  the inflate by `max_object_bytes`, 128 MiB at the shipped default, while the codec that parses the
-  object after commit refuses anything past a fixed 16 MiB. So such an object was answered Success
-  and could then only be recorded `ERROR`. The SCP's inflate bound is now the lesser of
-  `max_object_bytes` and 16 MiB, and the object is refused before commit. (`BACKLOG #2104`)
-- **The DICOM server (SCP) now answers a status that tells the sender whether to re-send.** An object
-  over the object or inflate cap was answered Out of Resources (`0xA700`), which senders retry, though
-  a re-send is refused again. It is now Cannot Understand `0xC010`, a final refusal. A commit that
-  raised was answered Cannot Understand (`0xC000`), though a store that is down may recover. It is now
-  Out of Resources (`0xA700`), as is a C-STORE that arrives after the engine's loop has stopped. A
-  negative `max_object_bytes` is still refused at build, but the message
-  no longer says `0` or `None` disables the cap; on the SCP both resolve to 16 MiB. See
-  `docs/DICOM.md` section 3 for the statuses. (`BACKLOG #2103`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
