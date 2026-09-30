@@ -210,6 +210,9 @@ enforces uniqueness per table, and the API's ``_dual_role_control`` carries a ``
 disambiguate the pair), so every per-connection map that can hold an entry for either direction
 is keyed by ``(Direction, name)`` rather than by the bare name."""
 
+type _LaneFault = Literal["credential", "configuration"]
+"""A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
+
 
 log = logging.getLogger(__name__)
 
@@ -1303,9 +1306,10 @@ class RegistryRunner:
         # so it reads as an operator pause that no reload lifts; this lets a reload that removes the
         # schedule resume the lane (#2069). Any later start or stop of the lane drops the entry.
         self._schedule_parked: set[str] = set()
-        # Lanes halted by a STOP that only an operator may lift: a credential fault (#109), the
-        # internal-error STOP policy, or a pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault
-        # bound, the #2074 claimer-death bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
+        # Lanes halted by a STOP that only an operator may lift, at least: a credential fault (#109),
+        # a connection configuration fault (#2083), the internal-error STOP policy, or a pooled
+        # dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death bound;
+        # see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
         # one (see _schedule_holds, which also names every path that clears a record). Keyed by
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
@@ -2854,9 +2858,10 @@ class RegistryRunner:
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
-        # An operator-required STOP (#109 credential fault, or the internal-error STOP policy) outranks
-        # the calendar. The start branch must not re-arm it: that re-tries a bad credential at every
-        # window open, which is the partner lockout the STOP exists to prevent. The OUTBOUND park must
+        # An operator-required STOP (at least a #109 credential fault, a #2083 configuration fault, or
+        # the internal-error STOP policy) outranks the calendar. The start branch must not re-arm it:
+        # that re-tries a bad credential at every window open, which is the partner lockout the STOP
+        # exists to prevent. The OUTBOUND park must
         # not run either, because the park is a pause and a pause is what a window open resumes (and a
         # pooled pause_lane overwrites the STOPPED phase outright). The INBOUND park still runs: it only
         # unbinds the listener, which leaves the halted router/transform workers exactly as they are and
@@ -2933,8 +2938,8 @@ class RegistryRunner:
         self._record_failed(name, exc, kind="inbound")
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
-        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
-        credential fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
+        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (at least a
+        #109 credential fault, a #2083 configuration fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
         claimer-death STOP via :meth:`_pooled_stop_hold`). Called at the STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
@@ -6601,33 +6606,21 @@ class RegistryRunner:
             # accept this message, so dead-letter it now rather than block the FIFO lane
             # forever (still replayable from the DLQ). AE/CE (transient) → retry per
             # policy, like a transport failure.
-            if exc.permanent and getattr(exc, "credential_fault", False):
-                # #109 (ADR 0095): a PERMANENT CREDENTIAL/AUTH fault (bad password / would lock out the
-                # partner account) — NOT a bad message. Under the "stop" policy (default) STOP the lane
-                # IMMEDIATELY (no dead-lettering the backlog, no re-auth storm that could trip the
-                # partner's account lockout) and RETAIN this claimed row UN-ERRORED (release it back to
-                # PENDING, undoing only the claim's attempts++ — no backoff, no last_error), so the
-                # queue is intact for an operator to resume after fixing the credential (reload/restart
-                # re-arms the STOPPED lane). The "dead_letter" policy opts back into the historical
-                # fail-fast dead-letter of just this row.
-                if self._credential_fault_policy == "stop":
-                    await self.store.release_claimed([item.id])
-                    log.error(
-                        "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
-                        "and retaining %d queued row(s) un-errored to protect the partner account "
-                        "(operator must fix the credential + reload/restart to resume)",
-                        name,
-                        exc.code,
-                        1,
-                    )
-                    self._alert_sink.connection_stopped(
-                        name,
-                        detail=f"credential fault ({exc.code}); lane stopped, queue retained (#109)",
-                    )
-                    self._hold_for_operator(name, "outbound")
-                    return _ItemOutcome.STOPPED, None
-                await self.store.dead_letter_now(item.id, safe_exc(exc))
-            elif exc.permanent:
+            # #109 (ADR 0095): a PERMANENT CREDENTIAL/AUTH fault (bad password / would lock out the
+            # partner account) — NOT a bad message. Under the "stop" policy (default) STOP the lane
+            # IMMEDIATELY (no dead-lettering the backlog, no re-auth storm that could trip the
+            # partner's account lockout) and RETAIN this claimed row UN-ERRORED (release it back to
+            # PENDING, undoing only the claim's attempts++ — no backoff, no last_error), so the
+            # queue is intact for an operator to resume after fixing the credential (reload/restart
+            # re-arms the STOPPED lane). A permanent CONFIGURATION fault (BACKLOG #2083) takes the
+            # same STOP: every queued row would meet the same refusal, so dead-lettering this row
+            # would only be the first of the lane's whole queue. The "dead_letter" policy opts back
+            # into the historical fail-fast dead-letter of just this row, for both.
+            fault = self._lane_stopping_fault(exc)
+            if fault is not None:
+                await self._stop_lane_retaining(name, [item.id], exc, fault)
+                return _ItemOutcome.STOPPED, None
+            if exc.permanent:
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
@@ -6890,31 +6883,16 @@ class RegistryRunner:
             else:
                 await connector.send(envelope)
         except NegativeAckError as exc:
-            if (
-                exc.permanent
-                and getattr(exc, "credential_fault", False)
-                and self._credential_fault_policy == "stop"
-            ):
-                # #109 (ADR 0095), the batch twin of the single-row branch in
-                # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is
-                # not a bad batch: dead-lettering all N here would empty the lane's queue into the
-                # DLQ, and a retry would re-authenticate toward a partner lockout. So STOP the lane
-                # and release every member un-errored (BACKLOG #2073). "dead_letter" falls through
-                # to the ordinary permanent reject below, exactly as the single row does.
-                await self.store.release_claimed(ids)
-                log.error(
-                    "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
-                    "and retaining %d queued row(s) un-errored to protect the partner account "
-                    "(operator must fix the credential + reload/restart to resume)",
-                    name,
-                    exc.code,
-                    len(ids),
-                )
-                self._alert_sink.connection_stopped(
-                    name,
-                    detail=f"credential fault ({exc.code}); lane stopped, queue retained (#109)",
-                )
-                self._hold_for_operator(name, "outbound")
+            # #109 (ADR 0095), the batch twin of the single-row branch in
+            # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is not a
+            # bad batch: dead-lettering all N here would empty the lane's queue into the DLQ, and a
+            # retry would re-authenticate toward a partner lockout. So STOP the lane and release
+            # every member un-errored (BACKLOG #2073). A configuration fault stops it the same way
+            # (BACKLOG #2083). "dead_letter" falls through to the ordinary permanent reject below,
+            # exactly as the single row does.
+            fault = self._lane_stopping_fault(exc)
+            if fault is not None:
+                await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
@@ -6962,6 +6940,54 @@ class RegistryRunner:
             self._note_lane_healthy(name)
             await self.store.mark_batch_done(ids)
         return _ItemOutcome.PROCESSED, retry_until
+
+    def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:
+        """Which connection fault ``exc`` is, when it must STOP the lane and keep the queue:
+        ``"credential"`` (#109, ADR 0095), ``"configuration"`` (BACKLOG #2083), or ``None`` for an
+        ordinary reject. Only a permanent fault stops, and only under the default
+        ``credential_fault_policy = "stop"``, which governs both: while BACKLOG #2083 was open the
+        configuration faults were read as credential faults, so this keeps each policy's behaviour
+        for them unchanged. ``getattr`` because a connector may raise a subclass built without the
+        markers."""
+        if not exc.permanent or self._credential_fault_policy != "stop":
+            return None
+        if getattr(exc, "credential_fault", False):
+            return "credential"
+        if getattr(exc, "config_fault", False):
+            return "configuration"
+        return None
+
+    async def _stop_lane_retaining(
+        self, name: str, ids: Sequence[str], exc: NegativeAckError, fault: _LaneFault
+    ) -> None:
+        """STOP outbound ``name`` on a connection fault and release every claimed row in ``ids``
+        back to PENDING un-errored (the claim's attempt given back, no backoff, no last_error), so the
+        queue is intact when an operator fixes the connection and reloads or restarts. The caller
+        returns :attr:`_ItemOutcome.STOPPED`."""
+        await self.store.release_claimed(list(ids))
+        if fault == "credential":
+            log.error(
+                "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
+                "and retaining %d queued row(s) un-errored to protect the partner account "
+                "(operator must fix the credential + reload/restart to resume)",
+                name,
+                exc.code,
+                len(ids),
+            )
+            detail = f"credential fault ({exc.code}); lane stopped, queue retained (#109)"
+        else:
+            log.error(
+                "delivery worker %r: PERMANENT connection configuration fault (%s); STOPPING the "
+                "lane and retaining %d queued row(s) un-errored, since every row would fail the "
+                "same way (operator must fix the connection's configuration + reload/restart to "
+                "resume)",
+                name,
+                exc.code,
+                len(ids),
+            )
+            detail = f"configuration fault ({exc.code}); lane stopped, queue retained (#2083)"
+        self._alert_sink.connection_stopped(name, detail=detail)
+        self._hold_for_operator(name, "outbound")
 
     async def _mark_batch_failed_and_arm(
         self, lane: str, ids: Sequence[str], error: str, retry: RetryPolicy
