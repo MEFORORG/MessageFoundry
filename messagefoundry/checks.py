@@ -2726,7 +2726,17 @@ def _run_tool(name: str, cmd: list[str]) -> CheckResult:
         return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
     try:
         # nosec: cmd[0] is a fixed tool name (ruff/mypy), no shell; args are repo paths (low-27).
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)  # nosec B603 B607
+        # ruff writes UTF-8; mypy writes its own interpreter's stdout encoding, which is UTF-8 under
+        # PEP 686 and the locale code page before it. The output only feeds a 300-char detail line.
+        proc = subprocess.run(  # nosec B603 B607
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=120,
+        )
     except subprocess.TimeoutExpired:
         # A wedged advisory tool must not block a commit forever — degrade to a skip (low-21).
         return CheckResult(name, ok=True, required=False, skipped=True, detail="timed out (120s)")

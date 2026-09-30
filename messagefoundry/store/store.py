@@ -3158,6 +3158,11 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
                 check=False,
                 capture_output=True,
                 text=True,
+                # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+                # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+                # failed decode loses the output this warning logs. Only logged, so replace.
+                encoding="oem",
+                errors="replace",
             )
             if result.returncode != 0:
                 log.warning(
@@ -3190,6 +3195,8 @@ def _grant_read(path: Path, principal: str) -> None:
             check=False,
             capture_output=True,
             text=True,
+            encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
+            errors="replace",
         )
     except OSError as exc:
         log.warning("could not grant read on %s: %s", path, exc)
