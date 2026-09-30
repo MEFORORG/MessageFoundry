@@ -240,9 +240,10 @@ _DEMOTE_BUDGET_CEILING = 10.0
 
 #: The default bound on each write ``stop()`` sends: the lease release and the ``left`` tombstone
 #: (BACKLOG #1987). Shared by both coordinators for the reason :func:`stepdown_pause_seconds` is.
-#: Picked against the service stop budget, not derived from a lease timing: NSSM's
-#: ``AppStopMethodConsole`` in ``scripts/service/install-service.ps1`` is that budget, and
-#: ``tests/test_cluster_stop_release.py`` reads it from there.
+#: Picked, not derived. ``Engine.stop()`` stops the coordinator last, after the graph teardown has
+#: spent its own share of NSSM's ``AppStopMethodConsole`` budget in
+#: ``scripts/service/install-service.ps1``, so this keeps the coordinator's share small. It does not
+#: and cannot guarantee that the whole shutdown fits that budget.
 #:
 #: **The bound is not the whole cost of a write that misses it.** An ``asyncio.timeout`` covers the
 #: acquire and the statement, and then the cancellation has to unwind through the driver:
@@ -252,13 +253,13 @@ _DEMOTE_BUDGET_CEILING = 10.0
 #:   passes the bound to that acquire, so a write costs at most twice the bound. Through a bare
 #:   ``pool.execute`` the acquire timeout is None and that wait has no limit.
 #: * SQL Server: the store quarantines the cancelled connection and may wait up to its
-#:   ``_DIRTY_CLOSE_TIMEOUT`` for the close, so a write costs at most the bound plus that.
+#:   ``_DIRTY_CLOSE_TIMEOUT`` for the close. Its pool release after that is not bounded here.
 #:
-#: ``stop()`` skips the tombstone once the release did not return, so a stuck pool pays that cost
-#: once. A write that misses the bound costs nothing the shutdown did not already accept: the lease
-#: row ages out at its TTL, which is what a failed release always meant. The bound also applies to a
-#: healthy leader's release. A release slower than the bound now falls back to that TTL, where it
-#: used to hold the shutdown open until it committed.
+#: ``stop()`` skips the tombstone once the release spent its whole bound, so a hung pool pays that
+#: cost once. A write that misses the bound costs nothing the shutdown did not already accept: the
+#: lease row ages out at its TTL, which is what a failed release always meant. The bound applies to a
+#: healthy leader's release too, so a release slower than the bound now falls back to that TTL, where
+#: it used to hold the shutdown open until it committed.
 STOP_WRITE_TIMEOUT_SECONDS = 2.0
 
 
@@ -269,9 +270,22 @@ async def _execute_within(pool: Any, timeout: float, sql: str, *args: Any) -> An
     timeout, and asyncpg 0.31.0's pool release, which is shielded from the cancel, waits for a
     cancelled statement's server acknowledgement for as long as that acquire timeout. None means no
     limit at all. Passing ``timeout`` to ``acquire`` gives the release the same budget, after which
-    asyncpg terminates the connection. So this costs at most twice ``timeout``."""
-    async with asyncio.timeout(timeout), pool.acquire(timeout=timeout) as con:
-        return await con.execute(sql, *args)
+    asyncpg terminates the connection. So this costs at most twice ``timeout``.
+
+    A failure AFTER the statement returned is the connection's return to the pool failing, so the
+    write has committed and its status is returned rather than lost. Reporting that write as failed
+    would leave a release owed that is not, and send the next reader looking for a hang."""
+    status: Any = None
+    try:
+        async with asyncio.timeout(timeout), pool.acquire(timeout=timeout) as con:
+            status = await con.execute(sql, *args)
+    except Exception as exc:
+        if status is None:
+            raise
+        log.debug(
+            "cluster: a bounded write committed, then its pool release failed: %s", safe_exc(exc)
+        )
+    return status
 
 
 class StepdownOutcome(NamedTuple):
@@ -960,7 +974,8 @@ class DbCoordinator:
         """Release leadership, cancel both background tasks, and mark this node left. Idempotent and
         safe even if :meth:`start` raised before the tasks existed (then there's nothing to tear down).
         Ordered so the tasks are stopped BEFORE the lease is released, so a still-running tick can't
-        re-acquire after we release."""
+        re-acquire after we release. The tombstone is skipped when the release spent its whole bound
+        (BACKLOG #1987), so a stopped node's row can then read ``active`` until it goes stale."""
         self._stop.set()
         tasks = [t for t in (self._heartbeat_task, self._fence_task) if t is not None]
         self._heartbeat_task = None
@@ -982,23 +997,30 @@ class DbCoordinator:
         # no interleaving of the two can leave this node reporting leader. The maintenance tick was the
         # dangerous competitor precisely because it can promote.
         #
-        # BACKLOG #1987: forced on may_own_lease_row(), so a SELF-FENCED node releases its row too.
-        # The fence clears the gate on this node's clock while the row stays live on the DB clock, so
-        # a release gated on the gate alone sent nothing and left a standby waiting out the TTL. The
-        # forced write was once tried here and reverted because it had no per-call bound, and a
-        # self-fenced node's pool is the one most likely to hang. The bound is the fix; what a write
-        # that misses it still costs is on STOP_WRITE_TIMEOUT_SECONDS. It bounds these two writes
-        # only. The gather above waits on a cancelled heartbeat task with no bound of its own.
+        # BACKLOG #1987: the release is FORCED, so a node sends it whatever its gate reads. A
+        # self-fenced node is the case the item names: the fence clears the gate on this node's clock
+        # while the row stays live on the DB clock, so a release gated on the gate sent nothing and a
+        # standby waited out the TTL. Forced unconditionally rather than on may_own_lease_row(),
+        # because the gather above can cancel a claim the server had already committed, before the
+        # tick recorded it, and nothing in memory can see that. The write is owner-scoped, so on a
+        # node that owns no row it matches nothing. The forced write was once tried here and reverted
+        # because it had no per-call bound, and a self-fenced node's pool is the one most likely to
+        # hang. The bound is the fix; what a write that misses it still costs is on
+        # STOP_WRITE_TIMEOUT_SECONDS. It bounds these two writes only: the gather above waits on a
+        # cancelled heartbeat task with no bound of its own.
+        started = time.monotonic()
         _, _, wrote, _ = await self._release_leadership(
-            force_write=self.may_own_lease_row(), timeout=self._stop_write_timeout
+            force_write=True, timeout=self._stop_write_timeout
         )
-        if not wrote:
-            # The release was sent and did not return, so the pool is not answering. The tombstone
-            # would spend a second bound on the same pool for a row the freshness filter in
-            # cluster_members() already handles, so skip it.
+        if not wrote and time.monotonic() - started >= self._stop_write_timeout:
+            # The release spent its whole bound, so the pool is not answering. The tombstone would
+            # spend another on the same pool for a row the freshness filter in cluster_members()
+            # already handles. A release that failed FAST says nothing about the pool, so the
+            # tombstone still goes out then.
             log.warning(
-                "cluster: node %s not marked left: the pool did not answer the lease release",
+                "cluster: node %s not marked left: the lease release did not return within %.1fs",
                 self.node_id,
+                self._stop_write_timeout,
             )
             return
         # Mark the row left rather than DELETE it: keeping a 'left' tombstone gives an operator a
@@ -1621,14 +1643,15 @@ class DbCoordinator:
         count at all — see :class:`StepdownReleaseUnconfirmed`.
 
         ``force_write`` sends the ``UPDATE`` even when this node's in-memory gate already reads False.
-        Both callers pass it on :meth:`may_own_lease_row`, so a self-fenced node releases its row on a
-        stepdown (BACKLOG #1508) and on a stop (BACKLOG #1987).
+        :meth:`step_down_leadership` passes it on :meth:`may_own_lease_row` (BACKLOG #1508), and
+        :meth:`stop` passes it always (BACKLOG #1987), so a self-fenced node releases its row on both.
 
         ``timeout`` bounds the write through :func:`_execute_within`. Only :meth:`stop` passes it. A
         self-fenced node's pool is the one most likely to hang, and a stop must not wait on it; a
         write that misses the bound is a failed write (``wrote=False``, the release still owed) and
-        the row ages out at its TTL. A stepdown passes none, because its
-        request deadline already cancels it and a timeout there would change what it reports."""
+        the row ages out at its TTL. **A stepdown passes none, so its write is still unbounded.** Its
+        request deadline is an ``asyncio.timeout`` around the handler, which does not bound an asyncpg
+        write for the reason :func:`_execute_within` gives; that gap is outside BACKLOG #1987."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None

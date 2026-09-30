@@ -127,7 +127,9 @@ cluster coordinates the parts that must not double-run or interleave:
   fence baseline is taken after the renew round trip returns while the expiry is stamped on the database
   clock at statement execution, and detection lands up to one fence tick late; and the config validator
   checks the *ordering* `heartbeat < fence < ttl` only, never that any margin survives. On a clean stop
-  the leader expires its lease so a standby takes over at once.
+  the leader expires its lease so a standby takes over at once. A node that has already self-fenced
+  expires it too. If that write does not return within 2 seconds, the node stops anyway and the lease
+  ages out at the TTL.
 - **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
   paused/partitioned old leader noticing it has fallen behind and demoting itself before the lease TTL
   elapses. As a **second, durable** backstop the `leader_lease` row also carries a monotonic
@@ -334,7 +336,8 @@ There is a promotion window, as in Rhapsody (minutes-class) — quantify it from
 benchmark, don't assume zero-downtime:
 
 - **Clean stop** (graceful shutdown): the leaving primary **expires its lease**, so a standby acquires on
-  its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`). A **planned switchover** that
+  its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`). A slow database can turn this
+  into the crash case below: the stop gives that write 2 seconds, then leaves the lease to age out. A **planned switchover** that
   leaves the node running takes the same path, without the shutdown — see `POST /cluster/stepdown` below.
 - **Crash / partition**: the primary's lease **ages out**, so a standby acquires after up to
   `leader_lease_ttl_seconds`. A partitioned old primary **self-fences** within

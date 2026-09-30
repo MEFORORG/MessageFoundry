@@ -193,7 +193,8 @@ class SqlServerCoordinator:
         self._fence_task = asyncio.create_task(self._fence_watchdog_loop())
 
     async def stop(self) -> None:
-        """Release leadership, cancel both tasks, mark this node left. Idempotent and never raises."""
+        """Release leadership, cancel both tasks, mark this node left. Idempotent and never raises.
+        The tombstone is skipped when the release spent its whole bound; see DbCoordinator.stop()."""
         self._stop.set()
         tasks = [t for t in (self._heartbeat_task, self._fence_task) if t is not None]
         self._heartbeat_task = None
@@ -205,18 +206,20 @@ class SqlServerCoordinator:
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
         # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
         # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
-        # Forced on may_own_lease_row() so a self-fenced node releases its row, and each write bounded
-        # so a stuck pool cannot hang the shutdown (BACKLOG #1987); DbCoordinator.stop() says why, and
-        # why the tombstone is skipped once the release did not return. No asyncpg-style helper here:
-        # the store's _acquire already bounds the borrow and quarantines a cancelled connection
-        # (STOP_WRITE_TIMEOUT_SECONDS says what that quarantine can still cost).
+        # Forced unconditionally, so a self-fenced node releases its row, and each write bounded
+        # (BACKLOG #1987). DbCoordinator.stop() says why the force is unconditional, when the tombstone
+        # is skipped, and what the bound does not cover. No asyncpg-style helper here: the store's
+        # _acquire already bounds the borrow and quarantines a cancelled connection, and
+        # STOP_WRITE_TIMEOUT_SECONDS says what that can still cost.
+        started = time.monotonic()
         _, _, wrote, _ = await self._release_leadership(
-            force_write=self.may_own_lease_row(), timeout=self._stop_write_timeout
+            force_write=True, timeout=self._stop_write_timeout
         )
-        if not wrote:
+        if not wrote and time.monotonic() - started >= self._stop_write_timeout:
             log.warning(
-                "cluster: node %s not marked left: the pool did not answer the lease release",
+                "cluster: node %s not marked left: the lease release did not return within %.1fs",
                 self.node_id,
+                self._stop_write_timeout,
             )
             return
         try:

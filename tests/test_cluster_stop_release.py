@@ -9,22 +9,23 @@ reverted because it had no per-call bound, and a self-fenced node's pool is the 
 
 Both coordinators run here against in-memory stand-ins, so no database is needed. The stand-ins model
 only the statements ``stop()`` and the claim send, plus the one piece of asyncpg behaviour the bound
-depends on (see :class:`_PgPool`). What they cannot show is a real driver under a real partition; no
-suite here does that, including the live-server ones (``test_cluster_failover_postgres.py``,
+depends on (see :class:`_PgAcquired`). What they cannot show is a real driver under a real partition;
+no suite here does that, including the live-server ones (``test_cluster_failover_postgres.py``,
 ``test_cluster_failover_sqlserver.py``), which exercise a healthy server.
 """
 
 from __future__ import annotations
 
 import asyncio
-import re
 import time
-from pathlib import Path
 from types import TracebackType
 
-from messagefoundry.pipeline.cluster import STOP_WRITE_TIMEOUT_SECONDS, DbCoordinator
+from messagefoundry.pipeline.cluster import (
+    STOP_WRITE_TIMEOUT_SECONDS,
+    DbCoordinator,
+    _execute_within,
+)
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
-from messagefoundry.store.sqlserver import _DIRTY_CLOSE_TIMEOUT
 
 _TTL = 30.0
 _FENCE = 20.0
@@ -35,9 +36,8 @@ _DB_NOW = 1_700_000_000.0
 # stop() into a clean failure rather than a hang that pytest-timeout ends by killing the whole run.
 _BOUND = 0.05
 _HANG_GUARD = 10.0
-_INSTALL_SERVICE = (
-    Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
-)
+_LEASE_SQL = "UPDATE leader_lease"
+_NODES_SQL = "UPDATE nodes"
 
 
 class _Clock:
@@ -83,6 +83,35 @@ class _LeaseRow:
         return row is not None and float(row["lease_expires_at"]) > self._db_clock()  # type: ignore[arg-type]
 
 
+class _Writes:
+    """What both stand-ins share: which statements hang or fail, and a count of those that landed.
+
+    ``hang_on`` models the realistic self-fence case: the statement is already in flight when the
+    server stops answering, so it never returns. ``fail_on`` raises at once, the way a dead pooled
+    connection does."""
+
+    def __init__(self, lease: _LeaseRow) -> None:
+        self._lease = lease
+        self.hang_on: str | None = None
+        self.fail_on: str | None = None
+        self.hung_in_flight = False
+        self.lease_writes = 0
+        self.node_writes = 0
+
+    async def run(self, sql: str, owner: object) -> int:
+        if self.hang_on is not None and self.hang_on in sql:
+            self.hung_in_flight = True
+            await asyncio.Event().wait()  # nothing ever sets it
+        if self.fail_on is not None and self.fail_on in sql:
+            raise ConnectionError("connection was closed in the middle of operation")
+        if _LEASE_SQL in sql:
+            self.lease_writes += 1
+            return self._lease.release(owner)
+        assert _NODES_SQL in sql, sql
+        self.node_writes += 1
+        return 1
+
+
 class _PgAcquired:
     """``pool.acquire(timeout=...)`` as asyncpg 0.31.0 shapes it, for one write."""
 
@@ -100,30 +129,24 @@ class _PgAcquired:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if (
-            exc_type is not None
-            and issubclass(exc_type, asyncio.CancelledError)
-            and self._pool.hang
-        ):
+        writes = self._pool.writes
+        cancelled = exc_type is not None and issubclass(exc_type, asyncio.CancelledError)
+        if cancelled and writes.hung_in_flight:
             # asyncpg: a statement cancelled in flight leaves the protocol cancelling, and the pool's
             # shielded release waits for the server to acknowledge that cancel for as long as the
             # ACQUIRE's timeout, then terminates the connection and re-raises. None waits forever. A
             # partitioned server never acknowledges, so this wait is the whole question.
+            writes.hung_in_flight = False
             await asyncio.wait_for(asyncio.Event().wait(), self._timeout)
 
 
 class _PgPool:
-    """One node's asyncpg-shaped view of the shared row.
-
-    ``hang`` models the realistic self-fence case: the statement is already in flight when the server
-    stops answering, so it never returns and its cancel is never acknowledged. A stall BEFORE the
-    statement would cancel cleanly and prove much less, because it skips the pool release wait."""
+    """One node's asyncpg-shaped view of the shared row. ``execute`` serves both ``pool.execute`` (the
+    stepdown's unbounded path) and ``con.execute`` (stop()'s path through ``acquire``)."""
 
     def __init__(self, lease: _LeaseRow) -> None:
         self._lease = lease
-        self.hang = False
-        self.lease_writes = 0
-        self.node_writes = 0
+        self.writes = _Writes(lease)
         self.acquire_timeouts: list[float | None] = []
 
     async def fetchrow(
@@ -136,46 +159,32 @@ class _PgPool:
         return _PgAcquired(self, timeout)
 
     async def execute(self, sql: str, *args: object) -> str:
-        # Serves both pool.execute (the stepdown's unbounded path) and con.execute (stop()'s path).
-        if self.hang:
-            await asyncio.Event().wait()  # in flight; the server never answers
-        if "UPDATE leader_lease" in sql:
-            self.lease_writes += 1
-            return f"UPDATE {self._lease.release(args[1])}"
-        assert "UPDATE nodes" in sql, sql
-        self.node_writes += 1
-        return "UPDATE 1"
+        # Lease release args: (lease_key, owner). Tombstone args: ("left", last_seen, node_id).
+        owner = args[1] if _LEASE_SQL in sql else args[2]
+        return f"UPDATE {await self.writes.run(sql, owner)}"
 
 
 class _SqlStore:
     """The SQL Server sibling of :class:`_PgPool`, shaped like the store's ``_fetchone``/``_execute``.
-    Its hang cancels cleanly: the real store's quarantine wait is bounded separately, by
-    ``_DIRTY_CLOSE_TIMEOUT``, and the budget test below counts it."""
+    Its hang cancels cleanly: the real store quarantines the cancelled connection, and what that can
+    still cost is on STOP_WRITE_TIMEOUT_SECONDS, not modelled here."""
 
     _settings = None
 
     def __init__(self, lease: _LeaseRow) -> None:
         self._lease = lease
-        self.hang = False
-        self.lease_writes = 0
-        self.node_writes = 0
+        self.writes = _Writes(lease)
 
     async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object] | None:
         assert "MERGE leader_lease" in sql
         return self._lease.claim(params[1])
 
     async def _execute(self, sql: str, params: tuple[object, ...]) -> int:
-        if self.hang:
-            await asyncio.Event().wait()
-        if "UPDATE leader_lease" in sql:
-            self.lease_writes += 1
-            return self._lease.release(params[1])
-        assert "UPDATE nodes" in sql, sql
-        self.node_writes += 1
-        return 1
+        owner = params[1] if _LEASE_SQL in sql else params[2]
+        return await self.writes.run(sql, owner)
 
 
-def _pg(pool: _PgPool, node: str, mono: _Clock, bound: float = _BOUND) -> DbCoordinator:
+def _pg(pool: _PgPool, node: str, mono: _Clock) -> DbCoordinator:
     return DbCoordinator(
         pool,
         node,
@@ -183,11 +192,11 @@ def _pg(pool: _PgPool, node: str, mono: _Clock, bound: float = _BOUND) -> DbCoor
         leader_lease_ttl_seconds=_TTL,
         leader_fence_timeout_seconds=_FENCE,
         monotonic=mono,
-        stop_write_timeout_seconds=bound,
+        stop_write_timeout_seconds=_BOUND,
     )
 
 
-def _ss(store: _SqlStore, node: str, mono: _Clock, bound: float = _BOUND) -> SqlServerCoordinator:
+def _ss(store: _SqlStore, node: str, mono: _Clock) -> SqlServerCoordinator:
     return SqlServerCoordinator(
         store,
         node,
@@ -195,16 +204,27 @@ def _ss(store: _SqlStore, node: str, mono: _Clock, bound: float = _BOUND) -> Sql
         leader_lease_ttl_seconds=_TTL,
         leader_fence_timeout_seconds=_FENCE,
         monotonic=mono,
-        stop_write_timeout_seconds=bound,
+        stop_write_timeout_seconds=_BOUND,
     )
 
 
-async def _lead_then_self_fence(coord: DbCoordinator | SqlServerCoordinator, mono: _Clock) -> None:
+def _backends(lease: _LeaseRow) -> list[tuple[str, _Writes, DbCoordinator | SqlServerCoordinator]]:
+    """One self-contained node "A" per backend over the same kind of row, so each scenario below runs
+    against both coordinators without a copy of its body."""
+    pool = _PgPool(lease)
+    store = _SqlStore(lease)
+    return [
+        ("postgres", pool.writes, _pg(pool, "A", _Clock(0.0))),
+        ("sqlserver", store.writes, _ss(store, "A", _Clock(0.0))),
+    ]
+
+
+async def _lead_then_self_fence(coord: DbCoordinator | SqlServerCoordinator) -> None:
     """Acquire the lease, then let the watchdog fence the node on its own clock. The DB clock does not
     move, so the row is still live when the test stops the node: exactly the window #1987 names."""
     await coord._maintain_leadership()
     assert coord.is_leader() is True
-    mono.t = _FENCE + 0.1
+    coord._monotonic.t = _FENCE + 0.1  # type: ignore[attr-defined]
     coord._check_fence()
     assert coord.is_leader() is False, "the fence did not fire, so this test proves nothing"
     assert coord.may_own_lease_row() is True
@@ -216,138 +236,127 @@ async def _timed_stop(coord: DbCoordinator | SqlServerCoordinator) -> float:
     return time.monotonic() - started
 
 
-# --- Postgres / SQLite-shaped coordinator (DbCoordinator) --------------------
+# --- the release lands --------------------------------------------------------
 
 
-async def test_pg_stop_of_a_self_fenced_node_expires_its_lease_row() -> None:
+async def test_stop_of_a_self_fenced_node_expires_its_lease_row() -> None:
+    for name, writes, a in _backends(lease := _LeaseRow(_Clock(_DB_NOW))):
+        lease.row = None
+        await _lead_then_self_fence(a)
+        assert lease.is_live(), f"{name}: control: the row must still be live after the fence"
+
+        await a.stop()
+
+        assert (writes.lease_writes, writes.node_writes) == (1, 1), name
+        assert lease.row is not None and lease.row["owner"] == "A", name
+        assert lease.row["lease_expires_at"] == 0.0, name
+        assert a._lease_release_owed is False, name
+        # A standby takes the row on its next tick instead of waiting out the TTL.
+        b = _pg(_PgPool(lease), "B", _Clock(0.0))
+        await b._maintain_leadership()
+        assert b.is_leader() is True, name
+
+
+async def test_pg_stop_writes_go_through_a_bounded_acquire() -> None:
+    # The acquire's timeout is what bounds asyncpg's release wait; a bare pool.execute leaves it None.
     lease = _LeaseRow(_Clock(_DB_NOW))
     pool = _PgPool(lease)
-    mono = _Clock(0.0)
-    a = _pg(pool, "A", mono)
-    await _lead_then_self_fence(a, mono)
-    assert lease.is_live(), "control: the row must still be live after the fence"
-
+    a = _pg(pool, "A", _Clock(0.0))
+    await _lead_then_self_fence(a)
     await a.stop()
-
-    assert pool.lease_writes == 1 and pool.node_writes == 1
-    assert lease.row is not None and lease.row["owner"] == "A"
-    assert lease.row["lease_expires_at"] == 0.0
-    assert a._lease_release_owed is False
-    # Both writes went through acquire(timeout=bound), which is what bounds asyncpg's release wait.
     assert pool.acquire_timeouts == [_BOUND, _BOUND]
-    # A standby takes the row on its next tick instead of waiting out the TTL.
-    b = _pg(_PgPool(lease), "B", _Clock(0.0))
-    await b._maintain_leadership()
-    assert b.is_leader() is True
 
 
-async def test_pg_stop_of_a_node_that_never_owned_the_row_sends_no_release() -> None:
-    # Control arm: the force is gated on may_own_lease_row, not sent unconditionally. B saw A's live
-    # lease, which clears B's baseline, so B's stop must leave A's row alone and send nothing for it.
+async def test_stop_of_a_follower_leaves_the_leaders_row_alone() -> None:
+    # The force is unconditional, because a claim the gather cancelled after the server committed it
+    # is invisible in memory. So the write must be owner-scoped: sent, and matching nothing here.
     lease = _LeaseRow(_Clock(_DB_NOW))
-    a = _pg(_PgPool(lease), "A", _Clock(0.0))
-    await a._maintain_leadership()
-    b_pool = _PgPool(lease)
-    b = _pg(b_pool, "B", _Clock(0.0))
-    await b._maintain_leadership()
-    assert b.is_leader() is False and b.may_own_lease_row() is False
+    leader = _pg(_PgPool(lease), "L", _Clock(0.0))
+    await leader._maintain_leadership()
+    for name, writes, b in _backends(lease):
+        await b._maintain_leadership()
+        assert b.is_leader() is False and b.may_own_lease_row() is False, name
 
-    await b.stop()
+        await b.stop()
 
-    assert b_pool.lease_writes == 0
-    assert b_pool.node_writes == 1
-    assert lease.is_live() and lease.row is not None and lease.row["owner"] == "A"
+        assert (writes.lease_writes, writes.node_writes) == (1, 1), name
+        assert lease.is_live() and lease.row is not None and lease.row["owner"] == "L", name
 
 
-async def test_pg_stop_is_bounded_when_the_release_hangs_in_flight() -> None:
+# --- the bound ------------------------------------------------------------------
+
+
+async def test_stop_is_bounded_when_the_release_hangs_in_flight() -> None:
+    for name, writes, a in _backends(lease := _LeaseRow(_Clock(_DB_NOW))):
+        lease.row = None
+        await _lead_then_self_fence(a)
+        writes.hang_on = _LEASE_SQL
+
+        elapsed = await _timed_stop(a)
+
+        # One write at most twice the bound, and the tombstone skipped. Generous slack for a loaded
+        # runner; an unbounded wait trips the outer guard instead.
+        assert elapsed < 2.0, f"{name}: stop() took {elapsed:.2f}s against a {_BOUND}s bound"
+        assert (writes.lease_writes, writes.node_writes) == (0, 0), name
+        assert a._lease_release_owed is True, name  # still owed, not silently dropped
+        assert lease.is_live(), name  # so the row ages out at its TTL, the pre-existing fallback
+
+
+async def test_stop_is_bounded_when_only_the_tombstone_hangs() -> None:
+    for name, writes, a in _backends(lease := _LeaseRow(_Clock(_DB_NOW))):
+        lease.row = None
+        await _lead_then_self_fence(a)
+        writes.hang_on = _NODES_SQL
+
+        elapsed = await _timed_stop(a)
+
+        assert elapsed < 2.0, f"{name}: stop() took {elapsed:.2f}s against a {_BOUND}s bound"
+        assert (writes.lease_writes, writes.node_writes) == (1, 0), name
+        assert not lease.is_live(), name  # the release landed before the tombstone hung
+
+
+async def test_a_release_that_fails_fast_still_sends_the_tombstone() -> None:
+    # Only a release that spent its whole bound says the pool is not answering. A fast failure says
+    # nothing about it, and skipping the tombstone would leave the row reading active and fresh.
+    for name, writes, a in _backends(lease := _LeaseRow(_Clock(_DB_NOW))):
+        lease.row = None
+        await _lead_then_self_fence(a)
+        writes.fail_on = _LEASE_SQL
+
+        await _timed_stop(a)
+
+        assert (writes.lease_writes, writes.node_writes) == (0, 1), name
+        assert a._lease_release_owed is True, name
+
+
+# --- _execute_within ------------------------------------------------------------
+
+
+class _ReleaseFailsAfterCommit:
+    """A connection whose statement returns and whose return to the pool then fails, as asyncpg's
+    release does when its reset round trip misses the acquire budget."""
+
+    def acquire(self, *, timeout: float | None = None) -> _ReleaseFailsAfterCommit:
+        return self
+
+    async def __aenter__(self) -> _ReleaseFailsAfterCommit:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        raise TimeoutError
+
+    async def execute(self, sql: str, *args: object) -> str:
+        return "UPDATE 1"
+
+
+async def test_a_write_that_committed_is_not_reported_failed_by_its_release() -> None:
+    status = await _execute_within(_ReleaseFailsAfterCommit(), _BOUND, "UPDATE leader_lease")
+    assert status == "UPDATE 1"
+
+
+def test_the_default_bound_reaches_both_coordinators() -> None:
     lease = _LeaseRow(_Clock(_DB_NOW))
-    pool = _PgPool(lease)
-    mono = _Clock(0.0)
-    a = _pg(pool, "A", mono)
-    await _lead_then_self_fence(a, mono)
-    pool.hang = True
-
-    elapsed = await _timed_stop(a)
-
-    # One write at most twice the bound (statement, then the release wait), and the tombstone is
-    # skipped. Generous slack for a loaded runner; an unbounded wait trips the outer guard instead.
-    assert elapsed < 2.0, f"stop() took {elapsed:.2f}s against a {_BOUND}s per-write bound"
-    assert pool.acquire_timeouts == [_BOUND], "the tombstone must be skipped after a hung release"
-    assert pool.lease_writes == 0 and pool.node_writes == 0
-    assert a._lease_release_owed is True  # still owed, not silently dropped
-    assert lease.is_live()  # so the row ages out at its TTL, the pre-existing fallback
-
-
-# --- SQL Server coordinator ---------------------------------------------------
-
-
-async def test_sqlserver_stop_of_a_self_fenced_node_expires_its_lease_row() -> None:
-    lease = _LeaseRow(_Clock(_DB_NOW))
-    store = _SqlStore(lease)
-    mono = _Clock(0.0)
-    a = _ss(store, "A", mono)
-    await _lead_then_self_fence(a, mono)
-    assert lease.is_live(), "control: the row must still be live after the fence"
-
-    await a.stop()
-
-    assert store.lease_writes == 1 and store.node_writes == 1
-    assert lease.row is not None and lease.row["owner"] == "A"
-    assert lease.row["lease_expires_at"] == 0.0
-    assert a._lease_release_owed is False
-    b = _ss(_SqlStore(lease), "B", _Clock(0.0))
-    await b._maintain_leadership()
-    assert b.is_leader() is True
-
-
-async def test_sqlserver_stop_of_a_node_that_never_owned_the_row_sends_no_release() -> None:
-    lease = _LeaseRow(_Clock(_DB_NOW))
-    a = _ss(_SqlStore(lease), "A", _Clock(0.0))
-    await a._maintain_leadership()
-    b_store = _SqlStore(lease)
-    b = _ss(b_store, "B", _Clock(0.0))
-    await b._maintain_leadership()
-    assert b.is_leader() is False and b.may_own_lease_row() is False
-
-    await b.stop()
-
-    assert b_store.lease_writes == 0
-    assert b_store.node_writes == 1
-    assert lease.is_live() and lease.row is not None and lease.row["owner"] == "A"
-
-
-async def test_sqlserver_stop_is_bounded_when_the_release_hangs() -> None:
-    lease = _LeaseRow(_Clock(_DB_NOW))
-    store = _SqlStore(lease)
-    mono = _Clock(0.0)
-    a = _ss(store, "A", mono)
-    await _lead_then_self_fence(a, mono)
-    store.hang = True
-
-    elapsed = await _timed_stop(a)
-
-    assert elapsed < 2.0, f"stop() took {elapsed:.2f}s against a {_BOUND}s per-write bound"
-    assert store.lease_writes == 0 and store.node_writes == 0
-    assert a._lease_release_owed is True
-    assert lease.is_live()
-
-
-# --- the shipped bound against the service stop budget ------------------------
-
-
-def test_the_shipped_bound_fits_the_service_stop_budget() -> None:
-    # Read the budget from the installer rather than restating it here, so lowering it there fails
-    # this test. Worst case per backend, from STOP_WRITE_TIMEOUT_SECONDS's own comment: a release that
-    # returns just inside the bound, then a tombstone that misses it. Postgres pays twice the bound per
-    # missed write (asyncpg's release wait), SQL Server the bound plus the store's quarantine close.
-    found = re.search(r"AppStopMethodConsole\s+(\d+)", _INSTALL_SERVICE.read_text(encoding="utf-8"))
-    assert found is not None, "install-service.ps1 no longer sets AppStopMethodConsole"
-    budget = int(found.group(1)) / 1000.0
-    bound = STOP_WRITE_TIMEOUT_SECONDS
-    postgres_worst = bound + 2 * bound
-    sqlserver_worst = bound + (bound + _DIRTY_CLOSE_TIMEOUT)
-    assert 0.0 < max(postgres_worst, sqlserver_worst) < budget
-    # And the default reaches both coordinators when nobody passes one.
-    lease = _LeaseRow(_Clock(_DB_NOW))
-    assert DbCoordinator(_PgPool(lease), "A")._stop_write_timeout == bound
-    assert SqlServerCoordinator(_SqlStore(lease), "A")._stop_write_timeout == bound
+    assert DbCoordinator(_PgPool(lease), "A")._stop_write_timeout == STOP_WRITE_TIMEOUT_SECONDS
+    assert SqlServerCoordinator(_SqlStore(lease), "A")._stop_write_timeout == (
+        STOP_WRITE_TIMEOUT_SECONDS
+    )

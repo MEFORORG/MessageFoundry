@@ -400,9 +400,12 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # 36 on 2026-09-27, when `purge_expired_sessions` moved inside the helper (BACKLOG #2096 gave it
     # an idle-window variant, and both variants now borrow through `_timed_acquire(record=False)`).
     # The CONNECTIONS.md note still says "at least", so this drop also leaves it true as written.
-    assert (len(store_sites), len(cluster_sites)) == (36, 10), (
+    # Cluster 10 -> 9 on 2026-09-30: stop()'s `left` tombstone moved to cluster._execute_within, which
+    # borrows through `pool.acquire(timeout=...)` (BACKLOG #1987). That note is about the store's
+    # helper and does not describe the coordinator, so it needed no change.
+    assert (len(store_sites), len(cluster_sites)) == (36, 9), (
         "the measured population of pool borrows OUTSIDE the bounded helper moved from 36 (store)"
-        " + 10 (cluster), measured 2026-09-27. Re-read the CONNECTIONS.md scope note before changing"
+        " + 9 (cluster), measured 2026-09-30. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 
