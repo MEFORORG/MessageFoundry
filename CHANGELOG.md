@@ -634,6 +634,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
+  the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
+  model defines both. The web console builds its bulk-replay buttons from them, so a channel whose
+  dead deliveries are all past the first page still gets one. The store contract gains
+  `list_replay_targets` on all three backends. (`BACKLOG #1743`, step 2)
 - **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
   The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
   dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
