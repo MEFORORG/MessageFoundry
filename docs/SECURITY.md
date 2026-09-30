@@ -3259,15 +3259,20 @@ Pydantic validator except `admin_write_rate_limit_window_seconds`, which must be
 neither `lockout_threshold` nor `lockout_minutes` carries one. So a `per_key` or `glob` of `0` disables that
 dimension, and a sign-in or PHI-read `*_window_seconds` of `0` ages every recorded hit out
 immediately — disabling enforcement while the limiter still reports as "enabled". Treat these as
-security-relevant values, not tuning knobs. **The sign-in limiter and the lockout are no longer
-silent about it** ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). While sign-in is on,
-`security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a `login_rate_limit_per_ip`
-or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds` of `0` or less, a
-`lockout_minutes` of `0` or less, and a `lockout_threshold` above the 100 that NIST SP 800-63B
-allows. Each then reaches the `serve` loosening warning, `messagefoundry security show` and
-`GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). A weak but non-zero
-count or window is still not named. Neither are the PHI-read and admin-write limiters, so turning
-either off, or zeroing one of its counts, is still silent.
+security-relevant values, not tuning knobs. **These limits are no longer silent about it**
+([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). While sign-in is on, `security_loosenings()` names any
+value **looser than its shipped default** for the sign-in limiter, the lockout
+(`lockout_minutes`, `lockout_threshold`, `lockout_max_minutes`), the PHI-read limiter, the
+admin-write limiter and its minimum gap, `max_sessions_per_user`, and, with OIDC on,
+`oidc_flow_cache_max`. That covers an off switch, a zeroed count and a window of `0` or less, and
+also a weak but non-zero value: a `1e-6` s window or a count of `1e9` is named. A value at or stricter
+than the default is not. The one count with no looser value is `phi_read_rate_limit_global`, which
+ships off. Each named value reaches the `serve` loosening warning, `messagefoundry security show` and
+`GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) for the table of values.
+The BACKLOG #2301 time floors are named the same way: `admin_write_min_interval_seconds`,
+`mfa_verify_min_elapsed_seconds` and, with OIDC on, `oidc_callback_min_elapsed_seconds`, each when
+below its default, and as off at `0`. The dual-control `[approvals].min_dwell_seconds` floor is not
+named yet.
 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained
