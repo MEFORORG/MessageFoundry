@@ -88,6 +88,10 @@ messagefoundry/auth/data/common_passwords.txt text eol=lf
 # The root patterns are ANCHORED with a leading slash. Unanchored, `README.md` also matches
 # messagefoundry/generators/README.md, and the five root names pin 11 files outside the shipped set.
 messagefoundry/** text=auto eol=lf
+# The toolkit distribution's import package (ADR 0201). It ships in its own wheel, and slice 6 moves
+# messagefoundry/anon/ here, which tests/test_anon_parity.py compares byte for byte with tee/anon/.
+# So it takes the same pin as the engine tree it receives code from.
+messagefoundry_toolkit/** text=auto eol=lf
 /LICENSE text=auto eol=lf
 /NOTICE text=auto eol=lf
 /README.md text=auto eol=lf
@@ -126,3 +130,8 @@ tee/anon/** text=auto eol=lf
 # checkout still verifies rather than failing with a hex mismatch that names nothing.
 messagefoundry/auth/data/common_passwords.txt text=auto eol=lf
 messagefoundry/auth/data/common_passwords.NOTICE text=auto eol=lf
+
+# The /metrics golden files (BACKLOG #2501). tests/test_metrics_exposition.py compares the engine's
+# scrape to them BYTE FOR BYTE, so a CRLF checkout would fail that test with no defect anywhere.
+# They hold pure LF; `eol=lf` keeps a regenerated copy that way too.
+tests/golden/*.prom text=auto eol=lf

@@ -36,10 +36,12 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   the engine serves the JSON API only and prints a warning at startup.
 - **Independent version root.** Unlike `messagefoundry-harness` (deliberately lockstep — it reads the
   engine's `__version__`), the console has its **own** `__version__`, tag, changelog, and PyPI cadence.
-  It is meant to depend on the engine through a PEP 508 **compat range** (`messagefoundry>=X,<Y`), not
-  lockstep. **That range is not set:** the package declares a bare `messagefoundry` dependency, so pip
-  installs any pair and the startup seam check is what refuses a mismatch. Setting it is step 2 of
-  [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md).
+  It depends on the engine through a PEP 508 **floor with no ceiling** (`messagefoundry>=X`), not
+  lockstep; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
+  floor is raised at each console release, not as the engine moves.** No console release has set
+  one yet, so the package still declares a bare `messagefoundry` dependency. Step 2 of
+  [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) sets it, and the
+  `release-webconsole` job refuses a console wheel whose engine requirement has no lower bound.
 - **Mounted same-origin, in-process.** `create_app` grafts the console onto its FastAPI app with a single
   call from the `serve_ui` tail: `mount_ui(app, deps)`. Because `create_managed_app` delegates to
   `create_app` and the tests call `create_app` directly, that one call site covers the CLI/service path
@@ -49,6 +51,38 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   (`messagefoundry.api.security` / `.models` / `.auth_models` / `.validation` / `._ui_seam`), `messagefoundry.auth`, and
   the pure `messagefoundry.parsing` library — **never** `pipeline` / `store` / `transports` / `config`
   (CLAUDE.md §4). The direction package → engine-api-leaf is the only allowed one.
+
+### The engine requirement is a floor with no ceiling
+
+Each console release sets two lower bounds and no upper bound (BACKLOG #1585):
+
+| Where | Requirement | The value |
+|---|---|---|
+| The console's [`pyproject.toml`](../packaging/messagefoundry-webconsole/pyproject.toml) | `messagefoundry>=X` | X is the first engine release that carries the seam the console supports. |
+| The engine's `[webconsole]` extra | `messagefoundry-webconsole>=A` | A is the console version being released. |
+
+**The floor is the fix.** A bare dependency is satisfied by any engine already installed, so `pip`
+keeps an older engine that lacks the functions the console calls. The floor makes resolution refuse
+that engine.
+
+**There is no ceiling, for four reasons:**
+
+1. Nobody can choose one honestly. `ENGINE_UI_SEAM` is a derived digest that moves whenever the
+   engine functions the console uses change, and `SUPPORTED_ENGINE_SEAMS` holds exactly one value
+   (BACKLOG #279). So at release time nobody knows which engine version will move the seam next.
+2. A ceiling protects weakly. An engine-only `pip install -U messagefoundry` installs the new engine
+   anyway and only reports the conflict afterwards.
+3. A ceiling blocks compatible engine patch releases.
+4. The startup handshake, `assert_engine_seam`, already guards the upper side exactly
+   ([section 2](#2-the-seam)).
+
+**The floor is raised at the console release, not ahead of it.** `main`'s engine still reports its
+last released version while it already carries a newer seam. A floor naming the next engine would
+not resolve against `main`'s editable engine until that engine is published, and the CI jobs that
+install the console editable would break. So engine X ships first, and the console release commit
+raises the floor to X. Between releases the floor on `main` lags the engine; that is harmless,
+because only the released wheel's value matters. The release gate checks that a floor exists, not
+that its value is current, so choosing X stays a release step.
 
 ### Before it imports the console, `serve` checks whose package it is
 
@@ -107,8 +141,10 @@ at startup via `assert_engine_seam(engine_seam)`, which raises `UiSeamMismatch` 
 rather than a raw `TypeError`. The handshake is designed in **three layers**; the two that are wired
 fail loud:
 
-1. **Install-time** — the PEP 508 range on the engine dependency would fail an out-of-range pair at
-   `pip`/`uv` resolve. **Not wired:** the range is unset (see §1), so this layer does not fire today.
+1. **Install-time** — the floor on the engine dependency makes `pip`/`uv` refuse an engine older
+   than the console's seam. It has no ceiling, so it never refuses a newer engine; layer 2 does
+   that. It fires only for a console released with the floor, because the package on `main`
+   declares a bare dependency (see §1).
 2. **Startup-time** — `create_app`'s `serve_ui` tail calls `assert_engine_seam(ENGINE_UI_SEAM)`
    **before** it builds the deps bundle, so a package that changed the bundle *shape* for a new seam
    surfaces as `UiSeamMismatch`, not a kwargs `TypeError`. A second identical assert at the top of
@@ -238,8 +274,9 @@ from `auth.service`):
    deploying site. Widening it back to a range requires landing the cross-seam CI matrix in the same
    change.
 4. Confirm green: `python -m pytest tests/test_webconsole_seam_snapshot.py -q`.
-5. At release, update the compat range on both sides (the engine `[webconsole]` extra and the package's
-   `messagefoundry>=X,<Y` dep) — see the RELEASE checklist.
+5. At release, set the floor on both sides: the engine `[webconsole]` extra and the package's
+   `messagefoundry>=X` dependency. Set no ceiling; see
+   [the floor section](#the-engine-requirement-is-a-floor-with-no-ceiling) and the RELEASE checklist.
 
 **After any merge that moved the contract surface, regenerate. A clean merge is not evidence of a
 correct digest.**

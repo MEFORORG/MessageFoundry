@@ -8,7 +8,10 @@ laptop they skip, and a fully skipped suite reports green — so two of the thre
 this fix unverified by anything a builder can run. This file parses source, so it runs on every leg.
 
 **Six sites, not two** (``replay`` and ``replay_dead`` on each of ``MessageStore``, ``PostgresStore``
-and ``SqlServerStore``), and inside them more than six statements:
+and ``SqlServerStore``), and inside them more than six statements. The table below also carries
+``list_replay_targets`` on each backend, which writes nothing: it is the reader the console draws
+its replay buttons from, so it must skip what replay skips (BACKLOG #1743 step 2). The replay
+statements are:
 
 - ``replay``'s ``UPDATE queue SET status`` — the re-pend itself;
 - ``replay``'s ``DELETE FROM delivered_keys`` — the re-send branch drops the idempotency-ledger entries
@@ -74,6 +77,11 @@ _GUARDED: dict[tuple[str, str, str], tuple[str, ...]] = {
         "SELECT DISTINCT message_id",
         "UPDATE queue SET status",
     ),
+    # Not a replay site but its READER: the console draws one replay button per pair this returns,
+    # so a pair replay would skip must not be one (BACKLOG #1743 step 2).
+    ("store.py", "MessageStore", "list_replay_targets"): ("SELECT DISTINCT o.channel_id",),
+    ("postgres.py", "PostgresStore", "list_replay_targets"): ("SELECT DISTINCT o.channel_id",),
+    ("sqlserver.py", "SqlServerStore", "list_replay_targets"): ("SELECT DISTINCT o.channel_id",),
 }
 
 
@@ -290,9 +298,10 @@ class Fake:
 #
 # A pass-through completion marker is an already-terminal outbound row on an INBOUND-only lane. No
 # delivery worker drains it, so every statement that turns an existing row back into outbound work
-# must leave it alone: the same six replay statements as above, plus ``resend_to``'s source read on
-# each backend, because a marker has no body and must never be chosen as a resend source. Same
-# machinery, and the same reasons for reading emitted SQL rather than a name reference.
+# must leave it alone: every statement in the table above (the replay statements and the
+# ``list_replay_targets`` reader), plus ``resend_to``'s source read on each backend, because a marker
+# has no body and must never be chosen as a resend source. Same machinery, and the same reasons for
+# reading emitted SQL rather than a name reference.
 
 #: How the marker exclusion reads once spliced. Each backend keeps it in a plain module constant.
 _MARKER_PREDICATE = (
