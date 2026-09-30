@@ -757,12 +757,23 @@ export function paramWritableModes(vm: RowViewModel, name: string): readonly Par
 /** Which of the engine's `set_params` refusals a `lens rewrite` error is, for an inline message. */
 export type RewriteRefusalKind = "dynamic" | "literal-only" | "template-shape" | "column-limit";
 
-// Keyed on substrings of the engine's own refusal text (messagefoundry/lens.py, `_render_moded_value`,
-// `_refuse_templated_write`, `_check_parts_spec`, `_render_parts`, `_refuse_overlong_template_lines`).
-// Template-shape is checked FIRST because it is the only mode family whose messages quote user text (a
-// refused path, verbatim), so a path spelling another family's needle must not be filed under it. The
-// other mode families quote only a Python parameter name, which cannot contain a space and so cannot
-// spell any needle here.
+// The engine's machine-readable refusal codes (messagefoundry/lens.py, the `REFUSAL_*` constants), each
+// mapped to its kind. `lens rewrite` emits one beside every refusal as `{"error": ..., "code": ...}`, and
+// the lens docstring calls changing a code's string a contract change. Every other code, the generic
+// `refused` included, is not a mode refusal.
+const REFUSAL_CODES: Readonly<Record<string, RewriteRefusalKind>> = {
+  "dynamic-mode": "dynamic",
+  "template-shape": "template-shape",
+  "literal-only": "literal-only",
+  "column-limit": "column-limit",
+};
+
+// The FALLBACK for an engine that predates the codes: substrings of its refusal text
+// (messagefoundry/lens.py, `_render_moded_value`, `_refuse_templated_write`, `_check_parts_spec`,
+// `_render_parts`, `_refuse_overlong_template_lines`). Template-shape is checked FIRST because it is the
+// only mode family whose messages quote user text (a refused path, verbatim), so a path spelling another
+// family's needle must not be filed under it. The other mode families quote only a Python parameter
+// name, which cannot contain a space and so cannot spell any needle here.
 const REWRITE_REFUSALS: ReadonlyArray<[RewriteRefusalKind, readonly string[]]> = [
   [
     "template-shape",
@@ -786,12 +797,22 @@ const REWRITE_REFUSALS: ReadonlyArray<[RewriteRefusalKind, readonly string[]]> =
 ];
 
 /**
- * Classify a `set_params` refusal from `lens rewrite` ({@link RewriteOutcome.error}) as one of the mode
- * refusals, or `undefined` for any other error. The message itself is still the thing to show; this only
- * says which field state it belongs to. A rewording in lens.py turns a match into `undefined`, which
+ * Classify a `set_params` refusal from `lens rewrite` as one of the mode refusals, or `undefined` for any
+ * other error.
+ *
+ * The engine's `code` ({@link RewriteOutcome.code}) decides first. When it is present it is the whole
+ * answer: a known code maps to its kind, and any other code, the generic `refused` included, is not a
+ * mode refusal, whatever its text says. Only when the code is ABSENT (an engine that predates the codes)
+ * does the text decide, by substring. A rewording in lens.py then turns a match into `undefined`, which
  * degrades to the plain error message rather than to a wrong kind.
  */
-export function classifyRewriteRefusal(error: string | undefined): RewriteRefusalKind | undefined {
+export function classifyRewriteRefusal(
+  error: string | undefined,
+  code?: string,
+): RewriteRefusalKind | undefined {
+  if (code !== undefined) {
+    return Object.hasOwn(REFUSAL_CODES, code) ? REFUSAL_CODES[code] : undefined;
+  }
   if (!error) {
     return undefined;
   }
@@ -1221,12 +1242,17 @@ export function buildEditRequest(msg: EditMessage, expectSrc?: string): EditRequ
 export interface RewriteOutcome {
   source?: string;
   error?: string;
+  /**
+   * The engine's machine-readable refusal code (`{"error": ..., "code": ...}`), when it sent one. Absent
+   * from an engine that predates the codes, and from a failure that never reached the CLI's JSON path.
+   */
+  code?: string;
 }
 
 /**
  * Interpret a `lens rewrite` CLI result (pure — testable with a canned CLI output). On exit 0 the
  * stdout is the rewritten module source (byte-identical outside the edited row). On a refusal the CLI
- * prints `{"error": …}` + exit 1; anything else falls back to stderr. Never throws.
+ * prints `{"error": …, "code": …}` + exit 1; anything else falls back to stderr. Never throws.
  */
 export function parseRewriteResult(result: { stdout: string; stderr: string; code: number }): RewriteOutcome {
   if (result.code === 0) {
@@ -1236,18 +1262,167 @@ export function parseRewriteResult(result: { stdout: string; stderr: string; cod
   if (text) {
     try {
       const parsed: unknown = JSON.parse(text);
-      if (
-        parsed !== null &&
-        typeof parsed === "object" &&
-        typeof (parsed as { error?: unknown }).error === "string"
-      ) {
-        return { error: (parsed as { error: string }).error };
+      if (isRecord(parsed) && typeof parsed.error === "string") {
+        const outcome: RewriteOutcome = { error: parsed.error };
+        if (typeof parsed.code === "string") {
+          outcome.code = parsed.code;
+        }
+        return outcome;
       }
     } catch {
       // stdout was not JSON — fall through to stderr.
     }
   }
   return { error: result.stderr.trim() || "lens rewrite failed" };
+}
+
+/**
+ * The text to show for a refused param edit: a plain sentence for each mode refusal
+ * ({@link classifyRewriteRefusal}), with the engine's own message after it, or the engine's message
+ * alone for any other refusal. The engine's message stays in every case, because it names the argument
+ * and, for a column limit, the line and its width.
+ */
+export function rewriteRefusalMessage(outcome: RewriteOutcome): string {
+  const detail = outcome.error ?? "lens rewrite failed";
+  switch (classifyRewriteRefusal(outcome.error, outcome.code)) {
+    case "dynamic":
+      return (
+        "this argument is in dynamic mode. It is an expression the Steps view cannot write back, " +
+        `so it is read-only here. Edit it in the code view. (${detail})`
+      );
+    case "literal-only":
+      return (
+        // The engine's message names the arguments that take a template; its list is not copied here.
+        `this argument takes a literal only, not a template. (${detail})`
+      );
+    case "template-shape":
+      return `the template was refused, and nothing was written. (${detail})`;
+    case "column-limit":
+      return (
+        "the line would pass the column limit, so nothing was written. The engine writes every field " +
+        "read with an empty-text fallback, msg[\"X\"] or \"\", so rewriting an older template makes each " +
+        "bare read longer. Shorten the template's text, or edit it in the code view. " +
+        `(${detail})`
+      );
+    default:
+      return detail;
+  }
+}
+
+/** The row and param a webview edit or pick addresses, echoed from the control's data-* attributes. */
+interface EditCoords {
+  handler: string;
+  lineStart: number;
+  lineEnd: number;
+  name: string;
+  // The row's PROJECTION-TIME source, echoed from `data-expect-src` — the F7 stale-coordinate guard
+  // input. Never recomputed from the live buffer (that made the guard tautological).
+  expectSrc: string;
+}
+
+/** The edit coordinates of an untrusted webview message, or `undefined` when any is missing. */
+function readEditCoords(m: Record<string, unknown>): EditCoords | undefined {
+  const { handler, lineStart, lineEnd, name, expectSrc } = m;
+  if (
+    typeof handler !== "string" ||
+    typeof lineStart !== "number" ||
+    typeof lineEnd !== "number" ||
+    typeof name !== "string" ||
+    typeof expectSrc !== "string"
+  ) {
+    return undefined;
+  }
+  return { handler, lineStart, lineEnd, name, expectSrc };
+}
+
+/** A webview `edit` message, read: the edit to apply, or why a well-addressed edit was refused. */
+export type EditMessageRead = { edit: EditMessage } | { refused: string };
+
+/**
+ * Read an untrusted webview message as a param edit (ADR 0076 §5).
+ *
+ * `undefined` when it is not an `edit` message, or when its coordinates are not all present: that is
+ * dropped silently, as it always was. An edit whose coordinates are present but whose value is not a
+ * string, a number or a well-formed template ({@link isTemplateValue}) is REFUSED with a reason, never
+ * repaired and never dropped silently: a template the webview built wrong must not become a partial
+ * write. A template is copied part by part, so nothing later can change what the engine is sent.
+ */
+export function readEditMessage(m: unknown): EditMessageRead | undefined {
+  if (!isRecord(m) || m.command !== "edit") {
+    return undefined;
+  }
+  const coords = readEditCoords(m);
+  if (coords === undefined) {
+    return undefined;
+  }
+  const raw = m.value;
+  let value: string | number | TemplateValue;
+  if (typeof raw === "string" || typeof raw === "number") {
+    value = raw;
+  } else if (isTemplateValue(raw)) {
+    value = templateValue(readTemplateParts(raw.parts) ?? []);
+  } else {
+    return {
+      refused:
+        `the Steps view sent a value for "${coords.name}" that is not text, a number or a template of ` +
+        "text and field parts, so nothing was written",
+    };
+  }
+  return { edit: { command: "edit", ...coords, value } };
+}
+
+/**
+ * A webview request to pick an HL7 path into one part of a template (#237 step 3). The provider runs the
+ * field picker, then writes {@link withPickedPath} as the argument's template. The picker produces a
+ * `{path}` part, never Python source.
+ */
+export interface PickPartMessage extends EditCoords {
+  /** The template's parts as the webview holds them, unsaved edits included. */
+  parts: TemplatePart[];
+  /** The path part the pick replaces, or `parts.length` to append a new path part. */
+  index: number;
+}
+
+/**
+ * Read an untrusted webview `pickPart` message, or `undefined` when any field is missing or malformed.
+ * `index` must name an existing PATH part, or be `parts.length` (append): a pick never overwrites text.
+ */
+export function readPickPartMessage(m: unknown): PickPartMessage | undefined {
+  if (!isRecord(m) || m.command !== "pickPart") {
+    return undefined;
+  }
+  const coords = readEditCoords(m);
+  const parts = readTemplateParts(m.parts);
+  const index = m.index;
+  if (coords === undefined || parts === null || typeof index !== "number" || !Number.isInteger(index)) {
+    return undefined;
+  }
+  const appends = index === parts.length;
+  if (!appends && !(index >= 0 && index < parts.length && "path" in parts[index])) {
+    return undefined;
+  }
+  return { ...coords, parts, index };
+}
+
+/** The path a pick into `parts` at `index` starts from: the part's current path, or "" when appending. */
+export function pickPartSeed(parts: readonly TemplatePart[], index: number): string {
+  const part = parts[index];
+  return part !== undefined && "path" in part ? part.path : "";
+}
+
+/** `parts` with `path` picked into `index`: the path part there replaced, or a new one appended. */
+export function withPickedPath(
+  parts: readonly TemplatePart[],
+  index: number,
+  path: string,
+): TemplatePart[] {
+  const next = parts.map(copyTemplatePart);
+  if (index >= next.length) {
+    next.push({ path });
+  } else {
+    next[index] = { path };
+  }
+  return next;
 }
 
 // ---- phase 3 v2 editing: STRUCTURAL ops (insert / delete / move rows) --------------------------------
@@ -2842,6 +3017,230 @@ export function resolveWidget(
   return { kind: "text" };
 }
 
+/** The edit coordinates every editable control of one param carries, echoed back on edit (F7). */
+function editCoordAttrs(handlerName: string, row: RowViewModel, name: string): string {
+  return (
+    `data-handler="${escapeHtml(handlerName)}" ` +
+    `data-line-start="${row.lineStart}" data-line-end="${row.lineEnd}" ` +
+    `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
+    `data-name="${escapeHtml(name)}"`
+  );
+}
+
+/**
+ * The editable input for one param holding a literal: the widget the schema resolves, plus the HL7 field
+ * picker beside a path or segment slot. This is the whole editable control on a row without modes, and
+ * the `static` pane of a moded argument.
+ */
+function renderLiteralInputHtml(
+  p: ParamField,
+  handlerName: string,
+  row: RowViewModel,
+  schema?: OpSchema,
+): string {
+  // The row's PROJECTION-TIME source (`data-expect-src`) is echoed back on edit as `expect_src` so a
+  // stale coordinate is refused, not mis-spliced (F7). An empty value shows a `[blank]` placeholder (a
+  // hint, NOT a value) so a freshly-inserted template reads as "fill me in"; `placeholder` is inert on
+  // submit, so the F7 round-trip is unaffected.
+  //
+  // BACKLOG #1760: the input WIDGET is resolved from the engine's param schema (enum -> <select>,
+  // int/float -> type=number, everything else -> text). Every widget carries the IDENTICAL edit
+  // coordinates (data-handler/data-line-start/data-line-end/data-expect-src/data-name) so the F7
+  // stale-guard round-trip is unchanged; with no schema (the read-only callers) every param resolves
+  // to `text`, so this markup is byte-identical to before.
+  const attrs = editCoordAttrs(handlerName, row, p.name);
+  const widget = resolveWidget(row.action, p.name, schema);
+  let input: string;
+  if (widget.kind === "enum" && widget.choices) {
+    // A closed-set param -> a dropdown; the current value is pre-selected. When the current literal
+    // is NOT one of the schema's choices (a hand-authored value the vocabulary no longer lists), it
+    // is prepended as the selected option so the dropdown DISPLAYS the actual argument — otherwise a
+    // <select> with no selected option shows its FIRST choice, misrepresenting an unchanged literal.
+    // The out-of-set option still round-trips through the same edit splice; an empty value takes no
+    // such option (the [blank] hint role is left to the choices).
+    const inSet = widget.choices.includes(p.value);
+    const current =
+      !inSet && p.value !== ""
+        ? `<option value="${escapeHtml(p.value)}" selected>${escapeHtml(p.value)}</option>`
+        : "";
+    const options = widget.choices
+      .map(
+        (c) =>
+          `<option value="${escapeHtml(c)}"${c === p.value ? " selected" : ""}>` +
+          `${escapeHtml(c)}</option>`,
+      )
+      .join("");
+    input = `<select class="edit" ${attrs}>${current}${options}</select>`;
+  } else if (widget.kind === "number") {
+    // A number field posts a JS number (see stepsWebview.js) so the engine renders an int/float
+    // literal, never a re-typed string literal (`_render_literal` renders `6` for an int but `"6"`
+    // for a str — posting the string would silently retype the arg).
+    input =
+      `<input type="number" class="edit" ${attrs} ` +
+      `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+  } else {
+    input =
+      `<input type="text" class="edit" ${attrs} ` +
+      `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+  }
+  // ADR 0104 §2.3: a pickable HL7 path/segment slot gets a picker button BESIDE its input. The input is
+  // NEVER removed (free-text always available); the pick writes through the SAME edit splice. Only a
+  // slot with a pick button gets the horizontal `.edit-row` wrapper — every other editable field's
+  // markup is byte-identical to before.
+  const pm = pickMode(row.action, p.name);
+  const pickBtn = pm
+    ? `<button class="pickpath" ${attrs} data-mode="${pm}" data-tip="Pick an HL7 field">&#8942;</button>`
+    : "";
+  return pickBtn ? `<div class="edit-row">${input}${pickBtn}</div>` : input;
+}
+
+// What each mode means, for the tag or selector beside a moded argument (ADR 0076 Amendment E).
+const MODE_TIPS: Readonly<Record<ParamMode, string>> = {
+  static: "Static: a fixed value, written as a literal",
+  templated: "Templated: text with HL7 field values filled in (an empty field writes empty text)",
+  dynamic:
+    "Dynamic: an expression the Steps view cannot write back. It is read-only here; edit it in the " +
+    "code view",
+};
+
+// The tip on a moded argument that offers no write at all, by its mode.
+const READ_ONLY_TIPS: Readonly<Record<ParamMode, string>> = {
+  static: "Shown for reference; the Steps view does not edit this argument",
+  templated:
+    "Read-only here: a template goes only into a value argument, so edit this one in the code view",
+  dynamic: MODE_TIPS.dynamic,
+};
+
+/** One template part as an editable chip: a text run, or a field path with its picker. */
+function renderTemplatePartHtml(part: TemplatePart): string {
+  const remove = `<button type="button" class="tpart-del" data-tip="Remove this part">Remove</button>`;
+  if ("path" in part) {
+    return (
+      `<span class="tpart" data-part="path">` +
+      `<input type="text" class="tpart-input" aria-label="Field path" value="${escapeHtml(part.path)}" ` +
+      `placeholder="[field]" />` +
+      `<button type="button" class="tpart-pick" data-tip="Pick an HL7 field">&#8942;</button>` +
+      remove +
+      `</span>`
+    );
+  }
+  return (
+    `<span class="tpart" data-part="text">` +
+    `<input type="text" class="tpart-input" aria-label="Text" value="${escapeHtml(part.text)}" ` +
+    `placeholder="[text]" />` +
+    remove +
+    `</span>`
+  );
+}
+
+/**
+ * The parts editor of a templated argument (BACKLOG #237 step 3). It edits PARTS, never Python: text
+ * runs and field paths, which the webview posts as `{"parts": [...]}` for the engine to render. A picked
+ * field arrives as a `{path}` part through the provider's picker. `source` is shown read-only above the
+ * editor when the argument is a template the engine could not read as parts.
+ */
+function renderTemplateEditorHtml(
+  parts: readonly TemplatePart[],
+  handlerName: string,
+  row: RowViewModel,
+  name: string,
+  source: string | undefined,
+): string {
+  const noPartsForm =
+    source === undefined
+      ? ""
+      : `<input type="text" class="tsource" readonly disabled value="${escapeHtml(source)}" ` +
+        `data-tip="This template has no parts form. Add a field to write a new template in its place." />`;
+  // `.tpart-blank` is the empty text chip "Add text" clones, so the webview never builds chip markup of
+  // its own that could drift from this renderer's.
+  return (
+    noPartsForm +
+    `<div class="tparts" ${editCoordAttrs(handlerName, row, name)}>` +
+    `<template class="tpart-blank">${renderTemplatePartHtml({ text: "" })}</template>` +
+    parts.map(renderTemplatePartHtml).join("") +
+    `<span class="tpart-add">` +
+    `<button type="button" class="tpart-add-text" data-tip="Add a run of text">Add text</button>` +
+    `<button type="button" class="tpart-add-path" data-tip="Add an HL7 field value">Add field</button>` +
+    `</span></div>`
+  );
+}
+
+/**
+ * One moded argument (ADR 0076 Amendment E, BACKLOG #237 step 3): its mode, a mode selector when more
+ * than one mode may be written, and one editing pane per writable mode.
+ *
+ * The modes offered are exactly `writable` ({@link paramWritableModes}), which only ever names writes an
+ * engine list grants. With no writable mode the argument renders read-only with its mode named, which is
+ * how a dynamic argument always renders: its verbatim source, disabled. Switching the selector only
+ * shows another pane; nothing is written until a value is committed in it, so a switch alone never
+ * changes the file.
+ */
+function renderModedFieldHtml(
+  p: ParamField,
+  view: ParamModeView,
+  writable: readonly ParamMode[],
+  handlerName: string,
+  row: RowViewModel,
+  schema?: OpSchema,
+): string {
+  const mode = view.mode;
+  const label = `<label>${escapeHtml(p.name)}</label>`;
+  const tag = (tip: string): string =>
+    `<span class="mode-tag" data-tip="${escapeHtml(tip)}">${mode}</span>`;
+  const open = `<div class="field moded" data-mode="${mode}">`;
+  // A mode that cannot write its own current shape is read-only, whatever else is listed: a pane in
+  // another mode would replace an argument this view cannot show faithfully in an editor.
+  if (!writable.includes(mode)) {
+    return (
+      open +
+      `<div class="mode-head">${label}${tag(READ_ONLY_TIPS[mode])}</div>` +
+      `<input type="text" readonly disabled value="${escapeHtml(p.value)}" /></div>`
+    );
+  }
+  const selector =
+    writable.length > 1
+      ? `<select class="mode-select" data-name="${escapeHtml(p.name)}" ` +
+        `aria-label="${escapeHtml(`Input mode for ${p.name}`)}">` +
+        writable
+          .map(
+            (m) =>
+              `<option value="${m}"${m === mode ? " selected" : ""} title="${escapeHtml(MODE_TIPS[m])}">` +
+              `${m}</option>`,
+          )
+          .join("") +
+        `</select>`
+      : tag(MODE_TIPS[mode]);
+  const panes = writable.map((m) => {
+    const hidden = m === mode ? "" : " hidden";
+    if (m === "static") {
+      // A templated argument switched to static starts empty: its f-string is not a literal to edit.
+      const literal: ParamField = { name: p.name, value: mode === "static" ? p.value : "" };
+      return (
+        `<div class="mode-pane" data-pane="static"${hidden}>` +
+        renderLiteralInputHtml(literal, handlerName, row, schema) +
+        `</div>`
+      );
+    }
+    // Templated. A templated argument edits the engine's parts. One with no parts form shows its source
+    // and starts an empty template. A static argument switched to templated starts from its literal as
+    // one text run, so adding a field keeps the text it had.
+    let parts: readonly TemplatePart[];
+    let source: string | undefined;
+    if (mode === "templated") {
+      parts = view.parts ?? [];
+      source = view.parts ? undefined : p.value;
+    } else {
+      parts = p.value !== "" ? [{ text: p.value }] : [];
+    }
+    return (
+      `<div class="mode-pane" data-pane="templated"${hidden}>` +
+      renderTemplateEditorHtml(parts, handlerName, row, p.name, source) +
+      `</div>`
+    );
+  });
+  return open + `<div class="mode-head">${label}${selector}</div>` + panes.join("") + `</div>`;
+}
+
 function renderParamsHtml(
   params: ParamField[],
   editable: Set<string>,
@@ -2854,74 +3253,16 @@ function renderParamsHtml(
   }
   const fields = params
     .map((p) => {
+      // A moded argument (the engine sent param_modes for it) renders by its mode. Every other argument,
+      // and every argument of a row whose engine sent no modes, renders exactly as it did before modes.
+      const view = ownModeView(row, p.name);
+      if (view !== undefined) {
+        const writable = handlerName ? paramWritableModes(row, p.name) : [];
+        return renderModedFieldHtml(p, view, writable, handlerName, row, schema);
+      }
       const label = `<label>${escapeHtml(p.name)}</label>`;
       if (editable.has(p.name)) {
-        // The row's PROJECTION-TIME source (`data-expect-src`) is echoed back on edit as `expect_src` so a
-        // stale coordinate is refused, not mis-spliced (F7). An empty value shows a `[blank]` placeholder (a
-        // hint, NOT a value) so a freshly-inserted template reads as "fill me in"; `placeholder` is inert on
-        // submit, so the F7 round-trip is unaffected.
-        //
-        // BACKLOG #1760: the input WIDGET is resolved from the engine's param schema (enum -> <select>,
-        // int/float -> type=number, everything else -> text). Every widget carries the IDENTICAL edit
-        // coordinates (data-handler/data-line-start/data-line-end/data-expect-src/data-name) so the F7
-        // stale-guard round-trip is unchanged; with no schema (the read-only callers) every param resolves
-        // to `text`, so this markup is byte-identical to before.
-        const attrs =
-          `data-handler="${escapeHtml(handlerName)}" ` +
-          `data-line-start="${row.lineStart}" data-line-end="${row.lineEnd}" ` +
-          `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
-          `data-name="${escapeHtml(p.name)}"`;
-        const widget = resolveWidget(row.action, p.name, schema);
-        let input: string;
-        if (widget.kind === "enum" && widget.choices) {
-          // A closed-set param -> a dropdown; the current value is pre-selected. When the current literal
-          // is NOT one of the schema's choices (a hand-authored value the vocabulary no longer lists), it
-          // is prepended as the selected option so the dropdown DISPLAYS the actual argument — otherwise a
-          // <select> with no selected option shows its FIRST choice, misrepresenting an unchanged literal.
-          // The out-of-set option still round-trips through the same edit splice; an empty value takes no
-          // such option (the [blank] hint role is left to the choices).
-          const inSet = widget.choices.includes(p.value);
-          const current =
-            !inSet && p.value !== ""
-              ? `<option value="${escapeHtml(p.value)}" selected>${escapeHtml(p.value)}</option>`
-              : "";
-          const options = widget.choices
-            .map(
-              (c) =>
-                `<option value="${escapeHtml(c)}"${c === p.value ? " selected" : ""}>` +
-                `${escapeHtml(c)}</option>`,
-            )
-            .join("");
-          input = `<select class="edit" ${attrs}>${current}${options}</select>`;
-        } else if (widget.kind === "number") {
-          // A number field posts a JS number (see stepsWebview.js) so the engine renders an int/float
-          // literal, never a re-typed string literal (`_render_literal` renders `6` for an int but `"6"`
-          // for a str — posting the string would silently retype the arg).
-          input =
-            `<input type="number" class="edit" ${attrs} ` +
-            `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
-        } else {
-          input =
-            `<input type="text" class="edit" ${attrs} ` +
-            `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
-        }
-        // ADR 0104 §2.3: a pickable HL7 path/segment slot gets a picker button BESIDE its input. The input is
-        // NEVER removed (free-text always available); the pick writes through the SAME edit splice. Only a
-        // slot with a pick button gets the horizontal `.edit-row` wrapper — every other editable field's
-        // markup is byte-identical to before.
-        const pm = pickMode(row.action, p.name);
-        const pickBtn = pm
-          ? `<button class="pickpath" data-handler="${escapeHtml(handlerName)}" ` +
-            `data-line-start="${row.lineStart}" data-line-end="${row.lineEnd}" ` +
-            `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
-            `data-name="${escapeHtml(p.name)}" data-mode="${pm}" ` +
-            `data-tip="Pick an HL7 field">&#8942;</button>`
-          : "";
-        return (
-          `<div class="field">${label}` +
-          (pickBtn ? `<div class="edit-row">${input}${pickBtn}</div>` : input) +
-          `</div>`
-        );
+        return `<div class="field">${label}${renderLiteralInputHtml(p, handlerName, row, schema)}</div>`;
       }
       return (
         `<div class="field">${label}` +

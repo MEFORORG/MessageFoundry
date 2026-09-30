@@ -199,6 +199,94 @@
         });
       });
     }
+    // ---- PER-ARGUMENT INPUT MODES (ADR 0076 Amendment E, BACKLOG #237 step 3) ------------------------
+    // The provider renders a moded argument with its mode, a selector when more than one mode may be
+    // written, and one pane per writable mode (stepsModel.renderModedFieldHtml). The modes offered come
+    // from the engine's lists; nothing here decides a mode or reads Python. Switching the selector only
+    // shows the other pane, so a switch alone never writes. The static pane is today's `input.edit`, so
+    // the listener above posts it. The templated pane edits PARTS: every committed change posts the whole
+    // template as {parts: [...]}, which the engine renders and checks. A field pick goes through the
+    // provider's picker as a `pickPart` request, so the picker yields a {path} part, never source.
+    // Wrapped like the context menu, so a throw here can never kill the wiring around it.
+    try {
+      (function wireModedArguments() {
+        // The parts a templated editor holds, in order, unsaved typing included. Each chip is one part.
+        function collectParts(box) {
+          return Array.from(box.querySelectorAll('.tpart')).map((chip) => {
+            const inp = chip.querySelector('.tpart-input');
+            const v = inp ? inp.value : '';
+            return chip.dataset.part === 'path' ? { path: v } : { text: v };
+          });
+        }
+        function coords(box) {
+          return {
+            handler: box.dataset.handler,
+            lineStart: Number(box.dataset.lineStart),
+            lineEnd: Number(box.dataset.lineEnd),
+            name: box.dataset.name,
+            expectSrc: box.dataset.expectSrc,
+          };
+        }
+        function postTemplate(box) {
+          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: collectParts(box) } }));
+        }
+        function postPick(box, index) {
+          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: collectParts(box), index: index }));
+        }
+        // A new, empty text chip: a clone of the renderer's own blank chip, so its markup has one source.
+        function newTextChip(box) {
+          const blank = box.querySelector('template.tpart-blank');
+          return blank ? blank.content.firstElementChild.cloneNode(true) : null;
+        }
+
+        for (const field of document.querySelectorAll('.field.moded')) {
+          const modeSel = field.querySelector('select.mode-select');
+          if (!modeSel) { continue; }
+          modeSel.addEventListener('change', () => {
+            for (const pane of field.querySelectorAll('.mode-pane')) {
+              pane.hidden = pane.dataset.pane !== modeSel.value;
+            }
+            const first = field.querySelector('.mode-pane:not([hidden]) input:not([disabled]), .mode-pane:not([hidden]) select');
+            if (first) { first.focus(); }
+          });
+        }
+
+        for (const box of document.querySelectorAll('.tparts')) {
+          // Keep a button's mousedown from blurring a typed chip first: that blur would post a racing edit
+          // that shifts the row and staleness-refuses the click's own write (F7). The click carries the
+          // typed text anyway, because it reads every chip.
+          box.addEventListener('mousedown', (ev) => {
+            if (ev.target.closest('button')) { ev.preventDefault(); }
+          });
+          box.addEventListener('change', (ev) => {
+            if (ev.target.classList && ev.target.classList.contains('tpart-input')) { postTemplate(box); }
+          });
+          box.addEventListener('click', (ev) => {
+            const btn = ev.target.closest('button');
+            if (!btn || !box.contains(btn)) { return; }
+            ev.stopPropagation(); // a part button must not also (re)select the row
+            const chips = Array.from(box.querySelectorAll('.tpart'));
+            const chip = btn.closest('.tpart');
+            if (btn.classList.contains('tpart-del') && chip) {
+              chip.remove();
+              postTemplate(box);
+            } else if (btn.classList.contains('tpart-pick') && chip) {
+              postPick(box, chips.indexOf(chip));
+            } else if (btn.classList.contains('tpart-add-path')) {
+              postPick(box, chips.length);
+            } else if (btn.classList.contains('tpart-add-text')) {
+              const added = newTextChip(box);
+              if (!added) { return; }
+              box.insertBefore(added, box.querySelector('.tpart-add'));
+              added.querySelector('input').focus(); // nothing is posted until the text is committed
+            }
+          });
+        }
+      })();
+    } catch (e) {
+      vscode.postMessage({ command: 'stepsDiag', level: 'error', text: 'mode wiring failed: ' + e });
+    }
+
     // Per-row structural affordances — each posts a delete/move command. The provider runs it as a lone op
     // (never batched) and forces a full re-projection afterwards (ADR 0076 §5 v2). data-op maps to the
     // command; each carries the row's coordinates + projection-time source (F7 stale guard). (The per-row

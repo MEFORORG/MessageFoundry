@@ -5,6 +5,7 @@ import * as assert from "assert";
 import {
   type EditMessage,
   type LensRow,
+  type RewriteRefusalKind,
   type RowViewModel,
   type TemplatePart,
   buildEditRequest,
@@ -14,8 +15,15 @@ import {
   paramModeOf,
   paramModeViews,
   paramWritableModes,
+  parseRewriteResult,
+  pickPartSeed,
+  readEditMessage,
+  readPickPartMessage,
   readTemplateParts,
+  renderRowHtml,
+  rewriteRefusalMessage,
   templateValue,
+  withPickedPath,
 } from "../../stepsModel";
 
 // BACKLOG #237 step 2: the IDE model reads ADR 0076 Amendment E's per-argument modes. The engine half
@@ -512,82 +520,167 @@ suite("Steps modes: parts on the wire and into a set_params payload", () => {
   });
 });
 
-suite("Steps modes: the engine's set_params refusals are classified by kind", () => {
-  // The messages below are the engine's own refusal text (messagefoundry/lens.py on the same base).
-  const cases: Array<[string, string | undefined]> = [
-    [
-      "parameter 'value' is in dynamic mode (an expression the lens cannot write back faithfully) - it " +
-        "is read-only here; edit it as text (ADR 0076 E.6.4)",
-      "dynamic",
-    ],
-    [
-      "parameter 'value': the expression would write a dynamic-mode argument, which is read-only - only " +
-        "a literal or a template may be written here (ADR 0076 E.6.4)",
-      "dynamic",
-    ],
-    [
-      "parameter 'dst' takes a literal only: only a value parameter takes a template (set_field or " +
-        "add_repetition value, append_to_field suffix, replace_literal new); a path, segment id, index or " +
-        "setting chosen by message content is refused",
-      "literal-only",
-    ],
-    [
-      "parameter 'value': write a template as {'parts': [...]}, not as an expression, so the engine " +
-        "renders it and checks it reads back",
-      "template-shape",
-    ],
-    ["parameter 'value': 'parts' must be a list of part objects", "template-shape"],
-    [
-      "parameter 'value': part 0 must be an object with exactly one key, 'text' or 'path'",
-      "template-shape",
-    ],
-    ["parameter 'value': part 0 must be {'text': <string>} or {'path': <string>}", "template-shape"],
-    [
-      "parameter 'value': part 1 path '' must be non-empty, with no quote, backslash, brace or " +
-        "non-printable character",
-      "template-shape",
-    ],
-    [
-      "parameter 'value': a template needs at least one 'path' part - plain text is static mode, so send " +
-        "it as a literal value instead",
-      "template-shape",
-    ],
+// The engine's own refusals, `{"error", "code"}` as `lens rewrite --contract 2` printed them on branch
+// b180/237-lens-edit-spec at cf17865d4 (the E.11 fallback rendering and the refusal codes). Where a
+// family has a message this base could not reach from a plain handler, its text is kept from the step 2
+// base and marked; its code is the one lens.py raises it with.
+const ENGINE_REFUSALS: Array<[string, string, RewriteRefusalKind | undefined]> = [
+  [
+    "parameter 'value' is in dynamic mode (an expression the lens cannot write back faithfully) - it " +
+      "is read-only here; edit it as text (ADR 0076 E.6.4)",
+    "dynamic-mode",
+    "dynamic",
+  ],
+  // step 2 base text; raised with REFUSAL_DYNAMIC_MODE.
+  [
+    "parameter 'value': the expression would write a dynamic-mode argument, which is read-only - only " +
+      "a literal or a template may be written here (ADR 0076 E.6.4)",
+    "dynamic-mode",
+    "dynamic",
+  ],
+  [
+    "parameter 'dst' takes a literal only: only a value parameter takes a template (set_field or " +
+      "add_repetition value, append_to_field suffix, replace_literal new); a path, segment id, index or " +
+      "setting chosen by message content is refused",
+    "literal-only",
+    "literal-only",
+  ],
+  [
+    "parameter 'value': write a template as {'parts': [...]}, not as an expression, so the engine " +
+      "renders it and checks it reads back",
+    "template-shape",
+    "template-shape",
+  ],
+  ["parameter 'value': 'parts' must be a list of part objects", "template-shape", "template-shape"],
+  [
+    "parameter 'value': part 0 must be an object with exactly one key, 'text' or 'path'",
+    "template-shape",
+    "template-shape",
+  ],
+  [
+    "parameter 'value': part 0 must be {'text': <string>} or {'path': <string>}",
+    "template-shape",
+    "template-shape",
+  ],
+  [
+    "parameter 'value': part 0 path '' must be non-empty, with no quote, backslash, brace or " +
+      "non-printable character",
+    "template-shape",
+    "template-shape",
+  ],
+  [
+    "parameter 'value': a template needs at least one 'path' part - plain text is static mode, so send " +
+      "it as a literal value instead",
+    "template-shape",
+    "template-shape",
+  ],
+  [
+    "parameter 'value': an object value must be {'parts': [...]} or {'expr': <source string>}",
+    "template-shape",
+    "template-shape",
+  ],
+  // step 2 base text; raised with REFUSAL_TEMPLATE_SHAPE.
+  [
+    "parameter 'value': part 0 carries a character that cannot be encoded as UTF-8",
+    "template-shape",
+    "template-shape",
+  ],
+  // step 2 base text; raised with REFUSAL_TEMPLATE_SHAPE.
+  [
+    "parameter 'value': the template did not render to a bounded interpolation that reads back to the " +
+      "same parts - refused (no change made)",
+    "template-shape",
+    "template-shape",
+  ],
+  // The E.11 column-limit text: an older bare read grows when its template is rewritten.
+  [
+    "this edit would make line 10 156 columns wide, past the 100-column limit - shorten the template's " +
+      "text, or edit it as text (every field read is written with an empty-text fallback, so an older " +
+      "bare read grows by 6 columns when the template is rewritten)",
+    "column-limit",
+    "column-limit",
+  ],
+  // Generic refusals: not mode refusals.
+  [
+    "unknown or absent parameter(s) ['nosuch'] for this call (the lens edits only parameters the call " +
+      "already passes)",
+    "refused",
+    undefined,
+  ],
+  [
+    "the row's source no longer matches the editor buffer (stale coordinates) - re-project the Steps " +
+      "view and retry",
+    "refused",
+    undefined,
+  ],
+];
+
+suite("Steps modes: refusals are classified by the engine's code first", () => {
+  for (const [message, code, kind] of ENGINE_REFUSALS) {
+    test(`code ${code} -> ${kind ?? "not a mode refusal"}: ${message.slice(0, 50)}`, () => {
+      assert.strictEqual(classifyRewriteRefusal(message, code), kind);
+    });
+  }
+
+  test("a present code is the whole answer, whatever the text says", () => {
+    // Generic `refused` wins over text that spells a mode needle (a user-chosen name quoted in it).
+    assert.strictEqual(
+      classifyRewriteRefusal("parameter 'x': 'is in dynamic mode' takes a literal only", "refused"),
+      undefined,
+    );
+    // A known code wins over text that spells a DIFFERENT family's needle.
+    assert.strictEqual(
+      classifyRewriteRefusal("parameter 'value' takes a literal only", "column-limit"),
+      "column-limit",
+    );
+    // A reworded message still classifies, because the code carries it.
+    assert.strictEqual(classifyRewriteRefusal("a wholly new sentence", "dynamic-mode"), "dynamic");
+    assert.strictEqual(classifyRewriteRefusal(undefined, "template-shape"), "template-shape");
+  });
+
+  test("an unknown code (a newer engine's family) is not guessed from the text", () => {
+    assert.strictEqual(
+      classifyRewriteRefusal("parameter 'value' is in dynamic mode (...)", "some-new-family"),
+      undefined,
+    );
+    // An inherited Object member is not a code this IDE knows.
+    assert.strictEqual(classifyRewriteRefusal("x", "toString"), undefined);
+    assert.strictEqual(classifyRewriteRefusal("x", "__proto__"), undefined);
+  });
+});
+
+suite("Steps modes: with no code (an older engine), the text decides", () => {
+  // The same engine messages, with the code absent: the substring fallback must reach the same kind.
+  for (const [message, , kind] of ENGINE_REFUSALS) {
+    test(`${kind ?? "not a mode refusal"}: ${message.slice(0, 60)}`, () => {
+      assert.strictEqual(classifyRewriteRefusal(message), kind);
+    });
+  }
+
+  const textOnly: Array<[string, RewriteRefusalKind | undefined]> = [
+    // The step 2 base's column-limit text, before E.11 reworded it.
     [
       "this edit would make line 9 97 columns wide, past the 88-column limit - shorten the template, or " +
         "edit it as text",
       "column-limit",
     ],
+    // The step 2 base's object-value text, before the codes reworded it.
     ["parameter 'value': an object value must be {'parts': [...]} or {'expr': <source>}", "template-shape"],
-    [
-      "parameter 'value': part 0 carries a character that cannot be encoded as UTF-8",
-      "template-shape",
-    ],
-    [
-      "parameter 'value': the template did not render to a bounded interpolation that reads back to the " +
-        "same parts - refused (no change made)",
-      "template-shape",
-    ],
     // A refused path is quoted verbatim, so a path spelling another family's needle stays template-shape.
     [
       "parameter 'value': part 0 path 'a\"is in dynamic mode' must be non-empty, with no quote, " +
         "backslash, brace or non-printable character",
       "template-shape",
     ],
-    // Not mode refusals: a note's over-long comment, a route row's list refusal, a stale coordinate.
+    // Not mode refusals: a note's over-long comment, a route row's list refusal.
     ["the edited comment would be 95 columns — over the 88-column limit; shorten it", undefined],
     ["a route row's 'handlers' must be a list of handler-name strings", undefined],
     // A user-chosen handler name quoted in an unrelated error must not spell a mode refusal.
     ["no recognized row at lines 3-3 in handler 'exactly one key'", undefined],
     ["unknown or absent parameter(s) ['is in dynamic mode'] for this call", undefined],
-    [
-      "the row's source no longer matches the editor buffer (stale coordinates) - re-project the Steps " +
-        "view and retry",
-      undefined,
-    ],
   ];
-
-  for (const [message, kind] of cases) {
-    test(`${kind ?? "not a mode refusal"}: ${message.slice(0, 60)}`, () => {
+  for (const [message, kind] of textOnly) {
+    test(`text only, ${kind ?? "not a mode refusal"}: ${message.slice(0, 50)}`, () => {
       assert.strictEqual(classifyRewriteRefusal(message), kind);
     });
   }
@@ -595,5 +688,342 @@ suite("Steps modes: the engine's set_params refusals are classified by kind", ()
   test("no error, no kind", () => {
     assert.strictEqual(classifyRewriteRefusal(undefined), undefined);
     assert.strictEqual(classifyRewriteRefusal(""), undefined);
+  });
+});
+
+suite("Steps modes: the rewrite result carries the code, and the message names the refusal", () => {
+  test("parseRewriteResult keeps the engine's code beside its message", () => {
+    const out = parseRewriteResult({
+      stdout: JSON.stringify({ error: "parameter 'value' takes a literal only: x", code: "literal-only" }),
+      stderr: "",
+      code: 1,
+    });
+    assert.deepStrictEqual(out, {
+      error: "parameter 'value' takes a literal only: x",
+      code: "literal-only",
+    });
+  });
+
+  test("an engine without codes, a non-string code, and a success carry no code", () => {
+    assert.deepStrictEqual(parseRewriteResult({ stdout: '{"error": "e"}', stderr: "", code: 1 }), {
+      error: "e",
+    });
+    assert.deepStrictEqual(
+      parseRewriteResult({ stdout: '{"error": "e", "code": 7}', stderr: "", code: 1 }),
+      { error: "e" },
+    );
+    assert.deepStrictEqual(parseRewriteResult({ stdout: "src\n", stderr: "", code: 0 }), {
+      source: "src\n",
+    });
+    assert.deepStrictEqual(parseRewriteResult({ stdout: "", stderr: "boom", code: 1 }), {
+      error: "boom",
+    });
+  });
+
+  test("every mode refusal gets its own sentence, and keeps the engine's message", () => {
+    for (const [message, code, kind] of ENGINE_REFUSALS) {
+      const text = rewriteRefusalMessage({ error: message, code });
+      assert.ok(text.includes(message), `the engine's message survives for code ${code}`);
+      if (kind === undefined) {
+        assert.strictEqual(text, message, "a generic refusal shows the engine's message alone");
+      } else {
+        assert.notStrictEqual(text, message, `a ${kind} refusal adds a plain sentence`);
+      }
+    }
+  });
+
+  test("the column-limit message says why an older template grows", () => {
+    const [message, code] = ENGINE_REFUSALS.find(([, c]) => c === "column-limit") ?? ["", ""];
+    const text = rewriteRefusalMessage({ error: message, code });
+    assert.ok(text.includes('msg["X"] or ""'), "names the fallback form the engine writes");
+    assert.ok(text.includes("older template"), "names the older-template case");
+    assert.ok(text.includes("100-column limit"), "carries the engine's limit through its message");
+  });
+
+  test("the dynamic message says the argument is read-only here", () => {
+    const text = rewriteRefusalMessage({ error: "e", code: "dynamic-mode" });
+    assert.ok(text.startsWith("this argument is in dynamic mode"));
+    assert.ok(text.includes("read-only"));
+  });
+
+  test("with no error at all the message still says something", () => {
+    assert.strictEqual(rewriteRefusalMessage({}), "lens rewrite failed");
+  });
+});
+
+suite("Steps modes: the provider's edit guard accepts a template and rejects a malformed one", () => {
+  const base = {
+    command: "edit",
+    handler: "h",
+    lineStart: 9,
+    lineEnd: 9,
+    name: "value",
+    expectSrc: "    set_field(...)",
+  };
+
+  test("a string and a number pass as before", () => {
+    assert.deepStrictEqual(readEditMessage({ ...base, value: "SMITH" }), {
+      edit: { ...base, value: "SMITH" },
+    });
+    assert.deepStrictEqual(readEditMessage({ ...base, value: 6 }), { edit: { ...base, value: 6 } });
+  });
+
+  test("a well-formed template passes as {parts}, copied part by part", () => {
+    const parts = [{ text: "MRN " }, { path: "PID-3.1" }];
+    const read = readEditMessage({ ...base, value: { parts } });
+    assert.ok(read && "edit" in read);
+    assert.deepStrictEqual(read.edit.value, { parts: [{ text: "MRN " }, { path: "PID-3.1" }] });
+    assert.notStrictEqual((read.edit.value as { parts: unknown[] }).parts[0], parts[0]);
+    // It then maps to the set_params payload unchanged.
+    assert.deepStrictEqual(buildEditRequest(read.edit).params, { value: { parts } });
+  });
+
+  test("a template the engine will refuse on meaning still reaches it (the engine decides)", () => {
+    // No path part, or an empty path: well-formed JSON, so the guard passes it and the engine refuses.
+    for (const parts of [[{ text: "only text" }], [{ path: "" }], []]) {
+      const read = readEditMessage({ ...base, value: { parts } });
+      assert.ok(read && "edit" in read, JSON.stringify(parts));
+    }
+  });
+
+  test("a malformed template is refused with a reason, never repaired and never dropped", () => {
+    const malformed: unknown[] = [
+      { parts: [{ text: "a", path: "b" }] },
+      { parts: [{ text: 1 }] },
+      { parts: [{ expr: "msg['A']" }] },
+      { parts: "PID-3" },
+      { parts: [{ path: "PID-3" }], extra: true },
+      { expr: 'f"{msg[\'A\']}"' },
+      [{ path: "PID-3" }],
+      null,
+      true,
+    ];
+    for (const value of malformed) {
+      const read = readEditMessage({ ...base, value });
+      assert.ok(read && "refused" in read, `refused: ${JSON.stringify(value)}`);
+      assert.ok(read.refused.includes('"value"'), "the reason names the argument");
+    }
+  });
+
+  test("a message that is not a well-addressed edit is dropped, as before", () => {
+    assert.strictEqual(readEditMessage(undefined), undefined);
+    assert.strictEqual(readEditMessage({ ...base, command: "pickPath", value: "x" }), undefined);
+    const { expectSrc: _drop, ...noExpect } = base;
+    assert.strictEqual(readEditMessage({ ...noExpect, value: "x" }), undefined);
+    assert.strictEqual(readEditMessage({ ...base, lineStart: "9", value: "x" }), undefined);
+  });
+});
+
+suite("Steps modes: a field pick into a template yields a {path} part", () => {
+  const base = {
+    command: "pickPart",
+    handler: "h",
+    lineStart: 9,
+    lineEnd: 9,
+    name: "value",
+    expectSrc: "    set_field(...)",
+  };
+  const parts = [{ text: "MRN " }, { path: "PID-3.1" }];
+
+  test("a pick replaces a path part, or appends one at the end", () => {
+    const replace = readPickPartMessage({ ...base, parts, index: 1 });
+    assert.ok(replace);
+    assert.strictEqual(pickPartSeed(replace.parts, replace.index), "PID-3.1");
+    assert.deepStrictEqual(withPickedPath(replace.parts, replace.index, "PID-3.4"), [
+      { text: "MRN " },
+      { path: "PID-3.4" },
+    ]);
+    const append = readPickPartMessage({ ...base, parts, index: 2 });
+    assert.ok(append);
+    assert.strictEqual(pickPartSeed(append.parts, append.index), "");
+    assert.deepStrictEqual(withPickedPath(append.parts, append.index, "PID-5.1"), [
+      ...parts,
+      { path: "PID-5.1" },
+    ]);
+    // Starting a template from nothing: one path part.
+    const fresh = readPickPartMessage({ ...base, parts: [], index: 0 });
+    assert.ok(fresh);
+    assert.deepStrictEqual(withPickedPath(fresh.parts, fresh.index, "PID-3"), [{ path: "PID-3" }]);
+  });
+
+  test("the result is always a well-formed template value", () => {
+    assert.strictEqual(isTemplateValue(templateValue(withPickedPath(parts, 2, "PID-3"))), true);
+  });
+
+  test("a pick never overwrites text, and a malformed request is dropped", () => {
+    assert.strictEqual(readPickPartMessage({ ...base, parts, index: 0 }), undefined, "index 0 is text");
+    for (const index of [-1, 3, 1.5, "1"]) {
+      assert.strictEqual(readPickPartMessage({ ...base, parts, index }), undefined, String(index));
+    }
+    assert.strictEqual(readPickPartMessage({ ...base, parts: [{ text: 1 }], index: 1 }), undefined);
+    assert.strictEqual(readPickPartMessage({ ...base, parts: "x", index: 0 }), undefined);
+    assert.strictEqual(readPickPartMessage({ ...base, command: "edit", parts, index: 2 }), undefined);
+  });
+
+  test("the request's parts are copied, so a later change to them changes nothing", () => {
+    const posted = [{ path: "PID-3" }];
+    const read = readPickPartMessage({ ...base, parts: posted, index: 1 });
+    assert.ok(read);
+    posted[0].path = "CHANGED";
+    assert.deepStrictEqual(read.parts, [{ path: "PID-3" }]);
+  });
+});
+
+// ---- the selector as rendered (BACKLOG #237 step 3) -------------------------------------------------
+
+const LINES = Array.from({ length: 20 }, (_v, i) => `    line_${i + 1}("a & b")`);
+const htmlOf = (row: LensRow, handler = "h"): string =>
+  renderRowHtml(buildRowViewModel(row, 0, LINES), handler);
+
+/** The `.field` markup of one param, cut out of a rendered row. */
+function fieldHtml(html: string, name: string): string {
+  const fields = html.split(`<div class="field`).slice(1);
+  const hit = fields.find((f) => f.includes(`<label>${name}</label>`));
+  assert.ok(hit, `no field for ${name}`);
+  return hit;
+}
+
+/** A field's markup without the inert blank chip `Add text` clones, so only real parts remain. */
+function withoutBlankChip(field: string): string {
+  return field.replace(/<template class="tpart-blank">.*?<\/template>/g, "");
+}
+
+/** The mode options a field's selector offers, in order; `[]` when it renders no selector. */
+function offeredModes(field: string): string[] {
+  const sel = /<select class="mode-select"[^>]*>(.*?)<\/select>/.exec(field);
+  if (!sel) {
+    return [];
+  }
+  return Array.from(sel[1].matchAll(/<option value="([^"]+)"/g), (m) => m[1]);
+}
+
+suite("Steps modes: the selector offers exactly the writable modes", () => {
+  test("every engine argument's selector equals paramWritableModes when it has a choice", () => {
+    for (const row of ENGINE_ROWS) {
+      const vm = buildRowViewModel(row, 0, LINES);
+      const html = renderRowHtml(vm, "h");
+      for (const name of Object.keys(row.params ?? {})) {
+        const writable = paramWritableModes(vm, name);
+        const field = fieldHtml(html, name);
+        assert.ok(field.startsWith(` moded" data-mode="${paramModeOf(vm, name)}"`), `${name} is moded`);
+        assert.deepStrictEqual(
+          offeredModes(field),
+          writable.length > 1 ? [...writable] : [],
+          `row ${row.line_start} ${name}`,
+        );
+        // Dynamic is never offered as a write, anywhere.
+        assert.ok(!offeredModes(field).includes("dynamic"));
+      }
+    }
+  });
+
+  test("a templated value offers static and templated, templated selected, with a parts editor", () => {
+    const field = fieldHtml(htmlOf(TEMPLATED_VALUE), "value");
+    assert.deepStrictEqual(offeredModes(field), ["static", "templated"]);
+    assert.ok(field.includes(`<option value="templated" selected`));
+    assert.ok(field.includes(`<div class="mode-pane" data-pane="templated">`), "templated pane shown");
+    assert.ok(field.includes(`<div class="mode-pane" data-pane="static" hidden>`), "static pane hidden");
+    // The parts editor holds the engine's parts, as chips, in order. No Python source is in it.
+    const chips = Array.from(
+      withoutBlankChip(field).matchAll(
+        /<span class="tpart" data-part="(text|path)"><input[^>]*value="([^"]*)"/g,
+      ),
+      (m) => [m[1], m[2]],
+    );
+    assert.deepStrictEqual(chips, [
+      ["text", "MRN "],
+      ["path", "PID-3.1"],
+      ["text", " / "],
+      ["path", "PID-5.1"],
+    ]);
+    const editor = field.slice(field.indexOf(`<div class="tparts"`));
+    assert.ok(!editor.includes("msg["), "the parts editor never carries Python source");
+    // The static pane starts empty: a switch to static writes nothing until a literal is typed.
+    assert.ok(/data-pane="static" hidden><input type="text" class="edit"[^>]*value=""/.test(field));
+  });
+
+  test("a static value offers both modes, and its templated pane starts from its literal", () => {
+    const field = fieldHtml(htmlOf(STATIC_LITERAL), "value");
+    assert.deepStrictEqual(offeredModes(field), ["static", "templated"]);
+    assert.ok(field.includes(`<option value="static" selected`));
+    assert.ok(field.includes(`<div class="mode-pane" data-pane="templated" hidden>`));
+    assert.ok(field.includes(`data-part="text"><input type="text" class="tpart-input" aria-label="Text" value="SMITH"`));
+  });
+
+  test("a static-only argument shows its mode as a tag and today's input, with no selector", () => {
+    const field = fieldHtml(htmlOf(TEMPLATED_VALUE), "path");
+    assert.deepStrictEqual(offeredModes(field), []);
+    assert.ok(field.includes(`<span class="mode-tag"`));
+    assert.ok(field.includes(`<input type="text" class="edit"`), "the literal input is unchanged");
+    assert.ok(field.includes(`class="pickpath"`), "the path picker stays");
+  });
+
+  test("a dynamic argument renders its source read-only, with no selector and no editor", () => {
+    const field = fieldHtml(htmlOf(DYNAMIC_VALUE), "value");
+    assert.deepStrictEqual(offeredModes(field), []);
+    assert.ok(field.includes(`>dynamic</span>`));
+    assert.ok(field.includes(`readonly disabled value="msg[&quot;PID-5.1&quot;] + &quot;x&quot;"`));
+    assert.ok(!field.includes(`class="edit"`) && !field.includes("tparts") && !field.includes("mode-pane"));
+  });
+
+  test("a templated argument the engine will not take a template into is read-only", () => {
+    for (const [row, name] of [
+      [TEMPLATED_LOCATOR, "dst"],
+      [DIAGNOSTIC_TEMPLATE, "template"],
+    ] as const) {
+      const field = fieldHtml(htmlOf(row), name);
+      assert.deepStrictEqual(offeredModes(field), [], name);
+      assert.ok(field.includes(`>templated</span>`), name);
+      assert.ok(!field.includes("tparts") && !field.includes(`class="edit"`), name);
+    }
+  });
+
+  test("a templated argument with no parts form shows its source and starts an empty template", () => {
+    const field = fieldHtml(htmlOf(TEMPLATED_NO_PARTS), "suffix");
+    assert.deepStrictEqual(offeredModes(field), ["static", "templated"]);
+    assert.ok(field.includes(`class="tsource" readonly disabled value="f&quot;-{msg.field(`));
+    const editor = withoutBlankChip(field.slice(field.indexOf(`<div class="tparts"`)));
+    assert.ok(!editor.includes(`class="tpart"`), "no chips: there are no parts to show");
+    assert.ok(field.includes(`<template class="tpart-blank">`), "the blank chip Add text clones is there");
+    assert.ok(editor.includes(`class="tpart-add-path"`), "a field can be added to start a template");
+  });
+
+  test("with no handler (a read-only caller) every moded argument is read-only", () => {
+    const html = htmlOf(TEMPLATED_VALUE, "");
+    assert.ok(!html.includes("mode-select") && !html.includes("tparts") && !html.includes(`class="edit"`));
+    assert.ok(html.includes(`>templated</span>`));
+  });
+});
+
+suite("Steps modes: with no param_modes the row renders exactly as before (ADR 0076 E.8)", () => {
+  // Golden: the `.params` markup the step 2 head (45fc007cc, before this selector existed) rendered for
+  // these two rows with no mode maps. Captured by building that head's stepsModel.ts and calling
+  // renderRowHtml(buildRowViewModel(row, 0, LINES), "h").
+  const PARAMS_BEFORE: Array<[LensRow, string]> = [
+    [
+      withoutModes(TEMPLATED_VALUE),
+      `<div class="params"><div class="field"><label>path</label><div class="edit-row"><input type="text" class="edit" data-handler="h" data-line-start="9" data-line-end="9" data-expect-src="    line_9(&quot;a &amp; b&quot;)" data-name="path" value="PID-5.2" placeholder="[blank]" /><button class="pickpath" data-handler="h" data-line-start="9" data-line-end="9" data-expect-src="    line_9(&quot;a &amp; b&quot;)" data-name="path" data-mode="path" data-tip="Pick an HL7 field">&#8942;</button></div></div><div class="field"><label>value</label><input type="text" readonly disabled value="f&quot;MRN {msg[&#39;PID-3.1&#39;]} / {msg[&#39;PID-5.1&#39;]}&quot;" /></div></div>`,
+    ],
+    [
+      withoutModes(LOOKUP),
+      `<div class="params"><div class="field"><label>connection</label><input type="text" class="edit" data-handler="h" data-line-start="15" data-line-end="15" data-expect-src="    line_15(&quot;a &amp; b&quot;)" data-name="connection" value="DB" placeholder="[blank]" /></div><div class="field"><label>statement</label><input type="text" class="edit" data-handler="h" data-line-start="15" data-line-end="15" data-expect-src="    line_15(&quot;a &amp; b&quot;)" data-name="statement" value="select 1" placeholder="[blank]" /></div><div class="field"><label>params</label><input type="text" readonly disabled value="{}" /></div></div>`,
+    ],
+  ];
+
+  for (const [row, expected] of PARAMS_BEFORE) {
+    test(`row ${row.line_start} (${row.action ?? row.call}) is byte-identical to the step 2 head`, () => {
+      const html = htmlOf(row);
+      const params = html.slice(html.indexOf(`<div class="params">`), html.lastIndexOf(`</li>`));
+      assert.strictEqual(params, expected);
+    });
+  }
+
+  test("no engine row stripped of its maps renders any mode markup", () => {
+    for (const row of ENGINE_ROWS) {
+      const html = htmlOf(withoutModes(row));
+      for (const marker of ["moded", "mode-select", "mode-tag", "mode-pane", "tparts", "tpart"]) {
+        assert.ok(!html.includes(marker), `row ${row.line_start} carries ${marker}`);
+      }
+    }
   });
 });
