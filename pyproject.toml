@@ -79,7 +79,6 @@ classifiers = [
 ]
 dependencies = [
     "hl7apy>=1.3",          # version-aware validation + profiles
-    "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
     "pydantic>=2.6",        # channel config models / validation
     # CONSTRAINT PIN (transitive, via pydantic/fhir-core): annotated-types 0.8.0 dropped `SLOTS`,
     # which fhir-core/fhir.resources import — every FHIR test ImportErrors on it. The cap bounds the

@@ -364,10 +364,6 @@ h11==0.16.0 \
     # via
     #   httpcore
     #   uvicorn
-hl7==0.4.5 \
-    --hash=sha256:b6eb97499ebe236e00c3009d43e6b0f040de002df12a292fa5efbd2ce2a8a838 \
-    --hash=sha256:f46bf7c165801fd40e8fcc9f2be41c5794415039adc97646aee7ee6b20ce8ccd
-    # via messagefoundry
 hl7apy==1.3.5 \
     --hash=sha256:4ed02ae574ddcf9084b389bfcaf1e9023c4b2f4dfa2ce4ab42c430c4180a03fe \
     --hash=sha256:c8b80ff5ad020bf9c1e68a6395cf45cb78db621f65569d1798c46eb1b657e27b

@@ -750,15 +750,6 @@ wheels = [
 ]
 
 [[package]]
-name = "hl7"
-version = "0.4.5"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b4/3a/67e8f7b695423eecbc38a1e8439bbb69fb234945dd3527fbdfdcec869cd0/hl7-0.4.5.tar.gz", hash = "sha256:b6eb97499ebe236e00c3009d43e6b0f040de002df12a292fa5efbd2ce2a8a838", size = 48796, upload-time = "2022-03-31T11:30:18.604Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8d/2b/024977b044ca3aa79153e0a4ff13cc465064ccf9cf7b60df46e6eab8340e/hl7-0.4.5-py2.py3-none-any.whl", hash = "sha256:f46bf7c165801fd40e8fcc9f2be41c5794415039adc97646aee7ee6b20ce8ccd", size = 25495, upload-time = "2022-03-31T11:30:16.696Z" },
-]
-
-[[package]]
 name = "hl7apy"
 version = "1.3.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1212,7 +1203,6 @@ dependencies = [
     { name = "cryptography" },
     { name = "defusedxml" },
     { name = "fastapi" },
-    { name = "hl7" },
     { name = "hl7apy" },
     { name = "httpx" },
     { name = "ldap3" },
@@ -1312,7 +1302,6 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.137.1" },
     { name = "fhir-resources", marker = "extra == 'fhir'", specifier = ">=7.1.0" },
     { name = "fhirpathpy", marker = "extra == 'fhir'", specifier = ">=2.2.0" },
-    { name = "hl7", specifier = ">=0.4.5" },
     { name = "hl7apy", specifier = ">=1.3" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "hvac", marker = "extra == 'vault'", specifier = ">=2.3.0,<3" },
