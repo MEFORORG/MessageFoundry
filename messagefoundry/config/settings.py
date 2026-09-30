@@ -6099,13 +6099,28 @@ def _reconcile_effective_bind(settings: ServiceSettings) -> None:
 LOCKOUT_THRESHOLD_CEILING = 100
 
 
-def _is_trust_every_peer(entry: str) -> bool:
-    """Whether a ``[api].trusted_proxies`` entry trusts every peer of its address family, read the
-    way uvicorn reads it: a strict network parse, where a host-bits-set entry is not a network."""
-    try:
-        return ipaddress.ip_network(entry).prefixlen == 0
-    except ValueError:
-        return False
+def _trust_every_peer_entries(entries: Sequence[str]) -> list[str]:
+    """The ``[api].trusted_proxies`` ranges that, together, trust every peer of an address family,
+    read the way uvicorn reads them: a strict network parse, where a host-bits-set entry is not a
+    network. Collapsed per family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole.
+    Returns the multi-address entries of each such family (a single-host entry adds nothing)."""
+    v4: list[tuple[str, ipaddress.IPv4Network]] = []
+    v6: list[tuple[str, ipaddress.IPv6Network]] = []
+    for entry in entries:
+        try:
+            net = ipaddress.ip_network(entry)
+        except ValueError:
+            continue
+        if isinstance(net, ipaddress.IPv4Network):
+            v4.append((entry, net))
+        else:
+            v6.append((entry, net))
+    named: list[str] = []
+    if any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v4)):
+        named += [entry for entry, net in v4 if net.num_addresses > 1]
+    if any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6)):
+        named += [entry for entry, net in v6 if net.num_addresses > 1]
+    return named
 
 
 def _auth_default(field: str) -> Any:
@@ -6147,7 +6162,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     A part of a limiter is named only while that limiter is built, as ``email_tls_verify`` sits under
     ``email_use_tls``: with the limiter off, a weak count or window changes nothing and would only
-    repeat the off entry. A window of 0 or less likewise stands in for its counts."""
+    repeat the off entry. A window of 0 or less likewise stands in for its counts.
+
+    **Not covered, and stated so the gap is visible:** at least the two BACKLOG #2301 time floors,
+    ``mfa_verify_min_elapsed_seconds`` and ``oidc_callback_min_elapsed_seconds``, are not reported;
+    0 turns each off silently. They were outside this change's brief, not judged safe."""
     out: list[tuple[str, str]] = []
 
     def _count(field: str, value: int, *, what: str, so: str, off: str | None) -> None:
@@ -6285,8 +6304,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         else:
             risk = (
                 f"an escalating lock stops doubling at {ceiling} minutes, below the default of "
-                f"{_auth_default('lockout_max_minutes')} (ADR 0197), so repeated lock cycles on "
-                "one account hold for less time"
+                f"{_auth_default('lockout_max_minutes')} (ADR 0197), so the longest lock a run of "
+                "repeated lock cycles on one account can reach is shorter than the default's"
             )
         out.append(("lockout_max_minutes", risk))
 
@@ -6435,10 +6454,10 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
-    ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288), every
-    ``[auth]`` sign-in, lockout, PHI-read, admin-write, session-cap and OIDC flow-cache limit set
-    looser than its shipped default (#1131, see :func:`_auth_limit_loosenings`), an
-    ``[api].trusted_proxies`` entry with a prefix of 0 (#1131),
+    ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
+    sign-in rate-limit, lockout, PHI-read, admin-write, session-cap and OIDC flow-cache settings
+    :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131), an
+    ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
@@ -6749,23 +6768,22 @@ def security_loosenings(
     # the edit, so turning sign-in on there must show these at once.
     if sec.require_sign_in:
         out.extend(_auth_limit_loosenings(auth))
-    # BACKLOG #1131: a trusted_proxies entry of 0.0.0.0/0 or ::/0 contains every peer of its family,
-    # so uvicorn trusts X-Forwarded-For from all of them, which is what the refused "*" does. The
-    # load still accepts it; naming it is the fix. Parsed STRICTLY, as uvicorn's _TrustedHosts parses
-    # it (__main__ hands it the list verbatim): "10.1.2.3/0" loads here (the validator is not strict)
-    # but fails uvicorn's strict parse and becomes a literal that matches nothing, so it trusts no
-    # peer and is not this loosening. Not gated on sign-in: a forged source address poisons the
-    # audit trail either way.
-    trust_all = [entry for entry in api.trusted_proxies if _is_trust_every_peer(entry)]
+    # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
+    # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
+    # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as
+    # uvicorn's _TrustedHosts parses them (__main__ hands it the list verbatim): "10.1.2.3/0" loads
+    # here (the validator is not strict) but fails uvicorn's strict parse and becomes a literal that
+    # matches nothing, so it trusts no peer and is not this loosening. Not gated on sign-in: a forged
+    # source address poisons the audit trail either way.
+    trust_all = _trust_every_peer_entries(api.trusted_proxies)
     if trust_all:
         out.append(
             (
                 "trusted_proxies",
-                f"[api].trusted_proxies includes {', '.join(trust_all)}, a prefix of 0 that covers "
-                "every address of its family, so X-Forwarded-For is trusted from EVERY such peer, "
-                "as the refused '*' would be -- any "
-                "client can declare its own source address, poisoning the audit trail, the "
-                "per-address sign-in limit and the new-client-IP step-up signal",
+                f"[api].trusted_proxies includes {', '.join(trust_all)}, which together cover every "
+                "address of their family, so X-Forwarded-For is trusted from EVERY such peer, as the "
+                "refused '*' would be -- any client can declare its own source address, poisoning "
+                "the audit trail, the per-address sign-in limit and the new-client-IP step-up signal",
             )
         )
     # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS

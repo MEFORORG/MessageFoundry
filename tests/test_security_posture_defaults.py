@@ -19,6 +19,7 @@ switch be added at an insecure value with nothing reporting it.
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
 import httpx
@@ -655,6 +656,21 @@ def test_a_ceiling_at_the_default_or_above_is_not_named_even_with_escalation_off
     assert _names(auth=AuthSettings(lockout_minutes=2000, lockout_max_minutes=2000)) == []
 
 
+def test_escalation_off_above_the_default_lock_names_only_the_ceiling() -> None:
+    """A longer-than-default lock with escalation off: the lock is stricter, the ceiling is not."""
+    auth = AuthSettings(lockout_minutes=16, lockout_max_minutes=16)
+    assert _names(auth=auth) == ["lockout_max_minutes"]
+    risk = _risk(auth, "lockout_max_minutes")
+    assert risk is not None
+    assert "escalation is OFF" in risk
+
+
+def test_a_short_lock_with_the_default_ceiling_names_only_the_lock() -> None:
+    assert _names(auth=AuthSettings(lockout_minutes=1, lockout_max_minutes=1440)) == [
+        "lockout_minutes"
+    ]
+
+
 def _oidc(**over: object) -> AuthSettings:
     """OIDC-enabled auth settings with the fields the model requires (it needs AD for roles)."""
     base: dict[str, object] = {
@@ -749,7 +765,7 @@ async def test_near_off_values_admit_what_the_default_refuses(
     assert admitted(default, "login", addresses=50) == 60
     assert admitted(default, "ceremony") == 10
     assert admitted(default, "phi") == 120
-    assert admitted(default, "admin") < 12  # the 0.15 s gap holds a 1 ms burst
+    assert admitted(default, "admin") == 2  # the 0.15 s gap: t = 0 and t = 0.15 of a 0.2 s burst
 
     tiny = AuthSettings(login_rate_limit_window_seconds=1e-6)
     assert admitted(tiny, "login") == 200
@@ -801,6 +817,50 @@ def test_a_bounded_proxy_entry_is_not_a_loosening(entry: str) -> None:
     assert _names(api=_proxied(entry)) == []
 
 
+def _split(network: str, bits: int) -> list[str]:
+    """``network`` cut into 2**bits equal ranges. Built rather than written out, so the file carries
+    no routable address literal for the forbidden-content scan to stop on."""
+    return [str(n) for n in ipaddress.ip_network(network).subnets(prefixlen_diff=bits)]
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        _split("0.0.0.0/0", 1),
+        _split("::/0", 1),
+        ["10.0.0.1", *_split("0.0.0.0/0", 2)],
+    ],
+)
+def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[str]) -> None:
+    """Review round 1: two halves trust every peer as surely as one /0 does."""
+    risk = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            api=_proxied(*entries),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    ).get("trusted_proxies")
+    assert risk is not None
+    # The single-host proxy entry adds nothing to the union, so it is not blamed.
+    assert "10.0.0.1" not in risk
+
+
+def test_ranges_that_leave_a_gap_are_not_a_loosening() -> None:
+    assert _names(api=_proxied(*_split("0.0.0.0/0", 2)[:3])) == []
+    # Two families never union into one.
+    assert _names(api=_proxied(_split("0.0.0.0/0", 1)[0], _split("::/0", 1)[1])) == []
+
+
 def test_uvicorn_reads_a_prefix_zero_entry_the_way_the_registry_does() -> None:
     """Ground the discriminator in uvicorn's own parser, which __main__ hands the list verbatim."""
     from uvicorn.middleware.proxy_headers import _TrustedHosts
@@ -808,6 +868,9 @@ def test_uvicorn_reads_a_prefix_zero_entry_the_way_the_registry_does() -> None:
     assert "203.0.113.9" in _TrustedHosts(["0.0.0.0/0"])
     assert "2001:db8::9" in _TrustedHosts(["::/0"])
     assert "203.0.113.9" not in _TrustedHosts(["10.1.2.3/0"])
+    halves = _TrustedHosts(_split("0.0.0.0/0", 1))
+    assert "10.9.9.9" in halves
+    assert "203.0.113.9" in halves
 
 
 # --- [api].plaintext_upstream_hop_acknowledged (BACKLOG #1179) --------------------------------

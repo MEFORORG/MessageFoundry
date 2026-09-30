@@ -3269,6 +3269,8 @@ also a weak but non-zero value: a `1e-6` s window or a count of `1e9` is named. 
 than the default is not. The one count with no looser value is `phi_read_rate_limit_global`, which
 ships off. Each named value reaches the `serve` loosening warning, `messagefoundry security show` and
 `GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) for the table of values.
+At least two time floors are still silent: `mfa_verify_min_elapsed_seconds` and
+`oidc_callback_min_elapsed_seconds` turn off at `0` with nothing named.
 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained

@@ -14,11 +14,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   NIST SP 800-63B allows, so each reaches the `serve` loosening warning, `messagefoundry security
   show` and `GET /security/posture`. The shipped defaults report nothing new. (`BACKLOG #1131`,
   ASVS 6.1.1)
-- **Any sign-in, lockout, PHI-read, admin-write, session-cap or OIDC flow-cache limit looser than its
-  shipped default is now a named security loosening, not only an off value.** A `1e-6` s window or a
-  count of `1e9` used to pass silently while the control was off in effect. An `[api].trusted_proxies`
-  entry of `0.0.0.0/0` or `::/0` is named too, since it trusts every peer as the refused `*` would.
-  Stricter values and the defaults report nothing. (`BACKLOG #1131`; ASVS 6.1.1, 6.3.1, 2.3.2)
+- **A sign-in rate limit, lockout setting, PHI-read or admin-write limit, session cap or OIDC
+  flow-cache cap looser than its shipped default is now a named security loosening, not only an off
+  value.** A `1e-6` s window or a count of `1e9` used to pass silently while the control was off in
+  effect. `[api].trusted_proxies` ranges that cover every peer, such as `0.0.0.0/0` or `::/0`, are
+  named too, since they trust every peer as the refused `*` would. Stricter values and the defaults
+  report nothing. (`BACKLOG #1131`; ASVS 6.1.1, 6.3.1, 2.3.2)
 - **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
   before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
   off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and

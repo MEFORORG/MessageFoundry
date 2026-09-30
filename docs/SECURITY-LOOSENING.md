@@ -79,7 +79,7 @@ section reference.
 | | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
 | | `[auth].max_sessions_per_user` | `5` (*conditional* — a loosening only while auth is on; `0` or less means unlimited, and so is named, as is any cap above `5`) |
 | | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while auth and OIDC are on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
-| | `[api].trusted_proxies` | `[]` (an entry of `0.0.0.0/0` or `::/0` trusts `X-Forwarded-For` from every peer, as the refused `*` would) |
+| | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
@@ -603,7 +603,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **What you lose:** at `lockout_minutes` of `0` or less, a run of wrong guesses at one account's password
   or second factor is never refused by a lock. The failures are still counted and audited. Each session is
   still revoked after `lockout_threshold` failed re-proofs, because that cap does not read
-  `lockout_minutes`. A shorter lock or a lower ceiling shortens the wait between runs of guesses. A higher
+  `lockout_minutes`. A shorter lock shortens the wait between runs of guesses, and a lower ceiling
+  shortens the longest lock that repeated runs can reach. A higher
   threshold lets that many wrong guesses through before any lock is set, and a session may fail that many
   re-proofs before it is revoked.
 - **When acceptable:** rarely. A site whose own sign-in front end already locks accounts may prefer the
@@ -672,13 +673,14 @@ This section is kept rather than deleted, because the claim it used to make is t
   a proxy limiter.
 - **Reversible:** yes, immediately — restore `512` (or delete the line) and restart.
 
-### `[api].trusted_proxies` containing `0.0.0.0/0` or `::/0` — every peer may set its own source address
+### `[api].trusted_proxies` covering every address, such as `0.0.0.0/0` or `::/0` — every peer may set its own source address
 > **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit
 > trail either way. The load refuses `*` for this reason, but an entry of `0.0.0.0/0` or `::/0` loads and
-> does the same thing for its address family, so it is named instead. The check parses each entry the way
-> uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, loads here but becomes a
-> literal in uvicorn that matches no peer, so it is not this loosening.
-- **What you lose:** uvicorn trusts `X-Forwarded-For` from every peer the entry covers, so any client can
+> does the same thing for its address family, so it is named instead. So are ranges whose union covers a
+> whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The check parses each
+> entry the way uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, loads here but
+> becomes a literal in uvicorn that matches no peer, so it is not this loosening.
+- **What you lose:** uvicorn trusts `X-Forwarded-For` from every peer the entries cover, so any client can
   declare its own source address. That poisons the audit source address, the per-address sign-in limit and
   the new-client-IP step-up signal. With `[security].allowed_client_networks` set, the load already
   refuses any range wider than one host.
