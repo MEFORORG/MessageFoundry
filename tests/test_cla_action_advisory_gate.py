@@ -7,7 +7,7 @@ that bundle would be reported. A gate whose success cannot be distinguished from
 thing to avoid here.* So most tests below are controls: each plants one failure the gate exists to
 catch and requires the gate to name it.
 
-NO NETWORK. The report the gate judges is a real ``npm audit --json`` reading taken on 2026-09-29
+NO NETWORK. The report the gate judges is a real ``npm audit --json`` reading taken on 2026-09-30
 against the vendored lockfile, recorded under ``tests/fixtures/cla_action_audit/``. The live call is
 replaced by an injected runner, so nothing here needs npm.
 
@@ -32,7 +32,7 @@ from tests._workflow_contexts import jobs_of
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = REPO_ROOT / "scripts" / "security"
-_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-09-29.json"
+_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-09-30.json"
 
 
 def _load(name: str) -> ModuleType:
@@ -349,14 +349,26 @@ def test_every_committed_entry_names_a_package_in_the_lockfile() -> None:
     """The committed baseline is checked here, not only a fixture-built one.
 
     A misspelt package would sit in the baseline acknowledging nothing and red only on the next
-    scheduled run, as a paired STALE and NEW. The fixture is an older reading than the baseline,
-    so this checks the committed file against the lockfile instead of against the fixture.
+    scheduled run, as a paired STALE and NEW.
     """
     locked = {key.rsplit("node_modules/", 1)[-1] for key in _LOCK["packages"] if key}
     baseline = gate.load_baseline(REPO_ROOT / gate.BASELINE_PATH)
 
     assert baseline
     assert {package for _, package in baseline} <= locked
+
+
+def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> None:
+    """Dropping an entry, say in a bad merge, reds here rather than on the next nightly.
+
+    A SUBSET, not equality, so acknowledging a new advisory does not force a fresh reading in the
+    same change. Refresh the fixture when you do have npm, and this keeps the two in step.
+    """
+    missing = _FOUND - gate.load_baseline(REPO_ROOT / gate.BASELINE_PATH)
+
+    assert not missing, (
+        f"the recorded reading reports these, and the baseline dropped them: {missing}"
+    )
 
 
 def test_the_advice_matches_the_kind_of_failure(
@@ -413,3 +425,29 @@ def test_the_scheduled_job_runs_the_live_audit() -> None:
         for run in runs
     )
     assert any("setup-node" in str(step.get("uses", "")) for step in job["steps"])
+
+
+def test_the_runner_asks_for_every_dependency_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An inherited omit setting would shrink the request while the reported total stayed 561."""
+    captured: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> Any:
+        captured["argv"], captured["env"] = argv, kwargs["env"]
+        return type("Done", (), {"stdout": _REPORT_TEXT, "stderr": ""})()
+
+    monkeypatch.setenv("NODE_ENV", "production")
+    monkeypatch.setenv("npm_config_omit", "dev")
+    monkeypatch.setattr(gate.shutil, "which", lambda _name: "npm")
+    monkeypatch.setattr(gate.subprocess, "run", fake_run)
+
+    gate.npm_runner(Path("."))
+
+    assert {"--include=dev", "--include=optional", "--include=peer"} <= set(captured["argv"])
+    assert not {"node_env", "npm_config_omit"} & {key.lower() for key in captured["env"]}
+
+
+def test_a_malformed_baseline_fails_closed_rather_than_as_a_finding(root: Path) -> None:
+    """Exit 1 means a finding; a baseline that cannot be read means no audit ran, which is 2."""
+    (root / gate.BASELINE_PATH).write_text("[[advisory]]\nid = 1\n", encoding="utf-8")
+
+    assert gate.main(["--root", str(root), "--report", str(_FIXTURE)]) == 2

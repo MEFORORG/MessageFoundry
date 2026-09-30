@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -203,8 +204,8 @@ def evaluate(
     """Every reason a report fails the gate. An empty list is a pass.
 
     Takes the two things a report contributes, :func:`audited_total` and :func:`findings`, so a
-    run computes each once. Each problem starts with its kind -- COVERAGE, NEW ADVISORY or STALE BASELINE ENTRY -- and
-    :data:`_WHAT_TO_DO` keys its advice on that word.
+    run computes each once. Each problem starts with its kind (COVERAGE, NEW ADVISORY or STALE
+    BASELINE ENTRY), and :data:`_WHAT_TO_DO` keys its advice on that.
     """
     problems: list[str] = []
     if audited != expected_entries:
@@ -216,7 +217,7 @@ def evaluate(
         detail = reported[(ident, package)]
         problems.append(
             f"NEW ADVISORY, not in {BASELINE_PATH}: {ident} in {package} "
-            f"({detail['severity']}) {detail['title']} {detail['url']}"
+            + _one_line(f"({detail['severity']}) {detail['title']} {detail['url']}")
         )
     for ident, package in sorted(baseline - set(reported)):
         problems.append(
@@ -251,8 +252,8 @@ def run_npm_audit(
             # npm writes its JSON error body to stdout and its log line to stderr. Print both, so a
             # local failure (a rejected lockfile, a usage error) is not read as a registry outage.
             print(f"attempt {attempt}: npm audit returned no verdict")
-            print(f"stdout: {stdout[:400]}")
-            print(f"stderr: {stderr[:400]}")
+            print(f"stdout: {_one_line(stdout[:400])}")
+            print(f"stderr: {_one_line(stderr[:400])}")
             if attempt < attempts:
                 sleep(attempt * 15)
     return None
@@ -267,10 +268,27 @@ def npm_runner(workdir: Path) -> tuple[str, str]:
     npm = shutil.which("npm")
     if npm is None:
         raise FileNotFoundError("npm is not on PATH; this audit needs Node and npm")
+    # npm can be told, through the environment, to leave dev, optional or peer packages out of the
+    # request, or not to send it at all. The dependency total it reports counts the tree either way,
+    # so the COVERAGE check could not see that. Clear those settings and ask for every kind.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.lower() not in {"node_env", "npm_config_omit", "npm_config_offline"}
+    }
     try:
         done = subprocess.run(  # nosec B603 - fixed argv, no shell
-            [npm, "audit", "--package-lock-only", "--json"],
+            [
+                npm,
+                "audit",
+                "--package-lock-only",
+                "--json",
+                "--include=dev",
+                "--include=optional",
+                "--include=peer",
+            ],
             cwd=workdir,
+            env=env,
             capture_output=True,
             # npm writes UTF-8. Without this, Windows decodes with the locale code page and an
             # advisory title outside it raises UnicodeDecodeError.
@@ -282,6 +300,16 @@ def npm_runner(workdir: Path) -> tuple[str, str]:
     except subprocess.TimeoutExpired:
         return "", f"npm audit took longer than {NPM_TIMEOUT} s"
     return done.stdout, done.stderr
+
+
+def _one_line(text: str) -> str:
+    """*text* with line breaks flattened, so network-supplied text cannot start a line.
+
+    GitHub Actions reads a log line that starts with ``::`` as a workflow command. Every line this
+    script prints starts with its own prefix, so an npm error body or an advisory title can only
+    begin a line by carrying a line break, and this removes those.
+    """
+    return text.replace("\r", " ").replace("\n", " ")
 
 
 def _limitation(root: Path) -> str:
@@ -330,10 +358,15 @@ def main(
     args = parser.parse_args(argv)
     root: Path = args.root
 
-    lock_bytes = (root / LOCK_PATH).read_bytes()
-    lock = json.loads(lock_bytes)
-    expected = lock_entry_count(lock)
-    baseline = load_baseline(root / BASELINE_PATH)
+    # A bad input is exit 2, like a missing verdict: the audit did not run, which is not a finding.
+    try:
+        lock_bytes = (root / LOCK_PATH).read_bytes()
+        lock = json.loads(lock_bytes)
+        expected = lock_entry_count(lock)
+        baseline = load_baseline(root / BASELINE_PATH)
+    except (OSError, ValueError) as broken:
+        print(f"::error::{_one_line(str(broken))}. Failing closed: no audit ran.")
+        return 2
 
     report: object
     if args.report is not None:
@@ -359,10 +392,15 @@ def main(
         f"{LOCK_PATH}: {expected} lockfile entries, {len(reported)} advisories reported, "
         f"{len(baseline)} acknowledged in {BASELINE_PATH}."
     )
-    print(f"SCOPE: {_limitation(root)}")
+    for problem in problems:
+        print(f"::error::{problem}")
+    # After the findings, so a broken provenance record cannot hide them behind its own error.
+    try:
+        print(f"SCOPE: {_limitation(root)}")
+    except (OSError, ValueError, KeyError) as broken:
+        print(f"::error::cannot read the limitation sentence from {RECORD_PATH}: {broken}")
+        problems.append("SCOPE")
     if problems:
-        for problem in problems:
-            print(f"::error::{problem}")
         for kind, advice in _WHAT_TO_DO.items():
             if any(problem.startswith(kind) for problem in problems):
                 print(advice)
