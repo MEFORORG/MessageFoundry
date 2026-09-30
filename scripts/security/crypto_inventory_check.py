@@ -571,7 +571,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
-    # and asserts it. Its one decision, leaving CERT_NONE hops alone, is on its IMPORT_ONLY row.
+    # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
     "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
@@ -827,12 +827,6 @@ IMPORT_ONLY: dict[str, str] = {
         "carries a trust anchor and a hop posture to the refusal checks; the OAuth2 token hop's "
         "opener is built by the shared base in transports/smart.py (BACKLOG #2115), which is "
         "inventoried"
-    ),
-    "messagefoundry/transports/strict_requests.py": (
-        "INSTRUMENT LIMIT. Gives each verifying Vault https connection a context from a factory "
-        "config/tls_policy.py returns, which builds and narrows it there, and leaves a CERT_NONE "
-        "connection (the TLS hop to an https proxy) on urllib3's own context: a TLS posture "
-        "decision with no crypto-shaped call in it (BACKLOG #300)"
     ),
     "tee/mefor_api.py": (
         "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
@@ -1375,6 +1369,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.keywrap",
             "tls_context:via messagefoundry.transports.rest",
         }
+    ),
+    # Loads requests' CA onto the https-proxy leg's context; _narrowed_pool_classes says why.
+    # INSTRUMENT LIMIT: the load sits in a class nested in a function reached only through
+    # StrictReplyAdapter.__init__, so no "via" token reaches the Vault callers' rows, and the
+    # CERT_NONE refusal in connect() is a posture decision with no crypto-shaped call.
+    "messagefoundry/transports/strict_requests.py": frozenset(
+        {"tls_context:.load_verify_locations()"}
     ),
     # BACKLOG #300, owner ruling R3 of 2026-09-27: both verifying contexts are narrowed to a pinned
     # copy of the approved suite list, the apiclient's pattern (tray/ may not import config/).
