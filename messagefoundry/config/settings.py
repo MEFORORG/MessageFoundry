@@ -6861,6 +6861,9 @@ def security_loosenings(
     # here (the validator is not strict) but fails uvicorn's strict parse and becomes a literal that
     # matches nothing, so it trusts no peer and is not this loosening. Not gated on sign-in: a forged
     # source address poisons the audit trail either way.
+    # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
+    # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
+    # but a refactor of the helper may raise one. Fix it at the source, as the MFA floor above does.
     trust_all = _trust_every_peer_entries(api.trusted_proxies)
     if trust_all:
         out.append(
