@@ -3181,8 +3181,10 @@ def test_lens_rewrite_counts_as_a_json_command_for_an_uncaught_exception(
     rc = main(["lens", "rewrite", str(module), "--edit", '{"line_start": 1, "line_end": 1}'])
 
     assert rc == 1
+    # `lens rewrite` adds its generic refusal code on the floor path too (BACKLOG #237).
     assert json.loads(capsys.readouterr().out) == {
-        "error": "RuntimeError: synthetic rewrite failure"
+        "error": "RuntimeError: synthetic rewrite failure",
+        "code": "refused",
     }
 
 

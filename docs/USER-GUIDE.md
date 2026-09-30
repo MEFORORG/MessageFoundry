@@ -537,6 +537,8 @@ The pages hang off a **top nav** of hover/focus dropdowns: **Traffic** (Connecti
 
 **Approvals.** When `[approvals]` holds a replay, purge or reload for a second approver, the held page names its approval id and links to **Admin > Approvals** (`/ui/approvals`). That page lists each pending request with **Approve** and **Reject**, and needs `approvals:approve`. A different user must approve: the engine refuses the requester, who may still reject their own request to withdraw it. Approving runs the held operation and shows its result. A release that was cut off mid-run is listed under *Interrupted releases* with no buttons; record what it did with `POST /approvals/{id}/resolve` on the engine API.
 
+**Approvals.** When `[approvals]` holds a replay, purge or reload for a second approver, the held page names its approval id and links to **Admin > Approvals** (`/ui/approvals`). That page lists each pending request with **Approve** and **Reject**, and needs `approvals:approve`. A different user must approve: the engine refuses the requester, who may still reject their own request to withdraw it. Approving runs the held operation and shows its result. A release that was cut off mid-run is listed under *Interrupted releases* with no buttons; record what it did with `POST /approvals/{id}/resolve` on the engine API.
+
 ### The VS Code extension (for config authors)
 
 The extension is a thin TypeScript UI that shells out to the `messagefoundry` CLI; it authors and tests interfaces, and can start/stop/restart a local engine and show its status — but **operating** and **monitoring** traffic is the web console's job. What it gives a config author:
