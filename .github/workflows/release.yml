@@ -1258,6 +1258,14 @@ jobs:
           PYSMOKE
           )
           echo "harness wheel version: $built"
+          # THE INSTALL LEGS OF BACKLOG #1585, RUN OFFLINE ON THE BUILT WHEEL. Everything above reads
+          # the Requires-Dist this wheel declares; this asks pip what it DOES with it. The script
+          # builds metadata-only stub engine wheels in a temp dir and resolves this wheel against each
+          # with --no-index --dry-run --ignore-installed: an older and a newer engine must be REFUSED,
+          # and the engine at this wheel's own version must resolve. No index is contacted and nothing
+          # is installed, so it adds no network to a job holding id-token: write.
+          # tests/test_packaging.py runs the same script against the pyproject's real table in CI.
+          /tmp/harnesssmoke/bin/python -I scripts/release/harness_resolution_check.py harness-dist/*.whl
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
             /tmp/harnesssmoke/bin/python -I - "$built" "$want" <<'PYVER'
