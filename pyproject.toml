@@ -54,6 +54,15 @@ exclude = ["CLAUDE.md"]
 [tool.hatch.build.targets.sdist]
 only-include = ["messagefoundry", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"]
 
+# The engine WHEEL, made explicit (ADR 0201 section 4, BACKLOG #1192, ASVS 15.2.3). Before this table
+# the wheel's contents were hatchling's unconfigured default, which happened to pick the package named
+# after the project. The wheel packs `messagefoundry/` and nothing else, so a module moved into
+# `messagefoundry_toolkit/` leaves it: the physical move IS the exclusion, and no exclude list derived
+# from CLI_TIERS stands in for it. NO per-target `exclude` here: hatchling would REPLACE the global
+# `exclude = ["CLAUDE.md"]` above rather than extend it.
+[tool.hatch.build.targets.wheel]
+packages = ["messagefoundry"]
+
 [project]
 name = "messagefoundry"
 dynamic = ["version"]  # single-sourced from messagefoundry/__init__.py (see [tool.hatch.version])
@@ -97,14 +106,25 @@ dependencies = [
     "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
     # Ceiling: api/protocol_headers.py overrides uvicorn internals, and serve refuses to start if one
     # moves. Raise it only after re-reading uvicorn's protocol modules (BACKLOG #1120).
-    "uvicorn[standard]>=0.29,<0.50",
+    # Plain uvicorn, not uvicorn[standard]: that extra also pulls watchfiles (--reload), python-dotenv
+    # (--env-file), PyYAML (a YAML log config) and colorama (Windows log colour). serve passes no
+    # reload, no env_file and log_config=None, so none of the four is ever imported. The three the
+    # engine does use are declared below with the extra's own markers.
+    "uvicorn>=0.29,<0.50",
+    # The HTTP protocol ``http="auto"`` picks when installed. protocol_headers.py floors both it and h11.
+    "httptools>=0.8.0",
+    # The legacy WebSocket server ``ws="auto"`` resolves to, which protocol_headers.py floors and
+    # /ws/stats runs on. Without a WebSocket library uvicorn serves no WebSocket route at all.
+    "websockets>=16.0",
+    # The event loop uvicorn's ``loop="auto"`` picks; mllp.py's TLS stop path accounts for it. Same
+    # marker as uvicorn[standard], because uvloop has no Windows, PyPy or Cygwin build.
+    "uvloop>=0.22.1; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'",
     "argon2-cffi>=23.1",    # argon2id password hashing (OWASP-recommended)
     "cryptography>=48.0.1", # AES-256-GCM PHI-at-rest encryption for the store (>=48.0.1: GHSA-537c-gmf6-5ccf)
     "ldap3>=2.9",           # Active Directory / LDAP authentication (pure-Python)
     "pyspnego>=0.10",       # SPNEGO/Kerberos negotiate for Windows SSO
     "tomlkit>=0.12",        # comment/format-preserving TOML writer for connections.toml (ADR 0007)
     "tzdata>=2024.1",       # IANA tz database for stdlib zoneinfo (Windows has no system tzdata)
-    "prometheus-client>=0.20",  # Prometheus /metrics exposition (BACKLOG #21)
     "psutil>=6.0",          # host CPU/mem gauges on the /metrics surface (BACKLOG #74)
     "httpx>=0.27",          # the shared apiclient HTTP client (messagefoundry.apiclient) — used by the bundled Windows tray's tokenless /health + /ui probes (messagefoundry.tray, ADR 0113, gui-scripts messagefoundry-tray) and the harness monitor; also the ASGI test client. Base (not an extra) so the tray works on every `pip install messagefoundry`.
     "truststore>=0.10",     # verify an https engine URL against the OS trust store (enterprise/AD-CS roots) — apiclient lazily imports it; base so the tray/monitor need no per-PC CA wrangling
@@ -262,7 +282,7 @@ fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64
 # second wheel (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin
 # in-process via mount_ui. That wheel IS on PyPI: the first webconsole-v* release claimed the name on
 # 2026-07-29. There is still no [webconsole] extra here, because re-adding it is an owner release step
-# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a compat range and a re-lock). Until
+# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a floor, no ceiling, and a re-lock). Until
 # then it installs as its own distribution; CI and a checkout use
 # `-e packaging/messagefoundry-webconsole`. With the package absent, serve refuses an explicit
 # serve_web_console=true and degrades a default-on console to JSON-only with a warning (__main__).
@@ -285,6 +305,17 @@ dev = [
     # cap in a deliberate PR that also clears the new findings.
     "ruff>=0.4,<0.16",
     "mypy>=1.10",
+    # Dozens of tests parse the CI workflows and .pre-commit-config.yaml with PyYAML. It used to reach
+    # every install through uvicorn[standard]; the base install dropped that extra, so the suite
+    # declares it here rather than riding on a runtime dependency it does not otherwise need.
+    "pyyaml>=6.0",
+    # The engine renders /metrics itself (messagefoundry/api/metrics.py). The metrics tests still
+    # parse the exposition with this library's parser, and tests/test_metrics_exposition.py renders
+    # through it to prove the engine's bytes match. Test-only, so it is not a runtime dependency.
+    # Floor 0.26.0: the golden files and the float-format comparison are that release's output, and
+    # earlier releases format some exponents differently, so an older one would fail those tests
+    # while blaming the engine.
+    "prometheus-client>=0.26.0",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
     # is no longer declared here.
 ]

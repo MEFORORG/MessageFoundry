@@ -274,7 +274,8 @@ jobs:
             tests/test_operator_docs_no_warning_sign.py
             tests/test_docs_upstream_hop_ack.py
             tests/test_dangerous_functionality_doc.py
-            tests/test_risky_component_designation.py"
+            tests/test_risky_component_designation.py
+            tests/test_changelog_fragments.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
           # the ruling above says removing a guard is a different act from adding one. They were
           # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,
@@ -447,6 +448,43 @@ jobs:
         if: runner.os == 'Linux'
         run: python scripts/quality/stale_repo_slug_check.py
 
+      # Changelog fragments against the base branch (BACKLOG #2080). A pull request adds its entry
+      # as a file under changelog.d/ instead of editing CHANGELOG.md, and the release pull request
+      # folds them in. Fragment FORMAT is tests/test_changelog_fragments.py's job, which runs in the
+      # suite and, on a docs-only pull request, in DOC_GUARDS below. This step covers the half that
+      # needs the BASE branch: it REFUSES a pull request that adds a `## [x.y.z]` heading while
+      # fragments remain (a release pull request that forgot `assemble`; release.yml's tag guard is
+      # the backstop), and WARNS, never fails, on a pull request that still edits CHANGELOG.md.
+      # Not paths-filtered: a pull request touching only .md is docs-only. Stdlib only. It runs in
+      # merge_group too, so a fragment merged after a release pull request's last PR run still stops
+      # that release in the queue rather than at the tag.
+      # THE BASE IS THE CHECKED-OUT COMMIT'S FIRST PARENT, not the base branch's tip. Both events
+      # check out a merge commit built against the base as it was then; the tip can have moved
+      # since, and diffing against it would warn on every pull request whose base gained an entry.
+      # Measured on this branch: main gained 37 CHANGELOG.md lines in 8 commits, and a tip diff
+      # warned on a branch that never touched the file. The parent is read off the commit object.
+      # It is usually already here (the ledger gate fetched main), so that is tried first; otherwise
+      # it is fetched into a THROWAWAY repository, because a shallow fetch into this checkout can
+      # move its shallow boundary under later steps (see "Refused commit subjects"). If it cannot be
+      # read, the step warns and passes; the timeout keeps a stalled fetch from wedging the leg.
+      - name: Changelog fragments against the base branch
+        if: runner.os == 'Linux' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        timeout-minutes: 5
+        run: |
+          base_copy="$RUNNER_TEMP/base-CHANGELOG.md"
+          scratch="$RUNNER_TEMP/changelog-base"
+          # No pipe: under `-o pipefail` an early-exiting reader can fail the step on SIGPIPE.
+          git cat-file -p HEAD > "$RUNNER_TEMP/head-commit"
+          parent=$(awk '/^parent /{print $2; exit}' "$RUNNER_TEMP/head-commit")
+          if [ -n "$parent" ] && { git show "$parent:CHANGELOG.md" > "$base_copy" 2>/dev/null \
+             || { git init -q "$scratch" \
+                  && git -C "$scratch" fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$parent" \
+                  && git -C "$scratch" show "$parent:CHANGELOG.md" > "$base_copy"; }; }; then
+            python scripts/release/changelog_fragments.py pr-check --base-changelog "$base_copy"
+          else
+            echo "::warning::could not read the base CHANGELOG.md; release.yml's tag guard is the backstop"
+          fi
+
       # BACKLOG #1226. The screen shipped and NOTHING RAN IT, so it read as coverage and produced
       # none -- a username reaching a WHERE clause was found three times by accident and zero times
       # on purpose. --baseline is what makes this step able to FAIL without turning the screen into
@@ -472,7 +510,9 @@ jobs:
       # --exclude cleanly drops it from the linux build.
       - name: Type-check (mypy, strict — linux platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
-        run: mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'
+        # messagefoundry_toolkit: the toolkit distribution's import package (ADR 0201). It receives code
+        # that moves out of messagefoundry/, so it is type-checked on the same strict terms.
+        run: mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
 
       # BACKLOG #1799: tests/ is type-checked. WHY THE SCOPE IS WHAT IT IS, so the next gap is not
       # found by accident. This is the THIRD directory to fall outside a gate that reads as
@@ -500,7 +540,7 @@ jobs:
       # path argument) plus every other sys.platform=='win32' branch.
       - name: Type-check (mypy, strict — win32 platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
-        run: mypy --platform win32 messagefoundry
+        run: mypy --platform win32 messagefoundry messagefoundry_toolkit
 
       # Step-level watchdog UNDER the job cap (#55): the windows-2022 leg intermittently
       # wedges ~25% in (a Windows ProactorEventLoop listener-teardown / socket wait that the shared
@@ -3541,6 +3581,12 @@ jobs:
     defaults:
       run:
         shell: pwsh
+    # BACKLOG #2442: every install below is handed this folder as -NssmDir, and every nssm call runs
+    # the nssm.exe in it by full path, the copy the installer checked (install-service.ps1,
+    # Resolve-Nssm). The nssm on the runner's PATH is Chocolatey's, which that check refuses.
+    # tests/test_nssm_pin.py fails on at least the other spellings of nssm it lists.
+    env:
+      SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3569,8 +3615,8 @@ jobs:
 
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
-      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). NSSM happens to
-      # be on the runner PATH, so the auto-download path is validated locally / on the user's box.
+      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). The installer
+      # downloads the pinned NSSM release into $env:SMOKE_NSSM_DIR.
       - name: Install the service
         shell: powershell
         run: |
@@ -3592,7 +3638,7 @@ jobs:
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
           # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
           # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
-          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
           # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
@@ -3651,7 +3697,7 @@ jobs:
           # refusing to start"), so NSSM crash-loops to SERVICE_PAUSED and /health never comes up. BOUND both
           # (30d) rather than setting [retention].allow_unbounded_phi=true: a real prod deployment configures
           # a window, so the smoke exercises the path it is meant to validate instead of opting out of it.
-          nssm set MessageFoundry AppEnvironmentExtra `
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry AppEnvironmentExtra `
             "MEFOR_SECURITY_REQUIRE_SIGN_IN=false" `
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
             "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
@@ -3746,7 +3792,7 @@ jobs:
           # engine's own certificate as its ONLY trust anchor -- the same approach the docker-smoke step
           # uses, on an interpreter this job already requires.
           $probe = 'import json,ssl,sys,urllib.request;ctx=ssl.create_default_context(cafile=sys.argv[1]);print(json.dumps(json.load(urllib.request.urlopen(sys.argv[2],context=ctx,timeout=5))))'
-          nssm start MessageFoundry
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" start MessageFoundry
           $ok = $null
           foreach ($i in 1..30) {
             $out = $null
@@ -3786,7 +3832,7 @@ jobs:
 
       - name: Stop the service (graceful)
         if: always()
-        run: nssm stop MessageFoundry
+        run: '& "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry'
 
       - name: Show service logs
         if: always()
@@ -3828,13 +3874,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         shell: powershell
-        run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
+        run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
 
       - name: Store access, auth on -- the service first, then the operator (ADR 0183 Wave 0)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         shell: powershell
-        run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -DataDir C:\ProgramData\MessageFoundry-w0-start-first
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-start-first
 
       # ADR 0183 Amendment A, Wave 2: the engine creates no account on its own now, so the start-first
       # order is the one an operator who starts the service before provisioning meets. This third arm
@@ -3849,7 +3895,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         shell: powershell
-        run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
         if: always()
@@ -4058,16 +4104,20 @@ jobs:
           python -m build --outdir dist .
           python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
           python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
-          ls -l dist harness-dist webconsole-dist
+          # The fifth artifact (ADR 0201): the toolkit wheel. Its own directory, never dist/, as in
+          # release.yml, where sharing dist/ would pull it into the engine's smoke and upload.
+          python -m build --wheel ./packaging/messagefoundry-toolkit --outdir toolkit-dist
+          ls -l dist harness-dist webconsole-dist toolkit-dist
 
       - name: Member gate over the real artifacts
         run: |
-          # The same script, the same arguments, the same three distribution sets release.yml gates
+          # The same script, the same arguments, the same four distribution sets release.yml gates
           # -- so a refusal here is the refusal a tag would have produced, minutes after the commit
           # instead of at publish time.
           python scripts/release/forbidden_members.py 'dist/*.tar.gz' 'dist/*.whl'
           python scripts/release/forbidden_members.py 'harness-dist/*.whl'
           python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+          python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
 
       - name: Positive control -- the gate must REFUSE a poisoned copy
         run: |
@@ -4138,6 +4188,37 @@ jobs:
           fi
           echo "control fired: the gate refused the planted tests/ member in the console wheel BY NAME"
           rm -rf testcontent-control
+
+      - name: Retired-path control -- the gate must REFUSE an engine wheel carrying a moved module
+        run: |
+          # The third rule's control (ADR 0201 section 4), on its own terms. The rule is keyed on the
+          # distribution name in the archive FILENAME, so the copy keeps the engine wheel's real
+          # filename, in a directory of its own. It is poisoned with the path retired in slice 2; a
+          # later slice may keep it, since a retired path stays retired. Same reason-not-exit-code
+          # check as the two controls above.
+          mkdir -p retired-control
+          cp dist/*.whl retired-control/
+          python - <<'PY'
+          import glob
+          import zipfile
+          [wheel] = glob.glob("retired-control/*.whl")
+          with zipfile.ZipFile(wheel, "a") as zf:
+              zf.writestr("messagefoundry/adr_analyze.py", "# moved to the toolkit\n")
+          PY
+          refusal="ships messagefoundry/adr_analyze.py"
+          status=0
+          log="$(python scripts/release/forbidden_members.py 'retired-control/*.whl' 2>&1)" || status=$?
+          printf '%s\n' "$log"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the member gate ACCEPTED an engine wheel carrying messagefoundry/adr_analyze.py -- the engine and toolkit split rule is broken"
+            exit 1
+          fi
+          if [[ "$log" != *"$refusal"* ]]; then
+            echo "::error::the member gate exited $status without reporting '$refusal', so it did NOT refuse the retired path. This control proved NOTHING about the clean engine result above"
+            exit 1
+          fi
+          echo "control fired: the gate refused the retired engine path BY NAME"
+          rm -rf retired-control
 
   # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
   # Server, Postgres, load, Windows-service smoke). Those legs CANNOT be required directly:

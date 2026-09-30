@@ -79,13 +79,15 @@ import pytest
 # One registry with PER-CLAUSE root tuples — deliberately not one flat list, so the two items that
 # share this edit cannot silently diverge and the differences are recorded rather than rediscovered:
 #
-# * ``_SOURCE_ROOTS`` — messagefoundry/ + messagefoundry_webconsole/ + harness/ + tee/, the
-#   first-party Python the ReDoS and single-parser clauses walk. ``tee/`` belongs here on the same
-#   footing as the rest: it parses untrusted HL7 off the wire (``tee/mllp.py``'s segment split over
+# * ``_SOURCE_ROOTS`` — messagefoundry/ + messagefoundry_webconsole/ + messagefoundry_toolkit/ +
+#   harness/ + tee/, the first-party Python the ReDoS and single-parser clauses walk. The toolkit
+#   joined before any code moved into it (ADR 0201 section 4): code that leaves messagefoundry/ must
+#   not leave these clauses, and ``corepoint_import`` parses untrusted Corepoint XML once it moves.
+#   ``tee/`` belongs here on the same footing as the rest: it parses untrusted HL7 off the wire (``tee/mllp.py``'s segment split over
 #   decoded MLLP frames, ``tee/anon/*`` over message fields), which is exactly the class these clauses
 #   score. Measured before adding: zero nested-quantifier offenders, zero unscannable patterns, no
 #   alternate JSON/URL/XML parser — so the coverage is free.
-# * ``_CRYPTO_ROOTS`` — those four plus ``scripts/``, the target of evaluation for the ASVS 11.1.3
+# * ``_CRYPTO_ROOTS`` — those five plus ``scripts/``, the target of evaluation for the ASVS 11.1.3
 #   cryptographic-discovery gate. Unchanged as a TUPLE (tee/ simply moved into the shared prefix):
 #   ``harness/`` and ``scripts/`` carry no crypto call site today and are walked pre-emptively, so a
 #   new one cannot appear outside the inventory — which ``test_crypto_roots_carry_no_unrecorded_call_site``
@@ -123,7 +125,13 @@ import pytest
 # would not fire on it — that rationale was measured false and removed.
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "messagefoundry"
-_SOURCE_ROOTS = (_PKG, _REPO / "messagefoundry_webconsole", _REPO / "harness", _REPO / "tee")
+_SOURCE_ROOTS = (
+    _PKG,
+    _REPO / "messagefoundry_webconsole",
+    _REPO / "messagefoundry_toolkit",
+    _REPO / "harness",
+    _REPO / "tee",
+)
 _CRYPTO_ROOTS = (*_SOURCE_ROOTS, _REPO / "scripts")
 _XML_ROOTS = _CRYPTO_ROOTS
 _CRYPTO_GATE = _REPO / "scripts" / "security" / "crypto_inventory_check.py"
@@ -721,13 +729,16 @@ def test_the_walk_actually_covers_the_widened_roots() -> None:
     assert tuple(p.name for p in _SOURCE_ROOTS) == (
         "messagefoundry",
         "messagefoundry_webconsole",
+        "messagefoundry_toolkit",
         "harness",
         "tee",
     )
     # Unchanged as a tuple across the tee/ move, which is what BACKLOG #282's gate widening consumes.
+    # The toolkit joined with ADR 0201 slice 2, and the gate's WALK_ROOTS joined it in the same change.
     assert tuple(p.name for p in _CRYPTO_ROOTS) == (
         "messagefoundry",
         "messagefoundry_webconsole",
+        "messagefoundry_toolkit",
         "harness",
         "tee",
         "scripts",
@@ -1269,8 +1280,8 @@ def test_no_file_imports_the_upstream_defusedxml_package() -> None:
 #: "does not cover" these paths "because the shipped CLI still defaults to" messagefoundry/ alone,
 #: and that BACKLOG #282 widening the walk would make this set redundant. #282 already landed --
 #: WALK_ROOTS is ``("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")``
-#: today, and every entry below already has a matching entry in the gate's own INVENTORY (confirmed
-#: by grep, not assumed). So this set is not filling a gap the gate misses; it is a second,
+#: on that date (ADR 0201 slice 2 later added "messagefoundry_toolkit"), and every entry below
+#: already has a matching entry in the gate's own INVENTORY (confirmed by grep, not assumed). So this set is not filling a gap the gate misses; it is a second,
 #: independently-maintained copy of one slice of it -- the same redundant-check shape #1301's and
 #: #1338's banner guards use elsewhere in this ledger. Left as a TODO rather than deleted here: doing
 #: that properly means confirming every remaining entry really is duplicated (not just the one this

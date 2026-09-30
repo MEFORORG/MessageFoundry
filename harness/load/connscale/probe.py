@@ -387,6 +387,10 @@ class FdSampler:
                 ],
                 capture_output=True,
                 text=True,
+                # Windows PowerShell 5.1 writes the OEM code page when piped. The rows are ASCII
+                # digits by construction, so a stray byte is replaced rather than raised.
+                encoding="oem",
+                errors="replace",
                 timeout=_PROBE_TIMEOUT_S,
             )
         # TimeoutExpired is caught FIRST because it is a SubprocessError subclass, and it is the one
@@ -431,7 +435,7 @@ class FdSampler:
             if not name.isdigit():
                 continue
             try:
-                raw = Path(f"/proc/{name}/stat").read_text()
+                raw = Path(f"/proc/{name}/stat").read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             pid = _as_int(name)
@@ -476,6 +480,8 @@ class FdSampler:
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
                 capture_output=True,
                 text=True,
+                encoding="oem",  # see _enumerate_windows
+                errors="replace",
                 timeout=_PROBE_TIMEOUT_S,
             )
         # TimeoutExpired first (it subclasses SubprocessError): a read that spent its whole budget
@@ -575,6 +581,8 @@ class FdSampler:
                 ["lsof", "-p", str(pid)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # only rows are counted; a non-UTF-8 path byte must not raise
+                errors="replace",
                 timeout=_PROBE_TIMEOUT_S,
             )
         except (OSError, subprocess.SubprocessError):
@@ -589,7 +597,7 @@ class FdSampler:
         # /proc/<pid>/stat: utime (field 14) + stime (field 15), in clock ticks. The comm field (2)
         # can contain spaces/parens, so split after the LAST ')' — everything after is field 3 onward.
         try:
-            raw = Path(f"/proc/{pid}/stat").read_text()
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
         after = raw.rpartition(")")[2].split()
@@ -608,7 +616,9 @@ class FdSampler:
     def _posix_rss_bytes(self, pid: int) -> int | None:
         # /proc/<pid>/statm: field 2 is resident set size in PAGES; × page size → bytes.
         try:
-            fields = Path(f"/proc/{pid}/statm").read_text().split()
+            fields = (
+                Path(f"/proc/{pid}/statm").read_text(encoding="utf-8", errors="replace").split()
+            )
         except OSError:
             return None
         if len(fields) < 2:

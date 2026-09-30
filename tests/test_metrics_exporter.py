@@ -105,8 +105,8 @@ async def test_metrics_endpoint_returns_parseable_exposition(
     assert METRICS_CONTENT_TYPE.startswith("text/plain")
 
     families = {f.name for f in text_string_to_metric_families(r.text)}
-    # Always-rendered families (build_info + the unwindowed gauges/histogram). CounterMetricFamily
-    # names parse back WITHOUT the _total suffix.
+    # Always-rendered families (build_info + the unwindowed gauges/histogram). Counter family names
+    # parse back WITHOUT the _total suffix.
     expected = {
         "messagefoundry_build_info",
         "messagefoundry_messages_received",
@@ -201,7 +201,7 @@ async def test_gather_snapshot_carries_aggregates(engine: Engine) -> None:
     assert any(
         h.channel_id == "adt_in" and h.destination_name == "adt_archive" for h in snap.latency
     )
-    # render_metrics returns bytes (pure-sync generate_latest over the snapshot).
+    # render_metrics returns bytes (the engine's pure-sync renderer over the snapshot).
     body = await render_metrics(engine)
     assert isinstance(body, bytes)
     assert SENTINEL.encode() not in body
@@ -214,13 +214,9 @@ async def test_gather_snapshot_carries_aggregates(engine: Engine) -> None:
 def _render_snapshot(snap: object) -> str:
     """Render one hand-built ``_Snapshot`` through the collector (pure sync) — lets us exercise the
     server-only pool families that SQLite (no pool) never populates."""
-    from prometheus_client import CollectorRegistry, generate_latest
+    from messagefoundry.api.metrics import _render_snapshot
 
-    from messagefoundry.api.metrics import _MetricsCollector
-
-    reg = CollectorRegistry()
-    reg.register(_MetricsCollector(snap))  # type: ignore[arg-type]
-    return generate_latest(reg).decode()
+    return _render_snapshot(snap).decode()  # type: ignore[arg-type]
 
 
 def _pool_snapshot(*, idle: int) -> object:
