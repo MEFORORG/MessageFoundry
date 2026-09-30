@@ -2342,6 +2342,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `/auth/negotiate` legs revoke nothing, because they return a token without
   replacing one; ending the old token is the client's job there.
   ([BACKLOG #1146](docs/BACKLOG.md))
+- **A console release now refuses a wheel whose engine requirement has no floor.** The
+  `release-webconsole` job reads the built wheel's `Requires-Dist` and fails unless its
+  `messagefoundry` requirement has a lower bound and no environment marker. An upper bound is
+  allowed. The console's engine requirement is a floor with no ceiling, set at each console release;
+  `docs/WEBCONSOLE-PACKAGE.md` says why. A bare dependency let `pip` keep an older engine that
+  lacks the functions the console calls. ([BACKLOG #1585](docs/BACKLOG.md))
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,

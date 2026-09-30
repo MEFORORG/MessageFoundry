@@ -926,6 +926,91 @@ jobs:
           PYVER
           fi
 
+      # BACKLOG #1585. The console's engine requirement is a FLOOR with NO CEILING, set at each console
+      # release (packaging/messagefoundry-webconsole/RELEASE.md step 2). docs/WEBCONSOLE-PACKAGE.md,
+      # "The engine requirement is a floor with no ceiling", says why. The floor cannot be raised on
+      # main ahead of the release: main's engine still reports its last released version while it
+      # already carries a newer seam, so a floor naming the next engine would not resolve against the
+      # editable engine the CI jobs install. That leaves a release step a person can skip, and a skipped
+      # one ships a bare `messagefoundry` dependency, which lets pip keep an older engine that lacks the
+      # functions the console calls. This step refuses that wheel.
+      #
+      # It reads the BUILT wheel's METADATA, not pyproject.toml, so it measures the artifact the steps
+      # below publish. An upper bound is allowed and never required: the runtime seam handshake
+      # (assert_engine_seam) is the guard on that side. It checks that a floor EXISTS, not that its
+      # value is right: a stale floor left from an earlier release passes. The value is step 2's job.
+      # No `if:` of its own, so a workflow_dispatch dry run on a `webconsole-*` ref fails here too.
+      #
+      # tests/test_webconsole_engine_floor.py extracts the PYFLOOR script and runs it over synthetic
+      # wheels, with mutation arms showing each requirement refusal is the line that fires.
+      - name: Engine floor gate — the console wheel must require messagefoundry with a lower bound
+        run: |
+          # Reuses the smoke venv above, which holds `packaging` at the constraints.lock pin, so this
+          # step installs nothing. -I keeps the checkout off sys.path.
+          /tmp/webconsolesmoke/bin/python -I - webconsole-dist/*.whl <<'PYFLOOR'
+          import sys
+          import zipfile
+          from email.parser import HeaderParser
+
+          from packaging.requirements import InvalidRequirement, Requirement
+          from packaging.utils import canonicalize_name
+
+          ENGINE = "messagefoundry"
+          # Every operator that sets a lower bound. `~=` and `==` also cap the range; that is allowed.
+          FLOOR_OPERATORS = frozenset({">=", ">", "==", "===", "~="})
+          FIX = "set the floor per packaging/messagefoundry-webconsole/RELEASE.md step 2"
+
+          wheels = sys.argv[1:]
+          if len(wheels) != 1:
+              raise SystemExit(f"::error::expected exactly one console wheel, got {wheels!r}")
+          with zipfile.ZipFile(wheels[0]) as zf:
+              metas = [
+                  n for n in zf.namelist() if n.count("/") == 1 and n.endswith(".dist-info/METADATA")
+              ]
+              if len(metas) != 1:
+                  raise SystemExit(f"::error::expected one top-level METADATA in {wheels[0]}, got {metas!r}")
+              meta = HeaderParser().parsestr(zf.read(metas[0]).decode("utf-8"))
+
+          engine_reqs = []
+          for line in meta.get_all("Requires-Dist") or []:
+              try:
+                  req = Requirement(line)
+              except InvalidRequirement as exc:
+                  raise SystemExit(f"::error::unparseable Requires-Dist {line!r} ({exc})")
+              if canonicalize_name(req.name) != ENGINE:
+                  continue
+              # An optional-dependency entry, such as `messagefoundry[dev]; extra == "dev"`, is not
+              # installed with the console, so it is not the engine requirement. Skipped only when the
+              # marker names an extra AND is false with no extra requested: `extra == "x" or
+              # python_version >= "3"` names one and still applies to every install, so it stays and
+              # is refused. A marker naming no extra always stays, whatever platform runs this.
+              extra_only = (
+                  req.marker is not None
+                  and "extra" in str(req.marker)
+                  and not req.marker.evaluate({"extra": ""})
+              )
+              if extra_only:
+                  continue
+              engine_reqs.append(req)
+
+          if not engine_reqs:
+              raise SystemExit(
+                  f"::error::the console wheel declares no unconditional {ENGINE} requirement; {FIX}"
+              )
+          for req in engine_reqs:
+              if req.marker is not None:
+                  raise SystemExit(
+                      f"::error::the console's engine requirement {str(req)!r} carries an environment "
+                      f"marker, so an install the marker excludes gets no floor; {FIX}"
+                  )
+              if not any(spec.operator in FLOOR_OPERATORS for spec in req.specifier):
+                  raise SystemExit(
+                      f"::error::the console's engine requirement {str(req)!r} has no lower bound, so "
+                      f"pip may keep an older engine that lacks the seam's functions; {FIX}"
+                  )
+          print("console engine requirement: " + ", ".join(str(r) for r in engine_reqs))
+          PYFLOOR
+
       # CREATE-OR-UPDATE, and it must CREATE — unlike release-harness, this job has no `needs: release`,
       # so on a `webconsole-v*` tag NO engine job has run and NO GitHub release exists. A bare
       # `gh release upload` (what the harness can safely use, because `needs: release` guarantees the
