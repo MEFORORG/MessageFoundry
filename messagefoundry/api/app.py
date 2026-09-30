@@ -6966,6 +6966,9 @@ def create_app(
                 metrics_history=metrics_history,
                 graph_edges=graph_edges,
                 set_connection_flag=set_connection_flag,
+                list_approvals=list_approvals,
+                approve_action=approve_action,
+                reject_action=reject_action,
             ),
             admin=admin,
         )
