@@ -35,6 +35,7 @@ a `vX.Y.Z-rc1` pre-release tag.
 
 from __future__ import annotations
 
+import copy
 import functools
 import gzip
 import io
@@ -53,6 +54,7 @@ import pytest
 from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
 from tests._force_include import hatch_build
+from tests._verify_softeners import verification_softeners
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -2342,14 +2344,28 @@ def test_the_sbomqs_pin_blocks_and_only_the_score_is_advisory() -> None:
     release with no warning. The step is now split: the verify-and-install half blocks, and the
     scoring half keeps ``continue-on-error`` because SBOM quality is a signal, not a gate (ADR 0149).
 
+    Mutation: ``test_the_sbomqs_split_refuses_each_way_back_to_a_green_pin_failure`` below applies
+    each one to a copy of this job.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(RELEASE_YML.read_text(encoding="utf-8"))
+    assert "defaults" not in workflow, (
+        "release.yml acquired workflow-level `defaults`. If it sets a shell, that shell can drop "
+        "bash's errexit under the sbomqs install step (BACKLOG #1698); check it and extend this test."
+    )
+    assert _sbomqs_split_offences(_jobs()["release"]) == []
+
+
+def _sbomqs_split_offences(job: dict) -> list[str]:
+    """Why ``job`` lets an sbomqs pin failure pass as a green release; empty when it blocks.
+
     Located by CONTENT, not by name, so a rename cannot blind this: the blocking half is the step
     that fetches the sbomqs release asset, and the advisory half is the step that runs
-    ``sbomqs score``. Each must be exactly one step.
-
-    Mutation: add ``continue-on-error: true`` to the install step, drop it from the scoring step,
-    or fold the two back into one. Red here.
+    ``sbomqs score``. Each must be exactly one step. Factored out so the mutation arms below run it
+    on edited copies of the live job, not only on the live file, where it can only be seen passing.
     """
-    steps = [step for step in _jobs()["release"]["steps"] if isinstance(step, dict)]
+    steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
 
     def _body(step: dict) -> str:
         return _executed_shell(str(step.get("run") or ""))
@@ -2360,39 +2376,174 @@ def test_the_sbomqs_pin_blocks_and_only_the_score_is_advisory() -> None:
         if "releases/download" in _body(step) and "sbomqs" in _body(step)
     ]
     scores = [i for i, step in enumerate(steps) if "sbomqs score" in _body(step)]
-    assert len(installs) == 1, f"expected one sbomqs download step in `release`, found {installs}"
-    assert len(scores) == 1, f"expected one `sbomqs score` step in `release`, found {scores}"
+    if len(installs) != 1 or len(scores) != 1:
+        return [
+            f"expected one sbomqs download step and one `sbomqs score` step in `release`, found "
+            f"downloads at {installs} and scores at {scores}"
+        ]
     install_at, score_at = installs[0], scores[0]
     install, score = steps[install_at], steps[score_at]
+    name = install.get("name")
+    body = _body(install)
+    offences: list[str] = []
+    if install_at == score_at:
+        offences.append(
+            "the sbomqs download and the score share one step again. Whatever `continue-on-error` "
+            "that step carries is then wrong for one half: set, a pin failure is a green release; "
+            "unset, a low SBOM score blocks one (owner ruling 2026-09-30, BACKLOG #1698; ADR 0149)."
+        )
+    if "sha256sum -c" not in body:
+        offences.append(
+            f"step {name!r} fetches sbomqs but no longer runs `sha256sum -c`, so the blocking half "
+            "blocks on nothing"
+        )
+    if "continue-on-error" in install:
+        offences.append(
+            f"step {name!r} acquired `continue-on-error` ({install.get('continue-on-error')!r}). A "
+            "pin mismatch would then end as a green release with no warning, which the owner ruled "
+            "out on 2026-09-30 (BACKLOG #1698)."
+        )
+    if "if" in install:
+        offences.append(
+            f"step {name!r} acquired an `if:` ({install.get('if')!r}). A SKIPPED verification is "
+            "not a failed one, and the score below would then run whatever binary was already on "
+            "the runner's PATH."
+        )
+    # One layer down from `continue-on-error`: a `shell:` that drops bash's `-e` lets every line
+    # after a failed check run. The default shell keeps it.
+    shells = [
+        ("step `shell:`", install.get("shell")),
+        ("job `defaults.run.shell`", ((job.get("defaults") or {}).get("run") or {}).get("shell")),
+    ]
+    offences.extend(
+        f"step {name!r} runs under a {where} ({shell!r}), which can drop bash's errexit; the "
+        "default shell keeps it, so a failed check stops the step"
+        for where, shell in shells
+        if shell is not None
+    )
+    # Inside the body: `|| true`, `set +e`, a check run as a condition. Round-2 review finding 3
+    # (BACKLOG #1698): each passed every check above while a mismatch carried on to install. The
+    # helper is the one the in-repo pin rule in tests/test_ci_venv_pinning.py reads.
+    offences.extend(
+        f"step {name!r} lets a failed pin check carry on: {reason}"
+        for reason in verification_softeners(body)
+    )
+    if "||" in body:
+        offences.append(
+            f"step {name!r} carries a `||` fallback. The owner ruled that a pin failure blocks "
+            "(2026-09-30, BACKLOG #1698), so the install step has no fallback to fall to."
+        )
+    if score.get("continue-on-error") is not True:
+        offences.append(
+            f"step {score.get('name')!r} lost `continue-on-error: true`. The SBOM score is a "
+            "signal, not a gate (ADR 0149), so a low score must not block a release."
+        )
+    if install_at != score_at and "releases/download" in _body(score):
+        offences.append(
+            f"step {score.get('name')!r} downloads a release asset under `continue-on-error`, "
+            "which is the shape this split removed: a fetch in an advisory step cannot block on "
+            "its pin"
+        )
+    if install_at > score_at:
+        offences.append("the sbomqs score runs before the step that installs sbomqs")
+    return offences
 
-    assert install_at != score_at, (
-        "the sbomqs download and the score share one step again. Whatever `continue-on-error` that "
-        "step carries is then wrong for one half: set, a pin failure is a green release; unset, a "
-        "low SBOM score blocks one (owner ruling 2026-09-30, BACKLOG #1698; ADR 0149)."
-    )
-    assert "sha256sum -c" in _body(install), (
-        f"step {install.get('name')!r} fetches sbomqs but no longer runs `sha256sum -c`, so the "
-        "blocking half blocks on nothing"
-    )
-    assert "continue-on-error" not in install, (
-        f"step {install.get('name')!r} acquired `continue-on-error` "
-        f"({install.get('continue-on-error')!r}). A pin mismatch would then end as a green release "
-        "with no warning, which the owner ruled out on 2026-09-30 (BACKLOG #1698)."
-    )
-    assert "if" not in install, (
-        f"step {install.get('name')!r} acquired an `if:` ({install.get('if')!r}). A SKIPPED "
-        "verification is not a failed one, and the score below would then run whatever binary was "
-        "already on the runner's PATH."
-    )
-    assert score.get("continue-on-error") is True, (
-        f"step {score.get('name')!r} lost `continue-on-error: true`. The SBOM score is a signal, "
-        "not a gate (ADR 0149), so a low score must not block a release."
-    )
-    assert "releases/download" not in _body(score), (
-        f"step {score.get('name')!r} downloads a release asset under `continue-on-error`, which "
-        "is the shape this split removed: a fetch in an advisory step cannot block on its pin"
-    )
-    assert install_at < score_at, "the sbomqs score runs before the step that installs sbomqs"
+
+def _release_step(job: dict, needle: str) -> dict:
+    """The one step in ``job`` whose executed shell contains ``needle``."""
+    found = [
+        step
+        for step in job["steps"]
+        if isinstance(step, dict) and needle in _executed_shell(str(step.get("run") or ""))
+    ]
+    assert len(found) == 1, f"expected one step running {needle!r}, found {len(found)}"
+    return found[0]
+
+
+def _edit_install_body(old: str, new: str) -> Callable[[dict], None]:
+    def mutate(job: dict) -> None:
+        step = _release_step(job, "sha256sum -c")
+        assert old in step["run"], f"the mutation's anchor {old!r} is gone from the live step"
+        step["run"] = step["run"].replace(old, new)
+
+    return mutate
+
+
+def _set_on_install(key: str, value: object) -> Callable[[dict], None]:
+    def mutate(job: dict) -> None:
+        _release_step(job, "sha256sum -c")[key] = value
+
+    return mutate
+
+
+def _drop_score_softening(job: dict) -> None:
+    del _release_step(job, "sbomqs score")["continue-on-error"]
+
+
+def _fold_score_into_install(job: dict) -> None:
+    score = _release_step(job, "sbomqs score")
+    install = _release_step(job, "sha256sum -c")
+    install["run"] += score["run"]
+    install["continue-on-error"] = True
+    job["steps"].remove(score)
+
+
+def _set_job_shell(job: dict) -> None:
+    job["defaults"] = {"run": {"shell": "bash {0}"}}
+
+
+_SBOMQS_VERIFY = 'echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -'
+
+
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        (_set_on_install("continue-on-error", True), "acquired `continue-on-error`"),
+        (_set_on_install("if", "false"), "acquired an `if:`"),
+        (_set_on_install("shell", "bash {0}"), "step `shell:`"),
+        (_set_job_shell, "job `defaults.run.shell`"),
+        (_drop_score_softening, "lost `continue-on-error: true`"),
+        (_fold_score_into_install, "share one step again"),
+        (_edit_install_body(_SBOMQS_VERIFY, _SBOMQS_VERIFY + " || true"), "carry on"),
+        (_edit_install_body(_SBOMQS_VERIFY, _SBOMQS_VERIFY + " || :"), "carry on"),
+        (_edit_install_body(_SBOMQS_VERIFY, "set +e\n" + _SBOMQS_VERIFY), "carry on"),
+        (
+            _edit_install_body(_SBOMQS_VERIFY, f"if ! {_SBOMQS_VERIFY}; then echo bad; fi"),
+            "carry on",
+        ),
+        (
+            _edit_install_body("tar -xzf", 'test -s "${asset}" || exit 1\ntar -xzf'),
+            "carries a `||` fallback",
+        ),
+    ],
+    ids=[
+        "continue-on-error",
+        "if-false",
+        "step-shell-without-e",
+        "job-shell-without-e",
+        "score-made-blocking",
+        "folded-back-into-one-step",
+        "or-true",
+        "or-colon",
+        "set-plus-e",
+        "as-a-condition",
+        "any-or-fallback",
+    ],
+)
+def test_the_sbomqs_split_refuses_each_way_back_to_a_green_pin_failure(
+    mutate: Callable[[dict], None], needle: str
+) -> None:
+    """Each mutation of the LIVE release job that lets a pin failure pass must be refused.
+
+    Round-2 review finding 3 (BACKLOG #1698): ``sha256sum -c - || true`` in the install step passed
+    the split test, because the test asked only whether the check was PRESENT and the step
+    UNSOFTENED at step level. The mutations run on a deep copy of the parsed workflow, so the arms
+    exercise the real step, and a drift in it moves them.
+    """
+    job = copy.deepcopy(_jobs()["release"])
+    mutate(job)
+    offences = _sbomqs_split_offences(job)
+    assert any(needle in o for o in offences), f"expected {needle!r} among {offences}"
 
 
 def test_the_harness_smoke_runs_the_install_resolution_check() -> None:

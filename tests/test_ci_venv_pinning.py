@@ -116,6 +116,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._verify_softeners import logical_lines, verification_softeners
+
 _REPO = Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO / ".github" / "workflows"
 
@@ -1138,8 +1140,9 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
 #: A bare lowercase 64-hex token — the shape of an in-repo SHA-256 pin, as `sha256sum -c` wants it.
 _SHA256_LITERAL = re.compile(r"\b[0-9a-f]{64}\b")
 
-#: A `$VAR` or `${VAR}` reference, for binding a verification line back to one of those assignments.
-_VAR_REF = re.compile(r"\$\{?(\w+)\}?")
+#: A plain `$VAR` or `${VAR}` reference, the only two forms the walk expands. A `${VAR:-x}` or any
+#: other parameter expansion is left as written, so its `$` survives and the rule refuses it.
+_VAR_REF = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
 
 #: The command that CHECKS a digest.
 _CHECKSUM_VERIFY = "sha256sum -c"
@@ -1159,22 +1162,48 @@ _SAME_ORIGIN_CHECKSUM_FETCH = re.compile(
 )
 
 
-#: Any assignment at the start of a line, simple or not. One the simple pattern below cannot read
-#: makes the walk FORGET the name rather than keep its earlier value: a stale value would let the
-#: rule vouch for a file or a digest bash never sees.
-_ANY_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?(\w+)=")
-
 #: `NAME=value`, `NAME="value"` or `NAME='value'` on a line of its own -- the only assignments the
 #: walk resolves. A value holding a command substitution is decided at run time, so it is forgotten.
 _SIMPLE_ASSIGNMENT = re.compile(r"""^\s*(?:export\s+)?(\w+)=("[^"]*"|'[^']*'|[^\s;&|]*)\s*$""")
 
-#: The file `curl` writes: `-o FILE` or `--output FILE`, the value quoted or bare.
-_CURL_OUTPUT = re.compile(r"""\bcurl\b[^\n]*?\s(?:-o|--output)[\s=]+("[^"]*"|'[^']*'|\S+)""")
+#: Any `NAME=` or `NAME+=` on a line that is NOT one simple assignment: `a; f=x`, `true && f=x`,
+#: `declare f=x`, `f=x cmd`. The walk cannot tell which of these bash applies, or when.
+_OTHER_ASSIGNMENT = re.compile(r"\b([A-Za-z_]\w*)\+?=")
+
+#: Builtins that set a name with no `=` the walk can read: `read f`, `for f in ...`, `printf -v f`.
+#: Every name on such a line is treated as set opaquely.
+_OPAQUE_SETTERS = re.compile(
+    r"\b(?:read|declare|typeset|local|readonly|export|mapfile|readarray|unset|for|select"
+    r"|getopts|printf|let)\b"
+)
+
+#: `eval`, `source` or `.` in command position can set ANY name, so after one nothing resolves.
+_OPAQUE_ALL = re.compile(r"(?:^|[;&|(]\s*)(?:eval|source|\.)\s")
 
 #: A digest followed by the file `sha256sum -c` checks it against (`<digest>  <file>`, with the
 #: optional `*` binary marker). Read AFTER variable expansion, so `${SBOMQS_SHA256}  ${asset}`
 #: resolves to the literal and the filename it names.
 _DIGEST_AND_FILE = re.compile(r"""\b[0-9a-f]{64}\s+\*?([^\s"'|]+)""")
+
+#: List and pipeline operators, longest first, which end a command's argument words.
+_SHELL_OPERATORS = ("||", "&&", "|", ";", "&", "(", ")")
+
+#: Short curl options that take a value. A flag cluster stops at the first one, and the rest of the
+#: cluster, or else the next word, is its value: `-sSfLo FILE` and `-oFILE` both write FILE.
+_CURL_SHORT_WITH_VALUE = frozenset("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+
+#: Curl options that put bytes somewhere the walk does not name, so each is REPORTED.
+_CURL_UNREAD_SHORT = frozenset("OJK:")
+_CURL_UNREAD_LONG = frozenset(
+    {
+        "--remote-name",
+        "--remote-name-all",
+        "--remote-header-name",
+        "--output-dir",
+        "--config",
+        "--next",
+    }
+)
 
 
 def _unquote(value: str) -> str:
@@ -1185,33 +1214,179 @@ def _unquote(value: str) -> str:
 
 def _expand(text: str, env: dict[str, str]) -> str:
     """Substitute ``$VAR`` / ``${VAR}`` from ``env``; an unknown name is left as written."""
-    return _VAR_REF.sub(lambda m: env.get(m.group(1), m.group(0)), text)
+    return _VAR_REF.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), text)
 
 
-def _walk_step(body: str) -> tuple[set[str], list[tuple[str, str]]]:
-    """``(files curl -o wrote, [(verify line, that line expanded)])``, read IN ORDER.
+def _shell_words(line: str) -> list[tuple[str, bool]]:
+    """``line`` split into ``(word, is_operator)`` pairs, with quotes removed from each word.
+
+    Enough of bash's word splitting to find a curl's arguments: quotes, backslash escapes and the
+    list and pipeline operators. A `>&` or `&>` redirection stays inside its word.
+    """
+    words: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    started = False
+    quote = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"' and line[i + 1 : i + 2] in ('"', "\\", "$", "`"):
+                i += 1
+                buf.append(line[i])
+            else:
+                buf.append(ch)
+            i += 1
+            continue
+        if ch in "\"'":
+            quote, started = ch, True
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(line):
+            buf.append(line[i + 1])
+            started = True
+            i += 2
+            continue
+        op = next((o for o in _SHELL_OPERATORS if line.startswith(o, i)), None)
+        if op == "&" and (line[i - 1 : i] in ("<", ">") or line[i + 1 : i + 2] == ">"):
+            op = None
+        if ch.isspace() or op:
+            if started:
+                words.append(("".join(buf), False))
+                buf, started = [], False
+            if op:
+                words.append((op, True))
+                i += len(op)
+            else:
+                i += 1
+            continue
+        buf.append(ch)
+        started = True
+        i += 1
+    if started:
+        words.append(("".join(buf), False))
+    return words
+
+
+def _curl_args(args: list[str]) -> tuple[list[str], list[str]]:
+    """``(files one curl writes with -o or --output, [shapes whose output the walk cannot name])``."""
+    outputs: list[str] = []
+    shapes: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            name, eq, value = arg.partition("=")
+            if name == "--output":
+                if not eq:
+                    i += 1
+                    value = args[i] if i < len(args) else ""
+                outputs.append(value)
+            elif name in _CURL_UNREAD_LONG:
+                shapes.append(name)
+        elif arg.startswith("-") and len(arg) > 1:
+            cluster = arg[1:]
+            for j, flag in enumerate(cluster):
+                if flag in _CURL_UNREAD_SHORT:
+                    shapes.append(f"-{flag}")
+                if flag in _CURL_SHORT_WITH_VALUE:
+                    value = cluster[j + 1 :]
+                    if not value:
+                        i += 1
+                        value = args[i] if i < len(args) else ""
+                    if flag == "o":
+                        outputs.append(value)
+                    break
+        elif arg.startswith((">", "1>")):
+            shapes.append("stdout redirected with `>`")
+        i += 1
+    files = [o for o in outputs if o not in ("", "-")]
+    shapes.extend(f"-o {o or '<no value>'}" for o in outputs if o in ("", "-"))
+    if not outputs and not shapes:
+        shapes.append("no -o, so it writes to stdout")
+    return files, shapes
+
+
+def _downloads(line: str) -> tuple[list[str], list[str]]:
+    """``(files the curls on ``line`` write, [downloads whose output the walk cannot name])``.
+
+    A download the walk cannot name is REPORTED, never skipped: that includes every `wget` and
+    `gh release download`, and a curl with `-O`, `--output-dir`, `-o -` or no `-o` at all.
+    """
+    words = _shell_words(line)
+    files: list[str] = []
+    unread: list[str] = []
+    for at, (word, is_op) in enumerate(words):
+        if is_op:
+            continue
+        tool = word.rsplit("/", 1)[-1]
+        following = [w for w, _op in words[at + 1 : at + 3]]
+        if tool in ("wget", "aria2c") or (tool == "gh" and following == ["release", "download"]):
+            unread.append(f"`{tool}` ({line.strip()!r})")
+            continue
+        if tool != "curl":
+            continue
+        args: list[str] = []
+        for arg, arg_is_op in words[at + 1 :]:
+            if arg_is_op:
+                break
+            args.append(arg)
+        written, shapes = _curl_args(args)
+        files.extend(written)
+        unread.extend(f"curl {shape} ({line.strip()!r})" for shape in shapes)
+    return files, unread
+
+
+def _opaque_names(lines: list[str]) -> set[str] | None:
+    """Names set in a way the walk cannot read; ``None`` when ANY name may be (``eval``, ``.``)."""
+    names: set[str] = set()
+    for line in lines:
+        if _SIMPLE_ASSIGNMENT.match(line):
+            continue
+        if _OPAQUE_ALL.search(line):
+            return None
+        names.update(m.group(1) for m in _OTHER_ASSIGNMENT.finditer(line))
+        if _OPAQUE_SETTERS.search(line):
+            names.update(re.findall(r"[A-Za-z_]\w*", line))
+    return names
+
+
+def _walk_step(body: str) -> tuple[set[str], list[str], list[tuple[str, str]]]:
+    """``(files curl wrote, [unread downloads], [(verify line, that line expanded)])``, IN ORDER.
 
     Each line is expanded against the assignments made BEFORE it, the way bash runs it, so a name
     reassigned between the download and the check resolves to what each line actually sees.
+
+    FAIL-CLOSED on names. Only a whole-line simple assignment is resolved, and only for a name
+    nothing else in the step sets. A name ALSO set on a shared line, by `&& f=`, `declare`, `read`
+    or `for`, is never resolved, even where the simple assignment stands alone. So its `$` survives
+    expansion, and the rule refuses what it names rather than trusting a value bash may not see.
     """
+    lines = logical_lines(body)
+    opaque = _opaque_names(lines)
     env: dict[str, str] = {}
     written: set[str] = set()
+    unread: list[str] = []
     verifies: list[tuple[str, str]] = []
-    for line in body.splitlines():
-        for m in _CURL_OUTPUT.finditer(line):
-            written.add(_expand(_unquote(m.group(1)), env))
+    for line in lines:
+        files, shapes = _downloads(line)
+        written.update(_expand(f, env) for f in files)
+        unread.extend(shapes)
         if _CHECKSUM_VERIFY in line:
             verifies.append((line.strip(), _expand(line, env)))
-        assigned = _ANY_ASSIGNMENT.match(line)
-        if assigned is None:
-            continue
         simple = _SIMPLE_ASSIGNMENT.match(line)
-        value = _unquote(simple.group(2)) if simple else None
-        if value is None or "$(" in value or "`" in value:
-            env.pop(assigned.group(1), None)
+        if simple is None:
+            continue
+        name, value = simple.group(1), _unquote(simple.group(2))
+        if opaque is None or name in opaque or "$(" in value or "`" in value:
+            env.pop(name, None)
         else:
-            env[assigned.group(1)] = _expand(value, env)
-    return written, verifies
+            env[name] = _expand(value, env)
+    return written, unread, verifies
 
 
 def _oidc_download_offences(body: str) -> list[str]:
@@ -1226,15 +1401,23 @@ def _oidc_download_offences(body: str) -> list[str]:
     `sha256sum -c` reads `<digest>  <file>` and checks THAT file, so a step pinning one name and
     downloading another passed while verifying nothing it went on to install.
 
-    LIMITS, stated rather than left implicit: only `curl -o` / `--output` on the curl line itself is
-    read as a download target (not `-O`, `wget`, `--output-dir`, a `-o` on a continuation line, or
-    `-o` fused into a flag cluster such as `-sSfLo`), and only a `<digest>  <file>` spelled on the
-    verify line is read as the verified name. Each unread shape is REPORTED, not waved through, so a
-    gap costs a false positive a reader sees. Control flow is not modelled: an assignment inside an
-    `if` counts as made.
+    EVERY failed check must stop the step (owner ruling 2026-09-30, BACKLOG #1698). A verify line
+    ending `|| true`, one run as an `if` condition, or a `set +e` anywhere in the step prints FAILED
+    and goes on to install the bytes. `tests/_verify_softeners.py` holds those shapes, and
+    `tests/test_release_pipeline.py` reads the same helper for the sbomqs split.
+
+    WHAT IS READ, AND WHAT IS REPORTED INSTEAD. A curl's target is read from `-o FILE`, `-oFILE`,
+    `--output FILE`, `--output=FILE` and a cluster ending in `o` such as `-sSfLo FILE`, with
+    backslash continuations joined first. Every other download shape is REPORTED as unread, not
+    waved through: `-O`, `-J`, `--output-dir`, `-K`, `-o -`, a stdout redirect, a curl with no `-o`,
+    and every `wget` or `gh release download`. A name the walk cannot resolve to a literal, because
+    it is unassigned or set by anything but one whole-line simple assignment, is also an offence. So
+    a gap costs a false positive a reader sees. Only a `<digest>  <file>` spelled on the verify line
+    is read as the verified name. Control flow is not modelled: an assignment inside an `if` counts
+    as made.
     """
     offences: list[str] = []
-    written, verifies = _walk_step(body)
+    written, unread, verifies = _walk_step(body)
     if not verifies:
         offences.append(
             f"carries no {_CHECKSUM_VERIFY!r}, so nothing compares the bytes against a literal, "
@@ -1247,6 +1430,23 @@ def _oidc_download_offences(body: str) -> list[str]:
             f"runs {_CHECKSUM_VERIFY!r} but the digest it checks traces to no in-repo SHA-256 "
             f"literal, inside `id-token: write`: {unbound}"
         )
+    if unread:
+        offences.append(
+            f"downloads in a shape the rule cannot read, so no pinned digest can be bound to what it "
+            f"wrote: {unread}. Spell each download `curl ... -o FILE`"
+        )
+    unresolved = sorted(
+        {f for f in written if "$" in f} | {raw for raw, expanded in verifies if "$" in expanded}
+    )
+    if unresolved:
+        offences.append(
+            f"names a downloaded file or a checked digest through a variable the rule cannot "
+            f"resolve to a literal: {unresolved}. Assign it once, on a line of its own"
+        )
+    offences.extend(
+        f"lets a failed {_CHECKSUM_VERIFY!r} carry on to install the bytes: {reason}"
+        for reason in verification_softeners(body)
+    )
     verified = {
         m.group(1) for _raw, expanded in verifies for m in _DIGEST_AND_FILE.finditer(expanded)
     }
@@ -1365,6 +1565,15 @@ echo "${{PIN}}  ${{asset}}" | sha256sum -c -
 tar -xzf "${{asset}}" tool
 """
 
+#: The verify line of `_GOOD_PINNED_BODY`, which the softening arms below rewrite.
+_GOOD_VERIFY = 'echo "${PIN}  ${asset}" | sha256sum -c -'
+
+#: A pinned, verified download of `a.tgz`, for arms that add a second download beside it.
+_VERIFIED_A = f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
+echo "${{PIN}}  a.tgz" | sha256sum -c -
+"""
+
 
 @pytest.mark.parametrize(
     ("label", "body", "needle"),
@@ -1449,6 +1658,122 @@ echo "${REMOTE_DIGEST}  a.tgz" | sha256sum -c -
 """,
             "traces to no in-repo SHA-256 literal",
         ),
+        # Round-2 finding 1: a second download the old one-regex read could not see, beside a
+        # verified `curl -o`. Each is either READ, and then unverified, or REPORTED as unread.
+        (
+            "cluster-ending-in-o",
+            _VERIFIED_A
+            + 'curl -sSfLo b.tgz "https://github.com/o/r/releases/download/v1.0/b.tgz"\n',
+            "no in-repo digest checks it",
+        ),
+        (
+            "remote-name",
+            _VERIFIED_A + 'curl -sSfLO "https://github.com/o/r/releases/download/v1.0/b.tgz"\n',
+            "cannot read",
+        ),
+        (
+            "second-output-on-one-curl",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL -o a.tgz "https://github.com/o/r/releases/download/v1.0/a.tgz" --output b.tgz "https://github.com/o/r/releases/download/v1.0/b.tgz"
+echo "${{PIN}}  a.tgz" | sha256sum -c -
+""",
+            "no in-repo digest checks it",
+        ),
+        (
+            "output-on-a-continuation-line",
+            _VERIFIED_A + 'curl -sSfL "https://github.com/o/r/releases/download/v1.0/b.tgz" \\\n'
+            "  -o b.tgz\n",
+            "no in-repo digest checks it",
+        ),
+        (
+            "output-dir",
+            _VERIFIED_A + "curl -sSfL --output-dir /tmp/x -o a.tgz "
+            '"https://github.com/o/r/releases/download/v1.0/b.tgz"\n',
+            "cannot read",
+        ),
+        (
+            "stdout-into-tar",
+            _VERIFIED_A + 'curl -sSfL "https://github.com/o/r/releases/download/v1.0/b.tgz" '
+            "-o - | tar -xz\n",
+            "cannot read",
+        ),
+        (
+            "wget",
+            _VERIFIED_A + 'wget -q "https://github.com/o/r/releases/download/v1.0/b.tgz"\n',
+            "cannot read",
+        ),
+        # Round-2 finding 2: a name set in a way the walk cannot read. Each used to resolve to its
+        # earlier, stale value, or to itself as a literal on both sides.
+        (
+            "same-line-reassignment",
+            f"""PIN={_PINNED_DIGEST}
+f=a.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o "$f"
+f=b.tgz; echo "${{PIN}}  $f" | sha256sum -c -
+""",
+            "cannot resolve",
+        ),
+        (
+            "and-list-reassignment",
+            f"""PIN={_PINNED_DIGEST}
+f=a.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o "$f"
+true && f=b.tgz
+echo "${{PIN}}  $f" | sha256sum -c -
+""",
+            "cannot resolve",
+        ),
+        (
+            "declare-reassignment",
+            f"""PIN={_PINNED_DIGEST}
+f=a.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o "$f"
+declare f=b.tgz
+echo "${{PIN}}  $f" | sha256sum -c -
+""",
+            "cannot resolve",
+        ),
+        (
+            "read-reassignment",
+            f"""PIN={_PINNED_DIGEST}
+f=a.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o "$f"
+read -r f <<< b.tgz
+echo "${{PIN}}  $f" | sha256sum -c -
+""",
+            "cannot resolve",
+        ),
+        (
+            "unassigned-on-both-sides",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o "$f"
+echo "${{PIN}}  $f" | sha256sum -c -
+""",
+            "cannot resolve",
+        ),
+        (
+            "parameter-expansion",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o "${{f:-a.tgz}}"
+echo "${{PIN}}  ${{f:-a.tgz}}" | sha256sum -c -
+""",
+            "cannot resolve",
+        ),
+        # Round-2 finding 3: the check is pinned and bound to the right file, and a mismatch still
+        # carries on to install. The owner ruled on 2026-09-30 that a pin failure blocks.
+        *(
+            (label, _GOOD_PINNED_BODY.replace(_GOOD_VERIFY, verify), "carry on to install")
+            for label, verify in (
+                ("or-true", _GOOD_VERIFY + " || true"),
+                ("or-colon", _GOOD_VERIFY + " || :"),
+                ("and-list", _GOOD_VERIFY + ' && tar -xzf "${asset}" tool'),
+                ("or-true-on-a-continuation-line", _GOOD_VERIFY + " \\\n  || true"),
+                ("as-a-condition", f"if ! {_GOOD_VERIFY}; then echo mismatch; fi"),
+                ("ignore-missing", _GOOD_VERIFY.replace("-c -", "-c --ignore-missing -")),
+                ("set-plus-e", "set +e\n" + _GOOD_VERIFY),
+                ("set-plus-o-errexit", "set +o errexit\n" + _GOOD_VERIFY),
+            )
+        ),
     ],
 )
 def test_the_oidc_pin_rule_refuses_a_digest_bound_to_another_file(
@@ -1466,9 +1791,28 @@ def test_the_oidc_pin_rule_refuses_a_digest_bound_to_another_file(
     )
 
 
-def test_the_oidc_pin_rule_accepts_the_pinned_shape() -> None:
-    """The control arm: the shape release.yml uses passes, so the refusals above discriminate."""
-    assert _oidc_download_offences(_executed_shell(_GOOD_PINNED_BODY)) == []
+_GOOD_CURL = 'curl -sSfL "https://github.com/o/r/releases/download/v1.0/${asset}" -o "${asset}"'
+
+
+@pytest.mark.parametrize(
+    "curl",
+    [
+        _GOOD_CURL,
+        'curl -sSfLo "${asset}" "https://github.com/o/r/releases/download/v1.0/${asset}"',
+        'curl -sSfL --output="${asset}" "https://github.com/o/r/releases/download/v1.0/${asset}"',
+        'curl -sSfL "https://github.com/o/r/releases/download/v1.0/${asset}" \\\n  -o "${asset}"',
+    ],
+    ids=["as-release-yml-spells-it", "cluster-ending-in-o", "output-equals", "continuation-line"],
+)
+def test_the_oidc_pin_rule_accepts_the_pinned_shape(curl: str) -> None:
+    """The control arms: each READABLE spelling of a pinned download passes.
+
+    The first is the shape release.yml uses. The rest are shapes the walk reads, so the refusals
+    above discriminate on the defect and not on how the curl is spelled.
+    """
+    assert _GOOD_CURL in _GOOD_PINNED_BODY
+    body = _GOOD_PINNED_BODY.replace(_GOOD_CURL, curl)
+    assert _oidc_download_offences(_executed_shell(body)) == []
 
 
 def _run_blocks(workflow: str) -> list[tuple[str, str]]:
