@@ -2277,21 +2277,16 @@ def toolkit_bundle_step(tmp_path: Path) -> tuple[str, Path, dict[str, str]]:
     """A usable bash and the bundle-move step, written as BYTES, for the leak-gate fixture's
     reasons: ``require_bash`` fails loudly, and ``write_text`` would hand bash CRLF lines.
 
-    The step re-runs the member gate as ``python scripts/release/forbidden_members.py``, so the env
-    puts a ``python`` shim for THIS interpreter first on PATH, and each work directory gets a copy
-    of the real gate script (see ``_toolkit_dist``). The shim is not the runner's python, but the
-    gate is stdlib-only, so any 3.14 runs it the same way.
+    The step re-runs the member gate as ``python scripts/release/forbidden_members.py``, so THIS
+    interpreter's directory goes first on PATH, as tests/test_release_member_gate.py's
+    ``_run_control`` does, and each work directory gets a copy of the real gate script (see
+    ``_toolkit_dist``). The gate is stdlib-only, so any 3.14 runs it the same way.
     """
     script = tmp_path / "toolkit_bundle.sh"
     body = _step_script_by_prefix(_TOOLKIT_BUNDLE_STEP_PREFIX, "the toolkit bundle move")
     script.write_bytes(body.encode("utf-8"))
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    shim = shim_dir / "python"
-    shim.write_bytes(f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" "$@"\n'.encode())
-    shim.chmod(0o755)
     env = _posix_tool_env()
-    env["PATH"] = os.pathsep.join([str(shim_dir), env["PATH"]])
+    env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env["PATH"]])
     return require_bash(tmp_path, env), script, env
 
 
@@ -2343,16 +2338,17 @@ def test_the_toolkit_bundle_step_moves_the_bundle_and_passes_a_wheel_only_dir(
     [
         # mv exits non-zero on an unmatched glob and names it.
         ([_TOOLKIT_WHEEL_NAME], False, "toolkit-dist/*.sigstore*"),
-        ([_TOOLKIT_BUNDLE_NAME], False, "toolkit-dist/ is EMPTY"),
-        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, "stray.txt"], False, "holds stray.txt"),
+        ([_TOOLKIT_BUNDLE_NAME], False, "it holds: nothing"),
+        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, "stray.txt"], False, "stray.txt"),
+        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, ".hidden"], False, ".hidden"),
         (
             [_TOOLKIT_WHEEL_NAME, _SECOND_TOOLKIT_WHEEL, _TOOLKIT_BUNDLE_NAME],
             False,
-            "holds 2 wheels",
+            _SECOND_TOOLKIT_WHEEL,
         ),
         ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME], True, "maintainer-internal"),
     ],
-    ids=["no-bundle", "no-wheel", "stray-file", "two-wheels", "leaking-wheel"],
+    ids=["no-bundle", "no-wheel", "stray-file", "hidden-file", "two-wheels", "leaking-wheel"],
 )
 def test_the_toolkit_bundle_step_refuses(
     toolkit_bundle_step: tuple[str, Path, dict[str, str]],

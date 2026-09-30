@@ -4122,26 +4122,9 @@ jobs:
       - name: The toolkit wheel carries its LICENSE and NOTICE
         run: |
           # BACKLOG #1192. tests/test_packaging.py checks the declaration and the source files; only a
-          # real build shows where hatchling puts them. A parent path once landed as
-          # `dist-info/licenses/../../LICENSE`, so require the exact member names.
-          python - <<'PY'
-          import glob
-          import sys
-          import zipfile
-
-          wheels = glob.glob("toolkit-dist/*.whl")
-          if len(wheels) != 1:
-              sys.exit(f"::error::expected one toolkit wheel, found {wheels}")
-          with zipfile.ZipFile(wheels[0]) as zf:
-              names = set(zf.namelist())
-          missing = [
-              n for n in ("LICENSE", "NOTICE")
-              if not any(m.endswith(".dist-info/licenses/" + n) and "/../" not in m for m in names)
-          ]
-          if missing:
-              sys.exit(f"::error::{wheels[0]} ships no dist-info/licenses/ {missing}")
-          print(f"{wheels[0]} carries LICENSE and NOTICE under dist-info/licenses/")
-          PY
+          # real build shows where hatchling puts them. The same script runs in release.yml's
+          # toolkit gate; tests/test_wheel_license_files.py covers what it refuses.
+          python scripts/release/wheel_license_files.py 'toolkit-dist/*.whl'
 
       - name: Positive control -- the gate must REFUSE a poisoned copy
         run: |

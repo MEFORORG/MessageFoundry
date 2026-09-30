@@ -36,7 +36,6 @@ both ``testpaths`` roots names the next module to re-derive the descent.
 
 from __future__ import annotations
 
-import copy
 import functools
 import re
 import subprocess
@@ -915,18 +914,13 @@ def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> 
 _TOOLKIT_PYPROJECT = _REPO / "packaging" / "messagefoundry-toolkit" / "pyproject.toml"
 
 
-@functools.cache
-def _toolkit_project_parsed() -> dict[str, Any]:
+def _toolkit_project() -> dict[str, Any]:
+    """The toolkit pyproject's ``[project]`` table, parsed fresh on each call (a small file), so a
+    test that mutates it cannot change what a later test reads."""
     project: dict[str, Any] = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))[
         "project"
     ]
     return project
-
-
-def _toolkit_project() -> dict[str, Any]:
-    """The toolkit pyproject's ``[project]`` table, parsed once, handed out as a COPY so a test
-    that mutates it cannot change what a later test reads."""
-    return copy.deepcopy(_toolkit_project_parsed())
 
 
 def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:

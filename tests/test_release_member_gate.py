@@ -696,10 +696,10 @@ def test_the_toolkit_gate_keeps_its_id_and_the_upload_reads_it() -> None:
     steps = _steps(_jobs()["release"])
     gates = [s for s in steps if "toolkit-dist/" in str(s.get("run") or "")]
     gates = [s for s in gates if _GATE_INVOCATION in str(s.get("run") or "")]
-    # The FIRST toolkit gate carries the id. A later re-run on the same directory (the bundle-move
-    # step after signing, BACKLOG #1192) does not, as the engine's dist-pub/ re-gate does not.
-    assert gates and gates[0].get("id") == "toolkit-member-gate", gates
-    assert [s.get("id") for s in gates].count("toolkit-member-gate") == 1, gates
+    # Two steps gate toolkit-dist/: the member gate before signing, and the bundle-move step after
+    # it (BACKLOG #1192). Unlike the engine's dist-pub/ re-gate, toolkit-dist/ IS uploaded below, so
+    # each needs its own id and the upload guard must read both.
+    assert [s.get("id") for s in gates] == ["toolkit-member-gate", "toolkit-bundle-move"], gates
     uploads = [
         s
         for s in steps
@@ -708,7 +708,8 @@ def test_the_toolkit_gate_keeps_its_id_and_the_upload_reads_it() -> None:
     ]
     assert len(uploads) == 1, "the release job's dry-run upload no longer carries toolkit-dist/"
     cond = str(uploads[0].get("if") or "")
-    assert "steps.toolkit-member-gate.outcome != 'failure'" in cond, cond
+    for gate_id in ("toolkit-member-gate", "toolkit-bundle-move"):
+        assert f"steps.{gate_id}.outcome != 'failure'" in cond, cond
 
 
 def test_the_member_gate_step_keeps_the_id_that_guard_depends_on() -> None:
