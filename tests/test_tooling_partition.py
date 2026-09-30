@@ -73,6 +73,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_adaptive_attributes_doc_drift.py",
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
+        # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
+        # ENGINE pull request -- that is where every entry is written -- and does not trip the tooling
+        # job's path gate, so listed as tooling this would face nothing on the change that breaks it.
+        # It loads scripts/release/changelog_fragments.py by path; that is the RULE, not its subject.
+        "test_changelog_fragments.py",
         # Reads messagefoundry_webconsole/static/app.js off disk. That is shipped product source by
         # this file's own stated rule -- the `_webconsole` arm of _ENGINE_IMPORT above exists to say
         # the console counts as the product -- so a test whose SUBJECT is that file is engine-subject

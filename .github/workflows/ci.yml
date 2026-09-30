@@ -274,7 +274,8 @@ jobs:
             tests/test_operator_docs_no_warning_sign.py
             tests/test_docs_upstream_hop_ack.py
             tests/test_dangerous_functionality_doc.py
-            tests/test_risky_component_designation.py"
+            tests/test_risky_component_designation.py
+            tests/test_changelog_fragments.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
           # the ruling above says removing a guard is a different act from adding one. They were
           # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,
@@ -446,6 +447,43 @@ jobs:
       - name: Stale repo slug (pre-rename vault path)
         if: runner.os == 'Linux'
         run: python scripts/quality/stale_repo_slug_check.py
+
+      # Changelog fragments against the base branch (BACKLOG #2080). A pull request adds its entry
+      # as a file under changelog.d/ instead of editing CHANGELOG.md, and the release pull request
+      # folds them in. Fragment FORMAT is tests/test_changelog_fragments.py's job, which runs in the
+      # suite and, on a docs-only pull request, in DOC_GUARDS below. This step covers the half that
+      # needs the BASE branch: it REFUSES a pull request that adds a `## [x.y.z]` heading while
+      # fragments remain (a release pull request that forgot `assemble`; release.yml's tag guard is
+      # the backstop), and WARNS, never fails, on a pull request that still edits CHANGELOG.md.
+      # Not paths-filtered: a pull request touching only .md is docs-only. Stdlib only. It runs in
+      # merge_group too, so a fragment merged after a release pull request's last PR run still stops
+      # that release in the queue rather than at the tag.
+      # THE BASE IS THE CHECKED-OUT COMMIT'S FIRST PARENT, not the base branch's tip. Both events
+      # check out a merge commit built against the base as it was then; the tip can have moved
+      # since, and diffing against it would warn on every pull request whose base gained an entry.
+      # Measured on this branch: main gained 37 CHANGELOG.md lines in 8 commits, and a tip diff
+      # warned on a branch that never touched the file. The parent is read off the commit object.
+      # It is usually already here (the ledger gate fetched main), so that is tried first; otherwise
+      # it is fetched into a THROWAWAY repository, because a shallow fetch into this checkout can
+      # move its shallow boundary under later steps (see "Refused commit subjects"). If it cannot be
+      # read, the step warns and passes; the timeout keeps a stalled fetch from wedging the leg.
+      - name: Changelog fragments against the base branch
+        if: runner.os == 'Linux' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        timeout-minutes: 5
+        run: |
+          base_copy="$RUNNER_TEMP/base-CHANGELOG.md"
+          scratch="$RUNNER_TEMP/changelog-base"
+          # No pipe: under `-o pipefail` an early-exiting reader can fail the step on SIGPIPE.
+          git cat-file -p HEAD > "$RUNNER_TEMP/head-commit"
+          parent=$(awk '/^parent /{print $2; exit}' "$RUNNER_TEMP/head-commit")
+          if [ -n "$parent" ] && { git show "$parent:CHANGELOG.md" > "$base_copy" 2>/dev/null \
+             || { git init -q "$scratch" \
+                  && git -C "$scratch" fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$parent" \
+                  && git -C "$scratch" show "$parent:CHANGELOG.md" > "$base_copy"; }; }; then
+            python scripts/release/changelog_fragments.py pr-check --base-changelog "$base_copy"
+          else
+            echo "::warning::could not read the base CHANGELOG.md; release.yml's tag guard is the backstop"
+          fi
 
       # BACKLOG #1226. The screen shipped and NOTHING RAN IT, so it read as coverage and produced
       # none -- a username reaching a WHERE clause was found three times by accident and zero times
