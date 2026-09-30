@@ -797,9 +797,12 @@ jobs:
           #                           "hardcoded password" hits that are all literal test credentials
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — upstream bytes pinned by
+          #                           tests/test_vendored_defusedxml.py, so no `# nosec` can be added.
+          #                           Its findings are its own stdlib XML imports, which it hardens.
           # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
           bandit -r . --skip B101,B110,B404,B608 \
-            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
+            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./messagefoundry/_vendor/defusedxml,./.venv,./node_modules
 
   gitleaks:
     name: gitleaks (secret scan)
@@ -989,6 +992,8 @@ jobs:
           #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — for PARITY WITH BANDIT, which cannot scan its
+          #                           byte-pinned upstream code; no rule here matches it today
           # The `./` prefix bandit uses is DROPPED on purpose: semgrep matches --exclude as a GLOB,
           # not a path, so `./tests` matches nothing and the flag would be inert — copying bandit's
           # string byte-for-byte yields an exclude list that excludes nothing. (Whether tests/ would
@@ -1006,6 +1011,7 @@ jobs:
           semgrep --config .semgrep --error --metrics off \
             --exclude tests --exclude harness --exclude samples --exclude ide \
             --exclude docs/benchmarks/results --exclude packaging/messagefoundry-webconsole/tests \
+            --exclude messagefoundry/_vendor/defusedxml \
             --exclude .venv --exclude node_modules \
             .
       - name: Handler-config taint rules — validate, regression gate, scan samples (ADR 0144 Inc 3)
@@ -1244,9 +1250,12 @@ jobs:
           #                           "hardcoded password" hits that are all literal test credentials
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — upstream bytes pinned by
+          #                           tests/test_vendored_defusedxml.py, so no `# nosec` can be added.
+          #                           Its findings are its own stdlib XML imports, which it hardens.
           # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
           bandit -r . --skip B101,B110,B404,B608 \
-            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
+            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./messagefoundry/_vendor/defusedxml,./.venv,./node_modules
       - name: Run the MessageFoundry rules
         if: ${{ !cancelled() }}
         run: |
@@ -1281,6 +1290,8 @@ jobs:
           #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — for PARITY WITH BANDIT, which cannot scan its
+          #                           byte-pinned upstream code; no rule here matches it today
           # The `./` prefix bandit uses is DROPPED on purpose: semgrep matches --exclude as a GLOB,
           # not a path, so `./tests` matches nothing and the flag would be inert — copying bandit's
           # string byte-for-byte yields an exclude list that excludes nothing. (Whether tests/ would
@@ -1298,6 +1309,7 @@ jobs:
           semgrep --config .semgrep --error --metrics off \
             --exclude tests --exclude harness --exclude samples --exclude ide \
             --exclude docs/benchmarks/results --exclude packaging/messagefoundry-webconsole/tests \
+            --exclude messagefoundry/_vendor/defusedxml \
             --exclude .venv --exclude node_modules \
             .
       - name: Handler-config taint rules — validate, regression gate, scan samples (ADR 0144 Inc 3)

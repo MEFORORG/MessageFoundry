@@ -1150,10 +1150,32 @@ _PARSING_MAY_REACH = (
     # static walk below holds it to that.
     "messagefoundry.redaction",
     "messagefoundry.timezone",
+    # The vendored defusedxml copy `parsing/message.py` parses XML through. Upstream code that
+    # imports only the stdlib, and the one leaf that is a package rather than a single file.
+    "messagefoundry._vendor",
 )
 
-#: The allowlisted modules outside `parsing/`. Each is a single top-level file.
+#: The allowlisted modules outside `parsing/`. Each is a top-level file or package.
 _PARSING_LEAVES = tuple(m for m in _PARSING_MAY_REACH if m != "messagefoundry.parsing")
+
+
+def _leaf_files(root: Path, leaves: Sequence[str]) -> list[Path]:
+    """Each leaf's source: its single file, or every file of its package.
+
+    A leaf that is neither raises rather than being skipped, for the reason `_scan` gives."""
+    files: list[Path] = []
+    missing: list[str] = []
+    for leaf in leaves:
+        name = leaf.rsplit(".", 1)[1]
+        if (root / f"{name}.py").is_file():
+            files.append(root / f"{name}.py")
+        elif (root / name / "__init__.py").is_file():
+            files.extend(sorted((root / name).rglob("*.py")))
+        else:
+            missing.append(str(root / name))
+    if missing:
+        raise AssertionError(f"allowlisted leaves not found: {missing}")
+    return files
 
 
 def _parsing_may_reach(module: str) -> bool:
@@ -1187,10 +1209,7 @@ def _parsing_static_scan(root: Path, leaves: Sequence[str] = _PARSING_LEAVES) ->
     directory = root / "parsing"
     if not directory.is_dir():
         raise AssertionError(f"walk target is not a directory: {directory}")
-    leaf_files = [root / f"{leaf.rsplit('.', 1)[1]}.py" for leaf in leaves]
-    missing = [str(f) for f in leaf_files if not f.is_file()]
-    if missing:
-        raise AssertionError(f"allowlisted leaves not found: {missing}")
+    leaf_files = _leaf_files(root, leaves)
     violations: list[str] = []
     walked = {"parsing": 0, "leaves": 0}
     for py, bucket in [
@@ -1212,7 +1231,8 @@ def test_parsing_imports_nothing_outside_its_allowlist() -> None:
     assert not scan.violations, scan.violations
     # A walk that opened nothing gives the same clean answer as a clean package; see `_scan`.
     assert scan.walked["parsing"] >= _MIN_FILES_WALKED["parsing"], dict(scan.walked)
-    assert scan.walked["leaves"] == len(_PARSING_LEAVES), dict(scan.walked)
+    # At least one file per leaf; a package leaf contributes each of its files.
+    assert scan.walked["leaves"] >= len(_PARSING_LEAVES), dict(scan.walked)
 
 
 @pytest.mark.parametrize(
