@@ -11,21 +11,24 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./cli";
+import { CollectionStore, CollectionStoreError } from "./collectionStore";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
 import { testBenchScript } from "./testBenchWebview";
 import { openChannel, postToWebview } from "./webviewMessaging";
 import {
-  compareCase,
-  type DeliveryComparison,
+  judgeCollectionRun,
+  pickCaseDetail,
+  type CaseRerun,
+  type CaseRunDetail,
   type TestCase,
   type TestCollection,
 } from "./testCollections";
 
-// Saved regression collections (BACKLOG #168, ADR 0121) live in machine-local workspaceState — NEVER a
-// repo file, and NEVER globalState (Settings-Sync-eligible → could carry PHI off-box). Keyed map.
-const COLLECTIONS_KEY = "messagefoundry.testBench.collections";
+// Saved regression collections (BACKLOG #168, ADR 0121) hold case bodies, which are PHI. They live in
+// VS Code SecretStorage, scoped to this workspace (BACKLOG #1174; see collectionStore.ts) — NEVER a
+// repo file, NEVER globalState (Settings-Sync-eligible), and no longer plain workspaceState.
 
 interface Delivery {
   to: string;
@@ -55,6 +58,7 @@ type Incoming =
   | { command: "listCollections" }
   | { command: "saveCollection" }
   | { command: "runCollection"; name: string }
+  | { command: "caseDetail"; run: number; index: number }
   | { command: "deleteCollection"; name: string };
 
 function esc(s: string): string {
@@ -83,6 +87,13 @@ export class TestBench {
   private rows: DryRunRow[] = [];
   private pickPaths: string[] = []; // the files last loaded — re-run under --trace on demand
   private traces: TraceEntry[] | null = null; // lazily fetched, aligned 1:1 with `rows` by index
+  // The last collection run's per-case differences and errors, held back from the webview until one
+  // case is asked for (ADR 0121, "Reveal on click"). `id` names the run a request must match.
+  private lastRun: { id: number; details: CaseRunDetail[] } | null = null;
+  // Bumped by every event that must drop a held run, and by every run start. A run holds and posts
+  // its result only if the generation it started under is still current, so a run in flight across
+  // a re-render, close, save or delete, or overtaken by a newer run, holds nothing.
+  private viewGen = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -97,7 +108,14 @@ export class TestBench {
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true },
     );
-    this.panel.onDidDispose(() => (this.panel = undefined), null, this.context.subscriptions);
+    this.panel.onDidDispose(
+      () => {
+        this.panel = undefined;
+        this.dropRun();
+      },
+      null,
+      this.context.subscriptions,
+    );
     this.panel.webview.onDidReceiveMessage((m: Incoming) => void this.onMessage(m));
     this.render();
   }
@@ -114,26 +132,93 @@ export class TestBench {
     } else if (m.command === "hex") {
       await this.showHex(m.index);
     } else if (m.command === "listCollections") {
-      await this.postCollections();
+      await this.withCollections(() => this.postCollections());
     } else if (m.command === "saveCollection") {
-      await this.saveCollection();
+      await this.withCollections(() => this.saveCollection());
     } else if (m.command === "runCollection") {
-      await this.runCollection(m.name);
+      await this.withCollections(() => this.runCollection(m.name));
+    } else if (m.command === "caseDetail") {
+      await this.showCaseDetail(m.run, m.index);
     } else if (m.command === "deleteCollection") {
-      await this.deleteCollection(m.name);
+      await this.withCollections(() => this.deleteCollection(m.name));
     }
   }
 
   // ---- Saved regression collections (BACKLOG #168, ADR 0121) -----------------------------------
-  // All persistence is machine-local workspaceState (not globalState — that is Settings-Sync-eligible
-  // and could carry PHI off-box). Case bodies are PHI; authors are steered to synthetic cases.
+  // Case bodies are PHI; authors are steered to synthetic cases. Persistence is VS Code SecretStorage
+  // (encrypted with an OS-keychain-held key), keyed per workspace, with a one-time move out of the
+  // workspaceState key earlier builds used (BACKLOG #1174). The logic lives in collectionStore.ts.
 
-  private loadCollections(): Record<string, TestCollection> {
-    return this.context.workspaceState.get<Record<string, TestCollection>>(COLLECTIONS_KEY, {});
+  private collections: CollectionStore | undefined;
+
+  private collectionStore(): CollectionStore {
+    // storageUri is VS Code's own per-workspace scope (the one workspaceState used). It is undefined
+    // only in a window with no folder open, where saving is refused anyway (it needs workspaceDir()).
+    this.collections ??= new CollectionStore(
+      this.context.secrets,
+      this.context.workspaceState,
+      this.context.storageUri?.toString() ?? "(no workspace)",
+    );
+    return this.collections;
   }
 
-  private async storeCollections(map: Record<string, TestCollection>): Promise<void> {
-    await this.context.workspaceState.update(COLLECTIONS_KEY, map);
+  private loadCollections(): Promise<Record<string, TestCollection>> {
+    return this.collectionStore().load();
+  }
+
+  private storeCollections(map: Record<string, TestCollection>): Promise<void> {
+    return this.collectionStore().save(map);
+  }
+
+  /**
+   * Run a collection action, reporting a storage failure without echoing anything it read: only the
+   * error's type is logged, never its message, which could quote a stored body. An unreadable stored
+   * value would block every collection command, so that case offers to delete the saved collections.
+   */
+  private async withCollections(action: () => Promise<void>): Promise<void> {
+    try {
+      await action();
+    } catch (e) {
+      console.warn(
+        `MessageFoundry Test Bench: collection storage failed (${e instanceof Error ? e.name : typeof e})`,
+      );
+      if (!(e instanceof CollectionStoreError)) {
+        void vscode.window.showErrorMessage(
+          "MessageFoundry: saved Test Bench collections could not be read or written.",
+        );
+        // A save or delete drops the held run before its store call, so re-list rather than leave a
+        // run view on screen whose Detail buttons can no longer be answered. Best effort.
+        try {
+          await this.postCollections();
+        } catch {
+          /* the message above already reports the storage failure */
+        }
+        return;
+      }
+      const reset = await vscode.window.showErrorMessage(
+        `MessageFoundry: ${e.message}. Delete the saved collections for this workspace?`,
+        { modal: true },
+        "Delete",
+      );
+      if (reset === "Delete") {
+        try {
+          await this.collectionStore().reset();
+          this.dropRun(); // every collection is gone, so no held run's details may stay in memory
+        } catch {
+          void vscode.window.showErrorMessage(
+            "MessageFoundry: the saved Test Bench collections could not be deleted.",
+          );
+          return;
+        }
+        try {
+          await this.postCollections();
+        } catch {
+          void vscode.window.showErrorMessage(
+            "MessageFoundry: saved Test Bench collections could not be read or written.",
+          );
+        }
+      }
+    }
   }
 
   /** Post the current collection list (name + case count only — bodies stay in the host) to the webview. */
@@ -141,7 +226,10 @@ export class TestBench {
     if (!this.panel) {
       return;
     }
-    const map = this.loadCollections();
+    const map = await this.loadCollections();
+    if (!this.panel) {
+      return; // closed while the (possibly migrating) load ran
+    }
     const items = Object.values(map)
       .map((c) => ({ name: c.name, cases: c.cases.length }))
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -166,7 +254,7 @@ export class TestBench {
     if (!name) {
       return;
     }
-    const map = this.loadCollections();
+    const map = await this.loadCollections();
     if (map[name]) {
       const overwrite = await vscode.window.showWarningMessage(
         `A collection named "${name}" already exists. Overwrite it?`,
@@ -183,6 +271,7 @@ export class TestBench {
       expected: r.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
     }));
     map[name] = { name, cases };
+    this.dropRun();
     await this.storeCollections(map);
     await this.postCollections();
     void vscode.window.showInformationMessage(
@@ -191,7 +280,7 @@ export class TestBench {
   }
 
   private async deleteCollection(name: string): Promise<void> {
-    const map = this.loadCollections();
+    const map = await this.loadCollections();
     if (!map[name]) {
       return;
     }
@@ -204,6 +293,7 @@ export class TestBench {
       return;
     }
     delete map[name];
+    this.dropRun();
     await this.storeCollections(map);
     await this.postCollections();
   }
@@ -218,16 +308,21 @@ export class TestBench {
     if (!this.panel) {
       return;
     }
-    const coll = this.loadCollections()[name];
+    const panel = this.panel;
+    const gen = ++this.viewGen;
+    // The load is async now (SecretStorage, BACKLOG #1174). The generation is taken first, so the
+    // check after the dry-run also drops a run whose view moved on during the load.
+    const coll = (await this.loadCollections())[name];
     const cwd = workspaceDir();
     if (!coll || !cwd) {
       return;
     }
+    const caseFile = (i: number): string => `case_${String(i).padStart(4, "0")}.hl7`;
     let tmpDir: string | undefined;
     try {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-testbench-"));
       const files = coll.cases.map((c, i) => {
-        const file = path.join(tmpDir as string, `case_${String(i).padStart(4, "0")}.hl7`);
+        const file = path.join(tmpDir as string, caseFile(i));
         fs.writeFileSync(file, c.input, "utf8");
         return file;
       });
@@ -241,25 +336,22 @@ export class TestBench {
           byBase.set(path.basename(row.path), row);
         }
       }
-      const results = coll.cases.map((c, i) => {
-        const row = byBase.get(`case_${String(i).padStart(4, "0")}.hl7`);
-        const actual = row ? row.deliveries.map((d) => ({ to: d.to, payload: d.payload })) : [];
-        const cmp = compareCase(c.expected, actual);
-        return {
-          name: c.name,
-          pass: row ? cmp.pass : false,
-          disposition: row?.disposition ?? "NO RESULT",
-          error: row?.error ?? (row ? null : "no dry-run row produced for this case"),
-          deliveries: cmp.deliveries as DeliveryComparison[],
-        };
+      if (this.panel !== panel || this.viewGen !== gen) {
+        return; // the view moved on while the dry-run ran (see viewGen): hold nothing
+      }
+      const reruns = coll.cases.map((_c, i): CaseRerun | undefined => {
+        const row = byBase.get(caseFile(i));
+        return row ? { disposition: row.disposition, error: row.error ?? null, deliveries: row.deliveries } : undefined;
       });
-      const passed = results.filter((r) => r.pass).length;
-      await postToWebview(this.panel.webview, {
+      const run = judgeCollectionRun(coll.cases, reruns);
+      this.lastRun = { id: gen, details: run.details };
+      await postToWebview(panel.webview, {
         type: "collectionRun",
         name,
-        passed,
-        total: results.length,
-        results,
+        run: gen,
+        passed: run.passed,
+        total: run.summaries.length,
+        results: run.summaries,
       });
     } catch (e) {
       void vscode.window.showErrorMessage(`MessageFoundry: collection run failed — ${String(e)}`);
@@ -273,6 +365,15 @@ export class TestBench {
         }
       }
     }
+  }
+
+  /** Post one case's differences and error, for a `caseDetail` request (ADR 0121, "Reveal on click"). */
+  private async showCaseDetail(run: unknown, index: unknown): Promise<void> {
+    const detail = pickCaseDetail(this.lastRun, run, index);
+    if (!this.panel || !detail) {
+      return;
+    }
+    await postToWebview(this.panel.webview, { type: "caseDetail", run, index, ...detail });
   }
 
   /**
@@ -439,7 +540,14 @@ export class TestBench {
     });
   }
 
+  /** Forget the held run, and make any run still in flight hold nothing when it lands. */
+  private dropRun(): void {
+    this.viewGen++;
+    this.lastRun = null;
+  }
+
   private render(): void {
+    this.dropRun(); // a new document has no run view to ask for it
     if (this.panel) {
       this.panel.webview.html = this.html(this.panel.webview);
     }
@@ -564,6 +672,7 @@ export class TestBench {
     .case { padding: 6px 0; border-bottom: 1px solid var(--vscode-panel-border); }
     .case .hd { display: flex; align-items: baseline; gap: 8px; }
     .case .hd .cn { font-size: 13px; }
+    .case .hd button { margin-left: auto; padding: 1px 8px; }
     .case .diffs { margin: 4px 0 0 12px; font-size: 12px; color: var(--vscode-descriptionForeground); }
     .case .diffs code { font-family: var(--vscode-editor-font-family, monospace); }
     .case .diffs .del { color: var(--vscode-testing-iconFailed, #f85149); }

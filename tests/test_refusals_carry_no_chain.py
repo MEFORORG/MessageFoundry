@@ -44,12 +44,12 @@ from pydantic import ValidationError
 from starlette.requests import Request
 
 import messagefoundry.parsing._backend as _hl7_backend
-from messagefoundry.__main__ import _load_operator_json, _OperatorJsonError
 from messagefoundry.api import app as api_app
 from messagefoundry.api.models import ChannelInfo
 from messagefoundry.apiclient.client import ApiError, _decode
 from messagefoundry.auth.oidc.jwks import JwksError, parse_jwks
 from messagefoundry.auth.webauthn import WebAuthnVerificationError, credential_id_from_response
+from messagefoundry.cli_common import _load_operator_json, _OperatorJsonError
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.models import ContentType

@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from messagefoundry.api.auth_models import AuditList, SecurityEventsList
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _window_note
+from ._common import _capped, _window_note
 
 __all__ = ["audit_log", "security_events"]
 
@@ -35,8 +35,17 @@ def audit_log(data: AuditList, *, limit: int) -> Markup:
     NEWEST FIRST, AND ONLY THE NEWEST — the route asks for ``limit`` rows and this page renders what
     came back (BACKLOG #1743). It cannot say window-of-total the way the messages and dead-letter
     pagers do, because ``AuditList`` carries no total and the store's ``list_audit`` has neither an
-    offset nor a count; giving this page a pager is a separate row that has to add both. Until then
-    the honest surface for a full trail is the ``audit:export`` CSV, which streams its own filter.
+    offset nor a count; giving this page a pager is a separate row that has to add both.
+
+    THE EXPORT DOES NOT HOLD THE WHOLE TRAIL EITHER, so the page does not say it does (BACKLOG
+    #1743 residual (c)). ``export_audit`` in ``api/auth_routes.py`` runs this page's store read
+    with its own ``limit`` and no offset; the page quotes no number, because that route owns it.
+    The route is on the engine API, whose ``require()`` reads only an ``Authorization`` bearer
+    header, so this console's cookie does not reach it. The page says so rather than reading as a
+    link the operator can follow.
+
+    "Only the most recent" is said only when the window is FULL (:func:`_capped`). Said always,
+    it told the reader of a short, complete listing that a missing event was somewhere else.
 
     ``limit`` is passed in rather than re-declared here so the sentence states the bound the query
     actually used — a second copy of the number would be wrong the day either one moved."""
@@ -44,14 +53,26 @@ def audit_log(data: AuditList, *, limit: int) -> Markup:
         [_ts(e.ts), e.actor or "—", e.action, e.channel_id or "—", e.detail or ""]
         for e in data.entries
     ]
+    window = (
+        " This page shows only the most recent entries. An older event missing here is off this "
+        "page, not out of the log."
+        if _capped(len(data.entries), limit)
+        else ""
+    )
     return page(
         "Audit",
         el("h1", "Audit log"),
         el(
             "p",
-            "The tamper-evident audit trail (metadata only — no PHI). Most recent first. This page "
-            "shows only the most recent entries, so an older event missing here is off this page, "
-            "not out of the log; the audit export is the complete record.",
+            "The tamper-evident audit trail (metadata only — no PHI). Most recent first." + window,
+            class_="muted",
+        ),
+        el(
+            "p",
+            "The audit export does not hold the whole trail either. It is GET /audit/export on the "
+            "engine API. It needs audit:export and a bearer session from POST /auth/login, not this "
+            "console session. It returns the newest entries up to its limit parameter. For older "
+            "entries, set its until parameter (epoch seconds) to an earlier time.",
             class_="muted",
         ),
         rows_table(["When", "Actor", "Action", "Channel", "Detail"], rows),
@@ -68,14 +89,19 @@ def security_events(data: SecurityEventsList, *, limit: int) -> Markup:
     is where a user checks whether something happened to their account, so an event older than the
     newest ``limit`` reads as an event that never happened (BACKLOG #1743)."""
     rows = [[_ts(e.ts), e.action, e.detail or ""] for e in data.events]
+    window = (
+        " This page shows only the most recent. An older event missing here is off this page, not "
+        "absent from the record."
+        if _capped(len(data.events), limit)
+        else ""
+    )
     return page(
         "My security events",
         el("h1", "My security events"),
         el(
             "p",
             "Recent security-relevant activity on your account (sign-ins, lockouts, credential "
-            "changes). Most recent first, and only the most recent — an older event missing here "
-            "is off this page, not absent from the record.",
+            "changes). Most recent first." + window,
             class_="muted",
         ),
         rows_table(["When", "Event", "Detail"], rows),

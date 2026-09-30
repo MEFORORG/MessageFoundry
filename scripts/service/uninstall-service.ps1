@@ -8,9 +8,15 @@
     Stops the service (Ctrl+C, letting the engine drain connections) and removes its NSSM
     registration.
 
+    IT RUNS NO nssm.exe (BACKLOG #2364). The Service Control Manager stops the service, which NSSM
+    answers with the same Ctrl+C drain `nssm stop` asks for, and sc.exe removes the registration and
+    the NSSM settings stored under it. Any nssm.exe this script could find would be one it has to
+    trust as administrator, and the copy an older install cached under the data directory sits where
+    the engine's own account can write.
+
     Removing the registration does NOT return the host to its pre-install state. The installer
     also grants a user right, writes access-control entries naming the run-as account, turns
-    inheritance off on the data directory, caches an NSSM binary, and (with -SuppressCrashDumps)
+    inheritance off on the data directory, keeps an NSSM binary, and (with -SuppressCrashDumps)
     writes machine-wide Windows Error Reporting keys. None of that is undone here by default, so
     this script reads the host before it removes the registration and prints an inventory of what
     it found still in place, with the command to clear each one.
@@ -29,7 +35,6 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$NssmPath,
     [string]$ServiceName = "MessageFoundry",
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
     # Opt-in: take the "Log on as a service" right back off the run-as account. Default OFF because
@@ -238,7 +243,7 @@ function Get-UninstallResidueNotice {
         [string]$ConfigDir,
         # Measured from the config dir's own ACL, not assumed from a switch this script never saw.
         [switch]$ConfigInheritanceStripped,
-        # Path of the cached NSSM binary, only when it is actually on disk.
+        # Path of the nssm.exe the registration starts, only when it is actually on disk.
         [string]$CachedNssm,
         # Image names found under the WER ExcludedApplications key.
         [string[]]$WerImages,
@@ -278,8 +283,9 @@ function Get-UninstallResidueNotice {
 
     if ($CachedNssm) {
         $lines += "  NSSM binary      $CachedNssm"
-        $lines += "                   The copy the installer downloaded. Delete it by hand once you"
-        $lines += "                   are sure you are not reinstalling."
+        $lines += "                   The copy the service was registered with. Any other service"
+        $lines += "                   installed with the same -NssmDir runs it too, so delete it by"
+        $lines += "                   hand only when none is left and you are not reinstalling."
     }
 
     if ($hasAccount) {
@@ -482,8 +488,7 @@ function Remove-AccountAce {
 # a SID once the service it is named for is gone. Reading afterwards would produce an empty inventory
 # that looks exactly like a clean host, which is the failure this whole change is about.
 #
-# IT RUNS ABOVE THE NSSM RESOLUTION because -DataDir is corrected from the registration below, and
-# Resolve-Nssm's fallback joins "bin" onto whatever -DataDir holds at that moment.
+# IT RUNS FIRST because -DataDir is corrected from the registration below, before anything uses it.
 #
 # Nothing here throws. A read that fails is recorded in $unreadable and named in the notice, so a
 # thinner list is never mistaken for a shorter one.
@@ -532,14 +537,18 @@ if (-not $PSBoundParameters.ContainsKey('DataDir')) {
     }
 }
 
-# Find nssm: explicit path, PATH, or the auto-provisioned cache. Fall back to sc.exe if absent.
-$cachedNssm = Join-Path $DataDir "bin\nssm.exe"
-if (-not $NssmPath) {
-    $cmd = Get-Command nssm -ErrorAction SilentlyContinue
-    $NssmPath = if ($cmd) { $cmd.Source } else { $cachedNssm }
+# The nssm.exe the registration starts, for the inventory only: nothing here runs it. Read before the
+# removal, because the registration is where the path lives.
+$cachedNssm = ""
+try {
+    $imagePath = [string](Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction Stop).ImagePath
+    $imageExe = if ($imagePath.Trim().StartsWith('"')) { ($imagePath.Trim() -split '"')[1] }
+                else { $imagePath.Trim() }
+    if ($imageExe -and (Test-Path -LiteralPath $imageExe)) { $cachedNssm = $imageExe }
+} catch {
+    $unreadable += ("the registered image path of '$ServiceName' ($($_.Exception.Message)) - so " +
+        "the nssm.exe it was started with is not named below")
 }
-$haveNssm = Test-Path $NssmPath
-if (-not (Test-Path $cachedNssm)) { $cachedNssm = "" }
 
 # WHICH ACCOUNTS CARRY A RESIDUE, DECIDED BY SID RATHER THAN BY SPELLING. The installer writes named
 # grants for any run-as account except LocalSystem, which it covers with the well-known SYSTEM SID
@@ -617,10 +626,10 @@ if ($appExe) {
 }
 
 Write-Host "Stopping '$ServiceName'..."
-# BOTH stop paths - nssm and the SCM fallback - ran without checking anything and without reading the
-# status back, so the removal below proceeded over a service that might still be running (BACKLOG
-# #1558). Stop-ServiceAndConfirm covers both: it takes an empty -NssmPath as "use the SCM".
-$stopped = Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $(if ($haveNssm) { $NssmPath } else { "" })
+# The stop used to run without reading the status back, so the removal below proceeded over a
+# service that might still be running (BACKLOG #1558). Stop-ServiceAndConfirm confirms it, and an
+# empty -NssmPath means "stop through the SCM", which is the only way this script stops it now.
+$stopped = Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath ""
 if (-not $stopped) {
     Write-Warning ("Removing the registration for '$ServiceName' while it is still running. Windows " +
         "marks the service for deletion but the PROCESS keeps running until it exits or the host " +
@@ -631,20 +640,14 @@ if (-not $stopped) {
 
 Write-Host "Removing '$ServiceName'..."
 # $LASTEXITCODE IS CLEARED FIRST HERE TOO, and this is the site where a stale read costs most. A
-# failed LAUNCH never writes the variable, so it keeps the 0 the stop above just left behind, and the
+# failed LAUNCH never writes the variable, so it keeps the 0 an earlier native command left, and the
 # check then passes and the script prints "Removed" over a registration that is still there. Unlike
 # the lockdown, where Get-BroadAclResidue reads the result back, nothing here re-reads: this exit
 # code is the ONLY evidence the removal happened, so it has to be this call's own.
 $global:LASTEXITCODE = $null
-if ($haveNssm) {
-    & $NssmPath remove $ServiceName confirm
-    if ($null -eq $LASTEXITCODE) { throw "nssm remove did not run ('$NssmPath' left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "nssm remove failed (exit $LASTEXITCODE)" }
-} else {
-    & sc.exe delete $ServiceName | Out-Null
-    if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
-    if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
-}
+& sc.exe delete $ServiceName | Out-Null
+if ($null -eq $LASTEXITCODE) { throw "sc.exe delete did not run (it left no exit code)" }
+if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
 
 Write-Host "Removed '$ServiceName'." -ForegroundColor Green
 

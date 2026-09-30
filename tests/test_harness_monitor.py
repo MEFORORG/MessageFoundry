@@ -261,6 +261,79 @@ def test_the_must_change_message_states_the_temporary_passwords_deadline(
         panel.shutdown()
 
 
+class _RefusedClient:
+    """Stands in for the ``EngineClient`` that ``_connect`` builds, and records what it is asked.
+
+    It is reachable, answers ``me()`` with a 401 so the panel prompts for a sign-in, and holds
+    ``token`` as the dialog left it."""
+
+    def __init__(self, token: str | None, logout_fails: bool) -> None:
+        self.token = token
+        self.calls: list[str] = []
+        self._logout_fails = logout_fails
+
+    def health(self) -> None:
+        self.calls.append("health")
+
+    def me(self) -> None:
+        self.calls.append("me")
+        raise ApiError("not authenticated", status=401)
+
+    def logout(self) -> None:
+        self.calls.append("logout")
+        self.token = None
+        if self._logout_fails:
+            raise ApiError("engine unreachable")
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+
+def _cancelled_dialog(client: object, parent: object = None) -> Any:
+    class _Dialog:
+        must_change_password = False
+
+        def exec(self) -> bool:
+            return False
+
+    return _Dialog()
+
+
+@pytest.mark.parametrize(
+    ("dialog", "token", "logout_fails", "expected"),
+    [
+        (_must_change_dialog(None), "tok-must-change", False, ["health", "me", "logout", "close"]),
+        (_must_change_dialog(None), "tok-must-change", True, ["health", "me", "logout", "close"]),
+        (_cancelled_dialog, None, False, ["health", "me", "close"]),  # control: nothing to end
+    ],
+    ids=["must-change", "must-change-logout-fails", "cancelled"],
+)
+def test_a_refused_connect_ends_the_session_the_sign_in_left(
+    qapp: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    dialog: Any,
+    token: str | None,
+    logout_fails: bool,
+    expected: list[str],
+) -> None:
+    """BACKLOG #2091. A must-change sign-in hands the client a live session the panel will not use.
+
+    RED when: ``_connect`` closes the client without logging that session out first, so it stays
+    live until it expires; when a failed logout escapes, or skips the close; or when a cancelled
+    sign-in, which holds no session, sends a logout anyway. The engine lets a must-change session
+    reach ``/auth/logout`` (``messagefoundry/api/security.py``, ``_MUST_CHANGE_EXEMPT_PATHS``)."""
+    client = _RefusedClient(token, logout_fails)
+    monkeypatch.setattr(monitor, "EngineClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(monitor, "LoginDialog", dialog)
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert client.calls == expected
+        assert panel._client is None
+    finally:
+        panel.shutdown()
+
+
 class _LoginClient:
     """Answers the dialog's two calls: no provider list, then a must-change sign-in."""
 

@@ -207,10 +207,19 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
+#: The subject a ``cleanup`` alert carries (BACKLOG #1174, PR 1771 defect 5). A good run whose
+#: staging could not be cleared is not a failed backup, so it must not share the failed-backup
+#: subject: the notifier keys its realert throttle and the durable alert instance on type plus
+#: subject, so a cleanup alert under ``dr_backup`` would silence a real failure for the cooldown,
+#: or be silenced by one.
+CLEANUP_ALERT_SUBJECT = "dr_backup:staging"
+
+
 class BackupError(RuntimeError):
     """A backup run failed at a named phase (``snapshot``/``encrypt``/``write``/``verify``/
-    ``destination``). The same alert also carries kind ``cleanup``, for a good run whose staging
-    could not be cleared (see :attr:`BackupResult.staging_leftover`). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
+    ``destination``/``space``). The same alert also carries kind ``cleanup``, under
+    :data:`CLEANUP_ALERT_SUBJECT`, for a good run whose staging could not be cleared (see
+    :attr:`BackupResult.staging_leftover`). Carries the ``kind`` so the caller can pass it to ``AlertSink.backup_failed`` and
     record it in the ``dr_backup`` ERROR audit row — the message is the ``safe_exc``-scrubbed cause
     (PHI-free)."""
 
@@ -479,6 +488,18 @@ class BackupRunner:
         # a sibling engine shard's live run survives it. Both run off the loop.
         staging_root, secure = self._staging_root(dest_dir)
         await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
+        # After the sweep, which frees what a dead run left, and before anything is written: a run
+        # that cannot fit fails here, naming the volume, not half-way through a multi-GB write. It
+        # runs before the OS temp sweep below, which needs this run's own directory to know which
+        # account to sweep for; on a box where the temp dir shares the data volume, a killed
+        # standalone verify's leftovers are still counted as used here.
+        shortfall = await asyncio.to_thread(
+            self._space_shortfall, staging_root, dest_dir, config_only=config_only
+        )
+        if shortfall is not None:
+            raise BackupError(
+                "space", f"not enough free space to stage this backup: it {shortfall}"
+            )
         loop = asyncio.get_running_loop()
         opening = loop.run_in_executor(
             None,
@@ -491,6 +512,9 @@ class BackupRunner:
             # and its directory would look live to every sweep for the life of the process.
             opening.add_done_callback(_release_when_opened)
             raise
+        except StagingNotPrivateError as exc:
+            # Its own text leads, whole: it names the directory and the fix, and holds no PHI.
+            raise BackupError("write", str(exc)) from exc
         except OSError as exc:
             raise BackupError(
                 "write",
@@ -526,6 +550,16 @@ class BackupRunner:
                     # sqlite3.Error: since BACKLOG #1937 the copy opens its own read-only connection,
                     # and a failure there is a snapshot failure too, not a generic backup one.
                     raise BackupError("snapshot", safe_exc(exc)) from exc
+                # The snapshot's real size is known now, and it is already on disk, so this asks only
+                # for what is still to come: the tar beside it and the archive at the destination.
+                # Inside the try, so a refusal here still releases the staging directory.
+                shortfall = await asyncio.to_thread(
+                    self._space_shortfall_after_snapshot, snap_path, work.path, dest_dir
+                )
+                if shortfall is not None:
+                    raise BackupError(
+                        "space", f"not enough free space to finish this backup: it {shortfall}"
+                    )
             try:
                 (
                     snapshot_sha256,
@@ -620,19 +654,29 @@ class BackupRunner:
             # The just-written archive is sealed under the active key, so the active key is the only
             # candidate the post-write verify needs (the retired-key keyring matters only for the
             # standalone restore-verify of an OLDER archive — run_restore_verify, AC-5).
-            verify = await asyncio.to_thread(
-                _verify_archive_blocking,
-                archive_path=str(staging_path),
-                keys=[key] if key is not None else [],
-                full=s.full_restore_verify,
-                allow_unencrypted=s.allow_unencrypted,
-                # The LIVE store settings, so a full verify opens the snapshot under this instance's
-                # real cipher/keyring/provider rather than a bare default (see _full_open_check).
-                store_settings=self._store_settings,
-                # The same staging root as the build, so the next backup's sweep covers both.
-                staging_root=staging_root,
-                secure=secure,
-            )
+            try:
+                verify = await asyncio.to_thread(
+                    _verify_archive_blocking,
+                    archive_path=str(staging_path),
+                    keys=[key] if key is not None else [],
+                    full=s.full_restore_verify,
+                    allow_unencrypted=s.allow_unencrypted,
+                    # The LIVE store settings, so a full verify opens the snapshot under this
+                    # instance's real cipher/keyring/provider rather than a bare default (see
+                    # _full_open_check).
+                    store_settings=self._store_settings,
+                    # The same staging root as the build, so the next backup's sweep covers both.
+                    staging_root=staging_root,
+                    secure=secure,
+                )
+            except StagingNotPrivateError as exc:
+                # Not a verdict on the archive: it stays at its staging name, unpublished and not
+                # quarantined, and the run fails naming both.
+                # The archive's location leads, so the 200-character cut keeps it.
+                raise BackupError(
+                    "write",
+                    f"archive written but not verified, left at {staging_path.name}: {exc}",
+                ) from exc
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
                 # (AC-6). Skipping only THIS run's prune — what this path used to do — does not
@@ -1042,7 +1086,7 @@ class BackupRunner:
             # operator must still hear about, through the same alert a failed run raises.
             try:
                 self._alert_sink.backup_failed(
-                    "dr_backup", kind="cleanup", detail=result.staging_leftover
+                    CLEANUP_ALERT_SUBJECT, kind="cleanup", detail=result.staging_leftover
                 )
             except Exception:
                 log.warning("DR backup: backup_failed alert sink raised", exc_info=True)
@@ -1098,6 +1142,49 @@ class BackupRunner:
             store_path=path if isinstance(path, str) else None,
             destination=dest_dir,
         )
+
+    def _space_shortfall(
+        self, staging_root: Path, dest_dir: Path, *, config_only: bool
+    ) -> str | None:
+        """Whether this run fits, as :func:`_space_shortfall` answers it. Runs off the loop.
+
+        The peak, with ``S`` the store file and ``C`` the config bundle: the staging root holds the
+        snapshot and the tar at once (``2S + C``), and so does the backup's own verify later (the
+        decrypted tar and the extracted store); the destination holds the archive (``S + C``, the
+        tar plus a small framing overhead). On one volume that is ``3S + 2C``.
+
+        The WAL is left out on purpose. SQLite never shrinks it without a truncating checkpoint, so
+        its file can stand at a high-water size far above what the snapshot will carry, and counting
+        it would refuse runs that fit. :meth:`_space_shortfall_after_snapshot` checks again with the
+        snapshot's real size once it exists."""
+        store_bytes = 0
+        path = getattr(self._store, "path", None)
+        if not config_only and isinstance(path, str) and path != ":memory:":
+            store_bytes = _file_size(Path(path))
+        config_bytes = self._config_bytes()
+        return _space_shortfall(
+            [
+                (staging_root, 2 * store_bytes + config_bytes),
+                (dest_dir, store_bytes + config_bytes),
+            ]
+        )
+
+    def _space_shortfall_after_snapshot(
+        self, snap_path: Path, staging: Path, dest_dir: Path
+    ) -> str | None:
+        """The second free-space check, once the snapshot is on disk. It asks only for what is still
+        to be written: the tar in staging (``S' + C``) and the archive at the destination
+        (``S' + C``), with ``S'`` the snapshot's real size. The backup's own verify later holds no
+        more on the staging volume than the build did, because the build's staging is released
+        first."""
+        rest = _file_size(snap_path) + self._config_bytes()
+        return _space_shortfall([(staging, rest), (dest_dir, rest)])
+
+    def _config_bytes(self) -> int:
+        """The bytes of the config bundle the archive will carry, or 0 when it carries none."""
+        if self._settings.include_config and self._config_dir is not None:
+            return _tree_size(Path(self._config_dir))
+        return 0
 
     def _backend_value(self) -> str:
         backend = getattr(self._store, "backend", None)
@@ -1196,7 +1283,7 @@ def _verify_archive_blocking(
     OS temp dir, and first sweeps that dir of this account's own abandoned staging (see
     :func:`_standalone_staging_root` and the staging-location block above :class:`_Staging`).
     ``secure`` locks each staged file to its owner before its first byte,
-    which every case but ``.mefor-staging`` passes.
+    which every case passes.
 
     ``keys`` is the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys") — the
     archive is matched against the whole set so one taken under a now-retired key still verifies after a
@@ -1225,6 +1312,7 @@ def _verify_archive_blocking(
     :func:`_discard_verify_staging`. When decrypted bytes survive that, the result says so: a ``PASS``
     becomes ``FAIL``, and any other verdict keeps its status and gains the directory in its reason. Its
     lock is released either way, so the next sweep of the same root removes what survived."""
+    standalone = staging_root is None
     try:
         # (1) Pre-decryption key check (only meaningful for an encrypted archive). For a plaintext
         # archive (no codec header) there is no key to mismatch.
@@ -1255,10 +1343,16 @@ def _verify_archive_blocking(
                     reason=f"no resolved key (active or retired) matches archive key_id={header_key_id}",
                 )
 
-        standalone = staging_root is None
         if staging_root is None:
             staging_root = _standalone_staging_root()
         work = _open_staging(staging_root, _VERIFY_STAGING_PREFIX, secure=secure)
+    except StagingNotPrivateError as exc:
+        if not standalone:
+            # A backup's own verify: the volume is at fault, not the archive, so this must not reach
+            # `_keep_failed_archive`, which would quarantine a good archive. The caller turns it into
+            # a `write` failure and leaves the archive unpublished.
+            raise
+        return VerifyResult("FAIL", reason=f"not a fault in the archive: {exc}")
     except (BackupCodecError, OSError, tarfile.TarError) as exc:
         return _verify_failure(exc)
 
@@ -1274,16 +1368,33 @@ def _verify_archive_blocking(
             # before the decrypt, so a dead run's plaintext is gone before this one needs the space.
             # Inside this block, so even a fault in the sweep still releases this run's directory.
             _sweep_abandoned_staging(staging_root, owned_like=work.path)
+        # A standalone verify holds the decrypted tar and the extracted store at once, each about the
+        # archive's size (BACKLOG #1174, PR 1771 defect 3). The backup's own verify is covered by the
+        # backup's check, which counts this peak on its staging root.
+        shortfall = (
+            _space_shortfall([(work.path, 2 * _file_size(Path(archive_path)))])
+            if standalone
+            else None
+        )
         try:
-            result = _verify_in_staging(
-                work.path,
-                archive_path=archive_path,
-                encrypted=encrypted,
-                match_key=match_key,
-                full=full,
-                store_settings=store_settings,
-                secure=secure,
-            )
+            if shortfall is not None:
+                # The reason says it is the volume, not the archive, so this FAIL is not read as a
+                # verdict on the archive.
+                result = VerifyResult(
+                    "FAIL",
+                    reason=f"not enough free space to verify this archive (not a fault in it): "
+                    f"it {shortfall}",
+                )
+            else:
+                result = _verify_in_staging(
+                    work.path,
+                    archive_path=archive_path,
+                    encrypted=encrypted,
+                    match_key=match_key,
+                    full=full,
+                    store_settings=store_settings,
+                    secure=secure,
+                )
         except (BackupCodecError, OSError, tarfile.TarError) as exc:
             result = _verify_failure(exc)
     except BaseException as exc:
@@ -1468,7 +1579,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 #   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes. What
 #   `_secure_file` leaves inside a temp directory's own DACL is not always owner-only (ADR 0163).
 # * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
-#   destination. The engine applies no ACL there; docs/PHI.md records that as a gap, not a control.
+#   destination, secured the same way: an owner-only per-run directory and `_secure_file` on each
+#   staged file. A share that will not keep the directory owner-only refuses the run (see
+#   `_open_staging`) rather than staging plaintext it cannot protect.
 # * A STANDALONE verify (`restore-verify`, the DR cold-seed activation) is neither. It stages in a
 #   private `mkdtemp` directory under the OS temp dir: mode 0700 on POSIX, and on Windows the
 #   protected DACL Python 3.13+ writes for that mode (SYSTEM, Administrators, OWNER RIGHTS), with
@@ -1618,14 +1731,131 @@ def _release_when_opened(opening: asyncio.Future[_Staging]) -> None:
     asyncio.get_running_loop().run_in_executor(None, work.release)
 
 
+def _file_size(path: Path) -> int:
+    """The size of ``path``, or 0 when it does not exist or cannot be read."""
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return 0
+
+
+def _tree_size(root: Path) -> int:
+    """The total size of the regular files under ``root``, never following a link, which is also
+    what ``_add_config_dir`` puts in the archive. 0 when ``root`` cannot be walked."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
+    return total
+
+
+def _nearest_existing(path: Path) -> Path:
+    """``path``, or its nearest ancestor that exists: a staging root may not be created yet."""
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return candidate
+    return path
+
+
+def _mib(n: int) -> str:
+    return f"{max(n, 0) / (1024 * 1024):,.0f} MiB"
+
+
+def _space_shortfall(needs: list[tuple[Path, int]]) -> str | None:
+    """A PHI-free sentence naming the first volume without room for what will be written there, or
+    ``None`` when every volume has room (BACKLOG #1174, PR 1771 defect 3).
+
+    ``needs`` pairs each directory with the bytes a run will hold there at its peak. Two directories
+    on one volume add up, which is the case that matters most: a server-DB store stages under its
+    own backup destination. A volume whose free space cannot be read is skipped, not failed: the
+    check exists to fail early and clearly, and a run it cannot judge still fails at the write."""
+    by_volume: dict[int, tuple[Path, int]] = {}
+    for path, needed in needs:
+        existing = _nearest_existing(path.absolute())
+        try:
+            volume = os.stat(existing).st_dev
+        except OSError:
+            continue
+        where, total = by_volume.get(volume, (existing, 0))
+        by_volume[volume] = (where, total + needed)
+    for where, total in by_volume.values():
+        try:
+            free = shutil.disk_usage(where).free
+        except OSError:
+            continue
+        if free < total:
+            return (
+                f"needs about {_mib(total)} free on the volume holding {where}, "
+                f"and {_mib(free)} is free"
+            )
+    return None
+
+
+class StagingNotPrivateError(OSError):
+    """A secured staging directory did not come out owner-only, so nothing was staged in it."""
+
+
+def _staging_is_private(path: Path) -> bool:
+    """Whether a staging directory admits only its own account.
+
+    POSIX: no group or other permission bits. Windows: a protected DACL whose allow entries name only
+    SYSTEM, Administrators, OWNER RIGHTS or the directory's own owner, which is what ``mkdtemp``
+    writes on Python 3.13+. A DACL that cannot be read or parsed is not private. Deny entries are
+    ignored: they only narrow access.
+
+    What it does not see, stated rather than implied: it trusts the owner the file system reports,
+    so a share whose server sets the owner (a CIFS ``uid=`` mount, Samba ``force user``) can pass
+    while admitting that principal; and on POSIX it reads mode bits only, so an inherited macOS or
+    NFSv4 extended ACL, which applies whatever the mode says, is invisible to it. Linux POSIX ACLs
+    are covered, because their mask follows the group bits of mode ``0700``."""
+    if sys.platform != "win32":
+        try:
+            return stat.S_IMODE(os.stat(path).st_mode) & 0o077 == 0
+        except OSError:
+            return False
+    from messagefoundry.store.store import _SDDL_DENY_TYPES, _parse_sddl_dacl, _read_dacl_sddl
+
+    sddl = _read_dacl_sddl(path, owner=True)
+    dacl = _parse_sddl_dacl(sddl) if sddl else None
+    if dacl is None or not dacl.protected or not dacl.aces:
+        return False
+    allowed = {"S-1-5-18", "S-1-5-32-544", "OW", "S-1-3-4"}
+    if dacl.owner:
+        allowed.add(dacl.owner)
+    return all(sid in allowed for kind, _f, _r, sid in dacl.aces if kind not in _SDDL_DENY_TYPES)
+
+
 def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
     """Create a staging directory under ``root`` and take its lock before anything is written there.
 
     The marker is created only AFTER the lock is held. A sweep that takes the lock and finds no marker
     cannot tell a crash in that instant from a run about to take its lock, so it leaves the directory
-    alone. Nothing in such a directory holds plaintext yet."""
+    alone. Nothing in such a directory holds plaintext yet.
+
+    With ``secure``, the new directory must be owner-only (BACKLOG #1174). ``mkdtemp`` asks for that,
+    but a share can ignore the request, for example an SMB or NFS mount whose modes or ACLs the
+    server sets. Then this removes the directory and raises :class:`StagingNotPrivateError`: the run
+    fails with a reason naming the directory, rather than staging plaintext the engine cannot
+    protect. Falling back to a local directory was the other choice, and was not taken: the run's
+    free-space check and its verify both name one staging root, and a second one would split them."""
     root.mkdir(parents=True, exist_ok=True)
     path = Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+    if secure and not _staging_is_private(path):
+        # Empty, so a leftover holds no plaintext; but it has no lock file, so no sweep will take it.
+        removed = _remove_tree(path)
+        # Short first: the failure record and the alert keep only the first 200 characters.
+        raise StagingNotPrivateError(
+            f"staging dir {path} is not owner-only"
+            + ("" if removed else " (empty, could not be removed; delete it)")
+            + "; the engine stages no plaintext there. Use a volume that keeps a directory's mode "
+            "or ACL: move the SQLite store's data directory, [backup].destination for a server-DB "
+            "store, or TMP, TEMP or TMPDIR for a standalone restore-verify"
+        )
     try:
         fd = os.open(
             path / _LOCK_NAME,
@@ -1683,12 +1913,13 @@ def _staging_root_for(
 ) -> tuple[Path, bool]:
     """Where to stage, and whether to lock the files with ``_secure_file``.
 
-    A SQLite store on disk stages in its own data directory, secured. Anything else stages in
-    ``.mefor-staging`` under ``destination``, unsecured: a server-DB store has no data directory, and
-    an in-memory store has none either."""
+    A SQLite store on disk stages in its own data directory. Anything else stages in
+    ``.mefor-staging`` under ``destination``: a server-DB store has no data directory, and an
+    in-memory store has none either. Both are secured (BACKLOG #1174): each run's directory must be
+    owner-only, which :func:`_open_staging` checks, and each staged file gets ``_secure_file``."""
     if not server_db and store_path and store_path != ":memory:":
         return Path(store_path).absolute().parent, True
-    return destination.absolute() / _SERVER_DB_STAGING_DIR, False
+    return destination.absolute() / _SERVER_DB_STAGING_DIR, True
 
 
 def _standalone_staging_root() -> Path:

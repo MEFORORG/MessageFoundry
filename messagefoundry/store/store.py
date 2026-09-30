@@ -56,6 +56,7 @@ from collections.abc import (
     Collection,
     Iterable,
     Mapping,
+    MutableMapping,
     Sequence,
 )
 from contextlib import asynccontextmanager
@@ -134,6 +135,11 @@ from messagefoundry.store.schema_verify import (
     live_schema_differences,
     run_schema_step,
     verify_live_schema,
+)
+from messagefoundry.store.sealed_cache import (
+    new_reference_set,
+    new_state_cache,
+    sealed_reference_set,
 )
 
 log = logging.getLogger(__name__)
@@ -4752,16 +4758,19 @@ class MessageStore:
         self._read_pool: asyncio.Queue[aiosqlite.Connection] | None = None
         self._read_conns: list[aiosqlite.Connection] = []
         # Transform-accessible state (ADR 0005): an in-memory read-through mirror of the `state` table,
-        # {(namespace, key): decoded_value}. The table is the source of truth; this is the synchronous
+        # {(namespace, key): value}. The table is the source of truth; this is the synchronous
         # read path state_get() resolves against (loaded at open, updated by transform_handoff ONLY
         # after the handoff transaction commits — a rolled-back op must never leak into the cache).
-        self._state_cache: dict[tuple[str, str], Any] = {}
+        # Each value is held SEALED (BACKLOG #1174): a SealedDict decrypts it only inside the read that
+        # asks, so no live key's plaintext sits in heap for the store's lifetime (see sealed_cache).
+        self._state_cache: MutableMapping[tuple[str, str], Any] = new_state_cache()
         # Reference sets (ADR 0006 Tier 1): an in-memory read-through mirror of the ACTIVE snapshot per
-        # set, {name: {key: decoded_value}}. Loaded at open; write_reference_snapshot swaps a set's
-        # entry wholesale ONLY after its build-new-then-flip transaction commits (a rolled-back sync
-        # never leaks into reference_view, so the last-good snapshot stays live). The synchronous read
-        # path reference("name").get(key) resolves against this via reference_view().
-        self._reference_cache: dict[str, dict[str, Any]] = {}
+        # set, {name: {key: value}}, each set a SealedDict like the state cache. Loaded at open;
+        # write_reference_snapshot swaps a set's entry wholesale ONLY after its build-new-then-flip
+        # transaction commits (a rolled-back sync never leaks into reference_view, so the last-good
+        # snapshot stays live). The synchronous read path reference("name").get(key) resolves against
+        # this via reference_view().
+        self._reference_cache: dict[str, MutableMapping[str, Any]] = {}
 
     # --- PHI-at-rest cipher seam for nullable text columns (WP-5) -------------
     # error / last_error / detail can embed raw HL7 fragments from exceptions, so they go through the
@@ -5214,10 +5223,12 @@ class MessageStore:
 
         Runs at open (and after the on-open encrypt migration, so values are decryptable under the
         current keyring). Each ``value`` is decrypted then JSON-decoded into its native Python value —
-        the form :func:`messagefoundry.config.state.state_get` returns. Bounded by the table size (the
-        ADR's documented v1 assumption; TTL/retention keeps it bounded)."""
+        the form :func:`messagefoundry.config.state.state_get` returns -- and then SEALED into the
+        cache (BACKLOG #1174), so the decrypt at open still fails closed here while the cache keeps no
+        plaintext. Bounded by the table size (the ADR's documented v1 assumption; TTL/retention keeps
+        it bounded)."""
         cur = await self._db.execute("SELECT namespace, key, value FROM state")
-        cache: dict[tuple[str, Any], Any] = {}
+        cache = new_state_cache()
         for r in await cur.fetchall():
             # #241 F2: decrypt+json.loads through the fail-closed helper — a keyless open of an
             # encrypted store raises an operator-facing StoreKeylessError (table + remedy), not a raw
@@ -5246,9 +5257,11 @@ class MessageStore:
             "FROM reference_version v "
             "LEFT JOIN reference r ON r.name = v.name AND r.version = v.version"
         )
-        cache: dict[str, dict[str, Any]] = {}
+        cache: dict[str, MutableMapping[str, Any]] = {}
         for r in await cur.fetchall():
-            entry = cache.setdefault(r["name"], {})
+            entry = cache.get(r["name"])
+            if entry is None:
+                entry = cache[r["name"]] = new_reference_set(r["name"])  # sealed (BACKLOG #1174)
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
                 # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
                 entry[r["key"]] = decrypt_json_cell(
@@ -7052,7 +7065,10 @@ class MessageStore:
         ``{(namespace, key): decoded_value}`` — the synchronous read surface the runner publishes (via
         :func:`messagefoundry.config.state.activated`) around each router/transform run so a Handler's
         ``state_get(...)`` resolves. Returned as a ``MappingProxyType`` (a live, read-only window onto
-        the cache): it reflects writes as they commit and can't be mutated through this handle."""
+        the cache): it reflects writes as they commit and can't be mutated through this handle. Each
+        read decrypts one sealed value and returns a fresh copy (BACKLOG #1174); take a frozen copy
+        with :func:`~messagefoundry.store.sealed_cache.point_in_time`, never ``dict(view)``, which
+        would decrypt every entry."""
         return MappingProxyType(self._state_cache)
 
     def reference_view(self) -> Mapping[str, Mapping[str, Any]]:
@@ -7077,17 +7093,18 @@ class MessageStore:
         the last-good snapshot stays active (graceful degradation). The cache is swapped **only after**
         commit — a rolled-back write never leaks into :meth:`reference_view`. Replaces the whole set
         (build-new-then-flip), so it is idempotent on a re-run with the same rows."""
+        encoded = [(k, encode_reference_value(v)) for k, v in rows.items()]
         encrypted = [
             (
                 name,
                 version,
                 k,
                 self._cipher.encrypt(
-                    encode_reference_value(v),
+                    text,
                     aad=cell_aad("reference", "value", name, version, k),
                 ),
             )
-            for k, v in rows.items()
+            for k, text in encoded
         ]
         async with _writer_txn(self._db, self._lock):
             # Drop the set's prior version(s) — we keep only the active snapshot per name.
@@ -7103,8 +7120,8 @@ class MessageStore:
                 (name, version, time.time(), len(encrypted)),
             )
             await self._commit()
-        # Commit succeeded → swap the active snapshot in the read cache (plaintext, decoded form).
-        self._reference_cache[name] = dict(rows)
+        # Commit succeeded → swap the active snapshot in the read cache, sealed (BACKLOG #1174).
+        self._reference_cache[name] = sealed_reference_set(name, encoded)
 
     async def converge_reference_cache(self) -> list[str]:
         """No-op on SQLite (Track B Step 6). SQLite is single-node: this handle is the SOLE writer of
@@ -12644,7 +12661,9 @@ class MessageStore:
         # Commit succeeded → evict the purged keys from the read-through cache (after commit, mirroring
         # the write path: the table is the source of truth, the cache follows it only once durable).
         for ck in purged_keys:
-            self._state_cache.pop(ck, None)
+            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+            if ck in self._state_cache:
+                del self._state_cache[ck]
         return len(purged_keys)
 
     async def wal_checkpoint(self) -> None:
