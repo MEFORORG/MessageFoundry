@@ -3514,16 +3514,16 @@ def create_app(
         total = await engine.store.count_dead(
             channel_id=channel_id, destination_name=destination_name, allowed_channels=allowed
         )
-        # The bulk-replay controls come from the whole filtered set, never from this page of rows,
-        # and the every-channel control from the unfiltered scope (BACKLOG #1743 step 2). Both
-        # reads carry the same RBAC scope as the list above.
-        targets = await engine.store.list_dead_targets(
+        # The two replay fields are defined on DeadLetterList. Both reads carry the list's scope.
+        targets = await engine.store.list_replay_targets(
             channel_id=channel_id, destination_name=destination_name, allowed_channels=allowed
         )
-        unfiltered = channel_id is None and destination_name is None
-        scope_total = (
-            total if unfiltered else await engine.store.count_dead(allowed_channels=allowed)
-        )
+        if channel_id is None and destination_name is None:
+            replayable_in_scope = bool(targets)
+        else:
+            replayable_in_scope = bool(
+                await engine.store.list_replay_targets(allowed_channels=allowed)
+            )
         dead = [_dead_row(r) for r in rows]
         # Same centralized per-property PHI gate as /messages (WP-9): messages:view_summary unlocks the
         # patient-identifying `summary` and the delivery `last_error` (which can quote field values —
@@ -3542,7 +3542,7 @@ def create_app(
             offset=offset,
             dead_letters=dead,
             replay_targets=[DeadLetterTarget(channel_id=c, destination_name=d) for c, d in targets],
-            scope_total=scope_total,
+            replayable_in_scope=replayable_in_scope,
         )
 
     @app.post(

@@ -8,7 +8,10 @@ laptop they skip, and a fully skipped suite reports green — so two of the thre
 this fix unverified by anything a builder can run. This file parses source, so it runs on every leg.
 
 **Six sites, not two** (``replay`` and ``replay_dead`` on each of ``MessageStore``, ``PostgresStore``
-and ``SqlServerStore``), and inside them more than six statements:
+and ``SqlServerStore``), and inside them more than six statements. The table below also carries
+``list_replay_targets`` on each backend, which writes nothing: it is the reader the console draws
+its replay buttons from, so it must skip what replay skips (BACKLOG #1743 step 2). The replay
+statements are:
 
 - ``replay``'s ``UPDATE queue SET status`` — the re-pend itself;
 - ``replay``'s ``DELETE FROM delivered_keys`` — the re-send branch drops the idempotency-ledger entries
@@ -74,6 +77,11 @@ _GUARDED: dict[tuple[str, str, str], tuple[str, ...]] = {
         "SELECT DISTINCT message_id",
         "UPDATE queue SET status",
     ),
+    # Not a replay site but its READER: the console draws one replay button per pair this returns,
+    # so a pair replay would skip must not be one (BACKLOG #1743 step 2).
+    ("store.py", "MessageStore", "list_replay_targets"): ("SELECT DISTINCT o.channel_id",),
+    ("postgres.py", "PostgresStore", "list_replay_targets"): ("SELECT DISTINCT o.channel_id",),
+    ("sqlserver.py", "SqlServerStore", "list_replay_targets"): ("SELECT DISTINCT o.channel_id",),
 }
 
 

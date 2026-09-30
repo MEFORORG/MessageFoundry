@@ -92,7 +92,7 @@ def _dead_letters(channel: str, destination: str) -> DeadLetterList:
         offset=0,
         dead_letters=[row],
         replay_targets=[DeadLetterTarget(channel_id=channel, destination_name=destination)],
-        scope_total=1,
+        replayable_in_scope=True,
     )
 
 
@@ -111,11 +111,17 @@ def test_the_dead_letter_replay_forms_encode_a_name_carrying_a_slash() -> None:
 
     # The page's two filter arguments are required (BACKLOG #1743) and are passed the same names, so
     # the assertions below cover the pager's QUERY-side encoding as well as the forms' PATH-side one.
+    # Two renders: a destination filter leaves out the per-channel form (BACKLOG #1743 step 2), so
+    # the channel-only render is the one that draws it.
     html = str(
         dead_letters(
             _dead_letters("IB/ACME", "OB/PARTNER"),
             channel_id="IB/ACME",
             destination_name="OB/PARTNER",
+        )
+    ) + str(
+        dead_letters(
+            _dead_letters("IB/ACME", "OB/PARTNER"), channel_id="IB/ACME", destination_name=""
         )
     )
 
@@ -134,7 +140,7 @@ def test_a_benign_connection_name_still_renders_readably() -> None:
         dead_letters(
             _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
             channel_id="IB_ACME_ADT",
-            destination_name="OB_PARTNER_ADT",
+            destination_name="",
         )
     )
     assert "/ui/dead-letters/IB_ACME_ADT/replay" in html

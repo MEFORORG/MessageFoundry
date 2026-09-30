@@ -1132,18 +1132,18 @@ class QueueStore(StoreLifecycle, Protocol):
         allowed_channels: Sequence[str] | None = None,
     ) -> int: ...
 
-    async def list_dead_targets(
+    async def list_replay_targets(
         self,
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
         allowed_channels: Sequence[str] | None = None,
     ) -> list[tuple[str, str]]:
-        """The distinct ``(channel_id, destination_name)`` pairs that hold at least one dead
-        delivery, sorted, over the same filters and ``allowed_channels`` scope as
-        :meth:`count_dead`. The console builds its bulk-replay controls from this set, not from the
-        page of rows it rendered, so a channel whose dead rows are all older than the first page
-        still gets a control (BACKLOG #1743 step 2)."""
+        """The distinct ``(channel_id, destination_name)`` pairs for which :meth:`replay_dead`
+        would re-queue at least one row, sorted, under the :meth:`count_dead` filters and
+        ``allowed_channels`` scope. So a dead row whose body retention erased, or a pass-through
+        marker, names no pair: replay skips both. ``GET /dead-letters`` returns this set as
+        ``DeadLetterList.replay_targets`` (BACKLOG #1743 step 2)."""
         ...
 
     async def outbox_for(self, message_id: str) -> Sequence[Row]: ...

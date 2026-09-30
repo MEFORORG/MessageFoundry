@@ -7,12 +7,9 @@ from the rows it rendered. A channel whose dead deliveries all sat past the firs
 button. It now builds them from ``DeadLetterList.replay_targets``, which the engine computes over
 the whole filtered dead set inside the caller's channel scope.
 
-Each test drives the real ``/ui/dead-letters`` route and first asserts the CONTROL: the old channel
-is absent from the rendered rows. Only then does its button prove anything.
-
-"Replay all dead (every channel)" is global by decision and keeps its every-channel label. It shows
-whenever the caller's scope holds a dead delivery, whatever the page filter, and hides only when
-the scope holds none.
+Each test drives the real ``/ui/dead-letters`` route. The paging test first asserts its CONTROL:
+the old channel is absent from the rendered rows, so only then does its button prove anything.
+What the controls should do is stated once, on ``pages.messages.dead_letters``.
 """
 
 from __future__ import annotations
@@ -148,8 +145,7 @@ async def test_nothing_dead_in_scope_draws_no_replay_control_at_all(engine: Engi
         await _login(c)
         r = await c.get("/ui/dead-letters")
         assert r.status_code == 200, r.text
-        assert REPLAY_ALL not in r.text
-        assert "/ui/dead-letters/" not in r.text.replace(REPLAY_ALL, "")
+        assert 'action="/ui/dead-letters/' not in r.text
 
 
 async def test_a_channel_scoped_caller_gets_controls_for_its_own_channels_only(
@@ -164,3 +160,23 @@ async def test_a_channel_scoped_caller_gets_controls_for_its_own_channels_only(
         assert r.status_code == 200, r.text
         assert OLD_CHANNEL in r.text and OLD_PAIR in r.text
         assert NEW_CHANNEL not in r.text, "a control leaked a channel outside the caller's scope"
+
+
+async def test_a_destination_filtered_page_draws_no_per_channel_control(engine: Engine) -> None:
+    """A per-channel button replays every destination of its channel. On a page filtered to one
+    destination it would re-send deliveries the filter excluded, so the page leaves it out and
+    keeps the exact per-destination button."""
+    await _seed(engine)
+    await _dead(engine, "IB_NEW", "OB_SIDE", now=30.0)
+    service = await _service(engine, [ALL_CHANNELS])
+    async with _client(engine, service) as c:
+        await _login(c)
+        r = await c.get("/ui/dead-letters", params={"destination_name": "OB_NEW"})
+        assert r.status_code == 200, r.text
+        assert 'action="/ui/dead-letters/IB_NEW/OB_NEW/replay"' in r.text
+        assert NEW_CHANNEL not in r.text, "a per-channel button would also replay OB_SIDE"
+        assert "OB_SIDE" not in r.text
+
+        # CONTROL: the same seed without the destination filter does draw the per-channel button.
+        unfiltered = await c.get("/ui/dead-letters")
+        assert NEW_CHANNEL in unfiltered.text and "OB_SIDE" in unfiltered.text

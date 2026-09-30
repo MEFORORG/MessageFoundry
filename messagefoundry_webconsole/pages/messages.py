@@ -878,17 +878,15 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
     default would let a second render site omit them, and the page would still render while its
     links quietly widened the listing, which is the one failure this argument exists to prevent.
 
-    **The bulk-replay buttons come from the engine's whole dead set, never from the rows drawn
-    here** (BACKLOG #1743 step 2). The per-channel and per-destination buttons are built from
-    ``data.replay_targets``: every distinct pair over the filtered set, inside the caller's channel
-    scope. So paging never changes which buttons exist, and a channel whose dead rows all sit past
-    this page still gets one. They do track the two filters, since the engine applied both.
+    **The bulk-replay buttons come from ``data.replay_targets``, never from the rows drawn here**
+    (BACKLOG #1743 step 2; ``DeadLetterList`` says what the field holds). So paging never changes
+    which buttons exist. The per-destination buttons follow both filters. The per-channel buttons
+    replay every destination of their channel, so on a destination-filtered page they are left
+    out rather than reach past the filter.
 
-    "Replay all dead (every channel)" does NOT track the filters, by decision. It posts to
-    ``/ui/dead-letters/replay-all``, which re-queues every channel, so its label says so. It shows
-    whenever ``data.scope_total`` is above zero, even on a filtered page that matched nothing, and
-    hides only when the caller's scope holds no dead delivery at all. The engine refuses it for a
-    channel-scoped caller (``_replay_in_scope``), whatever this page draws.
+    "Replay all dead (every channel)" ignores the filters, by decision, and its label says so. It
+    shows whenever ``data.replayable_in_scope`` is true, even on a filtered page that matched
+    nothing. The engine refuses it for a channel-scoped caller (``_replay_in_scope``).
     """
     headers = ["Failed", "Channel", "Destination", "Type", "Attempts", "Last error", "Message"]
     body = [
@@ -913,8 +911,9 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
         noun="dead delivery(s)",
         filters={"channel_id": channel_id, "destination_name": destination_name},
     )
-    pairs = sorted({(t.channel_id, t.destination_name) for t in data.replay_targets})
-    channels = sorted({ch for ch, _ in pairs})
+    pairs = [(t.channel_id, t.destination_name) for t in data.replay_targets]  # sorted by the store
+    # A per-channel button would replay destinations a destination filter excluded.
+    channels = [] if destination_name else sorted({ch for ch, _ in pairs})
     chan_forms = [
         el(
             "form",
@@ -936,7 +935,7 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
         for ch, dest in pairs
     ]
     actions: list[object] = []
-    if data.scope_total > 0:
+    if data.replayable_in_scope:
         # L6b (#75 parity): one action to replay every dead delivery across ALL channels.
         actions += [
             el("h2", "Bulk replay — everything"),

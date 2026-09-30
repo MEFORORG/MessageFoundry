@@ -283,8 +283,8 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
         "cipher-encrypted at rest"
     ),
     "DeadLetterList": (
-        "envelope: limit/offset/total/scope_total + DeadLetterRow rows (mapped) + DeadLetterTarget "
-        "replay targets"
+        "envelope: limit/offset/total + DeadLetterRow rows (mapped) + DeadLetterTarget replay "
+        "targets + the replayable_in_scope flag"
     ),
     "DeadLetterReplayResult": "requeued count only",
     "DeadLetterTarget": "channel_id/destination_name connection names only (BACKLOG #1743)",

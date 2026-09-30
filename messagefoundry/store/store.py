@@ -4003,11 +4003,11 @@ def _append_channel_scope(
 
 
 def _dead_target_pairs(rows: Iterable[tuple[Any, Any]]) -> list[tuple[str, str]]:
-    """Shape every backend's raw ``list_dead_targets`` rows into one sorted list. Sorting here, not
-    in SQL, gives the three backends one order whatever their collation. A pair with a NULL half is
-    dropped: a replay control names both halves in its path, and only ingress or routed rows carry
-    a NULL destination, which the dead-letter predicate already excludes by stage."""
-    return sorted({(str(c), str(d)) for c, d in rows if c is not None and d is not None})
+    """Shape every backend's raw ``list_replay_targets`` rows into one sorted list. Sorting here,
+    not in SQL, gives the three backends one order whatever their collation. A pair with a NULL or
+    empty half is dropped: a replay control names both halves in its path, and an empty segment
+    would address no route."""
+    return sorted({(str(c), str(d)) for c, d in rows if c and d})
 
 
 _SCHEMA = """
@@ -10055,20 +10055,22 @@ class MessageStore:
             row = await cur.fetchone()
         return int(row["n"]) if row else 0
 
-    async def list_dead_targets(
+    async def list_replay_targets(
         self,
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
         allowed_channels: Sequence[str] | None = None,
     ) -> list[tuple[str, str]]:
-        """The distinct dead ``(channel_id, destination_name)`` pairs, sorted; the contract is
-        :meth:`Store.list_dead_targets`. Same predicate as :meth:`count_dead`, so the set and the
-        count describe one population."""
+        """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
+        narrowed by the two clauses :meth:`replay_dead` applies, so every pair names rows a replay
+        would re-queue."""
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         async with self._read() as db:
             cur = await db.execute(
-                f"SELECT DISTINCT o.channel_id, o.destination_name FROM queue o{where}", params
+                "SELECT DISTINCT o.channel_id, o.destination_name"
+                f" FROM queue o{where} AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
+                params,
             )
             rows = await cur.fetchall()
         return _dead_target_pairs((r["channel_id"], r["destination_name"]) for r in rows)
