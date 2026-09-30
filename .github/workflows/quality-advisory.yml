@@ -27,15 +27,17 @@ name: quality-advisory
 #                                                         in the step summary of the nightly cron.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
-# TWO JOBS HERE ARE NOT RUBRIC SIGNALS, AND BOTH ARE HERE ON PURPOSE. `dangling-citations` (BACKLOG
-# #1431) reports backlog `#N` references that name no filed item in either ledger; `verdict-divergence`
-# (BACKLOG #1342) reports an open item whose banner `Verdict` contradicts a re-score line in its own
-# body. Both are LEDGER-hygiene checks, not code-quality measurements, and their natural sibling --
-# backlog-hygiene.yml -- is the wrong home: that workflow's only job IS a required context, so a step
-# added there could block every merge. This file is the repository's one place where a check can report
-# without being able to gate, which is the property both jobs need. Promoting either to blocking is an
-# owner decision and is deliberately untaken; see each item for the reasoning and for what its current
-# findings actually are.
+# TWO LEDGER-HYGIENE JOBS USED TO STAND HERE, AND NEITHER DOES NOW. CORRECTED 2026-09-30 (BACKLOG
+# #1342). This paragraph used to open "TWO JOBS HERE ARE NOT RUBRIC SIGNALS" and describe
+# `dangling-citations` (BACKLOG #1431) and `verdict-divergence` (BACKLOG #1342) as live jobs. Both
+# retired with the ledger (BACKLOG #1250), along with `deferral-resolution` (BACKLOG #1527). The note
+# at the top of `jobs:` records why they were removed rather than left running. Every job in this
+# file is now a rubric signal, or the `liveness` check on those signals.
+#
+# Why they lived here still holds for any future check of that kind. Their natural sibling,
+# backlog-hygiene.yml, is the wrong home: that workflow's only job IS a required context, so a step
+# added there could block every merge. This file is the repository's one place where a check can
+# report without being able to gate.
 #
 # WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
 # assumed, and the measurements are recorded here so a future session does not "helpfully" add a SARIF
