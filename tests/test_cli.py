@@ -1790,6 +1790,11 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
         "the refusal prescribes [security].local_access_only, which the loader REFUSES beside the "
         f"non-loopback listen_address that is the only way to reach this gate by FILE: {refusal!r}"
     )
+    # BACKLOG #1672: this arm is the warn path, where the engine would serve https on the minted
+    # placeholder (ADR 0172), so the hop is not cleartext and the refusal must not say it is.
+    assert "without TLS" not in refusal, refusal
+    assert "without an operator certificate" in refusal, refusal
+    assert "self-signed placeholder" in refusal, refusal
 
     # 2. The remediation the message used to give, applied to the config that tripped it, dies at
     #    load -- and never reaches the /ui gate to be cleared. Evidence about the LOADER, not a

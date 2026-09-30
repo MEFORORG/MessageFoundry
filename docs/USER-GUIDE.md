@@ -176,7 +176,11 @@ For production on Windows, run the engine as a background service via **NSSM** �
 .\scripts\service\install-service.ps1 -Environment prod
 ```
 
-`-Environment` is **required** (it becomes `serve --env`, just like step 3). The script is idempotent (re-run to reconfigure), auto-downloads a SHA-256-pinned NSSM if one isn't on `PATH`, and defaults to service name `MessageFoundry`, config `<repo>\samples\config`, store + logs under `C:\ProgramData\MessageFoundry`, bind `127.0.0.1:8765`. Override paths/port/account with flags, e.g.:
+`-Environment` is **required** (it becomes `serve --env`, just like step 3). The script is idempotent (re-run to reconfigure), and defaults to service name `MessageFoundry`, config `<repo>\samples\config`, store + logs under `C:\ProgramData\MessageFoundry`, bind `127.0.0.1:8765`.
+
+The service runs the `nssm.exe` the installer keeps in `C:\Program Files\MessageFoundry\nssm` (the `-NssmDir` flag). Only administrators can write to that folder. The installer checks each copy against a pinned SHA-256 before it uses it (`Resolve-Nssm` in `install-service.ps1`). That covers a copy already in the folder, one from `-NssmPath`, one on `PATH`, and a download. [SERVICE.md](SERVICE.md#prerequisites) item 2 says what happens to a copy that fails. The installer never adds the folder to `PATH`, so a bare `nssm` typed in a shell does not run the checked copy.
+
+Override paths/port/account with flags, e.g.:
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod -Port 9000 `
@@ -184,14 +188,18 @@ For production on Windows, run the engine as a background service via **NSSM** �
     -ServiceAccount "NT SERVICE\MessageFoundry"     # least-privilege; auto-grants the needed ACLs
 ```
 
-Manage and remove it:
+Manage and remove it from an elevated prompt. Windows' own service commands need no `nssm`:
 
 ```powershell
-nssm start  MessageFoundry
-nssm status MessageFoundry
-nssm stop   MessageFoundry
+Start-Service MessageFoundry
+Get-Service   MessageFoundry
+Stop-Service  MessageFoundry                       # NSSM answers with Ctrl+C, so connections drain
 .\scripts\service\uninstall-service.ps1            # elevated; prints what it leaves behind
 ```
+
+For a setting only NSSM has, run the checked copy by its full path, as in
+[SERVICE.md](SERVICE.md#start--stop--status): `& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set ...`.
+If you installed with another `-NssmDir`, use that folder.
 
 Removing the service does not undo everything the install did. The uninstaller prints an inventory
 of what is still on the host — the data directory, permissions naming the run-as account, a user
@@ -525,7 +533,7 @@ The pages hang off a **top nav** of hover/focus dropdowns: **Traffic** (Connecti
 
 - **Alerts** — the engine's **active alert instances** (open and acknowledged) plus the loaded `[alerts]` rules ([ADR 0044](adr/0044-operator-alert-state.md) refining [ADR 0014](adr/0014-alerting-rules-engine.md)). Each instance carries severity, status, event type, connection, occurrence count, first/last seen, reason, and who acknowledged it, with **Ack** / **Resolve** / windowed **Suspend** / **Resume** actions. Rule *editing* stays config-file driven; the rule list is shown read-only (event type, connection, min depth, min age, severity, transports, cooldown — transports reported present-or-not, secrets omitted). The notifications themselves still fan out through the engine's AlertSink (see [Monitoring dispositions and troubleshooting](#monitoring-dispositions-and-troubleshooting)).
 
-**Dead letters and replay.** The nav's **Dead letters** page lists dead-lettered deliveries newest-first — one row per message → destination that exhausted its retries (columns: *Failed / Channel / Destination / Type / Attempts / Last error / Message*) — with bulk **Replay all dead — `<connection>`** buttons, per-destination **Replay `<connection>` → `<destination>`** buttons, and one action to replay every dead delivery across all connections. The list is paged the same way the message log is (*first-last of total*, **Previous** / **Next**). **Read the buttons carefully: they are built from the rows on the page you are looking at, not from the whole list.** Paging changes which per-connection and per-destination buttons appear, and *replay every dead delivery across all connections* does exactly that — every connection in the store, including ones this page is not showing you. Viewing the list needs `messages:read`; replay needs `messages:replay` and is step-up (re-auth) gated server-side (and may be held for a second approver). Each row's **Message** link opens the audited detail page, where the **Deliveries** section shows the per-destination error and a per-message **Replay** — a second route to the same action. For diagnosing and clearing stuck deliveries, see the troubleshooting guidance in [EARLY-ADOPTER-GUIDE.md](EARLY-ADOPTER-GUIDE.md).
+**Dead letters and replay.** The nav's **Dead letters** page lists dead-lettered deliveries newest-first — one row per message → destination that exhausted its retries (columns: *Failed / Channel / Destination / Type / Attempts / Last error / Message*) — with bulk **Replay all dead — `<connection>`** buttons, per-destination **Replay `<connection>` → `<destination>`** buttons, and one action to replay every dead delivery across all connections. The list is paged the same way the message log is (*first-last of total*, **Previous** / **Next**). **Read the buttons carefully: they are built from the rows on the page you are looking at, not from the whole list.** Paging changes which per-connection and per-destination buttons appear, and *replay every dead delivery across all connections* does exactly that — every connection in the store, including ones this page is not showing you. Viewing the list needs `messages:read`; replay needs `messages:replay` and is step-up (re-auth) gated server-side (and may be held for a second approver). The **Last error** column shows `****`: error text can quote patient data, so each masked value carries a **Reveal** link that opens the message with its error text shown, as an audited request. Each row's **Message** link opens the audited detail page, where the **Deliveries** section shows the per-destination error (masked the same way until you choose **Reveal**) and a per-message **Replay** — a second route to the same action. For diagnosing and clearing stuck deliveries, see the troubleshooting guidance in [EARLY-ADOPTER-GUIDE.md](EARLY-ADOPTER-GUIDE.md).
 
 ### The VS Code extension (for config authors)
 
@@ -579,7 +587,7 @@ A delivery dead-letters when its retries are exhausted. Retry behavior is per-ou
 
 To recover:
 
-1. **Find the dead-letters.** Console: open the **Dead letters** page (or the message itself from **Messages**) and read its delivery row's **Last error**. API: `GET /dead-letters` (optionally `?channel_id=&destination_name=`) lists dead deliveries newest-first; each row carries `last_error`.
+1. **Find the dead-letters.** Console: open the **Dead letters** page (or the message itself from **Messages**) and choose **Reveal** beside its delivery row's masked **Last error**. API: `GET /dead-letters` (optionally `?channel_id=&destination_name=`) lists dead deliveries newest-first; each row's `last_error` is masked as `****`, so read the text with `GET /messages/{message_id}?reveal_errors=true` (needs `messages:view_raw`; audited).
 2. **Fix the cause** (the downstream endpoint, the transform, the config).
 3. **Replay.** `POST /dead-letters/replay` re-queues the dead deliveries (optionally scoped by `channel_id` / `destination_name`); each affected message reverts from `error` to `received` and re-drains. Already-delivered rows are left alone. Replay requires the `messages:replay` permission and is **step-up (re-auth) gated**, and may be held for a second approver when `[approvals]` is configured. (In the console, the **Dead letters** page lists these and offers the per-connection, per-destination, and replay-everything buttons directly; this API path is the equivalent for scripting and automation.)
 

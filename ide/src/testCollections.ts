@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Pure, dependency-free model + compare for Test Bench saved regression collections (BACKLOG #168,
-// ADR 0121). No `vscode` import (persistence via workspaceState lives in testBench.ts), so this is
+// ADR 0121). No `vscode` import (persistence lives in collectionStore.ts), so this is
 // unit-testable in isolation — the same discipline as hl7diff.ts / hexdump.ts. The compare REUSES
 // hl7diff.diffMessages (segment/field-aware alignment) rather than reimplementing it.
 
@@ -182,4 +182,76 @@ export function compareCase(
   }
 
   return { pass: deliveries.every((d) => d.status === "match"), deliveries };
+}
+
+/** What one case's rerun produced, as the host reads it off the dry-run row. `undefined`: no row. */
+export interface CaseRerun {
+  disposition: string;
+  error: string | null;
+  deliveries: readonly ExpectedDelivery[];
+}
+
+/** The part of one case's result the run view shows at once: no field value, no error text. */
+export interface CaseRunSummary {
+  name: string;
+  pass: boolean;
+  disposition: string;
+}
+
+/** The part shown only when that one case is clicked (ADR 0121, "Reveal on click"). */
+export interface CaseRunDetail {
+  error: string | null;
+  deliveries: DeliveryComparison[];
+}
+
+/** One collection rerun, split so the summaries can go to the view and the details stay behind. */
+export interface CollectionRunResult {
+  passed: number;
+  summaries: CaseRunSummary[];
+  details: CaseRunDetail[]; // aligned 1:1 with `summaries` by index
+}
+
+/**
+ * Judge every case of a collection against its rerun, and split each result in two: summaries, which
+ * carry no `before`/`after` value and no error text, and details, which carry both (ADR 0121, "Reveal
+ * on click"). `reruns[i]` is case `i`'s rerun, or `undefined` when the dry-run produced no row for it,
+ * which fails the case.
+ */
+export function judgeCollectionRun(
+  cases: readonly TestCase[],
+  reruns: readonly (CaseRerun | undefined)[],
+  ignore: readonly VolatileField[] = DEFAULT_VOLATILE_FIELDS,
+): CollectionRunResult {
+  const summaries: CaseRunSummary[] = [];
+  const details: CaseRunDetail[] = [];
+  cases.forEach((c, i) => {
+    const rerun = reruns[i];
+    const cmp = compareCase(c.expected, rerun ? rerun.deliveries : [], ignore);
+    summaries.push({
+      name: c.name,
+      pass: rerun ? cmp.pass : false,
+      disposition: rerun?.disposition ?? "NO RESULT",
+    });
+    details.push({
+      error: rerun ? rerun.error : "no dry-run row produced for this case",
+      deliveries: cmp.deliveries,
+    });
+  });
+  return { passed: summaries.filter((s) => s.pass).length, summaries, details };
+}
+
+/**
+ * The detail to post for a `caseDetail` request, or `null` to post nothing. The request comes from the
+ * webview, so both fields are untrusted: `run` must name the held run, and `index` must be an integer
+ * naming one of its cases.
+ */
+export function pickCaseDetail(
+  held: { id: number; details: readonly CaseRunDetail[] } | null,
+  run: unknown,
+  index: unknown,
+): CaseRunDetail | null {
+  if (!held || run !== held.id || typeof index !== "number" || !Number.isSafeInteger(index)) {
+    return null;
+  }
+  return index >= 0 && index < held.details.length ? held.details[index] : null;
 }

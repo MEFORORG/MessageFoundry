@@ -418,7 +418,7 @@ def test_cli_upsert_reports_connection_json_nested_past_the_decoder(
     `test_cli_upsert_does_not_report_a_downstream_recursion_error_as_bad_input` below.
 
     Why, and why the trigger below is manufactured rather than real nesting: `_load_operator_json`
-    in `messagefoundry/__main__.py`. The type facts are pinned once, by the anchor test
+    in `messagefoundry/cli_common.py`. The type facts are pinned once, by the anchor test
     `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
 
     RED when: `_load_operator_json`'s `except RecursionError` arm, or `_connection`'s
@@ -427,7 +427,7 @@ def test_cli_upsert_reports_connection_json_nested_past_the_decoder(
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr("messagefoundry.__main__.json.loads", _raise_recursion)
+    monkeypatch.setattr("messagefoundry.cli_common.json.loads", _raise_recursion)
     rc = main(["connection", "upsert", "--config", str(cfg), "--data", "[]", "--json"])
     out = capsys.readouterr().out
     monkeypatch.undo()  # restore json.loads before parsing the captured payload with it

@@ -180,6 +180,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
 from messagefoundry.transports import (
     DeliveryError,
@@ -208,6 +209,9 @@ type Direction = Literal["inbound", "outbound"]
 enforces uniqueness per table, and the API's ``_dual_role_control`` carries a ``role=`` to
 disambiguate the pair), so every per-connection map that can hold an entry for either direction
 is keyed by ``(Direction, name)`` rather than by the bare name."""
+
+type _LaneFault = Literal["credential", "configuration"]
+"""A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
 
 
 log = logging.getLogger(__name__)
@@ -772,11 +776,14 @@ class _ItemOutcome(Enum):
     STOPPED = "stopped"
 
 
-# Which direction's operator hold a STOPPED lane on each pooled stage belongs to. RESPONSE is absent
-# because no operator-required STOP happens there (its only STOP is the missing-inbound exit).
+# Which direction's operator hold a STOPPED lane on each pooled stage belongs to. A RESPONSE lane is
+# a loopback inbound's re-ingress, so it is the inbound's. Its T16 STOP (the missing-inbound exit)
+# needs no operator, but the dispatcher's own T17 and claimer-death bounds do. A #122 log halt turns
+# that STOPPED lane PAUSED, and the window open's start_inbound then resumed it (BACKLOG #2072).
 _HOLD_DIRECTION: dict[Stage, Direction] = {
     Stage.INGRESS: "inbound",
     Stage.ROUTED: "inbound",
+    Stage.RESPONSE: "inbound",
     Stage.OUTBOUND: "outbound",
 }
 
@@ -1295,8 +1302,14 @@ class RegistryRunner:
         self._schedule_tick = schedule_tick
         self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
         self._schedule_workers: dict[tuple[Direction, str], asyncio.Task[None]] = {}
-        # Lanes halted by a STOP that only an operator may lift: a credential fault (#109) or the
-        # internal-error STOP policy. The scheduler reads this so a window close or open never undoes
+        # Outbounds whose current pause the CALENDAR made. A schedule park goes through stop_outbound,
+        # so it reads as an operator pause that no reload lifts; this lets a reload that removes the
+        # schedule resume the lane (#2069). Any later start or stop of the lane drops the entry.
+        self._schedule_parked: set[str] = set()
+        # Lanes halted by a STOP that only an operator may lift, at least: a credential fault (#109),
+        # a connection configuration fault (#2083), the internal-error STOP policy, or a pooled
+        # dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death bound;
+        # see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
         # one (see _schedule_holds, which also names every path that clears a record). Keyed by
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
@@ -2522,6 +2535,7 @@ class RegistryRunner:
         # The OPERATOR now owns this lane's down state — a reload must not resume it (#115/#233): drop any
         # engine-park marker so _unpark_outbound_lane leaves it alone even if the graph says it may run.
         self._gate_parked.discard(name)
+        self._schedule_parked.discard(name)  # the scheduler's own park re-records it after this
         # (Re)create the quiescence Event CLEARED: the lane is not yet drained. The pooled dispatcher's
         # on_lane_paused (via _mark_outbound_quiesced) / the per_lane worker's loop-top gate SETs it once
         # in-flight hits zero.
@@ -2600,6 +2614,7 @@ class RegistryRunner:
             return
         self._gate_parked.discard(name)
         self._outbound_paused.discard(name)
+        self._schedule_parked.discard(name)
         ev = self._outbound_quiesced.get(name)
         if ev is not None:
             ev.clear()
@@ -2684,6 +2699,7 @@ class RegistryRunner:
             raise NotDeployedError(name)
         await self._ensure_destination_built(name)
         self._outbound_paused.discard(name)
+        self._schedule_parked.discard(name)
         # The OPERATOR now owns this lane's UP state — the engine park (if any) is spent, and a reload
         # must respect the start (#115): drop the marker so _unpark_outbound_lane can't re-park it.
         self._gate_parked.discard(name)
@@ -2706,16 +2722,82 @@ class RegistryRunner:
 
     # --- per-connection active-window scheduler (#147, ADR 0095) --------------
 
-    def _start_schedulers(self) -> None:
-        """Spawn one active-window scheduler task per scheduled inbound/outbound connection. Called
-        once from :meth:`start` under the reload lock; idempotent per (direction, name) (a live task
-        is not re-spawned). Byte-identical no-op when no connection declares a ``schedule``."""
+    def _declared_schedules(self) -> dict[tuple[Direction, str], Schedule]:
+        """Every ``schedule`` the current registry declares, keyed as :attr:`_schedule_workers` is."""
+        declared: dict[tuple[Direction, str], Schedule] = {}
         for ic in self.registry.inbound.values():
             if ic.schedule is not None:
-                self._spawn_scheduler(ic.name, "inbound", ic.schedule)
+                declared[("inbound", ic.name)] = ic.schedule
         for oc in self.registry.outbound.values():
             if oc.schedule is not None:
-                self._spawn_scheduler(oc.name, "outbound", oc.schedule)
+                declared[("outbound", oc.name)] = oc.schedule
+        return declared
+
+    def _start_schedulers(self) -> None:
+        """Spawn one active-window scheduler task per scheduled inbound/outbound connection. Called
+        from :meth:`start` and :meth:`_reconcile_schedulers` under the reload lock; idempotent per
+        (direction, name) (a live task is not re-spawned). Byte-identical no-op when no connection
+        declares a ``schedule``."""
+        for (kind, name), schedule in self._declared_schedules().items():
+            self._spawn_scheduler(name, kind, schedule)
+
+    async def _reconcile_schedulers(self, old: Registry) -> None:
+        """Bring the scheduler tasks in line with a reloaded registry (BACKLOG #2069). Called by
+        :meth:`reload` under the reload lock, once the swap has committed.
+
+        A task binds its ``Schedule`` when it is spawned, and only :meth:`start` used to spawn one.
+        So a reload that ADDED a schedule never ran it, an EDITED one kept its old calendar, and a
+        task whose connection was REMOVED kept reconciling a name the graph no longer declares, and
+        logged a traceback every tick.
+
+        EVERY task is replaced, not only the changed ones. A task that decided to start or park
+        before this reload is waiting on the lock this caller holds, and would act on that decision
+        after the reload without asking the new graph, whose DR threshold or ``auto_start`` may now
+        refuse it. A replacement decides afresh. A task can only be asleep or waiting on that lock,
+        so the cancel never lands inside a start or a park.
+
+        The replacements are spawned BEFORE the first await, so a reload cancelled mid-way still
+        leaves every declared schedule with a live task.
+
+        A kept outbound whose schedule this reload REMOVED is resumed if the calendar is what parked
+        it (:attr:`_schedule_parked`). The park reads as an operator pause, which no reload lifts,
+        so without this the lane would stay paused with no calendar left to resume it."""
+        retired = list(self._schedule_workers.values())
+        self._schedule_workers.clear()
+        for task in retired:
+            task.cancel()
+        self._start_schedulers()
+        for name, oc in self.registry.outbound.items():
+            was = old.outbound.get(name)
+            if (
+                oc.schedule is None
+                and was is not None
+                and was.schedule is not None
+                and name in self._schedule_parked
+            ):
+                await self._resume_unscheduled_outbound(name)
+        # A lane the new graph dropped has no calendar left to have parked it.
+        self._schedule_parked.intersection_update(self.registry.outbound)
+        await asyncio.gather(*retired, return_exceptions=True)
+
+    async def _resume_unscheduled_outbound(self, name: str) -> None:
+        """Resume a lane the calendar parked, now that its schedule is gone. Left paused whenever
+        something other than the calendar also holds it down: an operator-required STOP, a #122 log
+        halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
+        it, and the ordinary recovery for that state brings it up."""
+        if (
+            self._schedule_holds(name, "outbound")
+            or self._delivery_halted
+            or not self._deployed(name, "outbound")
+            or not self._auto_start_enabled(name, "outbound")
+        ):
+            return
+        log.info(
+            "schedule: outbound connection %r no longer has a schedule — resuming the lane its "
+            "calendar parked",
+            name,
+        )
+        await self._start_outbound_unsafe(name)
 
     def _spawn_scheduler(self, name: str, kind: Direction, schedule: Schedule) -> None:
         key = (kind, name)
@@ -2764,11 +2846,22 @@ class RegistryRunner:
         # NotDeployedError and the scheduler would log an exception EVERY tick.
         if not self._deployed(name, kind):
             return
+        # PARKED BY THE DR RUN-PROFILE (#61, ADR 0048): a below-threshold connection is deliberately
+        # not up this run, and the run-profile, not the calendar, decides that. The start branch is
+        # the #115 flaw class again: a scheduler tick is the ENGINE, and `start_inbound` treats its
+        # caller as an operator overriding the profile, so an in-window tick bound the listener and
+        # cleared the `filtered` marker (BACKLOG #2067). Gated above BOTH branches, as the deployed
+        # gate is: an outbound DR park is connector-less and unpaused, and pausing and resuming it on
+        # the calendar drives nothing. An operator start of an INBOUND clears its marker, and from then
+        # the calendar owns it again; a reload re-evaluates the profile for both directions.
+        if (kind, name) in self._filtered:
+            return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
-        # An operator-required STOP (#109 credential fault, or the internal-error STOP policy) outranks
-        # the calendar. The start branch must not re-arm it: that re-tries a bad credential at every
-        # window open, which is the partner lockout the STOP exists to prevent. The OUTBOUND park must
+        # An operator-required STOP (at least a #109 credential fault, a #2083 configuration fault, or
+        # the internal-error STOP policy) outranks the calendar. The start branch must not re-arm it:
+        # that re-tries a bad credential at every window open, which is the partner lockout the STOP
+        # exists to prevent. The OUTBOUND park must
         # not run either, because the park is a pause and a pause is what a window open resumes (and a
         # pooled pause_lane overwrites the STOPPED phase outright). The INBOUND park still runs: it only
         # unbinds the listener, which leaves the halted router/transform workers exactly as they are and
@@ -2776,6 +2869,14 @@ class RegistryRunner:
         would_start = active and not running
         would_park_outbound = kind == "outbound" and not active and running
         if (would_start or would_park_outbound) and self._schedule_holds(name, kind):
+            return
+        # A #122 log-write halt (ADR 0162/0189) is a held stop too while its latch holds: only an
+        # operator restart may lift it. A halted connection reads as not running, so every in-window
+        # tick used to call start. An inbound bound its listener, probed the dead sinks, paged and
+        # unbound again; an outbound probed and paged. That repeated every tick for as long as the
+        # disk stayed broken (BACKLOG #2066). The halt has already paged once. Only the start branch
+        # is gated: an inbound park just unbinds, and a halted outbound never reads as running.
+        if would_start and self._log_halt_holds(name, kind):
             return
         if active and not running:
             # Per-connection auto-start (#115): ``auto_start=False`` means the ENGINE never brings this
@@ -2786,9 +2887,20 @@ class RegistryRunner:
             # its calendar and closes the window cleanly.
             if not self._auto_start_enabled(name, kind):
                 return
-            log.info("schedule: %s connection %r entering active window — starting", kind, name)
+            # An inbound retrying a start already recorded failed said so once, in _record_failed.
+            log.log(
+                logging.DEBUG
+                if kind == "inbound" and (kind, name) in self._failed
+                else logging.INFO,
+                "schedule: %s connection %r entering active window — starting",
+                kind,
+                name,
+            )
             if kind == "inbound":
-                await self.start_inbound(name)
+                try:
+                    await self.start_inbound(name)
+                except Exception as exc:
+                    self._record_window_open_failure(name, exc)
             else:
                 await self.start_outbound(name)
         elif not active and running:
@@ -2801,15 +2913,74 @@ class RegistryRunner:
                 await self.stop_inbound(name)
             else:
                 await self.stop_outbound(name)
+                # After the stop, which drops the entry, and with no await between them.
+                self._schedule_parked.add(name)
+
+    def _record_window_open_failure(self, name: str, exc: Exception) -> None:
+        """Isolate an inbound its window open could not start, the way :meth:`start` isolates one
+        (ADR 0031): a failed status, one alert and one traceback, through :meth:`_record_failed`.
+
+        A reload no longer binds a scheduled inbound outside its window (BACKLOG #2069), so a port
+        another process took meanwhile is first found here, after the reload has committed. Before
+        this, the error reached :meth:`_schedule_worker`, which logged a traceback every tick and
+        recorded nothing an operator reads as status. The next tick still retries, and a bind that
+        succeeds clears the record. While the record stands, a retry that fails is logged at DEBUG
+        only, whatever its reason: keying on the reason text would re-alert every tick on an error
+        whose message varies. A reload clears the record (see :meth:`reload`), so the next window
+        open alerts afresh."""
+        if ("inbound", name) in self._failed:
+            log.debug(
+                "schedule: inbound connection %r still cannot start (%s); retrying next tick",
+                name,
+                safe_exc(exc),
+            )
+            return
+        self._record_failed(name, exc, kind="inbound")
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
-        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
-        credential fault or the internal-error STOP policy). Called at the STOP site as its last step
+        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (at least a
+        #109 credential fault, a #2083 configuration fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
+        claimer-death STOP via :meth:`_pooled_stop_hold`). Called at the STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
         to hold. The scheduler reads it through :meth:`_schedule_holds`."""
         self._stop_held.add((kind, name))
         self._stop_hold_logged.discard((kind, name))
+
+    def _log_halt_holds(self, name: str, kind: Direction) -> bool:
+        """Whether a #122 log-write halt holds ``name``'s ``kind`` lane down against the scheduler.
+
+        Only while the process-wide latch (:attr:`_delivery_halted`) holds, because that is the only
+        time a start costs a probe and a page. Once a restart has proved the log writable and cleared
+        the latch, a start re-arms a still-halted inbound with no probe at all. So the calendar may
+        bring back an inbound whose window was closed when the operator recovered. A reload skips a
+        scheduled inbound outside its window, so without this that inbound would stay halted, in
+        silence, after the fault was gone. An inbound must also be in :attr:`_log_halted`; one the
+        halt never took down has nothing to hold."""
+        if not self._delivery_halted:
+            return False
+        return kind == "outbound" or name in self._log_halted
+
+    def _pooled_stop_hold(self, stage: Stage) -> Callable[[str], None] | None:
+        """The ``on_lane_stopped`` hook for ``stage``'s dispatcher: hold every lane it STOPs on its
+        own account.
+
+        The runner-side STOP sites call :meth:`_hold_for_operator` themselves, but two pooled STOPs
+        are decided inside the dispatcher and no runner code sees them: the ADR 0070 T17 infra-fault
+        bound (``infra_fault_policy="stop"``) and the #2074 claimer-death bound. Unheld, the scheduler
+        parked such an outbound at the window close (a pause turns STOPPED into PAUSED) and resumed
+        it at the next open, retrying the fault the STOP was bounding; an inbound's listener came
+        back up over a lane nothing drains (BACKLOG #2072). A RESPONSE lane is held as its loopback
+        inbound, so a window open cannot resume it through that inbound's start. None for a stage
+        with no hold direction."""
+        kind = _HOLD_DIRECTION.get(stage)
+        if kind is None:
+            return None
+
+        def _hold(lane: str) -> None:
+            self._hold_for_operator(lane, kind)
+
+        return _hold
 
     def _release_operator_hold(self, name: str, kind: Direction) -> None:
         """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar
@@ -3296,7 +3467,16 @@ class RegistryRunner:
         The re-validation write is SYNCHRONOUS on the calling (event-loop) thread. That is the same
         posture as every other log write in this engine — stdlib logging is synchronous throughout,
         including the syslog forwarder — and this one runs at most once per operator recovery action,
-        never on the hot path, so it is not the blocking-the-loop hazard the async rules are about."""
+        never on the hot path, so it is not the blocking-the-loop hazard the async rules are about.
+
+        **The scheduler used to break "once per operator action"**, calling it every in-window tick
+        on a halted connection; :meth:`_log_halt_holds` now keeps it out (BACKLOG #2066). **Moving the
+        probe to a thread was measured and refused.** Two doors rely on it having no await point.
+        :meth:`_start_inbound_unsafe` probes AFTER it binds, so an await would let a sender be ACKed
+        into halted lanes before the refusal unbinds it. :meth:`_reconcile_outbounds` probes after the
+        reload's broadcast has armed an ADDED lane, so an await let that lane claim its head before
+        the refusal paused it: ``test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused``
+        went red, pooled, on ``halted_claim_gate_hits == 1``."""
         if not self._log_write_stopped:
             return True
         guard = active_log_guard()
@@ -4214,6 +4394,7 @@ class RegistryRunner:
         self._outbound_quiesced.clear()
         self._outbound_resume.clear()
         self._gate_parked.clear()
+        self._schedule_parked.clear()
         # start() re-arms every lane from scratch, so no STOP outlives a full teardown.
         self._stop_held.clear()
         self._stop_hold_logged.clear()
@@ -4476,6 +4657,7 @@ class RegistryRunner:
             # Connection controls: only the OUTBOUND dispatcher signals per-lane quiescence back to the
             # runner (the pause primitive is outbound-only) so 'stopped' means zero in-flight.
             on_lane_paused=(self._mark_outbound_quiesced if stage is Stage.OUTBOUND else None),
+            on_lane_stopped=self._pooled_stop_hold(stage),
             empty_counter=self._empty_claims,
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,
@@ -5134,10 +5316,11 @@ class RegistryRunner:
         both READ that decision and would otherwise take the unknown-lane default (ADR 0066 D4, and
         the ordering constraint BACKLOG #1867 turned on — do not move it below either);
         (3) reconcile the outbound connectors/workers *without* tearing them down, so in-flight
-        outbox rows keep draining (at-least-once preserved); (4) once the swap has committed, start a
+        outbox rows keep draining (at-least-once preserved); (3a) once the swap has committed,
+        reconcile the active-window scheduler tasks (:meth:`_reconcile_schedulers`); (4) start a
         detached report that warns with the count of rows each dropped inbound leaves waiting
         (:meth:`_warn_stranded_by_dropped_inbounds`). If any of steps 0-3 fails the previous graph's
-        intake is restored before the error propagates, and step 4 does not run. Restarting inbounds
+        intake is restored before the error propagates, and steps 3a and 4 do not run. Restarting inbounds
         before reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
@@ -5260,6 +5443,19 @@ class RegistryRunner:
                     if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
                     self._filtered.pop(("inbound", ic.name), None)
+                    # Active-window schedule (#147, ADR 0095): outside its window the calendar owns
+                    # this listener, and it is parked. Step 1 unbound it with every other source, so
+                    # re-binding it here opened the partner port until the scheduler's next tick
+                    # parked it again, up to a whole tick later (BACKLOG #2069). Its workers are
+                    # still re-armed below, so any backlog drains (AC-3). A failed record a window
+                    # open left is dropped: the reload is the recovery its alert names, and with no
+                    # bind here to clear it, it would hold the status at failed until the next open.
+                    # That open re-records and re-alerts if the cause is still there.
+                    if ic.schedule is not None and not ic.schedule.is_active(
+                        self._schedule_clock()
+                    ):
+                        self._failed.pop(("inbound", ic.name), None)
+                        continue
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
                 # Workers read self.registry live, so a Router/Handler change applies to rows processed
@@ -5294,6 +5490,12 @@ class RegistryRunner:
                     except Exception:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
+
+            # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
+            # graph, so an added schedule starts, an edited one changes and a removed one stops
+            # (BACKLOG #2069). After the rollback point on purpose,
+            # so a failed reload leaves every scheduler running against the graph it restored.
+            await self._reconcile_schedulers(old)
 
             # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
             # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
@@ -6404,33 +6606,21 @@ class RegistryRunner:
             # accept this message, so dead-letter it now rather than block the FIFO lane
             # forever (still replayable from the DLQ). AE/CE (transient) → retry per
             # policy, like a transport failure.
-            if exc.permanent and getattr(exc, "credential_fault", False):
-                # #109 (ADR 0095): a PERMANENT CREDENTIAL/AUTH fault (bad password / would lock out the
-                # partner account) — NOT a bad message. Under the "stop" policy (default) STOP the lane
-                # IMMEDIATELY (no dead-lettering the backlog, no re-auth storm that could trip the
-                # partner's account lockout) and RETAIN this claimed row UN-ERRORED (release it back to
-                # PENDING, undoing only the claim's attempts++ — no backoff, no last_error), so the
-                # queue is intact for an operator to resume after fixing the credential (reload/restart
-                # re-arms the STOPPED lane). The "dead_letter" policy opts back into the historical
-                # fail-fast dead-letter of just this row.
-                if self._credential_fault_policy == "stop":
-                    await self.store.release_claimed([item.id])
-                    log.error(
-                        "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
-                        "and retaining %d queued row(s) un-errored to protect the partner account "
-                        "(operator must fix the credential + reload/restart to resume)",
-                        name,
-                        exc.code,
-                        1,
-                    )
-                    self._alert_sink.connection_stopped(
-                        name,
-                        detail=f"credential fault ({exc.code}); lane stopped, queue retained (#109)",
-                    )
-                    self._hold_for_operator(name, "outbound")
-                    return _ItemOutcome.STOPPED, None
-                await self.store.dead_letter_now(item.id, safe_exc(exc))
-            elif exc.permanent:
+            # #109 (ADR 0095): a PERMANENT CREDENTIAL/AUTH fault (bad password / would lock out the
+            # partner account) — NOT a bad message. Under the "stop" policy (default) STOP the lane
+            # IMMEDIATELY (no dead-lettering the backlog, no re-auth storm that could trip the
+            # partner's account lockout) and RETAIN this claimed row UN-ERRORED (release it back to
+            # PENDING, undoing only the claim's attempts++ — no backoff, no last_error), so the
+            # queue is intact for an operator to resume after fixing the credential (reload/restart
+            # re-arms the STOPPED lane). A permanent CONFIGURATION fault (BACKLOG #2083) takes the
+            # same STOP: every queued row would meet the same refusal, so dead-lettering this row
+            # would only be the first of the lane's whole queue. The "dead_letter" policy opts back
+            # into the historical fail-fast dead-letter of just this row, for both.
+            fault = self._lane_stopping_fault(exc)
+            if fault is not None:
+                await self._stop_lane_retaining(name, [item.id], exc, fault)
+                return _ItemOutcome.STOPPED, None
+            if exc.permanent:
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
@@ -6693,6 +6883,17 @@ class RegistryRunner:
             else:
                 await connector.send(envelope)
         except NegativeAckError as exc:
+            # #109 (ADR 0095), the batch twin of the single-row branch in
+            # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is not a
+            # bad batch: dead-lettering all N here would empty the lane's queue into the DLQ, and a
+            # retry would re-authenticate toward a partner lockout. So STOP the lane and release
+            # every member un-errored (BACKLOG #2073). A configuration fault stops it the same way
+            # (BACKLOG #2083). "dead_letter" falls through to the ordinary permanent reject below,
+            # exactly as the single row does.
+            fault = self._lane_stopping_fault(exc)
+            if fault is not None:
+                await self._stop_lane_retaining(name, ids, exc, fault)
+                return _ItemOutcome.STOPPED, None
             if exc.permanent:
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
             else:
@@ -6739,6 +6940,54 @@ class RegistryRunner:
             self._note_lane_healthy(name)
             await self.store.mark_batch_done(ids)
         return _ItemOutcome.PROCESSED, retry_until
+
+    def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:
+        """Which connection fault ``exc`` is, when it must STOP the lane and keep the queue:
+        ``"credential"`` (#109, ADR 0095), ``"configuration"`` (BACKLOG #2083), or ``None`` for an
+        ordinary reject. Only a permanent fault stops, and only under the default
+        ``credential_fault_policy = "stop"``, which governs both: while BACKLOG #2083 was open the
+        configuration faults were read as credential faults, so this keeps each policy's behaviour
+        for them unchanged. ``getattr`` because a connector may raise a subclass built without the
+        markers."""
+        if not exc.permanent or self._credential_fault_policy != "stop":
+            return None
+        if getattr(exc, "credential_fault", False):
+            return "credential"
+        if getattr(exc, "config_fault", False):
+            return "configuration"
+        return None
+
+    async def _stop_lane_retaining(
+        self, name: str, ids: Sequence[str], exc: NegativeAckError, fault: _LaneFault
+    ) -> None:
+        """STOP outbound ``name`` on a connection fault and release every claimed row in ``ids``
+        back to PENDING un-errored (the claim's attempt given back, no backoff, no last_error), so the
+        queue is intact when an operator fixes the connection and reloads or restarts. The caller
+        returns :attr:`_ItemOutcome.STOPPED`."""
+        await self.store.release_claimed(list(ids))
+        if fault == "credential":
+            log.error(
+                "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
+                "and retaining %d queued row(s) un-errored to protect the partner account "
+                "(operator must fix the credential + reload/restart to resume)",
+                name,
+                exc.code,
+                len(ids),
+            )
+            detail = f"credential fault ({exc.code}); lane stopped, queue retained (#109)"
+        else:
+            log.error(
+                "delivery worker %r: PERMANENT connection configuration fault (%s); STOPPING the "
+                "lane and retaining %d queued row(s) un-errored, since every row would fail the "
+                "same way (operator must fix the connection's configuration + reload/restart to "
+                "resume)",
+                name,
+                exc.code,
+                len(ids),
+            )
+            detail = f"configuration fault ({exc.code}); lane stopped, queue retained (#2083)"
+        self._alert_sink.connection_stopped(name, detail=detail)
+        self._hold_for_operator(name, "outbound")
 
     async def _mark_batch_failed_and_arm(
         self, lane: str, ids: Sequence[str], error: str, retry: RetryPolicy
@@ -7301,7 +7550,7 @@ class RegistryRunner:
         (deterministic per-batch snapshot, ADR 0005):** because every sibling's PURE transform is computed
         BEFORE any sibling's handoff commits, a LIVE ``state_view()`` read would be interleaving-dependent.
         So this concurrent run freezes ONE point-in-time copy of the committed transform-state at
-        run-start (``dict(self.store.state_view())``) and threads it into every sibling's
+        run-start (``point_in_time(self.store.state_view())``) and threads it into every sibling's
         :meth:`_prepare_routed`, so each deterministically observes the state as of the message-batch's
         start — no sibling sees another sibling's in-run ``state_set``/``set_meta`` write, independent of
         interleaving. Defined semantics: *a message's sibling handlers read message-batch-start
@@ -7333,12 +7582,14 @@ class RegistryRunner:
             # siblings compute before any sibling's serial _apply_routed commits, reading the LIVE
             # state_view() would be interleaving-dependent; reading this frozen snapshot makes every
             # sibling deterministically observe message-batch-start state (no sibling sees another's
-            # in-run write). dict(state_view()) is a point-in-time copy: state_view() is a live
+            # in-run write). point_in_time(state_view()) is a point-in-time copy: state_view() is a live
             # MappingProxyType over the store's cache and each committed write REPLACES a key (never an
-            # in-place mutation), so the copied {(ns, key): value} references never change afterwards.
+            # in-place mutation), so the copied entries never change afterwards. It copies the SEALED
+            # entries (BACKLOG #1174): dict(state_view()) would decrypt the whole state table on the
+            # event loop for every concurrent run and hold it in plaintext for the run.
             # READ-side only — no store write, no txn-boundary change, no reordering (the apply below
             # stays the sole serial in-claim-order writer, so the final committed state is unchanged).
-            state_snapshot: Mapping[tuple[str, str], Any] = dict(self.store.state_view())
+            state_snapshot: Mapping[tuple[str, str], Any] = point_in_time(self.store.state_view())
 
             async def _compute(
                 it: OutboxItem,

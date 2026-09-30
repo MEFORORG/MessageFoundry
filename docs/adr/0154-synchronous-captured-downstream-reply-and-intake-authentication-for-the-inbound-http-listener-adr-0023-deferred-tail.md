@@ -7,6 +7,10 @@
   `None` return and **AC-8** said the receipt path kept its "`202` without a `message_id`". Both keep
   their original text, with a dated note in place. See
   [Amendment 2026-09-26](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).
+- **Amended 2026-09-29 (BACKLOG #2051, Manager ruling in batch 179):** a request that sends the
+  active mode's credential header more than once is answered **`400`**, not the `401` of **AC-11**.
+  AC-11 keeps its original text, with a dated note in place. See
+  [Amendment 2026-09-29](#amendment-2026-09-29-a-repeated-credential-header-is-answered-400).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
   ratified. **Both halves have since been authorised and built** — the split below is retained as the
@@ -1006,7 +1010,10 @@ to skip auth.
   THEN THE SYSTEM SHALL refuse with `401` **before any request body byte is read** and before any ingress row
   is written, using an identical response for missing and wrong, and SHALL compare in constant time without
   raising on a non-ASCII credential.
+  *(Amended 2026-09-29: a credential header sent more than once is answered `400`, not `401`, before any
+  comparison. See the [amendment](#amendment-2026-09-29-a-repeated-credential-header-is-answered-400).)*
   → `tests/test_inbound_http_intake_auth.py::test_missing_wrong_and_empty_credentials_are_indistinguishable_401`
+  → `tests/test_inbound_http_intake_auth.py::test_a_repeated_credential_header_is_refused_before_any_comparison`
 - **AC-12** — WHERE `intake_api_key_next` is **unset**, WHEN a peer presents no credential, THE SYSTEM SHALL
   refuse with `401`; AND WHERE `intake_api_key_next` is set, WHEN a peer presents either the current or the
   next key, THE SYSTEM SHALL accept it, so a partner key rotates without an outage.
@@ -1306,3 +1313,27 @@ Before this amendment each of these answered `202`, which told the sender the bo
 place. AC-8 now links a second test,
 `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, which pins
 the `422`, the exact body, exactly one `ERROR` row, no ingress row, and the `closed` event.
+
+## Amendment 2026-09-29: a repeated credential header is answered 400
+
+**A Manager seat ruled this in batch 179, on 2026-09-29, building BACKLOG #2051.** The rule itself is
+stated once, in the intake authentication row of [`SECURITY.md`](../SECURITY.md) Table B. Read it there.
+In short, the listener refuses a request that repeats the credential header the active mode reads,
+before it compares any credential.
+
+**Why it was needed.** The head parse keeps the last of two same-named header lines. A front end that
+authenticates the first copy would check a different credential from the one the listener accepts.
+
+**Why `400` and not AC-11's `401`.** A repeated credential is a malformed request, not a wrong
+credential. RFC 9110 lets a sender repeat a field only when the field is defined as a list, and
+`Authorization` is not. RFC 6750 section 3.1 names "repeats the same parameter" as `invalid_request`,
+which it answers `400`. BACKLOG #2051's closing text asks for `400` too.
+
+**Why the name oracle is accepted.** The `400` tells a peer it guessed the header name, which the `401`
+does not. [`CONNECTIONS.md`](../CONNECTIONS.md) already says `intake_api_key_header` is "a header
+**name**, not a secret", so that answer discloses nothing secret. The refusal is also charged as a failed
+attempt, so while `intake_auth_rate_limit` is on the same budget bounds it as any guess.
+
+**Where the original text stays.** AC-11 keeps its wording, with a dated italic note in place. It now
+links a second test,
+`tests/test_inbound_http_intake_auth.py::test_a_repeated_credential_header_is_refused_before_any_comparison`.

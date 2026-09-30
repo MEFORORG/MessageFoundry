@@ -286,7 +286,7 @@ def test_cli_add_reports_alert_rule_json_nested_past_the_decoder(
     does not blame the operator's input for it.
 
     Why, and why the trigger below is manufactured rather than real nesting: `_load_operator_json`
-    in `messagefoundry/__main__.py`. The type facts are pinned once, by the anchor test
+    in `messagefoundry/cli_common.py`. The type facts are pinned once, by the anchor test
     `tests/test_security_cli.py::test_cli_set_reports_security_json_nested_past_the_decoder`.
 
     RED when: `_load_operator_json`'s `except RecursionError` arm, or `_alert`'s
@@ -296,7 +296,7 @@ def test_cli_add_reports_alert_rule_json_nested_past_the_decoder(
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr("messagefoundry.__main__.json.loads", _raise_recursion)
+    monkeypatch.setattr("messagefoundry.cli_common.json.loads", _raise_recursion)
     rc = main(["alert", "add", "--service-config", str(svc), "--data", "[]", "--json"])
     out = capsys.readouterr().out
     monkeypatch.undo()  # restore json.loads before parsing the captured payload with it
