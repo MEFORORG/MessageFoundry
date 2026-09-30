@@ -104,6 +104,23 @@ TEST_CONTENT_BASENAMES: frozenset[str] = frozenset({"conftest.py"})
 #: never looser. The engine and the web console are deliberately absent.
 TEST_TOOLING_DISTRIBUTIONS: frozenset[str] = frozenset({"messagefoundry-harness"})
 
+#: A THIRD RULE, FOR THE ENGINE AND TOOLKIT SPLIT (ADR 0201 section 4, BACKLOG #1192, ASVS 15.2.3).
+#: The toolkit distribution carries the authoring and development code that the engine wheel must not.
+#: This rule is keyed on the distribution name in the archive filename, like the test-content rule,
+#: and matches path COMPONENTS, never a prefix string: an sdist member is
+#: ``messagefoundry-0.4.0/messagefoundry/...``, and a prefix match would never fire on it.
+ENGINE_DISTRIBUTION = "messagefoundry"
+TOOLKIT_DISTRIBUTION = "messagefoundry-toolkit"
+TOOLKIT_PACKAGE = "messagefoundry_toolkit"
+
+#: Engine paths ADR 0201 has moved into the toolkit, each as its run of path components. An engine
+#: archive carrying one as a CONSECUTIVE run is refused, wheel or sdist. A retired path stays
+#: retired, so this list only grows, one entry in the slice that retires each path.
+RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
+    # Slice 2: the advisory ADR coverage report, now messagefoundry_toolkit/adr_analyze.py.
+    ("messagefoundry", "adr_analyze.py"),
+)
+
 
 class InspectionError(RuntimeError):
     """An archive could not be inspected, so nothing about it has been proved."""
@@ -223,6 +240,29 @@ def development_content(member: str) -> str | None:
     return None
 
 
+def split_violation(member: str, dist: str) -> str | None:
+    """Why ``member`` breaks the engine and toolkit split for distribution ``dist``, or ``None``.
+
+    An engine archive may carry no ``messagefoundry_toolkit`` component and no retired engine path.
+    A toolkit archive may carry nothing whose first component is ``messagefoundry``: a toolkit that
+    writes into the engine's package directory is the split-package shape ADR 0201 rejects. Every
+    other distribution passes. Split and normalised exactly as :func:`forbidden` is.
+    """
+    parts = [_normalise(p) for p in member.replace("\\", "/").split("/") if p]
+    if not parts:
+        return None
+    if dist == ENGINE_DISTRIBUTION:
+        if TOOLKIT_PACKAGE in parts:
+            return f"path component {TOOLKIT_PACKAGE!r} belongs to the toolkit distribution"
+        for retired in RETIRED_ENGINE_PATHS:
+            width = len(retired)
+            if any(tuple(parts[i : i + width]) == retired for i in range(len(parts) - width + 1)):
+                return f"{'/'.join(retired)} moved to the toolkit distribution (ADR 0201)"
+    elif dist == TOOLKIT_DISTRIBUTION and parts[0] == ENGINE_DISTRIBUTION:
+        return "the toolkit may not write into the engine's package directory (ADR 0201)"
+    return None
+
+
 def distribution(archive: Path) -> str:
     """The PEP 503 normalised distribution name an archive's filename declares.
 
@@ -262,7 +302,11 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
         hits = [
             (name, why)
             for name in names
-            if (why := forbidden(name) or (None if tooling else development_content(name)))
+            if (
+                why := forbidden(name)
+                or (None if tooling else development_content(name))
+                or split_violation(name, dist)
+            )
             is not None
         ]
         errors.extend(f"::error::{archive.name} ships {name} -- {why}" for name, why in hits)
@@ -310,8 +354,9 @@ def _resolve(patterns: Sequence[str]) -> tuple[list[Path], list[str]]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Fail if a built distribution carries a maintainer-internal file, or test or "
-            "development content outside the test-tooling harness."
+            "Fail if a built distribution carries a maintainer-internal file, test or "
+            "development content outside the test-tooling harness, or a file on the wrong side "
+            "of the engine and toolkit split."
         ),
     )
     parser.add_argument(
@@ -339,7 +384,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"member gate passed: inspected {total} members across {len(archives)} archive(s), "
         f"none matching {len(FORBIDDEN_BASENAMES)} forbidden basenames or "
         f"{len(FORBIDDEN_PATH_COMPONENTS)} forbidden path components, and none carrying test or "
-        f"development content outside {len(TEST_TOOLING_DISTRIBUTIONS)} test-tooling distribution"
+        f"development content outside {len(TEST_TOOLING_DISTRIBUTIONS)} test-tooling distribution, "
+        f"and none on the wrong side of the engine and toolkit split"
     )
     return 0
 

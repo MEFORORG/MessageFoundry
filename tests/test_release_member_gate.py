@@ -42,6 +42,7 @@ from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: 
 from forbidden_members import (  # noqa: E402
     FORBIDDEN_BASENAMES,
     FORBIDDEN_PATH_COMPONENTS,
+    RETIRED_ENGINE_PATHS,
     TEST_CONTENT_BASENAMES,
     TEST_CONTENT_PATH_COMPONENTS,
     TEST_TOOLING_DISTRIBUTIONS,
@@ -49,6 +50,7 @@ from forbidden_members import (  # noqa: E402
     distribution,
     forbidden,
     main,
+    split_violation,
 )
 
 #: hatchling names every sdist member ``<project>-<version>/...``. The fixtures carry it because the
@@ -454,6 +456,108 @@ def test_the_cli_reports_every_archive_not_just_the_first(
 # --------------------------------------------------------------------------------------------------
 
 #: How a step invokes the gate. Matched against the step's `run:` text.
+# --------------------------------------------------------------------------------------------------
+# The third rule: the engine and toolkit split (ADR 0201 AC-6, BACKLOG #1192). Planted archives in
+# both the wheel and the sdist form, because the sdist's `<project>-<version>/` root is exactly what a
+# prefix match would miss.
+# --------------------------------------------------------------------------------------------------
+
+_ENGINE_WHEEL = "messagefoundry-0.4.0-py3-none-any.whl"
+_ENGINE_SDIST = "messagefoundry-0.4.0.tar.gz"
+_TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry/adr_analyze.py",  # the slice 2 retired path, wheel form
+        "messagefoundry-0.4.0/messagefoundry/adr_analyze.py",  # sdist form
+        "messagefoundry/ADR_Analyze.py",  # casefolded like every other rule
+        "messagefoundry\\adr_analyze.py",  # a backslash separator
+        "messagefoundry_toolkit/__init__.py",  # the toolkit package inside the engine
+        "messagefoundry-0.4.0/messagefoundry_toolkit/__main__.py",
+    ],
+)
+def test_an_engine_archive_carrying_toolkit_code_is_refused(member: str) -> None:
+    assert split_violation(member, "messagefoundry") is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry/__main__.py",
+        "messagefoundry/cli_common.py",
+        "messagefoundry-0.4.0/messagefoundry/config/impact.py",  # stays in the engine (ADR 0201)
+        "messagefoundry/tools/adr_analyze.py",  # not the retired run: a different parent
+        "adr_analyze.py",  # a run of one is not the two-component retired path
+    ],
+)
+def test_an_engine_archive_member_that_stays_is_allowed(member: str) -> None:
+    assert split_violation(member, "messagefoundry") is None
+
+
+def test_a_toolkit_archive_writing_into_the_engine_package_is_refused() -> None:
+    assert split_violation("messagefoundry/adr_analyze.py", "messagefoundry-toolkit") is not None
+    assert (
+        split_violation("messagefoundry_toolkit/adr_analyze.py", "messagefoundry-toolkit") is None
+    )
+    # The rule is keyed on the distribution: the same member in the engine is the engine's own.
+    assert split_violation("messagefoundry/__init__.py", "messagefoundry") is None
+    # And a distribution the rule does not name is untouched by it.
+    assert split_violation("messagefoundry_toolkit/x.py", "messagefoundry-harness") is None
+
+
+def test_the_retired_paths_are_stored_casefolded() -> None:
+    """The same silent-disarm shape as the other rules: a non-casefolded entry never matches."""
+    assert RETIRED_ENGINE_PATHS, "the retired-path list is empty, so the rule retires nothing"
+    for run in RETIRED_ENGINE_PATHS:
+        assert all(part == part.casefold() for part in run), run
+    assert distribution(Path(_TOOLKIT_WHEEL)) == "messagefoundry-toolkit"
+
+
+def test_the_cli_refuses_engine_archives_carrying_a_retired_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_sdist(
+        tmp_path / "dist" / _ENGINE_SDIST, (*_CLEAN_SDIST, "messagefoundry/adr_analyze.py")
+    )
+    wheel = _write_wheel(
+        tmp_path / "dist" / _ENGINE_WHEEL, (*_CLEAN_WHEEL, "messagefoundry_toolkit/__init__.py")
+    )
+    assert main([str(sdist), str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert "ships messagefoundry-0.3.0/messagefoundry/adr_analyze.py" in err
+    assert "ships messagefoundry_toolkit/__init__.py" in err
+
+
+def test_the_cli_refuses_a_toolkit_wheel_writing_into_the_engine(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wheel = _write_wheel(
+        tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL,
+        ("messagefoundry_toolkit/__init__.py", "messagefoundry/generators/__init__.py"),
+    )
+    assert main([str(wheel)]) == 1
+    assert "ships messagefoundry/generators/__init__.py" in capsys.readouterr().err
+
+
+def test_the_cli_passes_a_clean_toolkit_wheel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control for the two refusals above: the toolkit's own members pass every rule."""
+    wheel = _write_wheel(
+        tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL,
+        (
+            "messagefoundry_toolkit/__init__.py",
+            "messagefoundry_toolkit/__main__.py",
+            "messagefoundry_toolkit/adr_analyze.py",
+            "messagefoundry_toolkit-0.4.0.dist-info/METADATA",
+        ),
+    )
+    assert main([str(wheel)]) == 0
+    assert "inspected 4 members" in capsys.readouterr().out
+
+
 _GATE_INVOCATION = "scripts/release/forbidden_members.py"
 
 #: A parsed workflow is arbitrary YAML, so the value type is `Any` by construction. Naming the shape

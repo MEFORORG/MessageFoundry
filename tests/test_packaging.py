@@ -702,6 +702,58 @@ def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> 
     )
 
 
+# --- the toolkit pins the engine it ships with (ADR 0201 AC-7, BACKLOG #1192) ---------------------
+
+_TOOLKIT_PYPROJECT = _REPO / "packaging" / "messagefoundry-toolkit" / "pyproject.toml"
+
+
+def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
+    """The harness pin test's twin. ``messagefoundry-toolkit`` is lockstep too, and more tightly: its
+    handlers call engine internals with no stable seam, so any other engine is a wrong engine.
+
+    It also pins that the toolkit names NO extra and NOTHING ELSE: its third-party imports are core
+    engine dependencies, so the exact pin makes the engine's set the toolkit's (ADR 0201 section 1).
+    """
+    toolkit = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))
+    root = version_path(_TOOLKIT_PYPROJECT)
+    assert root == (_REPO / "messagefoundry" / "__init__.py").resolve(), (
+        f"the toolkit takes its version from {root}, which is not the engine's __init__.py - the "
+        f"lockstep premise this pin rests on is gone, so re-derive the pin before trusting it"
+    )
+    deps: list[str] = toolkit["project"]["dependencies"]
+    shipped = _version_literal(root)
+    assert _engine_pin(deps) == shipped, (
+        f"the toolkit must pin the engine at the version it ships with (ADR 0201 AC-7).\n"
+        f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
+        f"  {_TOOLKIT_PYPROJECT.relative_to(_REPO).as_posix()} pins: {_engine_pin(deps)}\n"
+        f"A VERSION BUMP IS THREE EDITS: __version__, the harness pin and this one."
+    )
+    engine = _engine_requirement(deps)
+    assert engine is not None and not engine.extras, (
+        f"the toolkit's engine pin names an extra: {deps}"
+    )
+    assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
+
+
+def test_the_toolkit_console_script_is_its_main() -> None:
+    """``messagefoundry-toolkit`` must run the same entry as ``python -m messagefoundry_toolkit``,
+    and that entry must exist, or a fresh install gets a console script that dies on import."""
+    import messagefoundry_toolkit.__main__ as toolkit_cli
+
+    scripts = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts == {"messagefoundry-toolkit": "messagefoundry_toolkit.__main__:main"}
+    assert callable(toolkit_cli.main)
+
+
+def test_the_engine_wheel_target_packs_the_engine_package_alone() -> None:
+    """ADR 0201 section 4: the physical move is the exclusion. The engine wheel packs
+    ``messagefoundry/`` and nothing else, so a module moved into ``messagefoundry_toolkit/`` leaves
+    it. Before this table the wheel's contents were hatchling's unconfigured default."""
+    wheel = hatch_build(_REPO / "pyproject.toml")["targets"]["wheel"]
+    assert wheel.get("packages") == ["messagefoundry"], wheel
+    assert "only-include" not in wheel and "include" not in wheel, wheel
+
+
 # --- BACKLOG #1835: .gitignore must not name a path a wheel force-include ships -------------------
 #
 # The BACKLOG #1702 section above asks which TRACKED files a map ships -- named rather than pointed
