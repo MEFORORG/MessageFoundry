@@ -364,15 +364,16 @@ def test_a_moved_command_under_json_is_refused_on_stdout_alone(
 
 
 def test_lens_rewrite_takes_json_mode_without_a_flag(capsys: pytest.CaptureFixture[str]) -> None:
-    """``lens rewrite`` has no ``--json`` flag and is JSON by default; ``lens schema`` has the flag
-    and is text without it. ``lens`` is still registered on the engine in slice 2, so the refusal
-    is driven directly rather than through ``main()``."""
-    assert cli_module._refuse_toolkit_command("lens", ["lens", "rewrite", "x.py"]) == 2
-    captured = capsys.readouterr()
-    assert captured.err == ""
-    assert "messagefoundry-toolkit lens" in json.loads(captured.out)["error"]
-    # Control: the sibling with a --json flag answers as text without it.
-    assert cli_module._refuse_toolkit_command("lens", ["lens", "schema"]) == 2
+    """``lens rewrite`` has no ``--json`` flag and answers in JSON; ``lens schema`` prints JSON with
+    or without its flag. ``lens parse`` reports an error as text without its flag. ``lens`` is still
+    registered on the engine in slice 2, so the refusal is driven directly, not through ``main()``."""
+    for argv in (["lens", "rewrite", "x.py"], ["lens", "schema"]):
+        assert cli_module._refuse_toolkit_command("lens", argv) == 2
+        captured = capsys.readouterr()
+        assert captured.err == "", argv
+        assert "messagefoundry-toolkit lens" in json.loads(captured.out)["error"]
+    # Control: the sibling whose errors are text without --json answers as text.
+    assert cli_module._refuse_toolkit_command("lens", ["lens", "parse", "x.py"]) == 2
     captured = capsys.readouterr()
     assert captured.out == "" and "messagefoundry-toolkit lens" in captured.err
 
@@ -385,9 +386,11 @@ def test_help_never_splits_the_toolkit_command_at_its_hyphen(
     ``toolkit`` on two lines at some widths, so a reader who copied the command got half of it.
     Every width a terminal plausibly has, because the break moves with the width."""
     module = cli_module if builder == "engine" else toolkit_cli
+    # argparse reads COLUMNS when format_help() makes its formatter, so one parser serves every width.
+    parser = module._build_parser()[0]
     for columns in range(50, 161):
         monkeypatch.setenv("COLUMNS", str(columns))
-        help_text = module._build_parser()[0].format_help()
+        help_text = parser.format_help()
         assert "messagefoundry-toolkit" in help_text, columns
         assert "messagefoundry-\n" not in help_text, f"split at COLUMNS={columns}"
 
@@ -402,6 +405,11 @@ def test_help_or_version_before_a_moved_command_still_answers(
             _run_engine(monkeypatch, [flag, "adr-analyze"])
         assert exc.value.code == 0, flag
         assert "is not a messagefoundry command" not in capsys.readouterr().err
+    # An abbreviation is not one of those flags, so argparse must refuse it too rather than read
+    # it as --version while the pre-parse reads a moved command (allow_abbrev=False).
+    with pytest.raises(SystemExit) as exc:
+        _run_engine(monkeypatch, ["--vers"])
+    assert exc.value.code == 2
 
 
 def test_only_a_toolkit_row_the_engine_does_not_register_is_refused() -> None:

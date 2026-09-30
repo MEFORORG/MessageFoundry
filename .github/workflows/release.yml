@@ -1323,7 +1323,7 @@ jobs:
 
           # THE LOCKSTEP PIN, CHECKED ON THE BUILT ARTIFACT (BACKLOG #1585). packaging/
           # messagefoundry-harness/pyproject.toml pins messagefoundry[harness]==<engine version>, and
-          # PEP 621 `dependencies` is STATIC, so a version bump is three edits (the toolkit pin too). tests/test_packaging.py
+          # PEP 621 `dependencies` is STATIC, so a version bump is at least three edits (the toolkit pin too). tests/test_packaging.py
           # catches a drift, but NOTHING in this workflow runs that suite and a tag can be cut from a
           # commit the merge queue never gated. This is the last place the claim is checkable before
           # the PyPI upload burns the version forever, and the metadata is already open.

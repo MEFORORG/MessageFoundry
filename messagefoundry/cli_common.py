@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 import textwrap
 from collections.abc import Callable, Mapping, Sequence
@@ -161,16 +162,18 @@ def run_cli(
 
 
 class HelpFormatter(argparse.HelpFormatter):
-    """argparse's default formatter, except that it never breaks a line at a hyphen.
+    """argparse's default formatter, except that a DESCRIPTION or EPILOG never breaks at a hyphen.
 
     The default wraps with ``textwrap``'s ``break_on_hyphens``, so ``messagefoundry-toolkit`` in a
     description or epilog splits as ``messagefoundry-`` and ``toolkit`` at some terminal widths, and
-    a reader who copies the command gets half of it. Everything else matches the default's
-    ``_fill_text``: whitespace collapsed, then filled to the width with the indent."""
+    a reader who copies the command gets half of it. Only ``_fill_text`` changes, which is what
+    formats those two, and otherwise it does what the default's does: ASCII whitespace collapsed,
+    then filled to the width with the indent. Argument help (``_split_lines``) is untouched, and
+    argparse does not hand this class to subparsers; a parser that wants it names it."""
 
     def _fill_text(self, text: str, width: int, indent: str) -> str:
         return textwrap.fill(
-            " ".join(text.split()),
+            re.sub(r"\s+", " ", text, flags=re.ASCII).strip(),
             width,
             initial_indent=indent,
             subsequent_indent=indent,
@@ -178,11 +181,13 @@ class HelpFormatter(argparse.HelpFormatter):
         )
 
 
-#: Subcommand paths whose output is JSON with no ``--json`` flag. ``lens rewrite`` takes JSON mode from
-#: ``set_defaults`` and the IDE parses what it prints; ``lens parse`` and ``lens schema`` have a flag.
-_JSON_BY_DEFAULT = frozenset({("lens", "rewrite")})
+#: Subcommand paths that answer in JSON with no ``--json`` flag. ``lens rewrite`` takes JSON mode from
+#: ``set_defaults``; ``lens schema`` prints JSON either way, its flag only choosing compact output.
+#: ``lens parse`` reports an error as text without its flag, so it is not here.
+_JSON_BY_DEFAULT = frozenset({("lens", "rewrite"), ("lens", "schema")})
 
-#: Top-level options argparse answers itself, ahead of any subcommand. None takes a value.
+#: Top-level options argparse answers itself, ahead of any subcommand. None takes a value. Exact
+#: spellings are enough because both commands' top-level parsers set ``allow_abbrev=False``.
 _ANSWERED_BY_ARGPARSE = frozenset({"-h", "--help", "--version"})
 
 

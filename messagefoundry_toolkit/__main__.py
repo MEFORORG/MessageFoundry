@@ -89,7 +89,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     command surface without running ``main()``. The map returned is :data:`_DISPATCH` itself.
     """
     parser = argparse.ArgumentParser(
-        prog=TOOLKIT_COMMAND, description=__doc__, formatter_class=HelpFormatter
+        prog=TOOLKIT_COMMAND,
+        description=__doc__,
+        formatter_class=HelpFormatter,
+        allow_abbrev=False,  # the pre-parse refusal reads --help and --version by exact spelling
     )
     parser.add_argument("--version", action="version", version=f"{TOOLKIT_COMMAND} {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)

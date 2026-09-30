@@ -48,7 +48,7 @@ dependencies = [
     # `messagefoundry.cli_common`. `[tool.hatch.version].path` above reads the engine's __init__.py,
     # so the two versions match by construction and `==` states that fact.
     #
-    # SO A VERSION BUMP IS THREE EDITS: messagefoundry/__init__.py, the harness pin and this line.
+    # SO A VERSION BUMP IS AT LEAST THREE EDITS: messagefoundry/__init__.py, the harness pin and this line.
     # tests/test_packaging.py::test_the_toolkit_pins_the_engine_at_the_version_it_ships_with is the
     # gate. The pin alone does not hold the pair together, because `pip install -U messagefoundry`
     # upgrades past it with a warning and exit 0, so the toolkit also compares the two installed

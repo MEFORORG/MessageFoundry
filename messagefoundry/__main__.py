@@ -197,6 +197,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     parser = argparse.ArgumentParser(
         prog="messagefoundry",
         formatter_class=HelpFormatter,
+        allow_abbrev=False,  # the pre-parse refusal reads --help and --version by exact spelling
         description=__doc__,
         epilog=f"Authoring commands ({moved}) are not in this command. Run them as "
         f"`{TOOLKIT_COMMAND} <command>`, from the separate {TOOLKIT_COMMAND} distribution.",

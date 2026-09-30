@@ -251,37 +251,31 @@ def development_content(member: str) -> str | None:
 def split_violation(member: str, dist: str) -> str | None:
     """Why ``member`` breaks the engine and toolkit split for distribution ``dist``, or ``None``.
 
-    An engine archive may carry no ``messagefoundry_toolkit`` component and no retired engine path.
-    A toolkit archive may carry nothing whose first component is ``messagefoundry``: a toolkit that
-    writes into the engine's package directory is the split-package shape ADR 0201 rejects. Every
-    other distribution passes. Split and normalised exactly as :func:`forbidden` is.
+    An engine archive may carry nothing named for the toolkit's import package, as a directory, a
+    module or a ``.pth`` (any component whose stem is ``messagefoundry_toolkit``), and no retired
+    engine path. A toolkit archive may carry nothing whose first component is ``messagefoundry``,
+    and no ``<name>.data/`` tree at all: PEP 427 installs ``purelib``, ``platlib``, ``scripts`` and
+    ``data`` outside the package, where each can overwrite the engine's package or its console
+    script. The toolkit has no reason to ship one, so refusing the whole class is simpler than
+    modelling each scheme. That is the split-package shape ADR 0201 rejects. Every other
+    distribution passes. Split and normalised exactly as :func:`forbidden` is.
     """
     parts = [_normalise(p) for p in _parts(member)]
     if not parts:
         return None
     if dist == ENGINE_DISTRIBUTION:
-        if TOOLKIT_PACKAGE in parts:
-            return f"path component {TOOLKIT_PACKAGE!r} belongs to the toolkit distribution"
+        if any(part.split(".", 1)[0] == TOOLKIT_PACKAGE for part in parts):
+            return f"a path named for {TOOLKIT_PACKAGE!r} belongs to the toolkit distribution"
         for retired in RETIRED_ENGINE_PATHS:
             width = len(retired)
             if any(tuple(parts[i : i + width]) == retired for i in range(len(parts) - width + 1)):
                 return f"{'/'.join(retired)} moved to the toolkit distribution (ADR 0201)"
-    elif dist == TOOLKIT_DISTRIBUTION and _install_root_parts(parts)[:1] == [ENGINE_DISTRIBUTION]:
-        return "the toolkit may not write into the engine's package directory (ADR 0201)"
+    elif dist == TOOLKIT_DISTRIBUTION:
+        if parts[0] == ENGINE_DISTRIBUTION:
+            return "the toolkit may not write into the engine's package directory (ADR 0201)"
+        if parts[0].endswith(".data"):
+            return "the toolkit ships no wheel .data tree, which installs outside its package"
     return None
-
-
-#: The wheel ``.data`` subdirectories pip installs into site-packages itself (PEP 427).
-_SITE_PACKAGES_DATA_DIRS = frozenset({"purelib", "platlib"})
-
-
-def _install_root_parts(parts: list[str]) -> list[str]:
-    """``parts`` as they land under site-packages. A wheel member at the archive root lands there as
-    written, and so does one under ``<name>.data/purelib/`` or ``<name>.data/platlib/``: PEP 427
-    moves those into site-packages at install, so either spelling can write into another package."""
-    if len(parts) > 2 and parts[0].endswith(".data") and parts[1] in _SITE_PACKAGES_DATA_DIRS:
-        return parts[2:]
-    return parts
 
 
 def distribution(archive: Path) -> str:

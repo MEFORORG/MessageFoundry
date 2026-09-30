@@ -394,12 +394,14 @@ def test_the_split_rule_loads_and_fires() -> None:
 
 def test_no_tracked_tree_breaks_the_engine_and_toolkit_split() -> None:
     rule = _split_violation()
+    # The engine tree is WALKED, so its `exclude` list filters it, as the sibling engine scans read it.
+    excluded = set(hatch_build(_REPO / "pyproject.toml").get("exclude", []))
     engine = sorted(_tracked("messagefoundry"))
     assert len(engine) >= 200, f"the engine scan saw only {len(engine)} files -- it broke"
     problems = [
         f"messagefoundry: {path} ({why})"
         for path in engine
-        if (why := rule(path, "messagefoundry")) is not None
+        if (why := rule(path, "messagefoundry")) is not None and Path(path).name not in excluded
     ]
     checked = []
     for pyproject in _packaging_pyprojects():

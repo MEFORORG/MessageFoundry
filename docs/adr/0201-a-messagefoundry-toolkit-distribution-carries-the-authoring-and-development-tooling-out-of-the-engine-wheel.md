@@ -355,6 +355,17 @@ command and says to run it as `messagefoundry-toolkit <command>`, from the separ
 `--json`, or when the command is `lens`, whose children take JSON mode from `set_defaults` and have
 no flag.
 
+> **Corrected at build, slice 2 (2026-09-30).** The sentence above over-reads `lens`. Only
+> `lens rewrite` takes JSON mode from `set_defaults`; `lens schema` prints JSON with or without its
+> `--json` flag; `lens parse` has the flag and reports an error as text without it. So the built rule
+> is `--json`, `lens rewrite` or `lens schema`, in `messagefoundry.cli_common.argv_wants_json`, which
+> both commands' pre-parse refusals use. And "the first argument that is not an option" yields to a
+> top-level `--help` or `--version` that comes first, because argparse answers those before it reads
+> a subcommand; both top-level parsers set `allow_abbrev=False` so those are the only spellings. A
+> pre-parse JSON refusal of `lens rewrite` still carries no `"code"` key, which BACKLOG #237 promises
+> on every `lens rewrite` refusal; no path reaches it until slice 4 moves `lens`, and that slice owns
+> it.
+
 The check keys on "not registered here", not on the tier alone. So while a slice has moved some
 toolkit rows and not others, the engine still runs the rows it still carries. The top-level `--help`
 gains one epilog line naming the toolkit commands and the distribution. The line names them; it

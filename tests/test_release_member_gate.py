@@ -471,6 +471,8 @@ _TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
         "messagefoundry\\adr_analyze.py",  # a backslash separator
         "messagefoundry_toolkit/__init__.py",  # the toolkit package inside the engine
         "messagefoundry-0.4.0/messagefoundry_toolkit/__main__.py",
+        "messagefoundry_toolkit.py",  # the import name as a top-level module
+        "messagefoundry-0.4.0.data/purelib/messagefoundry_toolkit.pth",
     ],
 )
 def test_an_engine_archive_carrying_toolkit_code_is_refused(member: str) -> None:
@@ -493,13 +495,16 @@ def test_an_engine_archive_member_that_stays_is_allowed(member: str) -> None:
 
 def test_a_toolkit_archive_writing_into_the_engine_package_is_refused() -> None:
     assert split_violation("messagefoundry/adr_analyze.py", "messagefoundry-toolkit") is not None
-    # PEP 427 installs a wheel's purelib and platlib data straight into site-packages.
-    for data in ("purelib", "platlib"):
-        member = f"messagefoundry_toolkit-0.4.0.data/{data}/messagefoundry/x.py"
+    # PEP 427 installs every .data scheme outside the package: purelib and platlib into
+    # site-packages, scripts over the engine's own console script, data under sys.prefix.
+    for tail in (
+        "purelib/messagefoundry/x.py",
+        "platlib/messagefoundry/x.py",
+        "scripts/messagefoundry",
+        "data/lib/python3.14/site-packages/messagefoundry/x.py",
+    ):
+        member = f"messagefoundry_toolkit-0.4.0.data/{tail}"
         assert split_violation(member, "messagefoundry-toolkit") is not None, member
-    # Other .data directories do not land in the engine's package.
-    member = "messagefoundry_toolkit-0.4.0.data/scripts/messagefoundry"
-    assert split_violation(member, "messagefoundry-toolkit") is None
     assert (
         split_violation("messagefoundry_toolkit/adr_analyze.py", "messagefoundry-toolkit") is None
     )
@@ -681,6 +686,26 @@ def test_no_step_hands_out_an_archive_the_member_gate_refused() -> None:
         "these steps run on always() and would hand out an archive the member gate refused -- "
         "each needs `&& steps.member-gate.outcome != 'failure'`:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_the_toolkit_gate_keeps_its_id_and_the_upload_reads_it() -> None:
+    """The toolkit wheel rides the engine job (ADR 0201), so its gate needs its own id and the
+    job's dry-run upload, which now carries ``toolkit-dist/``, must refuse to hand out what that
+    gate refused. The generic guard above looks only for ``steps.member-gate.outcome``, which the
+    engine gate satisfies alone, so without this a renamed id or a dropped clause stays green."""
+    steps = _steps(_jobs()["release"])
+    gates = [s for s in steps if "toolkit-dist/" in str(s.get("run") or "")]
+    gates = [s for s in gates if _GATE_INVOCATION in str(s.get("run") or "")]
+    assert [s.get("id") for s in gates] == ["toolkit-member-gate"], gates
+    uploads = [
+        s
+        for s in steps
+        if "upload-artifact" in str(s.get("uses") or "")
+        and "toolkit-dist/" in str((s.get("with") or {}).get("path") or "")
+    ]
+    assert len(uploads) == 1, "the release job's dry-run upload no longer carries toolkit-dist/"
+    cond = str(uploads[0].get("if") or "")
+    assert "steps.toolkit-member-gate.outcome != 'failure'" in cond, cond
 
 
 def test_the_member_gate_step_keeps_the_id_that_guard_depends_on() -> None:

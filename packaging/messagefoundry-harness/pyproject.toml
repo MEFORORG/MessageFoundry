@@ -52,7 +52,7 @@ dependencies = [
     # the engine it names carry the same string BY CONSTRUCTION. A range would be a claim about which
     # engines work; `==` is the fact that they ship together.
     #
-    # SO A VERSION BUMP IS THREE EDITS: messagefoundry/__init__.py, this line and the toolkit pin in
+    # SO A VERSION BUMP IS AT LEAST THREE EDITS: messagefoundry/__init__.py, this line and the toolkit pin in
     # packaging/messagefoundry-toolkit/pyproject.toml (ADR 0201). PEP 621 `dependencies`
     # is static (there is no metadata hook in this repository, and adding a build backend surface just
     # for one string is not worth it), so nothing derives this for you. `tests/test_packaging.py`
