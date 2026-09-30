@@ -73,9 +73,10 @@ because one arrived.
 5. Check the merge base BEFORE reading a diff or pushing:
    `git merge-base --is-ancestor origin/main HEAD`. Exit 0 means you contain the trunk tip.
 6. Check who else is in your files: `pwsh -NoProfile -File scripts/coord/overlap.ps1`.
-7. A new test that imports no `messagefoundry` goes in `tests/tooling_manifest.txt` in the same
-   commit. An engine test needs no line, and a listed one stops running on engine PRs. When
-   ambiguous, leave it off. Source of record: `tests/test_tooling_partition.py`.
+7. A new test importing none of `messagefoundry`, `harness`, `tee` needs a line: in
+   `tests/tooling_manifest.txt` if its subject is tooling, else in `_STAYS_WITHOUT_IMPORTING`.
+   When ambiguous, the latter. An engine test needs neither. Source of record:
+   `tests/test_tooling_partition.py`.
 
 ## Before you claim it works
 
