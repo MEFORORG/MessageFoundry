@@ -2489,7 +2489,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
   websockets server's own handshake answers. A step on a single response that errors logs a
   WARNING, once per response family and step, and leaves uvicorn's own response as it was. Those
-  steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 16.0,
+  steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 17.1,
   the versions `requirements.lock` pins. When one of those internals is missing, `serve` refuses
   to start; see the Security entry on the protocol header floor. (`BACKLOG #1120`)
 - **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
