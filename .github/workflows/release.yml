@@ -471,13 +471,14 @@ jobs:
           # (CISA VEX; NTIA Consumer Playbook). Source of truth: security/vex/messagefoundry.openvex.json.
           cp security/vex/messagefoundry.openvex.json messagefoundry-vex.openvex.json
 
-      - name: Score the SBOM quality (sbomqs — advisory, never blocks a release)
-        continue-on-error: true
+      - name: Install sbomqs (pinned in-repo; a pin failure BLOCKS the release)
+        # NO continue-on-error, on purpose: owner ruling 2026-09-30 (BACKLOG #1698). This step used to
+        # be one advisory step that downloaded, verified AND scored, so a pin mismatch -- the exact
+        # event the in-repo digest exists to catch -- ended as a green release with no warning. A
+        # substituted binary is a supply-chain event, not an SBOM-quality signal, so the verify and
+        # install half now fails the job. Only the SCORE below stays advisory (ADR 0149).
+        # tests/test_release_pipeline.py pins both halves of that split.
         run: |
-          # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
-          # SBOM completeness is visible in the release log. Advisory — SBOM quality is a signal, not a
-          # gate. ADR 0149.
-          #
           # PINNED IN-REPO, not against the asset's own checksums.txt (BACKLOG #1698). The security.yml
           # twin still verifies same-origin and that is adequate THERE. It is not adequate here, and the
           # difference is the job, not the tool: this step runs inside `id-token: write` — the identity
@@ -517,6 +518,15 @@ jobs:
           echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
+
+      - name: Score the SBOM quality (sbomqs -- advisory, never blocks a release)
+        continue-on-error: true
+        run: |
+          # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
+          # SBOM completeness is visible in the release log. Advisory: SBOM quality is a signal, not a
+          # gate (ADR 0149). It runs only the binary the BLOCKING step above verified and installed, so
+          # this continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG
+          # #1698).
           sbomqs score -b messagefoundry-sbom.cdx.json
           sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
 

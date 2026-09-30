@@ -2320,3 +2320,65 @@ def test_no_step_survives_a_leak_gate_rejection_in_the_release_job() -> None:
         f"`!=` form still uploads — which is the always() behaviour this step exists for. That "
         f"choice has a known cost, recorded beside the `if:` in release.yml; do not flip it here."
     )
+
+
+def test_the_sbomqs_pin_blocks_and_only_the_score_is_advisory() -> None:
+    """A pin failure BLOCKS the release; only the SBOM score stays advisory (BACKLOG #1698).
+
+    Owner ruling 2026-09-30 (BACKLOG #1698). The sbomqs download, its in-repo SHA-256 check and the
+    install used to share ONE step with the score, under a step-level ``continue-on-error: true``.
+    So the event the pin exists to catch -- a substituted or re-uploaded tarball -- ended as a green
+    release with no warning. The step is now split: the verify-and-install half blocks, and the
+    scoring half keeps ``continue-on-error`` because SBOM quality is a signal, not a gate (ADR 0149).
+
+    Located by CONTENT, not by name, so a rename cannot blind this: the blocking half is the step
+    that fetches the sbomqs release asset, and the advisory half is the step that runs
+    ``sbomqs score``. Each must be exactly one step.
+
+    Mutation: add ``continue-on-error: true`` to the install step, drop it from the scoring step,
+    or fold the two back into one. Red here.
+    """
+    steps = [step for step in _jobs()["release"]["steps"] if isinstance(step, dict)]
+
+    def _body(step: dict) -> str:
+        return _executed_shell(str(step.get("run") or ""))
+
+    installs = [
+        i
+        for i, step in enumerate(steps)
+        if "releases/download" in _body(step) and "sbomqs" in _body(step)
+    ]
+    scores = [i for i, step in enumerate(steps) if "sbomqs score" in _body(step)]
+    assert len(installs) == 1, f"expected one sbomqs download step in `release`, found {installs}"
+    assert len(scores) == 1, f"expected one `sbomqs score` step in `release`, found {scores}"
+    install_at, score_at = installs[0], scores[0]
+    install, score = steps[install_at], steps[score_at]
+
+    assert install_at != score_at, (
+        "the sbomqs download and the score share one step again. Whatever `continue-on-error` that "
+        "step carries is then wrong for one half: set, a pin failure is a green release; unset, a "
+        "low SBOM score blocks one (owner ruling 2026-09-30, BACKLOG #1698; ADR 0149)."
+    )
+    assert "sha256sum -c" in _body(install), (
+        f"step {install.get('name')!r} fetches sbomqs but no longer runs `sha256sum -c`, so the "
+        "blocking half blocks on nothing"
+    )
+    assert "continue-on-error" not in install, (
+        f"step {install.get('name')!r} acquired `continue-on-error` "
+        f"({install.get('continue-on-error')!r}). A pin mismatch would then end as a green release "
+        "with no warning, which the owner ruled out on 2026-09-30 (BACKLOG #1698)."
+    )
+    assert "if" not in install, (
+        f"step {install.get('name')!r} acquired an `if:` ({install.get('if')!r}). A SKIPPED "
+        "verification is not a failed one, and the score below would then run whatever binary was "
+        "already on the runner's PATH."
+    )
+    assert score.get("continue-on-error") is True, (
+        f"step {score.get('name')!r} lost `continue-on-error: true`. The SBOM score is a signal, "
+        "not a gate (ADR 0149), so a low score must not block a release."
+    )
+    assert "releases/download" not in _body(score), (
+        f"step {score.get('name')!r} downloads a release asset under `continue-on-error`, which "
+        "is the shape this split removed: a fetch in an advisory step cannot block on its pin"
+    )
+    assert install_at < score_at, "the sbomqs score runs before the step that installs sbomqs"

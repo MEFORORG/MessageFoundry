@@ -1162,6 +1162,111 @@ _SAME_ORIGIN_CHECKSUM_FETCH = re.compile(
 )
 
 
+#: `NAME=value`, `NAME="value"` or `NAME='value'` on a line of its own -- the simple assignments the
+#: filename binding resolves. A value holding a command substitution is left unresolved on purpose:
+#: what it expands to is decided at run time, and guessing would let a detector vouch for it.
+_SIMPLE_ASSIGNMENT = re.compile(r"""^\s*(?:export\s+)?(\w+)=("[^"]*"|'[^']*'|[^\s;&|]*)\s*$""")
+
+#: The file `curl` writes: `-o FILE` or `--output FILE`, the value quoted or bare.
+_CURL_OUTPUT = re.compile(r"""\bcurl\b[^\n]*?\s(?:-o|--output)[\s=]+("[^"]*"|'[^']*'|\S+)""")
+
+#: A digest followed by the file `sha256sum -c` checks it against (`<digest>  <file>`, with the
+#: optional `*` binary marker). Read AFTER variable expansion, so `${SBOMQS_SHA256}  ${asset}`
+#: resolves to the literal and the filename it names.
+_DIGEST_AND_FILE = re.compile(r"""\b[0-9a-f]{64}\s+\*?([^\s"'|]+)""")
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _expand(text: str, env: dict[str, str]) -> str:
+    """Substitute ``$VAR`` / ``${VAR}`` from ``env``; an unknown name is left as written."""
+    return _VAR_REF.sub(lambda m: env.get(m.group(1), m.group(0)), text)
+
+
+def _shell_assignments(body: str) -> dict[str, str]:
+    """Simple ``NAME=value`` assignments in a step body, each expanded against the ones before it."""
+    env: dict[str, str] = {}
+    for line in body.splitlines():
+        m = _SIMPLE_ASSIGNMENT.match(line)
+        if m is None:
+            continue
+        value = _unquote(m.group(2))
+        if "$(" in value or "`" in value:
+            continue
+        env[m.group(1)] = _expand(value, env)
+    return env
+
+
+def _curl_output_files(body: str, env: dict[str, str]) -> set[str]:
+    """Every file a ``curl -o`` in the body writes, with its simple variables resolved."""
+    return {
+        _expand(_unquote(m.group(1)), env)
+        for line in body.splitlines()
+        for m in _CURL_OUTPUT.finditer(line)
+    }
+
+
+def _oidc_download_offences(body: str) -> list[str]:
+    """Why a release-asset download inside `id-token: write` is not pinned in repo; empty if it is.
+
+    Factored out of the walk below so the rule can run against a synthetic step body. A rule whose
+    only fixture is the live workflow can only ever be shown passing.
+
+    The first two checks BIND THE DIGEST (see the test's docstring). The third BINDS THE FILE, and
+    it was missing until BACKLOG #1698: `sha256sum -c` reads `<digest>  <file>` and checks THAT
+    file, so a step pinning one name and downloading another passed while verifying nothing it went
+    on to install. The verified filename must now be one a `curl -o` in the same step wrote, both
+    read through the step's simple variable assignments.
+
+    LIMITS, stated rather than left implicit: only `curl -o` / `--output` is read as a download
+    target (not `-O`, `wget`, or `-o` fused into a flag cluster such as `-sSfLo`), and only a
+    `<digest>  <file>` spelled on the verify line itself is read as the verified name. Each of
+    those shapes is REPORTED, not waved through, so a gap costs a false positive a reader sees.
+    """
+    offences: list[str] = []
+    pinned = {m.group(1) for m in _SHA256_ASSIGNMENT.finditer(body)}
+    env = _shell_assignments(body)
+    verify_lines = [ln for ln in body.splitlines() if _CHECKSUM_VERIFY in ln]
+    bound = [
+        ln
+        for ln in verify_lines
+        if _SHA256_LITERAL.search(ln) or pinned & {m.group(1) for m in _VAR_REF.finditer(ln)}
+    ]
+    if not verify_lines:
+        offences.append(
+            f"carries no {_CHECKSUM_VERIFY!r}, so nothing compares the bytes against a literal, "
+            f"inside `id-token: write`"
+        )
+    elif not bound:
+        offences.append(
+            f"runs {_CHECKSUM_VERIFY!r} but the digest it checks traces to no in-repo SHA-256 "
+            f"literal, inside `id-token: write`"
+        )
+    else:
+        written = _curl_output_files(body, env)
+        verified = {m.group(1) for ln in bound for m in _DIGEST_AND_FILE.finditer(_expand(ln, env))}
+        if not written:
+            offences.append(
+                "downloads with no `curl -o <file>`, so no verified filename can be tied to the "
+                "bytes it fetched"
+            )
+        elif not verified & written:
+            offences.append(
+                f"verifies {sorted(verified) or 'no resolvable filename'} but `curl -o` wrote "
+                f"{sorted(written)}; the pin checks a file the step did not download"
+            )
+    if _SAME_ORIGIN_CHECKSUM_FETCH.search(body):
+        offences.append(
+            "reaches for a checksums file from the asset's own origin; that is replaced by "
+            "whoever replaces the asset"
+        )
+    return offences
+
+
 def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
     """A download inside `id-token: write` must be pinned IN REPO, not against its own origin.
 
@@ -1189,12 +1294,16 @@ def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
 
     KEYED ON `permissions.id-token: write`, and deliberately NOT on `continue-on-error`. The sibling
     rule above skips JOB-level `continue-on-error: true` because an advisory job cannot green a
-    required context. That reasoning does not transfer one level down: the sbomqs step carries
-    `continue-on-error` at STEP level, and a step-level skip here would skip the exact step this rule
-    exists to catch — advisory about its SCORE says nothing about the credential it runs beside.
+    required context. That reasoning does not transfer one level down: advisory about a SCORE says
+    nothing about the credential a download runs beside. The sbomqs download used to share a
+    step-level `continue-on-error` with its score; since owner ruling 2026-09-30 (BACKLOG #1698) the
+    verify-and-install half blocks, and `tests/test_release_pipeline.py` pins that split. This rule
+    still examines every step, softened or not.
 
     Mutation: restore the `curl … checksums.txt | sha256sum -c -` pair in release.yml's sbomqs step,
-    or drop the `SBOMQS_SHA256=` literal. Red here.
+    drop the `SBOMQS_SHA256=` literal, or verify a filename other than the one `curl -o` wrote. Red
+    here. `test_the_oidc_pin_rule_refuses_a_digest_bound_to_another_file` runs the same rule over
+    synthetic bodies, so each arm is shown failing and not only the live file passing.
     """
     yaml = pytest.importorskip("yaml")
     wf = yaml.safe_load((_WORKFLOWS / "release.yml").read_text(encoding="utf-8")) or {}
@@ -1218,32 +1327,10 @@ def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
                 continue
             checked += 1
             name = step.get("name") or "<unnamed step>"
-            # The literal must be BOUND to the verification, not merely co-present. Measured: three
-            # independent whole-body searches (a 64-hex exists / `sha256sum -c` appears / no
-            # checksums fetch) all pass on a step carrying an unrelated `docker pull …@sha256:…`
-            # beside `sha256sum -c some-other-manifest`, which verifies nothing about the tarball it
-            # then installs. So find the verification LINE and require the digest it checks to trace
-            # to an in-repo literal — inline, or through a variable assigned one in the same body.
-            pinned = {m.group(1) for m in _SHA256_ASSIGNMENT.finditer(body)}
-            verify_lines = [ln for ln in body.splitlines() if _CHECKSUM_VERIFY in ln]
-            if not verify_lines:
-                offenders.append(
-                    f"release.yml:{job_key} — step {name!r} carries no {_CHECKSUM_VERIFY!r}, so "
-                    f"nothing compares the bytes against a literal, inside `id-token: write`"
-                )
-            elif not any(
-                _SHA256_LITERAL.search(ln) or pinned & {m.group(1) for m in _VAR_REF.finditer(ln)}
-                for ln in verify_lines
-            ):
-                offenders.append(
-                    f"release.yml:{job_key} — step {name!r} runs {_CHECKSUM_VERIFY!r} but the digest "
-                    f"it checks traces to no in-repo SHA-256 literal, inside `id-token: write`"
-                )
-            if _SAME_ORIGIN_CHECKSUM_FETCH.search(body):
-                offenders.append(
-                    f"release.yml:{job_key} — step {name!r} reaches for a checksums file from the "
-                    f"asset's own origin; that is replaced by whoever replaces the asset"
-                )
+            offenders.extend(
+                f"release.yml:{job_key} — step {name!r} {reason}"
+                for reason in _oidc_download_offences(body)
+            )
 
     # Liveness: report what was EXAMINED. "no offenders" and "nothing was scanned" otherwise produce
     # the same green, and both halves of this walk (the permission key and the download marker) are
@@ -1264,6 +1351,78 @@ def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
         "a release-asset download runs beside the signing identity without an in-repo pin "
         "(BACKLOG #1698):\n  " + "\n  ".join(offenders)
     )
+
+
+_PINNED_DIGEST = "ab" * 32
+_GOOD_PINNED_BODY = f"""set -o pipefail
+PIN={_PINNED_DIGEST}
+asset="tool_1.0_Linux_x86_64.tar.gz"
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/${{asset}}" -o "${{asset}}"
+echo "${{PIN}}  ${{asset}}" | sha256sum -c -
+tar -xzf "${{asset}}" tool
+"""
+
+
+@pytest.mark.parametrize(
+    ("label", "body", "needle"),
+    [
+        (
+            # BACKLOG #1698 (b): the digest is pinned, but it is checked against a DIFFERENT file than
+            # the one curl wrote, so the bytes installed next are verified by nothing.
+            "pins-one-name-downloads-another",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
+echo "${{PIN}}  b.tgz" | sha256sum -c -
+tar -xzf a.tgz tool
+""",
+            "the pin checks a file the step did not download",
+        ),
+        (
+            # The same mismatch routed through variables, so the resolution is what is under test.
+            "mismatch-through-variables",
+            f"""PIN={_PINNED_DIGEST}
+got=a.tgz
+want=b.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/${{got}}" -o "${{got}}"
+echo "${{PIN}}  ${{want}}" | sha256sum -c -
+""",
+            "the pin checks a file the step did not download",
+        ),
+        (
+            "no-curl-output-file",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfLO "https://github.com/o/r/releases/download/v1.0/a.tgz"
+echo "${{PIN}}  a.tgz" | sha256sum -c -
+""",
+            "no `curl -o <file>`",
+        ),
+        (
+            "digest-not-in-repo",
+            """curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
+echo "${REMOTE_DIGEST}  a.tgz" | sha256sum -c -
+""",
+            "traces to no in-repo SHA-256 literal",
+        ),
+    ],
+)
+def test_the_oidc_pin_rule_refuses_a_digest_bound_to_another_file(
+    label: str, body: str, needle: str
+) -> None:
+    """Each arm of the in-repo pin rule, run on a synthetic step body, must FAIL (BACKLOG #1698).
+
+    The live-file test above can only ever show the rule passing, and a rule that has only been seen
+    passing has not been shown to check anything. `pins-one-name-downloads-another` is the shape
+    #1698 (b) names: before the file binding, it passed.
+    """
+    offences = _oidc_download_offences(_executed_shell(body))
+    assert any(needle in o for o in offences), (
+        f"{label}: expected an offence containing {needle!r}, got {offences}"
+    )
+
+
+def test_the_oidc_pin_rule_accepts_the_pinned_shape() -> None:
+    """The control arm: the shape release.yml uses passes, so the refusals above discriminate."""
+    assert _oidc_download_offences(_executed_shell(_GOOD_PINNED_BODY)) == []
 
 
 def _run_blocks(workflow: str) -> list[tuple[str, str]]:
