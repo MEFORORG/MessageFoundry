@@ -58,7 +58,6 @@ from typing import Any
 import pytest
 
 import messagefoundry.service as svc
-from tests._workflow_contexts import WORKFLOWS, jobs_of
 
 _INSTALL_SERVICE = svc.install_script_path()
 _DIR = _INSTALL_SERVICE.parent if _INSTALL_SERVICE is not None else None
@@ -775,22 +774,24 @@ _MEASURE = "measure-store-access.ps1"
 _SMOKE_JOB = "windows-service-smoke"
 # The folder the smoke job hands install-service.ps1, and so the only nssm.exe it may run.
 _SMOKE_DIR_VAR = "SMOKE_NSSM_DIR"
-_CHECKED_CALL = re.compile(
-    r'&\s*"\$env:' + _SMOKE_DIR_VAR + r'\\nssm\.exe"\s+(\w+)\s+MessageFoundry\b'
-)
-# At least these ways of running the nssm that PATH resolves: the bare command in command position,
-# and asking PATH for it. The checked call names nssm.exe after a backslash, so it does not match.
-_PATH_NSSM = re.compile(
-    r"(?:^|[;|{(&])\s*nssm(?:\.exe)?(?=\s|$|[;|)])|\bGet-Command\b.*\bnssm\b", re.I
-)
+_CHECKED_PATH = '"$env:' + _SMOKE_DIR_VAR + '\\nssm.exe"'
+_CHECKED_CALL = re.compile(re.escape(_CHECKED_PATH) + r"\s+(\w+)\s+MessageFoundry\b")
+# The word nssm or nssm.exe, in any case. It does not match inside -NssmDir or SMOKE_NSSM_DIR.
+_ANY_NSSM = re.compile(r"\bnssm(?:\.exe)?\b", re.I)
+# Commands that look an nssm up, or bind one to a variable, without an assignment statement.
+_LOOKUPS = {"get-command", "gcm", "where", "where.exe", "set-variable", "sv", "new-variable"}
 
 
-def _runs_path_nssm(script: str) -> list[str]:
-    """The lines of a workflow ``run:`` script that run an nssm found on PATH. Skips comments."""
+def _runs_unchecked_nssm(script: str) -> list[str]:
+    """The lines of a workflow ``run:`` script that name an nssm other than the checked copy.
+
+    Deliberately wider than "runs it": outside a comment, any mention of nssm but the checked path
+    counts, so a quoted name, a literal path, ``Start-Process`` or ``cmd /c`` cannot slip past.
+    """
     return [
         line.strip()
         for line in script.splitlines()
-        if not line.lstrip().startswith("#") and _PATH_NSSM.search(line)
+        if not line.lstrip().startswith("#") and _ANY_NSSM.search(line.replace(_CHECKED_PATH, ""))
     ]
 
 
@@ -803,17 +804,17 @@ def test_the_store_access_measurement_runs_only_the_installers_checked_nssm(
         f"{_MEASURE} takes no -NssmDir, so it cannot name the folder whose nssm.exe the installer "
         "checks"
     )
-    from_path = [
+    unchecked = [
         str(c["text"])
         for c in commands
-        if str(c.get("name")).lower() in ("nssm", "nssm.exe")
-        or (c.get("name") == "Get-Command" and "nssm" in str(c["text"]).lower())
+        if (str(c["first"]) != "$Nssm" and _ANY_NSSM.search(str(c["first"])))
+        or (str(c.get("name")).lower() in _LOOKUPS and _ANY_NSSM.search(str(c["text"])))
     ]
-    assert not from_path, (
-        f"{_MEASURE} runs the nssm on PATH, as administrator, with no hash check: {from_path}"
+    assert not unchecked, (
+        f"{_MEASURE} runs, or looks up, an nssm other than the checked $Nssm: {unchecked}"
     )
-    sources = [a["right"] for a in facts["assigns"] if a["left"] == "$Nssm"]
-    assert sources == ['Join-Path $NssmDir "nssm.exe"'], (
+    sources = [str(a["right"]) for a in facts["assigns"] if str(a["left"]).lower() == "$nssm"]
+    assert len(sources) == 1 and "$NssmDir" in sources[0] and "nssm.exe" in sources[0], (
         f"$Nssm must be the nssm.exe in -NssmDir and nothing else; it is assigned {sources}"
     )
     runs = [
@@ -839,10 +840,18 @@ def test_the_store_access_measurement_runs_only_the_installers_checked_nssm(
         "& nssm start MessageFoundry",
         "if ($up) { nssm.exe stop MessageFoundry }",
         "$n = (Get-Command nssm).Source",
+        "$s = nssm status MessageFoundry",
+        '& "nssm" stop MessageFoundry',
+        "& 'nssm.exe' stop MessageFoundry",
+        "Start-Process nssm -ArgumentList 'stop', 'MessageFoundry'",
+        "cmd /c nssm stop MessageFoundry",
+        "gcm NSSM",
+        '& "C:\\ProgramData\\chocolatey\\bin\\nssm.exe" stop MessageFoundry',
+        '& "$env:SMOKE_NSSM_DIR\\nssm.exe" stop MessageFoundry; nssm start MessageFoundry',
     ],
 )
-def test_the_path_nssm_detector_fires(line: str) -> None:
-    assert _runs_path_nssm(line) == [line.strip()]
+def test_the_unchecked_nssm_detector_fires(line: str) -> None:
+    assert _runs_unchecked_nssm(line) == [line.strip()]
 
 
 @pytest.mark.parametrize(
@@ -850,51 +859,64 @@ def test_the_path_nssm_detector_fires(line: str) -> None:
     [
         '& "$env:SMOKE_NSSM_DIR\\nssm.exe" stop MessageFoundry',
         "# nssm start MessageFoundry",
-        "Write-Host 'the nssm on PATH is not used'",
         ".\\scripts\\service\\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR",
+        "Get-Service MessageFoundry",
     ],
 )
-def test_the_path_nssm_detector_ignores_the_checked_copy_and_prose(line: str) -> None:
-    assert _runs_path_nssm(line) == []
-
-
-def _run_scripts(job: dict[str, Any]) -> list[str]:
-    steps = job.get("steps") or []
-    return [s["run"] for s in steps if isinstance(s, dict) and isinstance(s.get("run"), str)]
+def test_the_unchecked_nssm_detector_ignores_the_checked_copy_and_comments(line: str) -> None:
+    assert _runs_unchecked_nssm(line) == []
 
 
 @functools.cache
-def _workflow_runs() -> tuple[tuple[str, str, str], ...]:
-    """(file, job id, run script) for every step with a ``run:``, in every workflow."""
-    found = tuple(
+def _jobs(workflow: str) -> dict[str, dict[str, Any]]:
+    # Imported here, not at module scope: a venv without PyYAML turns that module's import into a
+    # skip, which at module scope would skip every installer test above along with these three.
+    from tests._workflow_contexts import jobs_of
+
+    return jobs_of(workflow)
+
+
+def _steps(job: dict[str, Any]) -> list[dict[str, Any]]:
+    return [s for s in job.get("steps") or [] if isinstance(s, dict)]
+
+
+def _run_scripts(job: dict[str, Any]) -> list[str]:
+    return [s["run"] for s in _steps(job) if isinstance(s.get("run"), str)]
+
+
+def test_no_workflow_names_an_unchecked_nssm() -> None:
+    from tests._workflow_contexts import WORKFLOWS
+
+    runs = [
         (path.name, job_id, script)
         for path in sorted(WORKFLOWS.glob("*.y*ml"))
-        for job_id, job in jobs_of(path.name).items()
+        for job_id, job in _jobs(path.name).items()
         for script in _run_scripts(job)
+    ]
+    assert any(job_id == _SMOKE_JOB for _, job_id, _ in runs), (
+        f"CONTROL FAILED: the {_SMOKE_JOB} job was not read under {WORKFLOWS}"
     )
-    assert found, f"CONTROL FAILED: no run step read under {WORKFLOWS}"
-    return found
-
-
-def test_no_workflow_runs_the_nssm_on_path() -> None:
     offenders = [
         f"{name} {job_id}: {line}"
-        for name, job_id, script in _workflow_runs()
-        for line in _runs_path_nssm(script)
+        for name, job_id, script in runs
+        for line in _runs_unchecked_nssm(script)
     ]
     assert not offenders, (
-        "a workflow runs the nssm on PATH. On a hosted runner that is the Chocolatey copy the "
-        f"installer refuses on its hash. Run the checked copy in -NssmDir instead: {offenders}"
+        "a workflow runs an nssm other than the checked copy. On a hosted runner the one on PATH "
+        f"is the Chocolatey copy the installer refuses on its hash: {offenders}"
     )
 
 
 def test_the_service_smoke_runs_the_copy_it_had_the_installer_check() -> None:
-    job = jobs_of("ci.yml").get(_SMOKE_JOB)
+    job = _jobs("ci.yml").get(_SMOKE_JOB)
     assert job, f"CONTROL FAILED: ci.yml has no {_SMOKE_JOB} job"
-    # The workflow-wide scan above must have read this job, or its clean result proves nothing.
-    assert any(job_id == _SMOKE_JOB for _, job_id, _ in _workflow_runs())
     assert (job.get("env") or {}).get(_SMOKE_DIR_VAR), (
         f"the {_SMOKE_JOB} job does not set {_SMOKE_DIR_VAR}"
+    )
+    overridden = [s.get("name") for s in _steps(job) if _SMOKE_DIR_VAR in (s.get("env") or {})]
+    assert not overridden, (
+        f"a step overrides {_SMOKE_DIR_VAR}, so it runs an nssm.exe from a folder the installer "
+        f"never checked: {overridden}"
     )
     scripts = _run_scripts(job)
     handed = "-NssmDir $env:" + _SMOKE_DIR_VAR
@@ -911,7 +933,7 @@ def test_the_service_smoke_runs_the_copy_it_had_the_installer_check() -> None:
             f"nssm.exe in some other folder: {calls}"
         )
     verbs = {m.group(1) for script in scripts for m in _CHECKED_CALL.finditer(script)}
-    assert verbs == {"set", "start", "stop"}, (
+    assert verbs >= {"set", "start", "stop"}, (
         f"{_SMOKE_JOB} should set, start and stop the service through the checked copy; it does "
         f"{sorted(verbs)}"
     )

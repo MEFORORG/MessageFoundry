@@ -95,7 +95,8 @@ param(
     # Handed to install-service.ps1, which checks the nssm.exe it keeps there against the pin and
     # refuses one anybody but an administrator can replace. Every nssm call below runs that copy,
     # never the one on PATH (BACKLOG #2442). Keep the default equal to install-service.ps1's.
-    [string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm"
+    # An empty value would resolve to the current directory, so it is refused here.
+    [ValidateNotNullOrEmpty()][string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm"
 )
 
 $ErrorActionPreference = "Stop"

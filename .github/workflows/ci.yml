@@ -3542,9 +3542,9 @@ jobs:
       run:
         shell: pwsh
     # BACKLOG #2442: every install below is handed this folder as -NssmDir, and every nssm call runs
-    # the nssm.exe in it by full path. The installer checks that copy against its pinned hash and
-    # refuses one anybody but an administrator can replace. The nssm on the runner's PATH is
-    # Chocolatey's, which fails that hash check, so a bare `nssm` here would run a copy nothing checked.
+    # the nssm.exe in it by full path, the copy the installer checked (install-service.ps1,
+    # Resolve-Nssm). The nssm on the runner's PATH is Chocolatey's, which that check refuses.
+    # tests/test_nssm_pin.py fails on any other nssm in a workflow.
     env:
       SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
 
