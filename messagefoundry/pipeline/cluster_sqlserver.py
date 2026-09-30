@@ -113,6 +113,7 @@ class SqlServerCoordinator:
         monotonic: Callable[[], float] = time.monotonic,
         alert_sink: AlertSink | None = None,
         run_schema_ddl: bool = True,
+        stop_write_timeout_seconds: float = STOP_WRITE_TIMEOUT_SECONDS,
     ) -> None:
         self._store = store
         self.node_id = node_id
@@ -151,8 +152,8 @@ class SqlServerCoordinator:
         # respect: only the three FIFO claim paths are epoch-fenced here (current_epoch()), so a
         # re-promoted ex-leader is not fenced out of claim_ready or any terminal resolve.
         self._leadership_lock = asyncio.Lock()
-        # BACKLOG #1987: the per-call bound on stop()'s two writes. Mirrors DbCoordinator's attribute.
-        self._stop_write_timeout = STOP_WRITE_TIMEOUT_SECONDS
+        # BACKLOG #1987: the bound on each of stop()'s two writes. Mirrors DbCoordinator's.
+        self._stop_write_timeout = stop_write_timeout_seconds
         self._monotonic = monotonic
         # Constant, NOT schema-namespaced like DbCoordinator's: this store never reads db_schema, so
         # installs sharing one database share these tables and must share this election and DDL lock.
@@ -205,10 +206,19 @@ class SqlServerCoordinator:
         # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
         # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
         # Forced on may_own_lease_row() so a self-fenced node releases its row, and each write bounded
-        # so a stuck pool cannot hang the shutdown (BACKLOG #1987); DbCoordinator.stop() says why.
-        await self._release_leadership(
+        # so a stuck pool cannot hang the shutdown (BACKLOG #1987); DbCoordinator.stop() says why, and
+        # why the tombstone is skipped once the release did not return. No asyncpg-style helper here:
+        # the store's _acquire already bounds the borrow and quarantines a cancelled connection
+        # (STOP_WRITE_TIMEOUT_SECONDS says what that quarantine can still cost).
+        _, _, wrote, _ = await self._release_leadership(
             force_write=self.may_own_lease_row(), timeout=self._stop_write_timeout
         )
+        if not wrote:
+            log.warning(
+                "cluster: node %s not marked left: the pool did not answer the lease release",
+                self.node_id,
+            )
+            return
         try:
             async with asyncio.timeout(self._stop_write_timeout):
                 await self._store._execute(

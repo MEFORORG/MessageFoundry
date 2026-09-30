@@ -238,15 +238,40 @@ _DEMOTE_BUDGET_FRACTION = 0.5
 _DEMOTE_BUDGET_FLOOR = 1.0
 _DEMOTE_BUDGET_CEILING = 10.0
 
-#: The per-call bound on each write ``stop()`` sends: the lease release and the ``left`` tombstone
-#: (BACKLOG #1987). Shared by both coordinators for the reason :func:`stepdown_pause_seconds` is. It
-#: covers the pool acquire as well as the statement, because an ``asyncio.timeout`` wraps the whole
-#: call; asyncpg's own ``timeout=`` would bound only the statement, and the SQL Server store has none.
-#: Picked against the service stop budget rather than derived from a lease timing: NSSM gives the
-#: process 15 s after Ctrl+C (``AppStopMethodConsole 15000`` in ``install-service.ps1``), and two writes
-#: at this bound spend at most 4 s of it. A write that misses the bound costs nothing the shutdown did
-#: not already accept: the lease row ages out at its TTL, which is what a failed release always meant.
+#: The default bound on each write ``stop()`` sends: the lease release and the ``left`` tombstone
+#: (BACKLOG #1987). Shared by both coordinators for the reason :func:`stepdown_pause_seconds` is.
+#: Picked against the service stop budget, not derived from a lease timing: NSSM's
+#: ``AppStopMethodConsole`` in ``scripts/service/install-service.ps1`` is that budget, and
+#: ``tests/test_cluster_stop_release.py`` reads it from there.
+#:
+#: **The bound is not the whole cost of a write that misses it.** An ``asyncio.timeout`` covers the
+#: acquire and the statement, and then the cancellation has to unwind through the driver:
+#:
+#: * Postgres: asyncpg's shielded pool release waits for the server to acknowledge the cancel, for as
+#:   long as the acquire's own timeout, and then terminates the connection. :func:`_execute_within`
+#:   passes the bound to that acquire, so a write costs at most twice the bound. Through a bare
+#:   ``pool.execute`` the acquire timeout is None and that wait has no limit.
+#: * SQL Server: the store quarantines the cancelled connection and may wait up to its
+#:   ``_DIRTY_CLOSE_TIMEOUT`` for the close, so a write costs at most the bound plus that.
+#:
+#: ``stop()`` skips the tombstone once the release did not return, so a stuck pool pays that cost
+#: once. A write that misses the bound costs nothing the shutdown did not already accept: the lease
+#: row ages out at its TTL, which is what a failed release always meant. The bound also applies to a
+#: healthy leader's release. A release slower than the bound now falls back to that TTL, where it
+#: used to hold the shutdown open until it committed.
 STOP_WRITE_TIMEOUT_SECONDS = 2.0
+
+
+async def _execute_within(pool: Any, timeout: float, sql: str, *args: Any) -> Any:
+    """Run one asyncpg write with a hard bound on the whole call, the driver's unwind included.
+
+    Why not ``asyncio.timeout(t)`` around ``pool.execute``: that ``execute`` acquires with no
+    timeout, and asyncpg 0.31.0's pool release, which is shielded from the cancel, waits for a
+    cancelled statement's server acknowledgement for as long as that acquire timeout. None means no
+    limit at all. Passing ``timeout`` to ``acquire`` gives the release the same budget, after which
+    asyncpg terminates the connection. So this costs at most twice ``timeout``."""
+    async with asyncio.timeout(timeout), pool.acquire(timeout=timeout) as con:
+        return await con.execute(sql, *args)
 
 
 class StepdownOutcome(NamedTuple):
@@ -792,6 +817,7 @@ class DbCoordinator:
         monotonic: Callable[[], float] = time.monotonic,
         alert_sink: AlertSink | None = None,
         run_schema_ddl: bool = True,
+        stop_write_timeout_seconds: float = STOP_WRITE_TIMEOUT_SECONDS,
     ) -> None:
         self._pool = pool
         self.node_id = node_id
@@ -869,9 +895,9 @@ class DbCoordinator:
         # DB hang, and it only ever demotes), and stop() releases without it so a shutdown is never
         # blocked behind an in-flight stepdown waiting on a hung pool.
         self._leadership_lock = asyncio.Lock()
-        # BACKLOG #1987: the per-call bound on stop()'s two writes. An attribute rather than a bare
-        # constant read so a test can shrink it; see STOP_WRITE_TIMEOUT_SECONDS for the value's reason.
-        self._stop_write_timeout = STOP_WRITE_TIMEOUT_SECONDS
+        # BACKLOG #1987: the bound on each of stop()'s two writes; STOP_WRITE_TIMEOUT_SECONDS says what
+        # a write that misses it still costs.
+        self._stop_write_timeout = stop_write_timeout_seconds
         # Monotonic clock for the fence (injectable for deterministic tests). Distinct from the DB clock
         # the lease uses: the fence measures a node-local elapsed duration (free of INTER-NODE skew —
         # that is the property being bought), the lease compares against the DB's own clock_timestamp().
@@ -960,11 +986,21 @@ class DbCoordinator:
         # The fence clears the gate on this node's clock while the row stays live on the DB clock, so
         # a release gated on the gate alone sent nothing and left a standby waiting out the TTL. The
         # forced write was once tried here and reverted because it had no per-call bound, and a
-        # self-fenced node's pool is the one most likely to hang. The bound is the fix: each write
-        # below gets STOP_WRITE_TIMEOUT_SECONDS, covering the pool acquire and the statement.
-        await self._release_leadership(
+        # self-fenced node's pool is the one most likely to hang. The bound is the fix; what a write
+        # that misses it still costs is on STOP_WRITE_TIMEOUT_SECONDS. It bounds these two writes
+        # only. The gather above waits on a cancelled heartbeat task with no bound of its own.
+        _, _, wrote, _ = await self._release_leadership(
             force_write=self.may_own_lease_row(), timeout=self._stop_write_timeout
         )
+        if not wrote:
+            # The release was sent and did not return, so the pool is not answering. The tombstone
+            # would spend a second bound on the same pool for a row the freshness filter in
+            # cluster_members() already handles, so skip it.
+            log.warning(
+                "cluster: node %s not marked left: the pool did not answer the lease release",
+                self.node_id,
+            )
+            return
         # Mark the row left rather than DELETE it: keeping a 'left' tombstone gives an operator a
         # visible "this node shut down cleanly" signal (vs a crashed node whose row goes stale), which
         # Step 4's election/diagnostics will distinguish. The row is re-activated by the next start().
@@ -972,15 +1008,15 @@ class DbCoordinator:
             # Also clear is_leader so a clean shutdown immediately stops reporting this node as leader
             # (Step 7). A hard crash skips this UPDATE and leaves the flag stale — the freshness filter in
             # cluster_members() handles that case by AND-ing the flag with a live last_seen.
-            # Bounded for the same reason as the release (#1987): an unbounded write here would hang
-            # the shutdown on the stuck pool the release above just gave up on.
-            async with asyncio.timeout(self._stop_write_timeout):
-                await self._pool.execute(
-                    "UPDATE nodes SET status=$1, last_seen=$2, is_leader=FALSE WHERE node_id=$3",
-                    "left",
-                    time.time(),
-                    self.node_id,
-                )
+            # Bounded for the same reason as the release (#1987).
+            await _execute_within(
+                self._pool,
+                self._stop_write_timeout,
+                "UPDATE nodes SET status=$1, last_seen=$2, is_leader=FALSE WHERE node_id=$3",
+                "left",
+                time.time(),
+                self.node_id,
+            )
         except Exception as exc:  # the pool may already be closing on shutdown — log, don't raise
             # safe_exc keeps the exception type + a redacted/bounded message: this is a connectivity
             # error (no PHI), but route it through the same redactor used everywhere for consistency.
@@ -1588,10 +1624,10 @@ class DbCoordinator:
         Both callers pass it on :meth:`may_own_lease_row`, so a self-fenced node releases its row on a
         stepdown (BACKLOG #1508) and on a stop (BACKLOG #1987).
 
-        ``timeout`` bounds the write, pool acquire included, with :func:`asyncio.timeout`. Only
-        :meth:`stop` passes it. A self-fenced node's pool is the one most likely to hang, and a stop
-        must not wait on it; a write that misses the bound is a failed write (``wrote=False``, the
-        release still owed) and the row ages out at its TTL. A stepdown passes none, because its
+        ``timeout`` bounds the write through :func:`_execute_within`. Only :meth:`stop` passes it. A
+        self-fenced node's pool is the one most likely to hang, and a stop must not wait on it; a
+        write that misses the bound is a failed write (``wrote=False``, the release still owed) and
+        the row ages out at its TTL. A stepdown passes none, because its
         request deadline already cancels it and a timeout there would change what it reports."""
         was_leader = self._is_leader
         self._is_leader = False
@@ -1619,13 +1655,16 @@ class DbCoordinator:
         self._lease_release_owed = True
         try:
             # Expire the lease (set it to the epoch) only if we still own it, so a standby's next
-            # acquire tick takes over at once instead of waiting out the full TTL. The timeout, when
-            # set, raises TimeoutError, which the arm below catches like any other failed write.
-            async with asyncio.timeout(timeout):
-                status = await self._pool.execute(
-                    "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = $1 AND owner = $2",
-                    self._lease_key,
-                    self.node_id,
+            # acquire tick takes over at once instead of waiting out the full TTL. A bounded write
+            # raises TimeoutError at its bound, which the arm below catches like any other failure.
+            release_sql = (
+                "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = $1 AND owner = $2"
+            )
+            if timeout is None:
+                status = await self._pool.execute(release_sql, self._lease_key, self.node_id)
+            else:
+                status = await _execute_within(
+                    self._pool, timeout, release_sql, self._lease_key, self.node_id
                 )
         except Exception as exc:  # the pool may already be closing on shutdown — log, don't raise
             log.warning(
