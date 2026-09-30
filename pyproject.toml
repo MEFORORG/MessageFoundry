@@ -110,7 +110,7 @@ dependencies = [
     # (--env-file), PyYAML (a YAML log config) and colorama (Windows log colour). serve passes no
     # reload, no env_file and log_config=None, so none of the four is ever imported. The three the
     # engine does use are declared below with the extra's own markers.
-    "uvicorn>=0.29,<0.50",
+    "uvicorn>=0.29,<0.55",
     # The HTTP protocol ``http="auto"`` picks when installed. protocol_headers.py floors both it and h11.
     "httptools>=0.8.0",
     # The legacy WebSocket server ``ws="auto"`` resolves to, which protocol_headers.py floors and
