@@ -53,10 +53,14 @@ SCHEMA_VERSION = 1
 
 #: Which rate window the readings payload's rates were computed over (BACKLOG #1420). The window is
 #: defined once, in `harness.load.connscale.runner._empty_claim_rates`. This value names the one that
-#: EXCLUDES the post-drain final. A payload without the field was computed over the old window, which
-#: ran to that final, and its readings are not comparable with these. A harvest filters on this exact
-#: name and value, so do not rename either.
-RATE_WINDOW = "in_hold_excl_drain"
+#: EXCLUDES the post-drain final AND the reload probe's time past the hold's end (BACKLOG #2024).
+#:
+#: Three populations exist, and none compares with another. No field: the window ran to the
+#: post-drain final. ``"in_hold_excl_drain"``: #1420 took that final out, but a slow reload's
+#: reconnect wait and extra hold were still inside. This value: #2024 took those out too.
+#: `scripts/connscale_harvest.py` filters on the exact name and each value, so a new window gets a
+#: new value and the harvest a new population; never reuse or rename one.
+RATE_WINDOW = "in_hold_excl_drain_reload_tail"
 
 # The shared rule (harness/_spreadsheet.py) — this module used to carry its own copy, and was the one
 # writer with no formula-injection test at all, which is how the copies drifted unnoticed.
@@ -247,6 +251,16 @@ class ConnScaleRecord:
     # reload probe ran, and `post_reload_reply_s` is also None when no reply came inside the wait.
     post_reload_reply_s: float | None = None
     post_reload_drops: int | None = None
+    # The reload window's own terms, saved so a reader can check why a send was or was not excused
+    # (BACKLOG #2024). `reload_aged` counts the sends the close stranded that were written BEFORE the
+    # window opened; the budget judged those. `reload_lookback_s` is how far before the request the
+    # window opened, and `reload_reconnect_timeout_s` is the reconnect wait the step allowed.
+    # `reload_not_applied` is True when dual control held the reload or the engine refused it, so no
+    # new graph ran. All four are None when no reload probe ran.
+    reload_aged: int | None = None
+    reload_lookback_s: float | None = None
+    reload_reconnect_timeout_s: float | None = None
+    reload_not_applied: bool | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -352,6 +366,10 @@ class ConnScaleRecord:
                 "extra_hold_s": _round_or_none(self.post_reload_extra_hold_s, 3),
                 "reply_s": _round_or_none(self.post_reload_reply_s, 3),
                 "drops_after": self.post_reload_drops,
+                "aged": self.reload_aged,
+                "lookback_s": _round_or_none(self.reload_lookback_s, 3),
+                "reconnect_timeout_s": _round_or_none(self.reload_reconnect_timeout_s, 3),
+                "not_applied": self.reload_not_applied,
             },
             "wall6_ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),
@@ -982,7 +1000,7 @@ class ConnScaleReport:
             "context": dict(context or {}),
             # ADDITIVE, so `schema_version` stays 2: every row below keeps its shape. What changed is
             # the window each value was computed over, and this field is how a harvest tells the
-            # two populations apart (BACKLOG #1420; see `RATE_WINDOW`).
+            # populations apart (BACKLOG #1420 and #2024; see `RATE_WINDOW`).
             "rate_window": RATE_WINDOW,
             "readings": readings,
         }

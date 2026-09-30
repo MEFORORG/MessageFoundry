@@ -26,9 +26,12 @@ THE THREE RULES THAT MAKE IT A HARVEST RATHER THAN A SAMPLE.
 2. **Every (leg, lane, N) cell stands alone.** The leg is the job's own matrix identity, so the two
    Windows legs are two legs and are never pooled, and neither is a second Python on one OS. N is
    the payload's own base count, so a change to the sweep's counts cannot pool two distributions.
-3. **Two populations, never mixed.** A payload carrying ``rate_window = "in_hold_excl_drain"`` was
-   written after BACKLOG #1420 narrowed the rate window. A payload without it is WITH-TAIL data,
-   and counts as that only from a run created after PR 729 (``541c51910``, 2026-09-01T13:01:20Z),
+3. **Three populations, never mixed.** A payload carrying
+   ``rate_window = "in_hold_excl_drain_reload_tail"`` was written after BACKLOG #2024 took the reload
+   probe's time past the hold out of the rate window. One carrying ``"in_hold_excl_drain"`` was
+   written after BACKLOG #1420 took the drain tail out, and before #2024. A payload without the
+   field is WITH-TAIL data, and counts as that only from a run created after PR 729
+   (``541c51910``, 2026-09-01T13:01:20Z),
    the commit that added the ``herd_floor`` block. Pass ``--with-tail-until`` once #1420 has
    landed, so a payload that lost the field fails closed rather than joining the with-tail cells.
    Anything else is excluded and counted by reason.
@@ -85,6 +88,9 @@ SUITE_STEP = "Tests (pytest)"
 
 #: The value BACKLOG #1420 writes into the payload once the rate window excludes the drain tail.
 POST_1420_RATE_WINDOW = "in_hold_excl_drain"
+#: The value BACKLOG #2024 writes once the window also excludes the reload probe's time past the
+#: hold. It must equal ``harness.load.connscale.report.RATE_WINDOW``; a test pins the two together.
+POST_2024_RATE_WINDOW = "in_hold_excl_drain_reload_tail"
 #: PR 729 (``541c51910``) merged at this instant and added the ``herd_floor`` block. A with-tail
 #: payload counts only from a run created after it. This is a fact about the data, not the
 #: inclusion window, which is always an argument.
@@ -92,9 +98,10 @@ WITH_TAIL_FLOOR = datetime(2026, 9, 1, 13, 1, 20, tzinfo=UTC)
 #: The three OS legs #1415 names. A leg missing from a harvest is flagged, never silently absent.
 EXPECTED_OS_LEGS = ("ubuntu-latest", "windows-2022", "windows-2025")
 
+POST_2024 = "post_2024"
 POST_1420 = "post_1420"
 WITH_TAIL = "with_tail"
-POPULATIONS = (POST_1420, WITH_TAIL)
+POPULATIONS = (POST_2024, POST_1420, WITH_TAIL)
 
 PASSED = "success"
 HARVESTED = "harvested"
@@ -228,6 +235,8 @@ def classify(
     if isinstance(version, int) and not isinstance(version, bool) and version < 2:
         return None, "schema 1 payload, from before PR 729"
     window = rate_window_of(payload)
+    if window == POST_2024_RATE_WINDOW:
+        return POST_2024, "rate_window=" + window
     if window == POST_1420_RATE_WINDOW:
         return POST_1420, "rate_window=" + window
     if window is not None:

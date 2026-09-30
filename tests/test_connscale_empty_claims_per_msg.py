@@ -42,6 +42,7 @@ from harness.load.connscale.report import (
     CONNSCALE_WORKERS_PER_CONNECTION,
     DIAGNOSTIC_FIELDS,
     ENGINE_IDLE_POLL_INTERVAL_S,
+    RATE_WINDOW,
     ConnScaleRecord,
     ConnScaleReport,
     NoLoss,
@@ -1034,14 +1035,15 @@ def test_the_payload_version_moved_and_the_harvested_ratio_ROWS_did_not() -> Non
     THE ``rate_window`` MARKER IS PINNED HERE TOO, as a LITERAL. BACKLOG #1420 changed the window the
     values are computed over without changing the row shape, so this top-level field is the only
     thing that splits the corpus where it really splits. A harvest filters on this exact name and
-    value; reading the constant back would pass a rename.
+    value; reading the constant back would pass a rename. BACKLOG #2024 moved the window again and
+    changed the value with it, so the literal below is the #2024 one.
     """
     report = _report(
         _rec("fixed_aggregate", 12, per_msg=48.0), _rec("fixed_aggregate", 24, per_msg=30.0)
     )
     payload = report.readings_payload(_METRIC, _KEY, tolerance=0.25, base_count=12)
     assert payload["schema_version"] == 2
-    assert payload["rate_window"] == "in_hold_excl_drain"
+    assert payload["rate_window"] == "in_hold_excl_drain_reload_tail"
 
     rows = payload["readings"]
     assert isinstance(rows, list) and len(rows) == 2
@@ -1294,3 +1296,22 @@ def test_no_two_tests_in_this_file_share_a_name() -> None:
     assert len(names) > 20, (
         f"the name scan found only {len(names)} tests; it is not reading the file"
     )
+
+
+def test_the_harvest_files_the_current_rate_window_in_its_own_population() -> None:
+    """BACKLOG #2024 changed ``RATE_WINDOW``. The #1415 harvest splits populations by that value, and
+    it EXCLUDES a value it does not know. So a window change the harvest was not told about would
+    drop every new payload as unrecognised, with no reading anywhere saying why. The harvest keeps
+    its own copy of the value because it runs without the harness; this pins the two together."""
+    from scripts import connscale_harvest as harvest
+
+    assert harvest.POST_2024_RATE_WINDOW == RATE_WINDOW
+    payload: dict[str, object] = {"schema_version": 2, "rate_window": RATE_WINDOW}
+    population, _ = harvest.classify(payload, harvest.WITH_TAIL_FLOOR)
+    assert population == harvest.POST_2024
+    # The control: the #1420 value is a DIFFERENT population, so the two never pool.
+    population, _ = harvest.classify(
+        {"schema_version": 2, "rate_window": harvest.POST_1420_RATE_WINDOW},
+        harvest.WITH_TAIL_FLOOR,
+    )
+    assert population == harvest.POST_1420
