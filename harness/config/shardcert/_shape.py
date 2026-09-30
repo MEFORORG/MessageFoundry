@@ -76,7 +76,7 @@ Knobs (all optional; safe defaults so a plain ``serve`` works):
   ``H = dests`` owners (none self-filter — that is a ``broadcast``-only shape); the fan-out is D, expressed
   in the ROUTER. ACCOUNTING is ``H = D`` (:func:`reported_shape` → ``(D, D)``): ``events/msg = 1 + D``,
   ``txn/msg = 3 + 2D + 2D``, sink no-loss ``S == A * D``, A4b ``free = A*(D − D) = 0``. **Fail-loud, never
-  clamp:** ``2 <= D < dests`` (``D == 1`` is plain ``partitioned``; ``D >= dests`` fans to all lanes -> use ``broadcast``). **⚠️ SIZE ``dests`` so the outbound
+  clamp:** ``2 <= D < dests`` (``D == 1`` is plain ``partitioned``; ``D >= dests`` fans to all lanes -> use ``broadcast``). **WARNING: SIZE ``dests`` so the outbound
   lane cycle does NOT re-cap ingress below the engine ceiling:** each message occupies D of the ``dests``
   strict-FIFO lanes, so the lane-limited ingress ceiling ``≈ dests / (D * cycle)`` (vs ``dests / cycle`` at
   D=1). Size **``dests >= D * G``** (``G = shards * lanes_per_shard``, the inbound band count) so the

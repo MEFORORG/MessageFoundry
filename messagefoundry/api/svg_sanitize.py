@@ -32,9 +32,9 @@ from xml.etree.ElementTree import (  # nosec B405 -- types only; every parse goe
 )
 from xml.sax.saxutils import escape  # nosec B406 -- output escaping only; nothing is parsed with it
 
-from defusedxml.common import DefusedXmlException
-from defusedxml.ElementTree import DefusedXMLParser
-from defusedxml.ElementTree import fromstring as _xml_fromstring
+from messagefoundry._vendor.defusedxml.common import DefusedXmlException
+from messagefoundry._vendor.defusedxml.ElementTree import DefusedXMLParser
+from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 
 __all__ = ["SvgRejected", "may_be_svg", "sanitize_if_svg", "sanitize_svg"]
 

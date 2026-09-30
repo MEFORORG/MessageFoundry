@@ -97,7 +97,7 @@ def is_external(url: str, organization_domains: list[str] | tuple[str, ...]) -> 
 def is_allowlisted(url: str, allowlist: list[str] | tuple[str, ...]) -> bool:
     """Has the operator explicitly exempted this destination from the interstitial?
 
-    ⚠️ This is the **audited escape**, and it lowers security by design: an allowlisted destination
+    WARNING: This is the **audited escape**, and it lowers security by design: an allowlisted destination
     is navigated to with no notification and no cancel, which is precisely what ASVS 3.7.3 asks for.
     It exists because operators have legitimate high-traffic internal destinations on domains they
     do not want to declare wholesale. The serve gate warns when it is non-empty.

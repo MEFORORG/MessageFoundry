@@ -93,7 +93,7 @@ _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
 # _ADVISORY_SECURITY_JOBS: these jobs MUST NOT carry continue-on-error. A job that can never report on
 # a PR cannot be required, but that is a reason to keep it out of branch protection -- not a reason to
 # discard its findings.
-_ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
+_ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit", "cla-action-audit"})
 
 # SUPERSEDED: hard-failing, reporting on EVERY pull request, and deliberately NOT required -- because a
 # required COMPOSITE now runs the same scan. Added 2026-09-16, when the owner removed these seven

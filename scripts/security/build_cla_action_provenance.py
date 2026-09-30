@@ -10,6 +10,11 @@ extension and the container image. None of them reach a compiled bundle sitting 
 So the bundle's only recorded provenance was a checksum in a ledger entry that lives in a separate
 repository, and nothing in this tree could be pointed at a tool.
 
+That paragraph describes the tree before this record existed. Since 2026-09-29 one gate does read the
+lockfile: ``audit_cla_action_lockfile.py`` beside this script, run daily by ``security.yml``'s
+``cla-action-audit`` job, reports any advisory not already in its baseline. This script still only
+detects change.
+
 WHAT IT DOES NOT DO, AND THIS IS THE LOAD-BEARING SENTENCE. A clean audit of
 ``upstream-package-lock.json`` proves the DECLARED dependencies of the pinned upstream commit are
 clean. It does not prove this bundle was BUILT from them: reproducing an ncc/webpack build needs a

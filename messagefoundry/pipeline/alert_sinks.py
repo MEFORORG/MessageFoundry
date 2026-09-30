@@ -728,9 +728,6 @@ class AlertRuleSet:
         # event time (or, with invert, only outside its windows). No schedule = always applies.
         if rule.schedule is not None and not rule.schedule.is_active(now_dt):
             return False
-        # #81: content-label filter — route a content_match event by its (non-PHI operator) label.
-        if rule.content_label is not None and str(event.get("label", "")) != rule.content_label:
-            return False
         # Depth applies only to queue_buildup (you can't be "over depth" on a stopped connection); the
         # age threshold applies to BOTH age-carrying events — queue_buildup and message_stall (#50) —
         # since both fire on the same oldest-undelivered age (delivered_age). A rule setting a threshold
@@ -862,19 +859,6 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "stopped": stopped,
             }
         )
-
-    def content_match(self, connection: str, *, label: str, rule_id: str | None = None) -> None:
-        # #81 (ADR 0133): a code-first Handler ("Action Point") inspected a message and decided to alert.
-        # PHI-FREE BY CONTRACT: there is NO value parameter — the event carries ONLY the connection, an
-        # operator `label` (e.g. "STAT order"), and an optional operator rule id — NEVER the matched field
-        # value. Rides the SAME (type, connection) throttle + ADR 0044 dedup as every other event, so a
-        # transform RE-RUN's re-emit folds into the one instance (idempotent) and is throttled to one
-        # notification per cooldown — the purity / at-least-once reconciliation (ADR 0133 D3). A rule can
-        # route it by `label` via AlertRule.content_label.
-        event: dict[str, Any] = {"type": "content_match", "connection": connection, "label": label}
-        if rule_id is not None:
-            event["rule_id"] = rule_id  # non-PHI operator id (payload key; not the matched value)
-        self._emit(event)
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         # The DB path stands in for "connection" so the realert throttle + subject keying work
@@ -1351,10 +1335,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             self._occurrences.pop(f"{inverse_of}:{connection}", None)
             coro = store.resolve_alert_instances_for(event_type=inverse_of, connection=connection)
         else:
-            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason);
-            # a content_match event carries only its non-PHI operator `label` (#81, ADR 0133) — NEVER the
-            # matched field value — so fall back to it so the instance shows what the content alert is about.
-            raw_reason = event.get("detail") or event.get("reason") or event.get("label")
+            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
+            raw_reason = event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
             coro = store.upsert_alert_instance(
                 event_type=etype,

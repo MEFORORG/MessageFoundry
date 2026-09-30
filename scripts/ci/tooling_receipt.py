@@ -34,9 +34,10 @@ from pathlib import Path
 # defusedxml, not xml.etree: stdlib ElementTree resolves external entities, so parsing an untrusted
 # document is an XXE read primitive. This report is produced by our own pytest run on our own runner,
 # so the practical exposure is nil -- but "the input happens to be trustworthy today" is exactly the
-# premise that rots, and the repo already ships defusedxml as a core dependency. Bandit blocks the
-# stdlib call (B405/B314) and it is right to; the fix is the safe parser, not a nosec.
-from defusedxml import ElementTree as ET
+# premise that rots. The engine carries its own vendored copy of defusedxml, and the `tooling` job
+# installs the engine before it runs this, so that copy is the one used. Bandit blocks the stdlib call
+# (B405/B314) and it is right to; the fix is the safe parser, not a nosec.
+from messagefoundry._vendor.defusedxml import ElementTree as ET
 
 
 def count(report: Path) -> tuple[int, int]:
