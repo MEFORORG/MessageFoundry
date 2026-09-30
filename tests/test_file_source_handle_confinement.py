@@ -305,3 +305,21 @@ def test_the_read_is_cut_off_at_the_cap_even_when_the_handle_under_reports_its_s
         file_mod._read_confined(drop, inbox, inbox.resolve(), 100)
     monkeypatch.undo()
     assert file_mod._read_confined(drop, inbox, inbox.resolve(), 4096) == b"X" * 4096
+
+
+def test_a_small_drop_does_not_reserve_the_whole_cap(tmp_path: Path) -> None:
+    """A buffered ``read(n)`` allocates ``n`` up front, so the read asks for the handle's size first.
+
+    Mutation: read ``cap + 1`` at once. Red: about 16 MiB is traced for a 60-byte file."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    drop = inbox / "drop.hl7"
+    drop.write_bytes(_DROP)
+    tracemalloc.start()
+    try:
+        raw = file_mod._read_confined(drop, inbox, inbox.resolve(), 16 << 20)
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert raw == _DROP
+    assert peak < 1 << 20, f"the read reserved the cap (traced peak {peak} bytes)"

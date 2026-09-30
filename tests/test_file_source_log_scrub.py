@@ -149,7 +149,8 @@ def test_a_failed_archive_claim_on_a_bumped_name_logs_no_partner_name(
     monkeypatch.setattr(file_mod, "_claim_unique", claim_fails)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
-        assert FileSource._move(dropped, tmp_path / "processed") is False
+        source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))
+        assert source._move(dropped, tmp_path / "processed") is False
 
     lines = [r.getMessage() for r in caplog.records if "could not move" in r.getMessage()]
     assert lines and "Permission denied" in lines[0], lines

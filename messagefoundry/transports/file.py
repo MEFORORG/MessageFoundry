@@ -775,27 +775,24 @@ class FileSource(SourceConnector):
             try:
                 raw, read_sig = await self._run_fs(self._read_settled, path)
             except _Unconfined:
-                # BACKLOG #2507: the name was swapped for a link, or for something that is not a
-                # regular file, after it was listed. Nothing was read; it is left in place, never
-                # moved (a move would follow the link), and not charged, like the other stay arms.
+                # BACKLOG #2507: left in place, unread and unmoved, and not charged (a stay arm).
                 self._log_unconfined(path)
                 continue
             except _OverCap as exc:
                 # Transport-level reject *before* any message is emitted — parallels MLLP dropping an
                 # over-cap frame. It never became a "received message", so (like MLLP) there's no
                 # store disposition to record; preserve the file in .error for the operator, log it,
-                # and record a connection event as MLLP does (#1621). Charged on the handle, so a
-                # file that grew after its stat is caught with at most cap + 1 bytes read (#2507).
+                # and record a connection event as MLLP does (#1621). Charged on the handle (#2507).
                 logger.warning(
                     "file %s exceeds max_file_bytes (%s); routing to error dir",
                     safe_name(path.name),
                     self.max_file_bytes,
                 )
-                archived = await self._run_fs(self._confined_move, path, self.error_dir)
+                archived = await self._run_fs(self._move, path, self.error_dir)
                 if archived:  # a failed move is logged by _move; nothing to record
                     await self._emit_event(
                         "file_oversize",
-                        reason=f"{exc.detail} exceeds max_file_bytes {self.max_file_bytes}",
+                        reason=f"{exc} exceeds max_file_bytes {self.max_file_bytes}",
                     )
                 disposed += 1
                 continue
@@ -836,7 +833,7 @@ class FileSource(SourceConnector):
                         safe_name(path.name),
                         safe_exc(exc, file_name=path.name),
                     )
-                    archived = await self._run_fs(self._confined_move, path, self.error_dir)
+                    archived = await self._run_fs(self._move, path, self.error_dir)
                     if archived:  # a failed move is logged by _move; nothing to record
                         await self._emit_event(
                             "file_decompress_failed", reason=safe_exc(exc, file_name=path.name)
@@ -861,7 +858,7 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     declared,
                 )
-                archived = await self._run_fs(self._confined_move, path, self.error_dir)
+                archived = await self._run_fs(self._move, path, self.error_dir)
                 if archived:  # a failed move is logged by _move; nothing to record
                     await self._emit_event(
                         "file_content_mismatch",
@@ -883,7 +880,7 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
-                archived = await self._run_fs(self._confined_move, path, self.error_dir)
+                archived = await self._run_fs(self._move, path, self.error_dir)
                 if archived:  # a failed move is logged by _move; nothing to record
                     await self._emit_event(
                         "file_scan_rejected", reason=safe_exc(exc, file_name=path.name)
@@ -1287,10 +1284,9 @@ class FileSource(SourceConnector):
         """Read ``path``, then stat it, in one hop off the event loop (BACKLOG #116).
 
         The caller compares that stat and the bytes read with the stat it took before the read, so a
-        file a partner is still writing in place is caught before it is emitted. The read is the
-        module function :func:`_read_confined` (BACKLOG #2507), which refuses a link or an escape from
-        the root with :class:`_Unconfined` and an over-cap file with :class:`_OverCap`. It stays a
-        module function on purpose: tests stand in for a locked or growing file by patching it."""
+        file a partner is still writing in place is caught before it is emitted. The read is
+        :func:`_read_confined` (BACKLOG #2507), a module function so tests can patch it to stand in
+        for a locked or growing file."""
         raw = _read_confined(path, self.directory, self._root_real, self.max_file_bytes)
         return raw, _file_sig(path)
 
@@ -1330,10 +1326,6 @@ class FileSource(SourceConnector):
             return False
         os.close(fd)
         return True
-
-    def _confined_move(self, path: Path, dest_dir: Path) -> bool:
-        """:meth:`_move`, for a file :meth:`_still_confined` has just re-checked (BACKLOG #2507)."""
-        return self._still_confined(path) and self._move(path, dest_dir)
 
     @staticmethod
     def _log_unreadable(path: Path, exc: OSError) -> None:
@@ -1376,9 +1368,9 @@ class FileSource(SourceConnector):
             # #142 process-in-place: never move or delete the source file — the durable dedup ledger
             # (recorded by _scan_once AFTER this returns) is what stops it being re-ingested next poll.
             return
-        if not self._still_confined(path):
-            return
         if self.after_read == "delete":
+            if not self._still_confined(path):
+                return
             try:
                 path.unlink()
             except OSError as exc:
@@ -1391,11 +1383,13 @@ class FileSource(SourceConnector):
         else:
             self._move(path, self.processed_dir)
 
-    @staticmethod
-    def _move(path: Path, dest_dir: Path) -> bool:
+    def _move(self, path: Path, dest_dir: Path) -> bool:
         """Archive ``path`` into ``dest_dir`` under a name claimed ATOMICALLY (BACKLOG #1046). Returns
         whether a copy now sits in ``dest_dir``. A quarantine is recorded only then (BACKLOG #1621): a
         file that could not be archived at all is logged here and examined again next scan.
+
+        Only a file :meth:`_still_confined` passes is moved (BACKLOG #2507), so every archive and
+        quarantine re-checks for a link swapped in since the read.
 
         This used to be ``path.replace(_unique(...))`` — a check-then-act pair, where ``_unique``
         asked ``exists()`` and ``replace`` then overwrote whatever was at the name it chose. Two
@@ -1410,6 +1404,8 @@ class FileSource(SourceConnector):
         the original would survive). If the unlink fails after the claim the file is archived AND
         left in place to be re-read — the same duplicate-read outcome the pre-existing failure arm
         already had, and logged the same way."""
+        if not self._still_confined(path):
+            return False
         try:
             _claim_unique(path, dest_dir / path.name)
         except OSError as exc:
@@ -1584,6 +1580,7 @@ def _link_free_name(source: Path, target: Path) -> Path | None:
     ``.error`` or ``.processed``."""
     for candidate in _free_names(target):
         try:
+            # Windows refuses the keyword even as True, so it is passed only where it is listed.
             if _LINK_TAKES_NOFOLLOW:
                 os.link(source, candidate, follow_symlinks=False)
             else:
@@ -1727,11 +1724,8 @@ class _Unconfined(OSError):
 
 
 class _OverCap(Exception):
-    """The file read from the handle is larger than ``max_file_bytes`` (BACKLOG #2507)."""
-
-    def __init__(self, detail: str) -> None:
-        super().__init__(detail)
-        self.detail = detail  # "<n> bytes" or "more than <cap> bytes": a size, never a name
+    """The file read from the handle is larger than ``max_file_bytes`` (BACKLOG #2507). Its message is
+    a size ("<n> bytes" or "more than <cap> bytes"), never a name."""
 
 
 _O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: without it the C runtime rewrites line endings
@@ -1741,10 +1735,9 @@ _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 #: POSIX opens a candidate one component at a time below the root, each relative to its parent's
 #: descriptor and none followed if it is a link. Windows has no ``dir_fd``; see :func:`_open_confined`.
 _WALK_BY_DIR_FD = os.open in os.supports_dir_fd and bool(_O_NOFOLLOW and _O_DIRECTORY)
-#: ``O_NOFOLLOW`` refuses a link with ELOOP (Linux, macOS) or EMLINK (FreeBSD). ``O_DIRECTORY`` with
-#: ``O_NOFOLLOW`` refuses a link to a directory with ENOTDIR on Linux.
-_LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
-_DIR_LINK_ERRNOS = _LINK_ERRNOS | {errno.ENOTDIR}
+#: ``O_NOFOLLOW`` refuses a link with ELOOP (Linux, macOS) or EMLINK (FreeBSD), and with
+#: ``O_DIRECTORY`` a link to a directory with ENOTDIR (Linux).
+_LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK, errno.ENOTDIR})
 #: POSIX ``os.link`` follows a link at its source unless told not to. Windows ``CreateHardLinkW`` links
 #: the link itself already, and Windows ``os.link`` does not list the flag.
 _LINK_TAKES_NOFOLLOW = os.link in os.supports_follow_symlinks
@@ -1754,21 +1747,17 @@ def _open_confined(path: Path, directory: Path, root_real: Path) -> tuple[int, o
     """Open ``path`` to read only if it is a regular file inside the watch root reached through no link
     (BACKLOG #2507). Returns the descriptor and its ``fstat``; the caller closes the descriptor.
 
-    ``_within_root`` screens a NAME when it is listed, and the read and the move come later, a whole
-    poll later under the settle gate. So whoever can write the drop directory could swap a checked name
-    for a link in between. This check is on what was OPENED, so a late swap is caught.
+    ``_within_root`` screens a NAME when it is listed; the read and the move come later. This check is
+    on what was OPENED, so a link swapped in between is caught.
 
-    **POSIX.** Each component below the root is opened relative to its parent's descriptor with
-    ``O_NOFOLLOW``, so no component can be a link however late it was swapped in, and nothing is
-    resolved by name after the check. The last is opened ``O_NONBLOCK``, so a FIFO swapped in opens at
-    once and then fails the regular-file check, rather than holding the poll thread.
+    **POSIX** opens each component below the root relative to its parent's descriptor with
+    ``O_NOFOLLOW``, so no component can be a link and nothing is resolved by name after the check. The
+    last is opened ``O_NONBLOCK``, so a FIFO swapped in fails the regular-file check instead of
+    blocking. **Windows** has no ``dir_fd``, so it opens by name and requires the handle's final path,
+    every link and junction resolved, to equal the root joined with the listed name.
 
-    **Windows.** ``os.open`` has no ``dir_fd`` there, so the file is opened by name and the handle's
-    final path, with every link and junction resolved, must equal the root joined with the listed name.
-
-    A link that stays inside the root is refused too: under ``O_NOFOLLOW`` it is a link, and on Windows
-    its final path is not the listed name. That keeps the two platforms alike. A hard link cannot be
-    told from the file it names, so it is outside what this check can see."""
+    Either way a link that stays inside the root is refused too. A hard link cannot be told from the
+    file it names, so it is outside what this check can see."""
     try:
         parts = path.relative_to(directory).parts
     except ValueError:
@@ -1785,8 +1774,10 @@ def _open_confined(path: Path, directory: Path, root_real: Path) -> tuple[int, o
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise _Unconfined("not a regular file")
-        if not _WALK_BY_DIR_FD and not _same_path(_final_path(fd), root_real.joinpath(*parts)):
-            raise _Unconfined("reached through a link or a junction")
+        if not _WALK_BY_DIR_FD:
+            expected = os.path.normcase(_plain(str(root_real.joinpath(*parts))))
+            if os.path.normcase(_plain(_final_path(fd))) != expected:
+                raise _Unconfined("reached through a link or a junction")
     except OSError:
         os.close(fd)
         raise
@@ -1799,20 +1790,20 @@ def _open_below(root: Path, parts: tuple[str, ...]) -> int:
     try:
         for part in parts[:-1]:
             parent = dir_fd
-            dir_fd = _open_no_link(part, os.O_RDONLY | _O_DIRECTORY, parent, _DIR_LINK_ERRNOS)
+            dir_fd = _open_no_link(part, os.O_RDONLY | _O_DIRECTORY, parent)
             os.close(parent)
-        return _open_no_link(parts[-1], os.O_RDONLY | _O_NONBLOCK, dir_fd, _LINK_ERRNOS)
+        return _open_no_link(parts[-1], os.O_RDONLY | _O_NONBLOCK, dir_fd)
     finally:
         os.close(dir_fd)
 
 
-def _open_no_link(name: str, flags: int, dir_fd: int, refused: frozenset[int]) -> int:
+def _open_no_link(name: str, flags: int, dir_fd: int) -> int:
     """``os.open`` relative to ``dir_fd`` with ``O_NOFOLLOW``. The error drops the component's name:
     under ``recursive`` it can be a partner-made subdirectory, which ``safe_exc`` cannot swap out."""
     try:
         return os.open(name, flags | _O_NOFOLLOW, dir_fd=dir_fd)
     except OSError as exc:
-        if exc.errno in refused:
+        if exc.errno in _LINK_ERRNOS:
             raise _Unconfined("a symbolic link") from None
         raise OSError(exc.errno, exc.strerror) from None
 
@@ -1823,16 +1814,15 @@ def _final_path(fd: int) -> str:
         raise _Unconfined("no final-path query on this platform")
     import msvcrt
 
-    query = _final_path_query()
     handle = msvcrt.get_osfhandle(fd)
     size = 512
     while True:
         buf = ctypes.create_unicode_buffer(size)
-        needed = query(handle, buf, size, 0)
+        needed = _final_path_query()(handle, buf, size, 0)
         if needed == 0:
             raise ctypes.WinError(ctypes.get_last_error())
         if needed < size:
-            return buf.value
+            return str(buf.value)
         size = needed  # too small: the return is the size needed, terminator included
 
 
@@ -1842,20 +1832,15 @@ def _final_path_query() -> Any:
         raise _Unconfined("no final-path query on this platform")
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    query = kernel32.GetFinalPathNameByHandleW
+    query = ctypes.WinDLL("kernel32", use_last_error=True).GetFinalPathNameByHandleW
     query.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
     query.restype = wintypes.DWORD
     return query
 
 
-def _same_path(final: str, expected: Path) -> bool:
-    return os.path.normcase(_plain(final)) == os.path.normcase(_plain(str(expected)))
-
-
 def _plain(path: str) -> str:
-    """Drop the ``\\\\?\\`` or ``\\\\?\\UNC\\`` prefix a final path carries, so it compares with a plain
-    one."""
+    """Drop the verbatim prefix a final path carries (``//?/`` or ``//?/UNC/``, with backslashes), so
+    it compares with a plain one."""
     if path.startswith("\\\\?\\UNC\\"):
         return "\\\\" + path[8:]
     if path.startswith("\\\\?\\"):
@@ -1868,14 +1853,20 @@ def _read_confined(path: Path, directory: Path, root_real: Path, cap: int | None
 
     The cap is charged on the handle, never on an earlier stat: the handle's size refuses an oversize
     file without reading it, and the bounded read refuses one that grew after that, or whose size
-    attribute lags what it serves. Either raises :class:`_OverCap`. ``cap`` None reads it whole."""
+    attribute lags what it serves. Either raises :class:`_OverCap`. ``cap`` None reads it whole.
+
+    The first read asks for the handle's size plus one, not ``cap + 1``: a buffered ``read(n)``
+    allocates ``n`` up front, so asking for the cap would reserve 16 MiB for every small drop."""
     fd, st = _open_confined(path, directory, root_real)
     with os.fdopen(fd, "rb") as handle:
         if cap is None:
             return handle.read()
         if st.st_size > cap:
             raise _OverCap(f"{st.st_size} bytes")
-        raw = handle.read(cap + 1)
+        want = st.st_size + 1
+        raw = handle.read(want)
+        if len(raw) == want and want <= cap:  # it grew past its own size: keep going, to the cap
+            raw += handle.read(cap + 1 - want)
     if len(raw) > cap:
         raise _OverCap(f"more than {cap} bytes")
     return raw
