@@ -452,11 +452,6 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
         )
 
 
-#: How many ``env()`` defaults :func:`_reject_envref_in_lists` follows down one chain. A legitimate
-#: chain is one or two links; the cap exists so a self-referential marker cannot spin the loader.
-_MAX_ENV_DEFAULT_DEPTH = 6
-
-
 def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     """Refuse an ``env()`` reference written as an ITEM of a list-valued setting (BACKLOG #1820).
 
@@ -475,23 +470,25 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
 
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
-    would otherwise arrive at the connector exactly as a list item written directly does. The same
-    holds for an ``env()`` used as another's default, so the chain is followed, in either spelling,
-    for at most :data:`_MAX_ENV_DEFAULT_DEPTH` links. A chain still going past that is refused, since
-    a code-first author can make a marker its own default and a chain not seen to its end cannot be
-    shown clean. A list that comes from the ENVIRONMENT exists only at resolve time and is not seen
-    here."""
+    would otherwise arrive at the connector exactly as a list item written directly does.
+
+    A default that is ITSELF a reference, in either spelling, is refused whole rather than followed.
+    :func:`resolve_env_settings` resolves one link only, so the inner reference is never resolved:
+    with the outer key unset the connector receives the inner reference object, whatever the
+    environment holds for its key, and at least ``proxy_no_proxy`` then reads as an empty list and
+    silently sends every host through the proxy. No chain of two links is usable, so there is no clean
+    chain to let through, and refusing at the first link needs no depth cap against a marker that is
+    its own default. ``connections.toml`` cannot reach this: its type check refuses a table where the
+    annotation wants an array. A list that comes from the ENVIRONMENT exists only at resolve time and
+    is not seen here."""
     offenders: list[str] = []
     for name, value in settings.items():
         label = name
-        depth = 0
-        while _is_nested_envref(value) and depth < _MAX_ENV_DEFAULT_DEPTH:
-            depth += 1
-            value = value.default if isinstance(value, EnvRef) else value.get("default")
-            label = f"{name} env() default" + (f" (nested {depth} deep)" if depth > 1 else "")
-        if _is_nested_envref(value):
-            offenders.append(f"{name} env() default (nested more than {depth} deep)")
-            continue
+        if isinstance(value, EnvRef):
+            label, value = f"{name} env() default", value.default
+            if _is_nested_envref(value):
+                offenders.append(label)
+                continue
         if isinstance(value, list | tuple | set | frozenset):
             offenders += [
                 f"{label} item {index}"
@@ -501,9 +498,9 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     if offenders:
         raise WiringError(
             f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
-            "not env-resolved, so it would reach the connector as its repr with any default= inside "
-            "it. Write the items as static values, or let one env() reference stand for the whole "
-            "setting."
+            "not env-resolved, so it would reach the connector unresolved, where a str() of it "
+            "carries any default= inside it. Write the items as static values, or let one env() "
+            "reference stand for the whole setting."
         )
 
 
