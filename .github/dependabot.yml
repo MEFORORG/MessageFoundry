@@ -256,5 +256,5 @@ updates:
   #
   # CORRECTED 2026-09-29: "MANUAL AND UNSCHEDULED" above is no longer true. `security.yml`'s
   # `cla-action-audit` job audits the lockfile on the daily cron and fails on any advisory not in
-  # `security/cla-action-advisories.toml` (BACKLOG #1578). It DETECTS; it does not remediate, so the
-  # reasons above for having no entry here still hold.
+  # `scripts/security/cla-action-advisories.toml` (BACKLOG #1578). It DETECTS; it does not
+  # remediate, so the reasons above for having no entry here still hold.

@@ -161,9 +161,10 @@ That gate detects **change**, not vulnerabilities. Advisories are a separate job
 `cla-action-audit` job audits the lockfile on the daily cron with `npm audit`, and a red scheduled
 run opens an issue through `nightly-notice.yml`. The tree does not audit clean and cannot be fixed
 here, so the job compares against a baseline of advisories already known,
-[`security/cla-action-advisories.toml`](../security/cla-action-advisories.toml), and fails on a new
-one. It also fails when a known one stops being reported, because an audit that no longer sees the
-known advisories has stopped looking. *This paragraph used to say nothing in CI scans this closure;
+[`scripts/security/cla-action-advisories.toml`](../scripts/security/cla-action-advisories.toml),
+and fails on a new one. It also fails when a known one stops being reported. Either the advisory
+was withdrawn, or the audit stopped seeing the package, and a person has to find out which. That
+check is what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
 that was true until BACKLOG #1578's audit job landed.* The baseline's first entries were recorded as
 found, not triaged for reachability. The exposure is bounded by where the bundle runs — CI only,
 never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no automated

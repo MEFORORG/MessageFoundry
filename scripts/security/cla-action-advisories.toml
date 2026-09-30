@@ -9,8 +9,8 @@
 # reviewed pull request, with a comment above the entry saying who triaged it and what they found.
 # The script prints what to check first.
 #
-# NO ENTRY HERE HAS BEEN TRIAGED YET. THE FIRST 35 WERE RECORDED AS FOUND. They are the whole result of the first
-# audit, run 2026-09-29 with npm 11.5.2. Nobody has yet judged whether each is reachable in the
+# NO ENTRY HERE HAS BEEN TRIAGED YET, SO NONE CARRIES THAT COMMENT. The first 35 are the whole
+# result of the first audit, run 2026-09-29 with npm 11.5.2, recorded as found. Nobody has yet judged whether each is reachable in the
 # bundle's runtime path, and listing them here is not that judgement. Some affect packages the
 # lockfile marks `dev` only (the @babel packages, for example). Others do not: lodash, lodash.set
 # and js-yaml are among the packages the lockfile does not mark `dev`.
@@ -161,8 +161,7 @@ package = "yaml"
 # THREE MORE, RECORDED 2026-09-30, and they are the gate's first live catch. The audit script's own
 # run while this baseline was being built reported them as NEW ADVISORY and exited 1, a day after the
 # first 35 were read. Recorded as found, NOT triaged, like the 35 above. brace-expansion 1.1.11 is
-# not marked `dev` in the lockfile. Delete these three entries if you would rather the job land red
-# and force the triage.
+# not marked `dev` in the lockfile.
 
 [[advisory]]
 id = "GHSA-6j4f-fj2g-mc7p"

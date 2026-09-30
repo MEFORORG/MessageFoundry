@@ -23,7 +23,8 @@ run's real output:
 1. **Coverage.** npm's dependency count equals the lockfile's entry count.
 2. **No new advisory.** Every reported advisory is in the baseline.
 3. **No stale entry.** Every baselined advisory is still reported. The bundle is KNOWN to carry
-   these, so an audit that stops reporting them has stopped looking, whatever its exit code says.
+   these, so an audit that stops reporting one has either stopped looking or met a withdrawn
+   advisory. Either way a person has to find out which.
 
 WHAT THIS PROVES, AND WHERE. Check 3 shows on each run that the audit sees the known-vulnerable
 packages in the bundle's closure. Check 2 turns any advisory it sees beyond the baseline into a red;
@@ -54,6 +55,7 @@ Stdlib only, like the provenance script beside it.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import shutil
@@ -75,15 +77,18 @@ LOCK_PATH = ".github/actions/cla-assistant-lite/upstream-package-lock.json"
 RECORD_PATH = ".github/actions/cla-assistant-lite/provenance.cdx.json"
 
 #: The acknowledged advisories. OUTSIDE the action directory on purpose: the provenance gate treats
-#: that directory as an allowlist and reports any file its record does not name.
-BASELINE_PATH = "security/cla-action-advisories.toml"
+#: that directory as an allowlist and reports any file its record does not name. Under ``scripts/``
+#: because ci.yml's tooling path filter matches it there, so a pull request that edits only the
+#: baseline still runs the tests that check it.
+BASELINE_PATH = "scripts/security/cla-action-advisories.toml"
 
 #: How many times to ask the registry before failing closed, as in the ``ide/`` npm-audit step.
 ATTEMPTS = 5
 
-#: Seconds one ``npm audit`` call may take. Five of these plus the 150 s of back-off must fit inside
-#: the job's ``timeout-minutes``, or the runner kills the job before it can print why it failed.
-NPM_TIMEOUT = 60
+#: Seconds one ``npm audit`` call may take. Every attempt at this plus the back-off, plus the job's
+#: setup steps, must fit inside the job's ``timeout-minutes``, or the runner kills the job before
+#: it can print why it failed. A healthy call takes a few seconds.
+NPM_TIMEOUT = 45
 
 #: A GitHub advisory id. npm names each advisory by a URL ending in one.
 _GHSA = re.compile(r"GHSA(?:-[23456789cfghjmpqrvwx]{4}){3}")
@@ -171,6 +176,8 @@ def load_baseline(path: Path) -> set[Finding]:
         raise ValueError(f"{path}: no [[advisory]] entries")
     baseline: set[Finding] = set()
     for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: advisory entry {index} is not an [[advisory]] table")
         ident, package = entry.get("id"), entry.get("package")
         if not (isinstance(ident, str) and ident and isinstance(package, str) and package):
             raise ValueError(f"{path}: advisory entry {index} needs a non-empty id and package")
@@ -182,18 +189,24 @@ def load_baseline(path: Path) -> set[Finding]:
     return baseline
 
 
+def audited_total(report: dict[str, Any]) -> object:
+    """How many dependencies npm says it audited."""
+    return report["metadata"]["dependencies"].get("total")
+
+
 def evaluate(
-    report: dict[str, Any],
+    audited: object,
     reported: dict[Finding, dict[str, str]],
     baseline: set[Finding],
     expected_entries: int,
 ) -> list[str]:
-    """Every reason this report fails the gate. An empty list is a pass.
+    """Every reason a report fails the gate. An empty list is a pass.
 
-    *reported* is ``findings(report)``, passed in so one run computes it once.
+    Takes the two things a report contributes, :func:`audited_total` and :func:`findings`, so a
+    run computes each once. Each problem starts with its kind -- COVERAGE, NEW ADVISORY or STALE BASELINE ENTRY -- and
+    :data:`_WHAT_TO_DO` keys its advice on that word.
     """
     problems: list[str] = []
-    audited = report["metadata"]["dependencies"].get("total")
     if audited != expected_entries:
         problems.append(
             f"COVERAGE: npm audited {audited} dependencies but the lockfile declares "
@@ -235,24 +248,34 @@ def run_npm_audit(
             if is_verdict(report):
                 print(f"advisory database answered (attempt {attempt})")
                 return report
-            print(f"attempt {attempt}: no verdict from the advisory database; retrying")
-            print(stderr[:400])
+            # npm writes its JSON error body to stdout and its log line to stderr. Print both, so a
+            # local failure (a rejected lockfile, a usage error) is not read as a registry outage.
+            print(f"attempt {attempt}: npm audit returned no verdict")
+            print(f"stdout: {stdout[:400]}")
+            print(f"stderr: {stderr[:400]}")
             if attempt < attempts:
                 sleep(attempt * 15)
     return None
 
 
 def npm_runner(workdir: Path) -> tuple[str, str]:
-    """Run ``npm audit`` for real. Exit status is ignored: :func:`is_verdict` decides."""
+    """Run ``npm audit`` for real. Exit status is ignored: :func:`is_verdict` decides.
+
+    A missing ``npm`` raises :class:`FileNotFoundError` rather than returning, because retrying
+    cannot fix it and five attempts would report it as the registry's fault.
+    """
     npm = shutil.which("npm")
     if npm is None:
-        return "", "npm is not on PATH"
+        raise FileNotFoundError("npm is not on PATH; this audit needs Node and npm")
     try:
         done = subprocess.run(  # nosec B603 - fixed argv, no shell
             [npm, "audit", "--package-lock-only", "--json"],
             cwd=workdir,
             capture_output=True,
-            text=True,
+            # npm writes UTF-8. Without this, Windows decodes with the locale code page and an
+            # advisory title outside it raises UnicodeDecodeError.
+            encoding="utf-8",
+            errors="replace",
             timeout=NPM_TIMEOUT,
             check=False,
         )
@@ -270,15 +293,25 @@ def _limitation(root: Path) -> str:
     raise ValueError(f"{RECORD_PATH} carries no limitation sentence")
 
 
-_WHAT_TO_DO = """\
+#: Advice per failure kind, keyed on the word each problem from :func:`evaluate` starts with.
+_WHAT_TO_DO = {
+    "NEW ADVISORY": f"""\
 What to do about a NEW ADVISORY. The tree cannot be fixed here: moving a pin means rebuilding the
 bundle, which needs a Node toolchain this repository does not carry.
 1. Triage it against where the bundle runs: .github/workflows/cla.yml, on pull_request_target and
    on a matching issue_comment, holding a repository token. A package the lockfile marks dev is
    upstream build toolchain rather than a declared runtime dependency.
-2. If it is reachable and serious, the remedy is replacing or re-vendoring the action, not this file.
-3. Otherwise acknowledge it: add an [[advisory]] entry to {baseline} in a reviewed pull request.
-   The entry is the record that somebody read it."""
+2. If it is reachable and serious, the remedy is replacing or re-vendoring the action.
+3. Otherwise acknowledge it: add an [[advisory]] entry to {BASELINE_PATH} in a reviewed pull
+   request, with a comment saying who triaged it and what they found.""",
+    "STALE BASELINE ENTRY": """\
+What to do about a STALE BASELINE ENTRY. Open the advisory's GitHub page. If it was withdrawn or its
+affected range no longer covers the locked version, remove the entry. If neither, the audit stopped
+seeing the package, and the audit is what needs fixing.""",
+    "COVERAGE": """\
+What to do about COVERAGE. The audit did not read the whole lockfile, so none of its other results
+mean anything yet. Check what npm printed, and whether a new npm counts dependencies differently.""",
+}
 
 
 def main(
@@ -286,7 +319,12 @@ def main(
     runner: Runner = npm_runner,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    # Advisory titles are arbitrary Unicode; a Windows console on a legacy code page would otherwise
+    # raise partway through the report.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(errors="replace")
+    summary = __doc__.splitlines()[0] if __doc__ else None
+    parser = argparse.ArgumentParser(description=summary)
     parser.add_argument("--report", type=Path, help="judge a saved `npm audit --json` report")
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="repository root")
     args = parser.parse_args(argv)
@@ -304,14 +342,19 @@ def main(
             print(f"::error::{args.report} is not an audit verdict")
             return 2
     else:
-        report = run_npm_audit(lock_bytes, manifest_for(lock), runner, sleep=sleep)
+        try:
+            report = run_npm_audit(lock_bytes, manifest_for(lock), runner, sleep=sleep)
+        except FileNotFoundError as missing:
+            print(f"::error::{missing}. Failing closed: this is not evidence of a clean tree.")
+            return 2
         if not is_verdict(report):
-            print(f"::error::No verdict from the npm advisory database after {ATTEMPTS} attempts.")
+            print(f"::error::npm audit returned no verdict after {ATTEMPTS} attempts. Read the")
+            print("::error::output above: a registry outage and a local npm error look alike here.")
             print("::error::Failing closed: this is not evidence of a clean tree.")
             return 2
 
     reported = findings(report)
-    problems = evaluate(report, reported, baseline, expected)
+    problems = evaluate(audited_total(report), reported, baseline, expected)
     print(
         f"{LOCK_PATH}: {expected} lockfile entries, {len(reported)} advisories reported, "
         f"{len(baseline)} acknowledged in {BASELINE_PATH}."
@@ -320,7 +363,9 @@ def main(
     if problems:
         for problem in problems:
             print(f"::error::{problem}")
-        print(_WHAT_TO_DO.format(baseline=BASELINE_PATH))
+        for kind, advice in _WHAT_TO_DO.items():
+            if any(problem.startswith(kind) for problem in problems):
+                print(advice)
         return 1
     print("PASS: coverage matched, every acknowledged advisory was seen, and no new one appeared.")
     return 0

@@ -92,7 +92,9 @@ _LODASH = ("GHSA-r5fr-rjxr-66jc", "lodash")
 
 
 def _evaluate(report: dict[str, Any], baseline: set[tuple[str, str]]) -> list[str]:
-    problems: list[str] = gate.evaluate(report, gate.findings(report), baseline, _EXPECTED)
+    problems: list[str] = gate.evaluate(
+        gate.audited_total(report), gate.findings(report), baseline, _EXPECTED
+    )
     return problems
 
 
@@ -236,12 +238,41 @@ def test_the_audit_retries_and_then_fails_closed() -> None:
     assert sleeps == [15, 30, 45, 60]
 
 
+#: What checkout, setup-python and setup-node may take before the script starts. An allowance, not
+#: a measurement: generous, so the test holds a real margin rather than the ladder alone.
+_SETUP_ALLOWANCE_S = 180
+
+
 def test_the_worst_case_retry_ladder_fits_inside_the_job_timeout() -> None:
     """If the runner kills the job first, the fail-closed message never prints."""
     job_seconds = int(jobs_of("security.yml")["cla-action-audit"]["timeout-minutes"]) * 60
     back_off = sum(attempt * 15 for attempt in range(1, gate.ATTEMPTS))
 
-    assert gate.ATTEMPTS * gate.NPM_TIMEOUT + back_off < job_seconds
+    assert _SETUP_ALLOWANCE_S + gate.ATTEMPTS * gate.NPM_TIMEOUT + back_off < job_seconds
+
+
+def test_a_missing_npm_fails_closed_at_once(root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Retrying cannot fix a missing npm, so it is not retried or blamed on the registry."""
+    seen: list[Path] = []
+
+    def runner(workdir: Path) -> tuple[str, str]:
+        seen.append(workdir)
+        raise FileNotFoundError("npm is not on PATH")
+
+    assert gate.main(["--root", str(root)], runner=runner, sleep=lambda _s: None) == 2
+    assert len(seen) == 1
+    assert "npm is not on PATH" in capsys.readouterr().out
+
+
+def test_a_non_verdict_prints_what_npm_wrote_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    """npm's JSON error body is on stdout; dropping it hides a local failure behind 'registry'."""
+    _, runner = _replay(_TRANSPORT_ERROR)
+
+    gate.run_npm_audit(
+        _LOCK_BYTES, gate.manifest_for(_LOCK), runner, attempts=1, sleep=lambda _s: None
+    )
+
+    assert "ECONNREFUSED" in capsys.readouterr().out
 
 
 def test_a_retry_that_gets_a_verdict_returns_it() -> None:
@@ -314,8 +345,32 @@ def test_main_prints_the_record_limitation(root: Path, capsys: pytest.CaptureFix
 # --- The committed baseline --------------------------------------------------------------------
 
 
-def test_the_committed_baseline_loads() -> None:
-    assert gate.load_baseline(REPO_ROOT / gate.BASELINE_PATH)
+def test_every_committed_entry_names_a_package_in_the_lockfile() -> None:
+    """The committed baseline is checked here, not only a fixture-built one.
+
+    A misspelt package would sit in the baseline acknowledging nothing and red only on the next
+    scheduled run, as a paired STALE and NEW. The fixture is an older reading than the baseline,
+    so this checks the committed file against the lockfile instead of against the fixture.
+    """
+    locked = {key.rsplit("node_modules/", 1)[-1] for key in _LOCK["packages"] if key}
+    baseline = gate.load_baseline(REPO_ROOT / gate.BASELINE_PATH)
+
+    assert baseline
+    assert {package for _, package in baseline} <= locked
+
+
+def test_the_advice_matches_the_kind_of_failure(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A STALE red must not be told to add an entry, which is the NEW remedy."""
+    (root / gate.BASELINE_PATH).write_text(
+        _as_toml(_FOUND | {("GHSA-2222-3333-4444", "lodash")}), encoding="utf-8"
+    )
+
+    assert gate.main(["--root", str(root), "--report", str(_FIXTURE)]) == 1
+    out = capsys.readouterr().out
+    assert "What to do about a STALE BASELINE ENTRY" in out
+    assert "What to do about a NEW ADVISORY" not in out
 
 
 @pytest.mark.parametrize(
@@ -329,6 +384,7 @@ def test_the_committed_baseline_loads() -> None:
             "listed twice",
         ),
         ("", "no [[advisory]] entries"),
+        ('advisory = ["GHSA-2222-3333-4444"]\n', "is not an [[advisory]] table"),
     ],
 )
 def test_a_malformed_baseline_raises(tmp_path: Path, body: str, message: str) -> None:

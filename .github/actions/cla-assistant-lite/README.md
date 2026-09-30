@@ -39,7 +39,7 @@ A clean audit of `upstream-package-lock.json` proves the **declared** dependenci
 
 ### Auditing the declared closure
 
-CI does this daily. `security.yml`'s `cla-action-audit` job runs `scripts/security/audit_cla_action_lockfile.py`, which audits the lockfile with `npm audit` and fails on any advisory not already listed in `security/cla-action-advisories.toml`. The tree does not audit clean, and nothing here can fix it, so that baseline is what lets a new advisory stand out. Adding an entry to it is the acknowledgement, in a reviewed pull request. The script's docstring says what else it checks, including the false-clean result it guards against. Run it by hand with `python scripts/security/audit_cla_action_lockfile.py` (it needs `npm`).
+CI does this daily. `security.yml`'s `cla-action-audit` job runs `scripts/security/audit_cla_action_lockfile.py`, which audits the lockfile with `npm audit` and fails on any advisory not already listed in `scripts/security/cla-action-advisories.toml`. The tree does not audit clean, and nothing here can fix it, so that baseline is what lets a new advisory stand out. Adding an entry to it is the acknowledgement, in a reviewed pull request. The script's docstring says what else it checks, including the false-clean result it guards against. Run it by hand with `python scripts/security/audit_cla_action_lockfile.py` (it needs `npm`).
 
 An auditor with their own tools can point them at the same closure:
 
