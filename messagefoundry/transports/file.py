@@ -804,6 +804,7 @@ class FileSource(SourceConnector):
             except OSError as exc:
                 self._log_unreadable(path, exc)
                 continue
+            self._refused.discard(str(path))  # read cleanly, so a later refusal warns again
             if before != read_sig or len(raw) != read_sig[0]:
                 # BACKLOG #116: a partner is still writing this file in place. Emitting what was read
                 # would pass a cut-off message as a complete one, so leave it for the next scan. Not
@@ -1756,7 +1757,12 @@ _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 #: POSIX opens a candidate one component at a time below the root, each relative to its parent's
 #: descriptor and none followed if it is a link. Windows has no ``dir_fd``; see :func:`_open_confined`.
-_WALK_BY_DIR_FD = os.open in os.supports_dir_fd and bool(_O_NOFOLLOW and _O_DIRECTORY)
+#: The move and delete act relative to the checked parent too, so every call they make must take it.
+_WALK_BY_DIR_FD = (
+    bool(_O_NOFOLLOW and _O_DIRECTORY)
+    and {os.open, os.stat, os.link, os.unlink} <= os.supports_dir_fd
+    and {os.stat, os.link} <= os.supports_follow_symlinks
+)
 #: ``O_NOFOLLOW`` refuses a link with ELOOP (Linux, macOS) or EMLINK (FreeBSD), and with
 #: ``O_DIRECTORY`` a link to a directory with ENOTDIR (Linux).
 _LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK, errno.ENOTDIR})
