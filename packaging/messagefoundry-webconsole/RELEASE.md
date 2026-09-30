@@ -53,14 +53,16 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       unclaimed; re-adding it is the point of this step, and step 3 re-locks to confirm the cycle
       resolves under both `uv lock` and plain `pip`.
 
-## 2. Set the package's engine dependency range
+## 2. Set the package's engine dependency floor
 
-- [ ] In [`pyproject.toml`](pyproject.toml), change `dependencies = ["messagefoundry"]` to the floor
-      `["messagefoundry>=X"]` from step 0. Add no upper bound and no environment marker.
+- [ ] In [`pyproject.toml`](pyproject.toml), set the engine dependency to the floor
+      `["messagefoundry>=X"]` from step 0, in the release commit. Engine X must already be on PyPI.
+      Add no upper bound and no environment marker.
 
       Do not skip this step. The `release-webconsole` job reads the built wheel and refuses it unless
-      its `messagefoundry` requirement has a lower bound and no marker, so a skipped step fails the
-      release rather than shipping a bare dependency.
+      its `messagefoundry` requirement has a lower bound and no marker, so a first release that skips
+      it fails rather than shipping a bare dependency. The job cannot tell a current floor from one
+      left by an earlier release, so after the first floored release, raising X is on you.
 
 ## 3. Re-lock and audit (now resolvable)
 
@@ -95,8 +97,8 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 ## 6. Tag + publish (the button)
 
-- [ ] Tag the release using the console's own scheme (independent cadence — e.g. a
-      `webconsole-vA.B.C` tag, or lockstep with the engine tag initially; document the choice).
+- [ ] Tag the release `webconsole-vA.B.C`, the console's own scheme (independent cadence). The
+      `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job.
 
 ## 7. Post-publish verification

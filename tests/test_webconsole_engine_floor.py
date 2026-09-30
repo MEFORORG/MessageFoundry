@@ -9,9 +9,10 @@ one ships a bare ``messagefoundry`` dependency. ``release-webconsole`` has a ste
 BUILT wheel's ``Requires-Dist`` and refuses that wheel.
 
 The step only runs on a ``webconsole-v*`` ref, so nothing else would notice if it stopped firing.
-This file extracts its ``PYFLOOR`` script and RUNS it over synthetic wheels. Each refusal also has
-a mutation arm: the guarding line is disabled and the same input must then pass, so a green here
-means that line is what refused, not some earlier crash.
+This file extracts its ``PYFLOOR`` script and RUNS it over synthetic wheels. Each refusal of a
+requirement also has a mutation arm: the guarding line is disabled and the same input must then
+pass, so a green here means that line is what refused, not some earlier crash. The wheel-shape
+refusals (wheel count, METADATA) are pinned by their messages instead.
 """
 
 from __future__ import annotations
@@ -107,6 +108,10 @@ _ACCEPTED = {
     "floor_and_ceiling": ["messagefoundry>=0.4.1,<0.5"],
     "compatible_release": ["messagefoundry~=0.4.1"],
     "floor_beside_the_dev_extra": ["messagefoundry>=0.4.1", _ENGINE_DEV_EXTRA],
+    "floor_beside_a_platform_gated_extra": [
+        "messagefoundry>=0.4.1",
+        'messagefoundry[dev]; sys_platform == "win32" and extra == "dev"',
+    ],
     "spelled_in_capitals": ["MessageFoundry>=0.4.1"],
 }
 
@@ -115,6 +120,11 @@ _REFUSED = {
     "bare_beside_the_dev_extra": (["messagefoundry", _ENGINE_DEV_EXTRA], "no lower bound"),
     "ceiling_only": (["messagefoundry<0.5"], "no lower bound"),
     "marker": (['messagefoundry>=0.4.1; sys_platform == "linux"'], "environment marker"),
+    # Names an extra, yet applies to every install, so it is not an optional-dependency entry.
+    "marker_naming_an_extra_that_applies_anyway": (
+        ["messagefoundry>=0.4.1", 'messagefoundry<0.1; extra == "x" or python_version >= "3"'],
+        "environment marker",
+    ),
     "wrong_name": (["messagefoundry-core>=0.4.1"], "no unconditional"),
     "dev_extra_only": ([_ENGINE_DEV_EXTRA], "no unconditional"),
     "no_requirements": ([], "no unconditional"),
@@ -146,6 +156,30 @@ def test_two_wheels_are_refused(tmp_path: Path) -> None:
     assert "exactly one console wheel" in r.stderr
 
 
+@pytest.mark.parametrize(
+    "members",
+    [[], ["nested/messagefoundry_webconsole-9.9.9.dist-info/METADATA"]],
+    ids=["no_metadata", "only_nested_metadata"],
+)
+def test_a_wheel_without_one_top_level_metadata_is_refused(
+    tmp_path: Path, members: list[str]
+) -> None:
+    path = tmp_path / "messagefoundry_webconsole-9.9.9-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("messagefoundry_webconsole/__init__.py", "")
+        for member in members:
+            zf.writestr(member, "Metadata-Version: 2.4\nRequires-Dist: messagefoundry>=0.4.1\n")
+    r = _run(_script(), path)
+    assert r.returncode != 0
+    assert "top-level METADATA" in r.stderr, r.stderr
+
+
+def test_an_unparseable_requirement_is_refused_by_name(tmp_path: Path) -> None:
+    r = _run(_script(), _wheel(tmp_path, ["messagefoundry>=>0.4.1"]))
+    assert r.returncode != 0
+    assert "unparseable Requires-Dist" in r.stderr, r.stderr
+
+
 # --- mutation arms: disable one guard, and the input it refused must now pass ------------------------
 
 
@@ -161,6 +195,7 @@ _MUTATIONS = {
     "marker": ("req.marker is not None", "marker"),
     "floor": ("not any(spec.operator in FLOOR_OPERATORS for spec in req.specifier)", "bare"),
     "name": ("canonicalize_name(req.name) != ENGINE", "wrong_name"),
+    "none_left": ("not engine_reqs", "wrong_name"),
 }
 
 
@@ -179,8 +214,6 @@ def test_the_extra_skip_is_what_lets_the_dev_extra_ride_beside_the_floor(tmp_pat
     requirement and every real console wheel is refused."""
     wheel = _wheel(tmp_path, _ACCEPTED["floor_beside_the_dev_extra"])
     assert _run(_script(), wheel).returncode == 0
-    mutated = _run(
-        _disable(_script(), 'req.marker is not None and "extra" in str(req.marker)'), wheel
-    )
+    mutated = _run(_disable(_script(), "extra_only"), wheel)
     assert mutated.returncode != 0
     assert "environment marker" in mutated.stderr

@@ -38,8 +38,8 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   engine's `__version__`), the console has its **own** `__version__`, tag, changelog, and PyPI cadence.
   It depends on the engine through a PEP 508 **floor with no ceiling** (`messagefoundry>=X`), not
   lockstep; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
-  floor is set at each console release, not on `main`:** the package on `main` declares a bare
-  `messagefoundry` dependency. Step 2 of
+  floor is raised at each console release, not as the engine moves.** No console release has set
+  one yet, so the package still declares a bare `messagefoundry` dependency. Step 2 of
   [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) sets it, and the
   `release-webconsole` job refuses a console wheel whose engine requirement has no lower bound.
 - **Mounted same-origin, in-process.** `create_app` grafts the console onto its FastAPI app with a single
@@ -76,10 +76,13 @@ that engine.
 4. The startup handshake, `assert_engine_seam`, already guards the upper side exactly
    ([section 2](#2-the-seam)).
 
-**The floor is set at release time because it cannot be right on `main`.** `main`'s engine still
-reports its last released version while it already carries a newer seam. A correct floor names an
-engine release that does not exist yet, so it would not resolve against `main`'s editable engine,
-and the CI jobs that install the console editable would break.
+**The floor is raised at the console release, not ahead of it.** `main`'s engine still reports its
+last released version while it already carries a newer seam. A floor naming the next engine would
+not resolve against `main`'s editable engine until that engine is published, and the CI jobs that
+install the console editable would break. So engine X ships first, and the console release commit
+raises the floor to X. Between releases the floor on `main` lags the engine; that is harmless,
+because only the released wheel's value matters. The release gate checks that a floor exists, not
+that its value is current, so choosing X stays a release step.
 
 ### Before it imports the console, `serve` checks whose package it is
 

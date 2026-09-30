@@ -920,19 +920,21 @@ jobs:
 
       # BACKLOG #1585. The console's engine requirement is a FLOOR with NO CEILING, set at each console
       # release (packaging/messagefoundry-webconsole/RELEASE.md step 2). docs/WEBCONSOLE-PACKAGE.md,
-      # "The engine requirement is a floor with no ceiling", says why. The floor cannot live on main: main's engine
-      # still reports its last released version while it already carries a newer seam, so a floor there
-      # would break the CI jobs that install the console editable. That leaves a release step a person
-      # can skip, and a skipped one ships a bare `messagefoundry` dependency, which lets pip keep an
-      # older engine that lacks the functions the console calls. This step refuses that wheel.
+      # "The engine requirement is a floor with no ceiling", says why. The floor cannot be raised on
+      # main ahead of the release: main's engine still reports its last released version while it
+      # already carries a newer seam, so a floor naming the next engine would not resolve against the
+      # editable engine the CI jobs install. That leaves a release step a person can skip, and a skipped
+      # one ships a bare `messagefoundry` dependency, which lets pip keep an older engine that lacks the
+      # functions the console calls. This step refuses that wheel.
       #
       # It reads the BUILT wheel's METADATA, not pyproject.toml, so it measures the artifact the steps
       # below publish. An upper bound is allowed and never required: the runtime seam handshake
-      # (assert_engine_seam) is the guard on that side. No `if:`, so a workflow_dispatch dry run on a
-      # release branch fails here too, before a tag does.
+      # (assert_engine_seam) is the guard on that side. It checks that a floor EXISTS, not that its
+      # value is right: a stale floor left from an earlier release passes. The value is step 2's job.
+      # No `if:` of its own, so a workflow_dispatch dry run on a `webconsole-*` ref fails here too.
       #
       # tests/test_webconsole_engine_floor.py extracts the PYFLOOR script and runs it over synthetic
-      # wheels, with mutation arms showing each refusal is the line that fires.
+      # wheels, with mutation arms showing each requirement refusal is the line that fires.
       - name: Engine floor gate — the console wheel must require messagefoundry with a lower bound
         run: |
           # Reuses the smoke venv above, which holds `packaging` at the constraints.lock pin, so this
@@ -970,8 +972,16 @@ jobs:
               if canonicalize_name(req.name) != ENGINE:
                   continue
               # An optional-dependency entry, such as `messagefoundry[dev]; extra == "dev"`, is not
-              # installed with the console, so it is not the engine requirement.
-              if req.marker is not None and "extra" in str(req.marker):
+              # installed with the console, so it is not the engine requirement. Skipped only when the
+              # marker names an extra AND is false with no extra requested: `extra == "x" or
+              # python_version >= "3"` names one and still applies to every install, so it stays and
+              # is refused. A marker naming no extra always stays, whatever platform runs this.
+              extra_only = (
+                  req.marker is not None
+                  and "extra" in str(req.marker)
+                  and not req.marker.evaluate({"extra": ""})
+              )
+              if extra_only:
                   continue
               engine_reqs.append(req)
 
