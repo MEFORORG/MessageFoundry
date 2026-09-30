@@ -355,6 +355,17 @@ command and says to run it as `messagefoundry-toolkit <command>`, from the separ
 `--json`, or when the command is `lens`, whose children take JSON mode from `set_defaults` and have
 no flag.
 
+> **Corrected at build, slice 2 (2026-09-30).** The sentence above over-reads `lens`. Only
+> `lens rewrite` takes JSON mode from `set_defaults`; `lens schema` prints JSON with or without its
+> `--json` flag; `lens parse` has the flag and reports an error as text without it. So the built rule
+> is `--json`, `lens rewrite` or `lens schema`, in `messagefoundry.cli_common.argv_wants_json`, which
+> both commands' pre-parse refusals use. And "the first argument that is not an option" yields to a
+> top-level `--help` or `--version` that comes first, because argparse answers those before it reads
+> a subcommand; both top-level parsers set `allow_abbrev=False` so those are the only spellings. A
+> pre-parse JSON refusal of `lens rewrite` still carries no `"code"` key, which BACKLOG #237 promises
+> on every `lens rewrite` refusal; no path reaches it until slice 4 moves `lens`, and that slice owns
+> it.
+
 The check keys on "not registered here", not on the tier alone. So while a slice has moved some
 toolkit rows and not others, the engine still runs the rows it still carries. The top-level `--help`
 gains one epilog line naming the toolkit commands and the distribution. The line names them; it
@@ -807,5 +818,19 @@ INSTALL-GUIDE text written in slice 4 should say so.
       2, and the brief said 3.
 - [x] The owner accepts the release-order trade in section 1: the toolkit uploads before the engine.
       Resolved 2026-09-29 by the owner's acceptance.
-- [ ] The build confirms the helper module's name (`cli_common.py` is a placeholder), and reads
-      Warehouse's pending-publisher behaviour before relying on it.
+- [x] The build confirms the helper module's name (`cli_common.py` is a placeholder), and reads
+      Warehouse's pending-publisher behaviour before relying on it. Resolved by slices 1 and 2. Slice
+      1 kept the name `messagefoundry/cli_common.py`. Slice 2 read two sources on 2026-09-30:
+      - **Warehouse.** docs.pypi.org, *Creating a PyPI project with a Trusted Publisher*: a pending
+        publisher *"does not create a project or reserve a project's name until it is actually used
+        to publish"*, and another user registering the name first invalidates it. Warehouse's
+        `warehouse/oidc/views.py` on `main`, `mint_token`: it looks for a matching PENDING publisher
+        first, and when one matches it creates the project and reifies the publisher at the token
+        exchange, before any upload. So the second review's reading holds: any token exchange from
+        `release.yml` whose claims match the pending publisher claims the name, which is the safe
+        direction. Read through a fetch that summarised the code, not line by line; the design
+        still relies only on the upload.
+      - **hatchling 1.32.4**, `builders/wheel.py` from the build cache: `force_include_editable` is
+        a build-data key defaulting to empty (`get_default_build_data`), which only a hook can set,
+        and both editable paths, `build_editable_detection` and `build_editable_explicit` (the
+        `dev-mode-dirs` one), add the force-included files. The second review's reading holds.

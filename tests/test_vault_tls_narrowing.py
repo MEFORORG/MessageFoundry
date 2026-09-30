@@ -432,9 +432,9 @@ def test_a_tls12_peer_negotiates_an_approved_tls12_suite(
 def test_the_hop_trusts_only_the_operator_ca_after_a_handshake(
     pki: _Pki, vault: _TlsVault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """urllib3 loads requests' ``verify`` path onto the supplied context. It must not load the OS
-    store as well, which it does on a context it builds itself; that would widen a hop the operator
-    anchored to one CA."""
+    """urllib3 loads requests' ``verify`` path onto the supplied Vault-leg context. It must not load
+    the OS store as well, which it does on a context it builds itself; that would widen a hop the
+    operator anchored to one CA."""
     monkeypatch.setenv(_CA_ENV, str(pki.ca))
     client = _kv_client(vault.url)
     factory = client.adapter.session.get_adapter(vault.url)._ssl_context_factory
@@ -742,7 +742,7 @@ def test_an_https_proxy_with_the_wrong_host_name_is_refused(
 def test_an_https_proxy_the_anchor_did_not_issue_is_refused(
     pki: _Pki, vault: _TlsVault, proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The proxy leg verifies against the same anchor as the Vault leg, as urllib3 always did."""
+    """The proxy leg verifies against the same anchor as the Vault leg."""
     import requests
 
     monkeypatch.setenv(_CA_ENV, str(pki.other_ca))

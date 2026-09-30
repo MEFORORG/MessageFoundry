@@ -365,11 +365,30 @@ class DeadLetterRow(PhiGatedModel):
     summary: str | None = None  # PHI-bearing (MRN/name); display is audited
 
 
+class DeadLetterTarget(BaseModel):
+    """One ``(inbound, outbound)`` pair a dead-letter replay would re-queue rows for."""
+
+    channel_id: str
+    destination_name: str
+
+
 class DeadLetterList(BaseModel):
+    """One page of dead deliveries, plus the two facts a bulk-replay control needs that no page of
+    rows can supply (BACKLOG #1743 step 2). This docstring is the one statement of what they mean.
+
+    ``replay_targets`` is every distinct pair a replay would re-queue rows for, over the WHOLE
+    filtered set inside the caller's channel scope, not over ``dead_letters``. So a channel whose
+    dead rows sit past this page still appears, and a row whose body retention erased does not.
+    ``replayable_in_scope`` says whether any such pair exists across the caller's whole scope with
+    the ``channel_id`` and ``destination_name`` filters dropped. Both are REQUIRED, so a second
+    construction site cannot omit them and silently render no controls."""
+
     total: int
     limit: int
     offset: int
     dead_letters: list[DeadLetterRow]
+    replay_targets: list[DeadLetterTarget]
+    replayable_in_scope: bool
 
 
 class ConnectionEventInfo(PhiGatedModel):

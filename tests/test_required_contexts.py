@@ -89,6 +89,10 @@ _MUST_NOT_BE_REQUIRED = (
     "Scorecard analysis",
     "kubeconform + HA policy lint",
     "freethread smoke (3.14t)",
+    # The Python 3.15 readiness canary. Advisory and allowed to go red; it has no merge_group
+    # trigger and runs on a pull request only when its own file changes.
+    "python 3.15 canary (ubuntu-latest)",
+    "python 3.15 canary (windows-latest)",
     "complexity triage (advisory)",
     "clone detection (advisory)",
     "diff-coverage (advisory)",

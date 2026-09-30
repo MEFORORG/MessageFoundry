@@ -54,8 +54,13 @@ _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 # /ui), so a test importing it is an engine test by subject. Keep the `_webconsole` arm explicit
 # rather than widening to `messagefoundry\w*`: the point is to name what counts as the product, and a
 # wildcard would silently absorb any future `messagefoundry_`-prefixed helper that is not.
+#
+# `_toolkit` is named for the same reason (ADR 0201). The toolkit distribution receives code that
+# moves out of messagefoundry/, so a test that imports only the toolkit is still an engine test by
+# subject. Without the arm it would be pushed into the path-gated tooling job, and stop running on
+# the pull requests that change the toolkit.
 _ENGINE_IMPORT = re.compile(
-    r"^\s*(from|import)\s+(messagefoundry(?:_webconsole)?|harness|tee)\b", re.M
+    r"^\s*(from|import)\s+(messagefoundry(?:_webconsole|_toolkit)?|harness|tee)\b", re.M
 )
 
 # Tests that do NOT import the engine and nonetheless belong on the engine legs, because their
@@ -73,6 +78,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_adaptive_attributes_doc_drift.py",
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
+        # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
+        # ENGINE pull request -- that is where every entry is written -- and does not trip the tooling
+        # job's path gate, so listed as tooling this would face nothing on the change that breaks it.
+        # It loads scripts/release/changelog_fragments.py by path; that is the RULE, not its subject.
+        "test_changelog_fragments.py",
         # Reads messagefoundry_webconsole/static/app.js off disk. That is shipped product source by
         # this file's own stated rule -- the `_webconsole` arm of _ENGINE_IMPORT above exists to say
         # the console counts as the product -- so a test whose SUBJECT is that file is engine-subject

@@ -16,7 +16,6 @@ anyio==4.14.2
     # via
     #   httpx
     #   starlette
-    #   watchfiles
 argon2-cffi==25.1.0
     # via messagefoundry
 argon2-cffi-bindings==25.1.0
@@ -47,9 +46,7 @@ charset-normalizer==3.4.7
 click==8.5.0
     # via uvicorn
 colorama==0.4.6 ; sys_platform == 'win32'
-    # via
-    #   pytest
-    #   uvicorn
+    # via pytest
 cryptography==50.0.1
     # via
     #   messagefoundry
@@ -91,7 +88,7 @@ hl7apy==1.3.5
 httpcore==1.0.9
     # via httpx
 httptools==0.8.0
-    # via uvicorn
+    # via messagefoundry
 httpx==0.28.1
     # via messagefoundry
 hvac==2.4.0
@@ -220,12 +217,10 @@ pytest-xdist==3.8.0
     # via messagefoundry
 python-dateutil==2.9.0.post0
     # via fhirpathpy
-python-dotenv==1.2.2
-    # via uvicorn
 pyx12==4.0.0
     # via messagefoundry
 pyyaml==6.0.3
-    # via uvicorn
+    # via messagefoundry
 requests==2.34.2
     # via
     #   hvac
@@ -270,17 +265,15 @@ typing-inspection==0.4.2
     #   pydantic
 tzdata==2026.4
     # via messagefoundry
-urllib3==2.7.0
+urllib3==2.8.0
     # via requests
 uvicorn==0.49.0
     # via messagefoundry
 uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
-    # via uvicorn
-watchfiles==1.2.0
-    # via uvicorn
+    # via messagefoundry
 webauthn==3.0.0
     # via messagefoundry
 websockets==16.0
-    # via uvicorn
+    # via messagefoundry
 xmlschema==4.3.2
     # via messagefoundry

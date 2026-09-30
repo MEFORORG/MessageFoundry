@@ -921,6 +921,14 @@ No static-DH parameter files are used, and at-rest key material is a pre-shared 
 negotiated — so the only key exchange in the system is inside TLS, with the parameters above. Material
 once the API/MLLP binds off-loopback (when the engine terminates TLS).
 
+**Handshake signature schemes `[PARTIAL — the SHA-224 pin acts on Python 3.15 only]` (ASVS 11.4.1,
+BACKLOG #1171).** By owner ruling of 2026-09-29, every context the engine narrows drops the three
+SHA-224 signature schemes where the interpreter can: `narrow_signature_algorithms` in
+[config/tls_policy.py](../messagefoundry/config/tls_policy.py). On Python 3.14 it changes nothing,
+so those contexts still offer and accept SHA-224. On 3.15 they stop, unless the linked OpenSSL is
+older than 3.4. The LDAPS hop is not reached. That function's docstring is the one statement of
+what it does, what else it changes, and what it cannot reach.
+
 **Outbound destination allowlist `[BUILT]` (WP-11c).** The `[egress]` section
 ([CONFIGURATION.md](CONFIGURATION.md#egress)) is a **fail-closed** allowlist for where the engine
 sends: `allowed_mllp` (host / host:port) and `allowed_file_dirs` (directory prefixes). Enforced at

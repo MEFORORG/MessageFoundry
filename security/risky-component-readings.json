@@ -303,29 +303,6 @@
       }
     },
     {
-      "name": "colorama",
-      "pinned": "0.4.6",
-      "in_core": true,
-      "latest_version": "0.4.6",
-      "newest_upload": "2022-10-25",
-      "releases_in_maintenance_window": 0,
-      "development_status": [
-        "Development Status :: 5 - Production/Stable"
-      ],
-      "project_status": "active",
-      "pinned_yanked": false,
-      "requires_python_latest": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*,!=3.5.*,!=3.6.*,>=2.7",
-      "advisories": [],
-      "advisories_dropped": [],
-      "advisories_unresolved": [],
-      "advisories_affecting_pin": [],
-      "risky": {
-        "maintenance": true,
-        "support": false,
-        "advisory_history": false
-      }
-    },
-    {
       "name": "cryptography",
       "pinned": "50.0.1",
       "in_core": true,
@@ -761,29 +738,6 @@
       }
     },
     {
-      "name": "prometheus-client",
-      "pinned": "0.26.0",
-      "in_core": true,
-      "latest_version": "0.26.0",
-      "newest_upload": "2026-07-24",
-      "releases_in_maintenance_window": 8,
-      "development_status": [
-        "Development Status :: 4 - Beta"
-      ],
-      "project_status": "active",
-      "pinned_yanked": false,
-      "requires_python_latest": ">=3.9",
-      "advisories": [],
-      "advisories_dropped": [],
-      "advisories_unresolved": [],
-      "advisories_affecting_pin": [],
-      "risky": {
-        "maintenance": false,
-        "support": false,
-        "advisory_history": false
-      }
-    },
-    {
       "name": "psutil",
       "pinned": "7.2.2",
       "in_core": true,
@@ -986,84 +940,6 @@
       "pinned_yanked": false,
       "requires_python_latest": ">=3.9",
       "advisories": [],
-      "advisories_dropped": [],
-      "advisories_unresolved": [],
-      "advisories_affecting_pin": [],
-      "risky": {
-        "maintenance": false,
-        "support": false,
-        "advisory_history": false
-      }
-    },
-    {
-      "name": "python-dotenv",
-      "pinned": "1.2.2",
-      "in_core": true,
-      "latest_version": "1.2.3",
-      "newest_upload": "2026-08-16",
-      "releases_in_maintenance_window": 6,
-      "development_status": [
-        "Development Status :: 5 - Production/Stable"
-      ],
-      "project_status": "active",
-      "pinned_yanked": false,
-      "requires_python_latest": ">=3.10",
-      "advisories": [
-        {
-          "id": "GHSA-mf9w-mj56-hr94",
-          "severity": "MODERATE",
-          "rated_by": "github",
-          "published": "2026-04-20"
-        }
-      ],
-      "advisories_dropped": [],
-      "advisories_unresolved": [],
-      "advisories_affecting_pin": [],
-      "risky": {
-        "maintenance": false,
-        "support": false,
-        "advisory_history": false
-      }
-    },
-    {
-      "name": "pyyaml",
-      "pinned": "6.0.3",
-      "in_core": true,
-      "latest_version": "6.0.3",
-      "newest_upload": "2025-09-25",
-      "releases_in_maintenance_window": 1,
-      "development_status": [
-        "Development Status :: 5 - Production/Stable"
-      ],
-      "project_status": "active",
-      "pinned_yanked": false,
-      "requires_python_latest": ">=3.8",
-      "advisories": [
-        {
-          "id": "GHSA-3pqx-4fqf-j49f",
-          "severity": "CRITICAL",
-          "rated_by": "github",
-          "published": "2020-02-19"
-        },
-        {
-          "id": "GHSA-6757-jp84-gxfx",
-          "severity": "CRITICAL",
-          "rated_by": "github",
-          "published": "2020-03-24"
-        },
-        {
-          "id": "GHSA-8q59-q68h-6hv4",
-          "severity": "CRITICAL",
-          "rated_by": "github",
-          "published": "2021-02-09"
-        },
-        {
-          "id": "GHSA-rprw-h62v-c2w7",
-          "severity": "CRITICAL",
-          "rated_by": "github",
-          "published": "2018-06-27"
-        }
-      ],
       "advisories_dropped": [],
       "advisories_unresolved": [],
       "advisories_affecting_pin": [],
@@ -1342,29 +1218,6 @@
       "project_status": "active",
       "pinned_yanked": false,
       "requires_python_latest": ">=3.8.1",
-      "advisories": [],
-      "advisories_dropped": [],
-      "advisories_unresolved": [],
-      "advisories_affecting_pin": [],
-      "risky": {
-        "maintenance": false,
-        "support": false,
-        "advisory_history": false
-      }
-    },
-    {
-      "name": "watchfiles",
-      "pinned": "1.2.0",
-      "in_core": true,
-      "latest_version": "1.3.0",
-      "newest_upload": "2026-09-21",
-      "releases_in_maintenance_window": 10,
-      "development_status": [
-        "Development Status :: 5 - Production/Stable"
-      ],
-      "project_status": "active",
-      "pinned_yanked": false,
-      "requires_python_latest": ">=3.10",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],

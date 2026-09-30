@@ -145,6 +145,8 @@ def _query(name: str) -> ServiceState:
             [_system_exe("sc.exe"), "query", name],
             capture_output=True,
             text=True,
+            encoding="oem",  # sc.exe's piped output; see service.service_state for why "replace"
+            errors="replace",
             timeout=5,
             creationflags=_NO_WINDOW,
         )

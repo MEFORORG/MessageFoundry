@@ -300,8 +300,12 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     ),
     "AlertsConfig": "sink configuration; credentials never returned",
     "AttachmentInfo": "content_type/id/total_bytes — attachment metadata, never bytes",
-    "DeadLetterList": "envelope: limit/offset/total + DeadLetterRow rows (mapped)",
+    "DeadLetterList": (
+        "envelope: limit/offset/total + DeadLetterRow rows (mapped) + DeadLetterTarget replay "
+        "targets + the replayable_in_scope flag"
+    ),
     "DeadLetterReplayResult": "requeued count only",
+    "DeadLetterTarget": "channel_id/destination_name connection names only (BACKLOG #1743)",
     "EditResendResult": "ids + routing decision, no body",
     "MessageBody": (
         "raw IS PHI but rides GET /messages/{id}/raw's messages:view_raw whole-body gate (documented "
