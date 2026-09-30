@@ -38,9 +38,12 @@ DEFAULT_LIMIT = 120_000
 _TITLE_LINES = 4
 
 
-def footer(full_url: str, *, headlines: bool) -> str:
-    """The closing lines of a shrunk body. ASCII only, so its length is the same however counted."""
-    what = "each entry's title only" if headlines else "cut short"
+def footer(full_url: str, *, cut: bool) -> str:
+    """The closing lines of a shrunk body. ASCII only, so its length is the same however counted.
+
+    ``cut`` says the titles themselves were cut short, because even they did not fit.
+    """
+    what = "each entry's title only" + (", and not every title" if cut else "")
     return (
         "\n\n---\n\n"
         f"These notes show {what}, to fit GitHub's limit on a release body. "
@@ -49,9 +52,9 @@ def footer(full_url: str, *, headlines: bool) -> str:
 
 
 def headlines(text: str) -> str:
-    """Every heading line, and the title of every top-level ``- `` entry, with entry bodies dropped.
+    """Every heading, every top-level paragraph, and the title of every top-level ``- `` entry.
 
-    An entry that opens with ``- **`` keeps its bold title: followed onto later lines while the
+    A top-level paragraph is kept whole, since a version's preamble says what it pairs with. An entry that opens with ``- **`` keeps its bold title: followed onto later lines while the
     ``**`` is unclosed (up to :data:`_TITLE_LINES` lines), and cut just after it closes. Any other
     entry keeps its first line. Nested bullets and continuation lines are body, and are dropped.
     """
@@ -84,6 +87,12 @@ def headlines(text: str) -> str:
             out.extend(joined.split("\n"))
             i = j
             continue
+        elif line and not line[0].isspace():
+            # A top-level paragraph line. Open it with a blank line, or Markdown would read it as a
+            # continuation of the entry above.
+            if (i == 0 or not lines[i - 1].strip()) and out and out[-1] != "":
+                out.append("")
+            out.append(line)
         i += 1
     return "\n".join(out).strip() + "\n"
 
@@ -106,11 +115,15 @@ def bound(text: str, full_url: str, limit: int = DEFAULT_LIMIT) -> str:
     """
     if len(text) <= limit:
         return text
-    tail = footer(full_url, headlines=True)
+    short = headlines(text).rstrip()
+    whole = short + footer(full_url, cut=False)
+    if len(whole) <= limit:
+        return whole
+    tail = footer(full_url, cut=True)
     budget = limit - len(tail)
     if budget <= 0:
         raise ValueError(f"limit {limit} leaves no room for the {len(tail)}-character footer")
-    return _cut(headlines(text), budget) + tail
+    return _cut(short, budget) + tail
 
 
 def main(argv: Sequence[str] | None = None) -> int:

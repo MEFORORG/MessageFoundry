@@ -2886,7 +2886,7 @@ def test_a_release_body_within_the_bound_is_left_exactly_as_extracted(
 def test_headlines_that_still_do_not_fit_are_cut_at_a_line_end_on_or_under_the_limit() -> None:
     mod = _notes_module()
     url = "https://example.invalid/CHANGELOG.md"
-    tail = mod.footer(url, headlines=True)
+    tail = mod.footer(url, cut=True)
     text = "".join(f"- **line {i:05d}**\n" for i in range(2_000))
     assert mod.headlines(text) == text  # nothing to drop, so only a cut can shrink it
     for limit in (len(tail) + 1, 500, 5_000, len(text) - 1):
@@ -2914,3 +2914,27 @@ def test_headlines_keep_headings_and_titles_and_drop_bodies() -> None:
         "## [1.0.0]\n\n### Fixed\n\n- **Short.**\n- **Long title\n  over two lines.**\n"
         "- plain entry, first line kept\n- **Unclosed\n"
     )
+
+
+def test_headlines_keep_a_versions_preamble_paragraph() -> None:
+    """The console's preamble names the engine it pairs with; a shrunk page must keep it."""
+    mod = _notes_module()
+    text = (
+        "## [0.4.0]\n\n**Requires engine 0.5.0.** Seam `x`,\nsecond line.\n\n"
+        "### Added\n- **Entry.** Body.\n  more\n\nA closing paragraph.\n"
+    )
+    assert mod.headlines(text) == (
+        "## [0.4.0]\n\n**Requires engine 0.5.0.** Seam `x`,\nsecond line.\n\n"
+        "### Added\n\n- **Entry.**\n\nA closing paragraph.\n"
+    )
+
+
+def test_a_shrunk_body_that_fits_says_titles_only_and_one_that_is_cut_says_so() -> None:
+    mod = _notes_module()
+    url = "https://example.invalid/CHANGELOG.md"
+    text = "".join(f"- **T{i}.** " + "b" * 200 + "\n" for i in range(100))
+    fits = mod.bound(text, url, len(text) - 1)
+    assert fits.endswith(mod.footer(url, cut=False)), fits[-200:]
+    assert "- **T99.**" in fits
+    cut = mod.bound(text, url, 1_000)
+    assert len(cut) <= 1_000 and cut.endswith(mod.footer(url, cut=True)), cut[-200:]
