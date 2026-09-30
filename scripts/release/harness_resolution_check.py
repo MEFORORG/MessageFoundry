@@ -193,8 +193,11 @@ def probes(shipped: Version) -> dict[str, tuple[str, bool]]:
     version: older is below ``shipped``, newer is above it, and matched is ``shipped`` itself.
     """
     major, minor, micro = (list(shipped.release) + [0, 0])[:3]
+    # The epoch leads PEP 440 ordering, so the newer arm keeps it: `1!0.3.3`, not `0.3.3`, which
+    # sorts BELOW `1!0.3.2` and would let a floor pin pass the arm meant to refuse it.
+    epoch = f"{shipped.epoch}!" if shipped.epoch else ""
     arms = {
-        "newer": (f"{major}.{minor}.{micro + 1}", False),
+        "newer": (f"{epoch}{major}.{minor}.{micro + 1}", False),
         "matched": (str(shipped), True),
     }
     older = next((v for v in ("0.0.1", "0.0.0") if Version(v) < shipped), None)

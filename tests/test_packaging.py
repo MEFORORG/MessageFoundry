@@ -837,6 +837,8 @@ def test_the_install_resolution_check_resolves_a_hyphenated_pre_release(tmp_path
         ("0.0.0", {"newer": "0.0.1", "matched": "0.0.0"}),
         ("0.0.1", {"older": "0.0.0", "newer": "0.0.2", "matched": "0.0.1"}),
         ("0.3.2", {"older": "0.0.1", "newer": "0.3.3", "matched": "0.3.2"}),
+        # The epoch leads PEP 440 ordering; a newer arm without it would sort below the shipped one.
+        ("1!0.3.2", {"older": "0.0.1", "newer": "1!0.3.3", "matched": "1!0.3.2"}),
     ],
 )
 def test_the_install_resolution_arms_never_share_a_version(
@@ -853,6 +855,9 @@ def test_the_install_resolution_arms_never_share_a_version(
     assert {arm: version for arm, (version, _want) in probes.items()} == expected
     versions = [Version(version) for version, _want in probes.values()]
     assert len(set(versions)) == len(versions), probes
+    assert Version(probes["newer"][0]) > Version(shipped), probes
+    if "older" in probes:
+        assert Version(probes["older"][0]) < Version(shipped), probes
 
 
 def test_the_install_resolution_check_refuses_an_unknown_arm(tmp_path: Path) -> None:

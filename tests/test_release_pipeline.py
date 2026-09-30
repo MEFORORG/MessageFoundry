@@ -2386,6 +2386,12 @@ def _sbomqs_split_offences(job: dict) -> list[str]:
     name = install.get("name")
     body = _body(install)
     offences: list[str] = []
+    if "continue-on-error" in job:
+        offences.append(
+            f"the `release` job acquired job-level `continue-on-error` "
+            f"({job.get('continue-on-error')!r}). A pin failure would still stop this job, but no "
+            "longer the workflow, so a job that `needs: release` could still run (BACKLOG #1698)."
+        )
     if install_at == score_at:
         offences.append(
             "the sbomqs download and the score share one step again. Whatever `continue-on-error` "
@@ -2492,6 +2498,10 @@ def _set_job_shell(job: dict) -> None:
     job["defaults"] = {"run": {"shell": "bash {0}"}}
 
 
+def _set_job_continue_on_error(job: dict) -> None:
+    job["continue-on-error"] = True
+
+
 _SBOMQS_VERIFY = 'echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -'
 
 
@@ -2515,6 +2525,8 @@ _SBOMQS_VERIFY = 'echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -'
             _edit_install_body("tar -xzf", 'test -s "${asset}" || exit 1\ntar -xzf'),
             "carries a `||` fallback",
         ),
+        (_edit_install_body(_SBOMQS_VERIFY, "trap 'exit 0' EXIT\n" + _SBOMQS_VERIFY), "carry on"),
+        (_set_job_continue_on_error, "job-level `continue-on-error`"),
     ],
     ids=[
         "continue-on-error",
@@ -2528,6 +2540,8 @@ _SBOMQS_VERIFY = 'echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -'
         "set-plus-e",
         "as-a-condition",
         "any-or-fallback",
+        "exit-trap",
+        "job-continue-on-error",
     ],
 )
 def test_the_sbomqs_split_refuses_each_way_back_to_a_green_pin_failure(
