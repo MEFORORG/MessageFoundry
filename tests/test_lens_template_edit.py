@@ -39,6 +39,7 @@ from messagefoundry.lens import (
     MODE_TEMPLATED,
     LensRewriteError,
     _display_width,
+    _is_empty_fallback_read,
     _normalize_parts,
     _param_mode,
     _render_parts,
@@ -85,7 +86,9 @@ def test_a_parts_value_writes_a_bounded_interpolation_and_reads_back_as_parts() 
     src = _one_row('set_field(msg, "PID-5.1", "old")')
     parts = [{"text": "MRN: "}, {"path": "PID-3.1"}]
     out = _set(src, {"value": {"parts": parts}})
-    assert out.splitlines()[5] == '    set_field(msg, "PID-5.1", f"MRN: {msg[\'PID-3.1\']}")'
+    assert (
+        out.splitlines()[5] == "    set_field(msg, \"PID-5.1\", f\"MRN: {msg['PID-3.1'] or ''}\")"
+    )
     row = _row(out)
     assert row["param_modes"] == {"path": MODE_STATIC, "value": MODE_TEMPLATED}
     assert row["param_parts"] == {"value": parts}
@@ -93,12 +96,13 @@ def test_a_parts_value_writes_a_bounded_interpolation_and_reads_back_as_parts() 
 
 
 def test_a_path_pick_writes_the_templated_form_never_a_bare_read() -> None:
-    """Manager decision for BACKLOG #237: the picker ALWAYS writes ``f"{msg['X']}"``. A bare
-    ``msg["X"]`` is ``dynamic`` and would be read-only the moment it landed."""
+    """Owner ruling 2026-09-29 (ADR 0076 E.11, item 2): the picker ALWAYS writes a template,
+    ``f"{msg['X'] or ''}"``. A bare ``msg["X"]`` is ``dynamic`` and would be read-only the moment it
+    landed."""
     out = _set(
         _one_row('set_field(msg, "PID-5.1", "old")'), {"value": {"parts": [{"path": "PID-3"}]}}
     )
-    assert "f\"{msg['PID-3']}\"" in out.splitlines()[5]
+    assert "f\"{msg['PID-3'] or ''}\"" in out.splitlines()[5]
     assert _row(out)["param_modes"]["value"] == MODE_TEMPLATED
 
 
@@ -164,13 +168,89 @@ def test_template_params_leaves_out_a_multi_line_argument() -> None:
 
 
 def test_resubmitting_the_current_parts_changes_no_byte() -> None:
-    """An edit that changes nothing changes nothing: a ``msg.field("X")`` read, an ``F`` prefix or a
-    triple-quoted spelling is not respelled when the IDE sends the parts back unchanged."""
-    for arg in ("f\"{msg.field('PID-3')}\"", "F\"{msg['PID-3']}\"", "f'''{msg['PID-3']}'''"):
+    """An edit that changes nothing changes nothing: when every read is already in the E.11 form, an
+    ``F`` prefix or a triple-quoted spelling is not respelled by sending the parts back unchanged."""
+    for arg in (
+        "f\"{msg['PID-3'] or ''}\"",
+        "F\"{msg['PID-3'] or ''}\"",
+        "f'''{msg['PID-3'] or ''}'''",
+    ):
         src = _one_row(f'set_field(msg, "PID-5.1", {arg})')
         parts = _row(src)["param_parts"]["value"]
         assert parts == [{"path": "PID-3"}], arg
         assert _set(src, {"value": {"parts": parts}}) == src, arg
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        pytest.param("f\"{msg['PID-3']}\"", id="bare-read"),
+        pytest.param("f\"{msg.field('PID-3')}\"", id="field-call"),
+        pytest.param("f\"{msg['PID-3'] or ''}/{msg['PID-4']}\"", id="one-of-two-reads-bare"),
+    ],
+)
+def test_resubmitting_the_parts_of_an_older_read_applies_the_e11_fix(arg: str) -> None:
+    """An older read renders an absent field as ``None``, and its parts look identical to the fixed
+    form's. Sending them back is the only way the IDE can fix it, so that write is NOT a no-op."""
+    src = _one_row(f'set_field(msg, "PID-5.1", {arg})')
+    parts = _row(src)["param_parts"]["value"]
+    out = _set(src, {"value": {"parts": parts}})
+    assert out != src
+    written = _row(out)
+    assert written["param_parts"]["value"] == parts
+    node = ast.parse(out.splitlines()[5].strip()).body[0]
+    assert isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+    value = node.value.args[2]
+    assert isinstance(value, ast.JoinedStr)
+    reads = [v.value for v in value.values if isinstance(v, ast.FormattedValue)]
+    assert reads and all(_is_empty_fallback_read(r) for r in reads)
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        pytest.param("f\"{msg['PID-3'] or ''}\"", id="empty-fallback-the-renderer-writes"),
+        pytest.param("f\"{msg['PID-3']}\"", id="bare-read"),
+        pytest.param("f\"{msg.field('PID-3')}\"", id="field-call"),
+    ],
+)
+def test_every_admitted_read_spelling_reads_back_as_one_path_part(arg: str) -> None:
+    """ADR 0076 E.11 (owner ruling 2026-09-29). The renderer writes ``msg["X"] or ""`` so an absent
+    field is empty text rather than ``None``; that form, and the two older spellings a hand-written
+    template may carry, all read back as the same ``{"path": "X"}`` part."""
+    row = _row(_one_row(f'set_field(msg, "PID-5.1", {arg})'))
+    assert row["param_modes"]["value"] == MODE_TEMPLATED
+    assert row["param_parts"]["value"] == [{"path": "PID-3"}]
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        pytest.param("f\"{msg['PID-3'] or 'N/A'}\"", id="non-empty-fallback"),
+        pytest.param("f\"{msg['PID-3'] or y}\"", id="name-fallback"),
+        pytest.param("f\"{msg['PID-3'] or '' or ''}\"", id="chained-fallback"),
+        pytest.param("f\"{msg.field('PID-3') or ''}\"", id="field-call-fallback"),
+    ],
+)
+def test_a_fallback_wider_than_empty_text_is_dynamic_and_refused(arg: str) -> None:
+    """NEGATIVE CONTROL for E.11: only ``or ""`` on a subscript read is admitted. Any other fallback
+    is a second value source the parts form cannot express, so it stays dynamic and read-only."""
+    src = _one_row(f'set_field(msg, "PID-5.1", {arg})')
+    row = _row(src)
+    assert row["param_modes"]["value"] == MODE_DYNAMIC
+    assert "value" not in row["param_parts"] and "value" not in row["template_params"]
+    with pytest.raises(LensRewriteError, match="dynamic mode"):
+        _set(src, {"value": {"parts": [{"path": "PID-3"}]}})
+
+
+def test_a_template_edit_upgrades_an_older_bare_read_to_the_fallback_form() -> None:
+    """Changing any part re-renders the whole template, so a bare read beside the edit is rewritten
+    to ``or ""``: the fix E.11 was ruled for, applied the moment the author touches the template."""
+    src = _one_row("set_field(msg, \"PID-5.1\", f\"{msg['PID-3']}/{msg['PID-4']}\")")
+    parts = _row(src)["param_parts"]["value"]
+    parts[1] = {"text": " / "}
+    out = _set(src, {"value": {"parts": parts}})
+    assert "f\"{msg['PID-3'] or ''} / {msg['PID-4'] or ''}\"" in out.splitlines()[5]
 
 
 def test_a_literal_expr_is_written_in_its_canonical_spelling() -> None:
@@ -221,7 +301,7 @@ def test_contract_v1_emits_no_param_parts() -> None:
 
 def test_the_native_form_takes_a_template_too() -> None:
     out = _set(_one_row('msg.set("PID-8", "U")'), {"value": {"parts": [{"path": "PID-8"}]}})
-    assert out.splitlines()[5] == '    msg.set("PID-8", f"{msg[\'PID-8\']}")'
+    assert out.splitlines()[5] == "    msg.set(\"PID-8\", f\"{msg['PID-8'] or ''}\")"
     row = _row(out)
     assert (row["action"], row["param_modes"]["value"]) == ("set_field", MODE_TEMPLATED)
 
@@ -233,7 +313,7 @@ def test_the_two_bounded_modes_switch_in_both_directions() -> None:
     assert out.splitlines()[5] == '    set_field(msg, "PID-5.1", "LITERAL")'
     # templated -> templated, by new parts
     out = _set(templated, {"value": {"parts": [{"path": "PID-4"}, {"text": "!"}]}})
-    assert out.splitlines()[5] == '    set_field(msg, "PID-5.1", f"{msg[\'PID-4\']}!")'
+    assert out.splitlines()[5] == "    set_field(msg, \"PID-5.1\", f\"{msg['PID-4'] or ''}!\")"
     # an expr is still accepted when the ENGINE classifies it static
     out = _set(templated, {"value": {"expr": '"plain"'}})
     assert _row(out)["param_modes"]["value"] == MODE_STATIC
@@ -369,6 +449,7 @@ TEXT_ALPHABET = [
     "}",
     "{{x}}",
     "{msg['X']}",
+    "{msg['X'] or ''}",
     "\\",
     '"',
     "'",
@@ -421,6 +502,10 @@ def _round_trip(parts: list[dict[str, str]]) -> str | None:
     assert _param_mode(node) == MODE_TEMPLATED, (parts, rendered)
     assert _template_parts(node) == _normalize_parts(parts), (parts, rendered)
     assert "\n" not in rendered and "\r" not in rendered, "a template must stay on one line"
+    # E.11: every read the renderer writes carries the empty-text fallback, never a bare read.
+    assert isinstance(node, ast.JoinedStr)
+    reads = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
+    assert reads and all(_is_empty_fallback_read(r) for r in reads), rendered
     return rendered
 
 
@@ -662,3 +747,224 @@ def test_a_template_edit_changes_only_its_own_argument(
         edited = next(r for r in after_rows if r["line_start"] == line)
         assert edited["param_parts"][param] == _normalize_parts(parts)
     assert written > 20, f"only {written} of {len(sample)} sampled templates were written"
+
+
+# =============================================================================
+# Machine-readable refusal codes -- what the IDE branches on instead of message text
+# =============================================================================
+
+
+def test_the_refusal_code_strings_are_pinned() -> None:
+    """The IDE classifier keys on these exact strings (steps 2 and 3 of BACKLOG #237). Changing one
+    is a contract change, so it must fail a test rather than pass silently."""
+    assert lens.REFUSAL_DYNAMIC_MODE == "dynamic-mode"
+    assert lens.REFUSAL_TEMPLATE_SHAPE == "template-shape"
+    assert lens.REFUSAL_LITERAL_ONLY == "literal-only"
+    assert lens.REFUSAL_COLUMN_LIMIT == "column-limit"
+    assert lens.REFUSAL_GENERIC == "refused"
+
+
+_STATIC = 'set_field(msg, "PID-5.1", "old")'
+
+#: (row, params, expected code) -- at least one case per member of every coded family.
+CODED_REFUSALS = [
+    pytest.param(
+        'set_field(msg, "PID-5.1", msg["PID-3"])', {"value": "X"}, "dynamic-mode", id="dyn-arg"
+    ),
+    pytest.param(_STATIC, {"value": {"expr": 'msg["PID-3"]'}}, "dynamic-mode", id="dyn-expr"),
+    pytest.param(_STATIC, {"value": {"parts": "PID-3"}}, "template-shape", id="not-a-list"),
+    pytest.param(
+        _STATIC, {"value": {"parts": [{"path": "A", "text": "b"}]}}, "template-shape", id="two-keys"
+    ),
+    pytest.param(_STATIC, {"value": {"parts": [{"field": "A"}]}}, "template-shape", id="bad-key"),
+    pytest.param(_STATIC, {"value": {"parts": [{"text": "x"}]}}, "template-shape", id="no-path"),
+    pytest.param(_STATIC, {"value": {"parts": [{"path": ""}]}}, "template-shape", id="empty-path"),
+    pytest.param(_STATIC, {"value": {"parts": [{"path": "A'B"}]}}, "template-shape", id="bad-path"),
+    pytest.param(
+        _STATIC,
+        {"value": {"expr": "f\"{msg['PID-3'] or ''}\""}},
+        "template-shape",
+        id="template-as-expr",
+    ),
+    pytest.param(_STATIC, {"value": {"parts": [], "x": 1}}, "template-shape", id="bad-object"),
+    pytest.param(_STATIC, {"path": {"parts": [{"path": "A"}]}}, "literal-only", id="action-path"),
+    pytest.param(
+        'row = db_lookup("MPI", "select 1", {})',
+        {"statement": {"parts": [{"path": "A"}]}},
+        "literal-only",
+        id="lookup",
+    ),
+    pytest.param(
+        'log_note("n {}", "x")', {"template": {"parts": [{"path": "A"}]}}, "literal-only", id="log"
+    ),
+    pytest.param(
+        _STATIC,
+        {"value": {"parts": [{"text": "x" * 80}, {"path": "PID-3"}]}},
+        "column-limit",
+        id="column-limit",
+    ),
+    pytest.param(_STATIC, {"value": float("inf")}, "refused", id="generic-non-finite"),
+    pytest.param(_STATIC, {"nope": "x"}, "refused", id="generic-unknown-param"),
+    pytest.param(
+        _STATIC,
+        {"value": {"parts": [{"path": "A"}, {"text": "\ud800"}]}},
+        "template-shape",
+        id="unencodable-part",
+    ),
+    pytest.param(_STATIC, {"value": {"expr": 5}}, "template-shape", id="expr-not-a-string"),
+    pytest.param(_STATIC, {"value": "\ud800"}, "refused", id="generic-unencodable-literal"),
+]
+
+
+def test_a_multi_line_dynamic_argument_reports_dynamic_mode() -> None:
+    """The dynamic check runs before the multi-line check, so the code names the real reason."""
+    src = _one_row(
+        'set_field(\n        msg,\n        "PID-5.1",\n        msg[\n            "PID-3"\n        ],\n    )'
+    )
+    edit = {"line_start": 6, "line_end": 12, "op": "set_params", "params": {"value": "X"}}
+    with pytest.raises(LensRewriteError) as info:
+        rewrite_source(src, edit, contract=CONTRACT_V2)
+    assert info.value.code == "dynamic-mode", str(info.value)
+
+
+def test_a_failed_read_back_carries_the_template_shape_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lens, "_escape_template_text", lambda text, quote: text)
+    with pytest.raises(LensRewriteError) as info:
+        _render_parts([{"text": "{x}"}, {"path": "PID-3"}], "value")
+    assert info.value.code == "template-shape"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["lens", "rewrite", "-"], id="stdin-source-without-edit"),
+        pytest.param(["lens", "rewrite", "MODULE", "--edit", "{not json"], id="bad-json"),
+        pytest.param(["lens", "rewrite", "MODULE", "--edit", "[]"], id="not-an-object"),
+    ],
+)
+def test_the_early_cli_refusals_carry_the_generic_code(
+    argv: list[str], tmp_path: Path, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    """Refusals raised before the rewrite runs carry a code too, so a consumer branching on "code"
+    never meets a payload without one."""
+    import json
+
+    from messagefoundry.__main__ import main
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(_STATIC).encode("utf-8"))
+    rc = main([str(module) if a == "MODULE" else a for a in argv])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"
+
+
+def test_non_utf8_stdin_is_refused_with_a_code_and_no_source_echo(
+    monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    import io
+    import json
+
+    from messagefoundry.__main__ import main
+
+    class _Stdin:
+        buffer = io.BytesIO(b"x = 1\n# SECRETPAYLOAD \xff\n")
+
+    monkeypatch.setattr("sys.stdin", _Stdin())
+    rc = main(["lens", "rewrite", "-", "--edit", '{"line_start": 1, "line_end": 1}'])
+    out = capsysbinary.readouterr().out.decode("utf-8")
+    assert rc == 1
+    assert json.loads(out)["code"] == "refused"
+    assert "SECRETPAYLOAD" not in out
+
+
+def test_a_non_utf8_edit_spec_on_stdin_is_refused_with_a_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    """The other stdin direction: the module is a file and the edit spec arrives on stdin."""
+    import io
+    import json
+
+    from messagefoundry.__main__ import main
+
+    class _Stdin:
+        buffer = io.BytesIO(b'{"line_start": 6, "line_end": 6, "params": {"value": "\xff"}}')
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(_STATIC).encode("utf-8"))
+    monkeypatch.setattr("sys.stdin", _Stdin())
+    rc = main(["lens", "rewrite", str(module)])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"
+    assert payload["error"].startswith("<stdin>: cannot read")
+
+
+def test_an_exception_no_arm_names_still_carries_the_generic_code(
+    tmp_path: Path, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    """main()'s floor adds the generic code for `lens rewrite`, so even an unhashable ``op`` (a
+    TypeError the rewriter does not name) leaves the IDE a code to branch on."""
+    import json
+
+    from messagefoundry.__main__ import main
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(_STATIC).encode("utf-8"))
+    edit = {"op": ["set_params"], "line_start": 6, "line_end": 6, "params": {"value": "x"}}
+    rc = main(["lens", "rewrite", str(module), "--edit", json.dumps(edit)])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"
+
+
+@pytest.mark.parametrize(("line", "params", "code"), CODED_REFUSALS)
+def test_every_refusal_carries_its_family_code(
+    line: str, params: dict[str, Any], code: str
+) -> None:
+    with pytest.raises(LensRewriteError) as info:
+        _set(_one_row(line), params)
+    assert info.value.code == code, str(info.value)
+
+
+@pytest.mark.parametrize(("line", "params", "code"), CODED_REFUSALS)
+def test_lens_rewrite_emits_the_code_beside_the_error(
+    line: str,
+    params: dict[str, Any],
+    code: str,
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    """The CLI contract: ``{"error": <message>, "code": <slug>}`` on stdout and exit 1. ``error`` stays
+    exactly the exception's message, so a consumer reading only it sees no change."""
+    import json
+
+    from messagefoundry.__main__ import main
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(line).encode("utf-8"))
+    edit = {"line_start": 6, "line_end": 6, "op": "set_params", "params": params}
+    rc = main(["lens", "rewrite", str(module), "--edit", json.dumps(edit), "--contract", "2"])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert set(payload) == {"error", "code"}
+    assert payload["code"] == code
+    with pytest.raises(LensRewriteError) as info:
+        _set(_one_row(line), params)
+    assert payload["error"] == str(info.value)
+
+
+def test_an_unreadable_module_carries_the_generic_code(
+    tmp_path: Path, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    import json
+
+    from messagefoundry.__main__ import main
+
+    missing = tmp_path / "absent.py"
+    rc = main(["lens", "rewrite", str(missing), "--edit", '{"line_start": 1, "line_end": 1}'])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"

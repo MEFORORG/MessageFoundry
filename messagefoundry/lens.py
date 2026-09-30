@@ -118,7 +118,31 @@ class LensRewriteError(ValueError):
     outside the v1 param-edit scope. A subclass of :class:`ValueError`; the CLI turns it into a clean
     ``{"error": …}`` + non-zero exit, exactly like :class:`LensParseError`, so the caller never applies a
     partial or lossy rewrite. Byte-preservation is the contract: an editable row is regenerated **only**
-    within its own line range, every other byte untouched (gate 2)."""
+    within its own line range, every other byte untouched (gate 2).
+
+    ``code`` is a stable machine-readable slug for the refusal FAMILY, which ``lens rewrite`` emits
+    beside the message as ``{"error": ..., "code": ...}``. The IDE keys on it, so a message can be
+    reworded without breaking a consumer. The families with their own code are the ``REFUSAL_*``
+    constants below; any other refusal carries :data:`REFUSAL_GENERIC`. Changing a code's string is a
+    contract change for the IDE."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code if code is not None else REFUSAL_GENERIC
+
+
+#: A dynamic-mode argument: editing one (AC-M5), or an ``expr`` that would write one (E.6.4).
+REFUSAL_DYNAMIC_MODE = "dynamic-mode"
+#: A malformed value object on a moded argument: ``parts`` not a list, a part without exactly one
+#: key, no path part, an empty or unusable path, an unencodable character, a template sent as an
+#: ``expr``, or an object that is neither ``{"parts": [...]}`` nor ``{"expr": <string>}``.
+REFUSAL_TEMPLATE_SHAPE = "template-shape"
+#: A template sent to a param outside the row's ``template_params`` (a literal-only param).
+REFUSAL_LITERAL_ONLY = "literal-only"
+#: A template write that pushes a line past the column limit.
+REFUSAL_COLUMN_LIMIT = "column-limit"
+#: Every other ``lens rewrite`` refusal.
+REFUSAL_GENERIC = "refused"
 
 
 # --- vocabulary registries ---------------------------------------------------
@@ -1411,12 +1435,7 @@ def _is_bounded_message_read(node: ast.expr) -> bool:
     something it cannot round-trip, which is what E.6.3 exists to forbid.
     """
     if isinstance(node, ast.Subscript):
-        return (
-            isinstance(node.value, ast.Name)
-            and node.value.id == "msg"
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        )
+        return _is_msg_subscript(node)
     if isinstance(node, ast.Call):
         func = node.func
         if not isinstance(func, ast.Attribute) or func.attr != "field":
@@ -1429,11 +1448,44 @@ def _is_bounded_message_read(node: ast.expr) -> bool:
     return False
 
 
+def _is_msg_subscript(node: ast.expr) -> bool:
+    """Whether ``node`` is exactly ``msg["LIT"]``, a subscript read with one constant string path."""
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "msg"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    )
+
+
+def _is_empty_fallback_read(node: ast.expr) -> bool:
+    """Whether ``node`` is exactly ``msg["LIT"] or ""`` -- a subscript read that renders an absent field
+    as empty text.
+
+    ADMITTED BY THE 2026-09-29 AMENDMENT NOTE (ADR 0076 E.11), and nothing wider. A bare read renders an
+    absent field as the text ``None`` inside an f-string, because ``Message.field`` returns None; the
+    ``or ""`` fallback is the one ``copy_field`` already writes. The operand must be the empty string
+    and nothing else: ``or "N/A"`` or ``or other`` is a second value source the parts form cannot
+    express, so it stays ``dynamic``. Only the subscript spelling is admitted, because it is the one
+    the renderer writes."""
+    return (
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 2
+        and _is_msg_subscript(node.values[0])
+        and isinstance(node.values[1], ast.Constant)
+        and isinstance(node.values[1].value, str)
+        and node.values[1].value == ""
+    )
+
+
 def _is_bounded_interpolation(node: ast.expr) -> bool:
     """Whether ``node`` is the ONE interpolation shape ADR 0076 E.5 admits as writable.
 
-    An f-string whose every ``FormattedValue`` is a bounded ``Message`` read carrying **no format spec
-    and no conversion**, and whose every remaining part is a constant string.
+    An f-string whose every ``FormattedValue`` is a bounded ``Message`` read, or a subscript read with
+    an empty-string fallback (:func:`_is_empty_fallback_read`, E.11), carrying **no format spec and no
+    conversion**, and whose every remaining part is a constant string.
 
     A format spec or a conversion (``!r``/``!s``/``!a``) is excluded because each is a second rendering
     step the lens does not model: reading the emitted text back would not recover the same parts, and
@@ -1455,7 +1507,7 @@ def _is_bounded_interpolation(node: ast.expr) -> bool:
             # ``conversion`` is -1 when absent; 114/115/97 are !r/!s/!a.
             if part.conversion != -1 or part.format_spec is not None:
                 return False
-            if not _is_bounded_message_read(part.value):
+            if not (_is_bounded_message_read(part.value) or _is_empty_fallback_read(part.value)):
                 return False
             continue
         return False
@@ -1489,7 +1541,8 @@ def _param_mode(node: ast.expr) -> str:
 # never builds or re-classifies Python source, which is what keeps this from becoming the second
 # grammar E.5 refuses.
 
-#: The two part kinds. ``text`` is literal text; ``path`` is one bounded ``msg[...]`` read.
+#: The two part kinds. ``text`` is literal text; ``path`` is one bounded read, written as
+#: ``msg[...] or ""`` so an absent field is empty text (ADR 0076 E.11).
 PART_TEXT = "text"
 PART_PATH = "path"
 
@@ -1516,19 +1569,23 @@ def _template_ok(kind: str, action: str | None, pname: str) -> bool:
 
 
 def _read_path(node: ast.expr) -> str | None:
-    """The HL7 path a bounded read names, when the read is exactly a path read, else None.
+    """The path a bounded read names, when the read is exactly a path read, else None.
 
-    ``msg["X"]`` and ``msg.field("X")`` both name path ``X``: ``Message.__getitem__`` is
-    ``self.field(path)``, so the two spellings read the same value. A ``msg.field`` call with any other
-    argument list has no parts form. The renderer always writes the subscript spelling."""
+    ``msg["X"] or ""``, ``msg["X"]`` and ``msg.field("X")`` all name path ``X``. The renderer writes
+    the first (E.11), which renders an absent field as empty text. The other two are older spellings a
+    hand-written template may carry: ``Message.__getitem__`` is ``self.field(path)``, so they read the
+    same value, but an absent field renders as the text ``None``. Any template write, including one
+    that resends the same parts, rewrites them to the fallback form, which is the fix E.11 was ruled
+    for. Only a template whose reads are ALL already in the fallback form is left alone when its
+    parts are resent unchanged. A ``msg.field`` call with any other argument list has no parts form."""
+    if isinstance(node, ast.BoolOp) and _is_empty_fallback_read(node):
+        node = node.values[0]
     if (
         isinstance(node, ast.Subscript)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "msg"
+        and _is_msg_subscript(node)
         and isinstance(node.slice, ast.Constant)
-        and isinstance(node.slice.value, str)
     ):
-        return node.slice.value
+        return str(node.slice.value)
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1645,37 +1702,45 @@ def _check_parts_spec(parts: Any, pname: str) -> list[dict[str, str]]:
     a template with no read is plain text, which ``static`` mode writes as a literal, and an f-string with
     no placeholder is dead weight a linter flags."""
     if not isinstance(parts, list):
-        raise LensRewriteError(f"parameter {pname!r}: 'parts' must be a list of part objects")
+        raise LensRewriteError(
+            f"parameter {pname!r}: 'parts' must be a list of part objects",
+            code=REFUSAL_TEMPLATE_SHAPE,
+        )
     checked: list[dict[str, str]] = []
     for i, part in enumerate(parts):
         if not isinstance(part, dict) or len(part) != 1:
             raise LensRewriteError(
                 f"parameter {pname!r}: part {i} must be an object with exactly one key, "
-                f"{PART_TEXT!r} or {PART_PATH!r}"
+                f"{PART_TEXT!r} or {PART_PATH!r}",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         ((key, value),) = part.items()
         if key not in (PART_TEXT, PART_PATH) or not isinstance(value, str):
             raise LensRewriteError(
                 f"parameter {pname!r}: part {i} must be {{{PART_TEXT!r}: <string>}} or "
-                f"{{{PART_PATH!r}: <string>}}"
+                f"{{{PART_PATH!r}: <string>}}",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         if not _is_encodable(value):
             raise LensRewriteError(
-                f"parameter {pname!r}: part {i} carries a character that cannot be encoded as UTF-8"
+                f"parameter {pname!r}: part {i} carries a character that cannot be encoded as UTF-8",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         if key == PART_PATH and (
             not value or not value.isprintable() or any(c in _PATH_FORBIDDEN for c in value)
         ):
             raise LensRewriteError(
                 f"parameter {pname!r}: part {i} path {value!r} must be non-empty, with no quote, "
-                "backslash, brace or non-printable character"
+                "backslash, brace or non-printable character",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
         checked.append({key: value})
     normalized = _normalize_parts(checked)
     if not any(PART_PATH in part for part in normalized):
         raise LensRewriteError(
             f"parameter {pname!r}: a template needs at least one {PART_PATH!r} part - plain text is "
-            "static mode, so send it as a literal value instead"
+            "static mode, so send it as a literal value instead",
+            code=REFUSAL_TEMPLATE_SHAPE,
         )
     return normalized
 
@@ -1683,10 +1748,12 @@ def _check_parts_spec(parts: Any, pname: str) -> list[dict[str, str]]:
 def _render_parts(parts: Any, pname: str) -> str:
     """Render a templated edit's structured parts to f-string source, or refuse (ADR 0076 E.5, E.6.3).
 
-    The output is ``f"...{msg['PATH']}..."``: double quotes outside, the subscript read inside. When the
-    text carries more double quotes than single ones the two swap (``f'...{msg["PATH"]}...'``), which is
-    the choice ``ruff format`` makes, so the spliced line stays format-clean. Before it is returned, the
-    EXISTING classifier must call it ``templated`` and read back exactly the parts that were sent.
+    The output is ``f"...{msg['PATH'] or ''}..."``: double quotes outside, and inside the subscript read
+    with its empty-string fallback, so an absent field writes empty text rather than ``None`` (E.11).
+    When the text carries more double quotes than single ones the two swap
+    (``f'...{msg["PATH"] or ""}...'``), which is the choice ``ruff format`` makes, so the spliced line
+    stays format-clean. Before it is returned, the EXISTING classifier must call it ``templated`` and
+    read back exactly the parts that were sent.
     That is round-trip totality (E.6.3) checked on every write rather than trusted, so a renderer
     defect refuses an edit instead of splicing a shape the lens cannot read back."""
     normalized = _check_parts_spec(parts, pname)
@@ -1695,7 +1762,7 @@ def _render_parts(parts: Any, pname: str) -> str:
     body = "".join(
         _escape_template_text(part[PART_TEXT], outer)
         if PART_TEXT in part
-        else "{msg[" + inner + part[PART_PATH] + inner + "]}"
+        else "{msg[" + inner + part[PART_PATH] + inner + "] or " + inner * 2 + "}"
         for part in normalized
     )
     rendered = "f" + outer + body + outer
@@ -1706,7 +1773,8 @@ def _render_parts(parts: Any, pname: str) -> str:
     if node is None or _param_mode(node) != MODE_TEMPLATED or _template_parts(node) != normalized:
         raise LensRewriteError(
             f"parameter {pname!r}: the template did not render to a bounded interpolation that reads "
-            "back to the same parts - refused (no change made)"
+            "back to the same parts - refused (no change made)",
+            code=REFUSAL_TEMPLATE_SHAPE,
         )
     return rendered
 
@@ -2255,7 +2323,7 @@ def rewrite_source(
 
     * a JSON scalar, written as a Python **literal** (``static``);
     * ``{"parts": [{"text": "..."}, {"path": "PID-3.1"}, ...]}``, written as the bounded interpolation
-      ``f"...{msg['PID-3.1']}..."`` (``templated``). At least one ``path`` part is required, and only a
+      ``f"...{msg['PID-3.1'] or ''}..."`` (``templated``). At least one ``path`` part is required, and only a
       param ``lens parse`` lists in the row's ``template_params`` accepts it;
     * ``{"expr": "<python source>"}``, spliced verbatim only if it classifies ``static``. An ``expr``
       that is ``dynamic`` (a bare ``msg["X"]`` read included) is refused, and so is one that is
@@ -2525,7 +2593,10 @@ def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line
         if new > _MAX_LINE_LENGTH and new > old:
             raise LensRewriteError(
                 f"this edit would make line {i + 1} {new} columns wide, past the "
-                f"{_MAX_LINE_LENGTH}-column limit - shorten the template, or edit it as text"
+                f"{_MAX_LINE_LENGTH}-column limit - shorten the template's text, or edit it as text "
+                "(every field read is written with an empty-text fallback, so an older bare read "
+                "grows by 6 columns when the template is rewritten)",
+                code=REFUSAL_COLUMN_LIMIT,
             )
 
 
@@ -2850,6 +2921,9 @@ def _splice_slots(
     for pname, node in slots.items():
         if pname not in params:
             continue
+        if moded is not None:
+            # Before the multi-line check, so a dynamic argument always reports dynamic-mode.
+            _refuse_dynamic_argument(node, pname)
         _refuse_multiline_arg(node, pname)
         consumed.add(pname)
         rendered: str | None
@@ -2913,13 +2987,30 @@ def _render_new_value(value: Any, original_is_literal: bool, pname: str) -> str:
     return rendered
 
 
+def _refuse_dynamic_argument(node: ast.expr, pname: str) -> None:
+    """Refuse any edit of an argument whose mode is ``dynamic`` (AC-M5, E.6.4)."""
+    if _param_mode(node) == MODE_DYNAMIC:
+        raise LensRewriteError(
+            f"parameter {pname!r} is in dynamic mode (an expression the lens cannot write back "
+            "faithfully) - it is read-only here; edit it as text (ADR 0076 E.6.4)",
+            code=REFUSAL_DYNAMIC_MODE,
+        )
+
+
+def _all_reads_fallback(node: ast.expr) -> bool:
+    """Whether every read in the f-string ``node`` is already the E.11 ``msg["X"] or ""`` form."""
+    return isinstance(node, ast.JoinedStr) and all(
+        _is_empty_fallback_read(v.value) for v in node.values if isinstance(v, ast.FormattedValue)
+    )
+
+
 def _render_moded_value(
     value: Any, node: ast.expr, pname: str, kind: str, template_ok: bool
 ) -> str | None:
     """Render a ``set_params`` value for a moded argument (ADR 0076 Amendment E), or refuse.
 
-    Returns None when the value is the parts the argument already has, so the caller leaves its bytes
-    alone.
+    Returns None when the value is the parts the argument already has and every read is already in
+    the E.11 form, so the caller leaves its bytes alone.
 
     The CURRENT argument's mode decides what may happen to it:
 
@@ -2933,28 +3024,29 @@ def _render_moded_value(
     ``{"expr": <source>}`` is still accepted, but only when the expression is a literal. A ``dynamic``
     one would author the open-set shape E.7 keeps read-only; a bare ``msg["X"]`` read is ``dynamic``
     (only an f-string is ``templated``), so a path pick writes ``{"parts": [{"path": "X"}]}``, which
-    renders ``f"{msg['X']}"``. A ``templated`` one is refused too, so that every templated write goes
+    renders ``f"{msg['X'] or ''}"``. A ``templated`` one is refused too, so that every templated write goes
     through the parts renderer and its round-trip gate: E.5 admits ``msg.field`` reads that no parts
     list can express, and one of them, ``msg.field("OBX-5", 2)``, raises at runtime."""
-    if _param_mode(node) == MODE_DYNAMIC:
-        raise LensRewriteError(
-            f"parameter {pname!r} is in dynamic mode (an expression the lens cannot write back "
-            "faithfully) - it is read-only here; edit it as text (ADR 0076 E.6.4)"
-        )
+    _refuse_dynamic_argument(node, pname)
     if isinstance(value, dict):
         if set(value) == {"parts"}:
             if not template_ok:
                 _refuse_templated_write(kind, pname)
             rendered_parts = _render_parts(value["parts"], pname)
-            if _template_parts(node) == _normalize_parts(value["parts"]):
-                # The parts the argument already has: an edit that changes nothing changes nothing, so
-                # a msg.field("X") read or an F-prefix is not respelled by a resubmitted template.
+            if _template_parts(node) == _normalize_parts(value["parts"]) and _all_reads_fallback(
+                node
+            ):
+                # The parts the argument already has, every read already in the E.11 form: an edit
+                # that changes nothing changes nothing, so an F-prefix or triple quotes is not
+                # respelled. An older bare or msg.field read is NOT left alone, because resending
+                # its parts is the only way the IDE can apply the E.11 fix to it.
                 return None
             return rendered_parts
-        if set(value) != {"expr"}:
+        if set(value) != {"expr"} or not isinstance(value["expr"], str):
             raise LensRewriteError(
                 f"parameter {pname!r}: an object value must be {{'parts': [...]}} or "
-                "{'expr': <source>}"
+                "{'expr': <source string>}",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
     rendered = _render_new_value(value, True, pname)
     if isinstance(value, dict):
@@ -2967,12 +3059,14 @@ def _render_moded_value(
         if new_mode == MODE_DYNAMIC:
             raise LensRewriteError(
                 f"parameter {pname!r}: the expression would write a dynamic-mode argument, which is "
-                "read-only - only a literal or a template may be written here (ADR 0076 E.6.4)"
+                "read-only - only a literal or a template may be written here (ADR 0076 E.6.4)",
+                code=REFUSAL_DYNAMIC_MODE,
             )
         if new_mode == MODE_TEMPLATED:
             raise LensRewriteError(
                 f"parameter {pname!r}: write a template as {{'parts': [...]}}, not as an expression, "
-                "so the engine renders it and checks it reads back"
+                "so the engine renders it and checks it reads back",
+                code=REFUSAL_TEMPLATE_SHAPE,
             )
     return rendered
 
@@ -3006,7 +3100,9 @@ def _refuse_templated_write(kind: str, pname: str) -> NoReturn:
             "append_to_field suffix, replace_literal new); a path, segment id, index or setting "
             "chosen by message content is refused"
         )
-    raise LensRewriteError(f"parameter {pname!r} takes a literal only: {reason}")
+    raise LensRewriteError(
+        f"parameter {pname!r} takes a literal only: {reason}", code=REFUSAL_LITERAL_ONLY
+    )
 
 
 def _render_literal(value: Any, pname: str) -> str:
@@ -3036,6 +3132,12 @@ def _render_literal(value: Any, pname: str) -> str:
         # then raises UnicodeEncodeError when the engine encodes the outbound — and (b) for a BMP char
         # emits a ``\uXXXX`` escape that diverges from ruff's canonical raw-char form (gate 3). Emitting
         # the raw UTF-8 char is value-preserving and ruff-canonical; control chars < U+0020 stay escaped.
+        # A lone surrogate (a JSON "\udXXX" escape) has no UTF-8 form, so the splice would raise
+        # UnicodeEncodeError instead of refusing; refuse it here.
+        if not _is_encodable(value):
+            raise LensRewriteError(
+                f"parameter {pname!r}: the value carries a character that cannot be encoded as UTF-8"
+            )
         return json.dumps(value, ensure_ascii=False)
     raise LensRewriteError(
         f"parameter {pname!r}: cannot render value of type {type(value).__name__} as a literal"

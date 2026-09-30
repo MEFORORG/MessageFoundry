@@ -1201,7 +1201,16 @@ def main(argv: list[str] | None = None) -> int:
         from messagefoundry.last_resort import report_uncaught
 
         text = report_uncaught(exc)
-        return _emit_error(text, as_json=True) if as_json else 1
+        if not as_json:
+            return 1
+        # `lens rewrite` promises a "code" on every refusal, for the IDE to branch on (BACKLOG #237),
+        # so its floor payload carries the generic one.
+        code: str | None = None
+        if args.command == "lens" and getattr(args, "lens_command", None) == "rewrite":
+            from messagefoundry.lens import REFUSAL_GENERIC
+
+            code = REFUSAL_GENERIC
+        return _emit_error(text, as_json=True, code=code)
 
 
 def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
@@ -4752,7 +4761,13 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
     ``{"error": …}`` + exit 1 on any refusal — never a partial/lossy write."""
     import sys
 
-    from messagefoundry.lens import LensParseError, LensRewriteError, rewrite_module, rewrite_source
+    from messagefoundry.lens import (
+        REFUSAL_GENERIC,
+        LensParseError,
+        LensRewriteError,
+        rewrite_module,
+        rewrite_source,
+    )
 
     # Read stdin as raw UTF-8 (never the Windows locale codepage) so source bytes round-trip exactly —
     # byte-stability (gate 2) would break if a non-ASCII char (the samples carry — and → in comments)
@@ -4760,31 +4775,46 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
     def _read_stdin() -> str:
         return sys.stdin.buffer.read().decode("utf-8")
 
-    if args.edit is not None:
-        edit_text = args.edit
-    elif args.module != "-":
-        edit_text = _read_stdin()
-    else:
+    # Every refusal here carries a code, the generic one where no specific family applies, so a
+    # consumer branching on "code" never meets a payload without it (BACKLOG #237). main()'s floor
+    # adds the same generic code for an exception this function does not name.
+    if args.edit is None and args.module == "-":
         return _emit_error(
             "provide the edit spec via --edit when the source is read from stdin ('-')",
             as_json=True,
+            code=REFUSAL_GENERIC,
+        )
+    # Stdin carries either the edit spec or the source, never both, and it is decoded HERE, before
+    # the rewrite runs, so this arm can only ever describe the operator's stdin. The message names
+    # the position only: the exception's ``object`` is the whole input, which is never echoed.
+    try:
+        edit_text = args.edit if args.edit is not None else _read_stdin()
+        stdin_source = _read_stdin() if args.module == "-" else None
+    except UnicodeDecodeError as exc:
+        return _emit_error(
+            f"<stdin>: cannot read (not UTF-8 at byte {exc.start}: {exc.reason})",
+            as_json=True,
+            code=REFUSAL_GENERIC,
         )
     try:
         edit = _load_operator_json(edit_text, "--edit JSON")
     except _OperatorJsonError as exc:
-        return _emit_error(str(exc), as_json=True)
+        return _emit_error(str(exc), as_json=True, code=REFUSAL_GENERIC)
     if not isinstance(edit, dict):
-        return _emit_error("the edit spec must be a JSON object", as_json=True)
+        return _emit_error(
+            "the edit spec must be a JSON object", as_json=True, code=REFUSAL_GENERIC
+        )
 
     try:
-        if args.module == "-":
-            rewritten = rewrite_source(
-                _read_stdin(), edit, module="<stdin>", contract=args.contract
-            )
+        if stdin_source is not None:
+            rewritten = rewrite_source(stdin_source, edit, module="<stdin>", contract=args.contract)
         else:
             rewritten = rewrite_module(args.module, edit, contract=args.contract)
-    except (LensParseError, LensRewriteError) as exc:
-        return _emit_error(str(exc), as_json=True)
+    except LensRewriteError as exc:
+        # The code is the refusal family the IDE branches on (BACKLOG #237); the message stays prose.
+        return _emit_error(str(exc), as_json=True, code=exc.code)
+    except LensParseError as exc:
+        return _emit_error(str(exc), as_json=True, code=REFUSAL_GENERIC)
     # The rewritten module source is file content, not a JSON report — write the exact UTF-8 bytes to
     # stdout (not sys.stdout.write, which would re-encode through the console codepage and corrupt
     # non-ASCII, defeating byte-stability).
@@ -8351,7 +8381,7 @@ def _load_operator_json(raw: str, what: str) -> Any:
     raise _OperatorJsonError(refused)
 
 
-def _emit_error(message: str, *, as_json: bool) -> int:
+def _emit_error(message: str, *, as_json: bool, code: str | None = None) -> int:
     """Report a command failure on the right stream and return its exit code.
 
     Text goes to **stderr**. A shell redirect of a command's output --
@@ -8361,9 +8391,13 @@ def _emit_error(message: str, *, as_json: bool) -> int:
 
     JSON stays on **stdout**, deliberately. Under ``--json`` the error object IS the command's
     machine-readable output: a consumer piping to ``jq`` reads it there, and the non-zero exit code
-    is what tells it apart from a success payload."""
+    is what tells it apart from a success payload.
+
+    ``code`` adds a machine-readable ``"code"`` key beside ``"error"`` in the JSON form, for a consumer
+    that must branch on the failure family without matching message text (``lens rewrite``)."""
     if as_json:
-        print(json.dumps({"error": message}))
+        payload = {"error": message} if code is None else {"error": message, "code": code}
+        print(json.dumps(payload))
     else:
         print(f"error: {message}", file=sys.stderr)
     return 1

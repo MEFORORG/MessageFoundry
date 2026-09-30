@@ -56,6 +56,9 @@ ADMITTED = [
     pytest.param("f\"{msg.field('PID-5.1')}\"", id="field-call-read"),
     pytest.param("f\"{msg.field('OBX-5', 2)}\"", id="field-call-multiple-constant-args"),
     pytest.param('f"no placeholders at all"', id="fstring-with-no-placeholders"),
+    # ADR 0076 E.11 (owner ruling 2026-09-29): the renderer's own path-part form.
+    pytest.param("f\"{msg['PID-5.1'] or ''}\"", id="subscript-read-with-empty-fallback"),
+    pytest.param("f\"ID {msg['PID-3'] or ''}/{msg['PID-4']}\"", id="fallback-beside-bare-read"),
 ]
 
 
@@ -82,6 +85,18 @@ EXCLUDED = [
     pytest.param("f\"{(y := msg['PID-5.1'])}\"", id="walrus"),
     pytest.param("f\"{msg['PID-5.1'] if flag else ''}\"", id="conditional-expression"),
     pytest.param("f\"{msg['PID-5.1'] + msg['PID-5.2']}\"", id="fstring-containing-concatenation"),
+    # E.11 admits `msg["X"] or ""` and NOTHING wider: every neighbour of that shape stays dynamic.
+    pytest.param("f\"{msg['PID-5.1'] or 'N/A'}\"", id="fallback-to-non-empty-text"),
+    pytest.param("f\"{msg['PID-5.1'] or y}\"", id="fallback-to-a-name"),
+    pytest.param("f\"{msg['PID-5.1'] or b''}\"", id="fallback-to-empty-bytes"),
+    pytest.param("f\"{msg['PID-5.1'] or 0}\"", id="fallback-to-a-number"),
+    pytest.param("f\"{msg['PID-5.1'] or '' or ''}\"", id="fallback-chained"),
+    pytest.param("f\"{'' or msg['PID-5.1']}\"", id="fallback-operands-reversed"),
+    pytest.param("f\"{msg['PID-5.1'] and ''}\"", id="and-instead-of-or"),
+    pytest.param("f\"{msg.field('PID-5.1') or ''}\"", id="fallback-on-a-field-call"),
+    pytest.param("f\"{msg[path] or ''}\"", id="fallback-on-an-unbounded-read"),
+    pytest.param("f\"{msg['PID-5.1'] or ''!r}\"", id="fallback-with-a-conversion"),
+    pytest.param("msg['PID-5.1'] or ''", id="fallback-outside-an-fstring"),
 ]
 
 
@@ -113,6 +128,27 @@ def test_the_exclusion_list_covers_every_shape_e5_names() -> None:
         "conditional-expression",
     ):
         assert required in ids, f"E.5 names {required} and no case covers it"
+
+
+def test_the_exclusion_list_covers_every_neighbour_e11_rules_out() -> None:
+    """POSITIVE CONTROL for ADR 0076 E.11 (owner ruling 2026-09-29), which admits `msg["X"] or ""`
+    and nothing wider. Deleting one of these cases would let a widened fallback pass silently."""
+    ids = {p.id for p in EXCLUDED}
+    for required in (
+        "fallback-to-non-empty-text",
+        "fallback-to-a-name",
+        "fallback-to-empty-bytes",
+        "fallback-to-a-number",
+        "fallback-chained",
+        "fallback-operands-reversed",
+        "and-instead-of-or",
+        "fallback-on-a-field-call",
+        "fallback-on-an-unbounded-read",
+        "fallback-with-a-conversion",
+        "fallback-outside-an-fstring",
+    ):
+        assert required in ids, f"E.11 excludes {required} and no case covers it"
+    assert "subscript-read-with-empty-fallback" in {p.id for p in ADMITTED}
 
 
 # --- static, and its tie to literal_params (AC-M2) ----------------------------
