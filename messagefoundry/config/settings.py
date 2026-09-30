@@ -6184,13 +6184,25 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         elif value > default:
             out.append((field, f"{what} is {value}, above the default of {default}, so {so}"))
 
-    def _floor(field: str, value: float, *, what: str, so: str, off: str) -> None:
-        """A time floor: refused sooner than ``value`` seconds, so 0 or less is off and a value
-        below the default is looser. A floor above the default refuses more and is not named."""
-        default = _auth_default(field)
+    def _floor_verdict(field: str, value: float) -> Literal["off", "looser"] | None:
+        """A time floor refuses an action sooner than ``value`` seconds, so 0 or less is off and a
+        value below the default is looser. A floor above the default refuses more: None.
+
+        Returns a LITERAL, never the value, so a caller can pick its text without the configured
+        number ever reaching that text (see the second-factor floor below)."""
         if value <= 0:
+            return "off"
+        if value < _auth_default(field):
+            return "looser"
+        return None
+
+    def _floor(field: str, value: float, *, what: str, so: str, off: str) -> None:
+        """A time floor whose configured value the entry quotes."""
+        verdict = _floor_verdict(field, value)
+        if verdict == "off":
             out.append((field, off))
-        elif value < default:
+        elif verdict == "looser":
+            default = _auth_default(field)
             out.append(
                 (
                     field,
@@ -6425,19 +6437,33 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     # a code or passkey that completes an MFA-pending session sooner than this after sign-in, and
     # skips the check at 0 or less. It applies to any account with a factor, whether or not
     # [security].require_mfa is on, so it is gated on sign-in only.
-    _floor(
-        "mfa_verify_min_elapsed_seconds",
-        auth.mfa_verify_min_elapsed_seconds,
-        what="the least time between sign-in and the second factor",
-        so=(
-            "a script holding a password may complete the second step with a relayed or scripted "
-            "code sooner after sign-in than a person could take in the prompt and answer it"
-        ),
-        off=(
-            "there is no least time between sign-in and the second factor, so a script holding "
-            "a password may complete the second step with a relayed or scripted code at once"
-        ),
-    )
+    #
+    # Its entry does NOT quote the configured value, unlike every other floor here. CodeQL's
+    # py/clear-text-logging-sensitive-data reads an attribute named mfa_* as a password source, and
+    # these entries reach the serve WARNING and `security show` stdout, so quoting the number raised
+    # two alerts on PR 1842. The value only picks a literal verdict (_floor_verdict), which carries
+    # no data from it. The operator loses nothing they did not set themselves.
+    step_field = "mfa_verify_min_elapsed_seconds"
+    step_verdict = _floor_verdict(step_field, auth.mfa_verify_min_elapsed_seconds)
+    if step_verdict == "off":
+        out.append(
+            (
+                step_field,
+                "there is no least time between sign-in and the second factor, so a script "
+                "holding a password may complete the second step with a relayed or scripted code "
+                "at once",
+            )
+        )
+    elif step_verdict == "looser":
+        out.append(
+            (
+                step_field,
+                "the least time between sign-in and the second factor is shorter than the "
+                f"default of {_auth_default(step_field):g} s, so a script holding a password may "
+                "complete the second step with a relayed or scripted code sooner after sign-in "
+                "than a person could take in the prompt and answer it",
+            )
+        )
 
     # --- the federated callback floor (BACKLOG #2301, ASVS 2.4.2): _oidc_callback_too_early refuses
     # a callback sooner than this after its flow started, and skips the check at 0 or less. The

@@ -785,6 +785,20 @@ def test_a_time_floor_says_off_at_zero_and_looser_below_the_default() -> None:
     assert "shorter than the default of 1 s" in weak
 
 
+def test_the_second_factor_floor_entry_never_quotes_the_configured_value() -> None:
+    """PR 1842: CodeQL reads an mfa_* attribute as a password source, and this entry reaches the
+    serve WARNING and stdout, so the configured number must stay out of it. The other floors still
+    quote theirs (the control arm), so a text that dropped every value would not pass either."""
+    mfa = _risk(AuthSettings(mfa_verify_min_elapsed_seconds=0.37), "mfa_verify_min_elapsed_seconds")
+    assert mfa is not None
+    assert "0.37" not in mfa
+    gap = _risk(
+        AuthSettings(admin_write_min_interval_seconds=0.037), "admin_write_min_interval_seconds"
+    )
+    assert gap is not None
+    assert "0.037" in gap
+
+
 def test_the_oidc_flow_cache_cap_is_not_named_without_oidc() -> None:
     """The cache is built only with OIDC on, so the cap is inert without it."""
     assert _names(auth=AuthSettings(oidc_flow_cache_max=1_000_000_000)) == []
