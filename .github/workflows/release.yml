@@ -1195,6 +1195,17 @@ jobs:
                   f"::error::{DIST} {dist.version} declares {len(engine)} requirements on the engine, "
                   f"expected exactly one (BACKLOG #1585): {[str(req) for req in engine]}"
               )
+          # NO ENVIRONMENT MARKER ON THE ENGINE REQUIREMENT (BACKLOG #1585). A pin spelled
+          # `messagefoundry[harness]==X; sys_platform == "linux"` is exact and passes every check
+          # below on this ubuntu runner, then installs NO engine on the Windows host the harness is
+          # for. Any marker is refused, not only a false one: a marker true here is still false
+          # somewhere a user installs. tests/test_packaging.py::_engine_pin refuses the same shape.
+          if engine[0].marker is not None:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires {engine[0]}, whose environment marker "
+                  f"leaves the engine uninstalled wherever it is false (BACKLOG #1585). Drop the "
+                  f"marker in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
+              )
           # THE PINNED VERSION IS COMPARED AS A PEP 440 VERSION, NOT AS A SPECIFIER STRING. `packaging`
           # preserves the raw spelling: str(Requirement("messagefoundry[harness]==0.3.0-rc1").specifier)
           # is "==0.3.0-rc1", and str(Requirement(...)) round-trips it, so a hyphen typed into the

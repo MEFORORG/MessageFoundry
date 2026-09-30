@@ -1723,8 +1723,19 @@ def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
         (["messagefoundry[harness]>=" + _SMOKE_VERSION], "a range instead of a pin"),
         (["messagefoundry==" + _SMOKE_VERSION], "the [harness] extra dropped"),
         ([], "no requirement on the engine at all"),
+        # BACKLOG #1585 (a): an exact pin wearing an environment marker. The first is TRUE wherever
+        # this suite runs, so it proves a marker is refused even when it would install the engine
+        # here; the second is the shape that passes on ubuntu and installs nothing on Windows.
+        (
+            ["messagefoundry[harness]==" + _SMOKE_VERSION + '; python_version >= "3"'],
+            "an exact pin gated by a marker true on this runner",
+        ),
+        (
+            ["messagefoundry[harness]==" + _SMOKE_VERSION + '; sys_platform == "linux"'],
+            "an exact pin gated by a platform marker",
+        ),
     ],
-    ids=["wrong-version", "range", "no-extra", "absent"],
+    ids=["wrong-version", "range", "no-extra", "absent", "marker-true-here", "platform-marker"],
 )
 def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
     requires: list[str], why: str, venv_template: Path, tmp_path: Path

@@ -592,9 +592,14 @@ def _engine_pin(dependencies: list[str]) -> str | None:
     would read as unpinned. Extras are the difference; ``packaging`` parses them and a regex over a
     PEP 508 string does not. Two predicates in one file, and this note is which is authoritative
     where.
+
+    A MARKER IS ALSO ``None`` (BACKLOG #1585). ``messagefoundry[harness]==0.3.2; sys_platform ==
+    "linux"`` pins the right version on the one platform the marker names and installs NO engine
+    anywhere else, so it passes on the ubuntu runner that grades it and fails on the Windows host the
+    harness is for. A requirement that holds only somewhere is not a lockstep pin.
     """
     req = _engine_requirement(dependencies)
-    if req is None:
+    if req is None or req.marker is not None:
         return None
     specs = list(req.specifier)
     if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
@@ -611,6 +616,8 @@ def test_the_engine_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
         "messagefoundry[harness]~=0.3.2",
         "messagefoundry[harness]==0.3.*",
         "messagefoundry[harness]>=0.3.2,<0.4",
+        'messagefoundry[harness]==0.3.2; sys_platform == "linux"',
+        "messagefoundry[harness]==0.3.2; python_version >= '3.14'",
     ):
         assert _engine_pin([loose]) is None, loose
     assert _engine_pin(["messagefoundry[harness]==0.3.2"]) == "0.3.2"
@@ -648,6 +655,12 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
     )
 
     shipped = _version_literal(root)
+    engine = _engine_requirement(harness["project"]["dependencies"])
+    assert engine is None or engine.marker is None, (
+        f"the harness requirement on the engine carries an environment marker ({engine.marker}), so "
+        f"it installs no engine wherever that marker is false (BACKLOG #1585). A lockstep pin must "
+        f"hold on every platform the harness installs on; drop the `; ...` clause."
+    )
     pinned = _engine_pin(harness["project"]["dependencies"])
     assert pinned == shipped, (
         f"the harness must pin the engine at the version it ships with (BACKLOG #1585).\n"
