@@ -30,15 +30,14 @@ redaction-aware feature later.)
 
 A ``choice`` group (the order detail of ORM^O01, for one) means "exactly one of these". hl7apy
 1.3.5 checks it as "all of these", so this module carries the upstream fix at its own boundary
-rather than patching hl7apy: see :data:`_LAST_HL7APY_WITH_CHOICE_BUG`.
+rather than patching hl7apy: see :func:`_choice_fix_needed`.
 """
 
 from __future__ import annotations
 
-import re
+import contextlib
 from dataclasses import dataclass
-from functools import lru_cache
-from importlib import metadata
+from functools import cache
 from typing import Any
 
 from messagefoundry.parsing.peek import (
@@ -56,28 +55,41 @@ __all__ = ["ValidationResult", "validate"]
 # ``"choice"``. Typed loosely because hl7apy ships no types.
 _Reference = tuple[Any, ...]
 
-# The last hl7apy release known to validate a ``choice`` group as a ``sequence``: upstream
-# crs4/hl7apy issue 151, fixed by PR 152, which was open and unmerged on 2026-09-30. The bug
-# makes every alternative of a choice required, so strict validation would reject any ORM^O01
-# or ORR^O02 that carries an order detail (ORC then OBR, say), and any other structure with a
-# choice group, in every HL7 version hl7apy ships from 2.2 on.
-_LAST_HL7APY_WITH_CHOICE_BUG = (1, 3, 5)
+# hl7apy 1.3.5 validates a ``choice`` group as a ``sequence`` (upstream crs4/hl7apy issue 151;
+# the fix, PR 152, was open and unmerged on 2026-09-30). That makes every alternative of a choice
+# required, so strict validation would reject any ORM^O01 or ORR^O02 carrying an order detail
+# (ORC then OBR, say), and any other structure with a choice group, in every HL7 version hl7apy
+# ships from 2.2 on. This probe is such a message, valid and synthetic.
+_CHOICE_PROBE = (
+    "MSH|^~\\&|SND|SND|RCV|RCV|20260101120000||ORM^O01|PROBE|P|2.5.1\r"
+    "PID|1||1^^^HOSP^MR||DOE^JOHN\r"
+    "ORC|NW|ORD1\r"
+    "OBR|1|ORD1||PANEL^Panel"
+)
 
 
-@lru_cache(maxsize=1)
+@cache
 def _choice_fix_needed() -> bool:
-    """True while the installed hl7apy is at or below the last release known to have the bug.
+    """True while the installed hl7apy, unaided, rejects the valid :data:`_CHOICE_PROBE`.
 
-    The guard switches the shim off on any newer release. ``tests/test_validate_choice_groups.py``
-    checks that choice against hl7apy's own behaviour, so it goes red if a newer release still
-    has the bug, or if the shim outlives the upstream fix.
+    Asked of hl7apy's behaviour rather than its version number, once per process, so the shim
+    switches itself off on the first release that validates choice groups correctly, and stays
+    on under an unpinned install of a newer release that does not.
+    ``tests/test_validate_choice_groups.py`` goes red on that release, so the shim gets deleted.
     """
+    from hl7apy.consts import VALIDATION_LEVEL
+    from hl7apy.exceptions import HL7apyException
+    from hl7apy.parser import parse_message
+    from hl7apy.validation import Validator
+
+    probe = parse_message(
+        _CHOICE_PROBE, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT
+    )
     try:
-        installed = metadata.version("hl7apy")
-    except metadata.PackageNotFoundError:
-        return False
-    parts = tuple(int(p) for p in re.findall(r"\d+", installed)[:3])
-    return parts <= _LAST_HL7APY_WITH_CHOICE_BUG
+        Validator.validate(probe)
+    except HL7apyException:
+        return True
+    return False
 
 
 def _as_sequence(ref: _Reference) -> _Reference:
@@ -96,12 +108,15 @@ def _as_sequence(ref: _Reference) -> _Reference:
     return ("sequence", tuple(children), *ref[2:])
 
 
-@lru_cache(maxsize=512)
-def _reference_without_choices(name: str, classname: str, hl7_version: str) -> _Reference:
+# Unbounded is safe: the key space is hl7apy's shipped tables, since an unknown name raises and
+# a raise is not cached.
+@cache
+def _references(name: str, classname: str, hl7_version: str) -> tuple[_Reference, _Reference]:
+    """The structure's hl7apy table, and the same table with its choice groups rewritten."""
     from hl7apy import load_reference
 
     ref: _Reference = load_reference(name, classname, hl7_version)
-    return _as_sequence(ref)
+    return ref, _as_sequence(ref)
 
 
 def _occurrences(element: Any, name: str) -> list[Any]:
@@ -113,35 +128,35 @@ def _occurrences(element: Any, name: str) -> list[Any]:
         return []  # hl7apy's validator skips a name its tables cannot resolve; so do we
 
 
-def _choice_errors(element: Any, ref: _Reference, errors: list[str]) -> None:
-    """Walk the groups of ``element`` and report each choice group without exactly one part.
+def _check_choice(group: Any, ref: _Reference, errors: list[str]) -> None:
+    """Report ``group`` unless exactly one alternative is present, as often as it must be.
 
     Mirrors the rule of the upstream fix (PR 152) and its error text, so the message an operator
     sees does not change when the shim is deleted.
     """
+    counts = {name: len(_occurrences(group, name)) for name, _sub, _card, _marker in ref[1]}
+    present = [name for name, count in counts.items() if count]
+    if not present:
+        errors.append(
+            f"Missing required child for choice group {group.name} "
+            f"(exactly one of {list(counts)} is required)"
+        )
+    elif len(present) > 1:
+        errors.append(f"Only one child allowed for choice group {group.name}: found {present}")
+    else:
+        minimum = next(card[0] for name, _sub, card, _marker in ref[1] if name == present[0])
+        if counts[present[0]] < minimum:
+            errors.append(f"Missing required child {group.name}.{present[0]}")
+
+
+def _choice_errors(element: Any, ref: _Reference, errors: list[str]) -> None:
+    """Walk the groups of ``element`` and check each choice group among them."""
     for name, sub, _cardinality, marker in ref[1]:
         if marker != "GRP":
             continue
         for group in _occurrences(element, name):
             if sub[0] == "choice":
-                # (name, minimum, count) for each alternative the message carries
-                chosen = [
-                    (alt[0], alt[2][0], count)
-                    for alt in sub[1]
-                    if (count := len(_occurrences(group, alt[0]))) > 0
-                ]
-                if not chosen:
-                    errors.append(
-                        f"Missing required child for choice group {group.name} "
-                        f"(exactly one of {[alt[0] for alt in sub[1]]} is required)"
-                    )
-                elif len(chosen) > 1:
-                    errors.append(
-                        f"Only one child allowed for choice group {group.name}: "
-                        f"found {[c[0] for c in chosen]}"
-                    )
-                elif chosen[0][2] < chosen[0][1]:
-                    errors.append(f"Missing required child {group.name}.{chosen[0][0]}")
+                _check_choice(group, sub, errors)
             _choice_errors(group, sub, errors)
 
 
@@ -183,7 +198,6 @@ def validate(
     a strict channel should reject). ``max_bytes`` / ``max_segments`` reject an oversized
     message before the (slow) strict parse.
     """
-    from hl7apy import load_reference
     from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import HL7apyException
     from hl7apy.parser import parse_message
@@ -215,29 +229,26 @@ def validate(
     if expected_version and version and expected_version != version:
         errors.append(f"version mismatch: message is {version}, channel expects {expected_version}")
 
-    reference: _Reference | None = None
+    references: tuple[_Reference, _Reference] | None = None
+    # An unknown structure (ChildNotFound), or a table shape the rewrite does not know, leaves
+    # ``references`` unset: hl7apy then validates unaided. The guard test over every shipped
+    # table keeps the second case from happening silently.
     if _choice_fix_needed():
-        try:
-            reference = _reference_without_choices(message.name, message.classname, version)
-        except Exception:
-            # An unknown structure (ChildNotFound), or a table shape the rewrite does not know:
-            # validate as hl7apy does unaided. The guard test over every shipped table keeps
-            # the second case from happening silently.
-            reference = None
+        with contextlib.suppress(Exception):
+            references = _references(message.name, message.classname, version)
 
     try:
-        Validator.validate(message, reference=reference)
+        Validator.validate(message, reference=references[1] if references else None)
     except HL7apyException as exc:
         errors.append(str(exc))
     except Exception as exc:  # defensive
         errors.append(str(exc))
-
-    if reference is not None:
-        try:
-            _choice_errors(
-                message, load_reference(message.name, message.classname, version), errors
-            )
-        except Exception as exc:  # defensive, as above
-            errors.append(str(exc))
+    else:
+        # Only when hl7apy found nothing, keeping the one-conformance-error contract above.
+        if references is not None:
+            try:
+                _choice_errors(message, references[0], errors)
+            except Exception as exc:  # defensive, as above
+                errors.append(str(exc))
 
     return ValidationResult(ok=not errors, version=version, errors=errors)

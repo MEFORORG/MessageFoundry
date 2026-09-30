@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.parsing import validate
-from messagefoundry.parsing.validate import _choice_fix_needed, _reference_without_choices
+from messagefoundry.parsing.validate import _CHOICE_PROBE, _choice_fix_needed, _references
 
 _PID = "PID|1||12345^^^HOSP^MR||DOE^JOHN||19800101|M"
 # ORC-7 is filled because v2.3 makes it required; later versions do not care.
@@ -86,45 +86,35 @@ def test_every_shipped_structure_table_takes_the_rewrite() -> None:
     """``validate`` falls back to unaided hl7apy if the rewrite cannot read a table, which would
     bring the bug back for that structure without a sound. This walks every message structure of
     every HL7 version hl7apy ships, so a table shape the rewrite does not know fails here."""
-    import importlib
-
     import hl7apy
 
     rewritten = 0
-    for hl7_version, module in hl7apy.SUPPORTED_LIBRARIES.items():
-        for structure in importlib.import_module(f"{module}.messages").MESSAGES:
-            ref = _reference_without_choices(structure, "Message", hl7_version)
+    for hl7_version in hl7apy.SUPPORTED_LIBRARIES:
+        for structure in hl7apy.load_library(hl7_version).MESSAGES:
+            _original, ref = _references(structure, "Message", hl7_version)
             assert not _has_choice_group(ref), (hl7_version, structure)
             rewritten += 1
     assert rewritten > 1000, rewritten  # the control: the loop really walked the tables
 
 
-def test_the_carried_fix_is_on_exactly_while_upstream_still_has_the_bug() -> None:
-    """Goes red the day hl7apy changes, in either direction, so the shim is never forgotten.
+def test_hl7apy_still_has_the_bug_so_the_shim_is_still_on() -> None:
+    """Goes red on the first hl7apy release that fixes issue 151. Then delete the shim.
 
-    If an hl7apy release fixes issue 151, the upstream validator stops rejecting this message.
-    The shim is version-guarded to 1.3.5 and earlier, so it switches itself off on any newer
-    release. This test then says whether that was right: if the new release still has the bug,
-    ``upstream_rejects`` stays True while the guard is False, and this fails. If a release at
-    or below the guard fixed it, the guard would still be True and this fails the other way.
-    Either failure means: re-read the guard in ``parsing/validate.py`` and delete the shim once
-    upstream is fixed.
+    The shim switches itself off on such a release, since :func:`_choice_fix_needed` asks
+    hl7apy rather than its version number. The code it leaves behind is dead, and this test is
+    what says so. It also pins that hl7apy rejects the probe for issue 151 and not for some
+    other reason, which would keep the shim on for the wrong cause.
     """
     from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import ValidationError
     from hl7apy.parser import parse_message
     from hl7apy.validation import Validator
 
-    message = parse_message(
-        _msg(_msh("ORM^O01", "2.5.1"), _PID, _ORC, _OBR),
-        find_groups=True,
-        validation_level=VALIDATION_LEVEL.TOLERANT,
+    probe = parse_message(
+        _CHOICE_PROBE, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT
     )
-    try:
-        Validator.validate(message)
-    except ValidationError as exc:
-        assert "Missing required child ORM_O01_OBRRQDRQ1RXOODSODT_SUPPGRP" in str(exc), exc
-        upstream_rejects = True
-    else:
-        upstream_rejects = False
-    assert _choice_fix_needed() == upstream_rejects
+    with pytest.raises(ValidationError, match="Missing required child ORM_O01_OBRRQDRQ1RXOODSODT"):
+        Validator.validate(probe)
+    assert _choice_fix_needed()
+    # The control: the engine accepts the same probe, so it is a valid message.
+    assert validate(_CHOICE_PROBE).ok

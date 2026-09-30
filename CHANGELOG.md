@@ -640,8 +640,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   an OBR or RXO order detail, with `Missing required child ORM_O01_CHOICE.RQD` or its per-version
   name, and the same for any other structure with a choice group. The engine now carries the
   upstream fix (PR 152, unmerged) at its own validation boundary: a choice group needs exactly
-  one alternative, and two in one group are still rejected. The shim is guarded to hl7apy 1.3.5
-  and earlier, and a test goes red when hl7apy changes so it is removed with the upstream fix.
+  one alternative, and two in one group are still rejected. The shim turns on only while
+  hl7apy itself rejects a valid probe order, and a test goes red on the first hl7apy release
+  that fixes the bug, so the shim is removed with it.
 - **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
   The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
   dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
