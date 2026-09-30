@@ -44,9 +44,11 @@ Usage::
     python scripts/release/changelog_fragments.py check --no-pending  # release.yml, on a tag
     python scripts/release/changelog_fragments.py assemble            # the release PR
 
-``pr-check`` compares a pull request's ``CHANGELOG.md`` with its base's. It REFUSES a pull request
-that adds a version heading while fragments remain, or while ``[Unreleased]`` still holds entries
-(the fragments were assembled after the rename, so the release notes would miss them). It WARNS,
+``pr-check`` compares a pull request's ``CHANGELOG.md`` with its base's. It REFUSES a release pull
+request -- one adding the heading for the version ``messagefoundry/__init__.py`` now declares --
+while fragments remain, or while ``[Unreleased]`` still holds bullets (the fragments were assembled
+after the rename, so the release notes would miss them). It refuses any pull request that leaves
+other than exactly one ``[Unreleased]`` heading. It WARNS,
 never fails, on a pull request that edits ``CHANGELOG.md`` without adding a version heading: pull
 requests opened before this change still edit it, and turning them red would buy nothing.
 """
@@ -54,6 +56,7 @@ requests opened before this change still edit it, and turning them red would buy
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess  # nosec B404 - fixed argv, no shell
 import sys
@@ -85,6 +88,7 @@ _LINK_DEF = re.compile(r"^\[[^\]]+\]:\s")
 #: An inline link target, and the targets that are NOT relative paths: a scheme, an anchor, or rooted.
 _LINK_TARGET = re.compile(r"\]\(([^)\s]+)")
 _NOT_RELATIVE = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|#|/)")
+_CODE_SPAN = re.compile(r"(`+).*?\1")
 
 
 class Fragment(NamedTuple):
@@ -106,9 +110,22 @@ def _sort_key(fragment: Fragment) -> tuple[int, int, str]:
     return (1, 0, fragment.name)
 
 
+def _prose_parts(line: str) -> list[str]:
+    """``line`` split into alternating prose and code-span pieces, prose at even indexes. A link
+    inside a code span is text, not a link, so neither the check nor the rewrite touches it."""
+    parts: list[str] = []
+    last = 0
+    for span in _CODE_SPAN.finditer(line):
+        parts += [line[last : span.start()], span.group()]
+        last = span.end()
+    parts.append(line[last:])
+    return parts
+
+
 def _link_problems(number: int, line: str) -> list[str]:
     problems: list[str] = []
-    for target in _LINK_TARGET.findall(line):
+    prose = " ".join(_prose_parts(line)[::2])
+    for target in _LINK_TARGET.findall(prose):
         if _NOT_RELATIVE.match(target):
             continue
         if not target.startswith("../") or target.startswith("../../"):
@@ -164,7 +181,9 @@ def load(fragment_dir: Path) -> list[Fragment]:
             )
             continue
         try:
-            body = path.read_text(encoding="utf-8")
+            # utf-8-sig: Windows PowerShell 5.1's `Out-File -Encoding utf8` writes a byte order
+            # mark, which would otherwise read as a line that does not start with '- '.
+            body = path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError:
             problems.append(f"{where}: not UTF-8")
             continue
@@ -178,12 +197,19 @@ def load(fragment_dir: Path) -> list[Fragment]:
 
 
 def rendered(fragment: Fragment) -> list[str]:
-    """The fragment's lines as they land in ``CHANGELOG.md``: verbatim, less one ``../`` per link."""
-    body = _LINK_TARGET.sub(
-        lambda m: "](" + (m.group(1)[3:] if m.group(1).startswith("../") else m.group(1)),
-        fragment.body.strip("\n"),
-    )
-    return body.splitlines()
+    """The fragment's lines as they land in ``CHANGELOG.md``: verbatim, less one ``../`` per link
+    outside a code span."""
+
+    def drop_one(match: re.Match[str]) -> str:
+        target = match.group(1)
+        return "](" + (target[3:] if target.startswith("../") else target)
+
+    out: list[str] = []
+    for line in fragment.body.strip("\n").splitlines():
+        parts = _prose_parts(line)
+        parts[::2] = [_LINK_TARGET.sub(drop_one, part) for part in parts[::2]]
+        out.append("".join(parts))
+    return out
 
 
 def _section_end(lines: list[str], start: int) -> int:
@@ -216,13 +242,15 @@ def assemble_text(changelog: str, fragments: list[Fragment]) -> str:
     existing bullets, so nothing already there moves. A category with no subsection gets a new one,
     placed before the first heading of a later category (Keep a Changelog order), else at the end.
     Raises :class:`FragmentError` if ``[Unreleased]`` is not there exactly once, or if a fragment's
-    text is already in the changelog -- a second run after a partial delete would duplicate it.
+    text is already under ``[Unreleased]`` -- a second run after a partial delete would duplicate
+    it. Released sections are not searched: a new entry may repeat an old one's words.
     """
     if not fragments:
         return changelog
     lines = changelog.split("\n")
     head = _unreleased(lines)
-    padded = "\n" + changelog.replace("\r\n", "\n") + "\n"
+    section = "\n".join(line.rstrip("\r") for line in lines[head : _section_end(lines, head)])
+    padded = "\n" + section + "\n"
     already = [f for f in fragments if "\n" + "\n".join(rendered(f)) + "\n" in padded]
     if already:
         raise FragmentError(
@@ -263,13 +291,11 @@ def new_versions(base: str, head: str) -> list[str]:
 
 
 def _unreleased_entries(changelog: str) -> int:
-    """How many non-blank, non-heading lines ``[Unreleased]`` holds; 0 without the heading."""
+    """How many bullet lines ``[Unreleased]`` holds. Raises if the heading is not there once."""
     lines = changelog.split("\n")
-    heads = [i for i, line in enumerate(lines) if line.rstrip() == _UNRELEASED]
-    if len(heads) != 1:
-        return 0
-    body = lines[heads[0] + 1 : _section_end(lines, heads[0])]
-    return sum(1 for line in body if line.strip() and not line.startswith("#"))
+    head = _unreleased(lines)
+    body = lines[head + 1 : _section_end(lines, head)]
+    return sum(1 for line in body if line.startswith(("- ", "* ", "+ ")))
 
 
 def _listing(fragments: list[Fragment]) -> str:
@@ -282,6 +308,18 @@ _ORDER_HINT = (
 )
 
 
+_DECLARED = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.MULTILINE)
+
+
+def _declared_version(root: Path) -> str | None:
+    """The engine's ``__version__``, read as text (never imported); None if it cannot be read."""
+    try:
+        match = _DECLARED.search((root / "messagefoundry" / "__init__.py").read_text("utf-8"))
+    except OSError:
+        return None
+    return match.group(1) if match else None
+
+
 def pr_check(root: Path, base_changelog: str) -> int:
     """The pull-request check. Returns the exit status; see the module docstring.
 
@@ -290,20 +328,27 @@ def pr_check(root: Path, base_changelog: str) -> int:
     fragments = load(root / FRAGMENT_DIR)
     head = (root / CHANGELOG).read_text(encoding="utf-8")
     added = new_versions(base_changelog, head)
-    if added and fragments:
+    # A new heading is THIS release only when it names the version the tree now declares, which a
+    # release pull request bumps and the release job holds the tag to. A backfilled heading for an
+    # already-shipped maintenance release leaves the declared version alone, and fragments pending
+    # then are normal. Without a readable version, the newest heading stands in for it.
+    declared = _declared_version(root)
+    top = _VERSION_HEADING.search(head)
+    candidate = declared if declared is not None else (top.group(1) if top else None)
+    release = candidate if candidate in added else None
+    stranded = _unreleased_entries(head)  # raises unless exactly one [Unreleased]
+    if release and fragments:
         print(
-            f"this pull request adds version heading(s) {', '.join(added)} to {CHANGELOG} while "
-            f"{len(fragments)} fragment(s) remain, so that release would miss them. "
-            f"{_ORDER_HINT}\n  {_listing(fragments)}",
+            f"this pull request releases {release} while {len(fragments)} fragment(s) remain, so "
+            f"its release notes would miss them. {_ORDER_HINT}\n  {_listing(fragments)}",
             file=sys.stderr,
         )
         return 1
-    stranded = _unreleased_entries(head)
-    if added and stranded:
+    if release and stranded:
         print(
-            f"this pull request adds version heading(s) {', '.join(added)}, but '{_UNRELEASED}' "
-            f"still holds {stranded} line(s), so that release's notes would miss them. They were "
-            f"probably assembled after the rename. Move them under the new version. {_ORDER_HINT}",
+            f"this pull request releases {release}, but '{_UNRELEASED}' still holds {stranded} "
+            f"bullet(s), so that release's notes would miss them. They were probably assembled "
+            f"after the rename. Move them under the new version. {_ORDER_HINT}",
             file=sys.stderr,
         )
         return 1
@@ -359,8 +404,11 @@ def assemble(root: Path, *, dry_run: bool = False) -> list[Fragment]:
         sys.stdout.buffer.write(updated.encode("utf-8"))
         sys.stdout.buffer.flush()
         return fragments
-    with changelog_path.open("w", encoding="utf-8", newline="") as handle:
+    # Write beside it, then replace: an interrupted write leaves the old file, never a truncated one.
+    staged = changelog_path.with_name(f".{CHANGELOG}.assembling")
+    with staged.open("w", encoding="utf-8", newline="") as handle:
         handle.write(updated)
+    os.replace(staged, changelog_path)
     for fragment in fragments:
         fragment.path.unlink()
     return fragments

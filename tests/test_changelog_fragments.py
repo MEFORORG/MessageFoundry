@@ -13,6 +13,7 @@ two workflows that call the script, so the gate cannot be wired to nothing.
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import subprocess  # nosec B404 - fixed argv, no shell
 import sys
@@ -293,18 +294,42 @@ def test_a_fragment_already_in_the_changelog_is_refused() -> None:
         cf.assemble_text(_CHANGELOG, [frag])
 
 
+def test_a_repeated_bullet_from_a_released_section_is_not_a_duplicate() -> None:
+    frag = cf.Fragment(Path("1.added.md"), "1", "added", "- released entry\n")
+    assert cf.assemble_text(_CHANGELOG, [frag]).count("- released entry") == 2
+
+
+def test_a_link_inside_a_code_span_is_left_alone(tmp_path: Path) -> None:
+    body = "- `handlers[name](msg)` and `[x](../a)` now work\n"
+    root = _repo(tmp_path, {"6.fixed.md": body})
+    cf.assemble(root)
+    assert body in (root / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+def test_a_byte_order_mark_is_accepted(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {})
+    (root / "changelog.d" / "6.fixed.md").write_bytes(b"\xef\xbb\xbf- fix\n")
+    assert [f.body for f in cf.load(root / "changelog.d")] == ["- fix\n"]
+
+
 def test_dot_files_are_ignored(tmp_path: Path) -> None:
     root = _repo(tmp_path, {".DS_Store": "x", ".2080.fixed.md.swp": "x"})
     assert cf.load(root / "changelog.d") == []
 
 
-def test_an_untracked_fragment_is_refused_and_nothing_is_written(tmp_path: Path) -> None:
+def test_an_untracked_fragment_is_refused_and_nothing_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     git = shutil.which("git")
     if git is None:
         pytest.skip("git is not on PATH")
     root = _repo(tmp_path, {"1.fixed.md": "- tracked\n"})
-    subprocess.run([git, "init", "-q"], cwd=root, check=True)  # nosec B603
-    subprocess.run([git, "add", "CHANGELOG.md", "changelog.d"], cwd=root, check=True)  # nosec B603
+    # Scrub GIT_* for this test AND for the script's own git call: a GIT_DIR exported by a hook
+    # would otherwise point both at the real repository.
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    for argv in ([git, "init", "-q"], [git, "add", "CHANGELOG.md", "changelog.d"]):
+        subprocess.run(argv, cwd=root, check=True)  # nosec B603
     (root / "changelog.d" / "2.fixed.md").write_text("- stray draft\n", encoding="utf-8")
     with pytest.raises(cf.FragmentError, match="not tracked") as caught:
         cf.assemble(root)
@@ -318,9 +343,18 @@ _RELEASED = _CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n## [0.5.
 
 
 def _pr_check(
-    tmp_path: Path, fragments: dict[str, str], head: str, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    fragments: dict[str, str],
+    head: str,
+    capsys: pytest.CaptureFixture[str],
+    declared: str = "0.5.0",
 ) -> tuple[int, str, str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     root = _repo(tmp_path, fragments, changelog=head)
+    (root / "messagefoundry").mkdir()
+    (root / "messagefoundry" / "__init__.py").write_text(
+        f'__version__ = "{declared}"\n', encoding="utf-8"
+    )
     base = tmp_path / "base-CHANGELOG.md"
     base.write_text(_CHANGELOG, encoding="utf-8")
     status = cf.main(["--root", str(root), "pr-check", "--base-changelog", str(base)])
@@ -343,7 +377,40 @@ def test_pr_check_refuses_entries_left_under_unreleased_after_the_rename(
     late = _RELEASED.replace("## [Unreleased]\n", "## [Unreleased]\n\n### Fixed\n- late entry\n", 1)
     status, _, err = _pr_check(tmp_path, {}, late, capsys)
     assert status == 1
-    assert "still holds 1 line" in err
+    assert "still holds 1 bullet" in err
+
+
+def test_pr_check_ignores_a_comment_left_under_unreleased(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    note = _RELEASED.replace("## [Unreleased]\n", "## [Unreleased]\n<!-- via changelog.d/ -->\n", 1)
+    status, _, _ = _pr_check(tmp_path, {}, note, capsys)
+    assert status == 0
+
+
+def test_pr_check_refuses_a_release_that_drops_unreleased(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Renaming without adding a fresh heading would break every later fragment pull request."""
+    renamed = _CHANGELOG.replace("## [Unreleased]\n", "## [0.5.0] - 2026-10-01\n", 1)
+    status, _, err = _pr_check(tmp_path, {}, renamed, capsys)
+    assert status == 1
+    assert "exactly one" in err
+
+
+def test_pr_check_allows_a_backfilled_heading_below_the_top(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A shipped maintenance release recorded after the fact is not a release of pending work: the
+    tree's declared version did not move to it."""
+    backfill = _CHANGELOG.replace("## [0.4.0]", "## [0.4.1] - 2026-09-30\n\n- hotfix\n\n## [0.4.0]")
+    status, _, _ = _pr_check(tmp_path, {"9.fixed.md": "- f\n"}, backfill, capsys, declared="0.4.0")
+    assert status == 0
+    # The same heading WITH the version bumped to it is a release, and is refused.
+    status, _, _ = _pr_check(
+        tmp_path / "bumped", {"9.fixed.md": "- f\n"}, backfill, capsys, declared="0.4.1"
+    )
+    assert status == 1
 
 
 def test_pr_check_passes_an_assembled_release_without_a_warning(
@@ -412,12 +479,12 @@ def test_ci_checks_every_pull_request_and_release_refuses_leftovers() -> None:
 
     release = steps("release.yml", "release")
     names = [str(s.get("name") or s.get("uses")) for s in release]
-    guard = [
+    tag_guard = [
         i
         for i, s in enumerate(release)
         if "changelog_fragments.py check --no-pending" in str(s.get("run"))
     ]
-    assert len(guard) == 1, "release.yml must refuse a tag while fragments remain"
+    assert len(tag_guard) == 1, "release.yml must refuse a tag while fragments remain"
     build = next(i for i, n in enumerate(names) if n.startswith("Build sdist"))
-    assert guard[0] < build, "the fragment guard must run before anything is built"
-    assert "refs/tags/" in str(release[guard[0]].get("if")), "the guard binds only a tag push"
+    assert tag_guard[0] < build, "the fragment guard must run before anything is built"
+    assert "refs/tags/" in str(release[tag_guard[0]].get("if")), "the guard binds only a tag push"

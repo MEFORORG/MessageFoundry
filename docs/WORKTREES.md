@@ -694,7 +694,8 @@ conflicted most. **`--ours` and `--theirs` both produce a file that passes every
 dropping someone's work** — no gate catches it, because the result is well-formed.
 
 **A pull request no longer edits `CHANGELOG.md` (BACKLOG #2080).** It adds a new fragment file under
-`changelog.d/`, and two new files never conflict. The release pull request folds them in; see
+`changelog.d/`. Two pull requests adding different files do not conflict; two that pick the same
+name still do. The release pull request folds them in; see
 `changelog.d/README.md`. The rule below still holds for any append-only file, and for an open pull
 request that still edits `CHANGELOG.md` directly.
 

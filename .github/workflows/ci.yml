@@ -462,21 +462,24 @@ jobs:
       # check out a merge commit built against the base as it was then; the tip can have moved
       # since, and diffing against it would warn on every pull request whose base gained an entry.
       # Measured on this branch: main gained 37 CHANGELOG.md lines in 8 commits, and a tip diff
-      # warned on a branch that never touched the file. The parent is read off the commit object and
-      # fetched into a THROWAWAY repository: a shallow fetch into this checkout can move its shallow
-      # boundary under later steps (see "Refused commit subjects"). If it cannot be read, the step
-      # warns and passes rather than wedging a required leg on a fetch.
+      # warned on a branch that never touched the file. The parent is read off the commit object.
+      # It is usually already here (the ledger gate fetched main), so that is tried first; otherwise
+      # it is fetched into a THROWAWAY repository, because a shallow fetch into this checkout can
+      # move its shallow boundary under later steps (see "Refused commit subjects"). If it cannot be
+      # read, the step warns and passes; the timeout keeps a stalled fetch from wedging the leg.
       - name: Changelog fragments against the base branch
         if: runner.os == 'Linux' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        timeout-minutes: 5
         run: |
           base_copy="$RUNNER_TEMP/base-CHANGELOG.md"
           scratch="$RUNNER_TEMP/changelog-base"
           # No pipe: under `-o pipefail` an early-exiting reader can fail the step on SIGPIPE.
           git cat-file -p HEAD > "$RUNNER_TEMP/head-commit"
           parent=$(awk '/^parent /{print $2; exit}' "$RUNNER_TEMP/head-commit")
-          if [ -n "$parent" ] && git init -q "$scratch" \
-             && git -C "$scratch" fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$parent" \
-             && git -C "$scratch" show "$parent:CHANGELOG.md" > "$base_copy"; then
+          if [ -n "$parent" ] && { git show "$parent:CHANGELOG.md" > "$base_copy" 2>/dev/null \
+             || { git init -q "$scratch" \
+                  && git -C "$scratch" fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$parent" \
+                  && git -C "$scratch" show "$parent:CHANGELOG.md" > "$base_copy"; }; }; then
             python scripts/release/changelog_fragments.py pr-check --base-changelog "$base_copy"
           else
             echo "::warning::could not read the base CHANGELOG.md; release.yml's tag guard is the backstop"
