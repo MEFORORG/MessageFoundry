@@ -14,7 +14,7 @@ The verify window is an operator knob: ``AuthService`` threads ``[auth].totp_ske
   authenticator can still log in) but the returned step is **clamped to the current step**, so consuming
   a tolerated future code never advances the single-use high-water mark past ``now`` — otherwise the
   user's own genuine current-step code (a non-greater step) would be rejected for up to ~30 s, a
-  self-inflicted lockout, not a bypass. ⚠️ The clamp does NOT preserve single-use here — it is what
+  self-inflicted lockout, not a bypass. WARNING: The clamp does NOT preserve single-use here — it is what
   costs it: recording a tolerated future code at ``now`` leaves that code's OWN step unspent, so the
   same code verifies again one step later (two successful uses, ASVS 6.5.1). Single-use holds only at
   the strict default. See test_optout_lets_one_tolerated_future_code_be_used_twice.

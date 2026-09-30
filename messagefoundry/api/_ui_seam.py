@@ -444,7 +444,7 @@ class UiDeps:
     #: Whether to interpose the "you are leaving this site" page at all. On by default; off is a
     #: posture decision and the serve gate says so.
     external_link_interstitial: bool = True
-    #: ⚠️ The audited escape — destinations navigated to with NO notification and NO cancel, which is
+    #: WARNING: The audited escape — destinations navigated to with NO notification and NO cancel, which is
     #: exactly what 3.7.3 asks for. Non-empty produces a startup warning naming every entry.
     external_link_allowlist: tuple[str, ...] = ()
     #: Host of the configured IdP authorization endpoint, for DISPLAY on the interstitial. Derived
