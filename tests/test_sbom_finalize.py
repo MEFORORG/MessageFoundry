@@ -131,3 +131,42 @@ def test_null_metadata_coerced(tmp_path: Path):
     )
     assert sbom_finalize.main([str(p)]) == 0
     assert _read(p)["metadata"]["lifecycles"] == [{"phase": "build"}]
+
+
+def _platform_values(doc: dict) -> list[str]:
+    return [
+        p["value"]
+        for p in doc["metadata"].get("properties", [])
+        if p.get("name") == sbom_finalize.PLATFORM_PROPERTY
+    ]
+
+
+def test_sys_platform_is_recorded_as_a_metadata_property(tmp_path: Path):
+    """The Linux and Windows engine SBOMs share a root component, so the label is what tells them
+    apart once the filename is gone."""
+    p = _write_bom(tmp_path)
+    assert sbom_finalize.main([str(p), "--sys-platform", "win32"]) == 0
+    assert _platform_values(_read(p)) == ["win32"]
+
+
+def test_sys_platform_replaces_rather_than_appends_and_keeps_other_properties(tmp_path: Path):
+    """A re-run with another value must leave ONE label, or a consumer reads two platforms."""
+    p = _write_bom(
+        tmp_path,
+        metadata={
+            "component": {"name": "messagefoundry", "type": "application"},
+            "properties": [{"name": "other:prop", "value": "kept"}],
+        },
+    )
+    assert sbom_finalize.main([str(p), "--sys-platform", "linux"]) == 0
+    assert sbom_finalize.main([str(p), "--sys-platform", "win32"]) == 0
+    doc = _read(p)
+    assert _platform_values(doc) == ["win32"]
+    assert {"name": "other:prop", "value": "kept"} in doc["metadata"]["properties"]
+
+
+def test_no_sys_platform_flag_writes_no_label(tmp_path: Path):
+    """The npm and container SBOMs call this helper without the flag and must not gain a label."""
+    p = _write_bom(tmp_path)
+    assert sbom_finalize.main([str(p)]) == 0
+    assert "properties" not in _read(p)["metadata"]
