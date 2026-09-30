@@ -46,7 +46,15 @@ maintainer.)
    pip install -e ".[dev,harness]"
    ```
 3. **Add a test for new behavior.**
-4. **Run the gates** — a change isn't ready until these pass (the PySide6 harness/Qt tests need the
+4. **Add a changelog fragment, and do not edit `CHANGELOG.md`.** A change a user or operator would
+   notice gets one new file, `changelog.d/<name>.<category>.md`, holding the bullet you would have
+   written under `[Unreleased]`. [changelog.d/README.md](changelog.d/README.md) has the naming
+   rules, the categories and an example. Check it with
+   `python scripts/release/changelog_fragments.py check`. The release pull request folds every
+   fragment into `CHANGELOG.md` with `python scripts/release/changelog_fragments.py assemble`.
+   This is the engine's changelog. A web console change still goes straight into
+   `packaging/messagefoundry-webconsole/CHANGELOG.md`.
+5. **Run the gates** — a change isn't ready until these pass (the PySide6 harness/Qt tests need the
    offscreen platform):
    ```powershell
    ruff check .
@@ -56,7 +64,7 @@ maintainer.)
    $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
    ```
    You can also run the project's own commit/CI gate: `python -m messagefoundry check`.
-5. **Install the commit hooks — including the leak gate — before your first commit:**
+6. **Install the commit hooks — including the leak gate — before your first commit:**
    ```powershell
    pip install pre-commit
    pre-commit install

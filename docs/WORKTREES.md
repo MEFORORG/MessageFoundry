@@ -689,9 +689,15 @@ looked at and silent about what it did not.** `main` moved seven times during on
 
 ### Resolving a conflict: never take a side wholesale
 
-`docs/BACKLOG.md` and `CHANGELOG.md` are single large files every session appends to, so they conflict
-most. **`--ours` and `--theirs` both produce a file that passes every check while silently dropping
-someone's work** — no gate catches it, because the result is well-formed.
+`docs/BACKLOG.md` and `CHANGELOG.md` were single large files every session appended to, so they
+conflicted most. **`--ours` and `--theirs` both produce a file that passes every check while silently
+dropping someone's work** — no gate catches it, because the result is well-formed.
+
+**A pull request no longer edits `CHANGELOG.md` (BACKLOG #2080).** It adds a new fragment file under
+`changelog.d/`. Two pull requests adding different files do not conflict; two that pick the same
+name still do. The release pull request folds them in; see
+`changelog.d/README.md`. The rule below still holds for any append-only file, and for an open pull
+request that still edits `CHANGELOG.md` directly.
 
 Re-apply intent instead: keep every entry from both sides, then verify the specific things you expect
 to survive. A real example — two PRs each adding a `### Changed` block under `[Unreleased]`: the union

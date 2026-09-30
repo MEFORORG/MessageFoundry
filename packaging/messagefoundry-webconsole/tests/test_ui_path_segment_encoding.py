@@ -53,7 +53,7 @@ from __future__ import annotations
 import pathlib
 import re
 
-from messagefoundry.api.models import DeadLetterList, DeadLetterRow
+from messagefoundry.api.models import DeadLetterList, DeadLetterRow, DeadLetterTarget
 from messagefoundry_webconsole.pages._common import _seg
 
 
@@ -84,7 +84,16 @@ def _dead_letters(channel: str, destination: str) -> DeadLetterList:
         message_type=None,
         received_at=0.0,
     )
-    return DeadLetterList(total=1, limit=50, offset=0, dead_letters=[row])
+    # The replay forms are built from replay_targets, not from the row (BACKLOG #1743 step 2), so the
+    # target carries the same two names the row does.
+    return DeadLetterList(
+        total=1,
+        limit=50,
+        offset=0,
+        dead_letters=[row],
+        replay_targets=[DeadLetterTarget(channel_id=channel, destination_name=destination)],
+        replayable_in_scope=True,
+    )
 
 
 def test_the_dead_letter_replay_forms_encode_a_name_carrying_a_slash() -> None:
@@ -102,11 +111,17 @@ def test_the_dead_letter_replay_forms_encode_a_name_carrying_a_slash() -> None:
 
     # The page's two filter arguments are required (BACKLOG #1743) and are passed the same names, so
     # the assertions below cover the pager's QUERY-side encoding as well as the forms' PATH-side one.
+    # Two renders: a destination filter leaves out the per-channel form (BACKLOG #1743 step 2), so
+    # the channel-only render is the one that draws it.
     html = str(
         dead_letters(
             _dead_letters("IB/ACME", "OB/PARTNER"),
             channel_id="IB/ACME",
             destination_name="OB/PARTNER",
+        )
+    ) + str(
+        dead_letters(
+            _dead_letters("IB/ACME", "OB/PARTNER"), channel_id="IB/ACME", destination_name=""
         )
     )
 
@@ -121,11 +136,19 @@ def test_a_benign_connection_name_still_renders_readably() -> None:
     """NEGATIVE CONTROL for the render path: encoding must not disfigure ordinary names."""
     from messagefoundry_webconsole.pages.messages import dead_letters
 
+    # Two renders, as above: the destination filter keeps its pager coverage, and the channel-only
+    # render draws the per-channel form.
     html = str(
         dead_letters(
             _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
             channel_id="IB_ACME_ADT",
             destination_name="OB_PARTNER_ADT",
+        )
+    ) + str(
+        dead_letters(
+            _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
+            channel_id="IB_ACME_ADT",
+            destination_name="",
         )
     )
     assert "/ui/dead-letters/IB_ACME_ADT/replay" in html

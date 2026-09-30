@@ -657,6 +657,10 @@ def test_the_powershell_detector_discriminates_on_encodability_not_on_ascii() ->
 # =================================================================================================
 
 _ENGINE = _ROOT / "messagefoundry"
+# The toolkit takes code OUT of messagefoundry/ (ADR 0201), so it takes the engine gate with it:
+# a module that moves must not leave the walk. It ships a console entry point of its own.
+_TOOLKIT = _ROOT / "messagefoundry_toolkit"
+_ENGINE_GATE_ROOTS = (_ENGINE, _TOOLKIT)
 
 
 # THE REACH ROOTS ACCEPT ONE REMEDY: `_calls_the_chokepoint` (BACKLOG #1875). Before that item this
@@ -776,6 +780,7 @@ def test_the_engine_scan_actually_covers_something() -> None:
     print(f"scanned {len(found)} python files under messagefoundry/")
     assert len(found) >= 200, f"only {len(found)} engine files -- the walk is not finding them"
     assert (_ENGINE / "__main__.py") in found
+    assert (_TOOLKIT / "__main__.py") in _modules_under(_TOOLKIT)
 
 
 class _RootScan(NamedTuple):
@@ -833,10 +838,14 @@ def _scan_root(root: Path) -> _RootScan:
 
 def test_no_engine_module_puts_an_unencodable_character_on_a_console() -> None:
     """The engine gate: a console-bound literal stays cp1252-safe unless its file hardens stdout."""
-    scan = _scan_root(_ENGINE)
-    print(f"console-bound and hardened, therefore allowed: {list(scan.exempted) or 'none'}")
-    assert not scan.offenders, "\n  ".join(
-        ["engine modules that can lose or abort console output:", *scan.offenders]
+    scans = [_scan_root(root) for root in _ENGINE_GATE_ROOTS]
+    # Both roots, so dropping the toolkit (ADR 0201) from the gate fails here, not as a quieter walk.
+    assert len(scans) >= 2, f"the engine gate scanned {len(scans)} root(s): {_ENGINE_GATE_ROOTS}"
+    exempted = [e for scan in scans for e in scan.exempted]
+    print(f"console-bound and hardened, therefore allowed: {exempted or 'none'}")
+    offenders = [o for scan in scans for o in scan.offenders]
+    assert not offenders, "\n  ".join(
+        ["engine modules that can lose or abort console output:", *offenders]
     )
 
 
@@ -844,7 +853,8 @@ def test_every_engine_module_decodes_as_utf8_and_parses() -> None:
     """Never a silent skip, for both reasons: a file that will not decode is the likeliest to carry
     the bytes this gate hunts, and a file that will not parse would make _printed_unencodable return
     an empty list that is indistinguishable from a clean one."""
-    broken = _scan_root(_ENGINE).unreadable
+    assert len(_ENGINE_GATE_ROOTS) >= 2, f"the engine gate names only {_ENGINE_GATE_ROOTS}"
+    broken = [b for root in _ENGINE_GATE_ROOTS for b in _scan_root(root).unreadable]
     assert not broken, "engine modules the scan could not read:\n  " + "\n  ".join(broken)
 
 
@@ -921,7 +931,7 @@ def _main(*body: str) -> tuple[str, ...]:
 def test_the_engine_hardening_signal_sees_the_real_entry_points() -> None:
     """Proved against the real files rather than a reconstruction of them: the two entry points the
     reach gate exempts today must be seen to call the chokepoint."""
-    for real in (_ENGINE / "__main__.py", _HARNESS / "__main__.py"):
+    for real in (_ENGINE / "__main__.py", _TOOLKIT / "__main__.py", _HARNESS / "__main__.py"):
         assert _calls_the_chokepoint(ast.parse(real.read_text(encoding="utf-8"))), real
 
 
@@ -1217,7 +1227,8 @@ def test_the_extension_would_have_caught_both_sites_it_was_built_for() -> None:
 # echoed as backslash escapes on stderr, and no scan of any file can see the path. The only control
 # that covers a value nobody wrote down is a hardened stream, so the decision this section records is
 # WHERE that hardening lives: at one chokepoint, `messagefoundry.console_streams`, called from the top
-# of every `__main__.py` under the two roots that ship console entry points. Placed file by file, it
+# of every `__main__.py` under the roots that ship console entry points (messagefoundry/, its
+# toolkit sibling messagefoundry_toolkit/ from ADR 0201, and harness/). Placed file by file, it
 # decayed; `harness/reconcile/__main__.py` was the one that never got it.
 #
 # The rule is keyed on `__main__.py` -- what `python -m <package>` runs -- and that is a FLOOR. A
@@ -1225,7 +1236,7 @@ def test_the_extension_would_have_caught_both_sites_it_was_built_for() -> None:
 # `harness/load/ingress_probe.py`, `messagefoundry/generators/adt.py` and
 # `messagefoundry/pipeline/_sandbox_worker.py` have one, and the last speaks a protocol over its
 # pipes, where re-encoding the stream would change a wire format rather than harden a console.
-# `tee/__main__.py` is outside both roots, like the rest of tee/.
+# `tee/__main__.py` is outside all three roots, like the rest of tee/.
 #
 # The runtime CONTROL, which drives the reconcile CLI with a non-cp1252 path under a cp1252 stream
 # and asserts the bytes come back intact, is `tests/test_console_streams.py`.
@@ -1243,7 +1254,7 @@ _ENTRY_POINTS_WITHOUT_A_CONSOLE = frozenset({"messagefoundry/tray/__main__.py"})
 def test_every_console_entry_point_hardens_at_the_chokepoint() -> None:
     found = {
         p.relative_to(_ROOT).as_posix(): p
-        for root in (_ENGINE, _HARNESS)
+        for root in (*_ENGINE_GATE_ROOTS, _HARNESS)
         for p in _modules_under(root)
         if p.name == "__main__.py"
     }
