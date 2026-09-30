@@ -32,6 +32,7 @@ the code rather than the runner is the sampling in :func:`_least_deadline_offset
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -504,3 +505,67 @@ async def test_the_equaliser_pads_on_ok_false_and_only_on_ok_false(
     ok = LoginOutcome(ok=True, token="t")
     assert await service._equalize_failure(ok, started, seam="t") is ok
     assert len(recorder.deadlines) == 1
+
+
+# --- the deferred audit writes (BACKLOG #2467) --------------------------------
+
+
+def _rows(count: int, each: float) -> list[Callable[[], Awaitable[None]]]:
+    """``count`` stand-in audit writes, each taking ``each`` seconds."""
+
+    async def row() -> None:
+        await asyncio.sleep(each)
+
+    return [row] * count
+
+
+async def test_the_deadline_does_not_move_with_the_number_of_audit_rows(
+    engine: Engine, recorder: _DeadlineRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the equaliser reads the clock for the deadline after the refusal's audit writes.
+
+    The ``queued`` value puts the write point 10 ms before a slot boundary, the shape a caller who
+    queues a second attempt on a name can pick. Read after the writes, zero rows answered on that
+    boundary and one or two rows on the next. Fixed before them, with room left, all three answer
+    on one deadline."""
+    budget = 0.4
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    failed = LoginOutcome(ok=False, error="nope")
+    offsets: dict[int, float] = {}
+    for count in (0, 1, 2):
+        started = time.monotonic()
+        await service._equalize_failure(
+            failed,
+            started,
+            seam="t",
+            queued=budget / 2 - 0.01,
+            writes=_rows(count, 0.03),
+            write_room=True,
+        )
+        offsets[count] = recorder.deadlines[-1] - started
+    spread = max(offsets.values()) - min(offsets.values())
+    assert spread < 0.001, f"the deadline depends on how many rows were written: {offsets}"
+
+
+async def test_writes_that_outrun_their_room_answer_on_a_whole_later_slot(
+    engine: Engine, recorder: _DeadlineRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writes longer than their room cannot put the raw elapsed on the wire: the answer waits to the
+    next slot boundary after they finish, the same fail-safe as work over the budget."""
+    budget = 0.2
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    started = time.monotonic()
+    # The write point is half a budget in and the rows take a whole one, so they end past slot 1.
+    await service._equalize_failure(
+        LoginOutcome(ok=False, error="nope"),
+        started,
+        seam="t",
+        writes=_rows(1, budget),
+        write_room=True,
+    )
+    finished = time.monotonic()
+    slots = (recorder.deadlines[-1] - started) / budget
+    assert abs(slots - round(slots)) < 1e-6 and round(slots) >= 2, slots
+    assert recorder.deadlines[-1] > finished - 0.001
