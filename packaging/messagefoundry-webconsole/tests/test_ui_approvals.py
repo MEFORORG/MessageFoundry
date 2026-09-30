@@ -18,7 +18,7 @@ import httpx
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision
 
 from messagefoundry.api import create_app
-from messagefoundry.api.models import ApprovalList, PendingApprovalInfo
+from messagefoundry.api.models import ApprovalDecisionResult, ApprovalList, PendingApprovalInfo
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import ApprovalsSettings
@@ -274,3 +274,27 @@ def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:
     empty = ApprovalList(approvals=[])
     assert "Request rejected" in str(pages.approvals_page(empty, notice="rejected"))
     assert "anything" not in str(pages.approvals_page(empty, notice="anything"))
+
+
+def test_a_release_that_did_no_work_says_so() -> None:
+    # A purge released while its outbound still runs skips, and the request is closed anyway.
+    def _page(result: dict[str, object]) -> str:
+        outcome = ApprovalDecisionResult(
+            operation="connection_purge", requested_by="maker", approved_by="checker", result=result
+        )
+        return str(pages.approval_approved(outcome))
+
+    skipped = _page({"cancelled": 0, "skipped": "outbound running"})
+    assert "The operation skipped its work: outbound running." in skipped
+    degraded = _page({"inbound": 1, "outbound": 1, "degraded": True, "failures": ["audit"]})
+    assert "at least one follow-on step failed" in degraded
+    clean = _page({"requeued": 2})
+    assert "skipped its work" not in clean and "follow-on step failed" not in clean
+
+
+def test_a_bulk_purge_with_a_held_destination_links_to_approvals() -> None:
+    # The nav links to the page on every render, so look only inside <main>.
+    held = str(pages.purge_result("all", [("out1", "held for approval (" + "a" * 32 + ")")]))
+    assert 'href="/ui/approvals"' in held.split("<main>", 1)[1]
+    purged = str(pages.purge_result("all", [("out1", "purged 0")]))
+    assert 'href="/ui/approvals"' not in purged.split("<main>", 1)[1]

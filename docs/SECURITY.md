@@ -1176,9 +1176,10 @@ else would need its own authorization rule stated here.
    `POST /ui/messages/search/presets/{preset_id}/delete` mirrors
    `DELETE /search/presets/{preset_id}` (`require_paced`, a floor `require_ui` charges too), deleting
    a saved query, not PHI. It is flagged because `POST /search/presets`, same method and
-   permission, carries `require_step_up`. `POST /ui/approvals/{approval_id}/approve` and
-   `POST /ui/approvals/{approval_id}/reject` (BACKLOG #1982) mirror `POST /approvals/{approval_id}/approve`
-   and `/reject` (`require_paced`, a floor `require_ui` charges too). They are flagged because
+   permission, carries `require_step_up`. The other two are
+   `POST /ui/approvals/{approval_id}/approve` and `POST /ui/approvals/{approval_id}/reject`
+   (BACKLOG #1982), which mirror `POST /approvals/{approval_id}/approve` and `/reject`
+   (`require_paced`, a floor `require_ui` charges too). They are flagged because
    `POST /approvals/{approval_id}/resolve`, same method and permission, carries `require_step_up`.
    The console does not offer the resolve, so that step-up has no console route to be missing from.
 

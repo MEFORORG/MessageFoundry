@@ -483,6 +483,8 @@ def purge_result(scope: str, outcomes: list[tuple[str | None, str]]) -> Markup:
         el("h1", "Queue purge"),
         el("p", f"Scope: {scope}. {len(outcomes)} destination(s) processed.", class_="muted"),
         _outcomes_table(outcomes),
+        # BACKLOG #1982: a held destination is released on the Approvals page.
+        approvals_link() if any("held for approval" in r for _d, r in outcomes) else Markup(""),
         el("p", el("a", "← Connections", href="/ui")),
         class_="card",
     )
