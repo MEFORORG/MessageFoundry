@@ -7,6 +7,16 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **BREAKING: `adr-analyze` moved to a separate `messagefoundry-toolkit` command, and out of the
+  engine wheel.** ADR 0201 slice 2 adds a third sibling distribution, `messagefoundry-toolkit`,
+  released in lockstep with the engine and pinned to the engine's own version. It carries the
+  authoring and development commands, and `adr-analyze` is the first to move: its module is
+  `messagefoundry_toolkit/adr_analyze.py`, and the engine wheel no longer ships
+  `messagefoundry/adr_analyze.py`. `messagefoundry adr-analyze` now exits 2 with one line naming
+  `messagefoundry-toolkit adr-analyze`, as `{"error": ...}` on stdout under `--json`, and the engine's
+  `--help` names the moved commands in its epilog. In a checkout, run `python -m
+  messagefoundry_toolkit adr-analyze`. An installed toolkit refuses to run beside an engine of another
+  version. The other toolkit rows of `CLI_TIERS` move in later slices. (`BACKLOG #1192`, ASVS 15.2.3)
 - **Turning the sign-in limiter or the account lockout off is now warned, not silent.** While
   sign-in is on, `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a
   `login_rate_limit_per_ip` or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds`

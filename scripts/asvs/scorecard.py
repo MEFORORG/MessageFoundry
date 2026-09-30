@@ -1715,7 +1715,15 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
 
 def _python_sources(root: Path) -> list[Path]:
     out: list[Path] = []
-    for pkg in ("messagefoundry", "messagefoundry_webconsole", "harness", "scripts"):
+    # messagefoundry_toolkit receives code that moves out of messagefoundry/ (ADR 0201), so an
+    # absence claim must keep reading it there.
+    for pkg in (
+        "messagefoundry",
+        "messagefoundry_webconsole",
+        "messagefoundry_toolkit",
+        "harness",
+        "scripts",
+    ):
         base = root / pkg
         if base.is_dir():
             out.extend(

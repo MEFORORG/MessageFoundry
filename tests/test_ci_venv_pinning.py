@@ -399,7 +399,7 @@ SECURITY_YML_PIP_BOOTSTRAPS = 4
 #: diff-coverage step reports "skipped" and exits 0).
 #:
 #: `release-tools.lock` carries the largest count and needs the exact number most, because ONE of its
-#: five `release.yml` sites fails quietly. Losing the install would still leave `python -m build` and
+#: six `release.yml` sites fails quietly. Losing the install would still leave `python -m build` and
 #: `python -m sigstore` failing loudly; `python -m cyclonedx_py` failing reads as the release breaking at
 #: the SBOM, not as a pinning regression. Read each job's own `permissions:` block for what those sites
 #: run with — restating it here would be a second copy free to drift, and the first draft of this comment
@@ -411,7 +411,8 @@ LOCK_INSTALLED_TOOLCHAINS = (
     ("security.yml", "ci/locks/ci-scanners.lock", 5),
     ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
     ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
-    ("release.yml", "ci/locks/release-tools.lock", 5),
+    # SIX since ADR 0201: the toolkit build step in the `release` job installs its own `build`.
+    ("release.yml", "ci/locks/release-tools.lock", 6),
     ("security.yml", "ci/locks/release-tools.lock", 1),
     # The last two were installing from a lock with no row here, so no exact count watched them
     # (BACKLOG #1545). `required-workflow-state.yml` installs `ci-scanners.lock` for PyYAML in both of
@@ -2169,7 +2170,7 @@ def _sbom_step_installs(workflow: str) -> tuple[str, ...]:
     SCOPED TO THE STEP, and that scoping is the whole point of this helper. Until 2026-09-10 the two
     installs could be found by searching the file for a line naming `cyclonedx-bom`; BACKLOG #332 step 6
     moved that tool into `ci/locks/release-tools.lock`, so the line is now
-    `pip install --require-hashes -r ci/locks/release-tools.lock` -- which `release.yml` runs at FIVE
+    `pip install --require-hashes -r ci/locks/release-tools.lock` -- which `release.yml` runs at SIX
     sites. An unscoped search would have compared an arbitrary one of them against `security.yml`'s and
     reported agreement it had not actually checked.
 
