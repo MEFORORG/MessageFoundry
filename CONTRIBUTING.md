@@ -59,7 +59,7 @@ maintainer.)
    ```powershell
    ruff check .
    ruff format --check .
-   mypy messagefoundry
+   mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit   # the packages CI checks
    mypy --explicit-package-bases tests   # needs CI's extras: scripts\worktree\ensure-venv.ps1 installs them
    $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
    ```

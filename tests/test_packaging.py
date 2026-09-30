@@ -942,6 +942,23 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
 
 
+def test_the_toolkit_wheel_ships_the_license_and_notice() -> None:
+    """BACKLOG #1192: the toolkit wheel carried no LICENSE or NOTICE, unlike the engine and console.
+
+    It declares both as PEP 639 ``license-files`` from its own directory, and its LICENSE is a copy
+    of the root one, so this pins the copy byte-identical: a license text edited in one place only
+    would ship two different licenses under one project name.
+    """
+    toolkit_dir = _TOOLKIT_PYPROJECT.parent
+    project = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    assert project.get("license-files") == ["LICENSE", "NOTICE"], project.get("license-files")
+    for name in ("LICENSE", "NOTICE"):
+        assert (toolkit_dir / name).is_file(), f"{name} is declared but missing from {toolkit_dir}"
+    assert (toolkit_dir / "LICENSE").read_bytes() == (_REPO / "LICENSE").read_bytes(), (
+        "packaging/messagefoundry-toolkit/LICENSE differs from the root LICENSE"
+    )
+
+
 def test_the_toolkit_console_script_is_its_main() -> None:
     """``messagefoundry-toolkit`` must run the same entry as ``python -m messagefoundry_toolkit``,
     and that entry must exist, or a fresh install gets a console script that dies on import."""

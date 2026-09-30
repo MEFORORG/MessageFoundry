@@ -199,14 +199,16 @@ def test_release_load_bearing_canaries_present() -> None:
         # Sigstore keyless signing over the artifacts AND the SBOM + VEX (space-separated in the sign cmd)
         "Sigstore keyless sign": "python -m sigstore sign dist/*.tar.gz dist/*.whl",
         "Sigstore signs SBOM + VEX": "messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json",
-        # SLSA build provenance; subjects now also bind the SBOM + VEX (comma-separated in
-        # subject-path). Its guard is checked on the step itself, not as a whole-file literal: the
+        # SLSA build provenance; subjects now also bind the SBOM + VEX and the toolkit wheel
+        # (comma-separated in subject-path; the toolkit's own test is
+        # test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle).
+        # Its guard is checked on the step itself, not as a whole-file literal: the
         # visibility half by `test_the_attestation_step_keeps_its_visibility_test`, the event-and-ref
         # half by section (4b) (BACKLOG #1805).
         "SLSA attest action pinned": "uses: actions/attest-build-provenance@",
         "SLSA subjects incl SBOM + VEX": (
             'subject-path: "dist/*.tar.gz, dist/*.whl, '
-            'messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"'
+            'messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json, toolkit-dist/*.whl"'
         ),
         # PyPI publish via the pinned pypa action, tag-gated, reading the clean staging dir
         "PyPI publish action pinned": "uses: pypa/gh-action-pypi-publish@",
@@ -2194,8 +2196,70 @@ def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
         "the toolkit upload is gated on a repository variable -- ADR 0201 rejects that, because an "
         "unset variable lets an engine that names the toolkit reach PyPI with the name unclaimed"
     )
-    # Never into dist/: that would pull the toolkit into the engine smoke, signing and staged upload.
+    # Never into dist/: that would pull the toolkit into the engine smoke and the staged upload.
     assert "--outdir toolkit-dist" in str(steps[build].get("run") or "")
+
+
+def test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle() -> None:
+    """BACKLOG #1192: the toolkit wheel gets the engine wheel's provenance, by explicit name.
+
+    It lives in toolkit-dist/, so no `dist/*` glob reaches it. Each assertion names one sink it
+    could silently drop out of: the Sigstore call, the SLSA subjects, the GitHub release assets and
+    the dry-run upload. The bundle must also LEAVE toolkit-dist/ before the toolkit's PyPI publish,
+    which uploads that directory whole: `sigstore sign` writes the bundle beside its input, and twine
+    rejects a bundle, so a bundle left there fails the upload that claims the toolkit's name.
+    """
+    steps = [s for s in _jobs()["release"]["steps"] if isinstance(s, dict)]
+
+    def one(pred: Callable[[dict], bool], what: str) -> int:
+        hits = [i for i, s in enumerate(steps) if pred(s)]
+        assert len(hits) == 1, f"expected one {what} step in `release`, found {hits}"
+        return hits[0]
+
+    def shell(i: int) -> str:
+        return _executed_shell(str(steps[i].get("run") or ""))
+
+    sign = one(lambda s: "python -m sigstore sign" in str(s.get("run") or ""), "Sigstore")
+    lines = shell(sign).replace("\\\n", " ").splitlines()
+    sign_cmds = [ln.split() for ln in lines if "python -m sigstore sign" in ln]
+    assert len(sign_cmds) == 1, sign_cmds
+    assert "toolkit-dist/*.whl" in sign_cmds[0], sign_cmds[0]
+    sign_at = next(n for n, ln in enumerate(lines) if "python -m sigstore sign" in ln)
+    moves = [
+        n
+        for n, ln in enumerate(lines)
+        if ln.split() == ["mv", "toolkit-dist/*.sigstore*", "toolkit-sigstore/"]
+    ]
+    assert moves and moves[0] > sign_at, (
+        "the toolkit bundle is not moved out of toolkit-dist/ after signing, so the toolkit's PyPI "
+        "upload would carry it"
+    )
+
+    attest = one(
+        lambda s: str(s.get("uses") or "").startswith("actions/attest-build-provenance@"), "SLSA"
+    )
+    subjects = [p.strip() for p in str(steps[attest]["with"]["subject-path"]).split(",")]
+    assert "toolkit-dist/*.whl" in subjects, subjects
+
+    release = one(lambda s: "gh release upload" in str(s.get("run") or ""), "GitHub release")
+    assets = re.search(r"assets=\((.*?)\)", shell(release), re.S)
+    assert assets, "the GitHub release step lost its `assets=( ... )` array"
+    assert {"toolkit-dist/*.whl", "toolkit-sigstore/*.sigstore*"} <= set(assets.group(1).split())
+
+    upload = one(
+        lambda s: (
+            "upload-artifact" in str(s.get("uses") or "")
+            and "toolkit-dist/" in str((s.get("with") or {}).get("path") or "")
+        ),
+        "dry-run upload",
+    )
+    assert "toolkit-sigstore/" in str(steps[upload]["with"]["path"]).split(), steps[upload]
+
+    publish = one(
+        lambda s: str(s.get("name") or "").startswith("Publish messagefoundry-toolkit"),
+        "toolkit publish",
+    )
+    assert sign < attest < release < publish, (sign, attest, release, publish)
 
 
 #: The engine smoke's import probe. ``flags`` is what the step passes the interpreter BEFORE ``-c``;

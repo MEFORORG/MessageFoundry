@@ -406,8 +406,8 @@ jobs:
       # the toolkit is published while the name is unclaimed, and no person has to remember an order.
       # A separate job gated on a repository variable, as `release-harness` is, was rejected: a variable
       # that can be unset IS that window. Built into toolkit-dist/, never dist/: sharing dist/ would
-      # pull the toolkit into the engine smoke above, the py.typed check, the signing and the staged
-      # engine upload.
+      # pull the toolkit into the engine smoke above, the py.typed check and the staged engine upload.
+      # The Sigstore, SLSA and release-asset steps below name toolkit-dist/ explicitly instead.
       - name: Build the toolkit wheel (wheel-only, into toolkit-dist/ — ADR 0201)
         run: |
           # HASH-PINNED, and installed HERE rather than trusted from the engine's build step: a step
@@ -751,9 +751,17 @@ jobs:
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
           # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
-          python -m sigstore sign dist/*.tar.gz dist/*.whl \
+          # The toolkit wheel is signed in the same call (ADR 0201, BACKLOG #1192), and its bundle is then
+          # MOVED out of toolkit-dist/. `sigstore sign` writes `<input>.sigstore.json` beside each input,
+          # and the toolkit's PyPI publish below uploads toolkit-dist/ whole, where twine rejects a bundle
+          # (the reason dist-pub/ exists for the engine). So toolkit-dist/ keeps only the wheel its member
+          # gate inspected, and toolkit-sigstore/ carries the bundle to the release assets.
+          python -m sigstore sign dist/*.tar.gz dist/*.whl toolkit-dist/*.whl \
             messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json
           ls -l dist/ messagefoundry-sbom.cdx.json.sigstore* messagefoundry-vex.openvex.json.sigstore*
+          mkdir -p toolkit-sigstore
+          mv toolkit-dist/*.sigstore* toolkit-sigstore/
+          ls -l toolkit-dist/ toolkit-sigstore/
 
       # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
       # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
@@ -788,7 +796,7 @@ jobs:
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && !github.event.repository.private }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"
+          subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json, toolkit-dist/*.whl"
 
       # CREATE-OR-UPDATE, not create. This was a bare `gh release create`, which fails with "a release
       # with the same tag name already exists" on any re-run — and because it sits BEFORE the PyPI
@@ -817,7 +825,7 @@ jobs:
             *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
             *)   pre_create="";             pre_edit="--prerelease=false" ;;
           esac
-          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore* toolkit-dist/*.whl
+          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore* toolkit-dist/*.whl toolkit-sigstore/*.sigstore*
                    messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore*
                    messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* )
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -873,6 +881,7 @@ jobs:
           path: |
             dist/
             toolkit-dist/
+            toolkit-sigstore/
             messagefoundry-sbom.cdx.json
             messagefoundry-sbom.cdx.json.sigstore*
             messagefoundry-vex.openvex.json

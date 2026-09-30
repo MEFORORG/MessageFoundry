@@ -19,7 +19,12 @@ decision record is [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality
 | PEP 740 attestations | PyPI-side provenance (Trusted Publishing) | PyPI |
 | SLSA build provenance | in-toto attestation binding each artifact (incl. SBOM + VEX) to the source commit | GitHub attestations / Sigstore bundle |
 
-Every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
+The toolkit wheel (`messagefoundry-toolkit`, ADR 0201) is built in the engine's release job. That
+job also signs it and writes its SLSA provenance, and attaches the wheel and its `.sigstore.json`
+bundle to the GitHub release (BACKLOG #1192). So both verification commands below work on it too. It
+has no SBOM of its own.
+
+Apart from that, every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
 job in `release.yml` sets `attestations: true`. So the web console wheel (`messagefoundry-webconsole`)
 and the harness wheel get a PyPI-side attestation whenever their PyPI publish runs. Both of those
 publishes are gated on a repository variable. That is all they get: their release jobs have no

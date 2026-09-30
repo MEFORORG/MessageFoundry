@@ -146,12 +146,14 @@ different ecosystem); see *VS Code extension & test harness* below for where to 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow
 > and published with **PEP 740 attestations** — all three publish jobs set `attestations: true`.
 >
-> **Sigstore signing, SLSA build-provenance and the CycloneDX SBOM cover the ENGINE wheel only.** The
+> **Sigstore signing and SLSA build-provenance cover the ENGINE wheel and the TOOLKIT wheel only, and
+> the CycloneDX SBOM covers the ENGINE only.** The `messagefoundry-toolkit` wheel is built in the
+> engine's release job, which signs and attests it (BACKLOG #1192). The
 > `messagefoundry-webconsole` and `messagefoundry-harness` release jobs contain no signing, attestation
 > or SBOM step (BACKLOG #1193) — this note previously said "every release", which is why it is spelled
 > out per artifact rather than tightened in place. So `gh attestation verify` finds a GitHub
-> attestation for the engine wheel and **will not** find one for the console or harness wheel; those
-> carry the PyPI-side attestation only.
+> attestation for the engine and toolkit wheels and **will not** find one for the console or harness
+> wheel; those carry the PyPI-side attestation only.
 >
 > Verify a downloaded **engine** wheel against its source commit with
 > `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry`, or pull the signed wheel + SBOM
