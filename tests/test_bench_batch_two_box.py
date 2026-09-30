@@ -575,3 +575,51 @@ async def test_batch_driver_crashed_band_fails_cell_not_absent(
     zero_loss = next((s for s in report.slos if s.name == "zero_loss"), None)
     assert zero_loss is not None and zero_loss.ok is False
     assert report.exit_code != 0
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #2012 -- the two-box outputs name their rate window, and it is not the sweep's
+# --------------------------------------------------------------------------------------------------
+
+
+def test_a_two_box_cell_names_the_hold_bracket_window() -> None:
+    from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, RATE_WINDOW
+
+    cell = bb.iter_batch_cells(_profile(), claim_mode="pooled")[3]
+    rec = bb.aggregate_cell_record(cell, [_fake_proc(sent=10, sink=10, read=150.0, arm_b1=True)])
+    failed = bb._failed_cell_record(cell, "boom")
+    for record in (rec, failed):
+        assert record.rate_window == HOLD_BRACKET_RATE_WINDOW
+        assert record.to_json_dict()["rate_window"] == HOLD_BRACKET_RATE_WINDOW
+    # The control: the two-box window is a different value from the sweep's, so they never pool.
+    assert HOLD_BRACKET_RATE_WINDOW != RATE_WINDOW
+
+
+def test_the_remote_report_json_names_its_rate_window() -> None:
+    from harness.load.connscale.remote import ConnScaleRemoteReport
+    from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, NoLoss
+
+    remote = ConnScaleRemoteReport(
+        engine_bands=1,
+        count_per_band=4,
+        per_conn_rate=1.0,
+        offered_aggregate_rate=4.0,
+        engine_index_base=0,
+        sink_host="127.0.0.1",
+        sink_ports=(40000,),
+        hold_start_iso="2026-09-30T00:00:00Z",
+        drain_complete_iso="2026-09-30T00:00:05Z",
+        achieved_aggregate_rate=4.0,
+        delivered_aggregate_rate=4.0,
+        sent=8,
+        acked=8,
+        nak=0,
+        deferred=0,
+        timeouts=0,
+        no_loss=NoLoss(True, 8, 8, 8, 8, 0, "ok"),
+        in_pipeline_peak=0,
+        drain_seconds=0.5,
+    )
+    throughput = remote.to_json_dict()["throughput"]
+    assert isinstance(throughput, dict)
+    assert throughput["rate_window"] == HOLD_BRACKET_RATE_WINDOW

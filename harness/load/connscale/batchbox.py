@@ -46,6 +46,7 @@ from harness.load.connscale.profile import FUSE_OFF, ConnScaleProfile
 from harness.load.connscale.report import (
     EXIT_OK,
     EXIT_SLO_VIOLATION,
+    HOLD_BRACKET_RATE_WINDOW,
     ConnScaleRecord,
     ConnScaleReport,
     NoLoss,
@@ -332,6 +333,7 @@ def aggregate_cell_record(
     )
 
     return ConnScaleRecord(
+        rate_window=HOLD_BRACKET_RATE_WINDOW,
         sweep_mode=cell.sweep_mode,
         count=cell.count,
         offered_aggregate_rate=offered,
@@ -389,6 +391,7 @@ def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
         detail=f"cell drive failed: {detail}",
     )
     return ConnScaleRecord(
+        rate_window=HOLD_BRACKET_RATE_WINDOW,
         sweep_mode=cell.sweep_mode,
         count=cell.count,
         offered_aggregate_rate=0.0,
@@ -772,6 +775,7 @@ async def run_batch_driver(
                     "sink_received": record.no_loss.sink_received,
                     "no_loss_ok": record.no_loss.ok,
                     "achieved_read_per_s": round(record.achieved_read_per_s, 2),
+                    "rate_window": record.rate_window,
                 },
             )
         except (ConnScaleError, OSError, ValueError) as exc:

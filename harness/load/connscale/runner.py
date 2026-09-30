@@ -53,6 +53,7 @@ from harness.load.connscale.profile import ConnScaleProfile
 from harness.load.connscale.report import (
     EXIT_OK,
     EXIT_SLO_VIOLATION,
+    RATE_WINDOW,
     ConnScaleRecord,
     ConnScaleReport,
     NoLoss,
@@ -1577,6 +1578,7 @@ def _build_record(
         reload_lookback_s=None if ra is None else ra.lookback_s,
         reload_reconnect_timeout_s=None if ra is None else ra.reconnect_timeout_s,
         reload_not_applied=None if ra is None else ra.not_applied,
+        rate_window=RATE_WINDOW,
     )
 
 

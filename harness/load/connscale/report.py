@@ -38,7 +38,7 @@ from harness.load.connscale.intake_audit import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from harness.load.connscale.compare import (
         ClaimModeComparison,
@@ -61,6 +61,25 @@ SCHEMA_VERSION = 1
 #: `scripts/connscale_harvest.py` filters on the exact name and each value, so a new window gets a
 #: new value and the harvest a new population; never reuse or rename one.
 RATE_WINDOW = "in_hold_excl_drain_reload_tail"
+
+#: The rate window of the two-box path (BACKLOG #2012). ``connscale-remote`` reads the engine once
+#: as the hold starts and once as it ends, and divides by the hold's length; the batch driver takes
+#: its rates from those reports. That window was never moved by #1420 or #2024, so it carries its
+#: own value rather than borrowing `RATE_WINDOW`, and the two never compare.
+HOLD_BRACKET_RATE_WINDOW = "hold_bracket"
+
+
+def records_rate_window(records: Iterable[ConnScaleRecord]) -> str | None:
+    """The one rate window a set of records was computed over, for an output built from several.
+
+    ``None`` when no record says. Two different windows, or a said and an unsaid one, come back
+    joined with ``|``, so a reader sees the mix rather than whichever record came first.
+    """
+    windows = sorted({r.rate_window or "unrecorded" for r in records})
+    if not windows or windows == ["unrecorded"]:
+        return None
+    return "|".join(windows)
+
 
 # The shared rule (harness/_spreadsheet.py) — this module used to carry its own copy, and was the one
 # writer with no formula-injection test at all, which is how the copies drifted unnoticed.
@@ -261,6 +280,11 @@ class ConnScaleRecord:
     reload_lookback_s: float | None = None
     reload_reconnect_timeout_s: float | None = None
     reload_not_applied: bool | None = None
+    # Which window this record's rates were computed over (BACKLOG #2012): `RATE_WINDOW` for a sweep
+    # step, `HOLD_BRACKET_RATE_WINDOW` for a two-box cell. The window moved at #1420 and again at
+    # #2024, so two records compare only where this matches. None means not recorded: a record
+    # built by hand, or read from an older artifact.
+    rate_window: str | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -270,6 +294,9 @@ class ConnScaleRecord:
             "sweep_mode": self.sweep_mode,
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),
+            # The window the `achieved` and `wall3_empty_claims` rates read (BACKLOG #2012). The
+            # `cpu` fields come from the OS probe's own readings and are not in it.
+            "rate_window": self.rate_window,
             "achieved": {
                 "read_per_s": round(self.achieved_read_per_s, 2),
                 "written_per_s": round(self.achieved_written_per_s, 2),

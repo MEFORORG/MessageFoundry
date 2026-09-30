@@ -221,3 +221,80 @@ def test_console_render_runs() -> None:
     text = rep.render_console()
     assert "Connection-scale report" in text
     assert "RESULT: PASS" in text
+
+
+# --- BACKLOG #2012: every JSON output that carries a rate names the window it was computed over ----
+
+
+def _swept(
+    *, claim_mode: str = "per_lane", fuse: bool = False, batch: bool = False
+) -> ConnScaleRecord:
+    """A record as a sweep step builds it: through `_build_record`, not the dataclass default."""
+    from harness.load.connscale.runner import _build_record
+    from harness.load.enginepoll import EnginePoller
+    from harness.load.metrics import Counters, Histogram
+
+    return _build_record(
+        claim_mode=claim_mode,
+        fuse_mode=fuse,
+        batch_mode=batch,
+        mode="fixed_aggregate",
+        count=12,
+        aggregate_rate=24.0,
+        metrics_counters=Counters(),
+        ack_hist=Histogram(),
+        poller=EnginePoller("http://127.0.0.1:1", token=None, origin=0.0),
+        samples=[],
+        in_hold_samples=0,
+        in_hold_floor_ticks=0,
+        proc_readings=[],
+        drain_seconds=1.0,
+        reload_seconds=None,
+    )
+
+
+def test_a_sweep_record_and_its_json_name_the_rate_window() -> None:
+    from harness.load.connscale.report import RATE_WINDOW
+
+    rec = _swept()
+    assert rec.rate_window == RATE_WINDOW
+    assert rec.to_json_dict()["rate_window"] == RATE_WINDOW
+    # A record built by hand says nothing, rather than claiming a window nobody measured.
+    assert _record(mode="fixed_aggregate", count=12).to_json_dict()["rate_window"] is None
+
+
+def test_each_comparison_json_names_the_rate_window_of_its_records() -> None:
+    from harness.load.connscale.compare import (
+        build_batch_comparison,
+        build_comparison,
+        build_fuse_comparison,
+    )
+    from harness.load.connscale.report import RATE_WINDOW
+
+    claim = build_comparison([_swept(), _swept(claim_mode="pooled")], ("per_lane", "pooled"))
+    fuse = build_fuse_comparison(
+        [_swept(claim_mode="pooled"), _swept(claim_mode="pooled", fuse=True)], (False, True)
+    )
+    batch = build_batch_comparison(
+        [_swept(claim_mode="pooled"), _swept(claim_mode="pooled", batch=True)], (False, True)
+    )
+    for comparison in (claim, fuse, batch):
+        assert comparison is not None
+        assert comparison.to_json_dict()["rate_window"] == RATE_WINDOW
+
+
+def test_a_mix_of_windows_is_shown_as_a_mix() -> None:
+    from harness.load.connscale.report import (
+        HOLD_BRACKET_RATE_WINDOW,
+        RATE_WINDOW,
+        records_rate_window,
+    )
+
+    swept = _swept()
+    bracket = dataclasses.replace(swept, rate_window=HOLD_BRACKET_RATE_WINDOW)
+    unsaid = _record(mode="fixed_aggregate", count=12)
+    assert records_rate_window([]) is None
+    assert records_rate_window([unsaid]) is None
+    assert records_rate_window([swept, swept]) == RATE_WINDOW
+    assert records_rate_window([swept, bracket]) == f"{HOLD_BRACKET_RATE_WINDOW}|{RATE_WINDOW}"
+    assert records_rate_window([swept, unsaid]) == f"{RATE_WINDOW}|unrecorded"
