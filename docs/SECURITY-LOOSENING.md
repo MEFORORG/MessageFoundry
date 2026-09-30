@@ -564,7 +564,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
 > limiter off, a count or window changes nothing, so only `login_rate_limit_enabled` is named, and a
-> window of `0` or less likewise stands in for its counts. **The cutoff is the shipped default, not a
+> window of `0` or less likewise stands in for its counts. A short window is not named when every count
+> it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
 > value at or stricter than the default is not reported. That includes a **negative** count, and a

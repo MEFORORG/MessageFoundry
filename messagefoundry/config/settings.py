@@ -6120,7 +6120,7 @@ def _trust_every_peer_entries(entries: Sequence[str]) -> list[str]:
         named += [entry for entry, net in v4 if net.num_addresses > 1]
     if any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6)):
         named += [entry for entry, net in v6 if net.num_addresses > 1]
-    return named
+    return list(dict.fromkeys(named))  # a repeated entry is named once, in order
 
 
 def _auth_default(field: str) -> Any:
@@ -6177,14 +6177,19 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         elif value > default:
             out.append((field, f"{what} is {value}, above the default of {default}, so {so}"))
 
-    def _window(field: str, value: float, *, what: str, off: str | None) -> bool:
+    def _window(
+        field: str, value: float, *, what: str, off: str | None, counts: tuple[int, ...]
+    ) -> bool:
         """A window: named at 0 or less where ``off`` says what that turns off, and below its
-        default. Returns whether the window still counts anything, which gates its counts."""
+        default. Returns whether the window still counts anything, which gates its counts.
+
+        ``counts`` are the counts the window paces. When every one is 0 (off), a short window
+        changes nothing, so it is not named as looser; each off count is named on its own."""
         default = _auth_default(field)
         if off is not None and value <= 0:
             out.append((field, off))
             return False
-        if value < default:
+        if value < default and any(counts):
             out.append(
                 (
                     field,
@@ -6224,6 +6229,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
             "still reads as on"
         ),
+        counts=(auth.login_rate_limit_per_ip, auth.login_rate_limit_global),
     ):
         _count(
             "login_rate_limit_per_ip",
@@ -6329,6 +6335,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             "it is counted -- no PHI-read limit holds, although phi_read_rate_limit_enabled still "
             "reads as on"
         ),
+        counts=(auth.phi_read_rate_limit_per_actor, auth.phi_read_rate_limit_global),
     ):
         _count(
             "phi_read_rate_limit_per_actor",
@@ -6362,6 +6369,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             auth.admin_write_rate_limit_window_seconds,
             what="the admin-write rate-limit window",
             off=None,
+            # Only the count reads the window: the gap is shorter than it (checked at load), so
+            # the last write is never pruned before the gap is measured.
+            counts=(auth.admin_write_rate_limit_per_actor,),
         )
         _count(
             "admin_write_rate_limit_per_actor",

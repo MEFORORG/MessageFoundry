@@ -618,6 +618,37 @@ def test_a_short_window_is_named_beside_its_loose_counts() -> None:
     assert off == ["login_rate_limit_window_seconds"]
 
 
+def test_a_short_window_over_counts_that_are_all_off_is_not_named() -> None:
+    """Review round 2: a window paces only its counts. With every one at 0 it paces nothing, so
+    naming it as looser would be a false warning; the zeroed counts are named instead."""
+    assert _names(
+        auth=AuthSettings(
+            login_rate_limit_per_ip=0,
+            login_rate_limit_global=0,
+            login_rate_limit_window_seconds=1.0,
+        )
+    ) == ["login_rate_limit_per_ip", "login_rate_limit_global"]
+    assert _names(
+        auth=AuthSettings(phi_read_rate_limit_per_actor=0, phi_read_rate_limit_window_seconds=1.0)
+    ) == ["phi_read_rate_limit_per_actor"]
+    assert _names(
+        auth=AuthSettings(
+            admin_write_rate_limit_per_actor=0, admin_write_rate_limit_window_seconds=1.0
+        )
+    ) == ["admin_write_rate_limit_per_actor"]
+    # One live count is enough for the window to matter again.
+    assert _names(
+        auth=AuthSettings(login_rate_limit_per_ip=0, login_rate_limit_window_seconds=1.0)
+    ) == ["login_rate_limit_window_seconds", "login_rate_limit_per_ip"]
+    assert _names(
+        auth=AuthSettings(
+            phi_read_rate_limit_per_actor=0,
+            phi_read_rate_limit_global=50,
+            phi_read_rate_limit_window_seconds=1.0,
+        )
+    ) == ["phi_read_rate_limit_window_seconds", "phi_read_rate_limit_per_actor"]
+
+
 def test_a_disabled_or_windowless_limiter_does_not_also_report_its_parts() -> None:
     """The PHI-read and admin-write limiters follow the sign-in limiter's rule: with the limiter
     unbuilt, or its window at 0 or less, its parts change nothing and are not named."""
@@ -851,8 +882,33 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
         )
     ).get("trusted_proxies")
     assert risk is not None
+    # Every range in the union is named, so a regression naming only one half reds here.
+    for entry in entries:
+        if ipaddress.ip_network(entry).num_addresses > 1:
+            assert entry in risk
     # The single-host proxy entry adds nothing to the union, so it is not blamed.
     assert "10.0.0.1" not in risk
+
+
+def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
+    risk = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            api=_proxied("::/0", "::/0"),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    )["trusted_proxies"]
+    assert risk.count("::/0") == 1
 
 
 def test_ranges_that_leave_a_gap_are_not_a_loosening() -> None:
