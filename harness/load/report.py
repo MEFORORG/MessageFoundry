@@ -685,6 +685,9 @@ def _reconcile(
     # immediately (1 >= 90 - 89), reads clean on every arm, and passes. That is the documented
     # give-up — 89 unconfirmed sends are not provable loss — but it is worth seeing stated as "the
     # gate went green on a run that moved one message" rather than inferred from three inequalities.
+    # The floor stays retired by decision. That stall shape is covered instead by a closed loop
+    # with a planted-stall control, tests/test_intake_liveness_closed_loop.py; its docstring
+    # states what it covers and what it does not.
     #
     # The failing side IS armed, and it is measured rather than argued: sabotaging the ingress
     # commit for ONE of 90 accept-ACKed messages makes the poll exhaust its timeout and the run red

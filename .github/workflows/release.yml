@@ -452,9 +452,17 @@ jobs:
           # the two steps run the same commands. NOTE that job is ALSO gated to schedule/workflow_dispatch,
           # so the dry-run has to be dispatched by hand; no pull request performs it. Both halves of this
           # install are therefore unexercised until a tag, a dispatch, or the nightly cron on `main`.
+          # NO SEEDED PIP IN THE SCAN VENV. A plain `python -m venv` copies the interpreter's bundled
+          # (ensurepip) pip into it, and environment mode lists every installed dist, so the SBOM
+          # listed pip: the venv's installer, which `pip install messagefoundry` never pulls. Listing it
+          # at ANY version is inaccurate, and it draws scanner findings whenever the bundled pip lags a
+          # fix (a local Windows 3.14 build seeded pip 26.1.2, which scanners flag). So the fix is
+          # absence, not a bump. `--without-pip` leaves the venv empty and the OUTER pip installs into
+          # it via `--python` (pip >= 22.3; it must precede `install`). ensurepip seeds pip alone on
+          # 3.12+, so there is no setuptools or wheel to drop. Guarded by tests/test_ci_venv_pinning.py.
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
-          python -m venv /tmp/sbomenv
-          /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
+          python -m venv --without-pip /tmp/sbomenv
+          python -m pip --python /tmp/sbomenv/bin/python install --require-hashes -r docker/locks/requirements-core.lock
           python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
             --pyproject pyproject.toml --mc-type application \
             --of JSON -o messagefoundry-sbom.cdx.json
