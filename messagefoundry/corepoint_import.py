@@ -764,8 +764,9 @@ def _role_verb(tokens: tuple[RoleToken, ...]) -> str:
     return ""
 
 
-def _subject_handle(action_list: Element) -> frozenset[str]:
-    """The one message handle an action-list's steps may be mapped against, or ``None``.
+def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[str]]:
+    """``(subject, held)`` for an action-list: the handles its steps may be mapped against, and the
+    handles known to hold ``msg``.
 
     A Corepoint action-list manipulates **several** messages at once (input, output, scratch), while a
     MessageFoundry Handler has exactly **one** ``msg``. So a field write is only faithfully
@@ -782,40 +783,39 @@ def _subject_handle(action_list: Element) -> frozenset[str]:
     non-input handle than deliver the input one, which is exactly why "the input handle" alone is the
     wrong predicate.)
 
-    Requires, therefore: exactly one distinct ``input-handle`` in the list, and either no ``MsgSend``
-    at all or a ``MsgSend`` that delivers that handle **or a whole-tree clone of it**. A clone — a
-    ``MsgTreeCopy`` of the input's ROOT into another handle — holds exactly the input's content, so a
-    write to it is a write to what ``msg`` will be; a *partial* copy is not, and is excluded, because
-    the destination tree then holds only the sub-node that was copied.
+    ``held`` therefore requires exactly one distinct ``input-handle`` in the list, and is that handle
+    **plus its whole-tree clones**. A clone — a ``MsgTreeCopy`` of the input's ROOT into another
+    handle — holds exactly the input's content, so a write to it is a write to what ``msg`` will be; a
+    *partial* copy is not, and is excluded, because the destination tree then holds only the sub-node
+    that was copied. A handle that ALSO receives a root copy of some other tree is not held, since its
+    content may be that other tree; when that handle is the input itself, nothing is held.
 
-    Anything else returns an empty set and **every** path-bearing statement in the list degrades to a
-    TODO — the honest output, because a cross-message write rendered as ``msg.set`` silently mutates
-    the wrong message."""
-    held, delivered = _scan_handles(action_list)
-    return held if delivered <= held else frozenset()
+    ``subject`` is ``held`` when every live ``MsgSend`` delivers a held handle, and empty otherwise. An
+    empty subject means **every** path-bearing statement in the list degrades to a TODO — the honest
+    output, because a cross-message write rendered as ``msg.set`` silently mutates the wrong message.
+    A ``MsgSend`` of anything outside ``held`` is refused by :func:`_send_refusal` (BACKLOG #313).
 
-
-def _scan_handles(action_list: Element) -> tuple[frozenset[str], frozenset[str]]:
-    """``(held, delivered)`` for an action-list: the handles that hold ``msg``, and those it sends.
-
-    ``held`` is the one input handle plus its whole-tree clones (see :func:`_subject_handle`), or empty
-    when the list does not have exactly one input handle, because then no handle is known to be
-    ``msg``. ``delivered`` is every handle a ``MsgSend`` names. A ``MsgSend`` of a handle outside
-    ``held`` would send the wrong message as ``msg``, which :func:`_send_refusal` refuses."""
+    The scan skips ``@Disabled`` subtrees (they never ran) and reads each statement's verb and kind
+    exactly as :func:`_parse_statement` does. It is **flow-insensitive**: it does not see statement
+    order or whether a copy sits in a branch, so a send that runs before its clone is made, or a clone
+    made only on one branch, still counts as held. Modelling that is #313 step 2."""
     inputs: set[str] = set()
     delivered: set[str] = set()
     root_copies: list[tuple[str, str]] = []  # (source handle, destination handle)
-    for elem in action_list.iter():
+    for elem in _live_elements(action_list):
         data = _attr(elem, "Data")
-        if not data:
-            continue
-        tokens = parse_roles(data)
+        tokens = parse_roles(data) if data else ()
+        if not tokens:
+            continue  # markup-free: no handle roles to learn from
         inputs.update(t.text for t in tokens if t.source_class == "input-handle")
-        verb = _role_verb(tokens).lower()
+        tag = _local(elem.tag)
+        if tag.lower() not in _STATEMENT_TAGS:
+            continue
+        verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
         operands = _operands_from_roles(tokens)
-        if verb == "msgsend" and operands and operands[0].kind == "handle":
-            delivered.add(operands[0].text)
-        elif verb == "msgtreecopy" and len(operands) == 2:
+        if _statement_kind(tag, verb) == "send":
+            delivered.add(_sent_handle(operands))  # "" when unidentifiable: never held
+        elif verb.lower() == "msgtreecopy" and len(operands) == 2:
             src, dst = operands
             if (
                 src.kind == "path"
@@ -825,15 +825,59 @@ def _scan_handles(action_list: Element) -> tuple[frozenset[str], frozenset[str]]
             ):
                 root_copies.append((src.handle, dst.handle))
     if len(inputs) != 1:
-        return frozenset(), frozenset(delivered)
-    same = {next(iter(inputs))}
-    # A clone chain is followed transitively, but only ever forward from the input.
+        return frozenset(), frozenset()
+    source = next(iter(inputs))
+    same = _clones_of(source, root_copies)
+    while True:
+        # A handle overwritten from outside the clone set may hold that other tree instead. Drop it,
+        # and every copy into or out of it, until nothing more drops.
+        foreign = {dst for src, dst in root_copies if src not in same}
+        if source in foreign:
+            return frozenset(), frozenset()
+        kept = [(s, d) for s, d in root_copies if s not in foreign and d not in foreign]
+        narrowed = _clones_of(source, kept)
+        if narrowed == same:
+            break
+        same = narrowed
+    held = frozenset(same)
+    return (held if delivered <= held else frozenset()), held
+
+
+def _clones_of(source: str, root_copies: list[tuple[str, str]]) -> set[str]:
+    """``source`` plus every handle a chain of root copies reaches from it, only ever forward."""
+    same = {source}
     for _ in range(len(root_copies)):
         grew = {dst for src, dst in root_copies if src in same}
         if grew <= same:
             break
         same |= grew
-    return frozenset(same), frozenset(delivered)
+    return same
+
+
+def _live_elements(action_list: Element) -> list[Element]:
+    """Every element under ``action_list`` in document order, less each ``@Disabled`` subtree."""
+    live: list[Element] = []
+    stack = list(reversed(list(action_list)))
+    while stack:
+        elem = stack.pop()
+        if _is_disabled(elem):
+            continue
+        live.append(elem)
+        stack.extend(reversed(list(elem)))
+    return live
+
+
+def _sent_handle(operands: tuple[Operand, ...]) -> str:
+    """The handle a role-parsed ``MsgSend`` delivers, or ``""`` when it names none this import can
+    identify: a ``$variable``, a partial path, or no operand at all."""
+    if not operands:
+        return ""
+    first = operands[0]
+    if first.kind == "handle":
+        return first.text
+    if first.kind == "path" and first.handle and _is_root_path(first.text):
+        return first.handle
+    return ""
 
 
 def _is_root_path(text: str) -> bool:
@@ -1280,19 +1324,26 @@ def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
     in place of the message Corepoint built. So the render raises at the send site instead
     (BACKLOG #313, step 1). Dropping the send would make the handler filter silently.
 
-    Only a named handle is judged, the same predicate :func:`_scan_handles` uses to fill ``delivered``.
-    A statement whose first operand is not a handle is left as it was."""
-    if not operands or operands[0].kind != "handle" or operands[0].text in held:
+    It fails CLOSED: a send is allowed only when :func:`_sent_handle` names a handle in ``held``, the
+    same reading :func:`_message_handles` uses to fill ``delivered``. A ``$variable``, a partial path
+    or no handle at all is refused, because which message it sends is not known. A markup-free
+    statement has no roles and never reaches here. The handle is untrusted and unbounded, so it is
+    flattened and elided before it enters the text."""
+    sent = _sent_handle(operands)
+    if sent and sent in held:
         return ""
-    handle = operands[0].text
+    refuse = "the import refuses to send msg in its place"
+    if not sent:
+        return f"MsgSend names no message handle this import can identify as msg; {refuse}"
+    handle = _comment_text(sent, 60)
     if not held:
         return (
             f"MsgSend delivers {handle}, and this action-list has no single input handle, so no "
-            f"handle is known to be msg; the import refuses to send msg in its place"
+            f"handle is known to be msg; {refuse}"
         )
     return (
-        f"MsgSend delivers {handle}, not the input handle this Handler holds as msg; the import "
-        f"refuses to send msg in its place"
+        f"MsgSend delivers {handle}, which is not the input handle or a whole-tree clone of it, "
+        f"so it is not msg; {refuse}"
     )
 
 
@@ -1438,21 +1489,11 @@ def _parse_statement(
     # set and it carries no qualifier — otherwise the emitted call would silently lose an operator.
     connectives = tuple(t.text for t in roles if t.role == "text" and t.text)
     qualified = any(t.role == "detail" for t in roles)
-    # Prefer the role layer's verb, but keep the flat reading as a NAMING fallback: a handful of verbs
-    # are not styled as a ``keyword`` span at all, and letting those collapse into "<unparsed>" would
-    # throw away the one thing that makes a TODO triageable — which verb it was.
-    verb = (_role_verb(roles) or flat_verb) if roles else flat_verb
+    verb = _statement_verb(roles, flat_verb)
     role_operands = _operands_from_roles(roles) if roles else ()
 
     source = _source_label(tag, verb)
-
-    kind = _CONTAINER_KIND_BY_TAG.get(tag.lower())
-    if kind is None:
-        # A ``<Line>``: control flow is carried by the verb, everything else is a transform statement.
-        kind = _KIND_BY_VERB.get(verb.lower())
-    elif kind in ("block", "call") and verb.lower() in _KIND_BY_VERB:
-        # ``<Call Data="ActionListCall …">`` — the verb is the more specific truth.
-        kind = _KIND_BY_VERB[verb.lower()]
+    kind = _statement_kind(tag, verb)
 
     # A construct NESTS its body under a placeholder condition; a ``<Block>``/``<Call>`` is a label
     # whose body stays at the same indentation, so it does not deepen control scope.
@@ -1526,6 +1567,28 @@ def _parse_statement(
     inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
     return [Control(kind, source, detail, body=inner, branches=branches)]
+
+
+def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:
+    """A statement's verb. Shared by :func:`_parse_statement` and :func:`_message_handles`, so the
+    scan that judges sends and the parse that renders them agree on which statements are sends.
+
+    Prefer the role layer's verb, but keep the flat reading as a NAMING fallback: a handful of verbs
+    are not styled as a ``keyword`` span at all, and letting those collapse into "<unparsed>" would
+    throw away the one thing that makes a TODO triageable — which verb it was."""
+    return (_role_verb(roles) or flat_verb) if roles else flat_verb
+
+
+def _statement_kind(tag: str, verb: str) -> str | None:
+    """The control kind a statement element renders as, or ``None`` for a transform statement."""
+    kind = _CONTAINER_KIND_BY_TAG.get(tag.lower())
+    if kind is None:
+        # A ``<Line>``: control flow is carried by the verb, everything else is a transform statement.
+        return _KIND_BY_VERB.get(verb.lower())
+    if kind in ("block", "call") and verb.lower() in _KIND_BY_VERB:
+        # ``<Call Data="ActionListCall …">`` — the verb is the more specific truth.
+        return _KIND_BY_VERB[verb.lower()]
+    return kind
 
 
 def _source_label(tag: str, verb: str) -> str:
@@ -1629,8 +1692,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
                 n += 1
             name = f"{name}_{n}"
         taken.add(name)
-        held, delivered = _scan_handles(action_list)
-        subject = held if delivered <= held else frozenset()  # what _subject_handle returns
+        subject, held = _message_handles(action_list)
         steps = tuple(_container_steps(action_list, subject, held, False))
         scope = _disabled_scope(action_list, parents)
         if scope is not None:
@@ -1928,6 +1990,13 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
         # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
         handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
+        if _has_refused_send(ctrl.body):
+            # Every Catch renders as ``except Exception:``, which would swallow the refusal's raise
+            # and run the Catch body instead: a delivery or a silent filter (BACKLOG #313).
+            out.append(
+                f"{pad}except NotImplementedError:  # a refused MsgSend above — never caught"
+            )
+            out.append(f"{pad}    raise")
         if not handlers:
             out.append(f"{pad}except Exception:  # TODO: Corepoint Try with no Catch — hand-finish")
             out.append(f"{pad}    raise")
@@ -2129,6 +2198,18 @@ def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     return False
 
 
+def _has_refused_send(steps: tuple[Step, ...]) -> bool:
+    """Whether the tree renders a refused ``MsgSend`` as a live ``raise`` (see :func:`_send_refusal`)."""
+    for step in steps:
+        if not isinstance(step, Control) or step.kind == "disabled":
+            continue
+        if step.kind == "send" and step.args and step.refusal:
+            return True
+        if _has_refused_send(step.body) or any(_has_refused_send(b.body) for b in step.branches):
+            return True
+    return False
+
+
 # --- top-level entry point ---------------------------------------------------
 
 
@@ -2294,8 +2375,8 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            if step.kind == "send" and step.refusal:
-                # Rendered as a raise and a TODO, never as the send, so it is not reported as shipped.
+            if step.kind == "send" and (step.refusal or not step.args):
+                # Rendered as a raise or a bare TODO, never as the send, so not reported as shipped.
                 unmapped.append(step.source_verb)
             elif (
                 step.kind in _MAPPED_CONTROL_KINDS

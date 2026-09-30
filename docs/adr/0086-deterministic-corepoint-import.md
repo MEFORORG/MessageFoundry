@@ -177,12 +177,23 @@ the export put it**, so a conditional send stays conditional. Nothing is ever si
 **(b″) AMENDMENT 2026-09-30 — a `MsgSend` of a handle that is not `msg` raises (BACKLOG #313, step
 1).** A Handler has one `msg`, the inbound message. An action-list can build and send another tree.
 The importer rendered that send as `Send(dest, msg)`, which delivers the unmodified input in place of
-the message Corepoint built. Now a role-parsed `MsgSend` whose handle is not the input handle, or a
-whole-tree clone of it, renders as a TODO marker and `raise NotImplementedError(...)` at the send
-site. Reaching it is an `ERROR` and a dead-letter, never a delivery. The destination stays declared
-and the handler keeps its `sends` list, so the handler neither filters silently nor gains a trailing
-`Send`. The summary counts the statement as unmapped. A markup-free `MsgSend` names no handle role,
-so it renders as before. Building the other tree is step 2 of #313.
+the message Corepoint built.
+
+A role-parsed `MsgSend` now sends only when its handle is the list's single input handle, or a
+whole-tree clone of it. Anything else renders as a TODO marker and `raise NotImplementedError(...)`
+at the send site: another handle, a `$variable`, a partial path, or no handle. A `Try` whose body
+holds such a raise gains an `except NotImplementedError: raise` arm ahead of its `Catch` arms, so a
+`Catch` cannot swallow it. The destination stays declared and the handler keeps its `sends` list, so
+the handler neither filters silently nor gains a trailing `Send`. The summary counts the statement
+as unmapped.
+
+At least these gaps remain:
+
+- A markup-free `MsgSend` carries no handle role, so it renders as before.
+- The handle scan does not see statement order or branches. A send that runs before its clone is
+  made, or a clone made on one branch only, still counts as `msg`.
+
+Building the other tree, and the flow the scan cannot see, is step 2 of #313.
 
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 

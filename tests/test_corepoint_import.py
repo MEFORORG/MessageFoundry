@@ -1097,7 +1097,10 @@ def test_a_msgsend_of_a_non_subject_handle_fails_loudly_and_sends_nothing() -> N
     assert "Send(" not in body  # no Send of msg anywhere: not inline, not trailing
     assert "    sends = []" in body and body.rstrip().endswith("return sends")
     assert "return None" not in body  # not a silent filter
-    assert '    raise NotImplementedError("Corepoint import: MsgSend delivers %OUT, not' in body
+    assert (
+        '    raise NotImplementedError("Corepoint import: MsgSend delivers %OUT, which is not the '
+        "input handle or a whole-tree clone of it" in body
+    )
     assert '# TODO: Corepoint MsgSend to "OB_ACME" — hand-finish: MsgSend delivers %OUT' in body
     # The destination stays declared, so the hand-finisher has somewhere to send the right message.
     assert 'outbound("OB_ACME", File(directory=' in src
@@ -1106,17 +1109,14 @@ def test_a_msgsend_of_a_non_subject_handle_fails_loudly_and_sends_nothing() -> N
 def test_a_non_subject_send_raises_when_the_handler_runs(tmp_path: Path) -> None:
     """The refusal is a runtime ERROR (dead-letter), not only a comment: calling the loaded handler
     raises, where the old render returned a Send of the unmodified input."""
-    from messagefoundry.config.wiring import load_config
-    from messagefoundry.parsing.message import Message
-
-    export = tmp_path / "pkg.xml"
-    export.write_text(_package(_role_send("other-handle", "%OUT", "OB_ACME")), encoding="utf-8")
-    out = tmp_path / "out"
-    import_corepoint(export, out)
-    handler_fn = load_config(out).handlers["t"]
-    msg = Message.parse("MSH|^~\\&|A|B|C|D|20260930||ADT^A01|1|P|2.5\rPID|1||123")
     with pytest.raises(NotImplementedError, match="MsgSend delivers %OUT"):
-        handler_fn(msg)
+        _run_handler(tmp_path, _role_send("other-handle", "%OUT", "OB_ACME"))
+
+
+def test_a_subject_send_returns_a_send_when_the_handler_runs(tmp_path: Path) -> None:
+    """The control arm for the runtime test: the same harness returns a Send for the input handle."""
+    result = _run_handler(tmp_path, _role_send("input-handle", "%ADT", "OB_IN"))
+    assert isinstance(result, list) and len(result) == 1
 
 
 def test_a_non_subject_send_is_counted_unmapped(tmp_path: Path) -> None:
@@ -1166,13 +1166,177 @@ def test_a_conditional_non_subject_send_raises_inside_its_branch() -> None:
 
 
 def test_a_hostile_handle_name_cannot_escape_the_raise_or_its_comment() -> None:
-    """The handle is untrusted export text: it rides into a string literal and a comment."""
+    """The handle is untrusted export text: it rides into a string literal and a comment, flattened
+    and elided, so neither a newline nor a huge span reaches the module or the stored error."""
     src = _handler_source(_role_send("other-handle", '%O"UT)\nimport os', "OB_ACME"))
     compile(src, "generated.py", "exec")
     assert "\nimport os" not in src
-    # Positive control: the newline did reach the render, escaped inside the raise's literal.
-    assert (
-        'raise NotImplementedError("Corepoint import: MsgSend delivers %O\\"UT)\\nimport os' in src
+    # Positive control: the handle did reach the render, flattened, with its quote escaped.
+    assert 'raise NotImplementedError("Corepoint import: MsgSend delivers %O\\"UT) import os' in src
+    long_src = _handler_source(_role_send("other-handle", "%" + "X" * 5000, "OB_ACME"))
+    raise_line = next(ln for ln in long_src.splitlines() if "raise NotImplementedError" in ln)
+    assert len(raise_line) < 400
+
+
+def _root_copy(
+    src_class: str, src: str, dst_class: str, dst: str, *, disabled: bool = False
+) -> str:
+    """A role-marked ``MsgTreeCopy <src>/ to <dst>/``: a whole-tree clone."""
+    line = _role_line(
+        _span("keyword", "MsgTreeCopy")
+        + " "
+        + _span(src_class, src)
+        + _span("path", "/")
+        + " to "
+        + _span(dst_class, dst)
+        + _span("path", "/")
+    )
+    return line.replace("<Line ", '<Line Disabled="1" ', 1) if disabled else line
+
+
+def _run_handler(tmp_path: Path, body: str) -> object:
+    """Import a one-list package, load it through the real loader, and call its handler once."""
+    from messagefoundry.config.wiring import load_config
+    from messagefoundry.parsing.message import Message
+
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(body), encoding="utf-8")
+    out = tmp_path / "out"
+    import_corepoint(export, out)
+    handler_fn = load_config(out).handlers["t"]
+    return handler_fn(Message.parse("MSH|^~\\&|A|B|C|D|20260930||ADT^A01|1|P|2.5\rPID|1||123"))
+
+
+def test_a_catch_cannot_swallow_a_refused_send(tmp_path: Path) -> None:
+    """Every Catch renders as ``except Exception:``. Without a re-raise arm ahead of it, the refusal
+    would be caught and the Catch body would deliver msg (or filter) with no ERROR recorded."""
+    body = (
+        "<Try><List>"
+        + _role_send("other-handle", "%OUT", "OB_ACME")
+        + '<Line Data="Catch"/>'
+        + _role_send("input-handle", "%ADT", "OB_ERR")
+        + "</List></Try>"
+    )
+    src = _handler_body(_handler_source(body))
+    assert src.index("except NotImplementedError:") < src.index("except Exception:")
+    with pytest.raises(NotImplementedError, match="MsgSend delivers %OUT"):
+        _run_handler(tmp_path, body)
+
+
+def test_a_try_with_no_refused_send_renders_as_before() -> None:
+    """The control arm: the re-raise arm appears only where a refusal sits in the try body."""
+    body = (
+        "<Try><List>"
+        + _role_send("input-handle", "%ADT", "OB_IN")
+        + '<Line Data="Catch"/>'
+        + '<Line Data="ItemClear %ADT/PID-19"/>'
+        + "</List></Try>"
+    )
+    src = _handler_body(_handler_source(body))
+    assert "except NotImplementedError" not in src
+    assert '        sends.append(Send("OB_IN", msg))' in src
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [
+        pytest.param(_span("other-handle", "%OUT") + _span("path", "/"), id="root-path-form"),
+        pytest.param(_span("variable", "$Out"), id="variable"),
+        pytest.param(_span("other-handle", "%OUT") + _span("path", "/PID"), id="partial-path"),
+    ],
+)
+def test_a_send_of_an_unidentified_or_other_message_is_refused(operand: str) -> None:
+    """Fail closed: a send is live only when its handle is provably msg. A root-path spelling of
+    another handle, a ``$variable`` and a partial path all refuse, and the list's field write then
+    degrades to a TODO because the list does not provably deliver msg."""
+    literal = _span("literal", '"OB_ACME"')
+    send = _role_line(_span("keyword", "MsgSend") + " " + operand + " to connection " + literal)
+    body = _handler_body(_handler_source(_WRITE_INPUT + send))
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+    assert 'set_field(msg, "MSH-6"' not in body
+
+
+def test_a_root_path_send_of_the_input_handle_still_sends() -> None:
+    """The control arm for the root-path spelling: ``%ADT/`` is the input, so it sends."""
+    literal = _span("literal", '"OB_IN"')
+    operand = _span("input-handle", "%ADT") + _span("path", "/")
+    send = _role_line(_span("keyword", "MsgSend") + " " + operand + " to connection " + literal)
+    body = _handler_body(_handler_source(_WRITE_INPUT + send))
+    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert 'set_field(msg, "MSH-6", "X")' in body
+
+
+def test_a_live_whole_tree_clone_still_sends() -> None:
+    """The control arm: a live root copy of the input makes the clone msg, as it always did."""
+    body = _handler_body(
+        _handler_source(
+            _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
+            + _role_send("other-handle", "%OUT", "OB_ACME")
+        )
+    )
+    assert '    sends.append(Send("OB_ACME", msg))' in body
+    assert "raise NotImplementedError" not in body
+
+
+def test_a_disabled_clone_does_not_make_its_handle_msg() -> None:
+    """A switched-off ``MsgTreeCopy`` never ran, so the handle it would have cloned into is not msg."""
+    body = _handler_body(
+        _handler_source(
+            _root_copy("input-handle", "%ADT", "other-handle", "%OUT", disabled=True)
+            + _role_send("other-handle", "%OUT", "OB_ACME")
+        )
+    )
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+
+
+def test_an_input_overwritten_by_another_tree_is_not_msg() -> None:
+    """A root copy of another tree INTO the input means the input may no longer be msg's content."""
+    body = _handler_body(
+        _handler_source(
+            _root_copy("other-handle", "%OUT", "input-handle", "%ADT")
+            + _role_send("input-handle", "%ADT", "OB_IN")
+        )
+    )
+    assert "Send(" not in body
+    assert "has no single input handle" in body
+
+
+def test_an_unstyled_send_verb_is_judged_like_a_styled_one() -> None:
+    """The scan and the parse read the verb the same way. A ``MsgSend`` with no ``keyword`` span is
+    still a send of another handle, so the list's field write degrades as well as the send refusing."""
+    literal = _span("literal", '"OB_ACME"')
+    send = _role_line("MsgSend " + _span("other-handle", "%OUT") + " to connection " + literal)
+    body = _handler_body(_handler_source(_WRITE_INPUT + send))
+    assert "raise NotImplementedError" in body
+    assert 'set_field(msg, "MSH-6"' not in body
+
+
+def test_two_input_handle_names_refuse_even_an_input_classed_send() -> None:
+    """With two input names nothing is provably msg, so every role-parsed send refuses. A disabled
+    line naming a second input does not count, because it never ran."""
+    second_input = _role_line(
+        _span("keyword", "ItemClear")
+        + " "
+        + _span("input-handle", "%IN2")
+        + _span("path", "/PID-19")
+    )
+    send = _role_send("input-handle", "%ADT", "OB_IN")
+    body = _handler_body(_handler_source(second_input + send))
+    assert "Send(" not in body
+    assert "has no single input handle" in body
+    disabled_second = second_input.replace("<Line ", '<Line Disabled="1" ', 1)
+    body = _handler_body(_handler_source(disabled_second + send))
+    assert '    sends.append(Send("OB_IN", msg))' in body
+
+
+def test_a_send_with_no_destination_is_counted_unmapped() -> None:
+    """It renders only a TODO marker, so the summary must not report it as shipped."""
+    assert _count_steps(_handler_steps('<Line Data="MsgSend $out"/>'), in_loop=False) == (
+        0,
+        ["MsgSend"],
+        0,
     )
 
 
