@@ -491,8 +491,9 @@ def _force_confirm_text(node: str, others: list[ClusterNode], *, holds: bool) ->
             "p",
             f"A forced drain does not stay drained. If no other node takes the lease, {node} takes it "
             "back on its first heartbeat after the stepdown pause, which lasts two heartbeats (20 "
-            "seconds at the shipped default). To keep leader work stopped for a maintenance window, "
-            "stop the service instead.",
+            "seconds at the shipped default) plus the longest acquire delay among the other "
+            "promotable nodes. To keep leader work stopped for a maintenance window, stop the "
+            "service instead.",
         ),
         el(
             "p",

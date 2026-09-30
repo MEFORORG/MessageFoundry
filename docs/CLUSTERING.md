@@ -127,7 +127,8 @@ cluster coordinates the parts that must not double-run or interleave:
   fence baseline is taken after the renew round trip returns while the expiry is stamped on the database
   clock at statement execution, and detection lands up to one fence tick late; and the config validator
   checks the *ordering* `heartbeat < fence < ttl` only, never that any margin survives. On a clean stop
-  the leader expires its lease so a standby takes over at once. A node that has already self-fenced
+  the leader expires its lease so a standby need not wait out the TTL: a preferred standby takes over
+  on its next heartbeat and a delayed one after its `acquire_delay_seconds`. A node that has already self-fenced
   expires it too. If that write does not return within 2 seconds, the node stops anyway and the lease
   ages out at the TTL.
 - **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
@@ -395,7 +396,8 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
 - **`force` drains the node anyway, and waives nothing else.** Send `{"force": true}` to step down the
   last promotable node on purpose. It does not turn a `400` or a `409` into a success. **It does not keep
   the node drained, either.** If no other node takes the lease, the drained node renews it on its first
-  tick after the two-heartbeat pause described below. To keep leader work stopped for a whole
+  tick after the stepdown pause described below, which is two heartbeats when no other promotable
+  node is fresh. To keep leader work stopped for a whole
   maintenance window, stop the service.
 - **`new_leader_eligible` is what that one membership read found:** whether another promotable node had
   a fresh heartbeat. On a `200` it is `false` only when you sent `force`. It names no successor, because
@@ -410,8 +412,8 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
   leadership is where you left it either. Do not start maintenance. Retry, and if it repeats, look at
   the store connection.
 - **A `503` reading `release-unconfirmed` means the node HAS already stood down — and the outcome is
-  genuinely unknown.** It has cleared its leadership flag, and this call stopped it claiming for two
-  `heartbeat_seconds`. What it could not confirm is whether the write expiring its lease row
+  genuinely unknown.** It has cleared its leadership flag, and this call stopped it claiming for the
+  stepdown pause described below. What it could not confirm is whether the write expiring its lease row
   committed, because a lost response to a committed `UPDATE` is indistinguishable here from an
   `UPDATE` that never ran. **It does not tell you a teardown just started**: on this `503` the demotion
   edge fires only if this call cleared the leader flag, and a retry finds the flag already clear.
@@ -442,8 +444,8 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
     draining it undoes the failover you just achieved. A retry reaches the write only after the
     membership read and the `412` check let it through, so while the store is still failing it answers
     `members-unreadable` and re-sends nothing.
-  - **Each retry that expires the row re-arms the stepdown pause** for another two `heartbeat_seconds`,
-    so the node stays drained while you retry. The pause stops only this node from claiming; it does
+  - **Each retry that expires the row re-arms the stepdown pause** for its full length again, so the
+    node stays drained while you retry. The pause stops only this node from claiming; it does
     not slow a standby.
   - Either way, read `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status
     code, is what tells you it is safe to start maintenance.
@@ -469,18 +471,25 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
 Rows already claimed on the old primary are recovered by the new one through the ordinary lease/reclaim
 path, so plan the switchover the same way you plan a restart.
 
-**The drained node stands down briefly before it contends again.** For two `heartbeat_seconds` after a
-stepdown it declines to claim or renew, so a sibling wins the expired lease rather than the node you
-just drained renewing itself straight back. On a cluster with no other promotable node that window is
-leaderless, which is why such a call is refused with `412` unless you send `force`.
+**Leader preference steers a planned failover, as it does a crash failover.** A stepdown or a clean
+stop writes the lease expiry as the database's current time. Each sibling's `acquire_delay_seconds`
+is added to that expiry, so a preferred (`0`) sibling takes the lease on its next heartbeat and a
+delayed one only after its delay has passed ([ADR 0096](adr/0096-cluster-leader-preference-and-non-promotable-standby.md),
+2026-09-30 amendment; [BACKLOG #1986](BACKLOG.md)). **The cost:** when every promotable sibling is
+delayed, the cluster has no leader for about the smallest of those delays after each planned
+handover. Until 2026-09-30 the release wrote zero instead, so every sibling could take a released
+lease at once and whichever ticked first won.
 
-**A handicapped sibling takes over after a stepdown too.** The stepdown writes the lease expiry as
-zero, not as the current time. `acquire_delay_seconds` is added to that stored expiry, so a released
-lease is open to every promotable sibling on its next heartbeat, however large its delay
-([BACKLOG #1507](BACKLOG.md)). So leader preference does not steer a planned failover: whichever
-promotable sibling ticks first takes the lease. The delay still applies to a lease that expired on
-its own, which is the crash failover it exists for. Give every node the same `heartbeat_seconds`: the pause is two of
-the drained node's own heartbeats, so a sibling with a longer one can miss it.
+**The drained node stands down before it contends again.** After a stepdown it declines to claim or
+renew for two of its own `heartbeat_seconds` plus the longest `acquire_delay_seconds` among the other
+promotable nodes with a fresh heartbeat. It reads those delays from the membership read the stepdown
+already takes. The delay term matters: the drained node reclaims through its own renew, which carries
+no delay, so without it a node whose siblings are all delayed would take its lease back before any of
+them could ([BACKLOG #1507](BACKLOG.md)). At the shipped default and with no delayed sibling the pause
+is 20 seconds. On a cluster with no other promotable node that window is leaderless, which is why
+such a call is refused with `412` unless you send `force`. Give every node the same
+`heartbeat_seconds`: the pause is counted in the drained node's own heartbeats, so a sibling with a
+longer one can miss it. A clean stop needs no pause, because a stopped node does not claim.
 
 **A node that has already self-fenced can be drained.** It has given up leadership in memory but still
 owns a live lease row, which `GET /cluster/nodes` shows as `lease_owner`. A stepdown there expires that
