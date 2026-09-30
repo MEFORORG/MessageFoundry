@@ -196,6 +196,7 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     _alert_summary,
+    _dead_target_pairs,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     _session_cap_groups,
@@ -6778,6 +6779,21 @@ class PostgresStore:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM queue o{where}", *params)
         return int(row["n"]) if row else 0
+
+    async def list_dead_targets(
+        self,
+        *,
+        channel_id: str | None = None,
+        destination_name: str | None = None,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """The distinct dead ``(channel_id, destination_name)`` pairs, sorted, over the
+        :meth:`count_dead` predicate; the contract is ``Store.list_dead_targets``."""
+        where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
+        rows = await self._fetchall(
+            f"SELECT DISTINCT o.channel_id, o.destination_name FROM queue o{where}", *params
+        )
+        return _dead_target_pairs((r["channel_id"], r["destination_name"]) for r in rows)
 
     @staticmethod
     def _message_filter(

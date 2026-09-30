@@ -53,7 +53,7 @@ from __future__ import annotations
 import pathlib
 import re
 
-from messagefoundry.api.models import DeadLetterList, DeadLetterRow
+from messagefoundry.api.models import DeadLetterList, DeadLetterRow, DeadLetterTarget
 from messagefoundry_webconsole.pages._common import _seg
 
 
@@ -84,7 +84,16 @@ def _dead_letters(channel: str, destination: str) -> DeadLetterList:
         message_type=None,
         received_at=0.0,
     )
-    return DeadLetterList(total=1, limit=50, offset=0, dead_letters=[row])
+    # The replay forms are built from replay_targets, not from the row (BACKLOG #1743 step 2), so the
+    # target carries the same two names the row does.
+    return DeadLetterList(
+        total=1,
+        limit=50,
+        offset=0,
+        dead_letters=[row],
+        replay_targets=[DeadLetterTarget(channel_id=channel, destination_name=destination)],
+        scope_total=1,
+    )
 
 
 def test_the_dead_letter_replay_forms_encode_a_name_carrying_a_slash() -> None:

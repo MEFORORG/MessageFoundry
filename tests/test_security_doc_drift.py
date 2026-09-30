@@ -282,8 +282,12 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
         "AlertInstanceInfo.reason — route-gated on monitoring:read, scrubbed at both ends, "
         "cipher-encrypted at rest"
     ),
-    "DeadLetterList": "envelope: limit/offset/total + DeadLetterRow rows (mapped)",
+    "DeadLetterList": (
+        "envelope: limit/offset/total/scope_total + DeadLetterRow rows (mapped) + DeadLetterTarget "
+        "replay targets"
+    ),
     "DeadLetterReplayResult": "requeued count only",
+    "DeadLetterTarget": "channel_id/destination_name connection names only (BACKLOG #1743)",
     "EditResendResult": "ids + routing decision, no body",
     "MessageBody": (
         "raw IS PHI but rides GET /messages/{id}/raw's messages:view_raw whole-body gate (documented "

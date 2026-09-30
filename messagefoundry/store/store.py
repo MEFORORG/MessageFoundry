@@ -4002,6 +4002,14 @@ def _append_channel_scope(
         clauses.append("1=0")  # scoped to no channels
 
 
+def _dead_target_pairs(rows: Iterable[tuple[Any, Any]]) -> list[tuple[str, str]]:
+    """Shape every backend's raw ``list_dead_targets`` rows into one sorted list. Sorting here, not
+    in SQL, gives the three backends one order whatever their collation. A pair with a NULL half is
+    dropped: a replay control names both halves in its path, and only ingress or routed rows carry
+    a NULL destination, which the dead-letter predicate already excludes by stage."""
+    return sorted({(str(c), str(d)) for c, d in rows if c is not None and d is not None})
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id           TEXT PRIMARY KEY,
@@ -10046,6 +10054,24 @@ class MessageStore:
             cur = await db.execute(f"SELECT COUNT(*) AS n FROM queue o{where}", params)
             row = await cur.fetchone()
         return int(row["n"]) if row else 0
+
+    async def list_dead_targets(
+        self,
+        *,
+        channel_id: str | None = None,
+        destination_name: str | None = None,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """The distinct dead ``(channel_id, destination_name)`` pairs, sorted; the contract is
+        :meth:`Store.list_dead_targets`. Same predicate as :meth:`count_dead`, so the set and the
+        count describe one population."""
+        where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT DISTINCT o.channel_id, o.destination_name FROM queue o{where}", params
+            )
+            rows = await cur.fetchall()
+        return _dead_target_pairs((r["channel_id"], r["destination_name"]) for r in rows)
 
     @staticmethod
     def _dead_filter(
