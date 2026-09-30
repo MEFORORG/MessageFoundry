@@ -88,7 +88,9 @@ _LIVE_SLICE = (
 )
 
 #: Dated measurement and handoff records. Exempt by the 2026-09-30 ruling: they record what a run
-#: said on its day, and rewriting one edits history rather than live guidance.
+#: said on its day, and rewriting one edits history rather than live guidance. Three carriers here
+#: have no date in their NAME -- TUNING-BASELINE.md, shardcert-ceiling-ladder.md and
+#: PLAN-ENGINE-ATTRIBUTION.md -- and are exempt as benchmark records that date themselves inside.
 _DATED_RECORDS = ("docs/benchmarks/",)
 
 _LEFT_FOR_1504 = (
@@ -108,7 +110,7 @@ _HELD: dict[str, tuple[int, str]] = {
     "CLA.md": (1, "legal banner, reviewed separately by the owner"),
     "COMMERCIAL-LICENSE.md": (1, "licence banner, reviewed separately by the owner"),
     "tests/test_ledger_check.py": (
-        3,
+        2,
         "deliberate non-ASCII test data (NON_ASCII_BODY, a ROW title)",
     ),
     "ide/src/hl7Picker.ts": (1, _UI_STRING + " (the UNVERIFIED badge ADR 0072 quotes)"),
@@ -139,22 +141,24 @@ def _sites(text: str, needle: str) -> list[int]:
 
 
 def _tree_census() -> dict[str, int]:
-    """U+26A0 count per tracked file that decodes as UTF-8 and carries at least one."""
+    """U+26A0 count per tracked file that carries at least one.
+
+    It counts the glyph's UTF-8 bytes rather than decoding, so a file with one stray non-UTF-8
+    byte is still read rather than skipped along with its glyphs.
+    """
     out = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
         ["git", "-C", str(_ROOT), "ls-files", "-z"],
         capture_output=True,
         check=True,
         timeout=120,
     ).stdout.decode("utf-8")
+    needle = _GLYPH.encode("utf-8")
     census: dict[str, int] = {}
     for rel in out.split("\0"):
         path = _ROOT / rel
         if not rel or not path.is_file():
             continue
-        try:
-            count = path.read_bytes().decode("utf-8").count(_GLYPH)
-        except UnicodeDecodeError:
-            continue  # binary assets (PNG, ICO): no text to carry a glyph
+        count = path.read_bytes().count(needle)
         if count:
             census[rel] = count
     return census
