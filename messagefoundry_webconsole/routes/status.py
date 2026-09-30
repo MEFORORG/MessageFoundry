@@ -268,7 +268,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             try:
                 # The store-computed aggregate, never this page (BACKLOG #1564) — see
                 # AlertInstanceList.total. limit=1 because no row is read here at all.
-                instances = await core.list_active_alerts(engine=engine, identity=identity, limit=1)
+                instances = await core.list_active_alerts(
+                    request=request, engine=engine, identity=identity, limit=1
+                )
                 alerts = {
                     "count": instances.total,
                     "severity": instances.worst_severity,

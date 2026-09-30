@@ -577,6 +577,28 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
     ) -> HTMLResponse:
+        return await _connection_details_page(name, request, engine, identity, reveal=None)
+
+    # The per-event reveal on this page (BACKLOG #2443, ASVS 14.2.6, owner ruling R12): the
+    # "Reveal" link beside a masked event reason. The request is the act, so it returns that one
+    # event's reason whole, the engine audits it as ``connection_event_reveal``, and the next bare
+    # load is masked again. messages:view_summary unlocks the reason, and phi=True charges the
+    # PHI-read budget the in-process handler call does not charge for itself.
+    @app.get("/ui/connection/{name}/events/{event_id}/reason", response_class=HTMLResponse)
+    async def ui_connection_event_reason(
+        name: str,
+        event_id: int,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(
+            require_ui(Permission.MONITORING_READ, Permission.MESSAGES_VIEW_SUMMARY, phi=True)
+        ),
+    ) -> HTMLResponse:
+        return await _connection_details_page(name, request, engine, identity, reveal=event_id)
+
+    async def _connection_details_page(
+        name: str, request: Request, engine: Any, identity: Identity, *, reveal: int | None
+    ) -> HTMLResponse:
         # Compose the detail view from existing monitoring handlers (no new PHI surface): find the row in
         # the (already channel-scoped) connection list, then its recent events. A singular /ui/connection/
         # path avoids colliding with the /ui/connections/{purge-confirm,...} action routes.
@@ -601,10 +623,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 since=None,
                 limit=50,
                 request=request,
+                reveal=reveal,
             )
         except HTTPException:
             events = []  # still show the connection's info + stats if events are RBAC-scoped out
-        return HTMLResponse(pages.connection_details(row, events))
+        return HTMLResponse(pages.connection_details(row, events, revealed=reveal))
 
     @app.get("/ui/messages", response_class=HTMLResponse)
     async def ui_messages(
