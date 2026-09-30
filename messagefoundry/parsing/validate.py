@@ -97,16 +97,24 @@ _SEQUENCES_LABELLED_CHOICE = frozenset(
         "SDR_S32_ANTI_MICROBIAL_DEVICE_CYCLE_DATA",
     }
 )
+# A valid RSP^E22: RSP_E22_QUERY_ACK carries both QAK and QPD, as HL7 requires.
+_LABELLED_CHOICE_PROBE = (
+    "MSH|^~\\&|SND|SND|RCV|RCV|20260101120000||RSP^E22^RSP_E22|PROBE|P|2.6\r"
+    "MSA|AA|MSG000\r"
+    "QAK|Q1|OK\r"
+    "QPD|E22^Auth^HL70471|Q1"
+)
 
 
 @cache
 def _choice_fix_needed() -> bool:
-    """True unless the installed hl7apy, unaided, gets both choice probes right.
+    """True unless the installed hl7apy, unaided, gets all three choice probes right.
 
     Asked of hl7apy's behaviour rather than its version number, once per process, so the shim
     switches itself off on the first release that validates choice groups correctly, and stays
     on under an unpinned install of a newer release that does not. It also stays on for a
-    release that accepts the valid probe only by no longer checking choice groups at all.
+    release that accepts the valid probe only by no longer checking choice groups at all, and
+    for one that merges PR 152 as written and so rejects the labelled-choice probe.
     ``tests/test_validate_choice_groups.py`` goes red on a fixed release, so the shim gets deleted.
     """
     from hl7apy.consts import VALIDATION_LEVEL
@@ -123,7 +131,12 @@ def _choice_fix_needed() -> bool:
         return True
 
     try:
-        return not (accepted(_CHOICE_PROBE) and not accepted(_TWO_ALTERNATIVES_PROBE))
+        correct = (
+            accepted(_CHOICE_PROBE)
+            and not accepted(_TWO_ALTERNATIVES_PROBE)
+            and accepted(_LABELLED_CHOICE_PROBE)
+        )
+        return not correct
     except Exception:
         # The shim is correct whatever hl7apy does with a choice, so a probe that cannot run
         # leaves it on rather than letting a strict inbound fall back to the bug.
@@ -131,6 +144,10 @@ def _choice_fix_needed() -> bool:
             "hl7apy choice-group probe failed; keeping the issue 151 shim on", exc_info=True
         )
         return True
+
+
+# Structures whose table the rewrite could not read, so each is logged once, not per message.
+_rewrite_failures: set[tuple[str, str | None]] = set()
 
 
 def _is_choice(name: str, ref: _Reference) -> bool:
@@ -284,12 +301,15 @@ def validate(
             # A table shape the rewrite does not know. Validate as hl7apy does unaided, which
             # brings the false reject back for this structure, so say so rather than hide it.
             # The test over every shipped table keeps this from happening with hl7apy's own.
-            logger.warning(
-                "issue 151 shim could not read hl7apy's table for %s v%s",
-                message.name,
-                version,
-                exc_info=True,
-            )
+            # Once per structure: a raise is not cached, so this path repeats per message.
+            if (message.name, version) not in _rewrite_failures:
+                _rewrite_failures.add((message.name, version))
+                logger.warning(
+                    "issue 151 shim could not read hl7apy's table for %s v%s",
+                    message.name,
+                    version,
+                    exc_info=True,
+                )
 
     try:
         Validator.validate(message, reference=references[1] if references else None)

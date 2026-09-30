@@ -21,6 +21,7 @@ import pytest
 from messagefoundry.parsing import validate
 from messagefoundry.parsing.validate import (
     _CHOICE_PROBE,
+    _LABELLED_CHOICE_PROBE,
     _SEQUENCES_LABELLED_CHOICE,
     _TWO_ALTERNATIVES_PROBE,
     _choice_error,
@@ -111,11 +112,16 @@ def test_the_choice_group_census_still_matches_the_shim() -> None:
     Every entry of the sequence list must still be labelled choice somewhere, or it is stale.
     Every other choice group must be a plain list of alternatives, each present exactly once.
     An optional or repeating alternative is the mark of a sequence mislabelled as a choice,
-    which is how the listed ones were found; and ``_choice_error`` relies on no alternative
-    needing more than one occurrence.
+    which is how some of the listed ones were found; and ``_choice_error`` relies on no
+    alternative needing more than one occurrence.
+
+    That mark does not catch every mislabel: QBP_E22_QUERY is QPD then RCP, both (1, 1), and
+    reads exactly like a real choice. So the count of choice-group names is pinned too, as
+    read from hl7apy 1.3.5. If it moves, a table changed, and each new choice group needs the
+    same by-hand check against the standard before this number is updated.
     """
     groups = _choice_groups()
-    assert len(groups) > 50, len(groups)  # the control: the census really read the tables
+    assert len(groups) == 73, sorted(groups)
     assert set(_SEQUENCES_LABELLED_CHOICE) <= set(groups)
     for name, alternatives in groups.items():
         if name not in _SEQUENCES_LABELLED_CHOICE:
@@ -154,19 +160,25 @@ def test_hl7apy_still_has_the_bug_so_the_shim_is_still_on() -> None:
     The shim switches itself off on such a release, since :func:`_choice_fix_needed` asks
     hl7apy rather than its version number. The code it leaves behind is dead, and this test is
     what says so. It also pins that hl7apy rejects the probe for issue 151 and not for some
-    other reason, which would keep the shim on for the wrong cause.
+    other reason, which would keep the shim on for the wrong cause. Before deleting the shim,
+    check that the new release still accepts ``_LABELLED_CHOICE_PROBE``: PR 152 as written
+    would not, and the shim then stays on by design.
     """
     from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import ValidationError
     from hl7apy.parser import parse_message
     from hl7apy.validation import Validator
 
-    probe = parse_message(
-        _CHOICE_PROBE, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT
-    )
+    def parsed(raw: str) -> Any:
+        return parse_message(raw, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT)
+
     with pytest.raises(ValidationError, match="Missing required child ORM_O01_OBRRQDRQ1RXOODSODT"):
-        Validator.validate(probe)
+        Validator.validate(parsed(_CHOICE_PROBE))
+    # The third probe arm is live: unaided hl7apy accepts it today, so only a release that
+    # starts rejecting it (PR 152 as written would) can keep the shim on through that arm.
+    assert Validator.validate(parsed(_LABELLED_CHOICE_PROBE))
     assert _choice_fix_needed()
-    # The control: the engine accepts the valid probe and rejects the two-alternative one.
+    # The control: the engine gets all three probes right.
     assert validate(_CHOICE_PROBE).ok
     assert not validate(_TWO_ALTERNATIVES_PROBE).ok
+    assert validate(_LABELLED_CHOICE_PROBE).ok
