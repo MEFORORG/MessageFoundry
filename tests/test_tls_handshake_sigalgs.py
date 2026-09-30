@@ -928,6 +928,19 @@ def test_a_list_the_build_refuses_raises_runtime_error() -> None:
         tls_policy.narrow_signature_algorithms(_Refusing(ssl.PROTOCOL_TLS_CLIENT))
 
 
+def test_a_catalogue_of_only_sha224_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing left once SHA-224 is gone is a refusal, not the "cannot list" no-op."""
+    monkeypatch.setattr(ssl, "get_sigalgs", lambda: ["rsa_pkcs1_sha224"], raising=False)
+    tls_policy._sigalgs_without_sha224.cache_clear()
+    ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        with pytest.raises(RuntimeError, match="nothing but SHA-224"):
+            tls_policy.narrow_signature_algorithms(ctx)
+    finally:
+        tls_policy._sigalgs_without_sha224.cache_clear()
+    assert getattr(ctx, "sigalg_calls", []) == []
+
+
 def test_an_unreadable_catalogue_pins_nothing_and_warns_once(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

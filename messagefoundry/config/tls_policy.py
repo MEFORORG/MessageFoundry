@@ -1086,9 +1086,11 @@ _SIGALGS_PIN_WARNED = False
 def _sigalgs_without_sha224() -> str | None:
     """OpenSSL's own signature-scheme catalogue minus the SHA-224 schemes, as a ``:`` list.
 
-    ``None`` when the catalogue cannot be read: ``ssl.get_sigalgs`` is absent before CPython 3.15,
-    and raises ``NotImplementedError`` on an OpenSSL older than 3.4. Read once per process, because
-    the linked OpenSSL does not change while the engine runs."""
+    ``None`` only when the catalogue cannot be read: ``ssl.get_sigalgs`` is absent before CPython
+    3.15, and raises ``NotImplementedError`` on an OpenSSL older than 3.4. A catalogue holding
+    nothing but SHA-224 gives ``""``, which the setter refuses, so that case fails closed rather
+    than reading as "cannot list". Read once per process, because the linked OpenSSL does not
+    change while the engine runs."""
     get_sigalgs = getattr(ssl, "get_sigalgs", None)
     if get_sigalgs is None:
         return None
@@ -1096,8 +1098,7 @@ def _sigalgs_without_sha224() -> str | None:
         catalogue = [str(name) for name in get_sigalgs()]
     except NotImplementedError:
         return None
-    kept = [name for name in catalogue if _SHA224_SIGALG_MARKER not in name.lower()]
-    return ":".join(kept) if kept else None
+    return ":".join(name for name in catalogue if _SHA224_SIGALG_MARKER not in name.lower())
 
 
 def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
@@ -1124,17 +1125,20 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
 
     * It omits schemes a provider adds, which on OpenSSL 3.5 are the three ML-DSA schemes (0x0904 to
       0x0906). Measured on CPython 3.14.6 / OpenSSL 3.5.7, the stock ClientHello offers them first.
-      So a pinned context stops offering ML-DSA, which needs an ML-DSA certificate to matter.
-    * Its order differs from the default in one place: ``rsa_pss_rsae_*`` comes before
-      ``rsa_pss_pss_*``. The two apply to different key types, so no peer can hold both.
+      So a pinned context stops offering ML-DSA. That matters only to a peer with an ML-DSA
+      certificate, and to an engine side holding one: it would have no scheme left to sign with.
+    * On the wire, once the security level has removed SHA-1, its order differs from the default in
+      one place: ``rsa_pss_rsae_*`` comes before ``rsa_pss_pss_*``. The two apply to different key
+      types, so no certificate can use both. (The default order is read from OpenSSL's source.)
 
     SHA-1 schemes stay in the list, as they are in the default one. The OpenSSL security level
     filters them out of what is sent, and :func:`refuse_lowered_security_level` holds that level.
 
     **``False`` means SHA-224 is still offered.** That is CPython 3.14, which has no setter, and a
     3.15 linked to an OpenSSL older than 3.4, whose catalogue cannot be read. The second case logs a
-    warning once per process. An OpenSSL that refuses the list raises :class:`RuntimeError`, as
-    :func:`narrow_tls13_suites` does, so the failure is never blamed on an operator's ``tls_ciphers``.
+    warning once per process. An OpenSSL that refuses the list, or a catalogue with nothing left once
+    SHA-224 is gone, raises :class:`RuntimeError`, as :func:`narrow_tls13_suites` does, so the
+    failure is never blamed on an operator's ``tls_ciphers``.
 
     **Reach.** Every engine-built context that narrows its suites, through
     :func:`narrow_to_approved_suites` or :func:`apply_operator_tls_ciphers`. At least these are not
@@ -1152,12 +1156,17 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
         if not _SIGALGS_PIN_WARNED:
             _SIGALGS_PIN_WARNED = True
             logger.warning(
-                "Could not take SHA-224 out of the TLS signature schemes: this OpenSSL (%s) cannot "
-                "list its own schemes, which needs OpenSSL 3.4 or later (BACKLOG #1171). Logged "
-                "once per process.",
+                "Could not take SHA-224 out of the TLS signature schemes: this interpreter cannot "
+                "list OpenSSL's schemes (ssl.get_sigalgs is absent, or the linked OpenSSL %s is "
+                "older than 3.4) (BACKLOG #1171). Logged once per process.",
                 ssl.OPENSSL_VERSION,
             )
         return False
+    if not names:
+        raise RuntimeError(
+            "OpenSSL's signature scheme catalogue holds nothing but SHA-224, so no list is left to "
+            "pin (BACKLOG #1171)"
+        )
     try:
         target.set_server_sigalgs(names)
     except ssl.SSLError as exc:
