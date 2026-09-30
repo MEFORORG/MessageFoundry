@@ -201,6 +201,10 @@ async def _run_one(
         sampler_stop.set()
         with contextlib.suppress(asyncio.CancelledError):
             await sample_task
+        # Count the in-hold readings BEFORE the post-drain final is appended below. `_build_record`
+        # cuts the rate window as `samples[:in_hold_samples]`, so a count taken after that append
+        # would put the drain tail back inside every achieved rate (BACKLOG #2011).
+        in_hold_samples = len(samples)
         # Stop the driver FIRST (flush queued sends + grace in-flight ACKs) BEFORE draining, so all
         # offered messages reach ingress before we wait for the pipeline to empty (the connscale
         # intake-gap fix).
@@ -225,6 +229,7 @@ async def _run_one(
             metrics=metrics,
             poller=poller,
             samples=samples,
+            in_hold_samples=in_hold_samples,
             drain_seconds=drain_seconds,
         )
     finally:
@@ -357,6 +362,7 @@ def _build_record(
     metrics: LiveMetrics,
     poller: EnginePoller,
     samples: list[EngineSample],
+    in_hold_samples: int,
     drain_seconds: float | None,
 ) -> EstateRecord:
     c = metrics.counters.snapshot()
@@ -366,8 +372,10 @@ def _build_record(
     # regardless of it (an estate step CAN send on the order of its connection count).
     no_loss = _reconcile(c, base, final, unconfirmed_budget=profile.count)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
-    read_per_s, written_per_s = _throughput_rates(samples)
-    # Achieved EVENT rate = in + out over the hold window (the calibration target's own units).
+    # The rate window is the in-hold readings only; `_throughput_rates` says why the drain tail is out.
+    rate_window = samples[:in_hold_samples]
+    read_per_s, written_per_s = _throughput_rates(rate_window)
+    # Achieved EVENT rate = in + out over the rate window (the calibration target's own units).
     achieved_total_ev = read_per_s + written_per_s
     achieved_per_conn_ev = achieved_total_ev / profile.count if profile.count else 0.0
     # Drain the per-sample OS-probe side map ONCE (each id(sample) can only be popped once), then derive
@@ -411,6 +419,7 @@ def _build_record(
         cpu_us_per_event=cpu_us_per_event,
         working_set_peak_bytes=ws_peak,
         fd_count_peak=fd_peak,
+        in_hold_samples=len(rate_window),
     )
 
 
@@ -495,7 +504,21 @@ def _reconcile(
 
 
 def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
-    """Achieved (read/s, written/s) over the hold window, first→last sample."""
+    """Achieved (read/s, written/s) from the first to the last reading of the list it is handed.
+
+    ``_build_record`` hands it the RATE WINDOW, ``samples[:in_hold_samples]``: every reading
+    ``_sample_loop`` took during the hold. That window EXCLUDES the post-drain final, which
+    ``_run_one`` appends after ``driver.stop(_STOP_GRACE)``, ``poller.await_drain(...)`` and
+    ``asyncio.sleep(_SETTLE)`` (BACKLOG #2011, the estate twin of connscale's #1420). Through the drain
+    the driver has stopped offering, so ``read`` flattens while the span keeps growing, and a window
+    that ran to the final would dilute every achieved rate by the drain time. The no-loss reconcile
+    still reads that final, through ``poller.final``.
+
+    Readings from before this change ran to the post-drain final and are not comparable with these.
+    Each record's JSON carries ``rate_window`` (:data:`~harness.load.estate.report.RATE_WINDOW`) so a
+    reader can tell the two populations apart. Fewer than two in-hold readings give ``(0.0, 0.0)``;
+    the record's ``in_hold_samples`` shows when that is why.
+    """
     if len(samples) < 2:
         return 0.0, 0.0
     first, last = samples[0], samples[-1]

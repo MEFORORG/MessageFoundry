@@ -22,6 +22,14 @@ EXIT_SLO_VIOLATION = 1
 
 SCHEMA_VERSION = 1
 
+#: Which window every achieved rate in an estate record was computed over (BACKLOG #2011). The window
+#: is defined in `harness.load.estate.runner._throughput_rates`; this value names the one that EXCLUDES
+#: the post-drain final. A record without the field was computed over the old window, which ran to
+#: that final, and its rates are not comparable with these. A reader filters on this exact name and
+#: value, so do not rename either. It is owned here, not imported from the connscale report: the two
+#: harnesses mark their own windows.
+RATE_WINDOW = "in_hold_excl_drain"
+
 
 @dataclass(frozen=True)
 class SloCheck:
@@ -81,9 +89,14 @@ class EstateRecord:
     working_set_peak_bytes: int | None = None
     fd_count_peak: int | None = None
 
+    # --- the rate window: how many in-hold readings the achieved rates above were read over ---
+    in_hold_samples: int = 0
+
     def to_json_dict(self) -> dict[str, object]:
         return {
             "count": self.count,
+            "rate_window": RATE_WINDOW,
+            "in_hold_samples": self.in_hold_samples,
             "shape": {
                 "simple_count": self.simple_count,
                 "hub_count": self.hub_count,
@@ -187,6 +200,9 @@ class EstateReport:
                 f"{('ok' if r.no_loss.ok else 'FAIL'):>8}{_na(_round_or_none(r.cpu_us_per_event, 2)):>11}"
                 f"{r.ack_p99_ms:>9.1f}"
             )
+        lines.append(
+            f"rates: over the in-hold readings, excluding the drain (rate_window={RATE_WINDOW})"
+        )
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:
