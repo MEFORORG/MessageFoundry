@@ -17,7 +17,7 @@
 #                 against a tag would satisfy a ref-only guard and publish to PyPI — which is what
 #                 "run it manually to dry-run it" invites an operator to do. Reading the old guard as
 #                 "a branch ref isn't `refs/tags/...`" is what hid this: a true sentence about the
-#                 wrong half of the trigger. The steps carrying the pair are at least the three PyPI
+#                 wrong half of the trigger. The steps carrying the pair are at least the four PyPI
 #                 publishes, the three GitHub-release mutations, and the SLSA build-provenance
 #                 attestation (BACKLOG #1805; the step's own comment says why). The COUNT is pinned in
 #                 tests/test_release_pipeline.py, which is its one authority — do not restate a
@@ -399,9 +399,12 @@ jobs:
       # engine upload.
       - name: Build the toolkit wheel (wheel-only, into toolkit-dist/ — ADR 0201)
         run: |
-          # `build` is already installed, hash-pinned, by the engine's build step above. Wheel-only for
-          # the harness's reason: messagefoundry_toolkit/ is force-included from the repo root, so an
+          # HASH-PINNED, and installed HERE rather than trusted from the engine's build step: a step
+          # that runs a release tool installs it itself (tests/test_ci_venv_pinning.py), so reordering
+          # the job cannot leave this step running a `build` nothing pinned. Wheel-only for the
+          # harness's reason: messagefoundry_toolkit/ is force-included from the repo root, so an
           # sdist would not be self-contained. Version read from messagefoundry/__init__.py (lockstep).
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           python -m build --wheel ./packaging/messagefoundry-toolkit --outdir toolkit-dist
           ls -l toolkit-dist/
 
@@ -415,7 +418,9 @@ jobs:
           # The harness smoke's shape, for the same reasons: tests/test_packaging.py does not run at tag
           # time, so the built wheel is the last place the lockstep pin is checkable before an upload
           # burns the version. Throwaway venv, --no-deps, isolated mode. See the harness job below.
-          PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+          # NO PIPE: sed prints the first match and quits, so no `| head -1` discards sed's exit code
+          # with pipefail off (tests/test_workflow_pipefail_screen.py).
+          PKG_PIN="$(sed -n '/^packaging==/{s/^packaging==\([^ ;]*\).*/\1/p;q;}' constraints.lock)"
           if [ -z "$PKG_PIN" ]; then
             echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
           fi
@@ -781,7 +786,7 @@ jobs:
             *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
             *)   pre_create="";             pre_edit="--prerelease=false" ;;
           esac
-          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore*
+          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore* toolkit-dist/*.whl
                    messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore*
                    messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* )
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -827,15 +832,16 @@ jobs:
         # tests/test_release_pipeline.py pins the gate itself as unconditional and free of
         # `continue-on-error`, which are the two ways the skipped-gate case could be made common.
         #
-        # BOTH gates are named here, not just the leak gate (BACKLOG #1838). They refuse different
+        # EVERY gate is named here, not just the leak gate (BACKLOG #1838), the toolkit gate included. They refuse different
         # things -- the leak gate asks where a member sits, the member gate asks what kind of file it
         # is -- so guarding on one and not the other uploads whatever the other one caught.
-        if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure'
+        if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure' && steps.toolkit-member-gate.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-artifacts
           path: |
             dist/
+            toolkit-dist/
             messagefoundry-sbom.cdx.json
             messagefoundry-sbom.cdx.json.sigstore*
             messagefoundry-vex.openvex.json
@@ -852,11 +858,10 @@ jobs:
       # uninstallable version, not an exposure, and a re-run finishes it. `skip-existing: true` is what
       # keeps that re-run from dying here on "File already exists", the deadlock v0.3.1 recorded.
       #
-      # OWNER PREREQ, one time, BEFORE the first tag carrying this step: a PENDING Trusted Publisher
-      # for `messagefoundry-toolkit` on PyPI, repo MEFORORG/MessageFoundry, workflow `release.yml`,
-      # environment blank to match the engine. Warehouse creates the project when a token exchange
-      # matches that pending publisher, which the first exchange in this job can do; the upload is
-      # what the design relies on, not the pending publisher.
+      # The one-time owner prerequisite for this step is stated in this file's header, THIRD
+      # distribution. Warehouse creates the project when a token exchange matches that pending
+      # publisher, which the first exchange in this job can do; the upload is what the design relies
+      # on, not the pending publisher (ADR 0201, To resolve on acceptance, records the reading).
       - name: Publish messagefoundry-toolkit to PyPI before the engine (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
@@ -1318,7 +1323,7 @@ jobs:
 
           # THE LOCKSTEP PIN, CHECKED ON THE BUILT ARTIFACT (BACKLOG #1585). packaging/
           # messagefoundry-harness/pyproject.toml pins messagefoundry[harness]==<engine version>, and
-          # PEP 621 `dependencies` is STATIC, so a version bump is two edits. tests/test_packaging.py
+          # PEP 621 `dependencies` is STATIC, so a version bump is three edits (the toolkit pin too). tests/test_packaging.py
           # catches a drift, but NOTHING in this workflow runs that suite and a tag can be cut from a
           # commit the merge queue never gated. This is the last place the claim is checkable before
           # the PyPI upload burns the version forever, and the metadata is already open.

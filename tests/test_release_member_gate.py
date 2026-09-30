@@ -452,11 +452,6 @@ def test_the_cli_reports_every_archive_not_just_the_first(
 
 
 # --------------------------------------------------------------------------------------------------
-# The wiring. A gate no publishing job calls is the gap that was reported.
-# --------------------------------------------------------------------------------------------------
-
-#: How a step invokes the gate. Matched against the step's `run:` text.
-# --------------------------------------------------------------------------------------------------
 # The third rule: the engine and toolkit split (ADR 0201 AC-6, BACKLOG #1192). Planted archives in
 # both the wheel and the sdist form, because the sdist's `<project>-<version>/` root is exactly what a
 # prefix match would miss.
@@ -498,6 +493,13 @@ def test_an_engine_archive_member_that_stays_is_allowed(member: str) -> None:
 
 def test_a_toolkit_archive_writing_into_the_engine_package_is_refused() -> None:
     assert split_violation("messagefoundry/adr_analyze.py", "messagefoundry-toolkit") is not None
+    # PEP 427 installs a wheel's purelib and platlib data straight into site-packages.
+    for data in ("purelib", "platlib"):
+        member = f"messagefoundry_toolkit-0.4.0.data/{data}/messagefoundry/x.py"
+        assert split_violation(member, "messagefoundry-toolkit") is not None, member
+    # Other .data directories do not land in the engine's package.
+    member = "messagefoundry_toolkit-0.4.0.data/scripts/messagefoundry"
+    assert split_violation(member, "messagefoundry-toolkit") is None
     assert (
         split_violation("messagefoundry_toolkit/adr_analyze.py", "messagefoundry-toolkit") is None
     )
@@ -558,6 +560,11 @@ def test_the_cli_passes_a_clean_toolkit_wheel(
     assert "inspected 4 members" in capsys.readouterr().out
 
 
+# --------------------------------------------------------------------------------------------------
+# The wiring. A gate no publishing job calls is the gap that was reported.
+# --------------------------------------------------------------------------------------------------
+
+#: How a step invokes the gate. Matched against the step's `run:` text.
 _GATE_INVOCATION = "scripts/release/forbidden_members.py"
 
 #: A parsed workflow is arbitrary YAML, so the value type is `Any` by construction. Naming the shape

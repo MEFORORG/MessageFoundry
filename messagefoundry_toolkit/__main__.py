@@ -23,6 +23,7 @@ from importlib import metadata
 from messagefoundry import __version__
 from messagefoundry.cli_common import (
     Dispatch,
+    HelpFormatter,
     _emit_error,
     _print_json,
     _safe_print,
@@ -87,7 +88,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     Building has no side effect, as with the engine's builder, so a test can read the toolkit's
     command surface without running ``main()``. The map returned is :data:`_DISPATCH` itself.
     """
-    parser = argparse.ArgumentParser(prog=TOOLKIT_COMMAND, description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog=TOOLKIT_COMMAND, description=__doc__, formatter_class=HelpFormatter
+    )
     parser.add_argument("--version", action="version", version=f"{TOOLKIT_COMMAND} {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 

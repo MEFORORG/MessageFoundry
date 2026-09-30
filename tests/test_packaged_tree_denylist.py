@@ -367,3 +367,57 @@ def test_no_non_tooling_distribution_ships_test_content() -> None:
         f"these files would ship test or development content and be REFUSED by the release gate on "
         f"a tag: {problems}. Keep tests outside the packaged tree."
     )
+
+
+# --- The third rule, the engine and toolkit split (ADR 0201 AC-6), read at pull-request time -------
+#
+# `packaging-build` measures the real artifacts, but its path filter skips a pull request that only
+# touches `messagefoundry/**` or `messagefoundry_toolkit/**`. So a change that re-adds a retired
+# engine path, or drops toolkit code into the engine tree, would be refused first on push to main or
+# at a tag. This mirror runs the same rule over the tracked trees on every pull request.
+
+
+def _split_violation() -> Callable[[str, str], str | None]:
+    """``split_violation()`` from the release gate: the engine and toolkit split rule."""
+    loaded: Callable[[str, str], str | None] = _gate().split_violation
+    return loaded
+
+
+def test_the_split_rule_loads_and_fires() -> None:
+    """The control for the scan below. A rule that matched nothing would make it pass forever."""
+    rule = _split_violation()
+    assert rule("messagefoundry/adr_analyze.py", "messagefoundry") is not None
+    assert rule("messagefoundry/messagefoundry_toolkit/x.py", "messagefoundry") is not None
+    assert rule("messagefoundry/generators/x.py", "messagefoundry-toolkit") is not None
+    assert rule("messagefoundry/__init__.py", "messagefoundry") is None
+
+
+def test_no_tracked_tree_breaks_the_engine_and_toolkit_split() -> None:
+    rule = _split_violation()
+    engine = sorted(_tracked("messagefoundry"))
+    assert len(engine) >= 200, f"the engine scan saw only {len(engine)} files -- it broke"
+    problems = [
+        f"messagefoundry: {path} ({why})"
+        for path in engine
+        if (why := rule(path, "messagefoundry")) is not None
+    ]
+    checked = []
+    for pyproject in _packaging_pyprojects():
+        mapping = _force_include_map(pyproject)
+        if not mapping:
+            continue
+        dist = _project_name(pyproject)
+        checked.append(dist)
+        shipped = _shipped_members(mapping, _tracked(*{src.split("/")[0] for src in mapping}))
+        problems.extend(
+            f"{dist}: {path} -> {member} ({why})"
+            for path, member in sorted(shipped.items())
+            if (why := rule(member, dist)) is not None
+        )
+    assert "messagefoundry-toolkit" in checked, (
+        f"the scan never reached the toolkit wheel's tree, so it proves nothing there: {checked}"
+    )
+    assert not problems, (
+        f"these files would be REFUSED by the release gate's engine and toolkit split rule on a "
+        f"tag (ADR 0201): {problems}"
+    )

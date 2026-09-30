@@ -266,9 +266,22 @@ def split_violation(member: str, dist: str) -> str | None:
             width = len(retired)
             if any(tuple(parts[i : i + width]) == retired for i in range(len(parts) - width + 1)):
                 return f"{'/'.join(retired)} moved to the toolkit distribution (ADR 0201)"
-    elif dist == TOOLKIT_DISTRIBUTION and parts[0] == ENGINE_DISTRIBUTION:
+    elif dist == TOOLKIT_DISTRIBUTION and _install_root_parts(parts)[:1] == [ENGINE_DISTRIBUTION]:
         return "the toolkit may not write into the engine's package directory (ADR 0201)"
     return None
+
+
+#: The wheel ``.data`` subdirectories pip installs into site-packages itself (PEP 427).
+_SITE_PACKAGES_DATA_DIRS = frozenset({"purelib", "platlib"})
+
+
+def _install_root_parts(parts: list[str]) -> list[str]:
+    """``parts`` as they land under site-packages. A wheel member at the archive root lands there as
+    written, and so does one under ``<name>.data/purelib/`` or ``<name>.data/platlib/``: PEP 427
+    moves those into site-packages at install, so either spelling can write into another package."""
+    if len(parts) > 2 and parts[0].endswith(".data") and parts[1] in _SITE_PACKAGES_DATA_DIRS:
+        return parts[2:]
+    return parts
 
 
 def distribution(archive: Path) -> str:

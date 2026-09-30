@@ -502,7 +502,7 @@ jobs:
       # path argument) plus every other sys.platform=='win32' branch.
       - name: Type-check (mypy, strict — win32 platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
-        run: mypy --platform win32 messagefoundry
+        run: mypy --platform win32 messagefoundry messagefoundry_toolkit
 
       # Step-level watchdog UNDER the job cap (#55): the windows-2022 leg intermittently
       # wedges ~25% in (a Windows ProactorEventLoop listener-teardown / socket wait that the shared

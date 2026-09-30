@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from messagefoundry import __version__
 from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR 0201 slice 1)
     Dispatch,
+    HelpFormatter,
     _emit_error,
     _load_operator_json,
     _OperatorJsonError,
@@ -195,6 +196,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     moved = ", ".join(sorted(_moved_toolkit_commands()))
     parser = argparse.ArgumentParser(
         prog="messagefoundry",
+        formatter_class=HelpFormatter,
         description=__doc__,
         epilog=f"Authoring commands ({moved}) are not in this command. Run them as "
         f"`{TOOLKIT_COMMAND} <command>`, from the separate {TOOLKIT_COMMAND} distribution.",

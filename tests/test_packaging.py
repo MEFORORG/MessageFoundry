@@ -653,7 +653,8 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
         f"the harness must pin the engine at the version it ships with (BACKLOG #1585).\n"
         f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
         f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins: {pinned}\n"
-        f"A VERSION BUMP IS TWO EDITS. PEP 621 `dependencies` is static and nothing in this repository "
+        f"A VERSION BUMP IS THREE EDITS, the toolkit pin included. PEP 621 `dependencies` is "
+        f"static and nothing in this repository "
         f"generates it, so set that table to `messagefoundry[harness]=={shipped}` in the same commit "
         f"that moves __version__."
     )

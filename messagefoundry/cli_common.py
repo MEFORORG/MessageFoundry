@@ -23,13 +23,14 @@ import argparse
 import json
 import logging
 import sys
+import textwrap
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import configure_stderr_logging
 
-__all__ = ["Dispatch", "argv_wants_json", "first_command", "run_cli"]
+__all__ = ["Dispatch", "HelpFormatter", "argv_wants_json", "first_command", "run_cli"]
 
 #: A command's top-level subcommand names, each mapped to the handler that runs it.
 Dispatch = Mapping[str, Callable[[argparse.Namespace], int]]
@@ -159,26 +160,62 @@ def run_cli(
         return _emit_error(text, as_json=True, code=code)
 
 
-#: Subcommands whose output is JSON with no ``--json`` flag: ``lens`` children take JSON mode from
-#: ``set_defaults``, and the IDE parses what they print.
-_JSON_BY_DEFAULT = frozenset({"lens"})
+class HelpFormatter(argparse.HelpFormatter):
+    """argparse's default formatter, except that it never breaks a line at a hyphen.
+
+    The default wraps with ``textwrap``'s ``break_on_hyphens``, so ``messagefoundry-toolkit`` in a
+    description or epilog splits as ``messagefoundry-`` and ``toolkit`` at some terminal widths, and
+    a reader who copies the command gets half of it. Everything else matches the default's
+    ``_fill_text``: whitespace collapsed, then filled to the width with the indent."""
+
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        return textwrap.fill(
+            " ".join(text.split()),
+            width,
+            initial_indent=indent,
+            subsequent_indent=indent,
+            break_on_hyphens=False,
+        )
+
+
+#: Subcommand paths whose output is JSON with no ``--json`` flag. ``lens rewrite`` takes JSON mode from
+#: ``set_defaults`` and the IDE parses what it prints; ``lens parse`` and ``lens schema`` have a flag.
+_JSON_BY_DEFAULT = frozenset({("lens", "rewrite")})
+
+#: Top-level options argparse answers itself, ahead of any subcommand. None takes a value.
+_ANSWERED_BY_ARGPARSE = frozenset({"-h", "--help", "--version"})
+
+
+def _command_path(argv: Sequence[str]) -> tuple[str, ...]:
+    """The subcommand path ``argv`` names, read BEFORE parsing: its arguments that are not options.
+
+    Empty when a top-level ``--help`` or ``--version`` comes first, because argparse answers that
+    and exits before it reads a subcommand: ``messagefoundry --help adr-analyze`` prints the help.
+    Neither command's top-level options take a value, so no option's value is mistaken for a
+    subcommand. Past the first word this is a guess, which is all the two callers need."""
+    path: list[str] = []
+    for arg in argv:
+        if not path and arg in _ANSWERED_BY_ARGPARSE:
+            return ()
+        if not arg.startswith("-"):
+            path.append(arg)
+    return tuple(path)
 
 
 def first_command(argv: Sequence[str]) -> str | None:
-    """The subcommand ``argv`` names, read BEFORE parsing: its first argument that is not an option.
-
-    Both commands' top-level options (``--help``, ``--version``) take no value, so nothing an
-    option consumes can be mistaken for the subcommand."""
-    return next((arg for arg in argv if not arg.startswith("-")), None)
+    """The top-level subcommand ``argv`` names, read before parsing, or None. See
+    :func:`_command_path` for how it is read."""
+    path = _command_path(argv)
+    return path[0] if path else None
 
 
 def argv_wants_json(argv: Sequence[str]) -> bool:
     """Whether a refusal made BEFORE parsing must answer as JSON (ADR 0201 section 3).
 
     ``--json`` anywhere in the arguments, or a subcommand that is JSON by default. One rule for every
-    pre-parse refusal on either command, so a toolkit ``lens`` refused for a version mismatch answers
-    the IDE the same way the engine's refusal of a moved ``lens`` does."""
-    return "--json" in argv or first_command(argv) in _JSON_BY_DEFAULT
+    pre-parse refusal on either command, so a toolkit ``lens rewrite`` refused for a version mismatch
+    answers the IDE the same way the engine's refusal of a moved one would."""
+    return "--json" in argv or _command_path(argv)[:2] in _JSON_BY_DEFAULT
 
 
 def _safe_print(line: str) -> None:
