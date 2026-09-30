@@ -373,7 +373,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Captured traffic | The messages the de-identification tools read | `anon/hl7.py` |
 | An SVG attachment inside a stored message | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
 | An uploaded file | The body of `POST /uploads`, or of `POST /ui/uploaded-logs/upload`, which the same handler serves. `api/multipart.py` is a hand-written `multipart/form-data` parser (ADR 0134), and its own comment calls each part's header block attacker-supplied. The route needs the files-upload permission and step-up authentication. | `api/app.py`, `api/multipart.py`, `uploads.py` |
-| A reference sync's file source | A file another system exports. `pipeline/reference_sync.py` re-reads it on a schedule and hands it to the code-set loader. The same loader reads the code sets in the config directory, which are operator input. | `config/code_sets.py` |
+| A reference sync's file source | A file another system exports. `pipeline/reference_sync.py` re-reads it on a schedule and hands it to the code-set loader, and a dry run's reference preview in `pipeline/dryrun.py` does too. The same loader reads the code sets in the config directory, which are operator input. | `config/code_sets.py` |
 | The sandbox child's replies | The child runs your Routers and Handlers, so the parent treats what it sends back as untrusted | `pipeline/sandbox.py`, `pipeline/_sandbox_codec.py` |
 | Partner and service replies | A partner's HTTP reply headers, a REST peer's Digest challenge, a FHIR server, a DICOMweb server, a SMART token endpoint, the AI provider | `transports/bounded_read.py`, `transports/rest.py`, `transports/fhir.py`, `transports/dicomweb.py`, `transports/smart.py`, `transports/ai_broker.py` |
 | Text a remote peer sizes | A reply field, a traceback or an error text, clamped and redacted before it is logged or shown | `redaction.py` |
@@ -562,10 +562,12 @@ or disables the service when it cannot delete them. It points the registration a
 one. It then starts the helper as LocalSystem.
 
 **At least these gaps remain.** The hash check covers only the `nssm.exe` the two installers run
-and register. Nothing checks an `nssm.exe` an administrator runs by hand, such as one on `PATH`,
-or the one `measure-store-access.ps1` runs (its row above). `Start-Service` and `Restart-Service`
-need no NSSM. To run NSSM by hand, use the checked copy in `-NssmDir`, or in the helper's folder,
-by its full path. `-HelperSha256` is only as good as the channel the operator took it from. With
+and register. Nothing checks an `nssm.exe` an administrator runs by hand, such as one on `PATH`.
+Nothing checks the one on `PATH` that `measure-store-access.ps1` (its row above) and the CI job
+`windows-service-smoke` run either. `Start-Service` and `Restart-Service` need no NSSM. To run
+NSSM by hand, use the checked copy in `-NssmDir`, or in the helper's folder, by its full path. That
+copy was checked when it was installed, and it stays safe only while its folder is
+administrator-only. `-HelperSha256` is only as good as the channel the operator took it from. With
 `-AllowBroadAcl`, whoever can write the helper's folder can swap a binary, plant a library beside
 it, or edit its configuration file, both between runs and during one.
 
