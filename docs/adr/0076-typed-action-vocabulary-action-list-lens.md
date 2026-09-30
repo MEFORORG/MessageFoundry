@@ -1077,18 +1077,25 @@ three fields, so AC-M7 is unchanged.
 
 **2. E.1: the path picker writes the templated form.** E.1 says a picker writing one bare `msg[...]`
 read is already admitted. The build does not use that route. `_param_mode` classifies a bare
-`msg["X"]` argument as `dynamic`, because only an f-string is `templated`, and AC-M2 and AC-M3 pin
-that. So the picker always writes a template, and a bare-read argument stays `dynamic` and read-only
-under AC-M5. Widening `_param_mode` to call a bare read `templated` was not taken.
+`msg["X"]` argument as `dynamic`, because only an f-string is `templated`. No acceptance criterion
+pins that; the AC-M5 tests in `tests/test_lens_template_edit.py` do, by listing a bare read among the
+dynamic arguments an edit must refuse. So the picker always writes a template, and a bare-read
+argument stays `dynamic` and read-only under AC-M5. Widening `_param_mode` to call a bare read
+`templated` was not taken.
 
 **3. E.5: a path part renders as `msg["X"] or ""`.** Inside an f-string a bare read renders an absent
 field as the text `None`, because `Message.field` returns `None`. A picked path would then write
 `None` into the outbound message. E.5's admitted set gains exactly one shape: a `FormattedValue` whose
-value is `msg["LIT"] or ""`, a subscript read with an empty-string fallback. That is the fallback
-`copy_field` already writes. Nothing wider is admitted. A non-empty fallback, a name, a number, a
-chained or reversed `or`, an `and`, and a fallback on a `msg.field(...)` call all stay `dynamic`.
-The renderer writes this form for every path part. The bare read and `msg.field("X")` stay admitted
-and read back as the same `{"path": "X"}` part, so round-trip totality (E.6.3) holds.
+value is `msg["LIT"] or ""`, a subscript read with an empty-string fallback. It is the same
+empty-text fallback `copy_field` uses, spelled on the subscript read the renderer writes. Nothing
+wider is admitted. A non-empty fallback, a name, a number, a chained or reversed `or`, an `and`, and
+a fallback on a `msg.field(...)` call all stay `dynamic`; the last is `copy_field`'s own spelling,
+excluded so the admitted set holds one shape. A template written through `set_params` renders every
+path part in this form. The bare read and `msg.field("X")` stay admitted and read back as the same
+`{"path": "X"}` part, so round-trip totality (E.6.3) holds; resending such a template's parts
+rewrites its reads to the fallback form, which is how the IDE applies this fix to an older template.
+Structural inserts (`insert_row` and the insert templates) still splice an `{"expr": ...}` verbatim
+and are not covered by this note.
 
 **4. Template writes go into value params only.** A templated write is accepted into exactly four
 parameters: `set_field.value`, `add_repetition.value`, `append_to_field.suffix` and

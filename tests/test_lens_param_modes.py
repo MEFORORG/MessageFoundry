@@ -130,6 +130,27 @@ def test_the_exclusion_list_covers_every_shape_e5_names() -> None:
         assert required in ids, f"E.5 names {required} and no case covers it"
 
 
+def test_the_exclusion_list_covers_every_neighbour_e11_rules_out() -> None:
+    """POSITIVE CONTROL for ADR 0076 E.11 (owner ruling 2026-09-29), which admits `msg["X"] or ""`
+    and nothing wider. Deleting one of these cases would let a widened fallback pass silently."""
+    ids = {p.id for p in EXCLUDED}
+    for required in (
+        "fallback-to-non-empty-text",
+        "fallback-to-a-name",
+        "fallback-to-empty-bytes",
+        "fallback-to-a-number",
+        "fallback-chained",
+        "fallback-operands-reversed",
+        "and-instead-of-or",
+        "fallback-on-a-field-call",
+        "fallback-on-an-unbounded-read",
+        "fallback-with-a-conversion",
+        "fallback-outside-an-fstring",
+    ):
+        assert required in ids, f"E.11 excludes {required} and no case covers it"
+    assert "subscript-read-with-empty-fallback" in {p.id for p in ADMITTED}
+
+
 # --- static, and its tie to literal_params (AC-M2) ----------------------------
 
 

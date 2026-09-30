@@ -4774,13 +4774,18 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
         return _emit_error(
             "provide the edit spec via --edit when the source is read from stdin ('-')",
             as_json=True,
+            code=REFUSAL_GENERIC,
         )
+    # Every refusal below carries a code, the generic one where no specific family applies, so a
+    # consumer branching on "code" never meets a payload without it (BACKLOG #237).
     try:
         edit = _load_operator_json(edit_text, "--edit JSON")
     except _OperatorJsonError as exc:
-        return _emit_error(str(exc), as_json=True)
+        return _emit_error(str(exc), as_json=True, code=REFUSAL_GENERIC)
     if not isinstance(edit, dict):
-        return _emit_error("the edit spec must be a JSON object", as_json=True)
+        return _emit_error(
+            "the edit spec must be a JSON object", as_json=True, code=REFUSAL_GENERIC
+        )
 
     try:
         if args.module == "-":
@@ -4789,6 +4794,14 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
             )
         else:
             rewritten = rewrite_module(args.module, edit, contract=args.contract)
+    except UnicodeDecodeError as exc:
+        # Non-UTF-8 source on stdin. The message names the position only: the exception's
+        # ``object`` is the whole source, which is never echoed.
+        return _emit_error(
+            f"<stdin>: cannot read (not UTF-8 at byte {exc.start}: {exc.reason})",
+            as_json=True,
+            code=REFUSAL_GENERIC,
+        )
     except LensRewriteError as exc:
         # The code is the refusal family the IDE branches on (BACKLOG #237); the message stays prose.
         return _emit_error(str(exc), as_json=True, code=exc.code)

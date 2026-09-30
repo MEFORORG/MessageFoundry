@@ -96,8 +96,9 @@ def test_a_parts_value_writes_a_bounded_interpolation_and_reads_back_as_parts() 
 
 
 def test_a_path_pick_writes_the_templated_form_never_a_bare_read() -> None:
-    """Manager decision for BACKLOG #237: the picker ALWAYS writes ``f"{msg['X'] or ''}"``. A bare
-    ``msg["X"]`` is ``dynamic`` and would be read-only the moment it landed."""
+    """Owner ruling 2026-09-29 (ADR 0076 E.11, item 2): the picker ALWAYS writes a template,
+    ``f"{msg['X'] or ''}"``. A bare ``msg["X"]`` is ``dynamic`` and would be read-only the moment it
+    landed."""
     out = _set(
         _one_row('set_field(msg, "PID-5.1", "old")'), {"value": {"parts": [{"path": "PID-3"}]}}
     )
@@ -167,13 +168,42 @@ def test_template_params_leaves_out_a_multi_line_argument() -> None:
 
 
 def test_resubmitting_the_current_parts_changes_no_byte() -> None:
-    """An edit that changes nothing changes nothing: a ``msg.field("X")`` read, an ``F`` prefix or a
-    triple-quoted spelling is not respelled when the IDE sends the parts back unchanged."""
-    for arg in ("f\"{msg.field('PID-3')}\"", "F\"{msg['PID-3']}\"", "f'''{msg['PID-3']}'''"):
+    """An edit that changes nothing changes nothing: when every read is already in the E.11 form, an
+    ``F`` prefix or a triple-quoted spelling is not respelled by sending the parts back unchanged."""
+    for arg in (
+        "f\"{msg['PID-3'] or ''}\"",
+        "F\"{msg['PID-3'] or ''}\"",
+        "f'''{msg['PID-3'] or ''}'''",
+    ):
         src = _one_row(f'set_field(msg, "PID-5.1", {arg})')
         parts = _row(src)["param_parts"]["value"]
         assert parts == [{"path": "PID-3"}], arg
         assert _set(src, {"value": {"parts": parts}}) == src, arg
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        pytest.param("f\"{msg['PID-3']}\"", id="bare-read"),
+        pytest.param("f\"{msg.field('PID-3')}\"", id="field-call"),
+        pytest.param("f\"{msg['PID-3'] or ''}/{msg['PID-4']}\"", id="one-of-two-reads-bare"),
+    ],
+)
+def test_resubmitting_the_parts_of_an_older_read_applies_the_e11_fix(arg: str) -> None:
+    """An older read renders an absent field as ``None``, and its parts look identical to the fixed
+    form's. Sending them back is the only way the IDE can fix it, so that write is NOT a no-op."""
+    src = _one_row(f'set_field(msg, "PID-5.1", {arg})')
+    parts = _row(src)["param_parts"]["value"]
+    out = _set(src, {"value": {"parts": parts}})
+    assert out != src
+    written = _row(out)
+    assert written["param_parts"]["value"] == parts
+    node = ast.parse(out.splitlines()[5].strip()).body[0]
+    assert isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+    value = node.value.args[2]
+    assert isinstance(value, ast.JoinedStr)
+    reads = [v.value for v in value.values if isinstance(v, ast.FormattedValue)]
+    assert reads and all(_is_empty_fallback_read(r) for r in reads)
 
 
 @pytest.mark.parametrize(
@@ -775,7 +805,79 @@ CODED_REFUSALS = [
     ),
     pytest.param(_STATIC, {"value": float("inf")}, "refused", id="generic-non-finite"),
     pytest.param(_STATIC, {"nope": "x"}, "refused", id="generic-unknown-param"),
+    pytest.param(
+        _STATIC,
+        {"value": {"parts": [{"path": "A"}, {"text": "\ud800"}]}},
+        "template-shape",
+        id="unencodable-part",
+    ),
+    pytest.param(_STATIC, {"value": {"expr": 5}}, "template-shape", id="expr-not-a-string"),
+    pytest.param(_STATIC, {"value": "\ud800"}, "refused", id="generic-unencodable-literal"),
 ]
+
+
+def test_a_multi_line_dynamic_argument_reports_dynamic_mode() -> None:
+    """The dynamic check runs before the multi-line check, so the code names the real reason."""
+    src = _one_row(
+        'set_field(\n        msg,\n        "PID-5.1",\n        msg[\n            "PID-3"\n        ],\n    )'
+    )
+    edit = {"line_start": 6, "line_end": 12, "op": "set_params", "params": {"value": "X"}}
+    with pytest.raises(LensRewriteError) as info:
+        rewrite_source(src, edit, contract=CONTRACT_V2)
+    assert info.value.code == "dynamic-mode", str(info.value)
+
+
+def test_a_failed_read_back_carries_the_template_shape_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lens, "_escape_template_text", lambda text, quote: text)
+    with pytest.raises(LensRewriteError) as info:
+        _render_parts([{"text": "{x}"}, {"path": "PID-3"}], "value")
+    assert info.value.code == "template-shape"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["lens", "rewrite", "-"], id="stdin-source-without-edit"),
+        pytest.param(["lens", "rewrite", "MODULE", "--edit", "{not json"], id="bad-json"),
+        pytest.param(["lens", "rewrite", "MODULE", "--edit", "[]"], id="not-an-object"),
+    ],
+)
+def test_the_early_cli_refusals_carry_the_generic_code(
+    argv: list[str], tmp_path: Path, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    """Refusals raised before the rewrite runs carry a code too, so a consumer branching on "code"
+    never meets a payload without one."""
+    import json
+
+    from messagefoundry.__main__ import main
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(_STATIC).encode("utf-8"))
+    rc = main([str(module) if a == "MODULE" else a for a in argv])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"
+
+
+def test_non_utf8_stdin_is_refused_with_a_code_and_no_source_echo(
+    monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    import io
+    import json
+
+    from messagefoundry.__main__ import main
+
+    class _Stdin:
+        buffer = io.BytesIO(b"x = 1\n# SECRETPAYLOAD \xff\n")
+
+    monkeypatch.setattr("sys.stdin", _Stdin())
+    rc = main(["lens", "rewrite", "-", "--edit", '{"line_start": 1, "line_end": 1}'])
+    out = capsysbinary.readouterr().out.decode("utf-8")
+    assert rc == 1
+    assert json.loads(out)["code"] == "refused"
+    assert "SECRETPAYLOAD" not in out
 
 
 @pytest.mark.parametrize(("line", "params", "code"), CODED_REFUSALS)

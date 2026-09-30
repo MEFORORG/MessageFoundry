@@ -133,8 +133,9 @@ class LensRewriteError(ValueError):
 
 #: A dynamic-mode argument: editing one (AC-M5), or an ``expr`` that would write one (E.6.4).
 REFUSAL_DYNAMIC_MODE = "dynamic-mode"
-#: A malformed templated value: ``parts`` not a list, a part without exactly one key, no path part,
-#: an empty or unusable path, an unencodable character, or a template sent as an ``expr``.
+#: A malformed value object on a moded argument: ``parts`` not a list, a part without exactly one
+#: key, no path part, an empty or unusable path, an unencodable character, a template sent as an
+#: ``expr``, or an object that is neither ``{"parts": [...]}`` nor ``{"expr": <string>}``.
 REFUSAL_TEMPLATE_SHAPE = "template-shape"
 #: A template sent to a param outside the row's ``template_params`` (a literal-only param).
 REFUSAL_LITERAL_ONLY = "literal-only"
@@ -2592,7 +2593,8 @@ def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line
         if new > _MAX_LINE_LENGTH and new > old:
             raise LensRewriteError(
                 f"this edit would make line {i + 1} {new} columns wide, past the "
-                f"{_MAX_LINE_LENGTH}-column limit - shorten the template, or edit it as text",
+                f"{_MAX_LINE_LENGTH}-column limit (each field read is written with an or '' "
+                "fallback, which adds 6 columns) - shorten the text, or edit it as text",
                 code=REFUSAL_COLUMN_LIMIT,
             )
 
@@ -2918,6 +2920,9 @@ def _splice_slots(
     for pname, node in slots.items():
         if pname not in params:
             continue
+        if moded is not None:
+            # Before the multi-line check, so a dynamic argument always reports dynamic-mode.
+            _refuse_dynamic_argument(node, pname)
         _refuse_multiline_arg(node, pname)
         consumed.add(pname)
         rendered: str | None
@@ -2981,13 +2986,30 @@ def _render_new_value(value: Any, original_is_literal: bool, pname: str) -> str:
     return rendered
 
 
+def _refuse_dynamic_argument(node: ast.expr, pname: str) -> None:
+    """Refuse any edit of an argument whose mode is ``dynamic`` (AC-M5, E.6.4)."""
+    if _param_mode(node) == MODE_DYNAMIC:
+        raise LensRewriteError(
+            f"parameter {pname!r} is in dynamic mode (an expression the lens cannot write back "
+            "faithfully) - it is read-only here; edit it as text (ADR 0076 E.6.4)",
+            code=REFUSAL_DYNAMIC_MODE,
+        )
+
+
+def _all_reads_fallback(node: ast.expr) -> bool:
+    """Whether every read in the f-string ``node`` is already the E.11 ``msg["X"] or ""`` form."""
+    return isinstance(node, ast.JoinedStr) and all(
+        _is_empty_fallback_read(v.value) for v in node.values if isinstance(v, ast.FormattedValue)
+    )
+
+
 def _render_moded_value(
     value: Any, node: ast.expr, pname: str, kind: str, template_ok: bool
 ) -> str | None:
     """Render a ``set_params`` value for a moded argument (ADR 0076 Amendment E), or refuse.
 
-    Returns None when the value is the parts the argument already has, so the caller leaves its bytes
-    alone.
+    Returns None when the value is the parts the argument already has and every read is already in
+    the E.11 form, so the caller leaves its bytes alone.
 
     The CURRENT argument's mode decides what may happen to it:
 
@@ -3004,26 +3026,25 @@ def _render_moded_value(
     renders ``f"{msg['X'] or ''}"``. A ``templated`` one is refused too, so that every templated write goes
     through the parts renderer and its round-trip gate: E.5 admits ``msg.field`` reads that no parts
     list can express, and one of them, ``msg.field("OBX-5", 2)``, raises at runtime."""
-    if _param_mode(node) == MODE_DYNAMIC:
-        raise LensRewriteError(
-            f"parameter {pname!r} is in dynamic mode (an expression the lens cannot write back "
-            "faithfully) - it is read-only here; edit it as text (ADR 0076 E.6.4)",
-            code=REFUSAL_DYNAMIC_MODE,
-        )
+    _refuse_dynamic_argument(node, pname)
     if isinstance(value, dict):
         if set(value) == {"parts"}:
             if not template_ok:
                 _refuse_templated_write(kind, pname)
             rendered_parts = _render_parts(value["parts"], pname)
-            if _template_parts(node) == _normalize_parts(value["parts"]):
-                # The parts the argument already has: an edit that changes nothing changes nothing, so
-                # a msg.field("X") read or an F-prefix is not respelled by a resubmitted template.
+            if _template_parts(node) == _normalize_parts(value["parts"]) and _all_reads_fallback(
+                node
+            ):
+                # The parts the argument already has, every read already in the E.11 form: an edit
+                # that changes nothing changes nothing, so an F-prefix or triple quotes is not
+                # respelled. An older bare or msg.field read is NOT left alone, because resending
+                # its parts is the only way the IDE can apply the E.11 fix to it.
                 return None
             return rendered_parts
-        if set(value) != {"expr"}:
+        if set(value) != {"expr"} or not isinstance(value["expr"], str):
             raise LensRewriteError(
                 f"parameter {pname!r}: an object value must be {{'parts': [...]}} or "
-                "{'expr': <source>}",
+                "{'expr': <source string>}",
                 code=REFUSAL_TEMPLATE_SHAPE,
             )
     rendered = _render_new_value(value, True, pname)
@@ -3110,6 +3131,12 @@ def _render_literal(value: Any, pname: str) -> str:
         # then raises UnicodeEncodeError when the engine encodes the outbound — and (b) for a BMP char
         # emits a ``\uXXXX`` escape that diverges from ruff's canonical raw-char form (gate 3). Emitting
         # the raw UTF-8 char is value-preserving and ruff-canonical; control chars < U+0020 stay escaped.
+        # A lone surrogate (a JSON "\udXXX" escape) has no UTF-8 form, so the splice would raise
+        # UnicodeEncodeError instead of refusing; refuse it here.
+        if not _is_encodable(value):
+            raise LensRewriteError(
+                f"parameter {pname!r}: the value carries a character that cannot be encoded as UTF-8"
+            )
         return json.dumps(value, ensure_ascii=False)
     raise LensRewriteError(
         f"parameter {pname!r}: cannot render value of type {type(value).__name__} as a literal"
