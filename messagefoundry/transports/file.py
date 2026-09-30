@@ -18,12 +18,16 @@ about a config **Handler**: its return is routed like any other (and an inadmiss
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import errno
+import functools
 import hashlib
 import logging
 import os
 import re
 import shutil
+import stat
+import sys
 import tempfile
 import time
 import traceback
@@ -746,8 +750,9 @@ class FileSource(SourceConnector):
                 break  # shutting down — leave the rest for the next start (at-least-once)
             if self._at_ceiling(disposed, len(candidates) - position):
                 break
-            # One stat serves the leave-mode key, the size cap and the before-read side of the #116
-            # partial-write check, so the key recorded below describes the bytes actually read.
+            # One stat serves the leave-mode key, the settle gate and the before-read side of the #116
+            # partial-write check, so the key recorded below describes the bytes actually read. The size
+            # cap is NOT charged here: it is charged on the handle the read opens (BACKLOG #2507).
             try:
                 before = await self._run_fs(_file_sig, path)
             except OSError as exc:
@@ -767,26 +772,33 @@ class FileSource(SourceConnector):
                 # BACKLOG #1811: first sighting, or the file changed since the last poll. Nothing is
                 # read, moved or charged against the per-tick budget, the same as #116's skip below.
                 continue
-            if self.max_file_bytes is not None and before[0] > self.max_file_bytes:
-                # Transport-level reject *before* any message is read — parallels MLLP dropping an
+            try:
+                raw, read_sig = await self._run_fs(self._read_settled, path)
+            except _Unconfined:
+                # BACKLOG #2507: the name was swapped for a link, or for something that is not a
+                # regular file, after it was listed. Nothing was read; it is left in place, never
+                # moved (a move would follow the link), and not charged, like the other stay arms.
+                self._log_unconfined(path)
+                continue
+            except _OverCap as exc:
+                # Transport-level reject *before* any message is emitted — parallels MLLP dropping an
                 # over-cap frame. It never became a "received message", so (like MLLP) there's no
                 # store disposition to record; preserve the file in .error for the operator, log it,
-                # and record a connection event as MLLP does (#1621).
+                # and record a connection event as MLLP does (#1621). Charged on the handle, so a
+                # file that grew after its stat is caught with at most cap + 1 bytes read (#2507).
                 logger.warning(
                     "file %s exceeds max_file_bytes (%s); routing to error dir",
                     safe_name(path.name),
                     self.max_file_bytes,
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir)
+                archived = await self._run_fs(self._confined_move, path, self.error_dir)
                 if archived:  # a failed move is logged by _move; nothing to record
                     await self._emit_event(
                         "file_oversize",
-                        reason=f"{before[0]} bytes exceeds max_file_bytes {self.max_file_bytes}",
+                        reason=f"{exc.detail} exceeds max_file_bytes {self.max_file_bytes}",
                     )
                 disposed += 1
                 continue
-            try:
-                raw, read_sig = await self._run_fs(self._read_settled, path)
             except OSError as exc:
                 self._log_unreadable(path, exc)
                 continue
@@ -824,7 +836,7 @@ class FileSource(SourceConnector):
                         safe_name(path.name),
                         safe_exc(exc, file_name=path.name),
                     )
-                    archived = await self._run_fs(self._move, path, self.error_dir)
+                    archived = await self._run_fs(self._confined_move, path, self.error_dir)
                     if archived:  # a failed move is logged by _move; nothing to record
                         await self._emit_event(
                             "file_decompress_failed", reason=safe_exc(exc, file_name=path.name)
@@ -849,7 +861,7 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     declared,
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir)
+                archived = await self._run_fs(self._confined_move, path, self.error_dir)
                 if archived:  # a failed move is logged by _move; nothing to record
                     await self._emit_event(
                         "file_content_mismatch",
@@ -871,7 +883,7 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir)
+                archived = await self._run_fs(self._confined_move, path, self.error_dir)
                 if archived:  # a failed move is logged by _move; nothing to record
                     await self._emit_event(
                         "file_scan_rejected", reason=safe_exc(exc, file_name=path.name)
@@ -1271,15 +1283,57 @@ class FileSource(SourceConnector):
         )
         return False
 
-    @staticmethod
-    def _read_settled(path: Path) -> tuple[bytes, _FileSig]:
-        """Read ``path`` whole, then stat it, in one hop off the event loop (BACKLOG #116).
+    def _read_settled(self, path: Path) -> tuple[bytes, _FileSig]:
+        """Read ``path``, then stat it, in one hop off the event loop (BACKLOG #116).
 
         The caller compares that stat and the bytes read with the stat it took before the read, so a
-        file a partner is still writing in place is caught before it is emitted. The read stays
-        ``path.read_bytes()`` on purpose: tests stand in for a locked file by patching that call."""
-        raw = path.read_bytes()
+        file a partner is still writing in place is caught before it is emitted. The read is the
+        module function :func:`_read_confined` (BACKLOG #2507), which refuses a link or an escape from
+        the root with :class:`_Unconfined` and an over-cap file with :class:`_OverCap`. It stays a
+        module function on purpose: tests stand in for a locked or growing file by patching it."""
+        raw = _read_confined(path, self.directory, self._root_real, self.max_file_bytes)
         return raw, _file_sig(path)
+
+    @staticmethod
+    def _log_unconfined(path: Path) -> None:
+        logger.warning(
+            "file source: refusing %s; it is a symbolic link, is reached through a link or a "
+            "junction, or is not a regular file. Left in place; not read, moved or deleted",
+            safe_name(path.name),
+        )
+
+    def _still_confined(self, path: Path) -> bool:
+        """Re-check ``path`` with :func:`_open_confined` just before it is archived, quarantined or
+        deleted (BACKLOG #2507).
+
+        The read's check does not carry over: the hand-off, the scan hook and a thread hop sit between
+        it and the move, and a link swapped in there would be followed by the hard link, the copy
+        fallback or the unlink. A refusal leaves the entry in place, logged. So does a check that fails
+        for any other reason, because moving a file that cannot be opened is not known to be safe.
+
+        The moment between this check and the move's first call remains, and it is not closed
+        everywhere. At the last name the hard link never follows a link (``_link_free_name``), the
+        copy fallback does not on POSIX (``_stage_copy``), and an unlink removes a link, not its
+        target. The Windows copy fallback, for a volume without hard links, does follow one. A
+        DIRECTORY swapped for a link in that moment, under ``recursive``, is followed everywhere."""
+        try:
+            fd, _st = _open_confined(path, self.directory, self._root_real)
+        except _Unconfined:
+            self._log_unconfined(path)
+            return False
+        except OSError as exc:
+            logger.warning(
+                "could not check %s before moving or deleting it (left in place for the next scan): %s",
+                safe_name(path.name),
+                safe_exc(exc, file_name=path.name),
+            )
+            return False
+        os.close(fd)
+        return True
+
+    def _confined_move(self, path: Path, dest_dir: Path) -> bool:
+        """:meth:`_move`, for a file :meth:`_still_confined` has just re-checked (BACKLOG #2507)."""
+        return self._still_confined(path) and self._move(path, dest_dir)
 
     @staticmethod
     def _log_unreadable(path: Path, exc: OSError) -> None:
@@ -1318,6 +1372,12 @@ class FileSource(SourceConnector):
         # ``read_sig`` None is a direct caller with no read to compare against: dispose as before.
         if read_sig is not None and self._changed_since_read(path, read_sig):
             return
+        if self.after_read == "leave":
+            # #142 process-in-place: never move or delete the source file — the durable dedup ledger
+            # (recorded by _scan_once AFTER this returns) is what stops it being re-ingested next poll.
+            return
+        if not self._still_confined(path):
+            return
         if self.after_read == "delete":
             try:
                 path.unlink()
@@ -1328,10 +1388,6 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
-        elif self.after_read == "leave":
-            # #142 process-in-place: never move or delete the source file — the durable dedup ledger
-            # (recorded by _scan_once AFTER this returns) is what stops it being re-ingested next poll.
-            return
         else:
             self._move(path, self.processed_dir)
 
@@ -1521,10 +1577,17 @@ def _free_names(target: Path) -> Iterator[Path]:
 
 def _link_free_name(source: Path, target: Path) -> Path | None:
     """Hard-link ``source`` to the first free name from ``target``, or return ``None`` when a hard link
-    cannot be made here at all (unsupported filesystem, or ``source`` on another one)."""
+    cannot be made here at all (unsupported filesystem, or ``source`` on another one).
+
+    A link at ``source`` is linked as itself, never followed to its target (BACKLOG #2507): the
+    archive move passes a partner-writable name, and following it could put an outside file in
+    ``.error`` or ``.processed``."""
     for candidate in _free_names(target):
         try:
-            os.link(source, candidate)
+            if _LINK_TAKES_NOFOLLOW:
+                os.link(source, candidate, follow_symlinks=False)
+            else:
+                os.link(source, candidate)
         except FileExistsError:
             continue
         except OSError:
@@ -1546,14 +1609,20 @@ def _stage_copy(source: Path, directory: Path) -> Path:
     than an ``except`` so nothing is caught or relabelled; it runs after the ``with`` has closed the
     handle, which Windows requires before an unlink. Deliberately not the ``except BaseException``
     the persistent-connection connectors use: this function is sync, so no ``CancelledError`` can
-    arrive mid-copy, and a wider catch would breach section 6 of CLAUDE.md for nothing."""
+    arrive mid-copy, and a wider catch would breach section 6 of CLAUDE.md for nothing.
+
+    ``source`` is opened ``O_NOFOLLOW`` where the platform has it, so the archive move never copies a
+    link's target out of place (BACKLOG #2507)."""
     fd, name = tempfile.mkstemp(dir=directory, suffix=".part")
     staged = Path(name)
     placed = False
     try:
         # `fd` is wrapped FIRST so a handle that closes it always exists: were `open(source)` opened
         # first and to raise, the fd would stay open and the unlink would fail on Windows.
-        with os.fdopen(fd, "wb") as handle, open(source, "rb") as reader:
+        with (
+            os.fdopen(fd, "wb") as handle,
+            open(source, "rb", opener=_open_no_follow) as reader,
+        ):
             shutil.copyfileobj(reader, handle)
             _flush_to_disk(
                 handle, directory
@@ -1647,6 +1716,174 @@ def _describe_os_error(exc: OSError | ValueError, *, file_name: str | None = Non
         return f"{type(exc).__name__}: [Errno {exc.errno}] {exc.strerror or ''}".rstrip()
     # A message-only OSError keeps its message, redacted, with the known name swapped for a label.
     return safe_exc(exc, file_name=file_name)
+
+
+class _Unconfined(OSError):
+    """The listed name no longer leads to a regular file inside the watch root (BACKLOG #2507): it is
+    a symbolic link, it is reached through a link or a junction, or it is not a regular file.
+
+    The caller leaves the entry in place and never reads or moves it. An ``OSError``, so a caller that
+    only has the ordinary failure arm still fails closed. The message never carries a file name."""
+
+
+class _OverCap(Exception):
+    """The file read from the handle is larger than ``max_file_bytes`` (BACKLOG #2507)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail  # "<n> bytes" or "more than <cap> bytes": a size, never a name
+
+
+_O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: without it the C runtime rewrites line endings
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+#: POSIX opens a candidate one component at a time below the root, each relative to its parent's
+#: descriptor and none followed if it is a link. Windows has no ``dir_fd``; see :func:`_open_confined`.
+_WALK_BY_DIR_FD = os.open in os.supports_dir_fd and bool(_O_NOFOLLOW and _O_DIRECTORY)
+#: ``O_NOFOLLOW`` refuses a link with ELOOP (Linux, macOS) or EMLINK (FreeBSD). ``O_DIRECTORY`` with
+#: ``O_NOFOLLOW`` refuses a link to a directory with ENOTDIR on Linux.
+_LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
+_DIR_LINK_ERRNOS = _LINK_ERRNOS | {errno.ENOTDIR}
+#: POSIX ``os.link`` follows a link at its source unless told not to. Windows ``CreateHardLinkW`` links
+#: the link itself already, and Windows ``os.link`` does not list the flag.
+_LINK_TAKES_NOFOLLOW = os.link in os.supports_follow_symlinks
+
+
+def _open_confined(path: Path, directory: Path, root_real: Path) -> tuple[int, os.stat_result]:
+    """Open ``path`` to read only if it is a regular file inside the watch root reached through no link
+    (BACKLOG #2507). Returns the descriptor and its ``fstat``; the caller closes the descriptor.
+
+    ``_within_root`` screens a NAME when it is listed, and the read and the move come later, a whole
+    poll later under the settle gate. So whoever can write the drop directory could swap a checked name
+    for a link in between. This check is on what was OPENED, so a late swap is caught.
+
+    **POSIX.** Each component below the root is opened relative to its parent's descriptor with
+    ``O_NOFOLLOW``, so no component can be a link however late it was swapped in, and nothing is
+    resolved by name after the check. The last is opened ``O_NONBLOCK``, so a FIFO swapped in opens at
+    once and then fails the regular-file check, rather than holding the poll thread.
+
+    **Windows.** ``os.open`` has no ``dir_fd`` there, so the file is opened by name and the handle's
+    final path, with every link and junction resolved, must equal the root joined with the listed name.
+
+    A link that stays inside the root is refused too: under ``O_NOFOLLOW`` it is a link, and on Windows
+    its final path is not the listed name. That keeps the two platforms alike. A hard link cannot be
+    told from the file it names, so it is outside what this check can see."""
+    try:
+        parts = path.relative_to(directory).parts
+    except ValueError:
+        raise _Unconfined("not under the watch directory") from None
+    if not parts or any(part in (".", "..") for part in parts):
+        raise _Unconfined("not a plain name under the watch directory")
+    if _WALK_BY_DIR_FD:
+        fd = _open_below(root_real, parts)
+    elif sys.platform == "win32":
+        fd = os.open(path, os.O_RDONLY | _O_BINARY)
+    else:  # pragma: no cover - no supported platform lands here, and failing closed is the safe arm
+        raise _Unconfined("this platform cannot confine a read to the watch root")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _Unconfined("not a regular file")
+        if not _WALK_BY_DIR_FD and not _same_path(_final_path(fd), root_real.joinpath(*parts)):
+            raise _Unconfined("reached through a link or a junction")
+    except OSError:
+        os.close(fd)
+        raise
+    return fd, st
+
+
+def _open_below(root: Path, parts: tuple[str, ...]) -> int:
+    """POSIX: open ``root/parts...`` one component at a time, following no link below ``root``."""
+    dir_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            parent = dir_fd
+            dir_fd = _open_no_link(part, os.O_RDONLY | _O_DIRECTORY, parent, _DIR_LINK_ERRNOS)
+            os.close(parent)
+        return _open_no_link(parts[-1], os.O_RDONLY | _O_NONBLOCK, dir_fd, _LINK_ERRNOS)
+    finally:
+        os.close(dir_fd)
+
+
+def _open_no_link(name: str, flags: int, dir_fd: int, refused: frozenset[int]) -> int:
+    """``os.open`` relative to ``dir_fd`` with ``O_NOFOLLOW``. The error drops the component's name:
+    under ``recursive`` it can be a partner-made subdirectory, which ``safe_exc`` cannot swap out."""
+    try:
+        return os.open(name, flags | _O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in refused:
+            raise _Unconfined("a symbolic link") from None
+        raise OSError(exc.errno, exc.strerror) from None
+
+
+def _final_path(fd: int) -> str:
+    """Windows: the final path of the file open on ``fd``, every link and junction resolved."""
+    if sys.platform != "win32":  # pragma: no cover - only the Windows arm calls this; narrows mypy
+        raise _Unconfined("no final-path query on this platform")
+    import msvcrt
+
+    query = _final_path_query()
+    handle = msvcrt.get_osfhandle(fd)
+    size = 512
+    while True:
+        buf = ctypes.create_unicode_buffer(size)
+        needed = query(handle, buf, size, 0)
+        if needed == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if needed < size:
+            return buf.value
+        size = needed  # too small: the return is the size needed, terminator included
+
+
+@functools.cache
+def _final_path_query() -> Any:
+    if sys.platform != "win32":  # pragma: no cover - narrows mypy
+        raise _Unconfined("no final-path query on this platform")
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel32.GetFinalPathNameByHandleW
+    query.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    query.restype = wintypes.DWORD
+    return query
+
+
+def _same_path(final: str, expected: Path) -> bool:
+    return os.path.normcase(_plain(final)) == os.path.normcase(_plain(str(expected)))
+
+
+def _plain(path: str) -> str:
+    """Drop the ``\\\\?\\`` or ``\\\\?\\UNC\\`` prefix a final path carries, so it compares with a plain
+    one."""
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
+def _read_confined(path: Path, directory: Path, root_real: Path, cap: int | None) -> bytes:
+    """Read ``path`` through :func:`_open_confined`, and at most ``cap + 1`` bytes (BACKLOG #2507).
+
+    The cap is charged on the handle, never on an earlier stat: the handle's size refuses an oversize
+    file without reading it, and the bounded read refuses one that grew after that, or whose size
+    attribute lags what it serves. Either raises :class:`_OverCap`. ``cap`` None reads it whole."""
+    fd, st = _open_confined(path, directory, root_real)
+    with os.fdopen(fd, "rb") as handle:
+        if cap is None:
+            return handle.read()
+        if st.st_size > cap:
+            raise _OverCap(f"{st.st_size} bytes")
+        raw = handle.read(cap + 1)
+    if len(raw) > cap:
+        raise _OverCap(f"more than {cap} bytes")
+    return raw
+
+
+def _open_no_follow(path: str, flags: int) -> int:
+    """An ``open()`` opener that refuses a link at the last name where the platform can (#2507)."""
+    return os.open(path, flags | _O_NOFOLLOW)
 
 
 def _mtime(p: Path) -> float:

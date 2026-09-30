@@ -945,8 +945,18 @@ its own policy block below):
   content_type-aware pipeline (ADR 0004). The two declarations that carry no reliable leading signature
   — `binary` (opaque bytes) and `text` (arbitrary) — are accepted **unchecked** by explicit policy; the
   pipeline codec/parser stays the real validator that records `ERROR`.
-- **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). An oversize file
-  is rejected by a `stat()` **before** it is read into memory (OOM / DoS guard); `None`/`0` disables it.
+- **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). The cap is
+  charged on the handle the read opens, not on an earlier `stat()`: an oversize file is rejected by
+  its handle's size **before** it is read into memory, and the read itself stops at the cap plus one
+  byte, so a file that grows after it was listed is refused too (OOM / DoS guard, BACKLOG #2507).
+  `None`/`0` disables it.
+- **Links are refused at read and at move time.** A drop is read only if the opened handle is a
+  regular file at the listed name inside the watch directory, reached through no symbolic link or
+  junction. POSIX opens each path component with `O_NOFOLLOW`; Windows compares the handle's final
+  path. The same check runs again just before the file is archived, quarantined or deleted. A refused
+  entry is logged and left in place, never read or moved, so a link swapped in after the listing
+  cannot pull an outside file into the pipeline, `.processed` or `.error`. This includes a link that
+  points inside the watch directory: drop real files, not links.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
   `decompress=` set the connector performs no decompression itself, so it materialises nothing beyond
   `max_file_bytes` where that cap is set. An earlier revision went further and said there is "no
