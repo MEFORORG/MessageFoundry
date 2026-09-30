@@ -65,8 +65,10 @@ _MIX = TypeMix({"ADT^A01": 1.0})
 # A3: a flat cumulative CPU counter over a non-trivial span is a wrong PID binding, not an idle engine —
 # report a gap rather than a fabricated 0.00 (mirrors the connscale runner's guard).
 _CPU_FLAT_GAP_SPAN_S = 5.0
-# A rate window needs a first and a last reading; `_top_up_in_hold` makes up any shortfall at hold end.
+# A rate window needs a first and a last reading; `_top_up_in_hold` makes up any shortfall at hold end,
+# trying at most `_TOP_UP_ATTEMPTS` times, one poll interval apart.
 _MIN_IN_HOLD_SAMPLES = 2
+_TOP_UP_ATTEMPTS = 3
 _PROC_BY_SAMPLE: dict[int, ProcSample] = {}
 
 
@@ -203,7 +205,7 @@ async def _run_one(
         sampler_stop.set()
         with contextlib.suppress(asyncio.CancelledError):
             await sample_task
-        await _top_up_in_hold(poller, samples)
+        make_up_samples = await _top_up_in_hold(poller, samples, interval=profile.poll_interval_s)
         # Count BEFORE the post-drain final is appended below; `_throughput_rates` defines the window.
         in_hold_samples = len(samples)
         # Stop the driver FIRST (flush queued sends + grace in-flight ACKs) BEFORE draining, so all
@@ -231,6 +233,7 @@ async def _run_one(
             poller=poller,
             samples=samples,
             in_hold_samples=in_hold_samples,
+            make_up_samples=make_up_samples,
             drain_seconds=drain_seconds,
         )
     finally:
@@ -357,20 +360,35 @@ async def _sample_loop(
             await asyncio.wait_for(stop.wait(), timeout=interval)
 
 
-async def _top_up_in_hold(poller: EnginePoller, samples: list[EngineSample]) -> None:
-    """Take make-up engine readings at hold end until the rate window has its two endpoints.
+async def _top_up_in_hold(
+    poller: EnginePoller, samples: list[EngineSample], *, interval: float
+) -> int:
+    """Take make-up engine readings once the sampler stops, until the rate window has two endpoints.
+    Returns how many it took; the record reports that count as ``make_up_samples``.
 
-    A window needs a first and a last reading. A short hold, or a slow first OS-probe tick inside
-    ``_sample_loop``, can leave one, and ``_throughput_rates`` then reads zero. Each make-up reading
-    lands after the sampler stops and before ``driver.stop``, so it is still outside the drain. It
-    carries no OS-probe reading, so the CPU fields are unaffected. A reading the poller cannot take is
-    not retried: the record's ``in_hold_samples`` then shows the short window.
+    A short hold, or a slow first OS-probe tick inside ``_sample_loop``, can leave one reading, and
+    ``_throughput_rates`` then reads zero. A make-up reading lands after the sampler is joined and
+    before ``driver.stop``, so it is outside the drain. It can land after the hold ends, because the
+    join waits for an OS probe in flight, and a reader sees that through ``make_up_samples``. It
+    carries no OS-probe reading, so the CPU fields are unaffected.
+
+    With NO reading from the hold it takes none. Two make-up readings would sit one round trip apart
+    after the hold, and a rate over that span is a made-up number, worse than the honest zero. A
+    failed attempt is retried one poll ``interval`` later, up to ``_TOP_UP_ATTEMPTS`` attempts.
     """
-    for _ in range(max(0, _MIN_IN_HOLD_SAMPLES - len(samples))):
+    if not samples:
+        return 0
+    taken = 0
+    for attempt in range(_TOP_UP_ATTEMPTS):
+        if len(samples) >= _MIN_IN_HOLD_SAMPLES:
+            break
+        if attempt:
+            await asyncio.sleep(interval)
         sample = await poller.sample_once()
-        if sample is None:
-            return
-        samples.append(sample)
+        if sample is not None:
+            samples.append(sample)
+            taken += 1
+    return taken
 
 
 def _build_record(
@@ -380,6 +398,7 @@ def _build_record(
     poller: EnginePoller,
     samples: list[EngineSample],
     in_hold_samples: int,
+    make_up_samples: int,
     drain_seconds: float | None,
 ) -> EstateRecord:
     c = metrics.counters.snapshot()
@@ -394,10 +413,12 @@ def _build_record(
     # Achieved EVENT rate = in + out over the rate window (the calibration target's own units).
     achieved_total_ev = read_per_s + written_per_s
     achieved_per_conn_ev = achieved_total_ev / profile.count if profile.count else 0.0
-    # Drain the per-sample OS-probe side map ONCE (each id(sample) can only be popped once), then derive
-    # both the CPU denominator and the FD/RSS peaks from the same readings. Read over the rate window,
-    # so the CPU span can never reach past the window the event rate was read over.
-    readings = _collect_proc(rate_window)
+    # Drain the per-sample OS-probe side map ONCE, over EVERY sample so no entry is left behind (each
+    # id(sample) can only be popped once), then keep the readings inside the rate window, so the CPU span
+    # can never reach past the window the event rate was read over. Both the CPU denominator and the
+    # FD/RSS peaks derive from those same readings.
+    window_end = rate_window[-1].elapsed_s if rate_window else float("-inf")
+    readings = [r for r in _collect_proc(samples) if r[0] <= window_end]
     cpu_total, cpu_mean, span = _cpu_from(readings)
     # CPU-microseconds per pipeline event over the SAME window: the honest headroom denominator (in+out
     # events, not messages). None when either the CPU probe or the event count is unavailable/zero.
@@ -437,6 +458,7 @@ def _build_record(
         working_set_peak_bytes=ws_peak,
         fd_count_peak=fd_peak,
         in_hold_samples=len(rate_window),
+        make_up_samples=make_up_samples,
     )
 
 
@@ -525,9 +547,10 @@ def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
 
     **THE ESTATE RATE WINDOW IS DEFINED HERE, ONCE** (BACKLOG #2011, the estate twin of connscale's
     #1420). Every other description of it points here. ``_build_record`` hands this function the
-    slice ``samples[:in_hold_samples]``, which holds every reading ``_sample_loop`` took during the
-    hold, plus any make-up readings ``_top_up_in_hold`` took at hold end to reach two. It starts at
-    hold start, so it still includes the pipeline's fill at the front.
+    slice ``samples[:in_hold_samples]``, which holds every reading ``_sample_loop`` took before the
+    sampler stopped, plus the ``make_up_samples`` readings ``_top_up_in_hold`` took after it to reach
+    two. **So the window is not exactly "the hold"**: a make-up reading can land after it ends. It
+    starts at hold start, so it still includes the pipeline's fill at the front.
 
     It EXCLUDES the post-drain final, which ``_run_one`` appends after ``driver.stop(_STOP_GRACE)``,
     ``poller.await_drain(...)`` and ``asyncio.sleep(_SETTLE)``. Through the drain the driver has

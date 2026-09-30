@@ -63,7 +63,9 @@ def _hold_then_final() -> list[EngineSample]:
     return [*hold, final]
 
 
-def _record(samples: list[EngineSample], in_hold_samples: int) -> EstateRecord:
+def _record(
+    samples: list[EngineSample], in_hold_samples: int, make_up_samples: int = 0
+) -> EstateRecord:
     profile = get_estate_profile("estate-smoke")
     counters = Counters()
     counters.sent = samples[-1].read
@@ -76,6 +78,7 @@ def _record(samples: list[EngineSample], in_hold_samples: int) -> EstateRecord:
         poller=poller,
         samples=samples,
         in_hold_samples=in_hold_samples,
+        make_up_samples=make_up_samples,
         drain_seconds=1.0,
     )
 
@@ -130,38 +133,47 @@ def test_a_single_in_hold_reading_reports_zero_and_says_why() -> None:
 
 
 class _FakePoller:
-    """Hands out queued readings from ``sample_once``, then ``None``, like a poller that stops answering."""
+    """Answers ``sample_once`` from a script: a reading, or ``None`` for a failed poll."""
 
-    def __init__(self, readings: list[EngineSample]) -> None:
-        self._readings = list(readings)
+    def __init__(self, answers: list[EngineSample | None]) -> None:
+        self._answers = list(answers)
         self.calls = 0
 
     async def sample_once(self) -> EngineSample | None:
         self.calls += 1
-        return self._readings.pop(0) if self._readings else None
+        return self._answers.pop(0) if self._answers else None
 
 
-def _top_up(existing: list[EngineSample], available: list[EngineSample]) -> tuple[int, int]:
-    fake = _FakePoller(available)
+def _top_up(
+    existing: list[EngineSample], answers: list[EngineSample | None]
+) -> tuple[int, int, int]:
+    """(readings after, make-up readings taken, polls made)."""
+    fake = _FakePoller(answers)
     samples = list(existing)
-    asyncio.run(runner._top_up_in_hold(cast(EnginePoller, fake), samples))
-    return len(samples), fake.calls
+    taken = asyncio.run(runner._top_up_in_hold(cast(EnginePoller, fake), samples, interval=0.0))
+    return len(samples), taken, fake.calls
 
 
 def test_a_short_hold_is_topped_up_to_two_readings() -> None:
     a, b, c = _hold_then_final()[:3]
-    assert _top_up([a], [b, c]) == (2, 1)
-    assert _top_up([], [a, b, c]) == (2, 2)
+    assert _top_up([a], [b, c]) == (2, 1, 1)
 
 
 def test_a_full_hold_takes_no_make_up_reading() -> None:
     a, b, c = _hold_then_final()[:3]
-    assert _top_up([a, b], [c]) == (2, 0)
+    assert _top_up([a, b], [c]) == (2, 0, 0)
 
 
-def test_a_poller_that_stops_answering_ends_the_top_up() -> None:
-    (a,) = _hold_then_final()[:1]
-    assert _top_up([a], []) == (1, 1)
+def test_a_hold_with_no_reading_is_not_made_up_from_nothing() -> None:
+    """Two make-up readings alone would sit one round trip apart after the hold: a made-up rate."""
+    a, b, c = _hold_then_final()[:3]
+    assert _top_up([], [a, b, c]) == (0, 0, 0)
+
+
+def test_a_failed_make_up_poll_is_retried_within_the_attempt_budget() -> None:
+    a, b = _hold_then_final()[:2]
+    assert _top_up([a], [None, b]) == (2, 1, 2)
+    assert _top_up([a], []) == (1, 0, runner._TOP_UP_ATTEMPTS)
 
 
 def test_run_one_counts_the_in_hold_readings_before_it_appends_the_final() -> None:
@@ -170,8 +182,10 @@ def test_run_one_counts_the_in_hold_readings_before_it_appends_the_final() -> No
     ``_run_one`` needs a live engine, so its order is pinned on its source text.
     """
     source = inspect.getsource(runner._run_one)
+    # Exactly one count, so a second recount after the append cannot hide behind the first.
+    assert source.count("in_hold_samples = len(samples)") == 1
     joined_at = source.index("await sample_task")
-    topped_up_at = source.index("await _top_up_in_hold(poller, samples)")
+    topped_up_at = source.index("await _top_up_in_hold(")
     count_at = source.index("in_hold_samples = len(samples)")
     append_at = source.index("samples.append(final)")
     # After the sampler is joined and topped up, so no in-hold reading is left out of the count;
@@ -189,6 +203,15 @@ def test_every_estate_output_carrying_a_rate_carries_the_window_marker() -> None
     (rec,) = payload["records"]
     assert rec["rate_window"] == RATE_WINDOW
     assert rec["in_hold_samples"] == _HOLD_TICKS
+    assert rec["make_up_samples"] == 0
     console = report.render_console()
     assert f"rate_window={RATE_WINDOW}" in console
     assert "WARNING" not in console
+    assert "make-up reading" not in console
+
+
+def test_a_window_ending_on_a_make_up_reading_says_so() -> None:
+    record = _record(_hold_then_final(), in_hold_samples=_HOLD_TICKS, make_up_samples=1)
+    assert f"N={record.count} rate window ends on 1 make-up reading(s)" in (
+        _report(record).render_console()
+    )
