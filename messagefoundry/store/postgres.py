@@ -293,15 +293,16 @@ _EPOCH_GUARD_RESOLVE = (
 )
 
 #: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). The Postgres
-#: twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced into
-#: :meth:`PostgresStore.replay` and :meth:`PostgresStore.replay_dead` so neither re-queues a delivery
-#: whose content retention has erased.
+#: twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced into at
+#: least :meth:`PostgresStore.replay` and :meth:`PostgresStore.replay_dead` so neither re-queues a
+#: delivery whose content retention has erased, and into :meth:`PostgresStore.list_replay_targets`.
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
 #: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). The Postgres twin of
-#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into
+#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into at least
 #: :meth:`PostgresStore.replay`, :meth:`PostgresStore.replay_dead` and the source read of
-#: :meth:`PostgresStore.resend_to`, so none of them turns a marker back into outbound work.
+#: :meth:`PostgresStore.resend_to`, so none of them turns a marker back into outbound work, and into
+#: :meth:`PostgresStore.list_replay_targets`.
 _NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
 
 #: The same exclusion over an aliased ``queue q``, DERIVED so the two cannot drift. Used by the

@@ -136,7 +136,15 @@ def test_a_benign_connection_name_still_renders_readably() -> None:
     """NEGATIVE CONTROL for the render path: encoding must not disfigure ordinary names."""
     from messagefoundry_webconsole.pages.messages import dead_letters
 
+    # Two renders, as above: the destination filter keeps its pager coverage, and the channel-only
+    # render draws the per-channel form.
     html = str(
+        dead_letters(
+            _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
+            channel_id="IB_ACME_ADT",
+            destination_name="OB_PARTNER_ADT",
+        )
+    ) + str(
         dead_letters(
             _dead_letters("IB_ACME_ADT", "OB_PARTNER_ADT"),
             channel_id="IB_ACME_ADT",

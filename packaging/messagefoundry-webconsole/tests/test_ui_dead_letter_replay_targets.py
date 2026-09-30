@@ -160,6 +160,9 @@ async def test_a_channel_scoped_caller_gets_controls_for_its_own_channels_only(
         assert r.status_code == 200, r.text
         assert OLD_CHANNEL in r.text and OLD_PAIR in r.text
         assert NEW_CHANNEL not in r.text, "a control leaked a channel outside the caller's scope"
+        # Pinned as the batch 180 decision left it: replay-all shows for a scoped caller too, and
+        # the engine refuses the POST (``_replay_in_scope``). Changing that is its own decision.
+        assert REPLAY_ALL in r.text
 
 
 async def test_a_destination_filtered_page_draws_no_per_channel_control(engine: Engine) -> None:

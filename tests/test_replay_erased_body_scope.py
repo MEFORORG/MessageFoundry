@@ -298,9 +298,10 @@ class Fake:
 #
 # A pass-through completion marker is an already-terminal outbound row on an INBOUND-only lane. No
 # delivery worker drains it, so every statement that turns an existing row back into outbound work
-# must leave it alone: the same six replay statements as above, plus ``resend_to``'s source read on
-# each backend, because a marker has no body and must never be chosen as a resend source. Same
-# machinery, and the same reasons for reading emitted SQL rather than a name reference.
+# must leave it alone: every statement in the table above (the replay statements and the
+# ``list_replay_targets`` reader), plus ``resend_to``'s source read on each backend, because a marker
+# has no body and must never be chosen as a resend source. Same machinery, and the same reasons for
+# reading emitted SQL rather than a name reference.
 
 #: How the marker exclusion reads once spliced. Each backend keeps it in a plain module constant.
 _MARKER_PREDICATE = (

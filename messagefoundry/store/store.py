@@ -845,9 +845,10 @@ UPLOAD_RESERVATION_STALE_AFTER = 300.0
 #: 3. a store-once row's ``''`` inline payload is a DEREF SENTINEL, not an erasure — it carries a
 #:    live ``body_ref``, and the purge releases that ref *before* it blanks the row.
 #:
-#: Spliced into :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can re-queue
-#: a delivery whose content no longer exists: the connector would be handed a zero-byte frame and the
-#: finalizer would record it as a successful send.
+#: Spliced into at least :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can
+#: re-queue a delivery whose content no longer exists: the connector would be handed a zero-byte
+#: frame and the finalizer would record it as a successful send. :meth:`QueueStore.list_replay_targets`
+#: reads with it too, so the console draws no replay button for such a row (BACKLOG #1743).
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
@@ -872,8 +873,8 @@ PASSTHROUGH_MARKER_HANDLER: Final = "@passthrough-marker"
 
 #: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). Spliced beside
 #: :data:`_REPLAYABLE_BODY` into at least :meth:`QueueStore.replay`, :meth:`QueueStore.replay_dead`,
-#: the source read of :meth:`QueueStore.resend_to`, and (as :data:`_NOT_PT_MARKER_Q`) the attachment
-#: clean-up's live-holder check. A new reader that asks "can this row still be delivered?" needs it
+#: the source read of :meth:`QueueStore.resend_to`, :meth:`QueueStore.list_replay_targets`, and (as
+#: :data:`_NOT_PT_MARKER_Q`) the attachment clean-up's live-holder check. A new reader that asks "can this row still be delivered?" needs it
 #: too. Re-pending a marker created work nothing can drain: the startup
 #: sweep would later dead-letter it and flip a delivered parent to ``ERROR``. A marker is also never a
 #: resend source, because it carries no body.

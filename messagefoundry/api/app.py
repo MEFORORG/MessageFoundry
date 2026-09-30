@@ -3518,9 +3518,9 @@ def create_app(
         targets = await engine.store.list_replay_targets(
             channel_id=channel_id, destination_name=destination_name, allowed_channels=allowed
         )
-        if channel_id is None and destination_name is None:
-            replayable_in_scope = bool(targets)
-        else:
+        # A filtered set is a subset of the scope, so a non-empty one already answers the flag.
+        replayable_in_scope = bool(targets)
+        if not replayable_in_scope and (channel_id is not None or destination_name is not None):
             replayable_in_scope = bool(
                 await engine.store.list_replay_targets(allowed_channels=allowed)
             )
