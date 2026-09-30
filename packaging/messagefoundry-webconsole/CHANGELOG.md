@@ -125,8 +125,7 @@ Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two togethe
   carrying the same change.
 - **BREAKING — the engine UI seam moved again, so this console no longer pairs with engine 0.4.0**
   (`BACKLOG #1141`, PR 1456). `SUPPORTED_ENGINE_SEAMS` no longer holds `75c4117d21fd0b98`, the
-  seam engine 0.4.0 ships. The line at the top of this section says where to read the value it
-  holds now, which can move again before the release. The console now imports three helpers from
+  seam engine 0.4.0 ships. It holds `10a6cc7c95459dcc`, the seam engine 0.5.0 ships. The console now imports three helpers from
   `messagefoundry.api.security`: `pending_credential_deadline`, `pending_credential_deadline_for`
   and `initial_credential_window_hours`. Engine 0.4.0 has none of them. So with the console on,
   engine 0.4.0 fails while importing this console and reports it as not installed. It never reaches
@@ -246,11 +245,12 @@ Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two togethe
   console's seam carries both halves.
 
 ### Notes
-- **pip now refuses an older engine.** The package declares `messagefoundry>=0.5.0`, a floor with
-  no ceiling (`RELEASE.md` step 2). Console 0.3.0 and earlier declared a bare `messagefoundry`, so
-  pip installed them beside any engine. A newer engine still installs, and the seam check at engine
-  startup refuses it if its seam differs. Pin both: `messagefoundry==0.5.0` with
-  `messagefoundry-webconsole==0.4.0`.
+- **pip no longer leaves this console beside an older engine.** The package declares
+  `messagefoundry>=0.5.0`, a floor with no ceiling (`RELEASE.md` step 2). Console 0.3.0 and earlier
+  declared a bare `messagefoundry`, so pip installed them beside any engine. Beside an engine older
+  than 0.5.0, pip now upgrades the engine, and an unpinned upgrade takes the newest release, whose
+  seam may differ. The seam check at engine startup refuses such a pair. Pin both:
+  `messagefoundry==0.5.0` with `messagefoundry-webconsole==0.4.0`.
 - **Not every `/ui` change needs a console change.** PR 1432 touched only a console test fixture,
   yet the console's OIDC sign-in now needs the IdP's `auth_time` claim (`BACKLOG #296`). That rule
   lives in the engine, and the engine's own `CHANGELOG.md` records it. Read that file too for

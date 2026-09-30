@@ -143,8 +143,8 @@ fail loud:
 
 1. **Install-time** — the floor on the engine dependency makes `pip`/`uv` refuse an engine older
    than the console's seam. It has no ceiling, so it never refuses a newer engine; layer 2 does
-   that. It fires only for a console released with the floor, because the package on `main`
-   declares a bare dependency (see §1).
+   that. It fires only for a console released with the floor: 0.4.0 is the first, and 0.3.0 and
+   earlier declared a bare dependency (see §1).
 2. **Startup-time** — `create_app`'s `serve_ui` tail calls `assert_engine_seam(ENGINE_UI_SEAM)`
    **before** it builds the deps bundle, so a package that changed the bundle *shape* for a new seam
    surfaces as `UiSeamMismatch`, not a kwargs `TypeError`. A second identical assert at the top of

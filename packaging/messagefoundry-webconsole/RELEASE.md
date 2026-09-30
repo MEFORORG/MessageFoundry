@@ -8,8 +8,8 @@
 > [`.github/workflows/release.yml`](../../.github/workflows/release.yml) builds and publishes this wheel
 > on its own `webconsole-v*` tag, and `messagefoundry-webconsole` has been registered on PyPI since the
 > first such release on 2026-07-29. What is still unwired is the **engine** side: the engine
-> `pyproject.toml` declares no `webconsole` extra and neither package sets a floor on the other, so the
-> pair cannot yet be installed as one. From a checkout the console installs by path
+> `pyproject.toml` declares no `webconsole` extra and sets no floor on the console, so the pair cannot
+> yet be installed as one. The console sets a floor on the engine from 0.4.0 on (step 2). From a checkout the console installs by path
 > (`pip install -e packaging/messagefoundry-webconsole`), and the seam handshake is exercised in CI
 > against the source tree.
 

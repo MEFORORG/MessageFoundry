@@ -41,6 +41,7 @@ The console pins itself against the engine's `ENGINE_UI_SEAM` (`SUPPORTED_ENGINE
 console on, the engine refuses to start beside any other console. The refusal is `UiSeamMismatch`
 when startup reaches the seam check, and an import error when a mismatched pair fails before it.
 
-Console 0.4.0 declares `messagefoundry>=0.5.0`, a floor with no ceiling. So pip refuses an older
-engine, but not a newer one; a newer engine with a different seam is refused at startup instead.
-Pin both versions, as above.
+Console 0.4.0 declares `messagefoundry>=0.5.0`, a floor with no ceiling. So pip will not leave it
+beside an engine older than 0.5.0. It upgrades the engine instead, and an unpinned upgrade takes
+the newest release, whose seam may differ. The engine refuses that pair at startup. Pin both
+versions, as above.
