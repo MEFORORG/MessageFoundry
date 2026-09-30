@@ -3541,6 +3541,12 @@ jobs:
     defaults:
       run:
         shell: pwsh
+    # BACKLOG #2442: every install below is handed this folder as -NssmDir, and every nssm call runs
+    # the nssm.exe in it by full path. The installer checks that copy against its pinned hash and
+    # refuses one anybody but an administrator can replace. The nssm on the runner's PATH is
+    # Chocolatey's, which fails that hash check, so a bare `nssm` here would run a copy nothing checked.
+    env:
+      SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3569,8 +3575,8 @@ jobs:
 
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
-      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). NSSM happens to
-      # be on the runner PATH, so the auto-download path is validated locally / on the user's box.
+      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). The installer
+      # downloads the pinned NSSM release into $env:SMOKE_NSSM_DIR.
       - name: Install the service
         shell: powershell
         run: |
@@ -3592,7 +3598,7 @@ jobs:
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
           # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
           # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
-          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
           # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
@@ -3651,7 +3657,7 @@ jobs:
           # refusing to start"), so NSSM crash-loops to SERVICE_PAUSED and /health never comes up. BOUND both
           # (30d) rather than setting [retention].allow_unbounded_phi=true: a real prod deployment configures
           # a window, so the smoke exercises the path it is meant to validate instead of opting out of it.
-          nssm set MessageFoundry AppEnvironmentExtra `
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry AppEnvironmentExtra `
             "MEFOR_SECURITY_REQUIRE_SIGN_IN=false" `
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
             "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
@@ -3746,7 +3752,7 @@ jobs:
           # engine's own certificate as its ONLY trust anchor -- the same approach the docker-smoke step
           # uses, on an interpreter this job already requires.
           $probe = 'import json,ssl,sys,urllib.request;ctx=ssl.create_default_context(cafile=sys.argv[1]);print(json.dumps(json.load(urllib.request.urlopen(sys.argv[2],context=ctx,timeout=5))))'
-          nssm start MessageFoundry
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" start MessageFoundry
           $ok = $null
           foreach ($i in 1..30) {
             $out = $null
@@ -3786,7 +3792,7 @@ jobs:
 
       - name: Stop the service (graceful)
         if: always()
-        run: nssm stop MessageFoundry
+        run: '& "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry'
 
       - name: Show service logs
         if: always()
@@ -3828,13 +3834,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         shell: powershell
-        run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
+        run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
 
       - name: Store access, auth on -- the service first, then the operator (ADR 0183 Wave 0)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         shell: powershell
-        run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -DataDir C:\ProgramData\MessageFoundry-w0-start-first
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-start-first
 
       # ADR 0183 Amendment A, Wave 2: the engine creates no account on its own now, so the start-first
       # order is the one an operator who starts the service before provisioning meets. This third arm
@@ -3849,7 +3855,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         shell: powershell
-        run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
         if: always()

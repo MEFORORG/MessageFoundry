@@ -24,6 +24,10 @@ What the scripts do now, and what this file pins:
    against a stubbed registry and a stubbed ``Win32_Service.Change``.
 4. **Each top level uses these in order**, read from the AST.
 5. **The uninstallers run no nssm.exe at all.** The SCM stops the service and ``sc.exe`` removes it.
+6. **The other runs of nssm use the copy the installer checked (#2442).** ``measure-store-access.ps1``
+   and the CI workflows used to run whatever ``nssm`` was on ``PATH``, as administrator. On a hosted
+   runner that is the Chocolatey copy the installer itself refuses on its hash. Both now run the
+   ``nssm.exe`` in the ``-NssmDir`` they hand the installer.
 
 Every refusal has a positive control beside it: a check that refuses everything would pass a
 refusal-only test. Everything runs in ONE pwsh process, because this file imports the engine and so
@@ -38,6 +42,7 @@ that start.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -53,6 +58,7 @@ from typing import Any
 import pytest
 
 import messagefoundry.service as svc
+from tests._workflow_contexts import WORKFLOWS, jobs_of
 
 _INSTALL_SERVICE = svc.install_script_path()
 _DIR = _INSTALL_SERVICE.parent if _INSTALL_SERVICE is not None else None
@@ -305,7 +311,7 @@ _CASES = r"""
 _AST_PROBES = """
   $ast = @{}
   foreach ($name in @('install-service.ps1', 'uninstall-service.ps1', 'install-net-helper.ps1',
-                      'uninstall-net-helper.ps1')) {
+                      'uninstall-net-helper.ps1', 'measure-store-access.ps1')) {
     $tree = [System.Management.Automation.Language.Parser]::ParseFile(
       (Join-Path $scripts $name), [ref]$null, [ref]$null)
     $ast[$name] = @{
@@ -318,6 +324,9 @@ _AST_PROBES = """
           $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         ForEach-Object { @{ name = $_.Name; start = $_.Extent.StartOffset; end = $_.Extent.EndOffset } })
       params = @($tree.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+      assigns = @($tree.FindAll({
+          $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+        ForEach-Object { @{ left = $_.Left.Extent.Text; right = $_.Right.Extent.Text } })
     }
   }
   $tree = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -758,3 +767,151 @@ def test_the_uninstallers_run_no_nssm(report: dict[str, Any], script: str) -> No
         assert _at(facts["commands"], _named("Stop-ServiceAndConfirm", '-NssmPath ""')), (
             "uninstall-service.ps1 no longer stops the service through the SCM"
         )
+
+
+# ------------------------------------------------- the runs of nssm outside the installers (#2442)
+
+_MEASURE = "measure-store-access.ps1"
+_SMOKE_JOB = "windows-service-smoke"
+# The folder the smoke job hands install-service.ps1, and so the only nssm.exe it may run.
+_SMOKE_DIR_VAR = "SMOKE_NSSM_DIR"
+_CHECKED_CALL = re.compile(
+    r'&\s*"\$env:' + _SMOKE_DIR_VAR + r'\\nssm\.exe"\s+(\w+)\s+MessageFoundry\b'
+)
+# At least these ways of running the nssm that PATH resolves: the bare command in command position,
+# and asking PATH for it. The checked call names nssm.exe after a backslash, so it does not match.
+_PATH_NSSM = re.compile(
+    r"(?:^|[;|{(&])\s*nssm(?:\.exe)?(?=\s|$|[;|)])|\bGet-Command\b.*\bnssm\b", re.I
+)
+
+
+def _runs_path_nssm(script: str) -> list[str]:
+    """The lines of a workflow ``run:`` script that run an nssm found on PATH. Skips comments."""
+    return [
+        line.strip()
+        for line in script.splitlines()
+        if not line.lstrip().startswith("#") and _PATH_NSSM.search(line)
+    ]
+
+
+def test_the_store_access_measurement_runs_only_the_installers_checked_nssm(
+    report: dict[str, Any],
+) -> None:
+    facts = _script(report, _MEASURE)
+    commands = facts["commands"]
+    assert "NssmDir" in facts["params"], (
+        f"{_MEASURE} takes no -NssmDir, so it cannot name the folder whose nssm.exe the installer "
+        "checks"
+    )
+    from_path = [
+        str(c["text"])
+        for c in commands
+        if str(c.get("name")).lower() in ("nssm", "nssm.exe")
+        or (c.get("name") == "Get-Command" and "nssm" in str(c["text"]).lower())
+    ]
+    assert not from_path, (
+        f"{_MEASURE} runs the nssm on PATH, as administrator, with no hash check: {from_path}"
+    )
+    sources = [a["right"] for a in facts["assigns"] if a["left"] == "$Nssm"]
+    assert sources == ['Join-Path $NssmDir "nssm.exe"'], (
+        f"$Nssm must be the nssm.exe in -NssmDir and nothing else; it is assigned {sources}"
+    )
+    runs = [
+        c for c in commands if str(c["first"]).startswith("$") and "nssm" in str(c["first"]).lower()
+    ]
+    assert runs, f"CONTROL FAILED: {_MEASURE} no longer runs nssm at all"
+    assert {str(c["first"]) for c in runs} == {"$Nssm"}, (
+        f"{_MEASURE} runs an nssm held in another variable: {[c['text'] for c in runs]}"
+    )
+    installs = [c for c in commands if '"install-service.ps1"' in str(c["first"])]
+    assert installs, f"CONTROL FAILED: {_MEASURE} no longer runs install-service.ps1"
+    assert all("-NssmDir $NssmDir" in str(c["text"]) for c in installs), (
+        f"{_MEASURE} does not hand the installer -NssmDir $NssmDir, so the installer checks a copy "
+        "in one folder while this script runs the one in another"
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "nssm stop MessageFoundry",
+        "  nssm set MessageFoundry AppEnvironmentExtra `",
+        "& nssm start MessageFoundry",
+        "if ($up) { nssm.exe stop MessageFoundry }",
+        "$n = (Get-Command nssm).Source",
+    ],
+)
+def test_the_path_nssm_detector_fires(line: str) -> None:
+    assert _runs_path_nssm(line) == [line.strip()]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '& "$env:SMOKE_NSSM_DIR\\nssm.exe" stop MessageFoundry',
+        "# nssm start MessageFoundry",
+        "Write-Host 'the nssm on PATH is not used'",
+        ".\\scripts\\service\\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR",
+    ],
+)
+def test_the_path_nssm_detector_ignores_the_checked_copy_and_prose(line: str) -> None:
+    assert _runs_path_nssm(line) == []
+
+
+def _run_scripts(job: dict[str, Any]) -> list[str]:
+    steps = job.get("steps") or []
+    return [s["run"] for s in steps if isinstance(s, dict) and isinstance(s.get("run"), str)]
+
+
+@functools.cache
+def _workflow_runs() -> tuple[tuple[str, str, str], ...]:
+    """(file, job id, run script) for every step with a ``run:``, in every workflow."""
+    found = tuple(
+        (path.name, job_id, script)
+        for path in sorted(WORKFLOWS.glob("*.y*ml"))
+        for job_id, job in jobs_of(path.name).items()
+        for script in _run_scripts(job)
+    )
+    assert found, f"CONTROL FAILED: no run step read under {WORKFLOWS}"
+    return found
+
+
+def test_no_workflow_runs_the_nssm_on_path() -> None:
+    offenders = [
+        f"{name} {job_id}: {line}"
+        for name, job_id, script in _workflow_runs()
+        for line in _runs_path_nssm(script)
+    ]
+    assert not offenders, (
+        "a workflow runs the nssm on PATH. On a hosted runner that is the Chocolatey copy the "
+        f"installer refuses on its hash. Run the checked copy in -NssmDir instead: {offenders}"
+    )
+
+
+def test_the_service_smoke_runs_the_copy_it_had_the_installer_check() -> None:
+    job = jobs_of("ci.yml").get(_SMOKE_JOB)
+    assert job, f"CONTROL FAILED: ci.yml has no {_SMOKE_JOB} job"
+    # The workflow-wide scan above must have read this job, or its clean result proves nothing.
+    assert any(job_id == _SMOKE_JOB for _, job_id, _ in _workflow_runs())
+    assert (job.get("env") or {}).get(_SMOKE_DIR_VAR), (
+        f"the {_SMOKE_JOB} job does not set {_SMOKE_DIR_VAR}"
+    )
+    scripts = _run_scripts(job)
+    handed = "-NssmDir $env:" + _SMOKE_DIR_VAR
+    for script_name in ("install-service.ps1", _MEASURE):
+        calls = [
+            line
+            for script in scripts
+            for line in script.splitlines()
+            if f"\\{script_name} " in line and not line.lstrip().startswith("#")
+        ]
+        assert calls, f"CONTROL FAILED: the {_SMOKE_JOB} job no longer runs {script_name}"
+        assert all(handed in line for line in calls), (
+            f"a {script_name} run in {_SMOKE_JOB} does not pass {handed}, so it checks or runs an "
+            f"nssm.exe in some other folder: {calls}"
+        )
+    verbs = {m.group(1) for script in scripts for m in _CHECKED_CALL.finditer(script)}
+    assert verbs == {"set", "start", "stop"}, (
+        f"{_SMOKE_JOB} should set, start and stop the service through the checked copy; it does "
+        f"{sorted(verbs)}"
+    )
