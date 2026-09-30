@@ -175,6 +175,8 @@ class Control:
     ``"case"``    ``ChooseFrom``/``<Case>`` with ``branches`` of kind ``"match"`` (``Matching``).
     ``"send"``    a ``MsgSend`` — ``args`` carries the rendered destination-name literal (empty when
                   the export names none, which degrades to a TODO marker rather than a guess).
+                  ``refusal`` is non-empty when the statement delivers a handle that is not provably
+                  ``msg``; the render then raises at the send site instead of sending (BACKLOG #313).
     ``"exit"``    ``Returns``/``ActionListExit``/``ActionListStop`` — no faithful vocabulary form, so a
                   TODO marker (never a silent flatten).
     ``"unknown"`` an element in a statement position whose TAG this layer does not model (a ``<Switch>``,
@@ -195,6 +197,8 @@ class Control:
     args: tuple[str, ...] = ()
     body: tuple[Step, ...] = field(default_factory=tuple)
     branches: tuple[Control, ...] = field(default_factory=tuple)
+    # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` sets it.
+    refusal: str = ""
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -787,6 +791,17 @@ def _subject_handle(action_list: Element) -> frozenset[str]:
     Anything else returns an empty set and **every** path-bearing statement in the list degrades to a
     TODO — the honest output, because a cross-message write rendered as ``msg.set`` silently mutates
     the wrong message."""
+    held, delivered = _scan_handles(action_list)
+    return held if delivered <= held else frozenset()
+
+
+def _scan_handles(action_list: Element) -> tuple[frozenset[str], frozenset[str]]:
+    """``(held, delivered)`` for an action-list: the handles that hold ``msg``, and those it sends.
+
+    ``held`` is the one input handle plus its whole-tree clones (see :func:`_subject_handle`), or empty
+    when the list does not have exactly one input handle, because then no handle is known to be
+    ``msg``. ``delivered`` is every handle a ``MsgSend`` names. A ``MsgSend`` of a handle outside
+    ``held`` would send the wrong message as ``msg``, which :func:`_send_refusal` refuses."""
     inputs: set[str] = set()
     delivered: set[str] = set()
     root_copies: list[tuple[str, str]] = []  # (source handle, destination handle)
@@ -810,16 +825,15 @@ def _subject_handle(action_list: Element) -> frozenset[str]:
             ):
                 root_copies.append((src.handle, dst.handle))
     if len(inputs) != 1:
-        return frozenset()
-    subject = next(iter(inputs))
-    same = {subject}
+        return frozenset(), frozenset(delivered)
+    same = {next(iter(inputs))}
     # A clone chain is followed transitively, but only ever forward from the input.
     for _ in range(len(root_copies)):
         grew = {dst for src, dst in root_copies if src in same}
         if grew <= same:
             break
         same |= grew
-    return frozenset(same) if delivered <= same else frozenset()
+    return frozenset(same), frozenset(delivered)
 
 
 def _is_root_path(text: str) -> bool:
@@ -1258,6 +1272,30 @@ def _role_send_args(operands: tuple[Operand, ...]) -> tuple[str, ...]:
     return ()
 
 
+def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
+    """Why a role-parsed ``MsgSend`` must not render as ``Send(dest, msg)``, or ``""`` when it may.
+
+    A Handler has one ``msg``: the inbound message. A ``MsgSend`` that names another handle (a scratch
+    or output tree the list built) would render as a send of ``msg`` and deliver the unmodified input
+    in place of the message Corepoint built. So the render raises at the send site instead
+    (BACKLOG #313, step 1). Dropping the send would make the handler filter silently.
+
+    Only a named handle is judged, the same predicate :func:`_scan_handles` uses to fill ``delivered``.
+    A statement whose first operand is not a handle is left as it was."""
+    if not operands or operands[0].kind != "handle" or operands[0].text in held:
+        return ""
+    handle = operands[0].text
+    if not held:
+        return (
+            f"MsgSend delivers {handle}, and this action-list has no single input handle, so no "
+            f"handle is known to be msg; the import refuses to send msg in its place"
+        )
+    return (
+        f"MsgSend delivers {handle}, not the input handle this Handler holds as msg; the import "
+        f"refuses to send msg in its place"
+    )
+
+
 def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control, ...]]:
     """Split a container body at its branch markers into ``(body, branches)``.
 
@@ -1318,7 +1356,11 @@ _MAX_NESTING = 100
 
 
 def _parse_list(
-    container: Element, subject: frozenset[str], in_control: bool, depth: int = 0
+    container: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
 ) -> list[Step]:
     """Parse the statement children of a ``<List>``/``<Actions>`` into ordered steps.
 
@@ -1333,7 +1375,7 @@ def _parse_list(
         tag = _local(child.tag).lower()
         if tag in _LIST_TAGS:
             # A doubly-wrapped list: flatten rather than lose the statements.
-            steps.extend(_parse_list(child, subject, in_control, depth + 1))
+            steps.extend(_parse_list(child, subject, held, in_control, depth + 1))
             continue
         # EVERY other child is a statement position and goes through _parse_statement — including a tag
         # this layer does not model, which comes back as an "unknown" marker plus its parsed subtree.
@@ -1341,7 +1383,7 @@ def _parse_list(
         # <DataPoint> package subtrees) dropped whole subtrees silently: those subtrees are children of
         # <Package>, NEVER of a <List>, so the tolerance was applied exactly where statements live and a
         # <Switch> — or a <Lines> typo — vanished with its body. Untrusted input is still never a crash.
-        produced = _parse_statement(child, subject, in_control, depth + 1)
+        produced = _parse_statement(child, subject, held, in_control, depth + 1)
         if (
             len(produced) == 1
             and isinstance(produced[0], Control)
@@ -1358,7 +1400,11 @@ def _parse_list(
 
 
 def _container_steps(
-    elem: Element, subject: frozenset[str], in_control: bool, depth: int = 0
+    elem: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
 ) -> list[Step]:
     """The nested body of ``elem``, in document order — every child, whatever shape it takes.
 
@@ -1367,11 +1413,15 @@ def _container_steps(
     is a **sibling** of the wrapper. Returning only the wrapper's children — as an earlier cut did the
     moment any wrapper existed — silently discarded those siblings, including an ``Else`` marker and its
     whole branch body."""
-    return _parse_list(elem, subject, in_control, depth + 1)
+    return _parse_list(elem, subject, held, in_control, depth + 1)
 
 
 def _parse_statement(
-    elem: Element, subject: frozenset[str], in_control: bool, depth: int = 0
+    elem: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
 ) -> list[Step]:
     """Parse one statement element into zero or more steps (a list, so a leaf can carry a body)."""
     tag = _local(elem.tag)
@@ -1406,7 +1456,7 @@ def _parse_statement(
 
     # A construct NESTS its body under a placeholder condition; a ``<Block>``/``<Call>`` is a label
     # whose body stays at the same indentation, so it does not deepen control scope.
-    body = _container_steps(elem, subject, in_control or kind in _NESTING_KINDS, depth)
+    body = _container_steps(elem, subject, held, in_control or kind in _NESTING_KINDS, depth)
 
     if _is_disabled(elem):
         # Preserved in full as commented-out pseudo-source — the subtree is parsed (so it is visible and
@@ -1464,7 +1514,8 @@ def _parse_statement(
         # ``*body`` matters: a ``MsgSend`` element that carries a nested list would otherwise lose it
         # (the break/exit path below always kept its body — this one silently did not).
         args = _role_send_args(role_operands) if roles else _send_args(operands)
-        return [Control("send", source, statement, args=args), *body]
+        refusal = _send_refusal(role_operands, held) if roles else ""
+        return [Control("send", source, statement, args=args, refusal=refusal), *body]
     if kind in ("break", "exit"):
         return [Control(kind, source, statement), *body]
     if kind in ("block", "call"):
@@ -1578,7 +1629,9 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
                 n += 1
             name = f"{name}_{n}"
         taken.add(name)
-        steps = tuple(_container_steps(action_list, _subject_handle(action_list), False))
+        held, delivered = _scan_handles(action_list)
+        subject = held if delivered <= held else frozenset()  # what _subject_handle returns
+        steps = tuple(_container_steps(action_list, subject, held, False))
         scope = _disabled_scope(action_list, parents)
         if scope is not None:
             # The whole list is switched off: wrap it in ONE disabled node so it is preserved as
@@ -1843,10 +1896,22 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))
         return out
     if ctrl.kind == "send":
+        refusal = _comment_text(ctrl.refusal)
         if not ctrl.args:
+            reason = f"; {refusal}" if refusal else ""
             return [
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: no destination named "
-                f"({label})"
+                f"({label}){reason}"
+            ]
+        if ctrl.refusal:
+            # A send of the wrong message. The raise keeps the destination and the ``sends`` list, so
+            # the handler neither sends msg here, nor filters silently, nor gains a trailing Send.
+            # Reaching this line is a loud ERROR (dead-letter), never a delivery (BACKLOG #313).
+            message = _lit(f"Corepoint import: {ctrl.refusal}")
+            return [
+                f"{pad}# TODO: Corepoint {ctrl.source_verb} to {ctrl.args[0]} — hand-finish: "
+                f"{refusal} ({label})",
+                f"{pad}raise NotImplementedError({message})",
             ]
         return [f"{pad}sends.append(Send({ctrl.args[0]}, msg))  # Corepoint {ctrl.source_verb}"]
     if ctrl.kind == "break":
@@ -2229,7 +2294,10 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            if (
+            if step.kind == "send" and step.refusal:
+                # Rendered as a raise and a TODO, never as the send, so it is not reported as shipped.
+                unmapped.append(step.source_verb)
+            elif (
                 step.kind in _MAPPED_CONTROL_KINDS
                 and step.kind not in _BRANCH_PARENT
                 and (step.kind != "break" or in_loop)

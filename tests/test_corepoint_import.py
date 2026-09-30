@@ -1036,6 +1036,146 @@ def test_msgsend_without_a_recoverable_destination_is_a_marker() -> None:
     assert "Send(" not in src.split('"""')[-1]
 
 
+# --- a MsgSend of a handle that is not msg (BACKLOG #313, step 1) -------------------------------
+#
+# A Handler has one ``msg``: the inbound message. A role-parsed ``MsgSend`` that names another handle
+# used to render ``Send(dest, msg)`` and so deliver the unmodified input in place of the message
+# Corepoint built. It now raises at the send site. All fixtures here are synthetic.
+
+
+def _span(cls: str, text: str) -> str:
+    return f"<span class='{cls}'>{text}</span>"
+
+
+def _role_line(data: str) -> str:
+    """A ``<Line>`` whose ``@Data`` carries role markup, escaped as the export writes it."""
+    escaped = data.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # XML attribute normalisation turns a raw newline into a space, so it rides as a character reference.
+    escaped = escaped.replace('"', "&quot;").replace("\n", "&#10;")
+    return f'<Line Data="{escaped}"/>'
+
+
+_WRITE_INPUT = _role_line(
+    _span("keyword", "ItemCopy")
+    + " "
+    + _span("literal", '"X"')
+    + " to "
+    + _span("input-handle", "%ADT")
+    + _span("path", "/MSH-6")
+)
+
+
+def _role_send(handle_class: str, handle: str, dest: str) -> str:
+    literal = _span("literal", '"' + dest + '"')
+    return _role_line(
+        _span("keyword", "MsgSend")
+        + " "
+        + _span(handle_class, handle)
+        + " to connection "
+        + literal
+    )
+
+
+def _handler_body(src: str) -> str:
+    return src.split("@handler")[-1]
+
+
+def test_a_msgsend_of_the_subject_handle_still_sends() -> None:
+    """The control arm: the input handle IS msg, so its send renders exactly as before."""
+    src = _handler_source(_WRITE_INPUT + _role_send("input-handle", "%ADT", "OB_IN"))
+    body = _handler_body(src)
+    assert 'set_field(msg, "MSH-6", "X")' in body  # the subject resolved, so the write mapped
+    assert '    sends.append(Send("OB_IN", msg))  # Corepoint MsgSend' in body
+    assert "raise NotImplementedError" not in body
+
+
+def test_a_msgsend_of_a_non_subject_handle_fails_loudly_and_sends_nothing() -> None:
+    """A send of another handle raises at the send site. It must not send msg, must not filter
+    silently, and must not gain a trailing unconditional ``Send``."""
+    src = _handler_source(_WRITE_INPUT + _role_send("other-handle", "%OUT", "OB_ACME"))
+    body = _handler_body(src)
+    assert "Send(" not in body  # no Send of msg anywhere: not inline, not trailing
+    assert "    sends = []" in body and body.rstrip().endswith("return sends")
+    assert "return None" not in body  # not a silent filter
+    assert '    raise NotImplementedError("Corepoint import: MsgSend delivers %OUT, not' in body
+    assert '# TODO: Corepoint MsgSend to "OB_ACME" — hand-finish: MsgSend delivers %OUT' in body
+    # The destination stays declared, so the hand-finisher has somewhere to send the right message.
+    assert 'outbound("OB_ACME", File(directory=' in src
+
+
+def test_a_non_subject_send_raises_when_the_handler_runs(tmp_path: Path) -> None:
+    """The refusal is a runtime ERROR (dead-letter), not only a comment: calling the loaded handler
+    raises, where the old render returned a Send of the unmodified input."""
+    from messagefoundry.config.wiring import load_config
+    from messagefoundry.parsing.message import Message
+
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(_role_send("other-handle", "%OUT", "OB_ACME")), encoding="utf-8")
+    out = tmp_path / "out"
+    import_corepoint(export, out)
+    handler_fn = load_config(out).handlers["t"]
+    msg = Message.parse("MSH|^~\\&|A|B|C|D|20260930||ADT^A01|1|P|2.5\rPID|1||123")
+    with pytest.raises(NotImplementedError, match="MsgSend delivers %OUT"):
+        handler_fn(msg)
+
+
+def test_a_non_subject_send_is_counted_unmapped(tmp_path: Path) -> None:
+    """The count-and-log summary must not report the refused send as shipped."""
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(_role_send("other-handle", "%OUT", "OB_ACME")), encoding="utf-8")
+    summary = import_corepoint(export, tmp_path / "out").to_json()
+    assert summary["total_mapped"] == 0
+    assert summary["total_unmapped"] == 1
+
+
+def test_a_send_with_no_single_input_handle_is_refused() -> None:
+    """With no input handle at all, no handle is known to be msg, so the send is refused too."""
+    body = _handler_body(_handler_source(_role_send("other-handle", "%OUT", "OB_ACME")))
+    assert "Send(" not in body
+    assert "has no single input handle" in body
+    assert "raise NotImplementedError" in body
+
+
+def test_a_mixed_list_refuses_only_the_non_subject_send() -> None:
+    """One list sending both handles: the input send stays live, the other one raises. The subject is
+    ambiguous here, so the field write degrades to a TODO exactly as before."""
+    src = _handler_source(
+        _WRITE_INPUT
+        + _role_send("input-handle", "%ADT", "OB_IN")
+        + _role_send("other-handle", "%OUT", "OB_ACME")
+    )
+    body = _handler_body(src)
+    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert 'Send("OB_ACME"' not in body
+    assert "raise NotImplementedError" in body
+    assert 'set_field(msg, "MSH-6"' not in body
+
+
+def test_a_conditional_non_subject_send_raises_inside_its_branch() -> None:
+    """The raise sits where the send was, so a conditional send stays conditional."""
+    src = _handler_source(
+        '<If Data="If (%ADT/PID-8 = &quot;M&quot;)"><List>'
+        + _role_send("other-handle", "%OUT", "OB_ACME")
+        + "</List></If>"
+    )
+    body = _handler_body(src)
+    assert "    if False:  # TODO: Corepoint If condition" in body
+    assert "        raise NotImplementedError(" in body
+    assert "Send(" not in body
+    assert body.rstrip().endswith("return sends")
+
+
+def test_a_hostile_handle_name_cannot_escape_the_raise_or_its_comment() -> None:
+    """The handle is untrusted export text: it rides into a string literal and a comment."""
+    src = _handler_source(_role_send("other-handle", '%O"UT)\nimport os', "OB_ACME"))
+    compile(src, "generated.py", "exec")
+    assert "\nimport os" not in src
+    # Positive control: the newline did reach the render, escaped inside the raise's literal.
+    assert (
+        'raise NotImplementedError("Corepoint import: MsgSend delivers %O\\"UT)\\nimport os' in src
+    )
+
+
 def test_generated_xml_module_compiles_and_passes_check(tmp_path: Path) -> None:
     """The emitted module parses, passes ``messagefoundry check``, and wires through the loader."""
     from messagefoundry.config.wiring import load_config

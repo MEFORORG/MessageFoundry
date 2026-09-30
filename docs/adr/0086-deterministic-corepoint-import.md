@@ -174,6 +174,16 @@ expression. `Returns`/`ActionListExit`/`ActionListStop` have no faithful form (a
 swallow the handler's `Send`s), so they emit a marker. A `MsgSend` appends to a `sends` list **where
 the export put it**, so a conditional send stays conditional. Nothing is ever silently flattened.
 
+**(b″) AMENDMENT 2026-09-30 — a `MsgSend` of a handle that is not `msg` raises (BACKLOG #313, step
+1).** A Handler has one `msg`, the inbound message. An action-list can build and send another tree.
+The importer rendered that send as `Send(dest, msg)`, which delivers the unmodified input in place of
+the message Corepoint built. Now a role-parsed `MsgSend` whose handle is not the input handle, or a
+whole-tree clone of it, renders as a TODO marker and `raise NotImplementedError(...)` at the send
+site. Reaching it is an `ERROR` and a dead-letter, never a delivery. The destination stays declared
+and the handler keeps its `sends` list, so the handler neither filters silently nor gains a trailing
+`Send`. The summary counts the statement as unmapped. A markup-free `MsgSend` names no handle role,
+so it renders as before. Building the other tree is step 2 of #313.
+
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 
 An action whose `class` has no v1 mapping emits, **in place**, an
