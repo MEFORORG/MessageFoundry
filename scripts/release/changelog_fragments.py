@@ -33,9 +33,16 @@ from the release notes, which is the loss this script exists to prevent.
 
 Usage::
 
-    python scripts/release/changelog_fragments.py check               # every PR (ci.yml)
+    python scripts/release/changelog_fragments.py check               # tests; any time
+    python scripts/release/changelog_fragments.py pr-check --base-changelog <file>  # ci.yml, a PR
     python scripts/release/changelog_fragments.py check --no-pending  # release.yml, on a tag
     python scripts/release/changelog_fragments.py assemble            # the release PR
+
+``pr-check`` compares the pull request's ``CHANGELOG.md`` with the base branch's. A pull request
+that adds a version heading while fragments remain is refused: that is a release pull request that
+forgot ``assemble``, caught before the tag rather than after it. A pull request that edits
+``CHANGELOG.md`` without adding a version heading gets a WARNING, never a failure, because pull
+requests opened before this change still edit it and turning them red would buy nothing.
 """
 
 from __future__ import annotations
@@ -64,6 +71,7 @@ CATEGORIES: dict[str, str] = {
 
 _NAME = re.compile(r"^(?P<name>[0-9a-z][0-9a-z-]*)\.(?P<category>[a-z]+)\.md$")
 _UNRELEASED = "## [Unreleased]"
+_VERSION_HEADING = re.compile(r"^## \[(?!Unreleased\])([^\]]+)\]", re.MULTILINE)
 #: A Markdown link reference definition at column 0, e.g. ``[0.4.0]: https://...``. The compare
 #: links at the foot of the file are not part of any section, so a section never runs into them.
 _LINK_DEF = re.compile(r"^\[[^\]]+\]:\s")
@@ -89,21 +97,23 @@ def _sort_key(fragment: Fragment) -> tuple[int, int, str]:
 
 
 def _body_problems(body: str) -> list[str]:
+    """One message per faulty line. The first non-blank line must be a bullet; later ones may also
+    be indented continuations."""
     problems: list[str] = []
-    lines = body.splitlines()
-    first = next((line for line in lines if line.strip()), None)
-    if first is None:
-        return ["is empty"]
-    if not first.startswith("- "):
-        problems.append("must start with a bullet ('- ')")
-    for number, line in enumerate(lines, start=1):
+    seen_content = False
+    for number, line in enumerate(body.splitlines(), start=1):
+        if not line.strip():
+            continue
         if line.startswith("#"):
             problems.append(f"line {number} starts with '#'; a heading would split the section")
-        elif line.strip() and not (line.startswith("- ") or line[0].isspace()):
+        elif not seen_content and not line.startswith("- "):
+            problems.append(f"line {number}: a fragment must start with a bullet ('- ')")
+        elif not (line.startswith("- ") or line[0].isspace()):
             problems.append(
                 f"line {number} is neither a bullet ('- ') nor an indented continuation"
             )
-    return problems
+        seen_content = True
+    return problems if seen_content else ["is empty"]
 
 
 def load(fragment_dir: Path) -> list[Fragment]:
@@ -205,6 +215,42 @@ def assemble_text(changelog: str, fragments: list[Fragment]) -> str:
     return "\n".join(lines)
 
 
+def new_versions(base: str, head: str) -> list[str]:
+    """Version headings (``## [x.y.z]``) in ``head`` that ``base`` does not have, in file order."""
+    known = set(_VERSION_HEADING.findall(base))
+    return [version for version in _VERSION_HEADING.findall(head) if version not in known]
+
+
+def _listing(fragments: list[Fragment]) -> str:
+    return "\n  ".join(f"{FRAGMENT_DIR}/{f.path.name}" for f in fragments)
+
+
+def pr_check(root: Path, base_changelog: str) -> int:
+    """The pull-request check. Returns the exit status; see the module docstring.
+
+    ``base_changelog`` is text read in universal-newline mode, like the head copy read here.
+    """
+    fragments = load(root / FRAGMENT_DIR)
+    head = (root / CHANGELOG).read_text(encoding="utf-8")
+    added = new_versions(base_changelog, head)
+    if added and fragments:
+        print(
+            f"this pull request adds version heading(s) {', '.join(added)} to {CHANGELOG} while "
+            f"{len(fragments)} fragment(s) remain, so that release would miss them. Run `python "
+            f"scripts/release/changelog_fragments.py assemble` first:\n  {_listing(fragments)}",
+            file=sys.stderr,
+        )
+        return 1
+    if not added and head != base_changelog:
+        print(
+            f"::warning file={CHANGELOG}::This pull request edits {CHANGELOG}. Add a fragment under "
+            f"{FRAGMENT_DIR}/ instead (see {FRAGMENT_DIR}/README.md); only the release pull request "
+            f"edits {CHANGELOG}. This is a warning, not a failure."
+        )
+    print(f"changelog fragments: {len(fragments)} well-formed; new version heading(s): {added}")
+    return 0
+
+
 def assemble(root: Path, *, dry_run: bool = False) -> list[Fragment]:
     """Fold ``root/changelog.d`` into ``root/CHANGELOG.md``, then delete the fragments.
 
@@ -241,6 +287,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also refuse ANY fragment; the release job runs this so a tag cannot ship without them",
     )
+    against = sub.add_parser(
+        "pr-check", help="compare CHANGELOG.md with the base branch's copy (pull requests)"
+    )
+    against.add_argument(
+        "--base-changelog", type=Path, required=True, help="the base branch's CHANGELOG.md"
+    )
     build = sub.add_parser("assemble", help="fold fragments into CHANGELOG.md and delete them")
     build.add_argument(
         "--dry-run", action="store_true", help="print the new CHANGELOG.md; change nothing"
@@ -251,16 +303,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             fragments = load(root / FRAGMENT_DIR)
             if args.no_pending and fragments:
-                names = "\n  ".join(f"{FRAGMENT_DIR}/{f.path.name}" for f in fragments)
                 print(
                     f"{len(fragments)} changelog fragment(s) were never assembled, so the release "
                     f"notes would miss them. Run `python scripts/release/changelog_fragments.py "
-                    f"assemble` in the release pull request:\n  {names}",
+                    f"assemble` in the release pull request:\n  {_listing(fragments)}",
                     file=sys.stderr,
                 )
                 return 1
             print(f"changelog fragments: {len(fragments)} well-formed, 0 malformed")
             return 0
+        if args.command == "pr-check":
+            base_path: Path = args.base_changelog
+            return pr_check(root, base_path.read_text(encoding="utf-8"))
         done = assemble(root, dry_run=args.dry_run)
     except FragmentError as error:
         print(f"changelog fragments refused:\n{error}", file=sys.stderr)

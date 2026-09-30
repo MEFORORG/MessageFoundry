@@ -30,7 +30,8 @@ Check your fragment before you push:
 python scripts/release/changelog_fragments.py check
 ```
 
-CI runs the same check on every pull request.
+CI runs the same check on every pull request, docs-only ones included. CI also warns, without
+failing, when a pull request edits `CHANGELOG.md` directly.
 
 ## At release
 
@@ -42,8 +43,9 @@ python scripts/release/changelog_fragments.py assemble
 
 Each entry goes at the end of the matching `###` heading under `## [Unreleased]`, after every
 entry already there. Then the release pull request renames `[Unreleased]` to the version, as
-before. The release workflow refuses to publish a tag while any fragment is left in this folder,
-because the release notes are read from `CHANGELOG.md` and would miss it.
+before. CI fails a pull request that adds a version heading while any fragment is left in this
+folder, and the release workflow refuses to publish a tag in that state. The release notes are
+read from `CHANGELOG.md`, so they would miss the fragment.
 
 This file is the only file here that is not a fragment. Any other misnamed file fails the check,
 rather than being skipped and lost at release.

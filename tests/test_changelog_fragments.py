@@ -13,6 +13,7 @@ two workflows that call the script, so the gate cannot be wired to nothing.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -247,17 +248,74 @@ def test_check_fails_on_a_malformed_fragment(tmp_path: Path) -> None:
     assert cf.main(["--root", str(root), "check"]) == 1
 
 
+def test_one_faulty_line_gets_one_message(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"8.fixed.md": "plain prose\n"})
+    with pytest.raises(cf.FragmentError) as caught:
+        cf.load(root / "changelog.d")
+    assert str(caught.value).count("line 1") == 1, str(caught.value)
+
+
+# --- the pull-request check against the base branch -------------------------------------------------
+
+_RELEASED = _CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n## [0.5.0] - 2026-10-01\n")
+
+
+def _pr_check(
+    tmp_path: Path, fragments: dict[str, str], head: str, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, str, str]:
+    root = _repo(tmp_path, fragments, changelog=head)
+    base = tmp_path / "base-CHANGELOG.md"
+    base.write_text(_CHANGELOG, encoding="utf-8")
+    status = cf.main(["--root", str(root), "pr-check", "--base-changelog", str(base)])
+    out = capsys.readouterr()
+    return status, out.out, out.err
+
+
+def test_pr_check_refuses_a_new_version_heading_while_fragments_remain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, _, err = _pr_check(tmp_path, {"9.fixed.md": "- f\n"}, _RELEASED, capsys)
+    assert status == 1
+    assert "0.5.0" in err and "changelog.d/9.fixed.md" in err
+
+
+def test_pr_check_passes_an_assembled_release_without_a_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, out, _ = _pr_check(tmp_path, {}, _RELEASED, capsys)
+    assert status == 0
+    assert "::warning" not in out
+
+
+def test_pr_check_warns_but_passes_a_direct_changelog_edit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edited = _CHANGELOG.replace("- existing fixed\n", "- existing fixed\n- direct edit\n")
+    status, out, _ = _pr_check(tmp_path, {"9.fixed.md": "- f\n"}, edited, capsys)
+    assert status == 0
+    assert out.startswith("::warning file=CHANGELOG.md::")
+
+
+def test_pr_check_is_silent_on_an_ordinary_fragment_pull_request(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, out, _ = _pr_check(tmp_path, {"9.fixed.md": "- f\n"}, _CHANGELOG, capsys)
+    assert status == 0
+    assert "::warning" not in out
+
+
+def test_new_versions_ignores_unreleased_and_known_headings() -> None:
+    assert cf.new_versions(_CHANGELOG, _RELEASED) == ["0.5.0"]
+    assert cf.new_versions(_RELEASED, _RELEASED) == []
+
+
 # --- the live tree ----------------------------------------------------------------------------------
 
 
-def test_the_live_fragments_are_well_formed() -> None:
-    """The same check ci.yml runs; here too so a local ``pytest`` catches a bad fragment."""
-    assert (_REPO / "changelog.d" / "README.md").is_file(), "changelog.d/ lost its README"
-    cf.load(_REPO / "changelog.d")
-
-
 def test_the_live_fragments_assemble_into_the_live_changelog_without_moving_a_line() -> None:
-    """Folding today's fragments into today's CHANGELOG.md keeps every existing line, in order."""
+    """Today's fragments are well-formed, and folding them into today's CHANGELOG.md keeps every
+    existing line, in order. ``load`` raising is the malformed-fragment failure."""
+    assert (_REPO / "changelog.d" / "README.md").is_file(), "changelog.d/ lost its README"
     fragments = cf.load(_REPO / "changelog.d")
     with (_REPO / "CHANGELOG.md").open(encoding="utf-8", newline="") as handle:
         before = handle.read()
@@ -270,14 +328,24 @@ def test_the_live_fragments_assemble_into_the_live_changelog_without_moving_a_li
 def test_ci_checks_every_pull_request_and_release_refuses_leftovers() -> None:
     """The gate must be wired: an assembler nothing calls protects nothing."""
     yaml = pytest.importorskip("yaml")
+    ci_text = (_REPO / ".github" / "workflows" / "ci.yml").read_text("utf-8")
 
     def steps(workflow: str, job: str) -> list[dict[str, Any]]:
         data = yaml.safe_load((_REPO / ".github" / "workflows" / workflow).read_text("utf-8"))
         return [s for s in data["jobs"][job]["steps"] if isinstance(s, dict)]
 
-    ci = [s for s in steps("ci.yml", "test") if "changelog_fragments.py check" in str(s.get("run"))]
-    assert len(ci) == 1, "ci.yml's test job must run the fragment check exactly once"
-    assert "code" not in str(ci[0].get("if") or ""), "the fragment check must run on docs-only PRs"
+    # A fragment-only pull request is docs-only and skips the suite, so this module must be in the
+    # docs-only lane. Parsed the way tests/test_doc_guards_lane.py parses it.
+    doc_guards = re.search(r'DOC_GUARDS="([^"]+)"', ci_text)
+    assert doc_guards is not None, "DOC_GUARDS is no longer a double-quoted assignment in ci.yml"
+    assert "tests/test_changelog_fragments.py" in doc_guards.group(1).split()
+
+    ci = [
+        s for s in steps("ci.yml", "test") if "changelog_fragments.py pr-check" in str(s.get("run"))
+    ]
+    assert len(ci) == 1, "ci.yml's test job must run the base-branch check exactly once"
+    guard = str(ci[0].get("if") or "")
+    assert "pull_request" in guard and "code" not in guard, "PR-only, and not skipped on docs-only"
 
     release = steps("release.yml", "release")
     names = [str(s.get("name") or s.get("uses")) for s in release]
