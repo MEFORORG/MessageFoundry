@@ -73,8 +73,9 @@ because one arrived.
 5. Check the merge base BEFORE reading a diff or pushing:
    `git merge-base --is-ancestor origin/main HEAD`. Exit 0 means you contain the trunk tip.
 6. Check who else is in your files: `pwsh -NoProfile -File scripts/coord/overlap.ps1`.
-7. If you add a file under `tests/`, classify it in `tests/tooling_manifest.txt` in the same commit,
-   or the PR can never go green.
+7. A new test that imports no `messagefoundry` goes in `tests/tooling_manifest.txt` in the same
+   commit. An engine test needs no line, and a listed one stops running on engine PRs. When
+   ambiguous, leave it off. Source of record: `tests/test_tooling_partition.py`.
 
 ## Before you claim it works
 
