@@ -20,8 +20,10 @@ run on every Linux runner. All HL7 is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import sys
 import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
@@ -323,3 +325,64 @@ def test_a_small_drop_does_not_reserve_the_whole_cap(tmp_path: Path) -> None:
         tracemalloc.stop()
     assert raw == _DROP
     assert peak < 1 << 20, f"the read reserved the cap (traced peak {peak} bytes)"
+
+
+async def test_a_refused_link_is_not_charged_and_is_warned_about_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A refusal leaves the entry in place, so it must not spend the per-tick budget, and a link left
+    there must not write a WARNING on every poll.
+
+    Mutations: charge the refusal arm (``disposed += 1``); red, the healthy file behind it waits. Drop
+    the once-only memory; red, a second WARNING."""
+    _require_symlinks(tmp_path)
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    first = inbox / "a_first.hl7"
+    first.write_bytes(_DROP)
+    (inbox / "b_second.hl7").write_bytes(_SECRET_HL7)
+    target = inbox / "target.txt"  # inside the root, so the listing keeps passing the link
+    _twin(first, target, _SECRET_OTHER)
+    src = _source(inbox, poll_max_files=1)
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()
+
+    def swap() -> None:
+        first.rename(tmp_path / "parked.hl7")
+        first.symlink_to(target)
+
+    _swap_when_settled(monkeypatch, src, first, swap)
+    with caplog.at_level(logging.WARNING, logger=_FILE_LOGGER):
+        await src._scan_once()
+        assert handler.got == [_SECRET_HL7], "the healthy file behind the refusal was not reached"
+        await src._scan_once()  # the link is still listed; its settle poll
+        await src._scan_once()  # and its second refusal
+    assert caplog.text.count("refusing") == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
+async def test_a_fifo_swapped_in_is_refused_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last name is opened ``O_NONBLOCK``, so a FIFO swapped in fails the regular-file check at once.
+
+    Mutation: drop ``O_NONBLOCK``. Red: the open waits for a writer and the scan times out."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    drop = inbox / "drop.hl7"
+    drop.write_bytes(_DROP)
+    src = _source(inbox)
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()
+
+    def swap() -> None:
+        drop.unlink()
+        if sys.platform != "win32":  # narrows mypy; the test is skipped there
+            os.mkfifo(drop)
+
+    _swap_when_settled(monkeypatch, src, drop, swap)
+    await asyncio.wait_for(src._scan_once(), timeout=10)
+    assert handler.got == []
+    assert list((inbox / ".error").iterdir()) == []

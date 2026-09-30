@@ -143,7 +143,7 @@ def test_a_failed_archive_claim_on_a_bumped_name_logs_no_partner_name(
     dropped.write_bytes(b"PAYLOAD")
     bumped = str(tmp_path / "processed" / f"{_MRN}_ADT-1.hl7")
 
-    def claim_fails(_tmp: Path, _target: Path) -> Path:
+    def claim_fails(_tmp: Path, _target: Path, **_k: object) -> Path:
         raise PermissionError(errno.EACCES, "Permission denied", "tmpab12.part", None, bumped)
 
     monkeypatch.setattr(file_mod, "_claim_unique", claim_fails)

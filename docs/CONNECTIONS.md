@@ -953,10 +953,11 @@ its own policy block below):
 - **Links are refused at read and at move time.** A drop is read only if the opened handle is a
   regular file at the listed name inside the watch directory, reached through no symbolic link or
   junction. POSIX opens each path component with `O_NOFOLLOW`; Windows compares the handle's final
-  path. The same check runs again just before the file is archived, quarantined or deleted. A refused
-  entry is logged and left in place, never read or moved, so a link swapped in after the listing
-  cannot pull an outside file into the pipeline, `.processed` or `.error`. This includes a link that
-  points inside the watch directory: drop real files, not links.
+  path. The same check runs again just before the file is archived, quarantined or deleted, and on
+  POSIX that act then names the file relative to its checked directory. A refused entry is logged (a
+  WARNING the first time) and left in place, never read or moved. So a link swapped in after the
+  listing cannot pull an outside file into the pipeline, `.processed` or `.error`. This includes a
+  link that points inside the watch directory: drop real files, not links.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
   `decompress=` set the connector performs no decompression itself, so it materialises nothing beyond
   `max_file_bytes` where that cap is set. An earlier revision went further and said there is "no
