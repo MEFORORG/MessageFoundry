@@ -172,14 +172,17 @@ function New-SyntheticPassword {
       candidate, so draw again; any other failure means the screen itself broke, so stop.
     #>
     param([string]$ForUsername, [string]$ForDbPath, [hashtable]$Environment)
+    $maxAttempts = 16
+    $secrets = $Environment.Clone()
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
         $bytes = New-Object byte[] 48
-        for ($attempt = 1; $attempt -le 16; $attempt++) {
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
             $rng.GetBytes($bytes)
             $candidate = (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
-            $secrets = @{ MEFOR_W0_ADMIN_PASSWORD = $candidate }
-            foreach ($k in $Environment.Keys) { $secrets[$k] = $Environment[$k] }
+            # Masked before the probe runs, since the probe's output is echoed to the log.
+            if ($env:GITHUB_ACTIONS -eq "true") { Write-Host "::add-mask::$candidate" }
+            $secrets["MEFOR_W0_ADMIN_PASSWORD"] = $candidate
             $r = Invoke-OperatorCli -Arguments @("screen", $ForUsername, $ForDbPath) -Secrets $secrets
             if ($r.Code -eq 0) { return $candidate }
             if ($r.Code -ne 3) {
@@ -187,7 +190,9 @@ function New-SyntheticPassword {
             }
         }
     } finally { $rng.Dispose() }
-    throw "no synthetic password cleared the policy in 16 attempts"
+    # A clause no 32-character alphanumeric string can meet (a longer minimum, a symbol rule) lands
+    # here on every draw, so name what the last draw was refused for.
+    throw "no synthetic password cleared the policy in $maxAttempts attempts; the last: $(Get-Excerpt $r.Text)"
 }
 
 function Get-Sid([string]$Account) {
@@ -634,6 +639,8 @@ Set-Content -LiteralPath (Join-Path $ConfigDir "IB_W0_STORE_ACCESS.py") -Encodin
 # The probe. `provision` replaces ONLY _read_new_password, then runs the real CLI entry point, so
 # settings, the at-rest gate, open_store(create=True) and provision_first_administrator are the
 # shipped code path. `health` and `login` speak https pinned to the engine's own minted certificate.
+# `screen` runs provision-admin's password policy on a candidate and exits 3 on a refusal, which
+# New-SyntheticPassword reads as "draw again"; keep 3 for that meaning alone.
 $ProbeSource = @'
 import json
 import os
@@ -743,8 +750,8 @@ Set-Content -LiteralPath $Probe -Value $ProbeSource -Encoding Ascii
 $StoreKey = (& $AppExe gen-key).Trim()
 if (-not $StoreKey) { throw "messagefoundry gen-key produced no store key" }
 if ($env:GITHUB_ACTIONS -eq "true") {
-    # Synthetic and per run. Masked anyway, so no later echo can print it in clear. The password is
-    # masked the same way once the try below has drawn it.
+    # Synthetic and per run. Masked anyway, so no later echo can print it in clear. New-SyntheticPassword
+    # masks each password candidate the same way before anything can echo it.
     Write-Host "::add-mask::$StoreKey"
 }
 $BaseUrl = "https://127.0.0.1:$Port"
@@ -754,14 +761,17 @@ Write-Host "store: $DbPath"
 
 try {
     # Drawn inside the try, so a broken screen reds through Add-Failure and the cleanup below like any
-    # other step. The environment is what provision-admin runs under, so the screen loads the same
-    # settings; the password itself rides MEFOR_W0_ADMIN_PASSWORD, added by the function.
-    $CurrentPhase = "operator password screen"
-    $Password = New-SyntheticPassword -ForUsername $Username -ForDbPath $DbPath -Environment @{
+    # other step. $ProvisionEnvironment is the one environment both the screen and every
+    # provision-admin call below run under, so both load the same settings. The password itself rides
+    # MEFOR_W0_ADMIN_PASSWORD, added per call.
+    $ProvisionEnvironment = @{
         MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
+        # Not a secret; it rides the same inherited-environment channel so it is cleared after.
         MEFOR_SECURITY_REQUIRE_MFA = "false"
     }
-    if ($env:GITHUB_ACTIONS -eq "true") { Write-Host "::add-mask::$Password" }
+    $CurrentPhase = "operator password screen"
+    $Password = New-SyntheticPassword -ForUsername $Username -ForDbPath $DbPath `
+        -Environment $ProvisionEnvironment
     $CurrentPhase = "setup"
 
     # --- install under the DEFAULT virtual account (no -ServiceAccount, no -AllowLocalSystem) ------
@@ -810,12 +820,9 @@ try {
     $provisionArgs = @(
         "provision", "--username", $Username, "--email", $Email, "--db", $DbPath, "--json", "--no-totp"
     )
-    $cliSecrets = @{
-        MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
-        MEFOR_W0_ADMIN_PASSWORD = $Password
-        # Not a secret; it rides the same inherited-environment channel so it is cleared after.
-        MEFOR_SECURITY_REQUIRE_MFA = "false"
-    }
+    # The screen above ran under $ProvisionEnvironment, so provision-admin loads the same settings.
+    $cliSecrets = $ProvisionEnvironment.Clone()
+    $cliSecrets["MEFOR_W0_ADMIN_PASSWORD"] = $Password
 
     if ($Order -eq "ProvisionFirst") {
         # 1. The operator provisions the fresh store.
