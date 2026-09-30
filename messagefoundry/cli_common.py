@@ -22,14 +22,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
-from collections.abc import Callable, Mapping
+import textwrap
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import configure_stderr_logging
 
-__all__ = ["Dispatch", "run_cli"]
+__all__ = ["Dispatch", "HelpFormatter", "argv_wants_json", "first_command", "run_cli"]
 
 #: A command's top-level subcommand names, each mapped to the handler that runs it.
 Dispatch = Mapping[str, Callable[[argparse.Namespace], int]]
@@ -157,6 +159,68 @@ def run_cli(
             return 1
         code = floor_code(args) if floor_code is not None else None
         return _emit_error(text, as_json=True, code=code)
+
+
+class HelpFormatter(argparse.HelpFormatter):
+    """argparse's default formatter, except that a DESCRIPTION or EPILOG never breaks at a hyphen.
+
+    The default wraps with ``textwrap``'s ``break_on_hyphens``, so ``messagefoundry-toolkit`` in a
+    description or epilog splits as ``messagefoundry-`` and ``toolkit`` at some terminal widths, and
+    a reader who copies the command gets half of it. Only ``_fill_text`` changes, which is what
+    formats those two, and otherwise it does what the default's does: ASCII whitespace collapsed,
+    then filled to the width with the indent. Argument help (``_split_lines``) is untouched, and
+    argparse does not hand this class to subparsers; a parser that wants it names it."""
+
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        return textwrap.fill(
+            re.sub(r"\s+", " ", text, flags=re.ASCII).strip(),
+            width,
+            initial_indent=indent,
+            subsequent_indent=indent,
+            break_on_hyphens=False,
+        )
+
+
+#: Subcommand paths that answer in JSON with no ``--json`` flag. ``lens rewrite`` takes JSON mode from
+#: ``set_defaults``; ``lens schema`` prints JSON either way, its flag only choosing compact output.
+#: ``lens parse`` reports an error as text without its flag, so it is not here.
+_JSON_BY_DEFAULT = frozenset({("lens", "rewrite"), ("lens", "schema")})
+
+#: Top-level options argparse answers itself, ahead of any subcommand. None takes a value. Exact
+#: spellings are enough because both commands' top-level parsers set ``allow_abbrev=False``.
+_ANSWERED_BY_ARGPARSE = frozenset({"-h", "--help", "--version"})
+
+
+def _command_path(argv: Sequence[str]) -> tuple[str, ...]:
+    """The subcommand path ``argv`` names, read BEFORE parsing: its arguments that are not options.
+
+    Empty when a top-level ``--help`` or ``--version`` comes first, because argparse answers that
+    and exits before it reads a subcommand: ``messagefoundry --help adr-analyze`` prints the help.
+    Neither command's top-level options take a value, so no option's value is mistaken for a
+    subcommand. Past the first word this is a guess, which is all the two callers need."""
+    path: list[str] = []
+    for arg in argv:
+        if not path and arg in _ANSWERED_BY_ARGPARSE:
+            return ()
+        if not arg.startswith("-"):
+            path.append(arg)
+    return tuple(path)
+
+
+def first_command(argv: Sequence[str]) -> str | None:
+    """The top-level subcommand ``argv`` names, read before parsing, or None. See
+    :func:`_command_path` for how it is read."""
+    path = _command_path(argv)
+    return path[0] if path else None
+
+
+def argv_wants_json(argv: Sequence[str]) -> bool:
+    """Whether a refusal made BEFORE parsing must answer as JSON (ADR 0201 section 3).
+
+    ``--json`` anywhere in the arguments, or a subcommand that is JSON by default. One rule for every
+    pre-parse refusal on either command, so a toolkit ``lens rewrite`` refused for a version mismatch
+    answers the IDE the same way the engine's refusal of a moved one would."""
+    return "--json" in argv or _command_path(argv)[:2] in _JSON_BY_DEFAULT
 
 
 def _safe_print(line: str) -> None:

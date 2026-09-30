@@ -536,8 +536,9 @@ jobs:
             --output-format JSON --output-file ../sbom-ide.cdx.json
           python ../scripts/security/sbom_finalize.py ../sbom-ide.cdx.json --phase build
       - name: Score SBOM quality (sbomqs — advisory)
-        # continue-on-error (matching the release.yml twin): sbomqs is advisory, so a download/checksum/parse
-        # hiccup here must never skip the SBOM-artifact upload below (the actual deliverable).
+        # continue-on-error: sbomqs is advisory HERE, so a download/checksum/parse hiccup must never skip
+        # the SBOM-artifact upload below (the actual deliverable). This no longer matches release.yml:
+        # there the install and pin check BLOCK and only the score is advisory (BACKLOG #1698).
         continue-on-error: true
         run: |
           # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA

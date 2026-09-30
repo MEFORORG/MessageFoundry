@@ -3,7 +3,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-L3-02 (ASVS 11.1.3): cryptographic-discovery gate.
 
-Enumerate every cryptographic call site across the five first-party roots (:data:`WALK_ROOTS`) via
+Enumerate every cryptographic call site across the six first-party roots (:data:`WALK_ROOTS`) via
 the AST and diff them against the maintained inventory below. The build **fails** when a module uses a
 crypto primitive it isn't documented to use — so a new (or moved) crypto usage can't slip in
 unreviewed, and the inventory below stays an accurate "where is crypto used" map (it is the
@@ -103,7 +103,7 @@ job runs, and what decides whether it blocks a merge, is stated once, at
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
-    python scripts/security/crypto_inventory_check.py            # scan the five real roots
+    python scripts/security/crypto_inventory_check.py            # scan the six real roots
     python scripts/security/crypto_inventory_check.py --package DIR   # scan an arbitrary package (tests)
     python scripts/security/crypto_inventory_check.py --list-operations   # also print every operation
     python scripts/security/crypto_inventory_check.py --non-python-operations   # TS/JS + PowerShell
@@ -128,7 +128,7 @@ if _HERE not in sys.path:
     sys.path.append(_HERE)
 import crypto_operations  # noqa: E402
 
-# The five first-party roots the gate walks — byte-identical (as basenames) to
+# The six first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
 # ``ide/`` is deliberately absent: it is the TypeScript VS Code extension and contains ZERO ``.py``
 # files, so THIS scanner — which rglobs ``*.py`` and walks the Python AST — has nothing to read there.
@@ -148,7 +148,7 @@ import crypto_operations  # noqa: E402
 # sites would stay invisible while the tree gained a green whose greenness is evidence of nothing.
 # ``ide/`` is covered by a SEPARATE arm instead (:data:`NON_PYTHON_WALK_ROOTS` below, BACKLOG #1172),
 # which reads ``.ts``/``.js`` by pattern rather than by AST and rides this same required context. So
-# this gate's green now means "no undocumented crypto in the PYTHON of five roots, AND no
+# this gate's green now means "no undocumented crypto in the PYTHON of six roots, AND no
 # undocumented or weak RANDOMNESS source in the non-Python roots". The randomness half is the only
 # non-Python claim the REQUIRED run supports. The extension's TLS floor is found by the operation arm
 # (:func:`check_non_python_operations`, BACKLOG #1164), which runs in its own CI job; see
@@ -160,7 +160,14 @@ import crypto_operations  # noqa: E402
 # ``_CRYPTO_ROOTS`` tuple likewise omits ``samples/`` and this walk-set is pinned byte-identical to it,
 # so adding ``samples/`` here would break that pin AND drag author-space into the ReDoS/XML static
 # guards that consume the same tuple.
-WALK_ROOTS = ("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")
+WALK_ROOTS = (
+    "messagefoundry",
+    "messagefoundry_webconsole",
+    "messagefoundry_toolkit",
+    "harness",
+    "tee",
+    "scripts",
+)
 
 # --------------------------------------------------------------------------------------------
 # The NON-PYTHON randomness arm (BACKLOG #1172, ASVS 11.5.1).
@@ -571,7 +578,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
-    # and asserts it. Its one decision, leaving CERT_NONE hops alone, is on its IMPORT_ONLY row.
+    # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
     "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
@@ -828,12 +835,6 @@ IMPORT_ONLY: dict[str, str] = {
         "opener is built by the shared base in transports/smart.py (BACKLOG #2115), which is "
         "inventoried"
     ),
-    "messagefoundry/transports/strict_requests.py": (
-        "INSTRUMENT LIMIT. Gives each verifying Vault https connection a context from a factory "
-        "config/tls_policy.py returns, which builds and narrows it there, and leaves a CERT_NONE "
-        "connection (the TLS hop to an https proxy) on urllib3's own context: a TLS posture "
-        "decision with no crypto-shaped call in it (BACKLOG #300)"
-    ),
     "tee/mefor_api.py": (
         "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
     ),
@@ -1022,6 +1023,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
             "tls_context:.set_ciphersuites()",
+            "tls_context:.set_server_sigalgs()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",
@@ -1375,6 +1377,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.keywrap",
             "tls_context:via messagefoundry.transports.rest",
         }
+    ),
+    # Loads requests' CA onto the https-proxy leg's context; _narrowed_pool_classes says why.
+    # INSTRUMENT LIMIT: the load sits in a class nested in a function reached only through
+    # StrictReplyAdapter.__init__, so no "via" token reaches the Vault callers' rows, and the
+    # CERT_NONE refusal in connect() is a posture decision with no crypto-shaped call.
+    "messagefoundry/transports/strict_requests.py": frozenset(
+        {"tls_context:.load_verify_locations()"}
     ),
     # BACKLOG #300, owner ruling R3 of 2026-09-27: both verifying contexts are narrowed to a pinned
     # copy of the approved suite list, the apiclient's pattern (tray/ may not import config/).
@@ -2396,7 +2405,7 @@ def main(argv: list[str] | None = None) -> int:
         "--package",
         type=Path,
         default=None,
-        help="single package directory to scan (default: the five real WALK_ROOTS + built-in inventory)",
+        help="single package directory to scan (default: the six real WALK_ROOTS + built-in inventory)",
     )
     parser.add_argument(
         "--list-operations",

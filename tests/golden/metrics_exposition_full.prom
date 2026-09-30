@@ -1,0 +1,136 @@
+# HELP messagefoundry_build_info Build metadata; constant 1, version carried as a label.
+# TYPE messagefoundry_build_info gauge
+messagefoundry_build_info{version="0.4.0+\"build\"\\x\n"} 1.0
+# HELP messagefoundry_host_cpu_percent Host-wide CPU utilization percent (0-100) since the previous scrape.
+# TYPE messagefoundry_host_cpu_percent gauge
+messagefoundry_host_cpu_percent NaN
+# HELP messagefoundry_host_memory_used_bytes Host physical memory in use (total - available), bytes.
+# TYPE messagefoundry_host_memory_used_bytes gauge
+messagefoundry_host_memory_used_bytes 1.6e+10
+# HELP messagefoundry_host_memory_total_bytes Host total physical memory, bytes.
+# TYPE messagefoundry_host_memory_total_bytes gauge
+messagefoundry_host_memory_total_bytes 1.234567e+06
+# HELP messagefoundry_process_resident_memory_bytes Resident set size (RSS) of the engine process, bytes.
+# TYPE messagefoundry_process_resident_memory_bytes gauge
+messagefoundry_process_resident_memory_bytes 0.5
+# HELP messagefoundry_messages_received_total Messages received on an inbound connection (process lifetime).
+# TYPE messagefoundry_messages_received_total counter
+messagefoundry_messages_received_total{connection="IB_ACME_ADT"} 12.0
+messagefoundry_messages_received_total{connection="IB_q\"uote\\back\nline-é"} 3.0
+# HELP messagefoundry_http_sync_replies_total Synchronous captured-downstream replies resolved, by outcome (process lifetime).
+# TYPE messagefoundry_http_sync_replies_total counter
+messagefoundry_http_sync_replies_total{connection="IB_HTTP",status="degraded"} 1.0
+messagefoundry_http_sync_replies_total{connection="IB_HTTP",status="reply"} 7.0
+messagefoundry_http_sync_replies_total{connection="IB_HTTP",status="timeout"} 2.0
+# HELP messagefoundry_http_sync_reply_wait_seconds Mean time an HTTP turn blocked on a captured downstream reply (process lifetime). Answers 'is this approaching reply_timeout?' before the pager does.
+# TYPE messagefoundry_http_sync_reply_wait_seconds gauge
+messagefoundry_http_sync_reply_wait_seconds{connection="IB_HTTP"} 0.5
+messagefoundry_http_sync_reply_wait_seconds{connection="IB_q\"uote\\back\nline-é"} 0.0
+# HELP messagefoundry_http_sync_reply_waiters HTTP turns currently blocked on a captured downstream reply.
+# TYPE messagefoundry_http_sync_reply_waiters gauge
+messagefoundry_http_sync_reply_waiters{connection="IB_HTTP"} 3.0
+messagefoundry_http_sync_reply_waiters{connection="IB_q\"uote\\back\nline-é"} 0.0
+# HELP messagefoundry_messages_errored_total Messages that failed intake/validation on an inbound connection (process lifetime).
+# TYPE messagefoundry_messages_errored_total counter
+messagefoundry_messages_errored_total{connection="IB_ACME_ADT"} 0.0
+messagefoundry_messages_errored_total{connection="IB_q\"uote\\back\nline-é"} 1.0
+# HELP messagefoundry_deliveries_total Messages delivered to an outbound connection (process lifetime).
+# TYPE messagefoundry_deliveries_total counter
+messagefoundry_deliveries_total{connection="IB_ACME_ADT",destination="OB_ARCHIVE"} 100.0
+messagefoundry_deliveries_total{connection="IB_ACME_ADT",destination="IB_q\"uote\\back\nline-é"} 0.0
+messagefoundry_deliveries_total{connection="IB_ACME_ADT",destination="OB_EMPTY"} 0.0
+# HELP messagefoundry_deliveries_dead_total Outbound deliveries that dead-lettered (process lifetime).
+# TYPE messagefoundry_deliveries_dead_total counter
+messagefoundry_deliveries_dead_total{connection="IB_ACME_ADT",destination="OB_ARCHIVE"} 2.0
+messagefoundry_deliveries_dead_total{connection="IB_ACME_ADT",destination="IB_q\"uote\\back\nline-é"} 0.0
+messagefoundry_deliveries_dead_total{connection="IB_ACME_ADT",destination="OB_EMPTY"} 0.0
+# HELP messagefoundry_queue_depth Current pending + inflight outbound rows for a destination.
+# TYPE messagefoundry_queue_depth gauge
+messagefoundry_queue_depth{connection="IB_ACME_ADT",destination="OB_ARCHIVE"} 4.0
+messagefoundry_queue_depth{connection="IB_ACME_ADT",destination="IB_q\"uote\\back\nline-é"} 0.0
+messagefoundry_queue_depth{connection="IB_ACME_ADT",destination="OB_EMPTY"} 0.0
+# HELP messagefoundry_oldest_pending_age_seconds Age (seconds) of the oldest queued outbound row for a destination.
+# TYPE messagefoundry_oldest_pending_age_seconds gauge
+messagefoundry_oldest_pending_age_seconds{connection="IB_ACME_ADT",destination="OB_ARCHIVE"} 100.0
+messagefoundry_oldest_pending_age_seconds{connection="IB_ACME_ADT",destination="IB_q\"uote\\back\nline-é"} -0.5
+# HELP messagefoundry_outbox_status Current count of outbound rows by status.
+# TYPE messagefoundry_outbox_status gauge
+messagefoundry_outbox_status{status="pending"} 3.0
+messagefoundry_outbox_status{status="dead"} 1.0
+# HELP messagefoundry_in_pipeline Current not-done rows across every stage (ingress + routed + outbound).
+# TYPE messagefoundry_in_pipeline gauge
+messagefoundry_in_pipeline 7.0
+# HELP messagefoundry_store_committed_txns_total Physical store transactions committed (process lifetime).
+# TYPE messagefoundry_store_committed_txns_total counter
+messagefoundry_store_committed_txns_total 1.23456789e+08
+# HELP messagefoundry_store_body_copies_total Raw/payload body strings durably written to the store (process lifetime).
+# TYPE messagefoundry_store_body_copies_total counter
+messagefoundry_store_body_copies_total 0.0
+# HELP messagefoundry_store_fenced_writes_total Terminal queue resolves rejected by the leader-epoch fence (process lifetime).
+# TYPE messagefoundry_store_fenced_writes_total counter
+messagefoundry_store_fenced_writes_total 1.0
+# HELP messagefoundry_store_claim_proc_effective 1 when the ADR 0114 stored-procedure claim path passed its startup gate and is active, 0 when it degraded to the shipped ad-hoc batch (claims still flow).
+# TYPE messagefoundry_store_claim_proc_effective gauge
+messagefoundry_store_claim_proc_effective 1.0
+# HELP messagefoundry_store_claim_proc_head_verbatim 1 when at least one deployed claim procedure's stored definition kept the CREATE OR ALTER head verbatim (this server does not rewrite it), else 0.
+# TYPE messagefoundry_store_claim_proc_head_verbatim gauge
+messagefoundry_store_claim_proc_head_verbatim 1.0
+# HELP messagefoundry_store_pool_max_connections Configured maximum size of the store connection pool.
+# TYPE messagefoundry_store_pool_max_connections gauge
+messagefoundry_store_pool_max_connections 10.0
+# HELP messagefoundry_store_pool_open_connections Connections currently open in the store pool.
+# TYPE messagefoundry_store_pool_open_connections gauge
+messagefoundry_store_pool_open_connections 10.0
+# HELP messagefoundry_store_pool_idle_connections Currently-free (idle) connections in the store pool.
+# TYPE messagefoundry_store_pool_idle_connections gauge
+messagefoundry_store_pool_idle_connections 0.0
+# HELP messagefoundry_store_pool_saturated 1 when the store pool has zero idle connections (saturated), else 0.
+# TYPE messagefoundry_store_pool_saturated gauge
+messagefoundry_store_pool_saturated 1.0
+# HELP messagefoundry_store_pool_acquire_wait_p50_seconds Store pool acquire() wait p50 (seconds) since process start.
+# TYPE messagefoundry_store_pool_acquire_wait_p50_seconds gauge
+messagefoundry_store_pool_acquire_wait_p50_seconds 0.0015
+# HELP messagefoundry_store_pool_acquire_wait_p95_seconds Store pool acquire() wait p95 (seconds) since process start.
+# TYPE messagefoundry_store_pool_acquire_wait_p95_seconds gauge
+messagefoundry_store_pool_acquire_wait_p95_seconds 0.02
+# HELP messagefoundry_store_pool_acquire_wait_p99_seconds Store pool acquire() wait p99 (seconds) since process start.
+# TYPE messagefoundry_store_pool_acquire_wait_p99_seconds gauge
+messagefoundry_store_pool_acquire_wait_p99_seconds +Inf
+# HELP messagefoundry_store_pool_acquire_wait_max_seconds Store pool acquire() wait max (seconds) since process start.
+# TYPE messagefoundry_store_pool_acquire_wait_max_seconds gauge
+messagefoundry_store_pool_acquire_wait_max_seconds 1e+17
+# HELP messagefoundry_store_pool_acquire_waits_total Store pool acquire() waits sampled (process lifetime).
+# TYPE messagefoundry_store_pool_acquire_waits_total counter
+messagefoundry_store_pool_acquire_waits_total 42.0
+# HELP messagefoundry_delivery_latency_seconds Delivery latency (updated_at - created_at) over done outbound rows.
+# TYPE messagefoundry_delivery_latency_seconds histogram
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="0.05"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="0.1"} 1.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="0.25"} 2.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="0.5"} 3.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="1.0"} 4.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="2.5"} 5.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="5.0"} 6.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="10.0"} 7.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="30.0"} 8.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="60.0"} 9.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="120.0"} 10.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="300.0"} 11.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_ACME_ADT",destination="OB_ARCHIVE",le="+Inf"} 15.0
+messagefoundry_delivery_latency_seconds_count{connection="IB_ACME_ADT",destination="OB_ARCHIVE"} 15.0
+messagefoundry_delivery_latency_seconds_sum{connection="IB_ACME_ADT",destination="OB_ARCHIVE"} 12.75
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="0.05"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="0.1"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="0.25"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="0.5"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="1.0"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="2.5"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="5.0"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="10.0"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="30.0"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="60.0"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="120.0"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="300.0"} 0.0
+messagefoundry_delivery_latency_seconds_bucket{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD",le="+Inf"} 0.0
+messagefoundry_delivery_latency_seconds_count{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD"} 0.0
+messagefoundry_delivery_latency_seconds_sum{connection="IB_q\"uote\\back\nline-é",destination="OB_ODD"} -Inf
