@@ -25,6 +25,17 @@ that value. Console 0.3.0 does not work with that engine, so upgrade the two tog
 under Changed says why engine 0.4.0 does not work with this console.
 
 ### Added
+- **An Approvals page releases or rejects a dual-control hold** (`BACKLOG #1982`, ASVS 2.3.5). The
+  console could hold a reload, purge or replay for a second approver, and could not release one.
+  `/ui/approvals`, under Admin, lists the open requests. Each pending one has Approve and Reject,
+  through the same engine handlers as `POST /approvals/{id}/approve` and `/reject`, so the engine
+  still refuses a requester approving their own request. A refusal renders as a page with the
+  engine's reason, and a too-new request keeps its `Retry-After`. `interrupted` releases are listed
+  without buttons, since the engine answers them 409; the resolve step stays on the engine API. The
+  held-for-approval pages, and a bulk purge result with a held destination, now link to it. A
+  release whose operation skipped its work or came back degraded says so above the result. Each
+  route asserts `approvals:approve`. The seam gains `list_approvals`, `approve_action` and
+  `reject_action`, so the seam digest moved.
 - **A session signed in through the identity provider steps up there** (`BACKLOG #296`, ADR 0142
   Amendment B). For such a session `/ui/reauth` shows no password field, only a Continue button to
   the sign-in provider. It posts to the new `POST /ui/reauth/oidc`, registered only when federation
