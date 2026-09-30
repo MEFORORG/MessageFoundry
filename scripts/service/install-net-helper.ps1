@@ -18,25 +18,36 @@
     of that block rather than a second reader of it (BACKLOG #1523).
 
     IT DOES NOT DOWNLOAD NSSM, and that is deliberate. install-service.ps1 pins the archive URL and
-    its SHA-256 in $NssmUrl / $NssmSha256, and tests/test_service_install_manifest.py guards that
-    pin. A second pin here would be a second thing to keep current, and it would go stale quietly.
-    So pass -NssmPath, or have nssm on PATH; net-helper/README.md "Prepare the files once" is the
-    download-and-check procedure, and it names that same pin.
+    its SHA-256 in $NssmUrl / $NssmSha256, and this script does not repeat them. So pass -NssmPath,
+    or have nssm on PATH; net-helper/README.md "Prepare the files once" is the download-and-check
+    procedure, and it names that same pin.
+
+    IT DOES CHECK BOTH BINARIES IT STARTS, because both run as SYSTEM (BACKLOG #2364). nssm.exe must
+    hash to $NssmExeSha256, the pin of the binary inside that archive, which this script carries in
+    a block tests/test_nssm_pin.py keeps identical to install-service.ps1's. mefor-net-helper.exe must hash
+    to -HelperSha256. That value has no pin in this repository: the helper is built per release and
+    per machine, so the hash comes from the build that made the binary - the net-helper workflow's
+    job summary, or Get-FileHash over your own `dotnet publish` output before it leaves your hands.
 
     Run from an elevated (Administrator) PowerShell prompt, on each cluster node, AFTER the engine's
     own service exists (its account is what the helper's pipe ACL is built from).
 
 .EXAMPLE
-    .\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -NssmPath C:\tools\nssm.exe
+    .\install-net-helper.ps1 -HelperSource ..\..\net-helper\out -HelperSha256 <SHA-256> -NssmPath C:\tools\nssm.exe
 
 .EXAMPLE
-    .\install-net-helper.ps1 -HelperSource D:\build\net-helper -ServiceConfig C:\ProgramData\MessageFoundry\messagefoundry.toml
+    .\install-net-helper.ps1 -HelperSource D:\build\net-helper -HelperSha256 <SHA-256> -ServiceConfig C:\ProgramData\MessageFoundry\messagefoundry.toml
 #>
 [CmdletBinding()]
 param(
     # The `dotnet publish` output folder holding mefor-net-helper.exe. See net-helper/README.md
     # "Build it" - `dotnet build` output is NOT installable, it needs the .NET runtime.
     [Parameter(Mandatory)][string]$HelperSource,
+    # The SHA-256 of that mefor-net-helper.exe, from the build that produced it (BACKLOG #2364). The
+    # script refuses a binary that does not match, before it stops a running helper and again after
+    # the copy, because it starts that binary as LocalSystem. REQUIRED, with no default: this
+    # repository cannot pin a binary that each release and each machine builds for itself.
+    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$HelperSha256,
     # Administrator-only by default, and the README explains why it is not under ProgramData: the
     # engine's account has modify rights there, so it could replace the binary that runs as SYSTEM.
     [string]$InstallDir = "C:\Program Files\MessageFoundry\net-helper",
@@ -90,6 +101,273 @@ $ErrorActionPreference = "Stop"
 # for the measurements behind it; set explicitly rather than relied on.
 $PSNativeCommandUseErrorActionPreference = $false
 
+# BEGIN pinned-hash check (kept byte-identical in install-service.ps1 and install-net-helper.ps1;
+# guarded by tests/test_nssm_pin.py, which fails if the two copies drift)
+#
+# The SHA-256 of nssm.exe itself: the win64 binary in the NSSM 2.24 archive that install-service.ps1
+# pins as $NssmSha256. Both installers check every nssm.exe they copy or run against this value,
+# whichever source it came from - -NssmPath, PATH, an installed copy, or a download (BACKLOG #2364).
+# Only the download used to be checked. The two uninstallers do not run nssm at all. The block also
+# carries the folder check and the registration read-back, which both installers need.
+$NssmExeSha256 = "F689EE9AF94B00E9E3F0BB072B34CAAF207F32DCB4F5782FC9CA351DF9A06C97"
+
+function Get-FilePinProblem {
+    <#
+      Why the file at $Path does not match the pinned SHA-256 $Expected, or "" when it does.
+
+      RETURNED, NOT THROWN, so each caller decides what a mismatch means: refuse to go on, or skip to
+      another source. The message names both hashes, so an operator can compare them against the
+      channel the pin came from. A file that cannot be hashed is a mismatch, never a pass.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    try {
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+    } catch {
+        return ("'$Path' could not be hashed ($($_.Exception.Message)), so nothing checked it " +
+            "against the pinned SHA-256 $Expected")
+    }
+    if ($actual -ne $Expected) { return "'$Path' has SHA-256 $actual, not the pinned $Expected" }
+    return ""
+}
+
+
+function Get-BroadWriteHolders {
+    <#
+      Principals who can write $Path, or can make themselves able to, beyond the five that always
+      may. Two arms: the OWNER, and Allow-write entries on the DACL.
+
+      Returns an empty array when the directory is administrator-only, which is what makes "the
+      folder is safe" a reading rather than an assumption.
+
+      NOT install-service.ps1's Get-BroadAclResidue, and deliberately not a copy of it. That one
+      allows the engine's service account, because the engine has to write its data directory; it
+      takes any Allow entry rather than write-class ones, and it has no owner arm. Here nothing
+      outside the five may write at all - whoever can write this folder can replace a binary that
+      an administrator runs, or that later runs as SYSTEM. Same shape, different question; naming them apart keeps a reader from
+      assuming one answers the other's.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
+    # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
+    # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
+    # REFUSAL, and in install-net-helper.ps1 its only escape is -AllowBroadAcl, which downgrades the
+    # whole check to a warning -- so one false positive would disable the gate.
+    $allowed = @(
+        "S-1-5-18",                                                                # SYSTEM
+        "S-1-5-32-544",                                                            # Administrators
+        "S-1-3-0",                                                                 # CREATOR OWNER
+        "S-1-3-4",                                                                 # OWNER RIGHTS
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"           # TrustedInstaller
+    )
+    $rights = [Security.AccessControl.FileSystemRights]
+    # THE TWO GENERIC BITS ARE IN THE MASK ON PURPOSE, and leaving them out is why a first version of
+    # this was quietly weaker than it looked. FileSystemRights names no GENERIC_ALL or GENERIC_WRITE,
+    # and a real Program Files ACL is full of them: measured on Windows 11 26200, five of its
+    # fourteen entries render as the bare numbers 268435456 (GENERIC_ALL) and -1610612736
+    # (GENERIC_READ|GENERIC_EXECUTE). Those are the inherit-only templates that decide what a file
+    # CREATED in the folder gets - which is exactly the binary this install is about to write - and
+    # none of the named bits below intersects them. So a GENERIC_ALL for Users would have passed a
+    # mask built only from the named rights.
+    $genericAll = 0x10000000
+    $genericWrite = 0x40000000
+    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::WriteAttributes -bor
+        $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
+        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
+    $found = @()
+    # RETURNED AS A RESIDUE, NOT THROWN. An unreadable DACL is not "the folder is fine", so it has to
+    # reach the caller - but throwing from here made install-net-helper.ps1's refusal message name
+    # -AllowBroadAcl as the escape when that switch is not consulted until AFTER this call. An operator following
+    # that instruction got the identical refusal: a dead end, and exactly the false-premise defect
+    # the rest of this script is written against. Returned as a finding instead, so the one decision
+    # about -AllowBroadAcl covers all three ways this can come back non-empty.
+    #
+    # -LiteralPath, NOT -Path. Measured: for a directory whose name holds '[' or ']', `Get-Acl -Path`
+    # returns $null WITHOUT raising, even under -ErrorAction Stop - so the catch never fires and the
+    # arms below read a null object.
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
+        return @("the permissions of '$Path' could not be read ($($_.Exception.Message)), so " +
+            "nothing established who can write there")
+    }
+    if ($null -eq $acl) {
+        return @("the permissions of '$Path' could not be read (Get-Acl returned nothing), so " +
+            "nothing established who can write there")
+    }
+
+    # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
+    # a low-privilege owner can rewrite the DACL whatever it says today and then replace a binary
+    # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
+    # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
+    # without it reports a clean folder for exactly that case.
+    #
+    # AND IT TAKES THE WELL-KNOWN ADMIN RIDs TOO, which the literal list cannot cover: that module's
+    # _WIN_ADMIN_RIDS records that the built-in Administrator (500), Domain Admins (512), Schema
+    # Admins (518) and Enterprise Admins (519) vary per domain. Without them a folder an admin ran
+    # `takeown` on, or one restored from a backup, is refused for being owned by an administrator.
+    $ownerSid = $null
+    try {
+        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    } catch { $ownerSid = "$($acl.Owner)" }
+    # COMPARED AS TEXT, NOT CAST. A RID is a 32-bit UNSIGNED value and [int] is signed, so casting
+    # overflows on a real SID: measured, TrustedInstaller's last group is 2271478464 and
+    # `[int]"2271478464"` throws "Value was either too large or too small for an Int32" -- which
+    # under $ErrorActionPreference = "Stop" aborted this whole check on an ordinary Program Files
+    # folder. A string compare answers the only question being asked and cannot overflow.
+    $ownerRid = if ($ownerSid -match '-(\d+)$') { $Matches[1] } else { "" }
+    if (($allowed -notcontains $ownerSid) -and ($ownerRid -notin @("500", "512", "518", "519"))) {
+        $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
+    }
+
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        $name = "$($rule.IdentityReference)"
+        # $allowed holds SIDs only, so an untranslatable identity falls back to its own text and is
+        # REPORTED rather than skipped: a SID nobody can translate is still a grant, and dropping it
+        # would turn a residue into a clean result.
+        $sid = $name
+        try {
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
+    }
+    return ($found | Select-Object -Unique)
+}
+function Get-ServiceImageProblem {
+    <#
+      Why the service's registration does not start "$Path", quoted, or "" when it does.
+
+      QUOTED OR NOTHING. An unquoted path with a space in it is CWE-428: the SCM tries each prefix
+      that ends at a space, so C:\Program Files\... is first tried as C:\Program.exe. NSSM 2.24
+      registers its own path unquoted, so Set-ServiceImage quotes it, and this accepts only that.
+      Arguments after the quoted path are allowed. Read from the service's registry key with
+      -LiteralPath, so the service name is never parsed as a wildcard or a query.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    $line = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $line = "$((Get-ItemProperty -LiteralPath $key -Name ImagePath -ErrorAction Stop).ImagePath)".Trim()
+    } catch { }
+    $quoted = "`"$Path`""
+    if (($line -eq $quoted) -or $line.StartsWith("$quoted ", [StringComparison]::OrdinalIgnoreCase)) {
+        return ""
+    }
+    return "'$ServiceName' is registered to start '$line', not the checked copy $quoted"
+}
+
+function Set-ServiceImage {
+    <#
+      Point the service's registration at "$Path", quoted, and read it back. Throws when it cannot.
+
+      This is what makes the checked copy the one the SCM starts. `nssm set` never changes the
+      image path, `nssm install` writes it unquoted, and a registration from an earlier install can
+      name any nssm.exe at all. Win32_Service.Change calls ChangeServiceConfig, which the SCM
+      applies at once; editing ImagePath in the registry would wait for a reboot. It is not passed
+      through sc.exe because Windows PowerShell 5.1 does not escape the quotes inside a native
+      argument.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Path)
+    if (-not (Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path)) { return }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its image path cannot be set." }
+    $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ PathName = "`"$Path`"" }
+    if ($result.ReturnValue -ne 0) {
+        throw ("Could not point '$ServiceName' at `"$Path`": Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    $problem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path
+    if ($problem) { throw "$problem, although Win32_Service.Change reported success." }
+}
+function Set-ServiceAccount {
+    <#
+      Set the account a service runs as through the SCM, and read it back. Throws when it cannot.
+
+      NOT `nssm set ObjectName`. NSSM 2.24, the build this repository pins, refuses a virtual account.
+      Measured on both hosted Windows runners in CI run 36590581708 (2026-09-29): "Invalid account
+      name!" and "Setting ObjectName requires both a username and password", exit 6. Win32_Service.
+      Change calls ChangeServiceConfig, which takes all three forms the installers use.
+
+      THE PASSWORD ARGUMENT DEPENDS ON THE ACCOUNT. ChangeServiceConfig wants lpPassword NULL for a
+      virtual or managed account, so StartPassword is left out of the call for those rather than sent
+      as "". LocalSystem and the two NT AUTHORITY service accounts take an empty string. Any other
+      account takes the -Password it was given.
+
+      THE PASSWORD NEVER REACHES A MESSAGE (BACKLOG #1573). It arrives as a SecureString and becomes
+      plaintext only inside the argument table of the one call, which is emptied in `finally`. Every
+      message here is built from the account name and a return code. When a password was passed, a
+      failed call's own exception text is left out too, because nothing guarantees it does not echo
+      its arguments.
+
+      THE NAME IS CANONICALISED FIRST, as `nssm set ObjectName` did: a bare user name or a UPN is
+      translated to its SID and back, to the DOMAIN\user form ChangeServiceConfig wants and stores.
+      A name that does not translate yet, such as a virtual account before its service exists, is
+      sent as given.
+
+      A FAILURE DISABLES THE SERVICE before the throw. The script stops there, before the data
+      directory is locked down, and a fresh registration would otherwise start at the next boot as
+      NSSM's default, LocalSystem.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$Account,
+        [SecureString]$Password
+    )
+    $fail = {
+        param([string]$Why)
+        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+        throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
+    }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its run-as account cannot be set." }
+    $builtin = $Account -match '^(\.\\)?LocalSystem$|^NT AUTHORITY\\(LocalService|NetworkService|SYSTEM)$'
+    if (-not $builtin) {
+        try {
+            $Account = ([Security.Principal.NTAccount]$Account).Translate(
+                [Security.Principal.SecurityIdentifier]).Translate([Security.Principal.NTAccount]).Value
+        } catch { }
+    }
+    $arguments = @{ StartName = $Account }
+    if ($builtin) { $arguments['StartPassword'] = "" }
+    $bstr = [IntPtr]::Zero
+    $result = $null
+    $failure = $null
+    try {
+        if ($Password) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+            $arguments['StartPassword'] = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        }
+        $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments $arguments -ErrorAction Stop
+    } catch {
+        $failure = if ($Password) { "the call failed" } else { $_.Exception.Message }
+    } finally {
+        $arguments.Remove('StartPassword')
+        if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    }
+    if ($failure) {
+        & $fail "Could not set '$ServiceName' to run as '$Account' (Win32_Service.Change: $failure)."
+    }
+    if ($result.ReturnValue -ne 0) {
+        & $fail ("Could not set '$ServiceName' to run as '$Account': Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    # Read back from the service's own key. The SCM keeps a ".\" prefix when it was given one, so the
+    # two sides are compared without it.
+    $stored = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $stored = "$((Get-ItemProperty -LiteralPath $key -Name ObjectName -ErrorAction Stop).ObjectName)"
+    } catch { }
+    if (($stored -replace '^\.\\', '') -ne ($Account -replace '^\.\\', '')) {
+        & $fail ("'$ServiceName' runs as '$stored', not '$Account', although Win32_Service.Change " +
+            "reported success.")
+    }
+}
+# END pinned-hash check
+
 $principal = [Security.Principal.WindowsPrincipal]::new(
     [Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -118,6 +396,14 @@ if (-not (Test-Path $SourceExe)) {
         "dotnet publish net-helper\MeforNetHelper.csproj --configuration Release --output " +
         "net-helper\out  (net-helper/README.md 'Build it').")
 }
+# CHECKED HERE, BEFORE ANYTHING IS STOPPED OR COPIED, so a wrong binary costs the operator a message and
+# not a stopped helper. The installed copy is checked again after the copy, because that is the file
+# the service starts as LocalSystem.
+$helperProblem = Get-FilePinProblem -Path $SourceExe -Expected $HelperSha256
+if ($helperProblem) {
+    throw ("Refusing mefor-net-helper.exe: $helperProblem (-HelperSha256). Take the hash from the " +
+        "build that produced this binary, and do not install one you cannot match to it.")
+}
 if (-not (Test-Path $AppExe)) {
     throw ("Engine executable not found at: $AppExe`nPass -AppExe. It is run once, read-only, to " +
         "resolve [cluster.vip]; it does not have to be the copy the service runs.")
@@ -129,23 +415,37 @@ function Resolve-HelperNssm {
 
       The copy is the point, not a convenience. The registration names an nssm.exe by path, and that
       binary starts a process running as SYSTEM - so it has to live somewhere only administrators can
-      write, beside the helper. net-helper/README.md is explicit that the engine's cached copy under
-      ProgramData is NOT such a place: the engine's own account has modify rights there.
+      write, beside the helper. net-helper/README.md is explicit that ProgramData is NOT such a
+      place: the engine's own account has modify rights there.
 
-      Nothing is downloaded and nothing is hash-checked here; see this script's header.
+      Nothing is downloaded here; see this script's header. What is found is checked against
+      $NssmExeSha256 and REFUSED on a mismatch, from either source (BACKLOG #2364). There is no
+      next source to fall back to, unlike install-service.ps1's search, so a PATH copy that fails
+      is a refusal too rather than a skip. This is the copy's first check; the installed copy gets
+      its own after the copy, because that one is what the service runs.
     #>
     param([string]$Provided)
     if ($Provided) {
-        $resolved = Resolve-AbsolutePath $Provided
-        if (-not (Test-Path $resolved)) { throw "NSSM not found at: $resolved" }
-        return $resolved
+        $found = Resolve-AbsolutePath $Provided
+        if (-not (Test-Path -LiteralPath $found)) { throw "NSSM not found at: $found" }
+        $where = "-NssmPath"
+    } else {
+        $onPath = Get-Command nssm -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $onPath) {
+            throw ("nssm.exe not found. Pass -NssmPath, or put nssm on PATH. net-helper/README.md " +
+                "'Prepare the files once' has the download and the hash check; the pinned archive " +
+                "and its SHA-256 are `$NssmUrl and `$NssmSha256 in install-service.ps1.")
+        }
+        $found = $onPath.Source
+        $where = "the nssm on PATH"
     }
-    $onPath = Get-Command nssm -ErrorAction SilentlyContinue
-    if ($onPath) { return $onPath.Source }
-    throw ("nssm.exe not found. Pass -NssmPath, or put nssm on PATH. net-helper/README.md " +
-        "'Prepare the files once' has the download and the hash check; the pinned archive and its " +
-        "SHA-256 are `$NssmUrl and `$NssmSha256 in install-service.ps1, which is the only place " +
-        "this repository states them.")
+    $problem = Get-FilePinProblem -Path $found -Expected $NssmExeSha256
+    if ($problem) {
+        throw ("Refusing $($where): $problem. Use the win64 nssm.exe from the archive " +
+            "install-service.ps1 pins; net-helper/README.md 'Prepare the files once' has the steps.")
+    }
+    return $found
 }
 
 function Get-VipSettings {
@@ -216,110 +516,6 @@ function Resolve-ClientAccountSid {
             "per-service virtual account only resolves while its service is registered, so " +
             "install the engine's service first, or pass -ClientAccount with the SID.")
     }
-}
-
-function Get-BroadWriteHolders {
-    <#
-      Principals who can write $Path, or can make themselves able to, beyond the five that always
-      may. Two arms: the OWNER, and Allow-write entries on the DACL.
-
-      Returns an empty array when the directory is administrator-only, which is what makes "the
-      folder is safe" a reading rather than an assumption.
-
-      NOT install-service.ps1's Get-BroadAclResidue, and deliberately not a copy of it. That one
-      allows the engine's service account, because the engine has to write its data directory; it
-      takes any Allow entry rather than write-class ones, and it has no owner arm. Here nothing
-      outside the five may write at all - whoever can write this folder can replace a binary that
-      later runs as SYSTEM. Same shape, different question; naming them apart keeps a reader from
-      assuming one answers the other's.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
-    # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
-    # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
-    # REFUSAL whose only escape is -AllowBroadAcl, which downgrades the whole check to a warning --
-    # so one false positive would disable the gate.
-    $allowed = @(
-        "S-1-5-18",                                                                # SYSTEM
-        "S-1-5-32-544",                                                            # Administrators
-        "S-1-3-0",                                                                 # CREATOR OWNER
-        "S-1-3-4",                                                                 # OWNER RIGHTS
-        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"           # TrustedInstaller
-    )
-    $rights = [Security.AccessControl.FileSystemRights]
-    # THE TWO GENERIC BITS ARE IN THE MASK ON PURPOSE, and leaving them out is why a first version of
-    # this was quietly weaker than it looked. FileSystemRights names no GENERIC_ALL or GENERIC_WRITE,
-    # and a real Program Files ACL is full of them: measured on Windows 11 26200, five of its
-    # fourteen entries render as the bare numbers 268435456 (GENERIC_ALL) and -1610612736
-    # (GENERIC_READ|GENERIC_EXECUTE). Those are the inherit-only templates that decide what a file
-    # CREATED in the folder gets - which is exactly the binary this install is about to write - and
-    # none of the named bits below intersects them. So a GENERIC_ALL for Users would have passed a
-    # mask built only from the named rights.
-    $genericAll = 0x10000000
-    $genericWrite = 0x40000000
-    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::WriteAttributes -bor
-        $rights::WriteExtendedAttributes -bor $rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
-        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor $genericAll -bor $genericWrite
-    $found = @()
-    # RETURNED AS A RESIDUE, NOT THROWN. An unreadable DACL is not "the folder is fine", so it has to
-    # reach the caller - but throwing from here made the caller's refusal message name -AllowBroadAcl
-    # as the escape when that switch is not consulted until AFTER this call. An operator following
-    # that instruction got the identical refusal: a dead end, and exactly the false-premise defect
-    # the rest of this script is written against. Returned as a finding instead, so the one decision
-    # about -AllowBroadAcl covers all three ways this can come back non-empty.
-    #
-    # -LiteralPath, NOT -Path. Measured: for a directory whose name holds '[' or ']', `Get-Acl -Path`
-    # returns $null WITHOUT raising, even under -ErrorAction Stop - so the catch never fires and the
-    # arms below read a null object.
-    $acl = $null
-    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
-        return @("the permissions of '$Path' could not be read ($($_.Exception.Message)), so " +
-            "nothing established who can write there")
-    }
-    if ($null -eq $acl) {
-        return @("the permissions of '$Path' could not be read (Get-Acl returned nothing), so " +
-            "nothing established who can write there")
-    }
-
-    # THE OWNER ARM, and the DACL alone is not the question. An owner holds WRITE_DAC implicitly, so
-    # a low-privilege owner can rewrite the DACL whatever it says today and then replace a binary
-    # this install is about to have the SCM start as SYSTEM. messagefoundry/config/wiring.py's
-    # _evaluate_config_dacl carries the same arm for the same reason (SEC-003, CWE-732); a check
-    # without it reports a clean folder for exactly that case.
-    #
-    # AND IT TAKES THE WELL-KNOWN ADMIN RIDs TOO, which the literal list cannot cover: that module's
-    # _WIN_ADMIN_RIDS records that the built-in Administrator (500), Domain Admins (512), Schema
-    # Admins (518) and Enterprise Admins (519) vary per domain. Without them a folder an admin ran
-    # `takeown` on, or one restored from a backup, is refused for being owned by an administrator.
-    $ownerSid = $null
-    try {
-        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    } catch { $ownerSid = "$($acl.Owner)" }
-    # COMPARED AS TEXT, NOT CAST. A RID is a 32-bit UNSIGNED value and [int] is signed, so casting
-    # overflows on a real SID: measured, TrustedInstaller's last group is 2271478464 and
-    # `[int]"2271478464"` throws "Value was either too large or too small for an Int32" -- which
-    # under $ErrorActionPreference = "Stop" aborted this whole check on an ordinary Program Files
-    # folder. A string compare answers the only question being asked and cannot overflow.
-    $ownerRid = if ($ownerSid -match '-(\d+)$') { $Matches[1] } else { "" }
-    if (($allowed -notcontains $ownerSid) -and ($ownerRid -notin @("500", "512", "518", "519"))) {
-        $found += "$($acl.Owner) (owner, so implicitly WRITE_DAC)"
-    }
-
-    foreach ($rule in $acl.Access) {
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
-        $name = "$($rule.IdentityReference)"
-        # $allowed holds SIDs only, so an untranslatable identity falls back to its own text and is
-        # REPORTED rather than skipped: a SID nobody can translate is still a grant, and dropping it
-        # would turn a residue into a clean result.
-        $sid = $name
-        try {
-            $sid = $rule.IdentityReference.Translate(
-                [Security.Principal.SecurityIdentifier]).Value
-        } catch { }
-        if ($allowed -notcontains $sid) { $found += "$name ($($rule.FileSystemRights))" }
-    }
-    return ($found | Select-Object -Unique)
 }
 
 function Invoke-HelperNssm {
@@ -514,6 +710,35 @@ if (-not $sameFile) {
 # reason and makes confirming it its own numbered step.
 $NssmPath = $TargetNssm
 
+# THE INSTALLED COPIES ARE CHECKED, NOT ONLY THEIR SOURCES (BACKLOG #2364). They are what the SCM
+# starts as SYSTEM, and a source can change between its check and the copy. The folder check above is
+# what keeps them from changing after this. With -AllowBroadAcl that check is only a warning, and then
+# nothing does: whoever can write the folder can still swap a binary, plant a DLL beside it or edit
+# the .conf before the start below.
+#
+# A COPY THAT FAILS IS DELETED BEFORE THE THROW, both binaries, and the deletion is read back. On a
+# reinstall the helper was stopped and its files copied over, and the registration still starts them
+# at boot. So when a file cannot be deleted, the registration is set to Disabled instead, and the
+# message says which of the two happened.
+$problem = (@(
+    (Get-FilePinProblem -Path $TargetExe -Expected $HelperSha256),
+    (Get-FilePinProblem -Path $TargetNssm -Expected $NssmExeSha256)
+) -ne "") -join "; "
+if ($problem) {
+    Remove-Item -LiteralPath $TargetExe, $TargetNssm -Force -ErrorAction SilentlyContinue
+    $left = @(@($TargetExe, $TargetNssm) | Where-Object { Test-Path -LiteralPath $_ })
+    $outcome = "Both binaries were deleted from '$InstallDir'."
+    if ($left.Count -gt 0) {
+        $outcome = "Could not delete $($left -join ' and ')."
+        if ($serviceExists) {
+            Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+            $outcome += " '$ServiceName' was set to Disabled so the registration cannot start them."
+        }
+    }
+    throw ("An installed copy failed its check: $problem. $outcome Nothing was started. Re-run from " +
+        "files you can match to their hashes.")
+}
+
 # The helper reads this with a strict UTF-8 decoder. Written with an explicit BOM-less UTF-8 encoder
 # rather than Set-Content, whose default encoding differs between PowerShell 7 and Windows
 # PowerShell 5.1 - and this script is reachable from both.
@@ -566,21 +791,21 @@ Invoke-HelperNssm set $ServiceName AppRotateBytes 10485760
 # administrator-rights work the engine's least-privilege account cannot do (ADR 0056), and its
 # app.manifest already requires elevation - started by an unprivileged account it fails at once with
 # ERROR_ELEVATION_REQUIRED (740).
-Invoke-HelperNssm set $ServiceName ObjectName LocalSystem
+Set-ServiceAccount -ServiceName $ServiceName -Account LocalSystem
 
-# READ THE REGISTRATION BACK. The exit code above says nssm accepted the setting, not that the SCM
-# will start the copy of nssm.exe in this folder - which is the property the folder's permissions are
-# protecting. net-helper/README.md makes this its own numbered step for that reason.
-$registered = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue).PathName
-if (-not $registered) {
-    throw "'$ServiceName' has no registered image path after the install; nothing to start."
-}
-# IndexOf and not -like: a path is not a wildcard pattern, and '[' or ']' anywhere in $TargetNssm
-# would make -like compare a character class instead of the text.
-if ($registered.IndexOf($TargetNssm, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-    throw ("'$ServiceName' would start '$registered', not '$TargetNssm'. Remove the service and " +
-        "re-run: a registration pointing at another copy of nssm.exe is a binary outside the folder " +
-        "whose permissions this install just checked.")
+# THE REGISTRATION IS POINTED AT THE CHECKED COPY, QUOTED, AND READ BACK (BACKLOG #2364). The exit
+# codes above say nssm accepted the settings, not that the SCM will start the copy of nssm.exe in this
+# folder - which is the property the folder's permissions protect. net-helper/README.md makes this its
+# own numbered step for that reason. `nssm install` writes its path unquoted, and the default folder
+# has a space in it (CWE-428), so Set-ServiceImage quotes it. It compares the whole registered line,
+# not a substring, so a longer path that merely contains this one does not pass. On failure the
+# service is set to Disabled before the throw, so it does not start at the next boot.
+try {
+    Set-ServiceImage -ServiceName $ServiceName -Path $TargetNssm
+} catch {
+    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+    throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled. Remove it with " +
+        ".\uninstall-net-helper.ps1 and re-run.")
 }
 
 # --- report -------------------------------------------------------------------------------------
@@ -601,7 +826,9 @@ if (-not $NoStart) {
 Write-Host ""
 Write-Host "Installed '$ServiceName'." -ForegroundColor Green
 Write-Host "  Helper   : $TargetExe ($signature)"
+Write-Host "             SHA-256 $($HelperSha256.ToUpperInvariant()), checked against -HelperSha256"
 Write-Host "  NSSM     : $TargetNssm"
+Write-Host "             SHA-256 $NssmExeSha256, checked against the pin"
 Write-Host "  Config   : $ConfPath"
 Write-Host "  Log      : $LogPath"
 Write-Host "  Address  : $($vip.address)/$($vip.mask) on '$confInterface'"

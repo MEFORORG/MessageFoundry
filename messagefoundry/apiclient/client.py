@@ -585,14 +585,17 @@ class EngineClient:
         #: Serialises a rebuild between threads sharing a poll client. Held across the file reads
         #: and the context build, so only a rebuild waits on it.
         self._rebuild_lock = threading.Lock()
-        #: Guards the swap of `_http`, the retired list and `_closed`. Held only for those, so a
-        #: close() never waits behind a slow read of the pin file.
+        #: Guards the swap of `_http`, the retired list, the in-use counts and `_closed`. Held only
+        #: for those, so a close() never waits behind a slow read of the pin file.
         self._state_lock = threading.Lock()
         self._closed = False
-        #: Transports replaced by a renewal. Kept open until close(): another thread may still be
-        #: mid-request on one, and closing it under that thread raises a bare RuntimeError. One is
-        #: added per renewal, and a renewal needs an engine restart, so the list stays short.
+        #: Transports replaced by a renewal that a request still holds. Another thread may be
+        #: mid-request on one, and closing it under that thread raises a bare RuntimeError, so each
+        #: stays open until its last request lets go (BACKLOG #2091); see _release_transport.
         self._retired_http: list[httpx.Client] = []
+        #: How many requests hold each transport right now, from the read of `_http` to the end of
+        #: the buffered reply. A transport absent here is held by none.
+        self._in_use: dict[httpx.Client, int] = {}
         if self.base_url.lower().startswith("https"):
             before = _read_pin(cacert) if cacert is not None else None
             try:
@@ -672,6 +675,33 @@ class EngineClient:
     def _open_transport(self, verify: ssl.SSLContext | bool) -> httpx.Client:
         return httpx.Client(base_url=self.base_url, timeout=self._timeout, verify=verify)
 
+    def _acquire_transport(self) -> httpx.Client:
+        """Read `_http` for one request attempt, and count the attempt as holding it.
+
+        The read and the count happen under one lock, so a renewal on another thread can never
+        close a transport between a request reading it and counting itself in."""
+        with self._state_lock:
+            transport = self._http
+            self._in_use[transport] = self._in_use.get(transport, 0) + 1
+            return transport
+
+    def _release_transport(self, transport: httpx.Client) -> None:
+        """End one attempt's hold on ``transport``, and close it if it was replaced and is now idle.
+
+        A replaced transport used to stay open until :meth:`close`, one per renewal, so a
+        long-lived client leaked one per engine restart (BACKLOG #2091). The current transport is
+        never closed here, and neither is one :meth:`close` already took."""
+        with self._state_lock:
+            held = self._in_use[transport] - 1
+            if held:
+                self._in_use[transport] = held
+                return
+            del self._in_use[transport]
+            if transport not in self._retired_http:
+                return
+            self._retired_http.remove(transport)
+        transport.close()
+
     def _follow_renewed_pin(self, failed: httpx.Client) -> bool:
         """After a certificate-verification failure on ``failed``, trust a renewed pinned file.
 
@@ -701,6 +731,9 @@ class EngineClient:
 
         A thread that failed on a transport another thread has already replaced retries on the
         replacement without reloading.
+
+        The replaced transport closes once no request holds it: here, when none does, or else when
+        the last one lets go (:meth:`_release_transport`).
         """
         if self._pin_paths is None:
             return False
@@ -729,8 +762,15 @@ class EngineClient:
             with self._state_lock:
                 if self._closed:
                     return False
-                self._retired_http.append(self._http)
+                replaced = self._http
                 self._http = self._open_transport(context)
+                # A request that holds the replaced transport closes it when it lets go. The
+                # caller retrying on the new one is usually such a request.
+                idle = replaced not in self._in_use
+                if not idle:
+                    self._retired_http.append(replaced)
+            if idle:
+                replaced.close()
             self._pin_pem = current
             self._pin_refused = None
         _log.info("engine certificate %s has changed; now trusting the renewed certificate", pin)
@@ -825,13 +865,10 @@ class EngineClient:
         _bearer: str | None = None,
         **kw: object,
     ) -> httpx.Response:
-        # One read of the transport for this attempt: a renewal on another thread may replace
-        # `_http`, and _follow_renewed_pin needs to know which transport THIS attempt failed on.
-        transport = self._http
         # ``_bearer`` sends a token OTHER than the held one, for the one call that must: ending the
-        # session a new sign-in replaced (:meth:`_end_replaced_session`). It rides through here
-        # rather than a side request so it keeps every bound below, the cleartext refusal, and the
-        # renewed-certificate follow. It disarms the MFA and step-up retries: their handlers elevate
+        # session a sign-in or set_token replaced (:meth:`_end_replaced_session`). It rides through
+        # here rather than a side request so it keeps every bound below, the cleartext refusal, and
+        # the renewed-certificate follow. It disarms the MFA and step-up retries: their handlers elevate
         # the HELD session, not the one sent here. The certificate retry stays armed and carries
         # ``_bearer`` through, so a revoke after a renewal still ends the REPLACED token rather than
         # falling back to the held one.
@@ -841,69 +878,82 @@ class EngineClient:
         if bearer is not None:
             self._refuse_credential_on_cleartext("a bearer token")
         headers = {"Authorization": f"Bearer {bearer}"} if bearer else None
-        # ASVS 4.2.5: bound the request line and the bearer this client emits. The limits are
-        # DUPLICATED from transports/rest.py rather than imported: ADR 0088 makes this package
-        # engine-free (a GUI/harness process must not pull transports/ in), so the import that would
-        # share them is exactly the coupling this package exists to avoid. Kept in step by
-        # ``test_apiclient_length_bounds_match_the_transport_constants``.
-        #
-        # The request is BUILT first so the bound measures the URL httpx will actually put on the
-        # wire — base_url joined to the path AND the ``params=`` query appended (BACKLOG #1047).
-        # Measuring ``base_url + path`` missed the query entirely, so every ``_get`` filter (a
-        # search needle, a control id) was unmeasured; ``build_request`` is httpx's own resolution
-        # step, so this asks the same question the transport will answer. ``send`` then dispatches
-        # the already-built request, which is exactly what ``request()`` does internally — the auth
-        # and follow-redirects client defaults are unchanged.
-        request = transport.build_request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
-        resolved_url = str(request.url)
-        if len(resolved_url) > MAX_REQUEST_URL_LEN:
-            raise ApiError(
-                f"request URL is {len(resolved_url)} chars, over the {MAX_REQUEST_URL_LEN}-char limit"
-            )
-        if headers is not None and len(headers["Authorization"]) > MAX_REQUEST_HEADER_VALUE_LEN:
-            # Never echo the value: it is a live session bearer.
-            raise ApiError(
-                f"the session Authorization header is {len(headers['Authorization'])} chars, over "
-                f"the {MAX_REQUEST_HEADER_VALUE_LEN}-char limit"
-            )
-        # ASVS 15.2.2 (BACKLOG #1577): `stream=True` plus `_buffer_bounded` is what stops the reply
-        # body being read to EOF. The bounded read happens HERE, immediately, so the three exits
-        # below -- the MFA retry, the step-up retry, and the >= 400 raise through `_error_detail`
-        # (which reads the body itself) -- all act on an already-buffered, already-closed response.
-        # Collapsing them to one release point is deliberate: a per-exit close is three chances to
-        # leak a pooled connection, and the symptom of leaking one is the console's background poll
-        # hanging on an exhausted pool, not a test failure.
-        #
-        # Both calls sit under ONE `except httpx.HTTPError`, because streaming moves where a
-        # transport failure lands: a socket that dies mid-body now fails inside `_buffer_bounded`
-        # rather than at `send`, and both have to read as "could not reach engine" rather than
-        # escaping as a raw httpx error out of a Qt slot. The over-the-bound refusal is an `ApiError`
-        # and so passes through this handler untouched; `_buffer_bounded` releases the connection on
-        # its own `finally` either way.
-        #
-        # A certificate-verification failure against a pinned engine gets ONE retry when the pinned
-        # file has been renewed (BACKLOG #1276); see _follow_renewed_pin for why that is the trigger
-        # and why the retry cannot deliver a request twice.
+        # One read of the transport for this attempt, counted as held until the reply is buffered.
+        # A renewal on another thread may replace `_http`: _follow_renewed_pin needs to know which
+        # transport THIS attempt failed on, and the replaced one must stay open until this attempt
+        # lets go of it (BACKLOG #2091). The certificate retry runs after the release, as its own
+        # attempt with its own hold, so the replaced transport can close while the retry runs.
+        transport = self._acquire_transport()
         try:
-            response = _buffer_bounded(
-                transport.send(request, stream=True), limit=MAX_RESPONSE_BYTES
-            )
-        except httpx.HTTPError as exc:
-            if (
-                _follow_pin
-                and _is_cert_verification_failure(exc)
-                and self._follow_renewed_pin(transport)
-            ):
-                return self._request(
-                    method,
-                    path,
-                    _allow_step_up=_allow_step_up,
-                    _allow_mfa=_allow_mfa,
-                    _follow_pin=False,
-                    _bearer=_bearer,
-                    **kw,
+            # ASVS 4.2.5: bound the request line and the bearer this client emits. The limits are
+            # DUPLICATED from transports/rest.py rather than imported: ADR 0088 makes this package
+            # engine-free (a GUI/harness process must not pull transports/ in), so the import that
+            # would share them is exactly the coupling this package exists to avoid. Kept in step by
+            # ``test_apiclient_length_bounds_match_the_transport_constants``.
+            #
+            # The request is BUILT first so the bound measures the URL httpx will actually put on
+            # the wire — base_url joined to the path AND the ``params=`` query appended (BACKLOG
+            # #1047). Measuring ``base_url + path`` missed the query entirely, so every ``_get``
+            # filter (a search needle, a control id) was unmeasured; ``build_request`` is httpx's
+            # own resolution step, so this asks the same question the transport will answer.
+            # ``send`` then dispatches the already-built request, which is exactly what
+            # ``request()`` does internally — the auth and follow-redirects client defaults are
+            # unchanged.
+            request = transport.build_request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
+            resolved_url = str(request.url)
+            if len(resolved_url) > MAX_REQUEST_URL_LEN:
+                raise ApiError(
+                    f"request URL is {len(resolved_url)} chars, over the {MAX_REQUEST_URL_LEN}-char limit"
                 )
-            raise ApiError(f"could not reach engine at {self.base_url}: {exc}") from exc
+            if headers is not None and len(headers["Authorization"]) > MAX_REQUEST_HEADER_VALUE_LEN:
+                # Never echo the value: it is a live session bearer.
+                raise ApiError(
+                    f"the session Authorization header is {len(headers['Authorization'])} chars, over "
+                    f"the {MAX_REQUEST_HEADER_VALUE_LEN}-char limit"
+                )
+            # ASVS 15.2.2 (BACKLOG #1577): `stream=True` plus `_buffer_bounded` is what stops the
+            # reply body being read to EOF. The bounded read happens HERE, immediately, so the three
+            # exits below -- the MFA retry, the step-up retry, and the >= 400 raise through
+            # `_error_detail` (which reads the body itself) -- all act on an already-buffered,
+            # already-closed response. Collapsing them to one release point is deliberate: a
+            # per-exit close is three chances to leak a pooled connection, and the symptom of
+            # leaking one is the console's background poll hanging on an exhausted pool, not a test
+            # failure.
+            #
+            # Both calls sit under ONE `except httpx.HTTPError`, because streaming moves where a
+            # transport failure lands: a socket that dies mid-body now fails inside
+            # `_buffer_bounded` rather than at `send`, and both have to read as "could not reach
+            # engine" rather than escaping as a raw httpx error out of a Qt slot. The over-the-bound
+            # refusal is an `ApiError` and so passes through this handler untouched;
+            # `_buffer_bounded` releases the connection on its own `finally` either way.
+            #
+            # A certificate-verification failure against a pinned engine gets ONE retry when the
+            # pinned file has been renewed (BACKLOG #1276); see _follow_renewed_pin for why that is
+            # the trigger and why the retry cannot deliver a request twice.
+            response: httpx.Response | None = None
+            try:
+                response = _buffer_bounded(
+                    transport.send(request, stream=True), limit=MAX_RESPONSE_BYTES
+                )
+            except httpx.HTTPError as exc:
+                if not (
+                    _follow_pin
+                    and _is_cert_verification_failure(exc)
+                    and self._follow_renewed_pin(transport)
+                ):
+                    raise ApiError(f"could not reach engine at {self.base_url}: {exc}") from exc
+        finally:
+            self._release_transport(transport)
+        if response is None:  # the pinned certificate was renewed: retry once, on the new transport
+            return self._request(
+                method,
+                path,
+                _allow_step_up=_allow_step_up,
+                _allow_mfa=_allow_mfa,
+                _follow_pin=False,
+                _bearer=_bearer,
+                **kw,
+            )
         # Second factor (WP-14, ASVS 6.3.3): the engine refuses a sensitive op with 403 +
         # X-MFA-Required when this session hasn't satisfied MFA. Prompt for a code (the handler calls
         # verify_mfa()) and retry once — transparently, like step-up. Checked first because the engine
@@ -1175,17 +1225,26 @@ class EngineClient:
             MessageSearchResults,
         )
 
-    def get_message(self, message_id: str, *, reveal_summary: bool = False) -> MessageDetail:
+    def get_message(
+        self, message_id: str, *, reveal_summary: bool = False, reveal_errors: bool = False
+    ) -> MessageDetail:
         """Open one message: metadata, deliveries and events, and NOT its body (BACKLOG #2345). The
         body is :meth:`get_message_body`, a separate audited act.
 
         ``summary`` and ``metadata`` come back display-masked, as on the list, unless
         ``reveal_summary`` is set. Set it only on an operator act aimed at the summary (BACKLOG
-        #2346, ASVS 14.2.6); the engine records the choice in the ``message_view`` audit row."""
-        # None drops the parameter, so a plain open sends the same URL it always did.
-        flag = "true" if reveal_summary else None
+        #2346, ASVS 14.2.6); the engine records the choice in the ``message_view`` audit row.
+        ``reveal_errors`` does the same for the error text: ``error``, each delivery's
+        ``last_error`` and each event's ``detail`` come back as a fixed mask unless it is set
+        (BACKLOG #2436)."""
+        # None drops a parameter, so a plain open sends the same URL it always did.
         return _decode(
-            self._get(f"/messages/{_seg(message_id)}", reveal_summary=flag), MessageDetail
+            self._get(
+                f"/messages/{_seg(message_id)}",
+                reveal_summary="true" if reveal_summary else None,
+                reveal_errors="true" if reveal_errors else None,
+            ),
+            MessageDetail,
         )
 
     def get_message_body(
@@ -1401,10 +1460,33 @@ class EngineClient:
         return self._user is not None and permission in self._user.permissions
 
     def set_token(self, token: str) -> None:
-        """Adopt an existing token (e.g. from the OS keyring) and refresh the cached user."""
+        """Adopt an existing token (e.g. from the OS keyring) and refresh the cached user.
+
+        The adopted token counts as NOT issued to this client, so a later :meth:`login` leaves it
+        live (see :class:`_TokenCell`).
+
+        The token it replaces is ended when the engine issued that one to this client, by the rule
+        :meth:`login` follows (BACKLOG #2091). This client is dropping it, and nothing else can
+        reach it, so leaving it live would only strand it. A token adopted from outside is dropped
+        and left live, because another process may be using it. Adopting the token already held
+        changes nothing, including where it came from.
+
+        The revoke runs after ``/auth/me`` answers, whether or not it succeeds: the held token
+        was replaced before that call, so a refused new token strands the old one just the same.
+
+        The revoke blocks the calling thread, as in :meth:`login`. No caller in this repository
+        reaches it today, because each one adopts a token on a fresh client that holds none."""
         self._refuse_credential_on_cleartext("a bearer token")
-        self._token = token
-        self._user = self.me()
+        prior = self._token
+        issued = self._token_cell.issued_here
+        replaced = prior if prior and issued and prior != token else None
+        if prior != token:
+            self._token = token
+        try:
+            self._user = self.me()
+        finally:
+            if replaced is not None:
+                self._end_replaced_session(replaced)
 
     def clear_auth(self) -> None:
         self._token = None
@@ -1451,6 +1533,12 @@ class EngineClient:
         returns after it, bounded by the client timeout, which httpx applies per phase rather than
         in total. A revoke that fails never fails the sign-in: see :meth:`_end_replaced_session`.
 
+        So a GUI caller that signs in on its main thread waits for the revoke there too. That is
+        LATENT, not reachable, today (BACKLOG #2091): the harness ``LoginDialog`` signs in on the
+        Qt main thread, but only ever on a fresh client that holds no token, so no revoke runs.
+        A caller that re-signs-in on a client already holding an issued token would wait out one
+        more round trip; moving the sign-in off that thread is the fix, if one ever does.
+
         The engine runs its per-user session cap inside ``/auth/login``, before this revoke. A user
         already at the cap therefore loses their oldest other session to make room, as with the
         IDE. Ending the old session inside the mint needs an engine-side change."""
@@ -1480,14 +1568,14 @@ class EngineClient:
         """Revoke ``prior`` with ``POST /auth/logout``, presenting it as the bearer.
 
         Only that one token is ended, never the user's other sessions: a bearer caller may run
-        several at once, one per tool. :meth:`login` calls this only for a token the engine issued
-        to this client, so a token shared with another process through :meth:`set_token` is never
-        ended here. The call installs no MFA or step-up retry, so it can never prompt the user;
-        ``/auth/logout`` is exempt from both gates anyway.
+        several at once, one per tool. :meth:`login` and :meth:`set_token` call this only for a
+        token the engine issued to this client, so a token shared with another process through
+        :meth:`set_token` is never ended here. The call installs no MFA or step-up retry, so it
+        can never prompt the user; ``/auth/logout`` is exempt from both gates anyway.
 
-        A failure is logged and swallowed, because the sign-in it follows has already succeeded. A
-        401 is the common case (usually the old token had already expired or been revoked), so it
-        logs at INFO. The engine refuses with 401 for other reasons too, so the line says the
+        A failure is logged and swallowed, because the sign-in or adoption it follows has already
+        replaced the token. A 401 is the common case (usually the old token had already expired or
+        been revoked), so it logs at INFO. The engine refuses with 401 for other reasons too, so the line says the
         engine refused rather than that the session had ended. Anything else may leave a live
         session behind, so it logs a WARNING with the error, which tells a certificate failure from
         a timeout from a local refusal.
@@ -1506,14 +1594,14 @@ class EngineClient:
         except (RuntimeError, ValueError, httpx.HTTPError) as exc:
             if isinstance(exc, ApiError) and exc.status == 401:
                 _log.info(
-                    "%s refused to end the session this sign-in replaced (401); it has most likely "
+                    "%s refused to end the session this client replaced (401); it has most likely "
                     "already ended",
                     self.base_url,
                 )
             else:
                 _log.warning(
-                    "signed in to %s, but could not end the session this sign-in replaced, so it "
-                    "may stay valid until it expires: %r",
+                    "could not end the session this client replaced at %s, so it may stay valid "
+                    "until it expires: %r",
                     self.base_url,
                     str(exc).replace(prior, "[token]")[:_REVOKE_LOG_CHARS],
                 )

@@ -47,6 +47,9 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   fails *before* anything goes live; (4) asks you to **confirm**; (5) **promotes** — a real
   `POST /config/reload` that **atomically swaps** the live graph (quiesce-and-swap — in-flight
   deliveries keep draining; a bad/empty config is rejected and the running graph is left untouched).
+  Where the engine's dual control holds `config_reload` for a second approver, step (5) instead
+  reports the promote as **held**, with its approval id: nothing is live until a different user
+  approves it, and the engine then loads the config as it is at that moment.
   The same config promotes to every environment — only each engine's own values differ. The engine
   **requires authentication**, so the IDE signs you in on first use (credentials → a token cached in
   VS Code SecretStorage; an expired token re-prompts); a plain-`http` off-box target is refused, and an

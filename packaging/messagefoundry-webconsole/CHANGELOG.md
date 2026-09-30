@@ -76,6 +76,12 @@ under Changed says why engine 0.4.0 does not work with this console.
     shown in UTC.
 
 ### Changed
+- **The error text is masked until the operator asks** (`BACKLOG #2436`, ASVS 14.2.6, owner
+  ruling R12). The detail page shows the message's error, each delivery's last error and each
+  event's detail as `****`, each with a "Reveal" link to the new `/ui/messages/{id}/errors`. The
+  dead-letter list masks each last error the same way and links it to that message's `/errors`.
+  The engine masks the text in its response, so the page never carries it. Needs an engine whose
+  `get_message` accepts `reveal_errors`.
 - **The message detail page shows the body and the summary only when the operator asks**
   (`BACKLOG #2346`, ASVS 14.2.6). `/ui/messages/{id}` now shows the metadata with the summary
   masked and no body. A "Show raw message" link opens `/ui/messages/{id}/body`, and a "Reveal"
@@ -114,6 +120,9 @@ under Changed says why engine 0.4.0 does not work with this console.
   holds the new value and the one-value rule above still applies.
 
 ### Fixed
+- **The enrol-first notice no longer offers a passkey the engine refuses** (`BACKLOG #1133`, ADR
+  0197 Amendment A). A local account `require_mfa` covers that has no TOTP now reads "enroll an
+  authenticator app (TOTP)"; other accounts still see both choices.
 - **The uploaded-file pages explain a refused, throttled or unavailable action** (`BACKLOG #1169`,
   PR 1506 follow-up A). Browse, resend and delete showed the engine's raw JSON for a status they
   did not map. Two new allow-listed codes cover browse: `browse_hop_refused` (the PHI-read hop
@@ -146,6 +155,7 @@ under Changed says why engine 0.4.0 does not work with this console.
   `[store].allow_unmarked_ciphertext` opt-out. Each refusal logs a WARNING with the file id and
   status only, never the filename. The `404` answers are unchanged, so a refused owner check still
   reads as a missing file.
+- **The audit pages state a cap only on a full window, and no longer call the audit export the complete record** (`BACKLOG #1743`). No seam change.
 
 ### Security
 - **The user page sets the notification address in its own field** (`BACKLOG #1139`, ADR 0182

@@ -101,6 +101,15 @@ def _pager(
     return el("p", *parts, class_="pager")
 
 
+def _capped(shown: int, limit: int) -> bool:
+    """Whether a listing with no total may be missing rows: only a FULL window can be.
+
+    A query that asked for ``limit`` rows and got fewer reached the end of what it could read. A
+    full window cannot tell "exactly ``limit``" from "more", so it counts as capped. A page that
+    says "only the most recent" asks this rather than repeating the comparison (BACKLOG #1743)."""
+    return shown >= limit
+
+
 def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None) -> Markup:
     """The footer for a listing that is CAPPED and cannot page — the sentence that separates "this
     is everything" from "this is the newest ``limit``" (BACKLOG #1743).
@@ -109,6 +118,10 @@ def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None)
     holds 200 or 200,000, and the reader cannot tell which, so the cap goes in the text beside the
     count. Styled ``muted`` rather than ``pager``: ``pager`` is the class :func:`_pager` uses for a
     line that CARRIES links, and borrowing it here would dress a dead end up as navigation.
+
+    WITHOUT ``total``, THE CAP IS STATED ONLY WHEN THE WINDOW IS FULL (:func:`_capped`). Saying
+    "capped" on a short listing would call a complete listing a partial one, which is the same
+    misreading turned around (BACKLOG #1743 residual (c)).
 
     ``total`` is for a capped listing whose model ALSO carries the whole count, so the line can say
     "N of M" the way :func:`_pager` does without offering links the route cannot serve (BACKLOG
@@ -121,13 +134,12 @@ def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None)
     It lives beside :func:`_pager` rather than in each page that calls it, because the next capped
     listing needs the same sentence and copying it is how the two pagers diverged."""
     if total is None:
-        return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
-    total = max(total, shown)
-    if total > shown and shown >= limit:
-        return el(
-            "p", f"{shown} of {total} {noun} shown, capped at the newest {limit}.", class_="muted"
-        )
-    return el("p", f"{shown} of {total} {noun} shown.", class_="muted")
+        count, capped = f"{shown} {noun}", _capped(shown, limit)
+    else:
+        total = max(total, shown)
+        count, capped = f"{shown} of {total} {noun}", total > shown and _capped(shown, limit)
+    bound = f", capped at the newest {limit}" if capped else ""
+    return el("p", f"{count} shown{bound}.", class_="muted")
 
 
 # At most this many failed inbounds are named in the heart's reason; the rest become "and N more".

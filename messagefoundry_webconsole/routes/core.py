@@ -125,6 +125,11 @@ _BAD_BOUND_MESSAGE = (
 #: - ``/body`` is the detail page's "Show raw message" link. The summary is derived from the body, so
 #:   showing the body and masking the summary beside it would hide nothing.
 #: - The parse tree, the editor and the editor's reject arm exist to show the body.
+#: - ``/errors`` reveals the error-tier text: the message's error, each delivery's last error and
+#:   each event's detail (BACKLOG #2436, owner ruling R12). The detail page offers it as a "Reveal"
+#:   link beside each masked value, and the dead-letter list links each masked last error to it.
+#:   It is its own act, so no other row in this table declares it: the scrubber that cleans that
+#:   text is not de-identification, and a body reveal is aimed at the body, not at the errors.
 #:
 #: A route that is not listed reveals nothing, and :func:`_message_body` refuses to fetch a body for
 #: a route that does not declare ``body``. That refusal covers the helpers only: a handler calling
@@ -136,6 +141,7 @@ UI_MESSAGE_REVEALS: Mapping[str, frozenset[str]] = MappingProxyType(
         "/ui/messages/{message_id}": frozenset(),
         "/ui/messages/{message_id}/summary": frozenset({"summary"}),
         "/ui/messages/{message_id}/body": frozenset({"summary", "body"}),
+        "/ui/messages/{message_id}/errors": frozenset({"errors"}),
         "/ui/messages/{message_id}/parse-tree": frozenset({"body"}),
         "/ui/messages/{message_id}/edit": frozenset({"body"}),
         "/ui/messages/{message_id}/edit-resend": frozenset({"body"}),
@@ -492,8 +498,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
-        # account with NO factor (a new user holding an admin-issued password): it is BOTH and can
-        # only rotate.
+        # account with NO factor (a new user holding an admin-issued password): it is BOTH. With
+        # require_mfa off it can only rotate; under it, it enrols TOTP first (ADR 0197 Amendment A).
         # An account that HAS a factor (an admin reset keeps them) proves it first, because the
         # rotation page refuses it until then (BACKLOG #1954), and the factor page sends it on to
         # the rotation page afterwards.
@@ -707,13 +713,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         message_id: str, request: Request, engine: Any, identity: Identity
     ) -> Any:
         """Open one message through the engine's audited ``get_message``, revealing the summary only
-        when this route declares ``summary`` in :data:`UI_MESSAGE_REVEALS` (BACKLOG #2346)."""
+        when this route declares ``summary`` in :data:`UI_MESSAGE_REVEALS` (BACKLOG #2346), and the
+        error-tier text only when it declares ``errors`` (BACKLOG #2436)."""
+        reveals = _declared_reveals(request)
         return await core.get_message(
             message_id,
             request,
             engine=engine,
             identity=identity,
-            reveal_summary="summary" in _declared_reveals(request),
+            reveal_summary="summary" in reveals,
+            reveal_errors="errors" in reveals,
         )
 
     async def _message_body(
@@ -750,18 +759,25 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             else None
         )
         return HTMLResponse(
-            pages.message_detail(detail, raw, summary_revealed="summary" in reveals)
+            pages.message_detail(
+                detail,
+                raw,
+                summary_revealed="summary" in reveals,
+                errors_revealed="errors" in reveals,
+            )
         )
 
-    # Three routes, one page. What each reveals is its row in UI_MESSAGE_REVEALS, so the act is the
+    # Four routes, one page. What each reveals is its row in UI_MESSAGE_REVEALS, so the act is the
     # route the operator chose: the bare path reveals nothing, /summary is the click on a masked
-    # summary, and /body is the "Show raw message" click. All three carry the gate the detail page
-    # always had, because each still opens the message through the view_raw-gated get_message.
+    # summary, /body is the "Show raw message" click, and /errors is the click on masked error text
+    # (BACKLOG #2436). All four carry the gate the detail page always had, because each still opens
+    # the message through the view_raw-gated get_message.
     #
-    # Three handlers rather than one function under three stacked decorators, on purpose. The
+    # Separate handlers rather than one function under stacked decorators, on purpose. The
     # PHI-read scope count in docs/SECURITY.md is derived from require_ui(..., phi=True) CALL SITES
-    # (tests/test_security_doc_rate_limits.py), so one shared gate would state 5 charging views
-    # where 7 routes charge. Each gate is also pinned per route by the /ui route map in SECURITY.md.
+    # (tests/test_security_doc_rate_limits.py), so one shared gate would state fewer charging
+    # views than there are routes that charge. Each gate is also pinned per route by the /ui route
+    # map in SECURITY.md.
     @app.get("/ui/messages/{message_id}", response_class=HTMLResponse)
     async def ui_message_detail(
         message_id: str,
@@ -782,6 +798,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui/messages/{message_id}/body", response_class=HTMLResponse)
     async def ui_message_detail_body(
+        message_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
+    ) -> HTMLResponse:
+        return await _detail_page(message_id, request, engine, identity)
+
+    @app.get("/ui/messages/{message_id}/errors", response_class=HTMLResponse)
+    async def ui_message_detail_errors(
         message_id: str,
         request: Request,
         engine: Any = Depends(deps.get_engine),
@@ -1222,7 +1247,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if await rotation_comes_first(auth, identity.must_change_password, token):
             # must_change outranks MFA for an account with no factor, mirroring require()/require_ui:
             # a fresh account is both, and only rotation is reachable until it happens. One that
-            # still owes an enrolled factor stays here to answer it (BACKLOG #1954).
+            # still owes an enrolled factor stays here to answer it (BACKLOG #1954), and one that
+            # must enrol TOTP first never reaches this branch (rotation_comes_first is False).
             return RedirectResponse("/ui/account/password", status_code=303)
         if await auth.mfa_satisfied(token):
             return RedirectResponse("/ui", status_code=303)  # idempotent: nothing owed
