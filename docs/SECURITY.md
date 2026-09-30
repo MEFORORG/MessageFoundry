@@ -600,7 +600,7 @@ under `create_app()` (they sum to 98, not 96, because BOTH `/messages/export` ro
 | `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
-| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). Never assignable to a custom role |
+| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches the first three (BACKLOG #1982). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
 the Deployment/Coding roles are complete and those endpoints can be gated the moment they land, without
@@ -668,8 +668,8 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 [`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 42 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 119 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 233
-(115 + the 117 console routes + the `/ui/static` mount). Of the 115: **96 are permission-gated**, 19 are
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 236
+(115 + the 120 console routes + the `/ui/static` mount). Of the 115: **96 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -923,14 +923,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **117 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **120 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 107 of the 117 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 110 of the 120 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -964,6 +964,9 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_ui` |
+| `GET` | `/ui/approvals` | `approvals:approve` | `require_ui` |
+| `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui` — paces the write like `require_paced`; the requester can never approve their own request |
+| `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
 | `GET` | `/ui/audit` | `audit:read` | `require_ui` |
 | `GET` | `/ui/cluster` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/cluster/force-stepdown` | `cluster:control` | `require_ui_step_up` |
@@ -1165,7 +1168,7 @@ else would need its own authorization rule stated here.
    `phi=` (BACKLOG #1025) and short-circuit above the handler that would refuse. Neither render puts
    PHI on the wire, so the asymmetry costs no confidentiality; it is recorded here because a reader
    comparing the two surfaces will otherwise find it and read it as drift.
-5. **Three further console routes are weaker than a permission-equivalent JSON route**, each for a
+5. **Five further console routes are weaker than a permission-equivalent JSON route**, each for a
    stated reason: `GET /ui/uploaded-logs` is plain `require_ui` — it mirrors `GET /uploads` (also
    plain `require`), a metadata-only listing, not the step-up'd `GET /uploads/{file_id}/messages`;
    `POST /ui/connections/{name}/flag` mirrors `POST /connections/{name}/flag` (`require_paced` — a
@@ -1173,7 +1176,12 @@ else would need its own authorization rule stated here.
    `POST /ui/messages/search/presets/{preset_id}/delete` mirrors
    `DELETE /search/presets/{preset_id}` (`require_paced`, a floor `require_ui` charges too), deleting
    a saved query, not PHI. It is flagged because `POST /search/presets`, same method and
-   permission, carries `require_step_up`.
+   permission, carries `require_step_up`. The other two are
+   `POST /ui/approvals/{approval_id}/approve` and `POST /ui/approvals/{approval_id}/reject`
+   (BACKLOG #1982), which mirror `POST /approvals/{approval_id}/approve` and `/reject`
+   (`require_paced`, a floor `require_ui` charges too). They are flagged because
+   `POST /approvals/{approval_id}/resolve`, same method and permission, carries `require_step_up`.
+   The console does not offer the resolve, so that step-up has no console route to be missing from.
 
 Differences 4 and 5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
@@ -1254,7 +1262,8 @@ server-side, not a client confirmation). On release the captured operation is **
 **both identities** are written to the hash-chained audit log (`approval.requested` by the maker,
 `approval.approved` by the checker); `POST /approvals/{id}/reject` declines it (`approval.rejected`), and
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
-at `GET /approvals`.
+at `GET /approvals`, or on the console's **Approvals** page (`/ui/approvals`, BACKLOG #1982), which
+offers Approve and Reject on each pending request and lists `interrupted` releases read-only.
 
 **The audit log must accept a release before the operation runs.** Before it claims a request, the
 gate writes an `approval.release_attempted` row against the approver, naming the requester. If the
@@ -1349,9 +1358,10 @@ keystroke-level model for user performance time with interactive systems", *Comm
 | K | press a key or button (the fastest typist the model lists) | 0.08 s |
 
 To release a request a person must at least see it and decide (M), pick out that one request (P), and
-submit (K). That is about **2.53 s**, even with the request on screen the instant it exists. There is no
-Approve button today: the only release path is `POST /approvals/{id}/approve` from an HTTP tool. There
-the person must carry the request's 32-character id into the command. Pointing at it costs P, and typing
+submit (K). That is about **2.53 s**, even with the request on screen the instant it exists. The
+console's Approvals page has an Approve button beside each request, and that is exactly this path: see
+it, point at the button, click. From an HTTP tool, `POST /approvals/{id}/approve`, the person must carry
+the request's 32-character id into the command. Pointing at it costs P, and typing
 it costs 32 K, about 2.56 s, so the bound holds either way. The default sits about 20% below 2.53 s,
 because M and P are averages and some people are faster. The margin is a judgment, not a measurement:
 nothing here shows that no person is ever faster than 2.0 s. The aim is that no genuine reviewer is
@@ -3244,11 +3254,20 @@ Read the two together: the table above is the operator-surface half, and that se
 picture including the ingest plane. That document is maintainer-internal;
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
-**No limiter has a validator floor.** None of the eleven `*_rate_limit_*` fields, nor
-`lockout_threshold` / `lockout_minutes`, carries a Pydantic validator. So a `per_key` or `glob` of `0`
-silently disables that dimension, and a `*_window_seconds` of `0` ages every recorded hit out
+**Almost no limiter has a validator floor.** None of the eleven `*_rate_limit_*` fields carries a
+Pydantic validator except `admin_write_rate_limit_window_seconds`, which must be above `0`, and
+neither `lockout_threshold` nor `lockout_minutes` carries one. So a `per_key` or `glob` of `0` disables that
+dimension, and a sign-in or PHI-read `*_window_seconds` of `0` ages every recorded hit out
 immediately — disabling enforcement while the limiter still reports as "enabled". Treat these as
-security-relevant values, not tuning knobs.
+security-relevant values, not tuning knobs. **The sign-in limiter and the lockout are no longer
+silent about it** ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). While sign-in is on,
+`security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a `login_rate_limit_per_ip`
+or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds` of `0` or less, a
+`lockout_minutes` of `0` or less, and a `lockout_threshold` above the 100 that NIST SP 800-63B
+allows. Each then reaches the `serve` loosening warning, `messagefoundry security show` and
+`GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). A weak but non-zero
+count or window is still not named. Neither are the PHI-read and admin-write limiters, so turning
+either off, or zeroing one of its counts, is still silent.
 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained

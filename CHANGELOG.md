@@ -7,6 +7,13 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Turning the sign-in limiter or the account lockout off is now warned, not silent.** While
+  sign-in is on, `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a
+  `login_rate_limit_per_ip` or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds`
+  of `0` or less, a `lockout_minutes` of `0` or less, and a `lockout_threshold` above the 100 that
+  NIST SP 800-63B allows, so each reaches the `serve` loosening warning, `messagefoundry security
+  show` and `GET /security/posture`. The shipped defaults report nothing new. (`BACKLOG #1131`,
+  ASVS 6.1.1)
 - **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
   before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
   off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and
@@ -311,6 +318,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   too, and `x_api_key` counts as a copy of `x-api-key`. The refusal is charged and audited like a
   wrong key, and it never names the header or its value. `docs/SECURITY.md` Table B, intake
   authentication row, states the rule. (`BACKLOG #2051`)
+- **`GET /cluster/status` says whether a stepdown on this node would send its lease release.** The
+  new `owns_lease_row` field is the coordinator's own drain test, now the public
+  `ClusterCoordinator.may_own_lease_row()` on the Postgres, SQL Server and single-node coordinators.
+  It is true at least while the node leads and on a self-fenced node. It is also true while an
+  earlier release write is owed. It means "may own": if another node has taken the lease, the
+  stepdown releases nothing and answers `409`. The web console reads it to offer the stepdown
+  control. It is false on a single node. See `docs/CLUSTERING.md`. (`BACKLOG #1988`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
@@ -666,6 +680,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   binds that inbound, a port another process holds is first found at the window open. The window
   open now records that inbound as failed and alerts once, as an engine start does, then retries
   quietly each tick. (`BACKLOG #2069`)
+- **An FTP server that plainly says it is busy no longer stops an outbound lane.** Every 5xx reply
+  while an FTP or FTPS session opened was treated as a refused credential, which stops the lane
+  (ADR 0095). A reply that names a connection limit, such as ProFTPD's "maximum number of
+  clients", is now retried. A refused `AUTH TLS`, `PBSZ` or `PROT P` is now a permanent
+  configuration fault, not a credential fault. So is a plain session's login refusal that plainly
+  demands TLS, and a refused greeting. A configuration fault still stops the lane and keeps the
+  queue, because every queued message would meet the same refusal; its alert names the
+  configuration, not a credential. A login reply that names the credential or the account stays a
+  credential fault, even beside a limit or a TLS demand. So does any other 5xx at the login, and
+  now a 4xx that names the credential, such as `430 Invalid username or password`. The credential
+  words are broad on purpose, so a busy reply that also carries one, such as "blocked", still stops
+  the lane. Both faults follow `credential_fault_policy`: the default `stop` stops the lane, on the
+  single-message and the batch path, and `dead_letter` dead-letters the message. With
+  `validate_directory` on, the per-send listing passes both through and retries every other fault.
+  (`BACKLOG #2083`)
 - **The SFTP and FTP source now waits for a file to stop growing before it reads it.** A file is
   read only once it lists at the same size on two polls in a row, as the local File source has done
   since `BACKLOG #1811`, so a partner that pauses between writes for less than `poll_seconds` is

@@ -21,7 +21,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal, cast
 
 import pytest
 from pydantic import BaseModel
@@ -169,6 +169,36 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     )
 
 
+def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any) -> None:
+    """Every name the console imports from ``messagefoundry.auth.service`` (BACKLOG #2015).
+
+    Before #2015 discovery read only ``AuthService`` out of that module, so a renamed step-up
+    constant or exception moved no seam. A PIN OVER A DISCOVERED SET, for the reason the
+    ``api.security`` pin above gives: update it to what discovery reports when the console's
+    imports change, and never widen it to a membership check.
+
+    Recorded 2026-09-29. The filing named three ``admin.py`` constants; the tree had five names
+    there by then, and ``OidcStepUp`` in ``routes/oidc.py`` was new since the filing too."""
+    assert surface.auth_service_symbols == (
+        "AuthService",
+        "Elevation",
+        "FEDERATED_BINDING_CHANGED",
+        "MfaStatus",
+        "NotifyEmailAlreadySet",
+        "OidcStepUp",
+        "STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY",
+        "STEP_UP_ACTION_ADMIN_RESET_MFA",
+        "STEP_UP_ACTION_ADMIN_RESET_PASSWORD",
+        "STEP_UP_ACTION_ADMIN_USER_UPDATE",
+        "STEP_UP_ACTION_MFA_CONFIRM",
+        "STEP_UP_ACTION_MFA_DISABLE",
+        "STEP_UP_ACTION_MFA_ENROLL",
+        "STEP_UP_ACTION_SESSION_TERMINATE",
+        "STEP_UP_ACTION_WEBAUTHN_DELETE",
+        "STEP_UP_ACTION_WEBAUTHN_ENROLL",
+    )
+
+
 def test_auth_service_properties_are_discovered_not_only_methods(surface: Any) -> None:
     """``has_action_step_up`` is CALLED by the console and was absent from the curated list, and six
     of the seven additions are PROPERTIES.
@@ -186,6 +216,7 @@ def test_discovery_is_order_stable(surface: Any) -> None:
     for section in (
         surface.dtos,
         surface.security_symbols,
+        surface.auth_service_symbols,
         surface.auth_service_methods,
         surface.app_state_attrs,
     ):
@@ -319,6 +350,173 @@ def test_literal_values_are_extracted() -> None:
     byte-identical."""
     lits = sd.literals_in_surface(sd._closure({"_Root"}, _fake_module(), "synthetic"))
     assert lits[f"{_Root.__module__}._Root.mode"] == ("a", "b")
+
+
+def _auth_service_names(source: str) -> set[str]:
+    names: set[str] = sd._auth_service_symbols([(Path("synthetic.py"), ast.parse(source))])
+    return names
+
+
+def test_auth_service_from_import_records_the_original_name() -> None:
+    """The alias is a local label; the engine ships the original name."""
+    src = "from messagefoundry.auth.service import NotifyEmailAlreadySet as Taken, Elevation\n"
+    assert _auth_service_names(src) == {"NotifyEmailAlreadySet", "Elevation"}
+
+
+def test_a_planted_rename_moves_the_discovered_auth_service_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2015's closing condition, at the discovery level. The digest-level twin is in
+    ``tests/test_webconsole_seam_snapshot.py``. Neither asserts an end-to-end ``UiSeamMismatch``:
+    the console's route modules import these names eagerly, so a skewed pair fails at import
+    before the handshake runs (BACKLOG #1907).
+
+    The rename is planted on both sides, as the one commit making it would. A console that did NOT
+    follow it fails loud instead, which is the last assertion."""
+    from messagefoundry.auth import service
+
+    before = _auth_service_names("from messagefoundry.auth.service import NotifyEmailAlreadySet\n")
+    monkeypatch.setattr(service, "NotifyEmailTaken", service.NotifyEmailAlreadySet, raising=False)
+    monkeypatch.delattr(service, "NotifyEmailAlreadySet")
+    after = _auth_service_names("from messagefoundry.auth.service import NotifyEmailTaken\n")
+    assert before == {"NotifyEmailAlreadySet"}
+    assert after == {"NotifyEmailTaken"}
+    with pytest.raises(sd.SeamDiscoveryError, match="does not define it"):
+        _auth_service_names("from messagefoundry.auth.service import NotifyEmailAlreadySet\n")
+
+
+def test_auth_service_star_import_fails_loud() -> None:
+    with pytest.raises(sd.SeamDiscoveryError, match="star import from auth.service"):
+        _auth_service_names("from messagefoundry.auth.service import *\n")
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "import messagefoundry.auth.service\n",
+        "import messagefoundry.auth.service as svc\n",
+        "from messagefoundry.auth import service\n",
+        "from messagefoundry.auth import Identity, service as svc\n",
+    ],
+)
+def test_binding_the_auth_service_module_fails_loud(src: str) -> None:
+    """Names read through a module binding appear in no import statement, so the walk could not
+    claim to have found them all."""
+    with pytest.raises(sd.SeamDiscoveryError, match="module import of auth.service"):
+        _auth_service_names(src)
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "from messagefoundry import auth\nx = auth.service.Elevation\n",
+        "from messagefoundry import auth as a\nx = a.service\n",
+        "import messagefoundry.auth\nx = messagefoundry.auth.service.Elevation\n",
+        "import messagefoundry.auth as a\nx = a.service.Elevation\n",
+        "import messagefoundry\nx = messagefoundry.auth.service.Elevation\n",
+    ],
+)
+def test_reaching_auth_service_through_a_package_binding_fails_loud(src: str) -> None:
+    with pytest.raises(sd.SeamDiscoveryError, match="through a package binding"):
+        _auth_service_names(src)
+
+
+def test_an_unrelated_service_attribute_is_not_refused() -> None:
+    """The control for the package-binding refusal: ``.service`` on anything else is not it."""
+    src = "from messagefoundry import auth\nimport messagefoundry\nx = app.service\ny = auth.identity\n"
+    assert _auth_service_names(src) == set()
+
+
+def test_a_name_auth_service_does_not_define_fails_loud() -> None:
+    """Otherwise the generator dies later with a bare AttributeError that names no console file."""
+    with pytest.raises(sd.SeamDiscoveryError, match="synthetic.py.*does not define it"):
+        _auth_service_names("from messagefoundry.auth.service import NoSuchName\n")
+
+
+def test_a_submodule_bound_in_auth_service_fails_loud() -> None:
+    """``auth.service`` binds ``oidc`` and other submodules. Importing one records a module, and the
+    names read through it are in no import statement."""
+    with pytest.raises(sd.SeamDiscoveryError, match="is a module bound in auth.service"):
+        _auth_service_names("from messagefoundry.auth.service import oidc\n")
+
+
+def test_a_star_import_from_any_engine_module_fails_loud() -> None:
+    """It could re-export an ``auth.service`` name the walk would never see."""
+    with pytest.raises(sd.SeamDiscoveryError, match="star import from an engine module"):
+        _auth_service_names("from messagefoundry.api.security import *\n")
+
+
+def test_the_nested_walk_reads_fields_only_and_sees_callable_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Callable[[X], R]`` holds ``X`` in a list ``get_args`` does not flatten, and
+    ``get_type_hints`` returns ``ClassVar`` annotations, which are not fields."""
+    import dataclasses
+    from collections.abc import Callable
+
+    # ClassVar is imported at MODULE level on purpose: under string annotations, @dataclass spots a
+    # ClassVar only through the defining module's namespace, and would otherwise make it a field.
+    fake = types.ModuleType(sd.AUTH_SERVICE_MODULE)
+
+    @dataclasses.dataclass
+    class Inner:
+        x: int = 0
+
+    @dataclasses.dataclass
+    class Unused:
+        y: int = 0
+
+    @dataclasses.dataclass
+    class Outer:
+        callback: Callable[[Inner], None] | None = None
+        registry: ClassVar[Unused | None] = None
+
+    for cls in (Inner, Unused, Outer):
+        cls.__module__ = sd.AUTH_SERVICE_MODULE
+        setattr(fake, cls.__name__, cls)
+    # get_type_hints resolves the string annotations in the defining module's namespace.
+    fake.Callable = Callable  # type: ignore[attr-defined]
+    fake.ClassVar = ClassVar  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, sd.AUTH_SERVICE_MODULE, fake)
+
+    assert sd._with_nested_auth_service_types(fake, {"Outer"}) == {"Outer", "Inner"}
+
+
+def test_a_class_reached_only_through_a_field_is_recorded() -> None:
+    """``OidcStepUp.elevation`` is an ``Elevation``, and the console reads its fields through it.
+    Importing ``OidcStepUp`` alone must bring ``Elevation`` into the seam, so its fields do not
+    depend on some other route importing it."""
+    assert _auth_service_names("from messagefoundry.auth.service import OidcStepUp\n") == {
+        "OidcStepUp",
+        "Elevation",
+    }
+
+
+def test_a_re_exported_auth_service_class_is_resolved_through_its_source() -> None:
+    """``api.security`` imports ``AuthService`` from ``auth.service``, so importing it from there
+    still reaches the engine's class and must be recorded."""
+    assert _auth_service_names("from messagefoundry.api.security import AuthService\n") == {
+        "AuthService"
+    }
+
+
+def test_a_same_named_class_elsewhere_is_not_recorded() -> None:
+    """The control for the re-export check. ``api.auth_models.CustomRoleInfo`` is a different class
+    from ``auth.service.CustomRoleInfo``. A lookup on ``auth.service`` by the imported name alone
+    records it; measured 2026-09-29 on the first draft of this check."""
+    from messagefoundry.api import auth_models
+    from messagefoundry.auth import service
+
+    # The control's premise, checked at runtime: mypy already knows the two types differ.
+    assert cast(object, auth_models.CustomRoleInfo) is not service.CustomRoleInfo
+    assert (
+        _auth_service_names("from messagefoundry.api.auth_models import CustomRoleInfo\n") == set()
+    )
+
+
+def test_relative_and_unrelated_imports_are_ignored() -> None:
+    src = "from ._auth import require_ui\nfrom messagefoundry.auth import Identity\n"
+    assert _auth_service_names(src) == set()
 
 
 def test_an_unresolved_forward_ref_fails_loud() -> None:

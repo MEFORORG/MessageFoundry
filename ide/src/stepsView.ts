@@ -71,12 +71,18 @@ import {
   escapeHtml,
   mergeLiveValues,
   parseRewriteResult,
+  pickPartSeed,
+  readEditMessage,
+  readPickPartMessage,
   releaseEdit,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
+  rewriteRefusalMessage,
   shouldAttachLiveValues,
   shouldFallBackToText,
+  templateValue,
   traceRowValues,
+  withPickedPath,
   type AddMenuItem,
   type EditMessage,
   type HandlerViewModel,
@@ -467,8 +473,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       const outcome = parseRewriteResult(res);
       if (outcome.source === undefined) {
+        // A mode refusal (dynamic, literal-only, template shape, column limit) gets a plain sentence
+        // keyed on the engine's refusal code; any other refusal shows the engine's message (#237).
         void vscode.window.showErrorMessage(
-          `MessageFoundry: could not apply the edit — ${outcome.error ?? "lens rewrite failed"}`,
+          `MessageFoundry: could not apply the edit — ${rewriteRefusalMessage(outcome)}`,
         );
         await render(); // revert the optimistic webview change to the true projection
         return;
@@ -596,6 +604,38 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       await render(); // reflect the picked value (no optimistic DOM value) + any drained edits
     };
 
+    // Run the native cascading field picker (ADR 0104 §2.3), then write what `build` makes of the picked
+    // path through applyPickedEdit's set_params splice. The picker runs OUTSIDE the edit guard (a modal
+    // must not hold the single edit slot — mirrors pickSample). No schema bundle → nothing to pick, so
+    // say so and leave the typed value to stand; a cancelled pick writes nothing. Shared by a literal
+    // path pick and a template part pick (#237), which differ only in the value they build.
+    const pickThenApply = async (
+      coords: Omit<EditMessage, "command" | "value">,
+      mode: "path" | "segment",
+      seed: string,
+      build: (picked: string) => EditMessage["value"],
+    ): Promise<void> => {
+      if (disposed) {
+        return;
+      }
+      if (!this.schema) {
+        void vscode.window.showInformationMessage(
+          "MessageFoundry: the HL7 field picker has no schema bundle here. Type the field path instead.",
+        );
+        return;
+      }
+      const picked = await pickHl7Path(this.schema, {
+        mode,
+        scope: this.scopeFor(coords.handler),
+        verified: this.structures?.verified,
+        seed,
+      });
+      if (picked === undefined || disposed) {
+        return; // cancelled — no write
+      }
+      await applyPickedEdit({ command: "edit", ...coords, value: build(picked) });
+    };
+
     // Undo / redo the document's edit stack. Every Steps edit lands there as a WorkspaceEdit (see applyOne
     // / applyStructural), so VS Code's own undo/redo already covers them — these buttons just surface it
     // inside the webview, where Ctrl+Z doesn't reach the document. Runs as a lone op behind the edit guard
@@ -633,8 +673,13 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         lineStart?: number;
         lineEnd?: number;
         name?: string;
-        // A number for a number-kind widget (BACKLOG #1760); a string for every other field.
-        value?: string | number;
+        // A number for a number-kind widget (BACKLOG #1760); a string for every other field; a
+        // `{"parts": [...]}` template from a templated argument's editor (#237). Untrusted, so an `edit`
+        // is read through readEditMessage rather than narrowed here.
+        value?: unknown;
+        // A `pickPart` request's template parts and the part index the pick fills (#237).
+        parts?: unknown;
+        index?: number;
         direction?: "up" | "down";
         toLineStart?: number;
         toLineEnd?: number;
@@ -680,27 +725,37 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             document.uri.fsPath,
             m.line,
           );
-        } else if (
-          m?.command === "edit" &&
-          typeof m.handler === "string" &&
-          typeof m.lineStart === "number" &&
-          typeof m.lineEnd === "number" &&
-          typeof m.name === "string" &&
-          // A number-kind widget posts a JS number (BACKLOG #1760); every other field posts a string.
-          (typeof m.value === "string" || typeof m.value === "number") &&
-          typeof m.expectSrc === "string"
-        ) {
-          void applyEdit({
-            command: "edit",
-            handler: m.handler,
-            lineStart: m.lineStart,
-            lineEnd: m.lineEnd,
-            name: m.name,
-            value: m.value,
-            // The row's PROJECTION-TIME source, echoed from `data-expect-src` — the F7 stale-coordinate
-            // guard input. Never recomputed from the live buffer here (that made the guard tautological).
-            expectSrc: m.expectSrc,
-          });
+        } else if (m?.command === "edit") {
+          // A number-kind widget posts a JS number (BACKLOG #1760), a templated argument's editor posts
+          // `{"parts": [...]}` (#237), and every other field posts a string. readEditMessage is the one
+          // guard: an edit with missing coordinates is dropped as before, and one whose value is none of
+          // the three (a malformed template included) is refused visibly, never repaired.
+          const read = readEditMessage(m);
+          if (read !== undefined && "refused" in read) {
+            void vscode.window.showErrorMessage(`MessageFoundry: could not apply the edit — ${read.refused}`);
+            // Revert the webview's unsent change to the true projection, but never under an edit in
+            // flight: then the refresh is owed and runs when the slot frees, as a suppressed save does.
+            // Rows only: nothing was written, so there is no reason to re-run the live-value trace.
+            if (guard.shouldReactToDocumentChange()) {
+              scheduleRowsOnlyRerender();
+            } else {
+              guard.noteSuppressedChange();
+            }
+          } else if (read !== undefined) {
+            void applyEdit(read.edit);
+          }
+        } else if (m?.command === "pickPart") {
+          // #237 step 3: pick an HL7 field into one part of a template. Same shape as pickPath below: the
+          // picker runs OUTSIDE the edit guard, then the whole template goes through the SAME set_params
+          // splice as `{"parts": [...]}`. The picker yields a path string that becomes a `{path}` part;
+          // no Python source is built here. A malformed request is dropped.
+          const pick = readPickPartMessage(m);
+          if (pick !== undefined) {
+            const { parts, index, ...coords } = pick;
+            void pickThenApply(coords, "path", pickPartSeed(parts, index), (picked) =>
+              templateValue(withPickedPath(parts, index, picked)),
+            );
+          }
         } else if (
           m?.command === "pickPath" &&
           typeof m.handler === "string" &&
@@ -709,40 +764,16 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.name === "string" &&
           typeof m.expectSrc === "string"
         ) {
-          // ADR 0104 §2.3: run the native cascading field picker OUTSIDE the edit guard (a modal must not
-          // hold the single edit slot — mirrors pickSample), then apply the chosen path through the SAME
-          // set_params splice. No schema bundle → nothing to pick (silent no-op). Capture the narrowed
-          // fields in consts so their types survive into the async closure.
-          const handler = m.handler;
-          const lineStart = m.lineStart;
-          const lineEnd = m.lineEnd;
-          const name = m.name;
-          const expectSrc = m.expectSrc;
-          const mode = m.mode === "segment" ? "segment" : "path";
+          // ADR 0104 §2.3: the picked path is written as the argument's literal.
+          const coords = {
+            handler: m.handler,
+            lineStart: m.lineStart,
+            lineEnd: m.lineEnd,
+            name: m.name,
+            expectSrc: m.expectSrc,
+          };
           const seed = typeof m.value === "string" ? m.value : "";
-          void (async () => {
-            if (!this.schema || disposed) {
-              return;
-            }
-            const picked = await pickHl7Path(this.schema, {
-              mode,
-              scope: this.scopeFor(handler),
-              verified: this.structures?.verified,
-              seed,
-            });
-            if (picked === undefined || disposed) {
-              return; // cancelled — no write
-            }
-            await applyPickedEdit({
-              command: "edit",
-              handler,
-              lineStart,
-              lineEnd,
-              name,
-              value: picked,
-              expectSrc,
-            });
-          })();
+          void pickThenApply(coords, m.mode === "segment" ? "segment" : "path", seed, (picked) => picked);
         } else if (
           m?.command === "deleteRow" &&
           typeof m.handler === "string" &&
@@ -1190,6 +1221,23 @@ function pageHtml(
        never reads as real content. */
     .params .field input::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground));
                            opacity: 1; font-style: italic; }
+    /* Per-argument input modes (ADR 0076 Amendment E, BACKLOG #237): the argument's mode as a tag, or a
+       selector when more than one mode may be written, above one pane per writable mode. */
+    .params .field .mode-head { display: flex; align-items: center; gap: 6px; }
+    .params .field .mode-tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+                           color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border);
+                           border-radius: 3px; padding: 0 4px; }
+    .params .field[data-mode="dynamic"] .mode-tag { border-style: dashed; }
+    .params .field select.mode-select { font-family: inherit; font-size: 11px; color: var(--vscode-dropdown-foreground);
+                           background: var(--vscode-dropdown-background);
+                           border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border)); border-radius: 2px; }
+    .params .field .tparts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+    .params .field .tpart { display: inline-flex; align-items: stretch; gap: 2px; padding: 1px;
+                           border: 1px solid var(--vscode-panel-border); border-radius: 3px; }
+    .params .field .tpart[data-part="path"] { border-color: var(--vscode-focusBorder); }
+    .params .field .tpart input.tpart-input { width: 9em; }
+    .params .field .tparts button { font-size: 11px; padding: 0 5px; }
+    .params .field input.tsource { margin-bottom: 4px; }
     pre.code { margin: 6px 0 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.1));
                border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: auto;
                font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; white-space: pre; }

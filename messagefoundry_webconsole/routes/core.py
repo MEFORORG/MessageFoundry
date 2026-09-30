@@ -90,9 +90,11 @@ _DIRECTORY_UNCONFIRMED_ERROR = (
 def _directory_unconfirmed(elevation: Elevation) -> bool:
     """``Elevation.directory_unconfirmed``, read so an engine that predates the field degrades.
 
-    The console ships as a separately versioned wheel, and the seam digest records ``verify_mfa``'s
-    signature but not ``Elevation``'s fields, so an older engine would pass the handshake and then
-    raise ``AttributeError`` here. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
+    The console ships as a separately versioned wheel. When this was written the seam digest
+    recorded ``verify_mfa``'s signature but not ``Elevation``'s fields, so an older engine would
+    pass the handshake and then raise ``AttributeError`` here. The digest records those fields since
+    BACKLOG #2015, so such an engine now ships a different seam; the fallback stays as a second
+    guard. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
     """
     return bool(getattr(elevation, "directory_unconfirmed", False))
 
