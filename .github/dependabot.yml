@@ -128,7 +128,8 @@ updates:
       # Keep the two lists covering all three levels: an update no group matches opens its own PR.
       # Key and values checked 2026-09-30 against GitHub's dependabot-options-reference page.
       # The level is read by version position, so a breaking 0.x release counts as a minor and
-      # still rides `python-deps`; the `ignore` caps above are what cover that case. Cost, accepted:
+      # still rides `python-deps`. The `ignore` caps above cover only the packages they name, so a
+      # breaking 0.x minor of any other package can still hold that batch. Cost, accepted:
       # both groups rewrite uv.lock, so in a week with both PRs open the second must rebase and
       # re-run CI after the first merges, and the two cannot share a merge-queue batch.
       python-deps:
