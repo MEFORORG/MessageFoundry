@@ -199,16 +199,15 @@ def test_release_load_bearing_canaries_present() -> None:
         # Sigstore keyless signing over the artifacts AND the SBOM + VEX (space-separated in the sign cmd)
         "Sigstore keyless sign": "python -m sigstore sign dist/*.tar.gz dist/*.whl",
         "Sigstore signs SBOM + VEX": "messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json",
-        # SLSA build provenance; subjects now also bind the SBOM + VEX and the toolkit wheel
-        # (comma-separated in subject-path; the toolkit's own test is
-        # test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle).
+        # SLSA build provenance; subjects now also bind the SBOM + VEX (comma-separated in
+        # subject-path). No closing quote, so a subject appended later does not break it.
         # Its guard is checked on the step itself, not as a whole-file literal: the
         # visibility half by `test_the_attestation_step_keeps_its_visibility_test`, the event-and-ref
         # half by section (4b) (BACKLOG #1805).
         "SLSA attest action pinned": "uses: actions/attest-build-provenance@",
         "SLSA subjects incl SBOM + VEX": (
             'subject-path: "dist/*.tar.gz, dist/*.whl, '
-            'messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json, toolkit-dist/*.whl"'
+            "messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"
         ),
         # PyPI publish via the pinned pypa action, tag-gated, reading the clean staging dir
         "PyPI publish action pinned": "uses: pypa/gh-action-pypi-publish@",
@@ -2160,6 +2159,33 @@ def test_the_toolkit_smoke_refuses_a_wheel_without_its_console_script_target(
     assert "console script would fail" in out, out
 
 
+def _release_steps() -> list[dict]:
+    """The `release` job's steps, in order. Indexes returned below refer to this list."""
+    return [s for s in _jobs()["release"]["steps"] if isinstance(s, dict)]
+
+
+def _release_step_index(pred: Callable[[dict], bool], what: str) -> int:
+    """Index of the one `release` step matching ``pred``.
+
+    ONE locator for the toolkit tests below, for the reason ``_step_script_by_prefix`` gives: two
+    copies of one lookup drift apart the first time either is fixed. A predicate over a step's shell
+    reads it through ``_executed_shell`` (see ``_runs``), so a comment quoting a command cannot match.
+    """
+    hits = [i for i, s in enumerate(_release_steps()) if pred(s)]
+    assert len(hits) == 1, f"expected one {what} step in `release`, found {hits}"
+    return hits[0]
+
+
+def _named(prefix: str) -> Callable[[dict], bool]:
+    """A predicate for the step whose name (or ``uses:``) starts with ``prefix``."""
+    return lambda s: str(s.get("name") or s.get("uses") or "").startswith(prefix)
+
+
+def _runs(needle: str) -> Callable[[dict], bool]:
+    """A predicate for the step whose EXECUTED shell contains ``needle``."""
+    return lambda s: needle in _executed_shell(str(s.get("run") or ""))
+
+
 def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
     """ADR 0201 section 1: the toolkit's first upload claims its name, and the engine names it.
 
@@ -2168,13 +2194,11 @@ def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
     runs immediately before the engine's upload, so a failure in it skips the engine's. A separate
     job gated on a repository variable would reopen the window the order closes.
     """
-    steps = [s for s in _jobs()["release"]["steps"] if isinstance(s, dict)]
+    steps = _release_steps()
     names = [str(s.get("name") or s.get("uses") or "") for s in steps]
 
     def at(prefix: str) -> int:
-        hits = [i for i, n in enumerate(names) if n.startswith(prefix)]
-        assert len(hits) == 1, f"expected one step starting {prefix!r} in `release`, found {hits}"
-        return hits[0]
+        return _release_step_index(_named(prefix), f"step starting {prefix!r}")
 
     build = at("Build the toolkit wheel")
     gate = at("Member gate — the toolkit wheel")
@@ -2200,6 +2224,11 @@ def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
     assert "--outdir toolkit-dist" in str(steps[build].get("run") or "")
 
 
+#: The step that moves the toolkit's Sigstore bundle out of toolkit-dist/ and then proves the
+#: directory holds only wheels. Matched as a name prefix.
+_TOOLKIT_BUNDLE_STEP_PREFIX = "Move the toolkit Sigstore bundle out of toolkit-dist/"
+
+
 def test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle() -> None:
     """BACKLOG #1192: the toolkit wheel gets the engine wheel's provenance, by explicit name.
 
@@ -2207,46 +2236,29 @@ def test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle() -> N
     could silently drop out of: the Sigstore call, the SLSA subjects, the GitHub release assets and
     the dry-run upload. The bundle must also LEAVE toolkit-dist/ before the toolkit's PyPI publish,
     which uploads that directory whole: `sigstore sign` writes the bundle beside its input, and twine
-    rejects a bundle, so a bundle left there fails the upload that claims the toolkit's name.
+    rejects a bundle, so a bundle left there fails the upload that claims the toolkit's name. What
+    the move step DOES is graded by running it, in the tests after this one.
     """
-    steps = [s for s in _jobs()["release"]["steps"] if isinstance(s, dict)]
+    steps = _release_steps()
+    sign = _release_step_index(_runs("python -m sigstore sign"), "Sigstore")
+    lines = _executed_shell(str(steps[sign]["run"])).replace("\\\n", " ").splitlines()
+    sign_lines = [ln.split() for ln in lines if "python -m sigstore sign" in ln]
+    assert len(sign_lines) == 1, sign_lines
+    assert "toolkit-dist/*.whl" in sign_lines[0], sign_lines[0]
 
-    def one(pred: Callable[[dict], bool], what: str) -> int:
-        hits = [i for i, s in enumerate(steps) if pred(s)]
-        assert len(hits) == 1, f"expected one {what} step in `release`, found {hits}"
-        return hits[0]
-
-    def shell(i: int) -> str:
-        return _executed_shell(str(steps[i].get("run") or ""))
-
-    sign = one(lambda s: "python -m sigstore sign" in str(s.get("run") or ""), "Sigstore")
-    lines = shell(sign).replace("\\\n", " ").splitlines()
-    sign_cmds = [ln.split() for ln in lines if "python -m sigstore sign" in ln]
-    assert len(sign_cmds) == 1, sign_cmds
-    assert "toolkit-dist/*.whl" in sign_cmds[0], sign_cmds[0]
-    sign_at = next(n for n, ln in enumerate(lines) if "python -m sigstore sign" in ln)
-    moves = [
-        n
-        for n, ln in enumerate(lines)
-        if ln.split() == ["mv", "toolkit-dist/*.sigstore*", "toolkit-sigstore/"]
-    ]
-    assert moves and moves[0] > sign_at, (
-        "the toolkit bundle is not moved out of toolkit-dist/ after signing, so the toolkit's PyPI "
-        "upload would carry it"
-    )
-
-    attest = one(
+    move = _release_step_index(_named(_TOOLKIT_BUNDLE_STEP_PREFIX), "toolkit bundle move")
+    attest = _release_step_index(
         lambda s: str(s.get("uses") or "").startswith("actions/attest-build-provenance@"), "SLSA"
     )
     subjects = [p.strip() for p in str(steps[attest]["with"]["subject-path"]).split(",")]
     assert "toolkit-dist/*.whl" in subjects, subjects
 
-    release = one(lambda s: "gh release upload" in str(s.get("run") or ""), "GitHub release")
-    assets = re.search(r"assets=\((.*?)\)", shell(release), re.S)
+    release = _release_step_index(_runs("gh release upload"), "GitHub release")
+    assets = re.search(r"assets=\((.*?)\)", _executed_shell(str(steps[release]["run"])), re.S)
     assert assets, "the GitHub release step lost its `assets=( ... )` array"
     assert {"toolkit-dist/*.whl", "toolkit-sigstore/*.sigstore*"} <= set(assets.group(1).split())
 
-    upload = one(
+    upload = _release_step_index(
         lambda s: (
             "upload-artifact" in str(s.get("uses") or "")
             and "toolkit-dist/" in str((s.get("with") or {}).get("path") or "")
@@ -2255,11 +2267,69 @@ def test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle() -> N
     )
     assert "toolkit-sigstore/" in str(steps[upload]["with"]["path"]).split(), steps[upload]
 
-    publish = one(
-        lambda s: str(s.get("name") or "").startswith("Publish messagefoundry-toolkit"),
-        "toolkit publish",
-    )
-    assert sign < attest < release < publish, (sign, attest, release, publish)
+    publish = _release_step_index(_named("Publish messagefoundry-toolkit"), "toolkit publish")
+    assert sign < move < attest < release < publish, (sign, move, attest, release, publish)
+
+
+@pytest.fixture
+def toolkit_bundle_step(tmp_path: Path) -> tuple[str, Path, dict[str, str]]:
+    """A usable bash and the bundle-move step, written as BYTES, for the leak-gate fixture's
+    reasons: ``require_bash`` fails loudly, and ``write_text`` would hand bash CRLF lines."""
+    script = tmp_path / "toolkit_bundle.sh"
+    body = _step_script_by_prefix(_TOOLKIT_BUNDLE_STEP_PREFIX, "the toolkit bundle move")
+    script.write_bytes(body.encode("utf-8"))
+    env = _posix_tool_env()
+    return require_bash(tmp_path, env), script, env
+
+
+def _toolkit_dist(root: Path, names: Sequence[str]) -> Path:
+    """A work directory whose toolkit-dist/ holds one small file per name."""
+    (root / "toolkit-dist").mkdir(parents=True)
+    for name in names:
+        (root / "toolkit-dist" / name).write_bytes(b"fixture\n")
+    return root
+
+
+_TOOLKIT_WHEEL_NAME = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
+_TOOLKIT_BUNDLE_NAME = f"{_TOOLKIT_WHEEL_NAME}.sigstore.json"
+
+
+def test_the_toolkit_bundle_step_moves_the_bundle_and_passes_a_wheel_only_dir(
+    toolkit_bundle_step: tuple[str, Path, dict[str, str]], tmp_path: Path
+) -> None:
+    """POSITIVE CONTROL for the refusals below. A harness that cannot run the step at all exits
+    non-zero on every refusal, so those are evidence only while this passes."""
+    bash, script, env = toolkit_bundle_step
+    work = _toolkit_dist(tmp_path / "ok", [_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME])
+
+    rc, out = _run_leak_gate(bash, work, script, env)
+    assert rc == 0, out
+    assert [p.name for p in (work / "toolkit-dist").iterdir()] == [_TOOLKIT_WHEEL_NAME]
+    assert [p.name for p in (work / "toolkit-sigstore").iterdir()] == [_TOOLKIT_BUNDLE_NAME]
+
+
+@pytest.mark.parametrize(
+    ("names", "why"),
+    [
+        ([_TOOLKIT_WHEEL_NAME], "no bundle was written, so the mv has nothing to move"),
+        ([_TOOLKIT_BUNDLE_NAME], "toolkit-dist/ is empty once the bundle leaves"),
+        (
+            [_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, "stray.txt"],
+            "a file the toolkit upload would reject stays behind",
+        ),
+    ],
+)
+def test_the_toolkit_bundle_step_refuses(
+    toolkit_bundle_step: tuple[str, Path, dict[str, str]],
+    tmp_path: Path,
+    names: list[str],
+    why: str,
+) -> None:
+    bash, script, env = toolkit_bundle_step
+    work = _toolkit_dist(tmp_path / "bad", names)
+
+    rc, out = _run_leak_gate(bash, work, script, env)
+    assert rc != 0, f"the step passed although {why}:\n{out}"
 
 
 #: The engine smoke's import probe. ``flags`` is what the step passes the interpreter BEFORE ``-c``;

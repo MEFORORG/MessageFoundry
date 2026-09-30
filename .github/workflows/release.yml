@@ -751,17 +751,37 @@ jobs:
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
           # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
-          # The toolkit wheel is signed in the same call (ADR 0201, BACKLOG #1192), and its bundle is then
-          # MOVED out of toolkit-dist/. `sigstore sign` writes `<input>.sigstore.json` beside each input,
-          # and the toolkit's PyPI publish below uploads toolkit-dist/ whole, where twine rejects a bundle
-          # (the reason dist-pub/ exists for the engine). So toolkit-dist/ keeps only the wheel its member
-          # gate inspected, and toolkit-sigstore/ carries the bundle to the release assets.
+          # The toolkit wheel is signed in the same call (ADR 0201, BACKLOG #1192). Its bundle lands in
+          # toolkit-dist/, and the next step moves it out.
           python -m sigstore sign dist/*.tar.gz dist/*.whl toolkit-dist/*.whl \
             messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json
           ls -l dist/ messagefoundry-sbom.cdx.json.sigstore* messagefoundry-vex.openvex.json.sigstore*
+
+      - name: Move the toolkit Sigstore bundle out of toolkit-dist/ (it must hold only the wheel)
+        run: |
+          # `sigstore sign` writes `<input>.sigstore.json` beside each input, and the toolkit's PyPI
+          # publish below uploads toolkit-dist/ WHOLE, where twine rejects anything but a distribution
+          # (the reason dist-pub/ exists for the engine). So the bundle moves to toolkit-sigstore/,
+          # which carries it to the release assets, and toolkit-dist/ keeps only what its member gate
+          # inspected (BACKLOG #1192). The mv fails the step if no bundle was written.
           mkdir -p toolkit-sigstore
           mv toolkit-dist/*.sigstore* toolkit-sigstore/
+          # THEN CHECK THE DIRECTORY, not only the move: any other file here, from a later edit or an
+          # output name the glob above misses, would fail the toolkit upload on a tag, after the
+          # GitHub release already exists. tests/test_release_pipeline.py runs this step.
+          wheels=0
+          for f in toolkit-dist/*; do
+            # No nullglob, so an empty directory leaves the pattern literal.
+            if [ ! -e "$f" ]; then
+              echo "::error::toolkit-dist/ is EMPTY, so there is no toolkit wheel to publish"; exit 1
+            fi
+            case "$f" in
+              *.whl) wheels=$((wheels + 1)) ;;
+              *) echo "::error::toolkit-dist/ holds $(basename "$f"), and the toolkit PyPI upload reads that directory whole"; exit 1 ;;
+            esac
+          done
           ls -l toolkit-dist/ toolkit-sigstore/
+          echo "toolkit-dist/ holds only wheels: $wheels"
 
       # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
       # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
