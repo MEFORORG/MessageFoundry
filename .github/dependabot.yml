@@ -62,14 +62,15 @@ updates:
     # resync then propagated 0.8.0/0.16.0 into constraints.lock, so ci.yml's `--constraint` pinned CI
     # *to* the broken versions. `python-deps` groups every minor and patch on `*`, and both of those
     # bumps are minors, so they red the WHOLE batch and hold every benign bump in it hostage. WHY
-    # each is capped lives beside the cap in pyproject.toml (ruff in [dev]) — do not
+    # each is capped lives beside the cap in pyproject.toml (ruff in [dev]; uvicorn in
+    # [project.dependencies]) — do not
     # restate it here; lift a cap and delete its entry in the SAME PR.
     # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
-    # routine one (`update-types` is the version-only knob and cannot express a range). A 0.15.x
-    # advisory fix still flows. Detection is untouched — security.yml's REQUIRED
-    # `pip-audit -r requirements.lock` covers it on every PR and on the daily cron, so a withheld fix
-    # reds a merge-blocking gate within ~24h and a human lifts the cap. Note the ceiling is the
-    # pyproject CAP, not this entry: a human would have to lift it either way.
+    # routine one (`update-types` is the version-only knob and cannot express a range). A ruff
+    # 0.15.x or uvicorn 0.49.x advisory fix still flows. Detection is untouched — security.yml's
+    # REQUIRED `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a
+    # withheld fix reds a merge-blocking gate within ~24h and a human lifts the cap. Note the
+    # ceiling is the pyproject CAP, not this entry: a human would have to lift it either way.
     # NOT IGNORED, deliberately: the exact `==` pins in `[dependency-groups]`, and no blanket
     # `versioning-strategy: lockfile-only`. Both would freeze the hash-pinned CI toolchain, which ADR
     # 0034 §3 wants moving THROUGH this machinery — a pinned toolchain outside it rots into
@@ -110,6 +111,13 @@ updates:
     # read it there. The range leaves the 7.3.x patch track open. The trade-off note above holds:
     # security.yml runs pip-audit over ci/locks/release-tools.lock. Lift this entry in the same PR
     # that moves the pyproject spec to a validated 7.4.
+    #
+    # `uvicorn` is the same WIDENED-CAP case. Dependabot proposed widening `uvicorn[standard]`'s
+    # `<0.50` to `<0.54` in PR 1773, which the Lander closed on 2026-09-28: 0.50 and later pick a
+    # websockets protocol the protocol-header floor refuses (BACKLOG #1120 arm (b)), so serve
+    # exits 2. Why the cap exists is beside it in pyproject.toml; read it there. The bare name
+    # matches `uvicorn[standard]` because dependabot-core's Python NameNormaliser strips extras
+    # before it compares names (read 2026-09-30). Lift this entry in the same PR that lifts the cap.
     ignore:
       - dependency-name: "ruff"
         versions: [">=0.16.0"]
@@ -117,6 +125,8 @@ updates:
         versions: [">=4.5.0"]
       - dependency-name: "cyclonedx-bom"
         versions: [">=7.4.0"]
+      - dependency-name: "uvicorn"
+        versions: [">=0.50.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates), SPLIT BY UPDATE TYPE (owner
       # decision 2026-09-30) so one bad major cannot hold the routine minors and patches hostage.
