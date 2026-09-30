@@ -457,6 +457,52 @@ jobs:
           echo "   and track to the fix. To silence a triaged advisory here, add '--ignore-vuln <ID>'"
           echo "   to the pip-audit call in the previous step, with the reason."
 
+  cla-action-audit:
+    name: cla-action-audit (vendored CLA action's declared closure)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # BACKLOG #1578. The vendored CLA action is a compiled bundle, and the upstream lockfile it was
+    # built from sits beside it as `upstream-package-lock.json`. The audits above are scoped to
+    # Python locks and `ide/package-lock.json`, so before this job no scheduled audit read that
+    # lockfile, and a new advisory against it reached somebody only if a person went looking.
+    #
+    # BASELINED, BECAUSE THE TREE CANNOT BE FIXED HERE. It is a frozen 2021-era tree that does not
+    # audit clean, and moving a pin means rebuilding the bundle with a Node toolchain this repository
+    # does not carry. So the job fails only on an advisory NOT in
+    # scripts/security/cla-action-advisories.toml, or on an entry there the audit stops reporting.
+    # The script's docstring has the rest, including the false-clean reading it guards against and
+    # which checks are its live positive controls. timeout-minutes must stay above the script's
+    # worst-case retry ladder plus job setup; tests/test_cla_action_advisory_gate.py holds that.
+    #
+    # WHY security.yml AND NOT A WORKFLOW OF ITS OWN. security-txt-renewal.yml rejects this file for
+    # a reminder that stays red for weeks, because it would hold the shared "Security" issue open.
+    # This job's red is cleared by a baseline pull request rather than by a date passing, and
+    # released-line-audit above, whose red also waits on a person acting, already lives here. If
+    # these reds start masking each other on that shared issue, a workflow of its own is the fix.
+    #
+    # ADVISORY BY PLACEMENT, the released-line-audit posture: schedule/dispatch-only, no
+    # continue-on-error, and red on a finding. The frozen tree changes only when an advisory is
+    # published, which no pull request causes, so it has nothing to say on one. A red scheduled run
+    # of this workflow opens an issue through nightly-notice.yml, which is how it reaches somebody.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this job pushes or uploads the tree, so the git credential has no work to do.
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Audit the vendored CLA lockfile against its advisory baseline
+        # Stdlib only, so nothing is installed. The script copies the lockfile into a throwaway
+        # directory under the stock name npm needs, retries a registry that gives no verdict, and
+        # fails closed when the retries run out.
+        run: python scripts/security/audit_cla_action_lockfile.py
+
   sbom:
     name: SBOMs (CycloneDX, multi-ecosystem)
     runs-on: ubuntu-latest

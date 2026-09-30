@@ -157,10 +157,18 @@ and `tests/test_cla_action_provenance.py` is the gate. It sits in the repo-harne
 every input the gate reads, and nothing under `messagefoundry/` is one. So the bundle cannot move
 without the record moving with it.
 
-That gate detects **change**, not vulnerabilities. Nothing in CI scans this closure for advisories:
-the audit commands below are run by hand or not at all. The exposure is bounded by where the bundle
-runs — CI only, never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no
-automated remediation lane exists for it.
+That gate detects **change**, not vulnerabilities. Advisories are a separate job. `security.yml`'s
+`cla-action-audit` job audits the lockfile on the daily cron with `npm audit`, and a red scheduled
+run opens an issue through `nightly-notice.yml`. The tree does not audit clean and cannot be fixed
+here, so the job compares against a baseline of advisories already known,
+[`scripts/security/cla-action-advisories.toml`](../scripts/security/cla-action-advisories.toml),
+and fails on a new one. It also fails when a known one stops being reported. Either the advisory
+was withdrawn, or the audit stopped seeing the package, and a person has to find out which. That
+check is what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
+that was true until BACKLOG #1578's audit job landed.* The baseline's first entries were recorded as
+found, not triaged for reachability. The exposure is bounded by where the bundle runs — CI only,
+never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no automated
+remediation lane exists for it.
 
 Two things are worth stating precisely, because a supply-chain record that implies more than it
 proves is worse than none:
