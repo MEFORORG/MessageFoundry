@@ -176,7 +176,11 @@ For production on Windows, run the engine as a background service via **NSSM** â
 .\scripts\service\install-service.ps1 -Environment prod
 ```
 
-`-Environment` is **required** (it becomes `serve --env`, just like step 3). The script is idempotent (re-run to reconfigure), auto-downloads a SHA-256-pinned NSSM if one isn't on `PATH`, and defaults to service name `MessageFoundry`, config `<repo>\samples\config`, store + logs under `C:\ProgramData\MessageFoundry`, bind `127.0.0.1:8765`. Override paths/port/account with flags, e.g.:
+`-Environment` is **required** (it becomes `serve --env`, just like step 3). The script is idempotent (re-run to reconfigure), and defaults to service name `MessageFoundry`, config `<repo>\samples\config`, store + logs under `C:\ProgramData\MessageFoundry`, bind `127.0.0.1:8765`.
+
+The service runs the `nssm.exe` the installer keeps in `C:\Program Files\MessageFoundry\nssm` (the `-NssmDir` flag). Only administrators can write to that folder. The installer checks each copy against a pinned SHA-256 before it uses it (`Resolve-Nssm` in `install-service.ps1`). That covers a copy already in the folder, one from `-NssmPath`, one on `PATH`, and a download. [SERVICE.md](SERVICE.md#prerequisites) item 2 says what happens to a copy that fails. The installer never adds the folder to `PATH`, so a bare `nssm` typed in a shell does not run the checked copy.
+
+Override paths/port/account with flags, e.g.:
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod -Port 9000 `
@@ -184,14 +188,18 @@ For production on Windows, run the engine as a background service via **NSSM** â
     -ServiceAccount "NT SERVICE\MessageFoundry"     # least-privilege; auto-grants the needed ACLs
 ```
 
-Manage and remove it:
+Manage and remove it from an elevated prompt. Windows' own service commands need no `nssm`:
 
 ```powershell
-nssm start  MessageFoundry
-nssm status MessageFoundry
-nssm stop   MessageFoundry
+Start-Service MessageFoundry
+Get-Service   MessageFoundry
+Stop-Service  MessageFoundry                       # NSSM answers with Ctrl+C, so connections drain
 .\scripts\service\uninstall-service.ps1            # elevated; prints what it leaves behind
 ```
+
+For a setting only NSSM has, run the checked copy by its full path, as in
+[SERVICE.md](SERVICE.md#start--stop--status): `& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set ...`.
+If you installed with another `-NssmDir`, use that folder.
 
 Removing the service does not undo everything the install did. The uninstaller prints an inventory
 of what is still on the host â€” the data directory, permissions naming the run-as account, a user
