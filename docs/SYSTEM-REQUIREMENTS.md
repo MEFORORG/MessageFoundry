@@ -112,7 +112,7 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 |---|---|
 | **Python** | **3.14**, 64-bit (the only supported runtime; CI-validated on Linux + Windows Server 2022 + 2025, the primary deploy target) |
 | Service manager (Windows) | **NSSM** (auto-provisioned, SHA-256-pinned, by the installer; or pre-staged). Requires administrator / elevation to register the service. |
-| C compiler | Not required for the default install (runtime dependencies ship as wheels) |
+| C compiler | Not required for the default install with standard CPython 3.14 on x86-64 Windows, glibc Linux (x86-64 or arm64) or arm64 macOS. The locked runtime dependencies ship wheels there (read from `uv.lock`, 2026-09-30). At least two other interpreters build packages from source. arm64 Windows builds `cryptography` and `httptools`. x86-64 macOS builds `cryptography` and `argon2-cffi-bindings`. Building `cryptography` needs a C compiler, a Rust toolchain and OpenSSL headers. |
 
 ## Databases (message store)
 
