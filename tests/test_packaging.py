@@ -40,6 +40,7 @@ import functools
 import re
 import subprocess
 import tomllib
+import zipfile
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -592,9 +593,14 @@ def _engine_pin(dependencies: list[str]) -> str | None:
     would read as unpinned. Extras are the difference; ``packaging`` parses them and a regex over a
     PEP 508 string does not. Two predicates in one file, and this note is which is authoritative
     where.
+
+    A MARKER IS ALSO ``None`` (BACKLOG #1585). ``messagefoundry[harness]==0.3.2; sys_platform ==
+    "linux"`` pins the right version on the one platform the marker names and installs NO engine
+    anywhere else, so it passes on the ubuntu runner that grades it and fails on the Windows host the
+    harness is for. A requirement that holds only somewhere is not a lockstep pin.
     """
     req = _engine_requirement(dependencies)
-    if req is None:
+    if req is None or req.marker is not None:
         return None
     specs = list(req.specifier)
     if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
@@ -611,6 +617,8 @@ def test_the_engine_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
         "messagefoundry[harness]~=0.3.2",
         "messagefoundry[harness]==0.3.*",
         "messagefoundry[harness]>=0.3.2,<0.4",
+        'messagefoundry[harness]==0.3.2; sys_platform == "linux"',
+        "messagefoundry[harness]==0.3.2; python_version >= '3.14'",
     ):
         assert _engine_pin([loose]) is None, loose
     assert _engine_pin(["messagefoundry[harness]==0.3.2"]) == "0.3.2"
@@ -631,9 +639,9 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
     ``messagefoundry.apiclient`` at module level, so an engine without it installs cleanly and then
     fails on the operator's first command.
 
-    WHAT THIS DOES NOT ESTABLISH: that a mismatched engine is refused at install time. That needs an
-    index carrying an older release and cannot run here. What is checked is the specifier the build
-    will emit as ``Requires-Dist``.
+    What is checked HERE is the specifier the build will emit as ``Requires-Dist``. That a mismatched
+    engine is refused at install time is checked separately, offline, by
+    ``test_the_harness_pin_refuses_a_mismatched_engine_at_install_time`` below.
     """
     harness = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))
     # READ FROM `[tool.hatch.version].path`, NOT HARDCODED -- but note what that buys and what it
@@ -648,6 +656,12 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
     )
 
     shipped = _version_literal(root)
+    engine = _engine_requirement(harness["project"]["dependencies"])
+    assert engine is None or engine.marker is None, (
+        f"the harness requirement on the engine carries an environment marker ({engine.marker}), so "
+        f"it installs no engine wherever that marker is false (BACKLOG #1585). A lockstep pin must "
+        f"hold on every platform the harness installs on; drop the `; ...` clause."
+    )
     pinned = _engine_pin(harness["project"]["dependencies"])
     assert pinned == shipped, (
         f"the harness must pin the engine at the version it ships with (BACKLOG #1585).\n"
@@ -673,6 +687,198 @@ def test_the_harness_pin_keeps_the_extra_the_harness_actually_needs() -> None:
         f"the harness depends on messagefoundry{sorted(engine.extras)}, not [harness] - the extra "
         f"is what installs PySide6, so the GUI would not start on a fresh install"
     )
+
+
+_RESOLUTION_CHECK = _REPO / "scripts" / "release" / "harness_resolution_check.py"
+
+
+@functools.cache
+def _resolution_module() -> Any:
+    """The resolution-check script, loaded by path. Its ``stub_wheel`` builds the synthetic harness
+    wheels below, so the test and the script cannot drift into two wheel writers."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("harness_resolution_check", _RESOLUTION_CHECK)
+    assert spec is not None and spec.loader is not None, f"cannot load {_RESOLUTION_CHECK}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _synthetic_harness_wheel(directory: Path, version: str, requires: list[str]) -> Path:
+    """A metadata-only harness wheel carrying ``requires`` as its ``Requires-Dist``."""
+    return Path(
+        _resolution_module().stub_wheel(
+            directory, "messagefoundry-harness", version, requires=requires
+        )
+    )
+
+
+def _require_pip() -> None:
+    import importlib.util
+
+    if importlib.util.find_spec("pip") is None:
+        pytest.skip("no pip in this interpreter, so the install-resolution arms cannot run here")
+
+
+def test_the_harness_pin_refuses_a_mismatched_engine_at_install_time(tmp_path: Path) -> None:
+    """BACKLOG #1585's install legs, run offline: the pin REFUSES an older or newer engine.
+
+    The tests above read the specifier; this asks pip what it does with it. The filed acceptance
+    wanted it and judged it unreachable without an index carrying an older engine. It needs none:
+    ``scripts/release/harness_resolution_check.py`` builds metadata-only STUB engine wheels in a
+    temporary directory and resolves against them with ``--no-index --dry-run``. No network.
+
+    Run through the script's CLI, the way release.yml's harness wheel smoke runs it on the BUILT
+    wheel. The harness wheel here is synthetic, but its ``Requires-Dist`` is the REAL
+    ``[project].dependencies`` table and its version is the shipped one, so a change to that table
+    moves this test.
+    """
+    import sys
+
+    _require_pip()
+    deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+    shipped = _version_literal(version_path(_HARNESS_PYPROJECT))
+    wheel = _synthetic_harness_wheel(tmp_path, shipped, deps)
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [sys.executable, str(_RESOLUTION_CHECK), str(wheel)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, (
+        f"the harness pin did not behave at install time (BACKLOG #1585):\n{out}"
+    )
+    for arm in ("older", "newer", "matched"):
+        assert f"{arm}: engine" in out, f"the resolution check never ran its {arm} arm:\n{out}"
+
+
+@pytest.mark.parametrize(
+    ("requires", "arm"),
+    [
+        (["messagefoundry[harness]"], "older"),
+        (["messagefoundry[harness]>=0.3.2"], "newer"),
+        (["messagefoundry[harness]==0.3.1"], "matched"),
+    ],
+    ids=["bare-name", "floor", "wrong-pin"],
+)
+def test_the_install_resolution_check_fails_when_the_pin_is_loose(
+    requires: list[str], arm: str, tmp_path: Path
+) -> None:
+    """The control: the resolution check must FAIL on the shapes #1585 exists to stop.
+
+    Without this the test above could pass because pip refuses everything (a stub the resolver
+    cannot read, say). Each case runs only the arm that must catch it, in process, so the controls
+    cost one pip run each. ``wrong-pin`` is the case where the harness version and its pin
+    disagree: pip refuses the engine at the harness's own version.
+    """
+    _require_pip()
+    wheel = _synthetic_harness_wheel(tmp_path, "0.3.2", requires)
+    failures = _resolution_module().check(wheel, arms={arm})
+    assert any(f"the {arm} arm" in f for f in failures), (
+        f"the {arm} arm passed {requires}, which it exists to refuse: {failures}"
+    )
+
+
+def test_the_install_resolution_check_names_an_unstubbed_dependency(tmp_path: Path) -> None:
+    """A second base dependency must be named, not blamed on the pin.
+
+    ``--no-index`` cannot resolve anything the script did not stub, so without this refusal every
+    arm reads as "refused" and the matched arm blames a correct engine pin.
+    """
+    wheel = _synthetic_harness_wheel(
+        tmp_path, "0.3.2", ["messagefoundry[harness]==0.3.2", "httpx>=0.27"]
+    )
+    failures = _resolution_module().check(wheel)
+    assert len(failures) == 1 and "httpx" in failures[0] and "besides" in failures[0], failures
+
+
+def test_the_install_resolution_check_counts_a_dependency_marked_for_another_platform() -> None:
+    """A base dependency gated to Windows is still a base dependency on the ubuntu runner.
+
+    Evaluating the marker only on the running platform would skip it there, and the check would
+    then say nothing about a dependency the Windows install needs. An extra-only one stays out.
+    """
+    others = _resolution_module()._other_base_requirements(
+        [
+            "messagefoundry[harness]==0.3.2",
+            'pywin32>=306; sys_platform == "win32"',
+            'pytest; extra == "dev"',
+        ]
+    )
+    assert others == ['pywin32>=306; sys_platform == "win32"'], others
+
+
+def test_the_stub_wheel_normalises_its_name_and_version(tmp_path: Path) -> None:
+    """A hyphenated pre-release must still make a VALID wheel filename.
+
+    ``0.3.0-rc1`` written raw into ``name-version-py3-none-any.whl`` adds a field, and pip refuses
+    the wheel as invalid, so every arm would read as refused and blame a correct pin.
+    """
+    wheel = _resolution_module().stub_wheel(tmp_path, "messagefoundry-harness", "0.3.0-rc1")
+    assert wheel.name == "messagefoundry_harness-0.3.0rc1-py3-none-any.whl", wheel.name
+    with zipfile.ZipFile(wheel) as zf:
+        meta = zf.read("messagefoundry_harness-0.3.0rc1.dist-info/METADATA").decode("utf-8")
+    assert "Version: 0.3.0rc1\n" in meta, meta
+
+
+def test_the_install_resolution_check_resolves_a_hyphenated_pre_release(tmp_path: Path) -> None:
+    """The matched arm at a pre-release spelled with a hyphen must resolve, end to end through pip."""
+    _require_pip()
+    wheel = _synthetic_harness_wheel(tmp_path, "0.3.0-rc1", ["messagefoundry[harness]==0.3.0rc1"])
+    assert _resolution_module().check(wheel, arms={"matched"}) == []
+
+
+@pytest.mark.parametrize(
+    ("shipped", "expected"),
+    [
+        ("0.0.0", {"newer": "0.0.1", "matched": "0.0.0"}),
+        ("0.0.1", {"older": "0.0.0", "newer": "0.0.2", "matched": "0.0.1"}),
+        ("0.3.2", {"older": "0.0.1", "newer": "0.3.3", "matched": "0.3.2"}),
+        # The epoch leads PEP 440 ordering; a newer arm without it would sort below the shipped one.
+        ("1!0.3.2", {"older": "0.0.1", "newer": "1!0.3.3", "matched": "1!0.3.2"}),
+    ],
+)
+def test_the_install_resolution_arms_never_share_a_version(
+    shipped: str, expected: dict[str, str]
+) -> None:
+    """At ``0.0.0`` and ``0.0.1`` a fixed ``0.0.1`` older arm would collide with another arm.
+
+    It used to share an index directory with it, so the second ``mkdir`` crashed. At ``0.0.0`` no
+    older release exists, so that arm is dropped rather than run on a version it does not describe.
+    """
+    from packaging.version import Version
+
+    probes = _resolution_module().probes(Version(shipped))
+    assert {arm: version for arm, (version, _want) in probes.items()} == expected
+    versions = [Version(version) for version, _want in probes.values()]
+    assert len(set(versions)) == len(versions), probes
+    assert Version(probes["newer"][0]) > Version(shipped), probes
+    if "older" in probes:
+        assert Version(probes["older"][0]) < Version(shipped), probes
+
+
+def test_the_install_resolution_check_refuses_an_unknown_arm(tmp_path: Path) -> None:
+    """A mistyped arm name must raise. It used to run no probe, and an empty list reads as a pass."""
+    wheel = _synthetic_harness_wheel(tmp_path, "0.3.2", ["messagefoundry[harness]==0.3.2"])
+    with pytest.raises(ValueError, match="unknown arm"):
+        _resolution_module().check(wheel, arms={"matchd"})
+
+
+def test_the_install_resolution_check_reports_a_wheel_with_no_version(tmp_path: Path) -> None:
+    """A METADATA without ``Version:`` must exit with an ``::error::``, not a bare traceback."""
+    wheel = tmp_path / "messagefoundry_harness-0.3.2-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr(
+            "messagefoundry_harness-0.3.2.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: messagefoundry-harness\n",
+        )
+    with pytest.raises(SystemExit) as raised:
+        _resolution_module().check(wheel)
+    assert str(raised.value.code).startswith("::error::"), raised.value.code
+    assert "no Version" in str(raised.value.code), raised.value.code
 
 
 def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> None:

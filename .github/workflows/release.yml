@@ -490,13 +490,14 @@ jobs:
           # (CISA VEX; NTIA Consumer Playbook). Source of truth: security/vex/messagefoundry.openvex.json.
           cp security/vex/messagefoundry.openvex.json messagefoundry-vex.openvex.json
 
-      - name: Score the SBOM quality (sbomqs — advisory, never blocks a release)
-        continue-on-error: true
+      - name: Install sbomqs (pinned in-repo; a pin failure BLOCKS the release)
+        # NO continue-on-error, on purpose: owner ruling 2026-09-30 (BACKLOG #1698). This step used to
+        # be one advisory step that downloaded, verified AND scored, so a pin mismatch -- the exact
+        # event the in-repo digest exists to catch -- ended as a green release with no warning. A
+        # substituted binary is a supply-chain event, not an SBOM-quality signal, so the verify and
+        # install half now fails the job. Only the SCORE below stays advisory (ADR 0149).
+        # tests/test_release_pipeline.py pins both halves of that split.
         run: |
-          # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
-          # SBOM completeness is visible in the release log. Advisory — SBOM quality is a signal, not a
-          # gate. ADR 0149.
-          #
           # PINNED IN-REPO, not against the asset's own checksums.txt (BACKLOG #1698). The security.yml
           # twin still verifies same-origin and that is adequate THERE. It is not adequate here, and the
           # difference is the job, not the tool: this step runs inside `id-token: write` — the identity
@@ -530,14 +531,25 @@ jobs:
           SBOMQS_SHA256=14fd58b89d4948265cce0fdb95d9b635ff667f352b5a9a05b3d13dbefa5d0195
           asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
           base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
-          curl -sSfL "${base}/${asset}" -o "${asset}"
+          # --retry covers a transient network error, which now blocks the release too. A pin
+          # MISMATCH is not a curl error, so it is never retried: the `sha256sum -c` below fails it.
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
           # Verify BY the canonical asset name: sha256sum -c reads "<digest>  <filename>" and checks
           # that file, so the name must match what curl wrote.
           echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
-          sbomqs score -b messagefoundry-sbom.cdx.json
-          sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
+
+      - name: Score the SBOM quality (sbomqs -- advisory, never blocks a release)
+        continue-on-error: true
+        run: |
+          # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
+          # SBOM completeness is visible in the release log. Advisory: SBOM quality is a signal, not a
+          # gate (ADR 0149). It calls the binary the BLOCKING step above verified, by the path it was
+          # installed at, so no other `sbomqs` earlier on PATH can stand in for it. This
+          # continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG #1698).
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json
+          /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |
@@ -1289,6 +1301,17 @@ jobs:
                   f"::error::{DIST} {dist.version} declares {len(engine)} requirements on the engine, "
                   f"expected exactly one (BACKLOG #1585): {[str(req) for req in engine]}"
               )
+          # NO ENVIRONMENT MARKER ON THE ENGINE REQUIREMENT (BACKLOG #1585). A pin spelled
+          # `messagefoundry[harness]==X; sys_platform == "linux"` is exact and passes every check
+          # below on this ubuntu runner, then installs NO engine on the Windows host the harness is
+          # for. Any marker is refused, not only a false one: a marker true here is still false
+          # somewhere a user installs. tests/test_packaging.py::_engine_pin refuses the same shape.
+          if engine[0].marker is not None:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires {engine[0]}, whose environment marker "
+                  f"leaves the engine uninstalled wherever it is false (BACKLOG #1585). Drop the "
+                  f"marker in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
+              )
           # THE PINNED VERSION IS COMPARED AS A PEP 440 VERSION, NOT AS A SPECIFIER STRING. `packaging`
           # preserves the raw spelling: str(Requirement("messagefoundry[harness]==0.3.0-rc1").specifier)
           # is "==0.3.0-rc1", and str(Requirement(...)) round-trips it, so a hyphen typed into the
@@ -1341,6 +1364,14 @@ jobs:
           PYSMOKE
           )
           echo "harness wheel version: $built"
+          # THE INSTALL LEGS OF BACKLOG #1585, RUN OFFLINE ON THE BUILT WHEEL. Everything above reads
+          # the Requires-Dist this wheel declares; this asks pip what it DOES with it. The script
+          # builds metadata-only stub engine wheels in a temp dir and resolves this wheel against each
+          # with --no-index --dry-run --ignore-installed: an older and a newer engine must be REFUSED,
+          # and the engine at this wheel's own version must resolve. No index is contacted and nothing
+          # is installed, so it adds no network to a job holding id-token: write.
+          # tests/test_packaging.py runs the same script against the pyproject's real table in CI.
+          /tmp/harnesssmoke/bin/python -I scripts/release/harness_resolution_check.py harness-dist/*.whl
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
             /tmp/harnesssmoke/bin/python -I - "$built" "$want" <<'PYVER'

@@ -63,7 +63,9 @@ artifacts — **no engine code changes**:
    same helper and retained as CI artifacts.
 3. **SBOM quality gate.** Score the Python engine and npm extension SBOMs with `sbomqs` (pinned `v2.0.11`,
    checksum-verified) — advisory (`sbomqs score -b` + NTIA breakdown), printed to the CI/release log, never
-   blocking. *Amended 2026-09-18 (BACKLOG #1698): "checksum-verified" now means two different things by
+   blocking. *Amended 2026-09-30 (owner ruling, BACKLOG #1698):* the SCORE stays advisory, but in
+   `release.yml` a failure to verify the sbomqs binary against its pin now blocks the release; see
+   Consequences. *Amended 2026-09-18 (BACKLOG #1698): "checksum-verified" now means two different things by
    workflow.* `security.yml` still verifies against the release's own `checksums.txt`, which is adequate in
    a job holding `contents: read`. `release.yml` verifies against a **SHA-256 literal held in this repo**,
    because that copy runs inside `id-token: write` — beside the identity that Sigstore-signs and publishes
@@ -131,9 +133,11 @@ questionnaires — a differentiator vs. Mirth/Corepoint, which ship no SBOM.
 sbomqs in `release.yml` is now **two coupled edits in one commit** — `VER` and `SBOMQS_SHA256` — and the
 new digest should be taken from **both** the release `checksums.txt` and GitHub's server-side asset
 `digest` field, two independent routes, which is what makes the literal evidence rather than a copied
-line. Moving only `VER` fails the `sha256sum -c`, and that step is `continue-on-error: true`, so the
-release still succeeds while shipping **no** sbomqs score. That degradation is silent by design of the
-advisory gate. What no offline test can catch is whether a digest is the RIGHT one for a version —
+line. Moving only `VER` fails the `sha256sum -c`. *Amended 2026-09-30 (owner ruling, BACKLOG #1698):*
+this sentence used to say that step was `continue-on-error: true`, so the release still succeeded while
+shipping no sbomqs score, silently. That no longer holds in `release.yml`. The download, the in-repo pin
+check and the install are now their own step with no `continue-on-error`, so a pin failure **blocks the
+release**; only the `sbomqs score` step stays advisory. `security.yml`'s copy is unchanged. What no offline test can catch is whether a digest is the RIGHT one for a version —
 that means fetching the asset, the network dependency the in-repo pin exists to remove. What a test
 *could* catch, and does not today, is the two literals moving apart at all: pinning the `(VER,
 SBOMQS_SHA256)` pair, and asserting release.yml's `VER` matches security.yml's, would force both edits
