@@ -427,10 +427,11 @@ Two results, and the second is the one that matters:
       **CORRECTED 2026-09-30 (BACKLOG #1215).** One premise of that 2026-08-06 rationale is now false:
       *"the code is unmerged"*. `scripts/hooks/mail-drain.ps1` and `scripts/hooks/mail-watch.ps1` are
       both on `main`. This note does not re-measure the *"never delivered mail in real use"* premise.
-      The evidence bearing on it is item 3 of the correction under §"Status and what gates wiring".
-      Nothing is re-decided here. Whether the decision still holds is part of the contradiction
-      below, which stays the owner's. The quote below cites `install-coordination.ps1:305`; that line
-      has moved, so find the row by searching for `mail-watch.ps1`.
+      Evidence bearing on it sits in §"Status and what gates wiring", including at least that
+      section's 2026-08-25 correction and its real-surface measurements. Nothing is re-decided here.
+      Whether the decision still holds is part of the contradiction below, which stays the owner's.
+      This note re-checks one detail of the quote and no other. Its `install-coordination.ps1:305`
+      anchor has moved; search that file for `Async = $true` to find the row.
   > **THE SHIPPED STATE CONTRADICTS THIS DECISION (measured 2026-08-25, BACKLOG #1215).**
   > `scripts/hooks/mail-watch.ps1` is wired at `Stop` in TWO installed config roots, and
   > `install-coordination.ps1:305` carries a row for it (`Marker = $WAKE_MARKER`, `Async = $true`)
@@ -445,12 +446,13 @@ Two results, and the second is the one that matters:
       displayed. Default config root only. WARNING: The rows are live; see §"Status and what gates
       wiring".
       **CORRECTED 2026-09-30 (BACKLOG #1215).** This box used to go on to say *"the hook still
-      resolves nothing outside a worktree holding this branch"*. That stopped being true once
-      `scripts/hooks/mail-drain.ps1` reached `main`. `scripts/coord/install-coordination.ps1` wires it
-      at both `SessionStart` and `Stop`. Its hook shim looks for the script in the primary checkout
-      first and the calling worktree second. So a session on a branch without the script still runs
-      the primary checkout's copy, as current as that checkout's last pull of `main`. The installer
-      also wires every config root it finds, not only the default one this box names. This note says
-      where the script resolves and where it is wired. It does not say whether the approval this box
-      records counts as approval under [BACKLOG #1028](../BACKLOG.md), which
-      §"Status and what gates wiring" says is not recorded. That question stays the owner's.
+      resolves nothing outside a worktree holding this branch"*. That is no longer true.
+      `scripts/hooks/mail-drain.ps1` is on `main`, and `scripts/coord/install-coordination.ps1` wires
+      it at both `SessionStart` and `Stop`. Its hook shim looks in the primary checkout before the
+      calling worktree, so a session on any branch runs the primary's copy once the primary has pulled
+      it. The installer's own header is the source of record for that order. The installer also wires
+      every config root it finds, not only the default one this box names. Whether that wider wiring
+      fits this approval is the owner's call. §"Status and what gates wiring" says wiring is gated on
+      the work tracked as [BACKLOG #1028](../BACKLOG.md), and that no approval through that gate is
+      recorded. This note does not decide whether the approval above meets it. That also stays the
+      owner's.
