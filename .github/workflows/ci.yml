@@ -1350,10 +1350,11 @@ jobs:
       # re-size together would bury the one change that can be reasoned about, so the re-size is
       # deliberately a later, separate change with its own measurement.
       #
-      # THE CAPS ARE NOW 5 / 6 / 8 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
+      # THE CAPS ARE NOW 6 / 7 / 8 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
       # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the first re-derivation this paragraph
       # defers and came back "unchanged". BACKLOG #1842 did the second, on the first hosted pool taken
-      # under xdist, and moved windows-2025 from 9 to 8. The notes are 50 lines apart and could be
+      # under xdist, and moved windows-2025 from 9 to 8. The third, by owner request 2026-09-30, moved
+      # ubuntu from 5 to 6 and windows-2022 from 6 to 7. The notes are 50 lines apart and could be
       # read as contradicting, which is the only reason this pointer exists. Do not restate the
       # arithmetic here -- one copy, per SDS-3.5.
       #
@@ -1407,9 +1408,10 @@ jobs:
       # 7:38 on 2026-09-22, nine days later. Not necessarily its FIRST: the pool above is twelve hours
       # wide, so it can date a breach and cannot date the earliest one.
       #
-      # THE MARGIN CAPS ARE RE-DERIVED, TWICE. The first re-derivation came back "UNCHANGED" -- 5 / 6 /
-      # 9 -- and saying so out loud is the point of the next few paragraphs. The second, BACKLOG #1842,
-      # moved windows-2025 to 8; it is the group headed "THE SECOND RE-DERIVATION" below. A cap that
+      # THE MARGIN CAPS ARE RE-DERIVED, THREE TIMES. The first re-derivation came back "UNCHANGED" -- 5 /
+      # 6 / 9 -- and saying so out loud is the point of the next few paragraphs. The second, BACKLOG
+      # #1842, moved windows-2025 to 8; it is the group headed "THE SECOND RE-DERIVATION" below. The
+      # third moved ubuntu to 6 and windows-2022 to 7; it is "THE THIRD RE-DERIVATION". A cap that
       # nobody moved and a cap that was checked and found right look identical in a diff, so here is
       # the first one's arithmetic. Each cap divided by the 1.30x floor gives the longest the step may
       # take on that leg, set beside the WORST SERIAL run in the 66-observation pool above:
@@ -1446,9 +1448,9 @@ jobs:
       #
       # THE SECOND RE-DERIVATION, BACKLOG #1842, ON THE FIRST HOSTED POST-xdist POOL. It moved
       # windows-2025 from 9 to 8 and left the other two alone. The pool's definition, n, min and median
-      # live ONCE, in the three web console rows of scripts/ci/step_margin_baseline.toml. The pool
-      # opens at the first run after PR 1415, which added `-n`. This note carries the sizing input and
-      # the evidence those rows do not:
+      # live ONCE, in scripts/ci/step_margin_baseline.toml, which kept them in a comment when the third
+      # re-derivation replaced those rows. The pool opens at the first run after PR 1415, which added
+      # `-n`. This note carries the sizing input and the evidence that record does not:
       #
       #   leg             worst passing   x 1.35   cap
       #   ubuntu-latest   3:13            4:21     5   unchanged
@@ -1505,6 +1507,27 @@ jobs:
       # margins would move with nothing here saying why. Until the knob is split, lowering it is a
       # decision about both suites: give the console step its own knob, or re-derive these caps.
       # tests/test_ci_step_margin.py asserts the count is at least 4 so the choice cannot be silent.
+      #
+      # THE THIRD RE-DERIVATION, BY OWNER REQUEST 2026-09-30. The gate went red on windows-2022 with the
+      # suite green on at least PRs 1810, 1829, 1833, 1836 and 1848 -- PR 1848 read 5:10 of a 6:00 cap,
+      # 1.162x. The owner asked for a re-measured pool, never a hand-raised cap or a weaker gate. Same
+      # instrument and filter as the second; the pool opens where that one closed, 2026-09-26T02:16Z,
+      # and runs to 2026-09-30T19:25Z, 915 runs. Its definition, n, min and median live ONCE, in the
+      # three web console rows of scripts/ci/step_margin_baseline.toml. The sizing input:
+      #
+      #   leg             worst passing   x 1.35   cap
+      #   ubuntu-latest   4:15            5:44     6   was 5
+      #   windows-2022    5:09            6:57     7   was 6
+      #   windows-2025    5:43            7:43     8   unchanged
+      #
+      # The kills stay 9 / 10 / 12. Each is still at least 1.30x its cap -- 9 over 6 is 1.5x, 10 over 7
+      # is 1.43x -- so the nesting table above does not move.
+      #
+      # THE SUITE IS STILL GROWING, AND THESE CAPS WILL NOT HOLD LONG. Daily medians in this pool rose
+      # 2:35 -> 3:34 on ubuntu, 3:12 -> 4:24 on windows-2022 and 3:29 -> 4:45 on windows-2025 across
+      # 2026-09-26 to 2026-09-30. At the new caps the gate reds above 4:37, 5:23 and 6:09, which is 9, 5
+      # and 8 percent over each leg's worst pooled run. When the next red comes, re-measure again; the
+      # growth lever named above is splitting `test_webui.py`, not more workers.
       #
       # THE CONSOLE SUITE HAS ITS OWN TIMING-SENSITIVE TESTS, and contention is the cost this change
       # pays rather than one it avoids. `test_webui.py`'s TOTP helper mints a code only when 3s of the
@@ -2148,8 +2171,8 @@ jobs:
           # run would buy no detection and cost false reds on green suites. That knob is the gate's
           # ruler and `webconsole_step_timeout` is only the wall -- this sentence named the wall until
           # they were split.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":5,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":6,"webconsole_step_timeout":10,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":6,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":7,"webconsole_step_timeout":10,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
