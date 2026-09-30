@@ -186,6 +186,28 @@ dependency graph would ingest it as this repository's own manifest and raise ale
 absent toolchain. The record is audit-only by construction, and `.github/dependabot.yml` carries no
 npm entry for this directory for the same reason.
 
+## The one vendored Python source, which does ship
+
+Unlike the bundle above, this one is inside the engine package, so every wheel and sdist carries it.
+`messagefoundry/_vendor/defusedxml/` holds two modules of defusedxml 0.7.1, the library that refuses
+DTDs and entities when the engine parses untrusted XML. The engine stopped installing defusedxml and
+uses this copy instead. [Its README](../messagefoundry/_vendor/defusedxml/README.md) records why, the
+upstream sdist URL and SHA-256, and each file's upstream SHA-256.
+
+The same two statements apply, scoped to this copy:
+
+1. **What is checked.** `tests/test_vendored_defusedxml.py` strips each module's two-line header
+   and compares the rest with the SHA-256 in the README's table, on every engine test run, and the
+   licence text the same way. That table sits beside the files, so an edit that updates both would
+   pass it. Where upstream defusedxml is installed, which the CI test legs do through the `x12`
+   extra, the same test also compares each module with the installed upstream file byte for byte,
+   and it fails when the lock moves upstream off the vendored version.
+2. **What is not.** The Python engine SBOM is generated from installed distributions, and pip-audit
+   reads the locks. Neither sees a copy inside the engine package, so neither would list it or report
+   an advisory against it. Such an advisory needs someone to check this copy by hand. The `x12`
+   extra still installs upstream defusedxml for `pyx12`, so the all-extras lock and its audit do
+   carry the upstream package, but that says nothing about the copy the engine runs.
+
 ## Related
 
 - [`SECURITY.md`](SECURITY.md) — authn/RBAC, PHI handling, reporting.
