@@ -157,7 +157,9 @@ def _narrowed_pool_classes(
     the pool's ``ProxyConfig.ssl_context``, which requests leaves ``None``, and ``None`` means
     urllib3's own unnarrowed context. So each connection replaces that field on its OWN copy of the
     config with ``factory()``. The proxy leg verifies with requests' ``cert_reqs`` and CA file, as it
-    always did, which is the Vault hop's anchor, and ``server_hostname`` is the proxy's host.
+    always did, which is the Vault hop's anchor, and ``server_hostname`` is the proxy's host. The
+    connection loads those onto the proxy context itself, because urllib3 2.8.0 stopped doing so for a
+    supplied proxy context.
     requests forwards through an ``https://`` proxy only for an ``http://`` Vault, and that shape is
     refused below. A forwarding connection that did verify would have one TLS leg, to the proxy, on
     the connection's own ``ssl_context``, which is already the factory's.
@@ -207,6 +209,13 @@ def _narrowed_pool_classes(
             ):
                 return None
             context = factory()
+            # urllib3 2.8.0 uses a supplied proxy context exactly as given: it takes the context's
+            # own verify_mode and loads no CA onto it. Up to 2.7.0 it applied the connection's
+            # cert_reqs and CA, as it still does on the Vault leg. So the connection applies them
+            # itself, and the proxy leg keeps the Vault hop's anchor on either release.
+            context.verify_mode = resolve_cert_reqs(self.cert_reqs)
+            if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
+                context.load_verify_locations(self.ca_certs, self.ca_cert_dir, self.ca_cert_data)
             # _replace builds a new tuple, so the pool's shared config is never changed.
             self.proxy_config = self.proxy_config._replace(ssl_context=context)
             return context

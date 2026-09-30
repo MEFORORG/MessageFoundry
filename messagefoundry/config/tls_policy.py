@@ -1397,7 +1397,9 @@ def assert_hvac_tls_suites(
     **Peer verification is unchanged by a supplied context. That was measured, not assumed.** urllib3
     still sets ``verify_mode`` from requests' ``cert_reqs``, and still loads requests' ``ca_certs``
     onto a supplied context: ``verify=<path>`` gives the operator's CA, and ``verify=True`` gives the
-    certifi bundle, as before. It does NOT load the OS store onto a supplied context, and
+    certifi bundle, as before. Since urllib3 2.8.0 that holds for the Vault leg only; on the TLS leg
+    to an ``https://`` proxy urllib3 uses a supplied context as given, so the adapter's connection
+    loads the same ``cert_reqs`` and ``ca_certs`` onto the proxy context itself. It does NOT load the OS store onto a supplied context, and
     ``create_urllib3_context`` loads no roots of its own, so a CA-anchored hop still trusts only that
     CA. It also loads a client certificate hvac found in ``VAULT_CLIENT_CERT``, which does not move the
     suite list. ``tests/test_vault_tls_narrowing.py`` handshakes against a real TLS listener: the right
