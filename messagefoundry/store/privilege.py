@@ -178,8 +178,14 @@ SQLSERVER_AUDIT_WRITE_PRIVILEGES: tuple[str, ...] = (
 
 
 def audit_write_grant(privilege: str, table: str) -> str:
-    """The one wording both backends use for a row-changing right on an append-only audit table."""
-    return f"{privilege} on table {table}"
+    """The one wording both backends use for a row-changing right on an append-only audit table.
+
+    A two-word right is lower-cased: the log redaction scrubs two adjacent ALL-CAPS words as a
+    possible patient name, so ``TAKE OWNERSHIP`` would log as ``[redacted]``. The probe still passes
+    the exact T-SQL name from the tuple above. The SQL Server OBSERVED detail spells the list out by
+    hand, so a change here needs the same change there."""
+    label = privilege.lower() if " " in privilege else privilege
+    return f"{label} on table {table}"
 
 
 def audit_write_alias(table: str, privilege: str) -> str:

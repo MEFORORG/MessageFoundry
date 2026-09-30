@@ -2029,7 +2029,7 @@ class PostgresStore:
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r}, ownership of its "
-                    "objects, and UPDATE, DELETE or TRUNCATE on audit_log or audit_chain_meta are "
+                    "objects, and UPDATE, DELETE, TRUNCATE or TRIGGER on audit_log or audit_chain_meta are "
                     "excess"
                     if external
                     else "schema_management=auto, so schema DDL rights are expected"

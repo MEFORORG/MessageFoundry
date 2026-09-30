@@ -3817,7 +3817,7 @@ class SqlServerStore:
         # Under external schema management `provision-schema` runs the DDL as another principal, so
         # db_ddladmin, and the same rights granted directly, are excess here.
         note = (
-            "fixed server + database role membership probed BY NAME (authoritative, catalog-visibility"
+            "fixed server + database role membership probed by name (authoritative, catalog-visibility"
             " independent); user-defined database roles added best-effort from sys.database_principals"
         )
         try:
@@ -3880,7 +3880,7 @@ class SqlServerStore:
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
                     "runtime (schema_management=external: no db_ddladmin, and no UPDATE, DELETE, "
-                    "ALTER, CONTROL or TAKE OWNERSHIP on audit_log or audit_chain_meta)"
+                    "ALTER, CONTROL or take ownership on audit_log or audit_chain_meta)"
                     if external
                     else "auto-mode"
                 )
