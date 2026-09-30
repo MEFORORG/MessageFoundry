@@ -9,10 +9,14 @@ is empty -- a renamed package, a glob that matches nothing, a fixture that moved
 empty too, and the test reports the property clean while checking nothing. Zero offenders over
 zero candidates is not a pass; it is a gate that never ran.
 
-WHAT COUNTS AS A SITE. Inside a ``test*`` function, an absence assertion over a NAME that was bound
-IN THAT FUNCTION to a comprehension, or to ``list``, ``sorted``, ``set``, ``tuple`` or
-``frozenset`` over one. The absence spellings are ``assert not NAME``, ``assert NAME == <empty>``
-(``[]``, ``{}``, ``()``, ``set()`` and the like) and ``assert len(NAME) == 0``. That is the
+WHAT COUNTS AS A SITE. Inside a ``test*`` function, an absence assertion over a NAME whose binding
+just before it, IN THAT FUNCTION, is to a comprehension, or to ``list``, ``sorted``, ``set``,
+``tuple`` or ``frozenset`` over one. A later rebinding does not change how an earlier site is
+judged, and a rebinding to anything else ends the site, except ``bad = sorted(bad)`` and the like,
+which re-collect the same walk. A function defined inside a test is a scope of its own, judged by
+its own bindings and its own guards. The absence spellings are ``assert not NAME``,
+``assert NAME == <empty>`` (``[]``, ``{}``, ``()``, ``set()`` and the like) and
+``assert len(NAME) == 0``. That is the
 "collect, then assert none" shape. An absence assertion on anything else (a flag, a return value, a
 helper's result) is not a site: the lint cannot see what such a name was built from, and guessing
 would bury the real shape in noise.
@@ -20,18 +24,25 @@ would bury the real shape in noise.
 WHAT GUARDS A SITE. An EARLIER ``assert`` at the test function's own top level that states a
 positive count of something the comprehension iterates over: ``len(x)`` compared with ``>`` or
 ``>=`` a bound that excludes zero, a bare ``assert len(x)``, or a bare truthiness assertion
-(``assert files``), where ``x`` or ``files`` reads a name the comprehension's loops read. An
-assertion about something else does not guard, nor does one inside a loop, a ``with`` block or a
-nested def, which may run zero times. ``len(x) == 0``, ``len(x) >= 0``, ``all(...)`` and other
-calls do not guard: each is true on an empty input. A comprehension all of whose loops run over
+(``assert files``), where ``x`` or ``files`` IS an expression the comprehension's loops draw
+from (``_walked`` lists what does not count). Sharing a name is not enough:
+``assert report['declared']`` does not guard a walk over ``report['commands']``, and neither does
+``assert report``, since a non-empty container can hold an empty part. A guard also fails when a name it reads is rebound between the guard and the walk,
+because the two then read different values. An assertion about something else does not guard, nor
+does one inside a loop, a ``with`` block or a nested def, which may run zero times.
+``len(x) == 0``, ``len(x) >= 0``, ``len(x) >= 0.0``, ``all(...)`` and other calls do not guard:
+each is true on an empty input. A comprehension all of whose loops run over
 non-empty literal lists, tuples or sets, with nothing starred, is exempt: it cannot iterate nothing.
 
 WHAT THIS DOES NOT CATCH is at least the following, so read its zero as no more than that. A floor
 enforced in a helper the test calls (``_guarded_scan`` in test_dependency_boundaries.py is one) is
 invisible to it, so such a site counts against the baseline although it is guarded. A collection
-built in a fixture or a helper and returned is not a site, and neither is any absence spelling not
-named above. The baseline is a per-file COUNT, so guarding one site in a file frees room for one new
-unguarded site in the same file.
+built in a fixture or a helper and returned is not a site, and neither is a name a nested helper
+reads from the test around it, nor any absence spelling not named above. "Before" means earlier
+in the source, not in control flow, so a binding in one branch of an ``if`` counts for code in the
+other. An argument to any call counts as a population, so ``assert tmp_path`` guards a walk over
+``tmp_path.rglob('*.py')`` although a path is always truthy. The baseline is a per-file COUNT, so
+guarding one site in a file frees room for one new unguarded site in the same file.
 
 IT IS A RATCHET, NOT A SWEEP. Rewriting every existing site is not this item's work and would
 collide with every open test change. The baseline below holds each file at its measured count. A
@@ -236,10 +247,52 @@ def _iterates_only_nonempty_literals(comp: ast.expr) -> bool:
     )
 
 
-def _source_names(comp: ast.expr) -> set[str]:
-    """The names every loop of the comprehension iterates over reads."""
+def _walked(comp: ast.expr) -> set[str]:
+    """The expressions the comprehension's loops draw their candidates from, as ``ast.dump`` text.
+
+    That is each loop's iterable and every expression inside it, since a call such as
+    ``_without_hash(requirements)`` may filter a population the test counted as ``requirements``.
+    Four things inside an iterable are left out, because counting them says nothing about the
+    population: a called function (``sorted`` in ``sorted(files)``), a constant, a container the
+    iterable only selects a part of (``report`` in ``report['commands']``, ``self`` in
+    ``self.files``), and a subscript's index or a conditional's test (``key`` in ``report[key]``,
+    ``cond`` in ``(files if cond else [])``). A later loop's iterable is evaluated inside the
+    comprehension, so an expression there that reads the comprehension's own loop variables is not
+    about any outer value, even when an outer name is spelled the same.
+    """
     generators: list[ast.comprehension] = getattr(comp, "generators", [])
-    return {n.id for g in generators for n in ast.walk(g.iter) if isinstance(n, ast.Name)}
+    local = {n.id for g in generators for n in ast.walk(g.target) if isinstance(n, ast.Name)}
+    parts: set[str] = set()
+
+    def collect(node: ast.AST, counts: bool, inner: bool) -> None:
+        if not isinstance(node, ast.expr) or isinstance(node, ast.Constant):
+            return
+        reads_local = inner and any(
+            isinstance(n, ast.Name) and n.id in local for n in ast.walk(node)
+        )
+        if counts and not reads_local:
+            parts.add(ast.dump(node))
+        if isinstance(node, (ast.Subscript, ast.Attribute)):
+            # The container a part is selected from, but never a subscript's index.
+            collect(node.value, False, inner)
+        elif isinstance(node, ast.IfExp):
+            collect(node.body, True, inner)
+            collect(node.orelse, True, inner)
+        elif isinstance(node, ast.Call):
+            # A method's receiver counts (``texts`` in ``texts.items()``); the function does not.
+            if isinstance(node.func, ast.Attribute):
+                collect(node.func.value, True, inner)
+            for arg in node.args:
+                collect(arg, True, inner)
+            for keyword in node.keywords:
+                collect(keyword.value, True, inner)
+        else:
+            for child in ast.iter_child_nodes(node):
+                collect(child, True, inner)
+
+    for index, g in enumerate(generators):
+        collect(g.iter, True, index > 0)
+    return parts
 
 
 def _len_argument(node: ast.expr) -> ast.expr | None:
@@ -257,14 +310,16 @@ def _len_argument(node: ast.expr) -> ast.expr | None:
 def _floor_is_positive(op: ast.cmpop, bound: ast.expr) -> bool:
     """``len(x) >= bound`` or ``len(x) > bound`` excludes zero, as far as the source shows.
 
-    A constant bound is checked (``>= 0`` and ``> -1`` do not exclude zero). A named bound such as
-    ``_MIN_FILES`` is taken on trust: the lint cannot evaluate it, and naming a floor is the habit
-    it wants.
+    A numeric constant bound is checked (``>= 0``, ``>= 0.0`` and ``> -1`` do not exclude zero), and
+    any other constant does not guard. A named bound such as ``_MIN_FILES`` is taken on trust: the
+    lint cannot evaluate it, and naming a floor is the habit it wants.
     """
     if isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub):
         return False  # a negative literal bound excludes nothing
-    if isinstance(bound, ast.Constant) and isinstance(bound.value, int):
-        return bound.value >= (1 if isinstance(op, ast.GtE) else 0)
+    if isinstance(bound, ast.Constant):
+        if not isinstance(bound.value, (int, float)):
+            return False
+        return bound.value > 0 if isinstance(op, ast.GtE) else bound.value >= 0
     return True
 
 
@@ -285,12 +340,16 @@ def _counted_expr(test: ast.expr) -> ast.expr | None:
     return None
 
 
-def _guards(test: ast.expr, source: set[str]) -> bool:
-    """``test`` states a positive count of something the comprehension iterates over."""
+def _guards(test: ast.expr, walked: set[str]) -> ast.expr | None:
+    """What ``test`` counts, when that is itself something the comprehension iterates over.
+
+    The counted expression must BE what the loops walk (see ``_walked``), not merely share a name
+    with it: ``assert report['declared']`` says nothing about a walk over ``report['commands']``.
+    """
     counted = _counted_expr(test)
-    if counted is None:
-        return False
-    return any(isinstance(n, ast.Name) and n.id in source for n in ast.walk(counted))
+    if counted is None or ast.dump(counted) not in walked:
+        return None
+    return counted
 
 
 _EMPTY_CALLS = frozenset({"set", "dict", "list", "tuple", "frozenset"})
@@ -327,47 +386,203 @@ def _absence_subject(test: ast.expr) -> str | None:
     return None
 
 
-def _sites(source: str) -> list[Site]:
-    """Every candidate site in ``source``, guarded or not."""
-    tree = ast.parse(source)
-    found: list[Site] = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if not fn.name.startswith("test"):
-            continue
-        collected: dict[str, ast.expr] = {}
-        asserts: list[ast.Assert] = []
-        for node in ast.walk(fn):
-            target: ast.expr | None = None
-            value: ast.expr | None = None
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target, value = node.targets[0], node.value
-            elif isinstance(node, ast.AnnAssign):
-                target, value = node.target, node.value
-            elif isinstance(node, ast.Assert):
-                asserts.append(node)
-            if isinstance(target, ast.Name) and value is not None:
-                comp = _comprehension(value)
-                if comp is not None:
-                    collected[target.id] = comp
-        # Only a guard at the function's own top level is sure to have RUN before the site: one in
-        # a loop body runs zero times on an empty input, and one in a `with pytest.raises` block or
-        # a nested def may never run at all.
-        top_level = [s for s in fn.body if isinstance(s, ast.Assert)]
-        for node in asserts:
-            name = _absence_subject(node.test)
-            if name is None or name not in collected:
-                continue
-            comp = collected[name]
-            if _iterates_only_nonempty_literals(comp):
-                continue
-            source_names = _source_names(comp)
-            guarded = any(
-                a.lineno < node.lineno and _guards(a.test, source_names) for a in top_level
-            )
-            found.append(Site(node.lineno, fn.name, name, guarded))
+_Scope = ast.FunctionDef | ast.AsyncFunctionDef
+
+#: Nodes whose insides belong to another scope: a nested def or class, a lambda, or a comprehension
+#: (whose loop variables are its own).
+_OPAQUE = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, *_COMPREHENSIONS)
+
+
+#: A source position, ``(line, column)``, so two statements on one line still have an order.
+_Pos = tuple[int, int]
+
+
+def _pos(node: ast.AST) -> _Pos:
+    return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
+@dataclass(frozen=True)
+class _Binding:
+    """One binding of a name in a scope.
+
+    ``comp`` is the comprehension the value collects, if any, and ``walk`` is where that
+    comprehension ran. ``bad = sorted(bad)`` re-collects the value it finds, so it keeps the earlier
+    binding's ``comp`` and ``walk``.
+    """
+
+    pos: _Pos
+    comp: ast.expr | None
+    walk: _Pos
+
+
+def _own_nodes(fn: _Scope) -> list[ast.AST]:
+    """Every node in ``fn``'s own scope, leaving out the insides of nested scopes."""
+    found: list[ast.AST] = []
+    stack: list[ast.AST] = list(fn.body)
+    while stack:
+        node = stack.pop()
+        found.append(node)
+        if not isinstance(node, _OPAQUE):
+            stack.extend(ast.iter_child_nodes(node))
     return found
+
+
+def _other_binders(node: ast.AST) -> list[tuple[str, _Pos]]:
+    """Names ``node`` binds in the scope without a ``Store`` name of its own.
+
+    That is an import, ``except ... as``, a ``match`` capture, and a walrus inside a comprehension,
+    which binds in the enclosing scope although the comprehension's other names stay inside it.
+    """
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [((a.asname or a.name).split(".")[0], _pos(node)) for a in node.names]
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        return [(node.name, _pos(node))]
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+        return [(node.name, _pos(node))]
+    if isinstance(node, ast.MatchMapping) and node.rest:
+        return [(node.rest, _pos(node))]
+    if isinstance(node, _COMPREHENSIONS):
+        return [
+            (n.target.id, _pos(n.target))
+            for n in ast.walk(node)
+            if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name)
+        ]
+    return []
+
+
+def _bindings(nodes: list[ast.AST]) -> dict[str, list[_Binding]]:
+    """Every binding of every name in a scope, in source order.
+
+    A name bound to anything but a comprehension gets a binding with no comprehension, so a later
+    ``bad = check(files)`` ends the site an earlier ``bad = [...]`` started. An augmented assignment
+    (``bad += [...]``) extends the value it finds rather than replacing it, and a bare annotation
+    (``bad: list[str]``) binds nothing, so neither is a binding.
+    """
+    comps: dict[int, ast.expr] = {}
+    recollects: set[int] = set()
+    skipped: set[int] = set()
+    raw: list[tuple[str, _Pos, int]] = []
+    for node in nodes:
+        if isinstance(node, ast.AugAssign) or (
+            isinstance(node, ast.AnnAssign) and node.value is None
+        ):
+            skipped.add(id(node.target))
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        if isinstance(target, ast.Name) and value is not None:
+            comp = _comprehension(value)
+            if comp is not None:
+                comps[id(target)] = comp
+            elif (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in _COLLECTORS
+                and value.args
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id == target.id
+            ):
+                recollects.add(id(target))
+        raw.extend((name, pos, 0) for name, pos in _other_binders(node))
+    raw.extend(
+        (n.id, _pos(n), id(n))
+        for n in nodes
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and id(n) not in skipped
+    )
+    found: dict[str, list[_Binding]] = {}
+    for name, pos, key in sorted(raw, key=lambda r: r[1]):
+        bound = found.setdefault(name, [])
+        if key in recollects and bound:
+            bound.append(_Binding(pos, bound[-1].comp, bound[-1].walk))
+        else:
+            bound.append(_Binding(pos, comps.get(key), pos))
+    return found
+
+
+def _reaching(bound: list[_Binding], pos: _Pos) -> _Binding | None:
+    """The last binding before ``pos``, which is the value an assertion there reads."""
+    earlier = [b for b in bound if b.pos < pos]
+    return earlier[-1] if earlier else None
+
+
+def _rebound_between(bound: list[_Binding], guard: _Pos, walk: _Pos) -> bool:
+    """A binding lands between the guard and the walk, so they read two different values.
+
+    A guard before the walk is stale if the name is rebound after the guard and before the walk's
+    statement; that statement reads the old value before any binding it makes. A guard after the
+    walk is stale if the name is rebound from the walk's statement up to the guard.
+    """
+    if guard < walk:
+        return any(guard < b.pos < walk for b in bound)
+    return any(walk <= b.pos < guard for b in bound)
+
+
+def _scope_sites(fn: _Scope, label: str) -> list[Site]:
+    """The candidate sites in ``fn``'s own scope, each judged by that scope's own guards."""
+    nodes = _own_nodes(fn)
+    bindings = _bindings(nodes)
+    # Only a guard at the function's own top level is sure to have RUN before the site: one in
+    # a loop body runs zero times on an empty input, and one in a `with pytest.raises` block or
+    # a nested def may never run at all.
+    top_level = [s for s in fn.body if isinstance(s, ast.Assert)]
+    found: list[Site] = []
+    for node in sorted((n for n in nodes if isinstance(n, ast.Assert)), key=_pos):
+        name = _absence_subject(node.test)
+        if name is None:
+            continue
+        reaching = _reaching(bindings.get(name, []), _pos(node))
+        if reaching is None or reaching.comp is None:
+            continue
+        if _iterates_only_nonempty_literals(reaching.comp):
+            continue
+        walked = _walked(reaching.comp)
+        guarded = False
+        for guard in top_level:
+            if _pos(guard) >= _pos(node):
+                continue
+            counted = _guards(guard.test, walked)
+            if counted is None:
+                continue
+            if not any(
+                isinstance(n, ast.Name)
+                and _rebound_between(bindings.get(n.id, []), _pos(guard), reaching.walk)
+                for n in ast.walk(counted)
+            ):
+                guarded = True
+                break
+        found.append(Site(node.lineno, label, name, guarded))
+    return found
+
+
+def _sites(source: str) -> list[Site]:
+    """Every candidate site in ``source``, guarded or not.
+
+    Every ``test*`` function is a scope, and so is every function defined inside one (a helper a
+    test builds for itself); ``label`` names a nested one ``test_x.helper``. Each scope is judged
+    alone: its own bindings, its own assertions and its own top-level guards.
+    """
+    found: list[Site] = []
+
+    def visit(node: ast.AST, inside: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if inside is not None:
+                    label: str | None = f"{inside}.{child.name}"
+                elif child.name.startswith("test"):
+                    label = child.name
+                else:
+                    label = None
+                if label is not None:
+                    found.extend(_scope_sites(child, label))
+                visit(child, label)
+            else:
+                visit(child, inside)
+
+    visit(ast.parse(source), None)
+    return sorted(found, key=lambda s: s.line)
 
 
 def _unguarded_sites(source: str) -> list[tuple[int, str, str]]:
@@ -433,6 +648,8 @@ def test_every_absence_spelling_is_a_site(absence: str) -> None:
         "assert files",
         "assert len(files) >= 1, files",
         "assert len(files)",
+        "assert len(files) >= 0.5",
+        "assert len(files) > 0.0",
     ],
 )
 def test_an_earlier_count_assertion_guards_the_site(guard: str) -> None:
@@ -455,6 +672,8 @@ def test_an_earlier_count_assertion_guards_the_site(guard: str) -> None:
         "assert len(files) < 99",
         "assert len(files) >= 0",
         "assert len(files) > -1",
+        "assert len(files) >= 0.0",
+        "assert len(files) > -0.5",
         # Positive, but about something the comprehension does not iterate.
         "assert other",
         "assert len(other) > 3",
@@ -542,6 +761,206 @@ def test_a_non_test_function_and_an_uncollected_name_are_not_sites() -> None:
         "    assert not bad\n"
         "def test_x(files):\n"
         "    bad = check(files)\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == []
+
+
+def test_the_binding_that_reaches_the_assertion_is_the_one_judged() -> None:
+    """Each site is judged by the binding just before it, not by the name's last binding."""
+    source = (
+        "def test_x(files):\n"
+        "    bad = [n for n in ('a', 'b') if n.isupper()]\n"
+        "    assert not bad\n"
+        "    bad = [p for p in files if p]\n"
+        "    assert not bad\n"
+        "    bad = check(files)\n"
+        "    assert not bad\n"
+        "def test_y(files):\n"
+        "    bad = [p for p in files if p]\n"
+        "    assert not bad\n"
+        "    bad = [n for n in ('a',) if n]\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == [(5, "test_x", "bad"), (10, "test_y", "bad")]
+
+
+def test_a_helper_inside_a_test_is_judged_by_its_own_guards() -> None:
+    source = (
+        "def test_x(roots):\n"
+        "    def check(files):\n"
+        "        assert files\n"
+        "        bad = [p for p in files if p]\n"
+        "        assert not bad\n"
+        "    def unchecked(files):\n"
+        "        bad = [p for p in files if p]\n"
+        "        assert not bad\n"
+        "    for r in roots:\n"
+        "        check(r)\n"
+        "        unchecked(r)\n"
+    )
+    assert _unguarded_sites(source) == [(8, "test_x.unchecked", "bad")]
+
+
+@pytest.mark.parametrize(
+    ("walk", "guard"),
+    [
+        ("report['commands']", "assert report['declared']"),
+        ("sorted(files)", "assert len(sorted(other)) > 0"),
+        ("self.files", "assert self.other"),
+        ("self.files", "assert self"),
+        ("report['commands']", "assert report"),
+        ("report[key]", "assert key"),
+        ("(files if cond else [])", "assert cond"),
+    ],
+)
+def test_a_guard_must_count_what_the_comprehension_walks(walk: str, guard: str) -> None:
+    """Sharing a name (a builtin, ``self``, a dict) with the walk is not counting the walk."""
+    source = (
+        "def test_x(self, report, files, other, key, cond):\n"
+        f"    {guard}\n"
+        f"    bad = [p for p in {walk} if p]\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == [(4, "test_x", "bad")]
+
+
+@pytest.mark.parametrize(
+    ("walk", "guard"),
+    [
+        ("report['commands']", "assert report['commands']"),
+        ("sorted(files)", "assert len(files) >= 2"),
+        ("self.files", "assert self.files"),
+        ("texts.items()", "assert texts"),
+        ("report['jobs'].items()", "assert len(report['jobs']) > 1"),
+    ],
+)
+def test_a_guard_on_the_walked_expression_still_guards(walk: str, guard: str) -> None:
+    source = (
+        "def test_x(self, report, files, texts):\n"
+        f"    {guard}\n"
+        f"    bad = [p for p in {walk} if p]\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == []
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        # The guard counted `files` before a filter narrowed it, possibly to nothing.
+        ("    assert files\n    files = [f for f in files if f.suffix == '.py']\n", ""),
+        ("    assert files\n    files = load(root)\n", ""),
+        # The guard counts a `files` rebound after the comprehension walked the old one.
+        ("", "    files = load(root)\n    assert files\n"),
+    ],
+)
+def test_a_guard_on_a_rebound_source_does_not_guard(before: str, after: str) -> None:
+    source = (
+        "def test_x(root):\n"
+        "    files = list(root.rglob('*'))\n"
+        f"{before}"
+        "    bad = [p for p in files if p]\n"
+        f"{after}"
+        "    assert not bad\n"
+    )
+    line = source.count("\n")
+    assert _unguarded_sites(source) == [(line, "test_x", "bad")]
+
+
+def test_an_outer_name_spelled_like_a_loop_variable_does_not_guard() -> None:
+    source = (
+        "def test_x(dirs, d):\n"
+        "    assert d\n"
+        "    bad = [x for d in dirs for x in d.iterdir() if x]\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == [(4, "test_x", "bad")]
+
+
+@pytest.mark.parametrize(
+    "rebind",
+    [
+        "    _ = [(files := []) for _ in (1,)]\n",
+        "    from somewhere import files\n",
+        "    try:\n        pass\n    except OSError as files:\n        pass\n",
+        "    match root:\n        case [*files]:\n            pass\n",
+    ],
+)
+def test_every_kind_of_rebinding_makes_a_guard_stale(rebind: str) -> None:
+    source = (
+        "def test_x(root):\n"
+        "    files = list(root.rglob('*'))\n"
+        "    assert files\n"
+        f"{rebind}"
+        "    bad = [p for p in files if p]\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == [(source.count("\n"), "test_x", "bad")]
+
+
+def test_a_guard_after_the_walk_with_no_rebinding_still_guards() -> None:
+    source = (
+        "def test_x(files):\n"
+        "    bad = [p for p in files if p]\n"
+        "    assert files\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == []
+
+
+def test_a_guard_after_a_walk_that_rebinds_its_own_source_does_not_guard() -> None:
+    """The walk read the old ``files``; the guard reads the new one the same statement bound."""
+    source = (
+        "def test_x(files):\n"
+        "    files = [p for p in files if p]\n"
+        "    assert files\n"
+        "    assert not files\n"
+    )
+    assert _unguarded_sites(source) == [(4, "test_x", "files")]
+
+
+@pytest.mark.parametrize(
+    ("between", "guarded"),
+    [
+        ("    bad = sorted(bad)\n", False),
+        ("    bad = set(bad)\n", False),
+        ("    bad: list[str]\n", False),
+        ("    bad += [1]\n", False),
+    ],
+)
+def test_a_statement_that_keeps_the_collected_value_keeps_the_site(
+    between: str, guarded: bool
+) -> None:
+    """Re-collecting, annotating or extending the name does not end the site it started."""
+    source = f"def test_x(files):\n    bad = [p for p in files if p]\n{between}    assert not bad\n"
+    sites = _sites(source)
+    assert [(s.line, s.name, s.guarded) for s in sites] == [(4, "bad", guarded)]
+
+
+def test_a_recollected_site_keeps_the_guard_of_its_walk() -> None:
+    source = (
+        "def test_x(files):\n"
+        "    assert files\n"
+        "    bad = [p for p in files if p]\n"
+        "    bad = sorted(bad)\n"
+        "    assert not bad\n"
+    )
+    assert _unguarded_sites(source) == []
+
+
+def test_two_statements_on_one_line_keep_their_order() -> None:
+    source = "def test_x(files):\n    bad = [p for p in files if p]; assert not bad\n"
+    assert _unguarded_sites(source) == [(2, "test_x", "bad")]
+
+
+def test_a_guard_on_the_rebound_source_itself_guards() -> None:
+    source = (
+        "def test_x(root):\n"
+        "    files = list(root.rglob('*'))\n"
+        "    files = [f for f in files if f.suffix == '.py']\n"
+        "    assert files\n"
+        "    bad = [p for p in files if p]\n"
         "    assert not bad\n"
     )
     assert _unguarded_sites(source) == []
