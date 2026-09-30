@@ -20,9 +20,12 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
-**Requires an engine newer than 0.4.0**, one whose `messagefoundry.api._ui_seam.ENGINE_UI_SEAM` is
-that value. Console 0.3.0 does not work with that engine, so upgrade the two together. The entry
-under Changed says why engine 0.4.0 does not work with this console.
+## [0.4.0] — 2026-09-30 — Early Access
+
+**Requires engine 0.5.0. Supported engine UI seam: `10a6cc7c95459dcc`**, the value engine 0.5.0
+ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
+to start. Engine 0.4.0 fails while importing this console, and the entry under Changed says why.
+Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two together.
 
 ### Added
 - **An Approvals page releases or rejects a dual-control hold** (`BACKLOG #1982`, ASVS 2.3.5). The
@@ -243,6 +246,11 @@ under Changed says why engine 0.4.0 does not work with this console.
   console's seam carries both halves.
 
 ### Notes
+- **pip now refuses an older engine.** The package declares `messagefoundry>=0.5.0`, a floor with
+  no ceiling (`RELEASE.md` step 2). Console 0.3.0 and earlier declared a bare `messagefoundry`, so
+  pip installed them beside any engine. A newer engine still installs, and the seam check at engine
+  startup refuses it if its seam differs. Pin both: `messagefoundry==0.5.0` with
+  `messagefoundry-webconsole==0.4.0`.
 - **Not every `/ui` change needs a console change.** PR 1432 touched only a console test fixture,
   yet the console's OIDC sign-in now needs the IdP's `auth_time` claim (`BACKLOG #296`). That rule
   lives in the engine, and the engine's own `CHANGELOG.md` records it. Read that file too for
@@ -389,6 +397,7 @@ two items sat under Unreleased.
   compat ranges, re-lock, add the release job) — see [`RELEASE.md`](RELEASE.md). It was not wired
   when this entry was written; the `release-webconsole` job published this wheel on 2026-07-29.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.3.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.4.0...HEAD
+[0.4.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.4.0
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.3.0
 [0.2.15]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.2.15

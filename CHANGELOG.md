@@ -2219,11 +2219,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   release, tagged `webconsole-v0.3.0` beside engine 0.4.0, accepts only `75c4117d21fd0b98`. So
   with the console on, this engine refuses to start with that release installed
   (`UiSeamMismatch`). The version number alone does not tell a matching console apart, so check
-  the constant. This entry does not quote the new value, because it can move again before the
-  release. **Migration:** upgrade the web console together with the engine, to a release whose
-  `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` holds this engine's
-  `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. Or set `[security].serve_web_console = false` to
-  run the JSON API alone. (`BACKLOG #1141`)
+  the constant. Engine 0.5.0 ships `10a6cc7c95459dcc`, which web console 0.4.0 accepts.
+  **Migration:** upgrade the web console to 0.4.0 together with the engine. Or set
+  `[security].serve_web_console = false` to run the JSON API alone. (`BACKLOG #1141`)
 - **BREAKING — the `403` for a session that must change its password is no longer always the exact
   string `password change required`.** When the engine can state the temporary password's
   deadline, the detail now reads `password change required; the temporary password stops working at
