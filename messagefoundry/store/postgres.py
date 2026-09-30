@@ -134,8 +134,12 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
 from messagefoundry.store.privilege import (
+    AUDIT_APPEND_ONLY_TABLES,
+    POSTGRES_AUDIT_WRITE_PRIVILEGES,
     PostgresRoleFacts,
     StorePrivilegeReport,
+    audit_write_alias,
+    classify_audit_writes,
     postgres_excess,
 )
 from messagefoundry.store.sealed_cache import (
@@ -148,6 +152,8 @@ from messagefoundry.store.store import (
     _ALERT_SEVERITY_RANK_SQL,
     _SESSION_CAP_ORDER_SQL,
     AUDIT_ALL_ROWS,
+    AUDIT_CHAIN_META_ROW_CHANGED,
+    AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -203,6 +209,7 @@ from messagefoundry.store.store import (
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
+    audit_rekey_refused,
     audit_rekey_when_keyed,
     audit_row_hash,
     birth_notify_email,
@@ -259,6 +266,29 @@ _LOCK_CLASS_FINALIZE = 3
 # a lane lock, so no cycle). Multi-destination writers lock in SORTED order (deadlock-free).
 _LOCK_CLASS_OUTBOUND_LANE = 4
 _AUDIT_LOCK = "mefor_audit_chain"
+
+
+def _audit_write_probe(table: str, privilege: str) -> str:
+    """One privilege-probe column: does ANY role this principal may assume hold ``privilege`` on the
+    append-only audit ``table`` (owner ruling R16)?
+
+    Read across ``pg_has_role(..., 'MEMBER')``, like the attribute probe, because a NOINHERIT member
+    can still ``SET ROLE`` to the holder and use the right; ``has_table_privilege(current_user, ...)``
+    alone counts only inherited rights. On PostgreSQL 16 a membership granted ``WITH INHERIT FALSE,
+    SET FALSE`` is counted too, though it gives neither; that over-reports, which is the safe side. ``UPDATE`` is read with ``has_any_column_privilege``, which a
+    single column grant also satisfies. ``to_regclass`` resolves through the pool's search_path, as the
+    store's own statements do; a table it cannot see yields NULL, which the probe reads as NOT READ.
+    ``table`` and ``privilege`` come from closed tuples in ``store.privilege``, never from input."""
+    check = "has_any_column_privilege" if privilege == "UPDATE" else "has_table_privilege"
+    rel = f"pg_catalog.to_regclass('{table}')"
+    return (
+        f" CASE WHEN {rel} IS NULL THEN NULL ELSE EXISTS (SELECT 1 FROM pg_catalog.pg_roles r"
+        f" WHERE pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER')"
+        f" AND pg_catalog.{check}(r.oid, {rel}, '{privilege}'))"
+        f" END AS {audit_write_alias(table, privilege)}"
+    )
+
+
 _SCHEMA_LOCK = "mefor_schema_init"
 _FINALIZE_LOCK_PREFIX = "mefor_finalize:"
 _OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
@@ -1591,7 +1621,11 @@ class PostgresStore:
         that ran the batch. A foreign table sharing the schema (an extension's, a DBA's own) is not the
         store's and must not block its start. ``schema_meta`` itself needs SELECT only, since external
         mode never writes it. No ``schema_meta`` yet means nothing is provisioned, which the marker read
-        that follows reports. Reads only."""
+        that follows reports. Reads only.
+
+        The append-only audit tables (owner ruling R16) need SELECT and INSERT only, so a role granted
+        exactly that passes here. Holding more on them is an over-grant, which the privilege preflight
+        (:meth:`probe_principal_privileges`) reports; this check only asks what is missing."""
         rows = await conn.fetch(
             "SELECT c.relname, c.relkind FROM pg_catalog.pg_class c"
             " WHERE c.relowner = (SELECT m.relowner FROM pg_catalog.pg_class m"
@@ -1601,13 +1635,18 @@ class PostgresStore:
             " AND ((c.relname = 'schema_meta'"
             "   AND NOT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT'))"
             " OR (c.relkind IN ('r', 'p') AND c.relname <> 'schema_meta'"
+            "   AND c.relname <> ALL($1::text[])"
             "   AND NOT (pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')"
             "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'INSERT')"
             "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'UPDATE')"
             "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'DELETE')))"
+            " OR (c.relkind IN ('r', 'p') AND c.relname = ANY($1::text[])"
+            "   AND NOT (pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')"
+            "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'INSERT')))"
             " OR (c.relkind = 'S'"
             "   AND NOT pg_catalog.has_sequence_privilege(current_user, c.oid, 'USAGE')))"
-            " ORDER BY c.relname"
+            " ORDER BY c.relname",
+            list(AUDIT_APPEND_ONLY_TABLES),
         )
         if not rows:
             return
@@ -1617,8 +1656,9 @@ class PostgresStore:
             f"the postgres store schema in database {self._settings.database!r} is provisioned and "
             f"current, but this role lacks row access to {len(rows)} object(s): {names}{more}. "
             "Refusing to start rather than fail mid-pipeline. Grant SELECT, INSERT, UPDATE, DELETE on "
-            "the tables and USAGE on the sequences to the runtime role (docs/DEPLOY-SERVER-DB.md "
-            "section 1.2); provision-schema cannot grant them"
+            "the tables, SELECT and INSERT only on audit_log and audit_chain_meta, and USAGE on the "
+            "sequences to the runtime role (docs/DEPLOY-SERVER-DB.md section 1.2); provision-schema "
+            "cannot grant them"
         )
         log.error("postgres: %s", exc)
         raise exc
@@ -1898,8 +1938,13 @@ class PostgresStore:
             # returns the stored name verbatim, as has_schema_privilege above consumes it.
             "  WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
             "    WHERE n.nspname = current_schema())"
-            "  AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned_in_schema"
-            " FROM pg_catalog.pg_database d WHERE d.datname = current_catalog"
+            "  AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned_in_schema,"
+            + ", ".join(
+                _audit_write_probe(table, privilege)
+                for table in AUDIT_APPEND_ONLY_TABLES
+                for privilege in POSTGRES_AUDIT_WRITE_PRIVILEGES
+            )
+            + " FROM pg_catalog.pg_database d WHERE d.datname = current_catalog"
         )
         if scalar is None:
             return StorePrivilegeReport(
@@ -1936,6 +1981,39 @@ class PostgresStore:
                 ),
             )
         schema = str(scalar["store_schema"] or "")
+        audit_writes, audit_unread = classify_audit_writes(scalar, POSTGRES_AUDIT_WRITE_PRIVILEGES)
+        excess = postgres_excess(
+            roles=facts,
+            owns_database=bool(scalar["owns_database"]),
+            create_on_database=bool(scalar["create_on_database"]),
+            database=database,
+            external=external,
+            schema=schema,
+            create_on_schema=bool(scalar["create_on_schema"]),
+            owned_in_schema=int(scalar["owned_in_schema"] or 0),
+            audit_writes=audit_writes,
+        )
+        unread_note = ""
+        if external and audit_unread:
+            # R16 is only a control if it can see the tables. A NULL is a table this role cannot
+            # resolve, so the append-only half was NOT READ. With nothing else found that makes the
+            # read unobserved rather than clean. With an over-grant already found it stays OBSERVED,
+            # so the start still refuses on what WAS read: a partial read only understates.
+            unread_note = (
+                f"the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this "
+                "role can change audit rows was not read; [store].schema_management is "
+                "'external', which requires INSERT and SELECT only on audit_log and "
+                "audit_chain_meta"
+            )
+            if not excess:
+                return StorePrivilegeReport(
+                    backend=self.backend,
+                    status=StorePrivilegeStatus.UNOBSERVABLE,
+                    principal=str(scalar["principal"] or ""),
+                    database=database,
+                    detail=unread_note,
+                )
+            unread_note = "; " + unread_note
         return StorePrivilegeReport(
             backend=self.backend,
             status=StorePrivilegeStatus.OBSERVED,
@@ -1946,26 +2024,19 @@ class PostgresStore:
             # SQL-Server-shaped value that would not mean the same thing.
             server_roles=(),
             database_roles=tuple(f.name for f in facts if not f.is_self),
-            excess=postgres_excess(
-                roles=facts,
-                owns_database=bool(scalar["owns_database"]),
-                create_on_database=bool(scalar["create_on_database"]),
-                database=database,
-                external=external,
-                schema=schema,
-                create_on_schema=bool(scalar["create_on_schema"]),
-                owned_in_schema=int(scalar["owned_in_schema"] or 0),
-            ),
+            excess=excess,
             detail=(
                 "roles are every role this principal may assume (pg_has_role MEMBER, so roles reached by "
                 "inheritance and by the set-role command alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
-                    f"schema_management=external, so CREATE on schema {schema!r} and ownership of its "
-                    "objects are excess"
+                    f"schema_management=external, so CREATE on schema {schema!r}, ownership of its "
+                    "objects, and UPDATE, DELETE, TRUNCATE or TRIGGER on audit_log or audit_chain_meta are "
+                    "excess"
                     if external
                     else "schema_management=auto, so schema DDL rights are expected"
                 )
+                + unread_note
             ),
         )
 
@@ -2330,39 +2401,57 @@ class PostgresStore:
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
         encrypted store (nothing to re-bless). An existing keyless chain stays keyless until the
-        explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin)."""
+        explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin).
+
+        The watermark row is only ever INSERTed (owner ruling R16), so the runtime role needs no
+        UPDATE on ``audit_chain_meta``: ``ON CONFLICT ... DO UPDATE`` demands that grant even when no
+        row conflicts. ``DO NOTHING`` needs INSERT alone. When no row went in, or the chain already
+        has rows, the row is read again: a peer engine may have keyed the chain, and appended to it,
+        since the first read, and this open then adopts what the peer wrote."""
+        meta = "SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1"
         async with self._timed_acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1"
-            )
-        if row is not None and row["keyed_from_id"] is not None:
-            self._audit_keyed_from = int(row["keyed_from_id"])
-            await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
-            return
-        async with self._timed_acquire() as conn:
+            row = await conn.fetchrow(meta)
+        if row is None or row["keyed_from_id"] is None:
             if not self._audit_keyed_capable():
                 return  # keyless store — the chain stays byte-identical to pre-#190
-            cnt = await conn.fetchrow("SELECT COUNT(*) AS n FROM audit_log")
-            if cnt is None:
-                return  # no count read: never key over rows that may exist
-            rows = int(cnt["n"])
-            if rows == 0 and self._read_only:
-                return  # BACKLOG #1780: key nothing from a read-only handle
-            if rows == 0:
+            async with self._timed_acquire() as conn:
+                cnt = await conn.fetchrow("SELECT COUNT(*) AS n FROM audit_log")
+                if cnt is None:
+                    return  # no count read: never key over rows that may exist
+                rows = int(cnt["n"])
+                if rows == 0 and self._read_only:
+                    return  # BACKLOG #1780: key nothing from a read-only handle
                 active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
-                await conn.execute(
-                    "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, 1, $1) "
-                    "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id, "
-                    "key_id = EXCLUDED.key_id",
-                    active_id,
-                )
+                inserted = False
+                if rows == 0:
+                    status = await conn.execute(
+                        "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, 1, $1) "
+                        "ON CONFLICT (id) DO NOTHING",
+                        active_id,
+                    )
+                    inserted = _rowcount(status) == 1  # fails closed: an unread tag re-reads
+                if not inserted:
+                    row = await conn.fetchrow(meta)
+            if inserted:
                 self._audit_keyed_from = 1
                 self._audit_first_key_id = self._audit_range_key_id = active_id
                 self._audit_range_from = 1
                 self._audit_range_keys = [active_id] if active_id is not None else []
-            else:
-                self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
-                warn_unkeyed_audit_chain(log, rows)
+                return
+            if row is None or row["keyed_from_id"] is None:
+                if rows > 0:
+                    self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
+                    warn_unkeyed_audit_chain(log, rows)
+                    return
+                reason = (
+                    AUDIT_CHAIN_META_ROW_CHANGED
+                    if row is None
+                    else AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK
+                )
+                log.error("postgres: %s", reason)
+                raise RuntimeError(reason)
+        self._audit_keyed_from = int(row["keyed_from_id"])
+        await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
 
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
@@ -2399,7 +2488,10 @@ class PostgresStore:
         """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
         without a DEK, verifies the existing chain first (refusing on any break), reports that verify
         when already keyed (BACKLOG #1904), else sets the watermark to the next id (never rewrites
-        existing hashes). See the SQLite twin."""
+        existing hashes). See the SQLite twin.
+
+        The watermark is INSERTed and never replaced (owner ruling R16), so the runtime role can run
+        this with INSERT and SELECT alone. A row already there is reported, not overwritten."""
         if not self._audit_keyed_capable():
             return False, "no store encryption key/MAC configured; cannot key the audit chain"
         ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
@@ -2412,13 +2504,17 @@ class PostgresStore:
             await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
             row = await conn.fetchrow("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
             watermark = (int(row["m"]) if row is not None else 0) + 1
-            await conn.execute(
+            status = await conn.execute(
                 "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, $1, $2) "
-                "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id, "
-                "key_id = EXCLUDED.key_id",
+                "ON CONFLICT (id) DO NOTHING",
                 watermark,
                 active_id,
             )
+            if _rowcount(status) != 1:  # fails closed: an unread tag is not a write
+                held = await conn.fetchrow("SELECT keyed_from_id FROM audit_chain_meta WHERE id=1")
+                return False, audit_rekey_refused(
+                    held is not None, None if held is None else held["keyed_from_id"]
+                )
         self._audit_keyed_from = watermark
         self._audit_first_key_id = self._audit_range_key_id = active_id
         self._audit_range_from = watermark

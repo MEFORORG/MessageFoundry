@@ -189,7 +189,7 @@ async def test_secret_is_quoteattr_escaped_in_attribute_position() -> None:
     wire = op.requests[0].data.decode()  # type: ignore[union-attr]
     assert ESCAPED in wire
     # the envelope must still parse — the quotes did not escape the attribute
-    import defusedxml.ElementTree as ET
+    import messagefoundry._vendor.defusedxml.ElementTree as ET
 
     ET.fromstring(wire)
 

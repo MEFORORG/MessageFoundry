@@ -398,7 +398,7 @@ def inbound_band_count(shard_count: int, lanes_per_shard: int) -> int:
     return shard_count * lanes_per_shard
 
 
-#: ⚠️ WHAT A CLEAN ``G >= L`` VERDICT DOES **NOT** SAY. The three-pool law (``ingress ≈ G/cycle``,
+#: WARNING: WHAT A CLEAN ``G >= L`` VERDICT DOES **NOT** SAY. The three-pool law (``ingress ≈ G/cycle``,
 #: ``routed ≈ G/cycle``, ``outbound ≈ L/cycle``) assumes ONE ``cycle``, and it is not one: the ingress cycle
 #: (decode + parse + strict-validate + commit) is strictly HEAVIER than the outbound one. So the counts can
 #: be equal — G == L — while the INBOUND pool is still the narrower one in capacity terms. This check compares
@@ -551,7 +551,7 @@ def check_fanout_lane_headroom(
 class RungFidelity(enum.Enum):
     """Whether a rung is ADMISSIBLE EVIDENCE ABOUT THE ENGINE, and if not, WHOSE fault it was.
 
-    ⚠️ **A ``sent`` SHORTFALL DOES NOT, ON ITS OWN, NAME A CULPRIT.** ``sent`` is incremented only after a job
+    **WARNING: A ``sent`` SHORTFALL DOES NOT, ON ITS OWN, NAME A CULPRIT.** ``sent`` is incremented only after a job
     is popped from a BOUNDED queue (``sender.py:185``), and the write loop ``await writer.drain()``s before
     popping the next. When the engine stops reading its socket the TCP window fills, ``drain()`` blocks, the
     queue fills, ``submit_nowait()`` refuses, and the message is NEVER SENT. So ``offered - sent`` is
@@ -622,7 +622,7 @@ FIDELITY_GATE_VERSION = 2
 #: reached the engine — it is proof the LOAD GENERATOR was able to OFFER the plan, which is exactly what a
 #: DRIVE SHORTFALL test needs and all it claims. The 2% band absorbs the token-bucket's boundary drops.
 #:
-#: ⚠️ THE BUCKET'S ACTUAL SHORTFALL HAS NEVER BEEN MEASURED, and this bar is TIGHTER than :data:`_INTAKE_TOL`
+#: WARNING: THE BUCKET'S ACTUAL SHORTFALL HAS NEVER BEEN MEASURED, and this bar is TIGHTER than :data:`_INTAKE_TOL`
 #: (5%), the band the sustain bar has always given the same physical phenomenon. A dropped token is a message
 #: never SENT, so if the bucket really drops >2% of tokens at high rates, a HEALTHY rung would be voided as a
 #: DRIVE SHORTFALL — discarding real engine evidence as a rig failure. Two reasons it stays at 0.98 anyway:
@@ -667,7 +667,7 @@ def rung_fidelity(
     FIRST, because when the plan never went on the wire the engine's low ``acked`` is a CONSEQUENCE, not a
     finding.
 
-    ⚠️ **BUT A ``sent`` SHORTFALL DOES NOT NAME A CULPRIT, AND v1 PRETENDED IT DID.** ``sent`` is incremented
+    **WARNING: BUT A ``sent`` SHORTFALL DOES NOT NAME A CULPRIT, AND v1 PRETENDED IT DID.** ``sent`` is incremented
     only after a job is popped from a BOUNDED queue and the writer ``drain()``s before popping the next
     (``sender.py``), so ENGINE BACKPRESSURE — the engine refusing to read its socket — stalls the write loop,
     fills the queue, and makes ``submit_nowait()`` refuse. The refused offers land in ``deferred``, and
@@ -2229,8 +2229,8 @@ class ShardCertLadderReport:
             # historical steps and emitted 3: a version number that NO artifact can ever carry, which sends a
             # consumer hunting for a v2 that does not exist. Exactly the class of trap this PR is about.)
             #
-            # ⚠️ ONE DELIBERATE REDEFINITION, plus additions:
-            #  * ⚠️ REDEFINED: `ceiling_rate` is now NULL when the climb stopped on a rung whose OFFER NEVER
+            # WARNING: ONE DELIBERATE REDEFINITION, plus additions:
+            #  * REDEFINED: `ceiling_rate` is now NULL when the climb stopped on a rung whose OFFER NEVER
             #    REACHED THE ENGINE (`drive_shortfall` / `offer_shortfall` / `fidelity_unknown`) or on one
             #    that TRIPPED THE STORE-POOL TRIPWIRE. `_is_ceiling` fires on the intake shortfall a drive
             #    shortfall ITSELF CAUSES, so a v1 `ceiling_rate` may be a pure function of the PLAN — or of
@@ -4178,7 +4178,7 @@ class ShardCertDriveReport:
             #    rides SHARDS_READY and the acquire_wait evidence + tripwire ride the ENGINE_DRAINED gate.
             #  * `traffic.deferred_backpressure` / `traffic.deferred_schedule` — the FIDELITY GATE'S CAUSE
             #    SPLIT (gate v2). `sent` is ENGINE-PACED (bounded queue + drain()), so a `sent` shortfall
-            #    cannot say whose fault it was; these can. ⚠️ `traffic.fidelity` is therefore NARROWED: a v4
+            #    cannot say whose fault it was; these can. WARNING: `traffic.fidelity` is therefore NARROWED: a v4
             #    `drive_shortfall` is a v5 `backpressure_bind`, `drive_shortfall` or `offer_shortfall`.
             #  * `traffic.sent_ratio` — so the UNMEASURED 0.98 sent bar can be re-derived from banked runs.
             "schema_version": 5,

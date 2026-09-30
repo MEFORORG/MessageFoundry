@@ -30,7 +30,6 @@ certifi==2026.6.17
 cffi==2.0.0
 click==8.5.0
 cryptography==50.0.1
-defusedxml==0.7.1
 fastapi==0.141.1
 h11==0.16.0
 hl7==0.4.5

@@ -4412,7 +4412,7 @@ async def test_rekey_audit_cli_server(store, capsys, monkeypatch) -> None:
     """CLI-23 (Postgres mirror): the ``rekey-audit`` CLI wrapper enables HMAC keying of an existing
     keyless chain (#190-D). It reaches the live Postgres store purely via ``MEFOR_STORE_*`` env (no
     ``--db``), needs a DEK to key, and writes ``audit_chain_meta.keyed_from_id = MAX(audit_log.id)+1`` via
-    PG's ``INSERT ... ON CONFLICT`` upsert under the advisory lock. Seed keyless (the fixture handle
+    PG's ``INSERT ... ON CONFLICT DO NOTHING`` under the advisory lock (owner ruling R16). Seed keyless (the fixture handle
     opened without a DEK), compute the watermark at RUNTIME (the fixture TRUNCATE ... RESTART IDENTITY
     reseeds the serial, but computing MAX(id)+1 is correct on either reseed behaviour), then drive the
     CLI off the event loop (its internal ``asyncio.run`` would raise in a running loop)."""
