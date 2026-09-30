@@ -180,12 +180,16 @@ The importer rendered that send as `Send(dest, msg)`, which delivers the unmodif
 the message Corepoint built.
 
 A role-parsed `MsgSend` now sends only when its handle is the list's single input handle, or a
-whole-tree clone of it. Anything else renders as a TODO marker and `raise NotImplementedError(...)`
-at the send site: another handle, a `$variable`, a partial path, or no handle. A `Try` whose body
-holds such a raise gains an `except NotImplementedError: raise` arm ahead of its `Catch` arms, so a
-`Catch` cannot swallow it. The destination stays declared and the handler keeps its `sends` list, so
-the handler neither filters silently nor gains a trailing `Send`. The summary counts the statement
-as unmapped.
+whole-tree clone of it that nothing else overwrites. Anything else renders as a TODO marker and
+`raise NotImplementedError(...)` at the send site: another handle, a `$variable`, a partial path, or
+no handle. A `Try` whose body holds such a raise gains an `except NotImplementedError: raise` arm
+ahead of its `Catch` arms, so a `Catch` cannot swallow it. The destination stays declared and the
+handler keeps its `sends` list, so the handler neither filters silently nor gains a trailing `Send`.
+`messagefoundry check` reports that outbound as unreferenced until someone finishes the send, which
+is accurate. The summary counts the statement as unmapped.
+
+Field writes map onto `msg` only for the one handle the list delivers. A list that delivers two
+different handles maps no field write at all.
 
 At least these gaps remain:
 

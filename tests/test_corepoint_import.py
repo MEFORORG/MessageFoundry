@@ -1098,10 +1098,10 @@ def test_a_msgsend_of_a_non_subject_handle_fails_loudly_and_sends_nothing() -> N
     assert "    sends = []" in body and body.rstrip().endswith("return sends")
     assert "return None" not in body  # not a silent filter
     assert (
-        '    raise NotImplementedError("Corepoint import: MsgSend delivers %OUT, which is not the '
-        "input handle or a whole-tree clone of it" in body
+        '    raise NotImplementedError("Corepoint import: MsgSend to OB_ACME: MsgSend delivers %OUT, '
+        "which is not the input handle or a whole-tree clone of it" in body
     )
-    assert '# TODO: Corepoint MsgSend to "OB_ACME" — hand-finish: MsgSend delivers %OUT' in body
+    assert "# TODO: Corepoint MsgSend to OB_ACME — hand-finish: MsgSend delivers %OUT" in body
     # The destination stays declared, so the hand-finisher has somewhere to send the right message.
     assert 'outbound("OB_ACME", File(directory=' in src
 
@@ -1132,7 +1132,7 @@ def test_a_send_with_no_single_input_handle_is_refused() -> None:
     """With no input handle at all, no handle is known to be msg, so the send is refused too."""
     body = _handler_body(_handler_source(_role_send("other-handle", "%OUT", "OB_ACME")))
     assert "Send(" not in body
-    assert "has no single input handle" in body
+    assert "no handle in this action-list is known to be msg" in body
     assert "raise NotImplementedError" in body
 
 
@@ -1172,7 +1172,10 @@ def test_a_hostile_handle_name_cannot_escape_the_raise_or_its_comment() -> None:
     compile(src, "generated.py", "exec")
     assert "\nimport os" not in src
     # Positive control: the handle did reach the render, flattened, with its quote escaped.
-    assert 'raise NotImplementedError("Corepoint import: MsgSend delivers %O\\"UT) import os' in src
+    assert (
+        'raise NotImplementedError("Corepoint import: MsgSend to OB_ACME: MsgSend delivers %O\\"UT) '
+        "import os" in src
+    )
     long_src = _handler_source(_role_send("other-handle", "%" + "X" * 5000, "OB_ACME"))
     raise_line = next(ln for ln in long_src.splitlines() if "raise NotImplementedError" in ln)
     assert len(raise_line) < 400
@@ -1300,7 +1303,7 @@ def test_an_input_overwritten_by_another_tree_is_not_msg() -> None:
         )
     )
     assert "Send(" not in body
-    assert "has no single input handle" in body
+    assert "no handle in this action-list is known to be msg" in body
 
 
 def test_an_unstyled_send_verb_is_judged_like_a_styled_one() -> None:
@@ -1325,7 +1328,7 @@ def test_two_input_handle_names_refuse_even_an_input_classed_send() -> None:
     send = _role_send("input-handle", "%ADT", "OB_IN")
     body = _handler_body(_handler_source(second_input + send))
     assert "Send(" not in body
-    assert "has no single input handle" in body
+    assert "no handle in this action-list is known to be msg" in body
     disabled_second = second_input.replace("<Line ", '<Line Disabled="1" ', 1)
     body = _handler_body(_handler_source(disabled_second + send))
     assert '    sends.append(Send("OB_IN", msg))' in body
@@ -1338,6 +1341,133 @@ def test_a_send_with_no_destination_is_counted_unmapped() -> None:
         ["MsgSend"],
         0,
     )
+
+
+def _tree_copy(src: str, dst: str) -> str:
+    """A role-marked ``MsgTreeCopy`` from raw operand markup ``src`` into raw operand markup ``dst``."""
+    return _role_line(_span("keyword", "MsgTreeCopy") + " " + src + " to " + dst)
+
+
+@pytest.mark.parametrize(
+    "copy",
+    [
+        pytest.param(
+            _tree_copy(
+                _span("variable", "$saved"), _span("input-handle", "%ADT") + _span("path", "/")
+            ),
+            id="variable-into-root",
+        ),
+        pytest.param(
+            _tree_copy(
+                _span("other-handle", "%OUT") + _span("path", "/"), _span("input-handle", "%ADT")
+            ),
+            id="tree-into-bare-handle",
+        ),
+        pytest.param(
+            _tree_copy(
+                _span("other-handle", "%OUT") + _span("path", "/PID"),
+                _span("input-handle", "%ADT") + _span("path", "/"),
+            ),
+            id="partial-path-into-root",
+        ),
+    ],
+)
+def test_an_input_overwritten_by_anything_else_is_not_msg(copy: str) -> None:
+    """Any whole-tree copy INTO the input from something that is not the input overwrites it, so
+    neither the send nor the field write may treat the input as msg any more."""
+    body = _handler_body(
+        _handler_source(_WRITE_INPUT + copy + _role_send("input-handle", "%ADT", "OB_IN"))
+    )
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+    assert 'set_field(msg, "MSH-6"' not in body
+
+
+def test_an_overwrite_inside_an_unmodelled_element_still_counts() -> None:
+    """An unmodelled tag ran in Corepoint even though the render only marks it."""
+    copy = _root_copy("other-handle", "%OUT", "input-handle", "%ADT").replace(
+        "<Line ", "<Switch ", 1
+    )
+    body = _handler_body(_handler_source(copy + _role_send("input-handle", "%ADT", "OB_IN")))
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+
+
+def test_a_write_to_an_unsent_clone_does_not_reach_the_input_send() -> None:
+    """Only the ONE delivered tree is msg. A write to a clone that is never sent is a write to a
+    different Corepoint tree, so it must not land in the input's send."""
+    write_clone = _role_line(
+        _span("keyword", "ItemCopy")
+        + " "
+        + _span("literal", '"Y"')
+        + " to "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/MSH-6")
+    )
+    body = _handler_body(
+        _handler_source(
+            _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
+            + write_clone
+            + _role_send("input-handle", "%ADT", "OB_IN")
+        )
+    )
+    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert 'set_field(msg, "MSH-6", "Y")' not in body
+
+
+def test_a_write_to_the_sent_clone_still_maps() -> None:
+    """The control arm: when the clone IS what the list sends, a write to it is a write to msg."""
+    write_clone = _role_line(
+        _span("keyword", "ItemCopy")
+        + " "
+        + _span("literal", '"Y"')
+        + " to "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/MSH-6")
+    )
+    body = _handler_body(
+        _handler_source(
+            _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
+            + write_clone
+            + _role_send("other-handle", "%OUT", "OB_ACME")
+        )
+    )
+    assert '    sends.append(Send("OB_ACME", msg))' in body
+    assert 'set_field(msg, "MSH-6", "Y")' in body
+
+
+def test_a_disabled_list_wrapper_is_scanned_as_the_render_emits_it() -> None:
+    """The render flattens a ``<List>`` wrapper even under ``@Disabled``, so the scan must see its
+    statements too, or the field write maps live beside a send the scan never counted."""
+    wrapped = '<List Disabled="1">' + _role_send("other-handle", "%OUT", "OB_ACME") + "</List>"
+    body = _handler_body(
+        _handler_source(_WRITE_INPUT + wrapped + _role_send("input-handle", "%ADT", "OB_IN"))
+    )
+    assert 'set_field(msg, "MSH-6"' not in body
+
+
+def test_a_refused_send_with_no_destination_still_raises() -> None:
+    """A refused send with no destination is still a refusal: a TODO alone would let the handler
+    fall through to a silent filter."""
+    send = _role_line(_span("keyword", "MsgSend") + " " + _span("other-handle", "%OUT"))
+    body = _handler_body(_handler_source(_WRITE_INPUT + send))
+    assert "Send(" not in body
+    assert (
+        '    raise NotImplementedError("Corepoint import: MsgSend (no destination named):' in body
+    )
+
+
+def test_a_refused_send_still_passes_the_required_check_gate(tmp_path: Path) -> None:
+    """The module stays valid config. ``check`` does report the kept outbound as unreferenced, an
+    advisory that is accurate: nothing sends to it until the hand-finish."""
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(_role_send("other-handle", "%OUT", "OB_ACME")), encoding="utf-8")
+    out = tmp_path / "out"
+    import_corepoint(export, out)
+    report = run_checks(out, run_lint=False)
+    assert report.ok
+    dead = next(r for r in report.results if r.name == "dead-config")
+    assert not dead.required and "outbound:OB_ACME" in dead.detail
 
 
 def test_generated_xml_module_compiles_and_passes_check(tmp_path: Path) -> None:
