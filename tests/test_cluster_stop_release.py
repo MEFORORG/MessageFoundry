@@ -29,8 +29,8 @@ from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
 _TTL = 30.0
 _FENCE = 20.0
-# A realistic DB clock. The release writes the epoch, 0.0, so against a DB clock that also starts at
-# 0.0 a released row still reads live and the standby check below would fail for the wrong reason.
+# A realistic DB clock. The release stamps the DB clock's now (BACKLOG #1986), and a clock that
+# starts at 0.0 could not tell that apart from the epoch the release used to write.
 _DB_NOW = 1_700_000_000.0
 # The bound the hang tests run with, and an outer guard far above it. The guard turns an unbounded
 # stop() into a clean failure rather than a hang that pytest-timeout ends by killing the whole run.
@@ -74,7 +74,7 @@ class _LeaseRow:
     def release(self, owner: object) -> int:
         row = self.row
         if row is not None and row["owner"] == owner:
-            row["lease_expires_at"] = 0.0
+            row["lease_expires_at"] = self._db_clock()  # the DB clock's now (BACKLOG #1986)
             return 1
         return 0
 
@@ -249,12 +249,14 @@ async def test_stop_of_a_self_fenced_node_expires_its_lease_row() -> None:
 
         assert (writes.lease_writes, writes.node_writes) == (1, 1), name
         assert lease.row is not None and lease.row["owner"] == "A", name
-        assert lease.row["lease_expires_at"] == 0.0, name
+        assert lease.row["lease_expires_at"] == _DB_NOW, name  # stamped at the DB clock's now
         assert a._lease_release_owed is False, name
         # A standby takes the row on its next tick instead of waiting out the TTL.
+        lease._db_clock.t = _DB_NOW + 1.0
         b = _pg(_PgPool(lease), "B", _Clock(0.0))
         await b._maintain_leadership()
         assert b.is_leader() is True, name
+        lease._db_clock.t = _DB_NOW
 
 
 async def test_pg_stop_writes_go_through_a_bounded_acquire() -> None:

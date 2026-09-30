@@ -204,7 +204,8 @@ class SqlServerCoordinator:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
-        # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
+        # expire the lease row at the DB clock's now, so a standby need not wait out the TTL and still
+        # waits its own acquire_delay (BACKLOG #1986; DbCoordinator.stop() says why). Deliberately
         # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
         # Forced unconditionally, so a self-fenced node releases its row, and each write bounded
         # (BACKLOG #1987). DbCoordinator.stop() says why the force is unconditional, when the tombstone
@@ -533,15 +534,19 @@ class SqlServerCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    async def step_down_leadership(self) -> StepdownOutcome:
+    async def step_down_leadership(
+        self, *, sibling_acquire_delay_seconds: float = 0.0
+    ) -> StepdownOutcome:
         """Release leadership and stay up as a standby (ADR 0056 slice 1). Mirrors
         :meth:`~messagefoundry.pipeline.cluster.DbCoordinator.step_down_leadership` — read its
         docstring for why the release is serialized against the maintenance tick, why the demotion
         edge fires, why this node pauses its own claim (and why the pause is not the exclusion), why the
-        pause is armed BOTH before and after the release, what the lock costs, why a retry re-sends an
+        pause is armed BOTH before and after the release, why it waits out the longest sibling delay
+        (BACKLOG #1986), what the lock costs, why a retry re-sends an
         owed write, why an unconfirmed lease write raises
         :class:`~messagefoundry.pipeline.cluster.StepdownReleaseUnconfirmed` here but not on
         :meth:`stop`, and why a self-fenced node still sends the write (BACKLOG #1508)."""
+        pause = stepdown_pause_seconds(self._heartbeat_seconds, sibling_acquire_delay_seconds)
         await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
         try:
             # Armed before the release's await so a cancellation inside the pool write cannot skip it,
@@ -554,9 +559,7 @@ class SqlServerCoordinator:
             arming = self.may_own_lease_row()
             prior_pause = self._no_claim_until
             if arming:
-                self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
-                    self._heartbeat_seconds
-                )
+                self._no_claim_until = self._monotonic() + pause
             was_leader, released_at, wrote, lease_released = await self._release_leadership(
                 force_write=arming
             )
@@ -568,10 +571,7 @@ class SqlServerCoordinator:
                 # Armed a SECOND time from the instant the write returned, taking the later expiry, so
                 # the write's own unbounded duration is not spent out of the pause. DbCoordinator's
                 # step_down_leadership carries the full reasoning; keep the two in lockstep.
-                self._no_claim_until = max(
-                    self._no_claim_until,
-                    self._monotonic() + stepdown_pause_seconds(self._heartbeat_seconds),
-                )
+                self._no_claim_until = max(self._no_claim_until, self._monotonic() + pause)
             if outcome.drained:  # a row release is a demotion edge too (#1508)
                 self._fire_on_demote()
             if not wrote:  # NOT nested under was_leader — a retry has already demoted
@@ -612,8 +612,12 @@ class SqlServerCoordinator:
         self._lease_release_owed = True
         try:
             async with asyncio.timeout(timeout):  # None = unbounded, the stepdown's case
+                # The expiry is the DB clock's now, read by the same _DB_NOW expression the MERGE's
+                # take-over predicate reads, so each sibling waits its own acquire_delay (BACKLOG
+                # #1986). DbCoordinator._release_leadership carries the reasoning.
                 rows = await self._store._execute(
-                    "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ? AND owner = ?",
+                    f"UPDATE leader_lease SET lease_expires_at = {_DB_NOW}"
+                    " WHERE lease_key = ? AND owner = ?",
                     (self._lease_key, self.node_id),
                 )
         except Exception as exc:

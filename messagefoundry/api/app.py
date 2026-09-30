@@ -342,6 +342,7 @@ from messagefoundry.pipeline.cluster import (
     StepdownReleaseUnconfirmed,
     build_coordinator,
     has_promotable_sibling,
+    longest_promotable_sibling_delay,
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
@@ -6433,7 +6434,8 @@ def create_app(
         the store is still failing it answers ``members-unreadable`` and re-sends nothing.
 
         **Each retry that releases the row re-arms the claim pause** for another two
-        ``heartbeat_seconds``, so a node an operator keeps retrying stays drained. That is the intent
+        ``heartbeat_seconds`` plus the longest promotable sibling's ``acquire_delay_seconds``
+        (BACKLOG #1986), so a node an operator keeps retrying stays drained. That is the intent
         of the call, and it does not slow a standby: the pause gates only this node's own claim.
         Either way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status
         code.
@@ -6534,8 +6536,14 @@ def create_app(
         # leadership, and that returned value is the only thing audited or reported: a fence or a
         # lost-lease tick between a pre-read and the release would otherwise record was_leader=true for
         # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
+        #
+        # The same membership read sizes the claim pause (BACKLOG #1986). The release stamps the
+        # lease expiry with the DB clock's now, so a delayed sibling may take it only after its delay,
+        # and this node must not reclaim before then.
         try:
-            outcome = await c.step_down_leadership()
+            outcome = await c.step_down_leadership(
+                sibling_acquire_delay_seconds=longest_promotable_sibling_delay(members, c.node_id)
+            )
         except StepdownLockTimeout as exc:
             # NOTHING RAN. No lease row was read or written, nothing was demoted, and — because the
             # handler takes no is_leader() pre-read — this node may lead nothing at all. So this arm

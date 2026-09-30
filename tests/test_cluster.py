@@ -110,7 +110,9 @@ class _NotLeaderCoordinator:
         # suite. Present so this stand-in still structurally satisfies the ClusterCoordinator protocol.
         return (None, None)
 
-    async def step_down_leadership(self) -> StepdownOutcome:
+    async def step_down_leadership(
+        self, *, sibling_acquire_delay_seconds: float = 0.0
+    ) -> StepdownOutcome:
         # A follower holds no leadership to release (ADR 0056 slice 1), so the honest answer is the
         # same one NullCoordinator gives. Present so this stand-in still structurally satisfies the
         # ClusterCoordinator protocol.
