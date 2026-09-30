@@ -33,6 +33,12 @@ anything. They are: `argument_modes` counts arguments, never rows, and nothing i
 `editable_rows` or `editable_pct`. At the default `--contract 1` the lens sends no modes, so the
 bucket is absent and every other figure is what it always was.
 
+`--contract 2` ALSO MOVES THE ROW FIGURES, which is why it is not the default. Contract 2 projects
+comment runs as `note` rows, a router's return as a `route` row, and `@router` defs as elements, and
+this script counts all of them (a note or route row as opaque, a router as a handler). So a contract
+2 run's row figures are not comparable with a contract 1 run's; the report says so, and
+`comparable_with_contract_1` is false in the JSON. Read only the argument bucket from such a run.
+
 PHI. `lens parse` is a static `ast` parse that never imports or executes a config module, and no
 message ever enters this path. The scan reads only code and emits only counts and file names, so it
 is safe to run against a production estate. Pass `--anonymize` when sending results anywhere.
@@ -201,7 +207,6 @@ def main(argv: list[str] | None = None) -> int:
     # E.9's own bucket: arguments by mode. Kept apart from `kinds`, and never read by the editable
     # figure below, so a templated argument is counted here and only here.
     arg_modes: Counter[str] = Counter()
-    saw_modes = False
     files = handlers = zero_editable = fully_typed = 0
     code_per_handler: list[int] = []
     opaque_per_handler: list[int] = []
@@ -226,7 +231,6 @@ def main(argv: list[str] | None = None) -> int:
             n_edit = n_opaque = n_code = 0
             for row in rows:
                 arg_modes.update(tally_argument_modes(row))
-                saw_modes = saw_modes or isinstance(row.get("param_modes"), dict)
                 if row.get("kind") == "code":
                     start = row.get("line_start")
                     end = row.get("line_end", start)
@@ -281,9 +285,13 @@ def main(argv: list[str] | None = None) -> int:
         "max_code_rows_in_one_handler": max(code_per_handler, default=None),
         "strict_control": args.strict_control,
         "contract": args.contract,
-        # ADR 0076 E.9: arguments by input mode, a bucket of its own. None when the lens sent no
-        # modes (contract 1), so an absent bucket is never read as "no templated arguments".
-        "argument_modes": _argument_mode_report(arg_modes) if saw_modes else None,
+        # Contract 2 counts note and route rows and @router defs, so its row figures above do not
+        # compare with a contract 1 run's (see the module docstring).
+        "comparable_with_contract_1": args.contract == 1,
+        # ADR 0076 E.9: arguments by input mode, a bucket of its own. Measured at contract 2, zeros
+        # included, and None at contract 1, where the lens sends no modes: an unmeasured bucket is
+        # never printed as "no templated arguments".
+        "argument_modes": _argument_mode_report(arg_modes) if args.contract >= 2 else None,
         "refusals": refusals,
     }
 
@@ -295,6 +303,11 @@ def main(argv: list[str] | None = None) -> int:
         return f"{(100.0 * n / d):.1f}%" if d else "n/a"
 
     print(f"corpus             : {args.config_dir}")
+    if args.contract != 1:
+        print(
+            f"contract           : {args.contract} (counts note/route rows and @router defs, so the row "
+            "figures below do NOT compare with a contract 1 run)"
+        )
     print(f"files scanned      : {files}   (parse-refused: {len(refusals)})")
     print(f"handlers projected : {handlers}")
     print(f"rows projected     : {total}")
@@ -330,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nargument modes (a bucket of its own, never in the EDITABLE figure; ADR 0076 E.9):")
         for mode, count in report.items():
             print(f"  {mode:<24} {count:>6}  {pct(count, total_args)}")
-    elif args.contract == 1:
+    else:
         print("\nargument modes: not measured at --contract 1 (pass --contract 2)")
     if refusals:
         print("\nparse refusals (whole-file: the lens steps aside to the text editor):")

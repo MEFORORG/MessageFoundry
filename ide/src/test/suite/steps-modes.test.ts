@@ -885,7 +885,7 @@ function fieldHtml(html: string, name: string): string {
 
 /** A field's markup without the inert blank chip `Add text` clones, so only real parts remain. */
 function withoutBlankChip(field: string): string {
-  return field.replace(/<template class="tpart-blank">.*?<\/template>/g, "");
+  return field.replace(/<template class="tpart-blank"[^>]*>.*?<\/template>/g, "");
 }
 
 /** The mode options a field's selector offers, in order; `[]` when it renders no selector. */
@@ -984,8 +984,26 @@ suite("Steps modes: the selector offers exactly the writable modes", () => {
     assert.ok(field.includes(`class="tsource" readonly disabled value="f&quot;-{msg.field(`));
     const editor = withoutBlankChip(field.slice(field.indexOf(`<div class="tparts"`)));
     assert.ok(!editor.includes(`class="tpart"`), "no chips: there are no parts to show");
-    assert.ok(field.includes(`<template class="tpart-blank">`), "the blank chip Add text clones is there");
+    assert.ok(field.includes(`<template class="tpart-blank" data-part="path">`), "the blank chip Add text clones is there");
     assert.ok(editor.includes(`class="tpart-add-path"`), "a field can be added to start a template");
+  });
+
+  test("a templated argument's static pane shows no enum choice as if it were current", () => {
+    const schema = {
+      set_field: [
+        { name: "value", kind: "enum" as const, choices: ["A", "B"], required: true, keyword_only: false },
+      ],
+    };
+    const templated = fieldHtml(renderRowHtml(buildRowViewModel(TEMPLATED_VALUE, 0, LINES), "h", schema), "value");
+    assert.ok(
+      /data-pane="static" hidden><select class="edit"[^>]*><option value="" selected><\/option><option value="A">/.test(
+        templated,
+      ),
+      "a blank option is selected, so choosing A is a real change",
+    );
+    // A static argument's own dropdown is unchanged: its literal is the selected option.
+    const literal = fieldHtml(renderRowHtml(buildRowViewModel(STATIC_LITERAL, 0, LINES), "h", schema), "value");
+    assert.ok(!literal.includes(`<option value="" selected>`));
   });
 
   test("with no handler (a read-only caller) every moded argument is read-only", () => {

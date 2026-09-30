@@ -103,8 +103,25 @@ def test_contract_2_reports_the_bucket_and_the_editable_figure_does_not_move(
     v1 = _run(cov, config, capsys)
     assert v1["argument_modes"] is None
     assert v1["contract"] == 1
+    # This corpus has no comments or routers, so contract 2 adds no note/route rows and the row
+    # figures agree. They need not in general, and the report says so.
+    assert v1["comparable_with_contract_1"] is True
+    assert v2["comparable_with_contract_1"] is False
     assert v1["editable_rows"] == v2["editable_rows"]
     assert v1["editable_pct"] == v2["editable_pct"]
+
+
+def test_a_measured_estate_with_no_typed_arguments_reports_zeros(
+    cov: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Measured and empty is a zero bucket, never the "not measured" None of contract 1.
+    (tmp_path / "h.py").write_text(
+        'from messagefoundry import Send, handler\n\n\n@handler("h")\ndef h(msg):\n'
+        '    return Send("OB", msg)\n',
+        encoding="utf-8",
+    )
+    v2 = _run(cov, tmp_path, capsys, "--contract", "2")
+    assert v2["argument_modes"] == {"static": 0, "templated": 0, "dynamic": 0}
 
 
 def test_an_unknown_mode_is_reported_not_dropped(cov: ModuleType) -> None:

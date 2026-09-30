@@ -1356,11 +1356,13 @@ export function readEditMessage(m: unknown): EditMessageRead | undefined {
     return undefined;
   }
   const raw = m.value;
+  // A template's parts, copied, or null when the value is not exactly a well-formed template.
+  const parts = isTemplateValue(raw) ? readTemplateParts(raw.parts) : null;
   let value: string | number | TemplateValue;
   if (typeof raw === "string" || typeof raw === "number") {
     value = raw;
-  } else if (isTemplateValue(raw)) {
-    value = templateValue(readTemplateParts(raw.parts) ?? []);
+  } else if (parts !== null) {
+    value = templateValue(parts);
   } else {
     return {
       refused:
@@ -3037,7 +3039,12 @@ function renderLiteralInputHtml(
   handlerName: string,
   row: RowViewModel,
   schema?: OpSchema,
+  blankFirst = false,
 ): string {
+  // `blankFirst` (the static pane of a templated argument, which starts empty) gives a dropdown a blank
+  // selected option, so it never shows a first choice as if it were the current value, and choosing
+  // that first choice is a real change that posts.
+  //
   // The row's PROJECTION-TIME source (`data-expect-src`) is echoed back on edit as `expect_src` so a
   // stale coordinate is refused, not mis-spliced (F7). An empty value shows a `[blank]` placeholder (a
   // hint, NOT a value) so a freshly-inserted template reads as "fill me in"; `placeholder` is inert on
@@ -3062,7 +3069,9 @@ function renderLiteralInputHtml(
     const current =
       !inSet && p.value !== ""
         ? `<option value="${escapeHtml(p.value)}" selected>${escapeHtml(p.value)}</option>`
-        : "";
+        : blankFirst
+          ? `<option value="" selected></option>`
+          : "";
     const options = widget.choices
       .map(
         (c) =>
@@ -3151,17 +3160,22 @@ function renderTemplateEditorHtml(
       ? ""
       : `<input type="text" class="tsource" readonly disabled value="${escapeHtml(source)}" ` +
         `data-tip="This template has no parts form. Add a field to write a new template in its place." />`;
-  // `.tpart-blank` is the empty text chip "Add text" clones, so the webview never builds chip markup of
-  // its own that could drift from this renderer's.
+  // The two `.tpart-blank` templates are the empty chips "Add text" and "Add field" clone, so the webview
+  // never builds chip markup of its own that could drift from this renderer's. The hint is shown while
+  // the webview holds a template back because it has no filled-in field yet (see stepsWebview.js).
   return (
     noPartsForm +
     `<div class="tparts" ${editCoordAttrs(handlerName, row, name)}>` +
-    `<template class="tpart-blank">${renderTemplatePartHtml({ text: "" })}</template>` +
+    `<template class="tpart-blank" data-part="text">${renderTemplatePartHtml({ text: "" })}</template>` +
+    `<template class="tpart-blank" data-part="path">${renderTemplatePartHtml({ path: "" })}</template>` +
     parts.map(renderTemplatePartHtml).join("") +
     `<span class="tpart-add">` +
     `<button type="button" class="tpart-add-text" data-tip="Add a run of text">Add text</button>` +
     `<button type="button" class="tpart-add-path" data-tip="Add an HL7 field value">Add field</button>` +
-    `</span></div>`
+    `</span>` +
+    `<span class="tpart-hint" hidden>Not saved yet: a template needs every field filled in, and at ` +
+    `least one field. For plain text, switch to static.</span>` +
+    `</div>`
   );
 }
 
@@ -3217,7 +3231,7 @@ function renderModedFieldHtml(
       const literal: ParamField = { name: p.name, value: mode === "static" ? p.value : "" };
       return (
         `<div class="mode-pane" data-pane="static"${hidden}>` +
-        renderLiteralInputHtml(literal, handlerName, row, schema) +
+        renderLiteralInputHtml(literal, handlerName, row, schema, mode !== "static") +
         `</div>`
       );
     }

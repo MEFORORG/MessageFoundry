@@ -29,6 +29,8 @@ interface JsdomWindow {
   document: DomNode;
   Event: new (type: string, init?: Record<string, unknown>) => unknown;
   MouseEvent: new (type: string, init?: Record<string, unknown>) => unknown;
+  KeyboardEvent: new (type: string, init?: Record<string, unknown>) => unknown;
+  FocusEvent: new (type: string, init?: Record<string, unknown>) => unknown;
   [key: string]: unknown;
 }
 interface JsdomModule {
@@ -180,6 +182,19 @@ function click(p: Page, el: DomNode): void {
   el.dispatchEvent(new p.window.MouseEvent("click", { bubbles: true, cancelable: true }));
 }
 
+/** Focus leaving `from` for `to` (null: out of the page), as a browser reports it. */
+function leave(p: Page, from: DomNode, to: DomNode | null): void {
+  const target = from.querySelector(".tpart-input") ?? from;
+  target.dispatchEvent(new p.window.FocusEvent("focusout", { bubbles: true, relatedTarget: to }));
+}
+
+/** Click an editor's Add button and return the chip it added (the last chip). */
+function addChipBy(p: Page, box: DomNode, button: string): DomNode {
+  click(p, box.querySelector(button));
+  const chips = box.querySelectorAll(".tpart");
+  return chips[chips.length - 1];
+}
+
 const CHIP_INPUTS = ".tparts .tpart .tpart-input";
 
 suite("Steps modes webview: the selector and the parts editor post only what the engine accepts", () => {
@@ -196,13 +211,20 @@ suite("Steps modes webview: the selector and the parts editor post only what the
     assert.deepStrictEqual(diag, [], "no wiring reported a failure");
   });
 
-  test("editing a text part posts the whole template as parts, with the row's coordinates", () => {
+  test("a template is written once, when focus leaves its editor, with the row's coordinates", () => {
     const p = loadPage([TEMPLATED_VALUE]);
-    const inputs = p.field(7, "value").querySelectorAll(CHIP_INPUTS);
+    const field = p.field(7, "value");
+    const inputs = field.querySelectorAll(CHIP_INPUTS);
     const before = p.posted.length;
     change(p, inputs[0], "ID ");
+    change(p, inputs[2], " - ");
+    assert.deepStrictEqual(sent(p, before), [], "typing across chips writes nothing yet");
+    // Moving between chips of the same editor is still one pass.
+    leave(p, field.querySelector(".tparts"), inputs[1]);
+    assert.deepStrictEqual(sent(p, before), [], "focus moving inside the editor does not end the pass");
+    leave(p, field.querySelector(".tparts"), null);
     const msgs = sent(p, before);
-    assert.strictEqual(msgs.length, 1);
+    assert.strictEqual(msgs.length, 1, "one write for the whole pass");
     const read = readEditMessage(msgs[0]);
     assert.ok(read && "edit" in read, "the provider's guard accepts the posted template");
     assert.deepStrictEqual(read.edit, {
@@ -211,22 +233,55 @@ suite("Steps modes webview: the selector and the parts editor post only what the
       lineStart: 7,
       lineEnd: 7,
       name: "value",
-      value: { parts: [{ text: "ID " }, { path: "PID-3.1" }, { text: " / " }, { path: "PID-5.1" }] },
+      value: { parts: [{ text: "ID " }, { path: "PID-3.1" }, { text: " - " }, { path: "PID-5.1" }] },
       expectSrc: LINES[6],
     });
+    // Nothing changed since: leaving again writes nothing.
+    leave(p, field.querySelector(".tparts"), null);
+    assert.strictEqual(sent(p, before).length, 1);
   });
 
-  test("a typed field path is a {path} part, never Python source", () => {
+  test("Enter in a chip ends the pass and writes", () => {
     const p = loadPage([TEMPLATED_VALUE]);
-    const inputs = p.field(7, "value").querySelectorAll(CHIP_INPUTS);
+    const input = p.field(7, "value").querySelectorAll(CHIP_INPUTS)[1];
     const before = p.posted.length;
-    change(p, inputs[1], "PID-3.4");
+    input.value = "PID-3.4";
+    input.dispatchEvent(new p.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     const [msg] = sent(p, before);
     assert.deepStrictEqual((msg.value as { parts: unknown[] }).parts[1], { path: "PID-3.4" });
     assert.ok(!JSON.stringify(msg).includes("msg["), "no source is ever built in the webview");
   });
 
-  test("removing a part posts the template without it", () => {
+  test("a pass with no field, or an empty one, is held back with a hint, not sent", () => {
+    const p = loadPage([STATIC_VALUE]);
+    const field = p.field(6, "value");
+    change(p, field.querySelector("select.mode-select"), "templated");
+    const box = field.querySelector(".tparts");
+    const hint = box.querySelector(".tpart-hint");
+    assert.strictEqual(hint.hidden, true);
+    const before = p.posted.length;
+    // Only text: the engine would refuse it, and its refusal would re-project the page.
+    change(p, box.querySelectorAll(CHIP_INPUTS)[0], "Mr SMITH");
+    leave(p, box, null);
+    assert.deepStrictEqual(sent(p, before), [], "a template with no field is not sent");
+    assert.strictEqual(hint.hidden, false, "the hint says why");
+    // Typing a path into a new field chip completes it; the pass is then written.
+    const chip = addChipBy(p, box, ".tpart-add-path");
+    const pickReq = sent(p, before);
+    assert.strictEqual(pickReq.length, 1, "Add field asks for a pick");
+    change(p, chip.querySelector(".tpart-input"), "");
+    leave(p, box, null);
+    assert.strictEqual(sent(p, before).length, 1, "an empty field is held back too");
+    assert.strictEqual(hint.hidden, false);
+    change(p, chip.querySelector(".tpart-input"), "PID-3");
+    leave(p, box, null);
+    const msgs = sent(p, before);
+    assert.strictEqual(msgs.length, 2);
+    assert.deepStrictEqual(msgs[1].value, { parts: [{ text: "Mr SMITH" }, { path: "PID-3" }] });
+    assert.strictEqual(hint.hidden, true);
+  });
+
+  test("removing a part writes the template without it", () => {
     const p = loadPage([TEMPLATED_VALUE]);
     const chips = p.field(7, "value").querySelectorAll(".tpart");
     const before = p.posted.length;
@@ -242,7 +297,7 @@ suite("Steps modes webview: the selector and the parts editor post only what the
     const p = loadPage([TEMPLATED_VALUE]);
     const field = p.field(7, "value");
     // Typed but not yet committed: the pick must carry it, or the pick's write would drop it.
-    field.querySelectorAll(CHIP_INPUTS)[0].value = "UNSAVED ";
+    change(p, field.querySelectorAll(CHIP_INPUTS)[0], "UNSAVED ");
     const before = p.posted.length;
     click(p, field.querySelectorAll(".tpart")[3].querySelector(".tpart-pick"));
     const msgs = sent(p, before);
@@ -251,42 +306,42 @@ suite("Steps modes webview: the selector and the parts editor post only what the
     assert.ok(pick, "the provider's guard accepts the pick request");
     assert.strictEqual(pick.index, 3);
     assert.deepStrictEqual(pick.parts[0], { text: "UNSAVED " });
+    // The pick's write carries the pass, so leaving afterwards writes nothing more.
+    leave(p, field.querySelector(".tparts"), null);
+    assert.strictEqual(sent(p, before).length, 1);
   });
 
-  test("Add field asks for a new path part at the end", () => {
+  test("Add field adds an empty field chip and asks the picker to fill it", () => {
     const p = loadPage([TEMPLATED_VALUE]);
+    const box = p.field(7, "value").querySelector(".tparts");
     const before = p.posted.length;
-    click(p, p.field(7, "value").querySelector(".tpart-add-path"));
+    addChipBy(p, box, ".tpart-add-path");
     const pick = readPickPartMessage(sent(p, before)[0]);
-    assert.ok(pick);
+    assert.ok(pick, "the provider's guard accepts it: the index names the new empty path part");
     assert.strictEqual(pick.index, 4);
-    assert.strictEqual(pick.parts.length, 4);
+    assert.deepStrictEqual(pick.parts[4], { path: "" });
+    assert.strictEqual(box.querySelectorAll(".tpart").length, 5, "the chip stays for a typed path");
   });
 
-  test("Add text adds an empty chip and posts nothing until the text is committed", () => {
+  test("Add text adds an empty chip and writes nothing until the pass ends", () => {
     const p = loadPage([TEMPLATED_VALUE]);
-    const field = p.field(7, "value");
+    const box = p.field(7, "value").querySelector(".tparts");
     const before = p.posted.length;
-    click(p, field.querySelector(".tpart-add-text"));
+    const chip = addChipBy(p, box, ".tpart-add-text");
     assert.deepStrictEqual(sent(p, before), [], "adding an empty chip writes nothing");
-    const inputs = field.querySelectorAll(CHIP_INPUTS);
-    assert.strictEqual(inputs.length, 5);
-    change(p, inputs[4], " end");
+    assert.strictEqual(chip.dataset.part, "text");
+    change(p, chip.querySelector(".tpart-input"), " end");
+    leave(p, box, null);
     const [msg] = sent(p, before);
     assert.deepStrictEqual((msg.value as { parts: unknown[] }).parts[4], { text: " end" });
   });
 
-  test("a part button never selects the row or blurs a typed chip first", () => {
-    // The page default-selects the LAST row, so the templated row goes first to start unselected.
-    const p = loadPage([TEMPLATED_VALUE, STATIC_VALUE]);
-    const row = p.doc.querySelector('li.row[data-line-start="7"]');
-    assert.ok(!row.classList.contains("selected"), "the templated row starts unselected");
+  test("a part button's mousedown keeps the focus, so a click never ends the pass first", () => {
+    const p = loadPage([TEMPLATED_VALUE]);
     const btn = p.field(7, "value").querySelector(".tpart-add-path");
     const down = new p.window.MouseEvent("mousedown", { bubbles: true, cancelable: true }) as DomNode;
     btn.dispatchEvent(down);
-    assert.strictEqual(down.defaultPrevented, true, "mousedown on a part button keeps the focus");
-    click(p, btn);
-    assert.ok(!row.classList.contains("selected"), "a part button click does not select its row");
+    assert.strictEqual(down.defaultPrevented, true);
   });
 
   test("switching modes only shows the other pane, and writes nothing", () => {
@@ -302,10 +357,10 @@ suite("Steps modes webview: the selector and the parts editor post only what the
     assert.strictEqual(pane("templated").hidden, false);
     assert.deepStrictEqual(sent(p, before), [], "a mode switch alone never writes");
     // The templated pane starts from the literal, so the first field pick keeps the text.
-    click(p, field.querySelector(".tpart-add-path"));
+    addChipBy(p, field.querySelector(".tparts"), ".tpart-add-path");
     const pick = readPickPartMessage(sent(p, before)[0]);
     assert.ok(pick);
-    assert.deepStrictEqual(pick.parts, [{ text: "SMITH" }]);
+    assert.deepStrictEqual(pick.parts, [{ text: "SMITH" }, { path: "" }]);
     assert.strictEqual(pick.index, 1);
   });
 

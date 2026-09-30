@@ -606,16 +606,22 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
 
     // Run the native cascading field picker (ADR 0104 §2.3), then write what `build` makes of the picked
     // path through applyPickedEdit's set_params splice. The picker runs OUTSIDE the edit guard (a modal
-    // must not hold the single edit slot — mirrors pickSample). No schema bundle → nothing to pick
-    // (silent no-op); a cancelled pick writes nothing. Shared by a literal path pick and a template
-    // part pick (#237), which differ only in the value they build.
+    // must not hold the single edit slot — mirrors pickSample). No schema bundle → nothing to pick, so
+    // say so and leave the typed value to stand; a cancelled pick writes nothing. Shared by a literal
+    // path pick and a template part pick (#237), which differ only in the value they build.
     const pickThenApply = async (
       coords: Omit<EditMessage, "command" | "value">,
       mode: "path" | "segment",
       seed: string,
       build: (picked: string) => EditMessage["value"],
     ): Promise<void> => {
-      if (!this.schema || disposed) {
+      if (disposed) {
+        return;
+      }
+      if (!this.schema) {
+        void vscode.window.showInformationMessage(
+          "MessageFoundry: the HL7 field picker has no schema bundle here. Type the field path instead.",
+        );
         return;
       }
       const picked = await pickHl7Path(this.schema, {
@@ -727,7 +733,13 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           const read = readEditMessage(m);
           if (read !== undefined && "refused" in read) {
             void vscode.window.showErrorMessage(`MessageFoundry: could not apply the edit — ${read.refused}`);
-            void render(); // revert the webview's unsent change to the true projection
+            // Revert the webview's unsent change to the true projection, but never under an edit in
+            // flight: then the refresh is owed and runs when the slot frees, as a suppressed save does.
+            if (guard.shouldReactToDocumentChange()) {
+              scheduleRerender();
+            } else {
+              guard.noteSuppressedChange();
+            }
           } else if (read !== undefined) {
             void applyEdit(read.edit);
           }

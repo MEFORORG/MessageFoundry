@@ -204,9 +204,16 @@
     // written, and one pane per writable mode (stepsModel.renderModedFieldHtml). The modes offered come
     // from the engine's lists; nothing here decides a mode or reads Python. Switching the selector only
     // shows the other pane, so a switch alone never writes. The static pane is today's `input.edit`, so
-    // the listener above posts it. The templated pane edits PARTS: every committed change posts the whole
-    // template as {parts: [...]}, which the engine renders and checks. A field pick goes through the
-    // provider's picker as a `pickPart` request, so the picker yields a {path} part, never source.
+    // the listener above posts it. The templated pane edits PARTS and posts the whole template as
+    // {parts: [...]}, which the engine renders and checks. A field pick goes through the provider's
+    // picker as a `pickPart` request, so the picker yields a {path} part, never source.
+    //
+    // A template is written ONCE per editing pass, not per chip: typing marks the editor dirty, and the
+    // write happens when focus leaves the editor, on Enter, or on Remove. Every write rewrites the row and
+    // re-projects the page, so a write per chip would race the next chip's write into a stale-coordinate
+    // refusal (F7) or wipe typing in progress. A pass is also held back, with a visible hint, while the
+    // template has no field or an empty one: the engine refuses both, and its refusal would re-project
+    // the page and throw the pass away. The engine still checks every template it is sent.
     // Wrapped like the context menu, so a throw here can never kill the wiring around it.
     try {
       (function wireModedArguments() {
@@ -227,16 +234,35 @@
             expectSrc: box.dataset.expectSrc,
           };
         }
-        function postTemplate(box) {
-          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: collectParts(box) } }));
+        function setHint(box, shown) {
+          const hint = box.querySelector('.tpart-hint');
+          if (hint) { hint.hidden = !shown; }
         }
+        // Write the editor's template if it has unsaved changes and at least one field, none empty.
+        function flush(box) {
+          if (box.dataset.dirty !== 'true') { return; }
+          const parts = collectParts(box);
+          const paths = parts.filter((p) => 'path' in p);
+          if (paths.length === 0 || paths.some((p) => p.path === '')) { setHint(box, true); return; }
+          setHint(box, false);
+          box.dataset.dirty = '';
+          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: parts } }));
+        }
+        // Ask the provider to pick a field into part `index`. The request carries every chip, typing
+        // included, and its write replaces any pending pass.
         function postPick(box, index) {
+          setHint(box, false);
+          box.dataset.dirty = '';
           vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: collectParts(box), index: index }));
         }
-        // A new, empty text chip: a clone of the renderer's own blank chip, so its markup has one source.
-        function newTextChip(box) {
-          const blank = box.querySelector('template.tpart-blank');
-          return blank ? blank.content.firstElementChild.cloneNode(true) : null;
+        // A new, empty chip of `kind`: a clone of the renderer's own blank chip, so its markup has one
+        // source, placed before the Add buttons.
+        function addChip(box, kind) {
+          const blank = box.querySelector('template.tpart-blank[data-part="' + kind + '"]');
+          if (!blank) { return null; }
+          const chip = blank.content.firstElementChild.cloneNode(true);
+          box.insertBefore(chip, box.querySelector('.tpart-add'));
+          return chip;
         }
 
         for (const field of document.querySelectorAll('.field.moded')) {
@@ -252,33 +278,45 @@
         }
 
         for (const box of document.querySelectorAll('.tparts')) {
-          // Keep a button's mousedown from blurring a typed chip first: that blur would post a racing edit
-          // that shifts the row and staleness-refuses the click's own write (F7). The click carries the
-          // typed text anyway, because it reads every chip.
+          // Keep a button's mousedown from blurring a typed chip first, so a click never ends the pass
+          // before the button acts; the button's own action carries the typing.
           box.addEventListener('mousedown', (ev) => {
             if (ev.target.closest('button')) { ev.preventDefault(); }
           });
           box.addEventListener('change', (ev) => {
-            if (ev.target.classList && ev.target.classList.contains('tpart-input')) { postTemplate(box); }
+            if (ev.target.classList && ev.target.classList.contains('tpart-input')) { box.dataset.dirty = 'true'; }
+          });
+          box.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter' && ev.target.classList && ev.target.classList.contains('tpart-input')) {
+              ev.preventDefault();
+              box.dataset.dirty = 'true';
+              flush(box);
+            }
+          });
+          box.addEventListener('focusout', (ev) => {
+            if (!(ev.relatedTarget && box.contains(ev.relatedTarget))) { flush(box); }
           });
           box.addEventListener('click', (ev) => {
             const btn = ev.target.closest('button');
             if (!btn || !box.contains(btn)) { return; }
             ev.stopPropagation(); // a part button must not also (re)select the row
-            const chips = Array.from(box.querySelectorAll('.tpart'));
             const chip = btn.closest('.tpart');
             if (btn.classList.contains('tpart-del') && chip) {
               chip.remove();
-              postTemplate(box);
+              box.dataset.dirty = 'true';
+              flush(box);
             } else if (btn.classList.contains('tpart-pick') && chip) {
-              postPick(box, chips.indexOf(chip));
+              postPick(box, Array.from(box.querySelectorAll('.tpart')).indexOf(chip));
             } else if (btn.classList.contains('tpart-add-path')) {
-              postPick(box, chips.length);
-            } else if (btn.classList.contains('tpart-add-text')) {
-              const added = newTextChip(box);
+              // An empty field chip, then the picker for it. Cancelled, or with no picker, the chip
+              // stays for the path to be typed.
+              const added = addChip(box, 'path');
               if (!added) { return; }
-              box.insertBefore(added, box.querySelector('.tpart-add'));
-              added.querySelector('input').focus(); // nothing is posted until the text is committed
+              added.querySelector('input').focus();
+              postPick(box, Array.from(box.querySelectorAll('.tpart')).indexOf(added));
+            } else if (btn.classList.contains('tpart-add-text')) {
+              const added = addChip(box, 'text');
+              if (added) { added.querySelector('input').focus(); } // written with the pass, not now
             }
           });
         }
