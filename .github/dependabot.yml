@@ -60,9 +60,10 @@ updates:
     # pyproject.toml must be restated here as a version range or the cap is decorative. PR #66 rewrote
     # `annotated-types<0.8` -> `<0.9` (BOTH declaration sites) and `ruff>=0.4,<0.16` -> `<0.17`; the
     # resync then propagated 0.8.0/0.16.0 into constraints.lock, so ci.yml's `--constraint` pinned CI
-    # *to* the broken versions. `python-deps` groups on `*`, so those two red the WHOLE batch and hold
-    # every benign bump in it hostage. WHY each is capped lives beside the cap in pyproject.toml
-    # (annotated-types in [project.dependencies] and in the [fhir] extra; ruff in [dev]) — do not
+    # *to* the broken versions. `python-deps` groups every minor and patch on `*`, and both of those
+    # bumps are minors, so they red the WHOLE batch and hold every benign bump in it hostage. WHY
+    # each is capped lives beside the cap in pyproject.toml (annotated-types in
+    # [project.dependencies] and in the [fhir] extra; ruff in [dev]) — do not
     # restate it here; lift a cap and delete its entry in the SAME PR. ONE entry covers BOTH
     # annotated-types declarations: `ignore` filters a candidate VERSION by package name within this
     # manifest, not by declaration site, so a second entry would describe nothing.
@@ -122,9 +123,20 @@ updates:
       - dependency-name: "cyclonedx-bom"
         versions: [">=7.4.0"]
     groups:
-      # Version-update grouping (applies-to defaults to version-updates).
+      # Version-update grouping (applies-to defaults to version-updates), SPLIT BY UPDATE TYPE (owner
+      # decision 2026-09-30) so one bad major cannot hold the routine minors and patches hostage.
+      # Keep the two lists covering all three levels: an update no group matches opens its own PR.
+      # Key and values checked 2026-09-30 against GitHub's dependabot-options-reference page.
+      # The level is read by version position, so a breaking 0.x release counts as a minor and
+      # still rides `python-deps`; the `ignore` caps above are what cover that case. Cost, accepted:
+      # both groups rewrite uv.lock, so in a week with both PRs open the second must rebase and
+      # re-run CI after the first merges, and the two cannot share a merge-queue batch.
       python-deps:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+      python-deps-major:
+        patterns: ["*"]
+        update-types: ["major"]
       # Security-update grouping: collapse multiple vulnerable-dep fixes into ONE PR so a single
       # review/merge clears them — faster remediation when several CVEs land together.
       python-security:
@@ -150,7 +162,7 @@ updates:
     groups:
       # One weekly PR for all action bumps instead of one PR per action (CI cost: every extra PR
       # buys a full required-check pass + a push-to-main run when it auto-merges). Mirrors the
-      # python-deps/ide-deps grouping above. A patch batched with a major rides the same PR —
+      # ide-deps grouping below. A patch batched with a major rides the same PR —
       # latency-only, auto-merge still gates on the full CI pass. Security updates keep their own
       # group so an advisory fix is never held behind a routine batch.
       actions-deps:
