@@ -1343,6 +1343,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **On Python 3.15 the engine stops offering SHA-224 TLS signature schemes.** Every context the
+  engine narrows drops `rsa_pkcs1_sha224`, `ecdsa_sha224` and `dsa_sha224` through
+  `SSLContext.set_server_sigalgs`. Read from the OpenSSL source, not yet measured on 3.15, that one
+  list covers client offers, server signatures and client certificate requests. The list is
+  OpenSSL's own catalogue minus SHA-224, with the three ML-DSA schemes that catalogue omits put
+  back at the front. Measured with the OpenSSL 3.5.7 command line (`-sigalgs`, not a CPython 3.15
+  run), the offer loses exactly the
+  three SHA-224 schemes; `rsa_pss_rsae_*` now comes before `rsa_pss_pss_*`. A build that refuses
+  the ML-DSA names still drops SHA-224, without ML-DSA, and logs a warning once. Python 3.14 is
+  unchanged. A 3.15
+  on an OpenSSL older than 3.4 pins nothing and logs a warning once. The LDAPS hop is not reached.
+  (`BACKLOG #1171`, ASVS 11.4.1, owner ruling 2026-09-29)
 - **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
   reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
   account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was
