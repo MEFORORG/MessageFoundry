@@ -23,6 +23,7 @@ from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
 from ._common import _pager, _seg
+from .approvals import approvals_link
 
 __all__ = [
     "dead_letter_pending",
@@ -469,8 +470,24 @@ def _resend_section(detail: MessageDetail) -> list[object]:
     ]
 
 
+def _reveal_cell(value: str | None, href: str, *, revealed: bool) -> object:
+    """A masked cell: the value as the engine sent it, plus a "Reveal" link to ``href`` while it is
+    masked (BACKLOG #2346, #2436; ASVS 14.2.6).
+
+    ``None`` (a caller without ``messages:view_summary``) and an empty value render as they always
+    did, with no link, because there is nothing to reveal. The masked value is still escaped by the
+    builder: masking is not sanitizing."""
+    if revealed or not value:
+        return value
+    return el("span", value, " ", el("a", "Reveal", href=href, class_="muted"))
+
+
 def message_detail(
-    detail: MessageDetail, raw_body: str | None, *, summary_revealed: bool
+    detail: MessageDetail,
+    raw_body: str | None,
+    *,
+    summary_revealed: bool,
+    errors_revealed: bool,
 ) -> Markup:
     """A single message: metadata + the AUDITED raw body (escaped inside <pre>) + deliveries/events, plus
     an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress.
@@ -479,17 +496,13 @@ def message_detail(
     fetch (BACKLOG #2345); the open carries no body. ``None`` means this route did not ask for it, so
     the page offers "Show raw message" instead (BACKLOG #2346, ASVS 14.2.6). ``summary_revealed``
     says whether this route asked the engine to reveal the summary; when it did not, the Summary
-    row offers "Reveal" beside the masked value. Neither link is a toggle: each is its own audited request."""
+    row offers "Reveal" beside the masked value. ``errors_revealed`` does the same for the
+    error-tier text, the Error row and each delivery's last error and event's detail (BACKLOG #2436):
+    while it is off, each masked value carries a "Reveal" link to ``/errors``. No link is a toggle:
+    each is its own audited request."""
     msg = _seg(detail.id)
-    summary_cell: object = detail.summary
-    if not summary_revealed and detail.summary:
-        # The masked value is still escaped by the builder: masking is not sanitizing.
-        summary_cell = el(
-            "span",
-            detail.summary,
-            " ",
-            el("a", "Reveal", href=f"/ui/messages/{msg}/summary", class_="muted"),
-        )
+    summary_href = f"/ui/messages/{msg}/summary"
+    errors_href = f"/ui/messages/{msg}/errors"
     meta = rows_table(
         ["Field", "Value"],
         [
@@ -499,8 +512,8 @@ def message_detail(
             ["Type", detail.message_type],
             ["Control ID", detail.control_id],
             ["Status", detail.status],
-            ["Summary", summary_cell],
-            ["Error", detail.error],
+            ["Summary", _reveal_cell(detail.summary, summary_href, revealed=summary_revealed)],
+            ["Error", _reveal_cell(detail.error, errors_href, revealed=errors_revealed)],
         ],
         adjustable=False,
     )
@@ -523,11 +536,27 @@ def message_detail(
     )
     outbox = rows_table(
         ["Destination", "Status", "Attempts", "Last error"],
-        [[o.destination_name, o.status, o.attempts, o.last_error] for o in detail.outbox],
+        [
+            [
+                o.destination_name,
+                o.status,
+                o.attempts,
+                _reveal_cell(o.last_error, errors_href, revealed=errors_revealed),
+            ]
+            for o in detail.outbox
+        ],
     )
     events = rows_table(
         ["When", "Event", "Destination", "Detail"],
-        [[e.ts, e.event, e.destination, e.detail] for e in detail.events],
+        [
+            [
+                e.ts,
+                e.event,
+                e.destination,
+                _reveal_cell(e.detail, errors_href, revealed=errors_revealed),
+            ]
+            for e in detail.events
+        ],
     )
     replay = el(
         "form",
@@ -864,8 +893,9 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
             d.destination_name,
             d.message_type,
             d.attempts,
-            d.last_error,
-            el("a", "view", href=f"/ui/messages/{d.message_id}"),
+            # No reveal here: the message's /errors reveals it (field_authz, BACKLOG #2436).
+            _reveal_cell(d.last_error, f"/ui/messages/{_seg(d.message_id)}/errors", revealed=False),
+            el("a", "view", href=f"/ui/messages/{_seg(d.message_id)}"),
         ]
         for d in data.dead_letters
     ]
@@ -958,6 +988,7 @@ def dead_letter_pending(pending: object) -> Markup:
             class_="muted",
         ),
         el("p", text(f"Approval id: {approval_id}"), class_="muted"),
+        approvals_link(),
         el("p", el("a", "← Dead letters", href="/ui/dead-letters")),
         class_="card",
     )

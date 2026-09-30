@@ -116,7 +116,8 @@ Consolidate these before you install anything:
       cross-platform Python.
 - [ ] **Administrator/elevation** on the host if you will install the Windows service.
 - [ ] **Outbound network access** for the service installer to download the SHA-256-pinned NSSM
-      binary (or pre-stage NSSM on the host / on `PATH`).
+      binary. Offline, pass `-NssmPath` with the win64 `nssm.exe` from `nssm-2.24.zip`. A copy
+      on `PATH` counts only if it is that exact binary; a package manager's build is skipped.
 - [ ] **Firewall plan:** open your inbound MLLP listener port(s) (the samples use e.g. `2575`/`2600`)
       to senders, and decide who may reach the **API on `127.0.0.1:8765`** (default loopback —
       keep it that way; see §6).
@@ -296,12 +297,13 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 
 ### 4.4 Run it as a Windows service (the supported production run-mode)
 
-Use the elevated installer; install under a **least-privilege virtual account** rather than the
-default LocalSystem:
+Use the elevated installer. It runs the service under a **least-privilege virtual account**. That
+is now its default, so `-ServiceAccount` below only makes the choice explicit. `-Environment` is
+required:
 
 ```powershell
 # from an elevated shell
-scripts\service\install-service.ps1 -ServiceAccount "NT SERVICE\MessageFoundry"
+scripts\service\install-service.ps1 -Environment prod -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
 
 The installer is idempotent, auto-downloads a SHA-256-pinned NSSM, bakes absolute `serve` paths into
@@ -311,7 +313,7 @@ account. Service defaults: name `MessageFoundry`, data dir `C:\ProgramData\Messa
 
 > ⚠️ **Pinned-wheel operational model.** With a pinned-version install (§4.1), the running service
 > loads the **installed wheel** — a known, pinned version, not a moving checkout. Picking up a new
-> engine version is a deliberate `pip install "messagefoundry==<new>"` + NSSM restart (§13), so every
+> engine version is a deliberate run of the §13 upgrade runbook, which pins the new version, so every
 > upgrade is an explicit, reviewable act. *(A contributor running the **editable** install instead
 > serves whatever branch is checked out — treat that checkout as the release artifact; see §13.)*
 
@@ -729,8 +731,9 @@ message, and confirm the **"wiring started"** banner in `service.out.log`.
 (ACL them; don't ship them off-box — off-box logging is deferred), and include them in your retention
 policy.
 
-**Graceful drain for maintenance:** stopping the service (Ctrl+C / NSSM stop) triggers the ASGI
-lifespan to call `engine.stop()` for a clean drain. Always **drain → stop → back up → change → restart
+**Graceful drain for maintenance:** `Stop-Service MessageFoundry` reaches the engine as Ctrl+C,
+through NSSM. That, or Ctrl+C on a foreground `serve`, makes the ASGI lifespan call `engine.stop()`
+for a clean drain. Always **drain → stop → back up → change → restart
 → verify**.
 
 **Failure-drill runbook — rehearse these in the lab/staging before prod:**

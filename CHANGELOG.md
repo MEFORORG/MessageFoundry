@@ -7,6 +7,13 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Turning the sign-in limiter or the account lockout off is now warned, not silent.** While
+  sign-in is on, `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a
+  `login_rate_limit_per_ip` or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds`
+  of `0` or less, a `lockout_minutes` of `0` or less, and a `lockout_threshold` above the 100 that
+  NIST SP 800-63B allows, so each reaches the `serve` loosening warning, `messagefoundry security
+  show` and `GET /security/posture`. The shipped defaults report nothing new. (`BACKLOG #1131`,
+  ASVS 6.1.1)
 - **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
   before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
   off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and
@@ -285,11 +292,35 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
+  encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
+  `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256
+  MAC. That MAC still derives its key from the passphrase through the PKCS#12 KDF. It is now
+  refused like any MAC that is not PBMAC1 at the PBKDF2 floor. **This includes OpenSSL's default
+  MAC and `cryptography`'s `NoEncryption` output**, which carries a SHA-256 MAC under an empty
+  passphrase. An unencrypted bundle with no MAC (`-nomac`) still loads with no passphrase, since
+  nothing in it comes from a password. A bundle with an approved MAC now needs `MEFOR_PFX_PASSWORD`
+  even when its bags are clear. The refusal gives the `openssl` re-export commands. (`BACKLOG #1352`)
+- **BREAKING: the `Http()` listener answers 400 to a request that repeats its credential header.**
+  That header is `intake_api_key_header` under `intake_auth="api_key"` and `Authorization` under
+  `"bearer"`. In the shipped code the listener kept the last copy. So `x-api-key: wrong` then
+  `x-api-key: <key>` was accepted, while a front end reading the first copy saw a wrong key. The
+  listener now refuses the request before it compares any credential. Identical copies are refused
+  too, and `x_api_key` counts as a copy of `x-api-key`. The refusal is charged and audited like a
+  wrong key, and it never names the header or its value. `docs/SECURITY.md` Table B, intake
+  authentication row, states the rule. (`BACKLOG #2051`)
+- **`GET /cluster/status` says whether a stepdown on this node would send its lease release.** The
+  new `owns_lease_row` field is the coordinator's own drain test, now the public
+  `ClusterCoordinator.may_own_lease_row()` on the Postgres, SQL Server and single-node coordinators.
+  It is true at least while the node leads and on a self-fenced node. It is also true while an
+  earlier release write is owed. It means "may own": if another node has taken the lease, the
+  stepdown releases nothing and answers `409`. The web console reads it to offer the stepdown
+  control. It is false on a single node. See `docs/CLUSTERING.md`. (`BACKLOG #1988`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
   its first byte, and the snapshot gets it once its copy completes. A server-DB store stages in
-  `.mefor-staging` under `[backup].destination`, where the engine applies no ACL. Staging is
+  `.mefor-staging` under `[backup].destination`, secured the same way (see Fixed). Staging is
   removed on success, on an exception and on cancellation. A directory left by a crash or `SIGKILL`
   is removed by the next backup, which goes by each directory's lock and never by its age, so a
   sibling engine shard's live run survives it; nothing is swept at `serve` start. When a good
@@ -603,6 +634,101 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
+  The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
+  dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
+  pause the stopped lane and the next open resume it, retrying the fault every window. The
+  dispatcher now reports the STOPs it decides itself to the runner, which holds the lane until a
+  real re-arm. A loopback's re-ingress lane is held too, as its inbound: after a log-write halt, a
+  window open would have resumed that stopped lane.
+  (`BACKLOG #2072`)
+- **The scheduler no longer starts a connection the DR run-profile parked.** A window open called
+  the same start an operator uses, which reads as overriding the profile. On a DR box it would have
+  bound a below-threshold listener and cleared its `filtered` status. The scheduler now leaves a
+  filtered connection alone in both directions. An operator start still overrides the profile, and
+  the calendar owns the connection from then on. (`BACKLOG #2067`)
+- **A log-write halt no longer makes the scheduler restart and re-page every tick.** A halted
+  scheduled connection reads as not running, so each in-window tick called start. On a first
+  deployment an inbound would have bound its partner port, probed the dead log sinks, paged and
+  unbound, every tick; an outbound would have probed and paged. The scheduler now treats the halt
+  as a held stop while the halt is latched, so the halt's own page is the only one. Once a restart
+  proves the log writable, the calendar may bring the other halted connections back.
+  The probe stays on the event loop; moving it to a thread opened a window at two recovery doors.
+  (`BACKLOG #2066`)
+- **A credential fault on a batching outbound now stops the lane and keeps the batch.** The
+  single-message path already stopped on a permanent credential fault (#109). The HL7 batch path
+  had no such branch, so a bad password would have dead-lettered every message in the batch. Under
+  the default `credential_fault_policy = "stop"` the batch path now stops the lane, pages, and
+  returns every member to pending with its attempt given back. `"dead_letter"` still dead-letters
+  the batch. (`BACKLOG #2073`)
+- **A reload now keeps each connection's schedule in step with the new config.** A scheduler task
+  kept the calendar it started with, and only engine start created one. A reload that added a
+  schedule never ran it, an edited schedule kept its old hours, and a removed connection logged a
+  traceback every tick. The reload also opened a schedule-parked listener's port until the next
+  tick closed it. A committed reload now replaces every scheduler task from the new config, and
+  leaves a scheduled inbound unbound outside its window. An outbound whose schedule is removed is
+  resumed if the calendar had parked it, since nothing else would. Because the reload no longer
+  binds that inbound, a port another process holds is first found at the window open. The window
+  open now records that inbound as failed and alerts once, as an engine start does, then retries
+  quietly each tick. (`BACKLOG #2069`)
+- **An FTP server that plainly says it is busy no longer stops an outbound lane.** Every 5xx reply
+  while an FTP or FTPS session opened was treated as a refused credential, which stops the lane
+  (ADR 0095). A reply that names a connection limit, such as ProFTPD's "maximum number of
+  clients", is now retried. A refused `AUTH TLS`, `PBSZ` or `PROT P` is now a permanent
+  configuration fault, not a credential fault. So is a plain session's login refusal that plainly
+  demands TLS, and a refused greeting. A configuration fault still stops the lane and keeps the
+  queue, because every queued message would meet the same refusal; its alert names the
+  configuration, not a credential. A login reply that names the credential or the account stays a
+  credential fault, even beside a limit or a TLS demand. So does any other 5xx at the login, and
+  now a 4xx that names the credential, such as `430 Invalid username or password`. The credential
+  words are broad on purpose, so a busy reply that also carries one, such as "blocked", still stops
+  the lane. Both faults follow `credential_fault_policy`: the default `stop` stops the lane, on the
+  single-message and the batch path, and `dead_letter` dead-letters the message. With
+  `validate_directory` on, the per-send listing passes both through and retries every other fault.
+  (`BACKLOG #2083`)
+- **The SFTP and FTP source now waits for a file to stop growing before it reads it.** A file is
+  read only once it lists at the same size on two polls in a row, as the local File source has done
+  since `BACKLOG #1811`, so a partner that pauses between writes for less than `poll_seconds` is
+  waited out. Every file now waits at least one poll. The gate is always on and reads the listed
+  size alone, since a remote listing has no reliable modification time; it cannot see a same-size
+  rewrite, nor anything on a server that lists every file at size 0. (`BACKLOG #2071`)
+- **An SFTP upload to a server that stops reading is now cut off, and a few SFTP errors that escaped
+  raw are now classified.** paramiko retries a stalled socket write without limit, so such an upload
+  would have held its worker thread for good. The connector now closes the connection once an upload
+  makes no progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per 32 KiB step), and the delivery is
+  retried, after the partial temp file is removed where it can be; a failed store now removes its temp, except
+  after a refused credential. An `EOFError` and a helper thread that cannot start are now transient, and a
+  `paramiko.SFTPError` is permanent. With `overwrite = false`, a same-named symlink, directory or
+  other non-file entry now counts as a collision, and `POST /connections/{name}/test` ensures and
+  lists the upload directory on one connection. (`BACKLOG #2082`)
+- **A DR backup or standalone `restore-verify` that will not fit now fails before it writes.** A
+  backup checks the free space on its staging and destination volumes after its sweep and before
+  anything is written. It counts the store file twice on the staging volume, the archive once on
+  the destination, and all three when the two share a volume. It checks again with the snapshot's
+  real size once the snapshot is taken, so a large idle WAL file does not refuse a run that fits.
+  A short run fails
+  with a `backup_failed` alert of the new kind `space` that names the volume and both sizes. A
+  standalone verify needs about twice the archive free under the OS temp dir. Short, it returns
+  `FAIL` with a reason that says the volume, not the archive, is at fault. A volume whose free
+  space cannot be read is not checked. The `cleanup` alert, raised when a good backup's staging
+  cannot be cleared, now uses its own subject, `dr_backup:staging`. It shared `dr_backup` with a
+  failed backup, and so shared its realert throttle: one could silence the other. An alert rule
+  that matches the subject `dr_backup` exactly no longer catches cleanup alerts; match
+  `dr_backup:staging` too. A server-DB store's backup staging under `.mefor-staging` is now
+  secured like a SQLite store's: each staged file gets the store's `_secure_file`. Every staging
+  directory, in a SQLite data directory, in `.mefor-staging` and a standalone verify's under the
+  OS temp dir alike, must now come out owner-only. On a volume that will not keep a directory
+  owner-only, a backup fails with a reason naming the directory, and a
+  standalone `restore-verify` returns `FAIL` saying the volume is at fault. Volumes that can
+  refuse include, for example, a CIFS or Samba share without POSIX extensions, WSL `/mnt/c`
+  without `metadata`, a Docker Desktop bind mount of a Windows path, and FAT or exFAT. Setups on
+  such a volume that backed up before may now refuse. (`BACKLOG #1174`)
+- **A trailing-slash path is now a 404, never a redirect to an `http://` URL.** The engine used to
+  answer `GET /health/` or `GET /ui/` with a 307 before authentication, and its absolute `Location`
+  kept the request's scheme. Behind a TLS-terminating proxy whose `X-Forwarded-Proto` is not
+  trusted or not sent, that scheme is `http`, so the redirect would point a client at plaintext.
+  `create_app` now sets `redirect_slashes=False`. Use `/ui`, not `/ui/`, in a bookmark or a proxy
+  rule. (`BACKLOG #1968`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

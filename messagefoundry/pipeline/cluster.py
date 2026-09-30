@@ -615,6 +615,27 @@ class ClusterCoordinator(Protocol):
         """
         ...
 
+    def may_own_lease_row(self) -> bool:
+        """Whether a stepdown on this node would send the lease-expiring write, which is the
+        engine's own "would this node drain" test (BACKLOG #1508, #1988).
+
+        True when the gate reads True, when an earlier release write is owed, or when a confirmed
+        hold has not been cleared since. The last one is the self-fence window: the gate is clear on
+        this node's clock while its lease row still names it on the DB clock. False after a
+        release that returned, after a claim the DB answered with another owner's lease, and always
+        on :class:`NullCoordinator`, which has no lease row. Cheap and synchronous, like
+        :meth:`is_leader`: it reads cached state only, outside the leadership lock, so the answer is
+        point-in-time.
+
+        It says "may". The write is owner-scoped, so a node whose row a sibling took without this
+        node seeing it still reads True here, and its stepdown answers ``409``.
+
+        **This docstring is the source of record for what** ``ClusterStatus.owns_lease_row``
+        **means.** ``GET /cluster/status`` publishes this value under that name, and the web console
+        reads it to decide whether to offer the stepdown control; the console's own
+        ``_control_blocker`` says where it offers less than this."""
+        ...
+
 
 class NullCoordinator:
     """The single-node default (SQLite and single-node Postgres). Every gate is ``True``, there is no
@@ -693,6 +714,10 @@ class NullCoordinator:
         # single-node caller with 400 before it touches the coordinator (ADR 0056) — but a truthful
         # answer here keeps the Protocol honest for any direct caller.
         return StepdownOutcome(was_leader=False, released_at=None, lease_released=False)
+
+    def may_own_lease_row(self) -> bool:
+        # Single-node: there is no lease row, so a stepdown would drain nothing.
+        return False
 
 
 # One-time-per-process info guard: the active-passive HA feature set is COMPLETE — election (Step 4),
@@ -816,9 +841,11 @@ class DbCoordinator:
         # ADR 0056 slice 1: a lease-expiring write did not return, so this node may still own a live
         # lease row it has already stopped claiming in memory. _release_leadership ARMS it before the
         # write and clears it only when one returns, so neither a raise nor a cancellation can leave it
-        # clear. Read by step_down_leadership ALONE, to force the retry's write past the not-a-leader
-        # early return — without it a retry sends nothing and answers "not the leader" over a lease row
-        # that is still live and still ours.
+        # clear. Read through may_own_lease_row() by step_down_leadership, to force the retry's write
+        # past the not-a-leader early return — without it a retry sends nothing and answers "not the
+        # leader" over a lease row that is still live and still ours. Since BACKLOG #1988 that method
+        # is also read, lock-free, by GET /cluster/status, so a change to when this flag arms or
+        # clears also changes what the API publishes as owns_lease_row.
         self._lease_release_owed = False
         # ADR 0056 slice 1: mutual exclusion between _maintain_leadership and the stepdown's release.
         # BOTH of them decide leadership across an await on the pool, and a stepdown runs from an API
@@ -1294,7 +1321,7 @@ class DbCoordinator:
         )
         if row is None or row["owner"] != self.node_id:
             # The DB answered, and another node holds a live lease: this node owns no row, so drop both
-            # things _may_own_lease_row reads (BACKLOG #1508). An owed release is moot too: its
+            # things may_own_lease_row reads (BACKLOG #1508). An owed release is moot too: its
             # owner-scoped write can no longer match. Only here, where the row was actually read; the
             # short-circuits above return not-held without looking at it.
             self._last_renew_ok = None
@@ -1417,7 +1444,7 @@ class DbCoordinator:
         **A self-fenced node is drained too (BACKLOG #1508).** The fence clears the gate on the node's
         own clock while the row stays live on the DB clock, so gating the write on the gate refused
         exactly the drain an operator reaches for after a fence. The write is now gated on
-        :meth:`_may_own_lease_row`, and the pause and the demotion edge follow the row as well as the
+        :meth:`may_own_lease_row`, and the pause and the demotion edge follow the row as well as the
         gate. A node that has seen a sibling take its lease sends nothing and answers ``409``.
         """
         await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
@@ -1435,7 +1462,7 @@ class DbCoordinator:
             # Held across the await because the second arm below needs the SAME predicate, and
             # `self._is_leader` is already False by then — _release_leadership clears it on its first
             # line, so re-reading it there would silently arm nothing.
-            arming = self._may_own_lease_row()
+            arming = self.may_own_lease_row()
             prior_pause = self._no_claim_until
             if arming:
                 # Stand down long enough that every sibling has had a full tick at the expired lease.
@@ -1486,9 +1513,11 @@ class DbCoordinator:
             self._leadership_lock.release()
         return outcome
 
-    def _may_own_lease_row(self) -> bool:
+    def may_own_lease_row(self) -> bool:
         """Whether this node may own a lease row, so a stepdown must send the expiring write
         (BACKLOG #1508). Pure in-memory, so it adds no round trip to the stepdown's critical section.
+        Public since BACKLOG #1988, which publishes it through ``GET /cluster/status``; the Protocol
+        method :meth:`ClusterCoordinator.may_own_lease_row` says what that published value means.
 
         Three disjuncts. The gate reads True. An earlier write is owed
         (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and nothing
@@ -1531,7 +1560,7 @@ class DbCoordinator:
         count at all — see :class:`StepdownReleaseUnconfirmed`.
 
         ``force_write`` sends the ``UPDATE`` even when this node's in-memory gate already reads False.
-        Only :meth:`step_down_leadership` passes it, on :meth:`_may_own_lease_row`. :meth:`stop` never
+        Only :meth:`step_down_leadership` passes it, on :meth:`may_own_lease_row`. :meth:`stop` never
         does: it is best-effort by design, and a self-fenced node's pool is the one most likely to
         hang a shutdown on a write with no per-call bound. So a self-fenced node that is STOPPED still
         leaves its row to age out; that gap is outside BACKLOG #1508, which is the stepdown."""

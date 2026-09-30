@@ -112,7 +112,12 @@ fail loud:
 2. **Startup-time** — `create_app`'s `serve_ui` tail calls `assert_engine_seam(ENGINE_UI_SEAM)`
    **before** it builds the deps bundle, so a package that changed the bundle *shape* for a new seam
    surfaces as `UiSeamMismatch`, not a kwargs `TypeError`. A second identical assert at the top of
-   `mount_ui` is belt-and-suspenders.
+   `mount_ui` is belt-and-suspenders. A pair far enough apart fails one step earlier, at the
+   engine's import of the console, when one package imports a name the other lacks. The engine
+   names that case too (BACKLOG #1907): `serve` prints `error: refusing to mount the web console:`
+   and exits with code 2, and `create_app` raises a `RuntimeError`. Each says the console is
+   installed but failed to import, and names `ENGINE_UI_SEAM` and the installed console version.
+   The engine holds no minimum console version, so it names none.
 3. **CI** — the package suite runs against the supported engine seam(s); the engine repo's snapshot gate
    (below) fails on an incompatible change the seam did not follow.
 
@@ -169,8 +174,9 @@ omissions, because the gate's coverage *is* the list. Nothing below asks you to 
 Four files implement it:
 
 - [`scripts/seam_discovery.py`](../scripts/seam_discovery.py) — walks the console's own imports and
-  uses to derive the surface it depends on: the `api.security` deps, the `AuthService` members
-  (methods **and** properties), the `app.state` attributes, and the DTOs it renders, closed over
+  uses to derive the surface it depends on: the `api.security` deps, every other name it imports
+  from `auth.service` (constants, exceptions, result dataclasses; BACKLOG #2015), the `AuthService`
+  members (methods **and** properties), the `app.state` attributes, and the DTOs it renders, closed over
   nested models. An idiom the walk cannot resolve exactly raises `SeamDiscoveryError` rather than
   being skipped, so a new blind spot is loud instead of silent.
 - [`scripts/webconsole_seam_snapshot.py`](../scripts/webconsole_seam_snapshot.py) — emits a stable,
@@ -199,7 +205,8 @@ surface `seam_discovery.py` finds, so it exists only once the change is made and
 
 When you deliberately change the injected contract (add/rename a `CoreHandlers`/`AdminHandlers` field,
 change an `api.security` dep signature, rename a rendered DTO field or one of its `Literal` values,
-add/remove an `app.state` hook or a consumed `AuthService` member):
+add/remove an `app.state` hook or a consumed `AuthService` member, rename a name the console imports
+from `auth.service`):
 
 1. Make the contract change in the engine (and the matching consumer change in the package).
 2. Regenerate the engine side:
@@ -300,7 +307,9 @@ python -m pytest packaging/messagefoundry-webconsole/tests -q
 
   Both tests mock the app and the server, so they check the exit code and the message, not a live
   JSON-only serve. An embedder that calls `create_app(serve_ui=True)` directly gets a clear
-  `RuntimeError`, not a bare `ImportError`.
+  `RuntimeError`, not a bare `ImportError`. A console that is installed but fails to import is a
+  different case, with its own message, and
+  [`tests/test_webconsole_import_failure.py`](../tests/test_webconsole_import_failure.py) covers it.
 
 ---
 

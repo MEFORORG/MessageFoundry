@@ -376,7 +376,11 @@ class AlertSink(Protocol):
     def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
         """A scheduled or on-demand DR backup failed (ADR 0049, #60) — the snapshot, encrypt, write, or
         restore-verify step. ``name`` labels the source (``"dr_backup"``); ``kind`` is the failing phase
-        (``snapshot``/``encrypt``/``write``/``verify``/``destination``); ``detail`` is a PHI-free,
+        (``snapshot``/``encrypt``/``write``/``verify``/``destination``/``space``, the last when the
+        run would not fit on its staging or destination volume). One kind is not a failure: ``cleanup``
+        is a good run whose plaintext staging could not be cleared, and it is raised under its own
+        subject, ``"dr_backup:staging"``, so it never shares a failed backup's throttle or instance
+        (BACKLOG #1174). ``detail`` is a PHI-free,
         ``safe_exc``-scrubbed error **class/reason** — never a message body or key material. Dedicated
         (not reusing :meth:`storage_threshold`) so an operator can route/triage a backup failure
         independently of a store-size alert. Emitted by the

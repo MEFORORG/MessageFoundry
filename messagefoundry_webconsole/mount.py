@@ -29,6 +29,7 @@ from ._static import AllowlistedStaticFiles
 from .routes import (
     account,
     admin,
+    approvals,
     audit,
     cluster,
     config,
@@ -58,6 +59,9 @@ _REGISTRARS = (
     status,
     # BACKLOG #1495. Literal paths only, with no {param} sibling to shadow or be shadowed by.
     cluster,
+    # BACKLOG #1982. One literal path and two under /ui/approvals/{approval_id}/, with no sibling
+    # anywhere else in the table to shadow or be shadowed by.
+    approvals,
     monitoring_writes,
     connection_writes,
     config,

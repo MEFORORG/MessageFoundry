@@ -103,9 +103,20 @@ not a TOML key**; there is no `[api]` or `[security]` equivalent:
 setx MEFOR_TLS_REVOCATION_ATTESTED 1        # per-session: PowerShell $env:MEFOR_TLS_REVOCATION_ATTESTED="1"
 ```
 
-Under NSSM put it on the service, not in an interactive shell —
-`nssm set MessageFoundry AppEnvironmentExtra MEFOR_TLS_REVOCATION_ATTESTED=1` (see
-[`SERVICE.md`](SERVICE.md)). Setting it is **you taking responsibility for revocation**: the engine
+Under NSSM put it on the service, not in an interactive shell. Run the `nssm.exe` the installer
+checked, by its full path, not a bare `nssm` from `PATH`. The path below is the default
+`-NssmDir`; if you installed with another, use that folder:
+
+```powershell
+& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_TLS_REVOCATION_ATTESTED=1
+Restart-Service MessageFoundry
+```
+
+**That `set` replaces the service's whole list of extra variables.** Add any other variable the
+service needs to the same call. [`SERVICE.md`](SERVICE.md#start--stop--status) says how, and how to
+keep the store key out of that list.
+
+Setting it is **you taking responsibility for revocation**: the engine
 performs no OCSP/CRL check of its own (stdlib `ssl` has no fetch), so the certificate this listener
 presents must be backed by a revocation-checking PKI — short-lived / ACME-rotated certs, an
 OCSP-must-staple issuer, or a trust store that consults CRLs. If you cannot make that claim
@@ -342,9 +353,9 @@ mTLS here is **transport authentication only** unless you also populate
 | Hostname mismatch in the browser | The engine cert's SAN doesn't cover the host in `[security].web_console_public_address`. Reissue the cert with the right SAN, or point the origin at a name the cert covers. |
 | `https://…/ui` returns 404, engine started fine | The console auto-degraded to JSON-only: `[security].serve_web_console` was left at its default on an exposed instance, or the `messagefoundry-webconsole` wheel is missing. Both print a stderr warning at startup — check the service log. |
 | Engine won't start: `refusing to serve behind an upstream TLS terminator … without [api].plaintext_upstream_hop_acknowledged` | Option B with no `tls_cert_file`: the proxy-to-engine hop is plaintext and yours to secure. Set `plaintext_upstream_hop_acknowledged = true` under `[api]` once it is. |
-| Engine won't start: `refusing to serve the browser ops dashboard … without TLS` | An off-loopback `/ui` bind with no TLS. Configure `tls_cert_file` (Option A) or `tls_terminated_upstream` + `trusted_proxies` + `plaintext_upstream_hop_acknowledged` (Option B). `--allow-insecure-bind` does **not** cover `/ui`. |
+| Engine won't start: `refusing to serve the browser ops dashboard … without an operator certificate or a declared TLS-terminating proxy` | An off-loopback `/ui` bind with neither of those. The engine would still encrypt the hop on its generated self-signed placeholder, but no trust store vouches for that certificate, so the browser surface refuses it. Configure `tls_cert_file` (Option A) or `tls_terminated_upstream` + `trusted_proxies` + `plaintext_upstream_hop_acknowledged` (Option B). `--allow-insecure-bind` does **not** cover `/ui`. |
 | Engine won't start: `…serve_web_console=true needs the web console package` | Install `messagefoundry-webconsole` (or set `serve_web_console = false` for a JSON-only engine). |
-| Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without TLS on the JSON API — same fix as above. |
+| Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without an operator certificate on the JSON API. The engine would serve the placeholder there too, and refuses it for the same reason. Same fix as above. |
 | Engine won't start: `refusing to serve the API with in-process TLS on non-loopback host … performs NO certificate revocation check` | The [ADR 0078](adr/0078-certificate-revocation-posture.md) revocation gate on Option A. Set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the **service environment** (not the TOML), or move to Option B and let the proxy do revocation. This gate reads neither the data label nor `[security].enforcement`, so a synthetic/lab box and a `warn`-dialled box hit it too. |
 | Engine won't start: `refusing to serve on a … PHI instance … behind an upstream TLS terminator … without: [api].proxy_intra_service_auth …` | The Posture-B attestation gate on Option B. Declare **both** `[api].proxy_intra_service_auth` (`mtls`/`network`/`shared_secret`) and `[api].proxy_tls_min_version` (`1.2`/`1.3`) — see Option B's block. It fires on a PHI instance under `enforcement = enforce` with an off-loopback bind; the loopback-behind-a-proxy variant warns instead. |
 | Signed in, but every route returns `403` with `X-MFA-Required: 1` | `[security].require_mfa` is on (the default) and this account hasn't enrolled a factor. Enrol TOTP or a passkey at `/ui/account`; the browser session is confined to `/ui/mfa` until then. |

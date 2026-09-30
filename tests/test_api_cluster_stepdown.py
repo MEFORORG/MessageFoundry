@@ -18,7 +18,7 @@ which is the failure mode this file exists to rule out.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -124,6 +124,11 @@ class _StandinCoordinator(NullCoordinator):
 
     def is_clustered(self) -> bool:
         return self._clustered
+
+    def may_own_lease_row(self) -> bool:
+        # What a real coordinator reports outside the self-fence window: a clustered leader owns its
+        # row. NullCoordinator's answer (always False) would publish the opposite for a stand-in leader.
+        return self._clustered and self._leader
 
     async def cluster_members(self) -> list[ClusterMember]:
         self.calls.append("cluster_members")
@@ -387,6 +392,37 @@ async def test_a_self_fenced_drain_answers_200_and_audits_both_facts(tmp_path: P
         rows = await _rows(engine, "cluster_stepdown")
         assert len(rows) == 1
         assert json.loads(str(rows[0]["detail"])) == expected
+
+
+class _SelfFencedCoordinator(_StandinCoordinator):
+    """The gate is clear and the lease row still names this node: the self-fence window."""
+
+    def may_own_lease_row(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("make", "role", "owns"),
+    [
+        (lambda: _StandinCoordinator(clustered=True, leader=True), "primary", True),
+        (lambda: _StandinCoordinator(clustered=True, leader=False), "standby", False),
+        (lambda: _SelfFencedCoordinator(clustered=True, leader=False), "standby", True),
+        (lambda: _StandinCoordinator(clustered=False, leader=True), "single-node", False),
+    ],
+    ids=["leader", "standby", "self-fenced", "single-node"],
+)
+async def test_cluster_status_publishes_the_engines_own_drain_test(
+    tmp_path: Path, make: Callable[[], _StandinCoordinator], role: str, owns: bool
+) -> None:
+    coord = make()  # built per run: a stand-in carries state, so it is never shared across cases
+    # BACKLOG #1988. owns_lease_row is the coordinator's may_own_lease_row(), the same predicate the
+    # stepdown gates its write on, so a client can offer the control where the engine would send it.
+    # A self-fenced node reads role=standby and owns_lease_row=true: the flag alone cannot say it.
+    async with _admin(tmp_path, coord) as (_eng, c, boss):
+        r = await c.get("/cluster/status", headers=_auth(boss))
+        assert r.status_code == 200, r.text
+        assert r.json()["role"] == role
+        assert r.json()["owns_lease_row"] is owns
 
 
 async def test_single_node_is_refused_before_the_coordinator_is_touched(tmp_path: Path) -> None:

@@ -21,7 +21,7 @@ If an exclusion or rule is not justified below for *your* deployment, do not add
 | Windows service name | `MessageFoundry` (installed via **NSSM** wrapper) |
 | Registered service binary (`Application`) | `<repo>\.venv\Scripts\messagefoundry.exe` (a console-scripts shim) |
 | **Actual long-running process** (socket owner) | the venv **`python.exe`** that `messagefoundry.exe` re-execs |
-| Service wrapper process | `nssm.exe` (at `<DataDir>\bin\nssm.exe` by default) |
+| Service wrapper process | `nssm.exe` (at `C:\Program Files\MessageFoundry\nssm\nssm.exe` by default, the installer's `-NssmDir`) |
 | `DataDir` default | `C:\ProgramData\MessageFoundry` |
 | Message store DB | `C:\ProgramData\MessageFoundry\messagefoundry.db` |
 | DB sidecars (WAL mode) | `messagefoundry.db-wal`, `messagefoundry.db-shm` (hyphenated suffix on the **full** filename) |
@@ -59,7 +59,7 @@ Exclude these specific paths (substitute your real `DataDir`, repo path, and con
 | File-connector **outbound (destination) directory** + `*.part` + `*.probe` | Write-temp (`*.part`, `tempfile.mkstemp` suffix), then rename; reachability probe (`*.probe`) | Temp files churned on every delivery | Failed renames → stuck/duplicated delivery |
 | `<repo>\.venv\` | Engine Python virtual environment | Interpreter + dependencies, constantly memory-mapped | Import-time scan latency; DLL/`.pyd` false positives |
 | `<repo>\samples\config` or your real **config dir** | Connection/Router/Handler modules | Loaded at startup; not data, but scanned on read | Startup latency; spurious quarantine of `.py` |
-| `<DataDir>\bin\nssm.exe` | Cached service wrapper | Long-running supervisor binary | False-positive quarantine kills the service |
+| `C:\Program Files\MessageFoundry\nssm\nssm.exe` | Service wrapper, in the installer's `-NssmDir` | Long-running supervisor binary | False-positive quarantine kills the service |
 
 > **REMOTEFILE is different.** The directory exclusions above are for the **local File connector only**. If you use the **REMOTEFILE** connector (SFTP/FTP/FTPS), its files live on the **remote** server, not in a local watched directory — there is no local intake dir to exclude. REMOTEFILE instead needs an **outbound firewall rule** (see the firewall section). Do not invent a local-dir exclusion for it.
 
@@ -73,9 +73,9 @@ Exclude these specific paths (substitute your real `DataDir`, repo path, and con
 |---|---|
 | venv **`python.exe`** (`<repo>\.venv\Scripts\python.exe`) | The real long-running engine process: listeners, connect sockets, store I/O. Interpreters are a frequent heuristic false-positive, and on-access scanning of its memory-mapped modules adds latency to a real-time message path. |
 | `messagefoundry.exe` (`<repo>\.venv\Scripts\messagefoundry.exe`) | The registered service shim that re-execs `python.exe`. Exclude so the launcher isn't blocked/quarantined. |
-| `nssm.exe` (`<DataDir>\bin\nssm.exe`) | The service wrapper. A quarantine here stops the whole service. |
+| `nssm.exe` (`C:\Program Files\MessageFoundry\nssm\nssm.exe`) | The service wrapper. A quarantine here stops the whole service. |
 
-> There is **no** `.venv\Scripts\nssm.exe`. NSSM is resolved only from `-NssmPath`, from an on-`PATH` `nssm`, or auto-downloaded to `<DataDir>\bin\nssm.exe`.
+> There is **no** `.venv\Scripts\nssm.exe`. The service always runs the copy in the installer's `-NssmDir`. The installer fills that folder from `-NssmPath`, from an on-`PATH` `nssm`, or by downloading NSSM, and checks each against a pinned SHA-256 first.
 
 ### WAL corruption / latency — why the DB trio is the most important exclusion
 
@@ -102,7 +102,7 @@ Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\messagefoundry.db
 Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\messagefoundry.db-shm'
 Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\logs'
 Add-MpPreference -ExclusionPath 'C:\Path\To\MessageFoundry\.venv'
-Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\bin\nssm.exe'
+Add-MpPreference -ExclusionPath 'C:\Program Files\MessageFoundry\nssm\nssm.exe'
 # DPAPI store key + connector key/cert files — exclude their ACTUAL configured paths:
 Add-MpPreference -ExclusionPath 'C:\Path\To\store-key.bin'        # [store].encryption_key_file
 Add-MpPreference -ExclusionPath 'C:\Path\To\signing-key.pem'      # JWS / SMART / SOAP mTLS keys & certs
@@ -113,7 +113,7 @@ Add-MpPreference -ExclusionPath 'C:\Feeds\outbound'
 # --- Process exclusions ---
 Add-MpPreference -ExclusionProcess 'C:\Path\To\MessageFoundry\.venv\Scripts\python.exe'
 Add-MpPreference -ExclusionProcess 'C:\Path\To\MessageFoundry\.venv\Scripts\messagefoundry.exe'
-Add-MpPreference -ExclusionProcess 'C:\ProgramData\MessageFoundry\bin\nssm.exe'
+Add-MpPreference -ExclusionProcess 'C:\Program Files\MessageFoundry\nssm\nssm.exe'
 ```
 
 **Third-party EDR (CrowdStrike, SentinelOne, Defender for Endpoint, Sophos, etc.):** create the equivalent **file/folder exclusions** and **process/executable exclusions** for the same paths and processes through your management console, and ensure any key/cert files are excluded from **cloud sample submission / upload**, not just on-access scanning.

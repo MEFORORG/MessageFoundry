@@ -67,10 +67,10 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate, IdentityRe
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import (
-    MASKED_UNTIL_REVEALED,
     count_exposed,
     count_masked,
     redact_unauthorized,
+    revealable,
 )
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
@@ -678,7 +678,10 @@ def _cookie_secure(request: Request) -> bool:
     )
 
 
-def _get_engine(request: Request) -> Engine:
+async def _get_engine(request: Request) -> Engine:
+    # ``async`` so FastAPI runs this provider on the event loop instead of taking a thread from the
+    # shared AnyIO worker pool on every request (ASVS 15.4.4, BACKLOG #1195). It must stay
+    # non-blocking: a blocking call here would stall the loop instead.
     engine: Engine | None = getattr(request.app.state, "engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="engine not started")
@@ -695,9 +698,10 @@ def _executor_gauges(app: FastAPI) -> tuple[int | None, int | None]:
     return executor.queue_depth, executor.busy
 
 
-def _get_gate(request: Request) -> ApprovalGate | None:
+async def _get_gate(request: Request) -> ApprovalGate | None:
     """The dual-control approval gate (ASVS 2.3.5), or ``None`` when no engine is bound — then gated
-    endpoints execute inline and the ``/approvals`` routes report 503."""
+    endpoints execute inline and the ``/approvals`` routes report 503. ``async`` for the reason
+    :func:`_get_engine` gives."""
     return getattr(request.app.state, "approval_gate", None)
 
 
@@ -1678,6 +1682,12 @@ def create_app(
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
+    #
+    # redirect_slashes=False (BACKLOG #1968): Starlette otherwise answers a trailing-slash miss with a
+    # pre-auth 307 whose absolute Location carries the scope scheme. Behind a TLS-terminating proxy
+    # whose X-Forwarded-Proto is not trusted or not sent, that scheme is http, so the redirect would
+    # point the client at an http:// URL. A trailing-slash miss is now a 404.
+    # tests/test_api_redirect_slashes.py pins that no route ends in "/" and no mount redirects.
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -1685,6 +1695,7 @@ def create_app(
         docs_url="/docs" if expose_docs else None,
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
+        redirect_slashes=False,
     )
     if engine is not None:
         app.state.engine = engine
@@ -3506,6 +3517,8 @@ def create_app(
         # Same centralized per-property PHI gate as /messages (WP-9): messages:view_summary unlocks the
         # patient-identifying `summary` and the delivery `last_error` (which can quote field values —
         # review low-8); a caller without it gets them nulled. Exposure audited server-side (M-5).
+        # A holder gets both masked, and this list has no reveal of its own: see
+        # field_authz.ERROR_TEXT_MASKED_UNTIL_REVEALED (BACKLOG #2436).
         dead = [redact_unauthorized(d, identity) for d in dead]
         exposed, masked = count_exposed(dead), count_masked(dead)
         if exposed or masked:
@@ -3863,8 +3876,9 @@ def create_app(
         messages = [_summary(r) for r in rows]
         # Per-property PHI gate, centralized in api/field_authz (WP-9, ASVS 8.2.3): a caller without
         # messages:view_summary gets `summary` AND `error` (handler exception text can quote field
-        # values — review low-8) nulled; the detail endpoint keeps them, gated instead by
-        # messages:view_raw which already exposes the body.
+        # values — review low-8) nulled. A holder gets both masked here, with no reveal on the list:
+        # the summary and the error text are each lifted only by an explicit act on the single-message
+        # open (BACKLOG #2346, #2436).
         messages = [redact_unauthorized(m, identity) for m in messages]
         # Every patient-identifying value actually returned is audited SERVER-SIDE (coalesced per
         # actor/hour) — never gated on a client flag, so a scripted bulk fetch can't harvest the
@@ -4225,15 +4239,19 @@ def create_app(
         # Annotated rather than ``= Query(False)``, for the reason get_message_body gives: this is a
         # CoreHandlers seam function too, and an in-process caller that leaves it out must get False.
         reveal_summary: Annotated[bool, Query()] = False,
+        reveal_errors: Annotated[bool, Query()] = False,
     ) -> MessageDetail:
         """Open one message: metadata, deliveries, events and attachments, and never its body.
 
         ``reveal_summary`` is the explicit act that lifts the display mask on ``summary`` and
         ``metadata`` for this one response (BACKLOG #2346, ASVS 14.2.6). Left out, those two come
         back masked exactly as the list surfaces return them, so an open with no act aimed at the
-        summary (a dead-letter link, a replay redirect, a direct URL) does not unmask them. The open
-        still returns what no list does, the delivery errors and event details, gated on
-        ``messages:view_summary`` as before; the flag does not touch those."""
+        summary (a dead-letter link, a replay redirect, a direct URL) does not unmask them.
+
+        ``reveal_errors`` is a second, separate act (BACKLOG #2436, owner ruling R12). It lifts the
+        whole-value mask on the error-tier text: the message's ``error``, each delivery's
+        ``last_error`` and each event's ``detail``. Left out, those come back as a fixed mask. Both
+        flags only lift a mask; a caller without ``messages:view_summary`` still gets nulls."""
         row = await engine.store.get_message(message_id)
         # 404 (not 403) when the message is outside the caller's channel scope — don't reveal that a
         # message exists in another tenant's channel (per-channel RBAC).
@@ -4295,23 +4313,41 @@ def create_app(
         # and metadata exactly as the list does, and only ``reveal_summary`` lifts the mask, for THIS
         # response (BACKLOG #2346). The caller sets it on an act aimed at the summary: the web console
         # declares it per route, and a bare open (a dead-letter link, a replay redirect, a direct URL)
-        # leaves it off. The raw body is get_message_body's, a separate act with its own audit row.
-        # The unmask is a call argument with nowhere to live between calls, so it cannot become a
-        # session-wide toggle by accident.
-        outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
-        events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(
-            detail,
-            identity,
-            revealed=MASKED_UNTIL_REVEALED if reveal_summary else frozenset(),
-        ).model_copy(update={"outbox": outbox, "events": events})
+        # leaves it off; ``reveal_errors`` is the same for the error text (BACKLOG #2436). The raw
+        # body is get_message_body's, a separate act with its own audit row. Each unmask is a call
+        # argument with nowhere to live between calls, so it cannot become a session-wide toggle by
+        # accident. Each model's set is built once, here, and read by both the redaction and the
+        # audit below, so the two cannot disagree about what was revealed.
+        reveal = {
+            cls: revealable(cls, summary=reveal_summary, error_text=reveal_errors)
+            for cls in (MessageDetail, OutboxInfo, EventInfo)
+        }
+        outbox = [
+            redact_unauthorized(o, identity, revealed=reveal[OutboxInfo]) for o in detail.outbox
+        ]
+        events = [
+            redact_unauthorized(e, identity, revealed=reveal[EventInfo]) for e in detail.events
+        ]
+        detail = redact_unauthorized(detail, identity, revealed=reveal[MessageDetail]).model_copy(
+            update={"outbox": outbox, "events": events}
+        )
         # record_audit puts the open in the tamper-evident, GET /audit-visible compliance chain
         # (docs/PHI.md §6 names message_view as audited — review M-3), still before returning.
         # ``revealed`` names the masked-until-revealed properties this response carries complete,
-        # read from the redacted model rather than from the request: a caller without view_summary
+        # read from the redacted models rather than from the request: a caller without view_summary
         # got nulls, and an empty value had nothing to unmask, so neither is recorded as a
-        # disclosure it never received (BACKLOG #2346).
-        revealed = sorted(p for p in MASKED_UNTIL_REVEALED if reveal_summary and getattr(detail, p))
+        # disclosure it never received (BACKLOG #2346). A nested row's property is recorded under
+        # its list's name, `outbox.last_error` or `events.detail` (BACKLOG #2436).
+        revealed = sorted(
+            f"{prefix}{p}"
+            for prefix, cls, shown in (
+                ("", MessageDetail, [detail]),
+                ("outbox.", OutboxInfo, outbox),
+                ("events.", EventInfo, events),
+            )
+            for p in reveal[cls]
+            if any(getattr(m, p) for m in shown)
+        )
         await engine.store.record_audit(
             "message_view",
             actor=identity.username,
@@ -6223,7 +6259,10 @@ def create_app(
         """This node's cluster posture: id, whether it's clustered, whether it's the leader, its
         active-passive role, and the cached config version. All cheap in-memory coordinator gates — no DB
         round-trip. Single-node (NullCoordinator) reports clustered=false, is_leader=true,
-        role="single-node", config_version=0."""
+        role="single-node", config_version=0, owns_lease_row=false.
+
+        ``owns_lease_row`` is the coordinator's ``may_own_lease_row()`` (BACKLOG #1988), whose
+        Protocol docstring says what it means."""
         c = engine.coordinator
         clustered = c.is_clustered()
         is_leader = c.is_leader()
@@ -6234,6 +6273,7 @@ def create_app(
             is_leader=is_leader,
             role=role,
             config_version=c.config_version_cached(),
+            owns_lease_row=c.may_own_lease_row(),
         )
 
     @app.get("/cluster/nodes", response_model=ClusterNodeList)
@@ -6345,7 +6385,7 @@ def create_app(
           leads nothing — this branch asserts nothing about who the leader is.
         * ``StepdownReleaseUnconfirmed`` → reason ``release-unconfirmed``. This node **has** demoted
           itself and **this call armed its claim pause** — both hold on every branch that reaches the
-          raise, because the pause is armed on the coordinator's ``_may_own_lease_row()`` and the
+          raise, because the pause is armed on the coordinator's ``may_own_lease_row()`` and the
           write is only attempted under the same condition. What it could not confirm is whether the
           write expiring its lease row committed. A lost response to a committed ``UPDATE`` is
           indistinguishable from an ``UPDATE`` that never ran, so the body is conditional: saying "it
@@ -6805,10 +6845,23 @@ def create_app(
         # GUARDED import (Option B): the web console is an optional package, so the engine imports +
         # boots + serves the JSON API without it. It is required only when serve_ui is on, and a missing
         # install fails LOUD at startup here — never a mid-request 500. (The absent path is exercised by
-        # tests/test_webconsole_absent.py, which shadows the import.)
+        # tests/test_webconsole_absent.py, which shadows the import; the installed-but-broken path by
+        # tests/test_webconsole_import_failure.py.)
         try:
             from messagefoundry_webconsole import assert_engine_seam, mount_ui
-        except ImportError as exc:  # pragma: no cover
+        except ImportError as exc:
+            from messagefoundry.api._webconsole_import import (
+                console_import_failure,
+                console_is_absent,
+            )
+
+            # BACKLOG #1907: an INSTALLED console that fails to import (an old wheel missing a name
+            # this engine imports, or one whose own import chain breaks) is not "not installed". It
+            # raises here, before assert_engine_seam can name the mismatch, so name it instead.
+            if not console_is_absent(exc):
+                raise RuntimeError(
+                    f"serve_ui requires the web console, and {console_import_failure(exc)}"
+                ) from exc
             # ASVS 15.2.4: this string is an INSTALL INSTRUCTION the operator will paste, so what it
             # names has to be true. It once named a `webconsole` EXTRA that pyproject does not declare,
             # so the command simply failed. It now names the DISTRIBUTION, whose name has been
@@ -6913,6 +6966,9 @@ def create_app(
                 metrics_history=metrics_history,
                 graph_edges=graph_edges,
                 set_connection_flag=set_connection_flag,
+                list_approvals=list_approvals,
+                approve_action=approve_action,
+                reject_action=reject_action,
             ),
             admin=admin,
         )
@@ -7982,6 +8038,19 @@ def create_managed_app(
             if credential_reminder is not None:
                 credential_reminder.cancel()
                 await asyncio.gather(credential_reminder, return_exceptions=True)
+            # BACKLOG #2087: let approval outcome writes still running land before the store closes.
+            # A write whose caller was cancelled, such as by a request timeout, finishes on its own,
+            # and would otherwise meet a closed store. drain() is bounded, and it is guarded like the
+            # flush below, so neither a failure nor the deadline skips engine.stop(). The gate is
+            # read through getattr because a startup that failed early may not have built one.
+            approval_gate = getattr(app.state, "approval_gate", None)
+            if approval_gate is not None:
+                try:
+                    await approval_gate.drain()
+                except Exception:
+                    _log.exception(
+                        "approval gate: the shutdown drain failed; continuing the teardown"
+                    )
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
             # called it, so every clean restart dropped the open hour's PHI-summary access audit --

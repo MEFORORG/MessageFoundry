@@ -192,9 +192,10 @@ from typing import Any
 #:
 #: BACKLOG #1139: ``AuthService`` gained the public static ``suggested_notify_email``, which the
 #: console's ``/ui/account/notify-address`` form calls to pre-fill the address. It was first a
-#: module function in ``auth.service``, which discovery does not read, so the seam did not move and
-#: an older engine passed the handshake and then failed the console's import. A METHOD the console
-#: calls, so it forces a bump for the reason the ``factor_binding_is_blocked`` entry above gives.
+#: module function in ``auth.service``, which discovery did not read then, so the seam did not move
+#: and an older engine passed the handshake and then failed the console's import. A METHOD the
+#: console calls, so it forces a bump for the reason the ``factor_binding_is_blocked`` entry above
+#: gives. (Discovery reads the console's ``auth.service`` imports since BACKLOG #2015, below.)
 #:
 #: BACKLOG #1139, slice 3 (ADR 0182 Amendment A): ``UserUpdateRequest`` gained ``notify_email``, the
 #: one field that moves the notification address. Saving the profile ``email`` no longer moves it.
@@ -252,12 +253,23 @@ from typing import Any
 #: not #2346 would pass the handshake with this console and then fail each message page with a
 #: TypeError. Neither is released, so no such pair can ship, but the gate does not see it.
 #:
+#: BACKLOG #2436 (ASVS 14.2.6, owner ruling R12): ``get_message`` gained a second keyword,
+#: ``reveal_errors``, on the same terms and with the same blind spot. The digest did not move.
+#:
+#: BACKLOG #2015: discovery now reads every name the console imports from ``auth.service``, not
+#: only ``AuthService``. Those include step-up action constants, an exception, and result
+#: dataclasses whose fields the console reads; ``tests/test_seam_discovery.py`` pins the set.
+#: Renaming one moved nothing before, so a skewed pair passed the gate and failed at import. The
+#: contract did not change; the digest moved because the gate now sees more of it. A skewed pair
+#: still fails at import rather than with ``UiSeamMismatch`` until BACKLOG #1907 lands, because the
+#: console's route modules import these names eagerly.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "44e3109437ae7510"
+ENGINE_UI_SEAM: str = "e14988c64a45577c"
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,7 +289,8 @@ class CoreHandlers:
 
     list_connections: Callable[..., Awaitable[Any]]
     list_messages: Callable[..., Awaitable[Any]]
-    # Takes ``reveal_summary`` (BACKLOG #2346); the console sets it from its per-route reveal table.
+    # Takes ``reveal_summary`` (BACKLOG #2346) and ``reveal_errors`` (BACKLOG #2436); the console
+    # sets both from its per-route reveal table.
     get_message: Callable[..., Awaitable[Any]]
     # The raw body's own audited fetch (BACKLOG #2345). Its JSON gate is
     # require_phi_read(MESSAGES_VIEW_RAW), so a /ui route calling it must assert messages:view_raw
@@ -344,6 +357,14 @@ class CoreHandlers:
     # First console→connections.toml write seam (BACKLOG #131, ADR 0007 amendment; seam v9): the
     # object-flag toggle (config:deploy). TOML-managed connections only — a code-first one is refused 409.
     set_connection_flag: Callable[..., Awaitable[Any]]
+    # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
+    # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
+    # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
+    # write the same way. The resolve of an interrupted release is not on the seam: its JSON gate is
+    # require_step_up and the console renders those rows read-only.
+    list_approvals: Callable[..., Awaitable[Any]]
+    approve_action: Callable[..., Awaitable[Any]]
+    reject_action: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)

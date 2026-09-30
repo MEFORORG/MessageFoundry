@@ -318,6 +318,25 @@ the modules where any code reads input from outside the engine, whichever call t
 The second holds the ones that read only what the engine wrote itself or an operator supplied. The
 third table lists hand-written parsers the patterns cannot see, found by reading the code.
 
+**One rule decides a hand-over.** Some modules only hand outside input to other code. Such a module
+is in the first table when it hands the input to a parser. A parser here is a format library, a
+module under `parsing/`, or a module in the hand-read table. The module is in the second table when
+it hands the input only to other engine code, which picks the parser. A module that does both is in
+the first table. The rule places at least these modules:
+
+- `pipeline/wiring_runner.py`, first. It hands each received body to `pipeline/ingress_guards.py`,
+  and an HL7 body to `parsing/peek.py`.
+- `pipeline/dryrun.py`, first. It reads fixture files itself, and hands bodies to `parsing/`.
+- `store/store.py`, `store/postgres.py` and `store/sqlserver.py`, first. Each hands a stored
+  message body to `parsing/binary.py`.
+- `transports/loopback.py` and `transports/passthrough.py`, second. They hand their bodies to the
+  engine's intake.
+- `__main__.py`, second. It hands at least dry-run fixtures to `pipeline/dryrun.py` and
+  `pipeline/dryrun_trace.py`, a Corepoint export to `corepoint_import.py`, and a backup to
+  `pipeline/dr_backup.py`.
+- `auth/service.py`, second. It hands an identity provider's token to `auth/oidc/`, and a passkey
+  response to `auth/webauthn.py`. The first table's identity provider and passkey rows cover them.
+
 The scan leaves some parsing out on purpose, and it has limits:
 
 - `tomllib` is not in pattern 1. It reads at least service settings, connection files, environment
@@ -341,7 +360,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Input | Where it comes from | Modules |
 |---|---|---|
 | Inbound connectors | Whatever a sender or a polled source delivers. `transports/http_listener.py` reads the HTTP request line and headers itself. | `transports/file.py`, `transports/http_listener.py`, `transports/remotefile.py`, `transports/tcp.py`, `transports/x12.py`, `transports/database.py` |
-| The intake path | The shared ingress code that hands each received body to the parsers below | `pipeline/wiring_runner.py` |
+| The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py` |
+| Dry-run fixtures | The sample and batch files a dry run reads, such as the `--messages` files of `messagefoundry dryrun`. A fixture may be captured traffic. `read_fixture` reads each file, and `split_messages` hands a batch file to `parsing/split.py` to split. The scan's match in this module is different: a JSON decode of a value it encoded a moment before. | `pipeline/dryrun.py` |
+| A stored message body, when retention strips its documents | The body a sender delivered, decrypted from the store. Each backend's retention pass hands it to `parsing/binary.py`, in the hand-read table below, to strip its embedded documents. The scan's matches here are different: JSON the engine wrote itself. | `store/store.py`, `store/postgres.py`, `store/sqlserver.py` |
 | HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
 | JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
@@ -370,9 +391,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool | `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/metadata.py`, `store/crypto.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
+| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
-| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
+| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py` |
 
@@ -383,6 +404,8 @@ The scan leaves some parsing out on purpose, and it has limits:
 | MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
 | HL7 batch files, split into messages | `parsing/split.py` |
 | The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
+| An inbound text body, decoded with its connection's declared character set and checked for NUL bytes and size, before the HL7 peek or a Router sees it. A binary body is only size-checked and base64-carried. | `pipeline/ingress_guards.py` |
+| Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
 
@@ -438,6 +461,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |
 | It reads a value you typed into the extension's connection form | `connectionForm.ts` |
+| It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 
 **Extension files that parse text the patterns cannot see.**
@@ -485,7 +509,7 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
 | `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
@@ -507,20 +531,45 @@ Other switches on `install-service.ps1` change more than the service:
   keyed by program name. So they affect every process with that name on the machine, not only the
   engine.
 
-**Three scripts run programs they did not check.** `install-service.ps1` and
-`uninstall-service.ps1` look for NSSM in three places: `-NssmPath`, then `PATH`, then a copy cached
-in the data directory's `bin` folder. Only when all three miss does the installer download NSSM. It
-checks that download against a fixed SHA-256 hash, and stops on a mismatch. A copy found on `PATH`
-or in the cache runs without that check. The cache sits in the data directory, where the engine's
-service account can modify files. So code running as the engine could replace that `nssm.exe`, and
-the next install or uninstall would run it as administrator.
+**The installers run NSSM only from a folder administrators alone can write, and only a checked
+copy.** `install-service.ps1` keeps the service's `nssm.exe` in `-NssmDir`,
+`C:\Program Files\MessageFoundry\nssm` by default. It makes any folder it creates there
+administrator-only. It then reads the owner and permissions of the file, its folder and each folder
+above it, stopping below the drive root. It refuses when anyone else can write to or rename any of
+them. It
+fills the folder from `-NssmPath`, from `PATH`, or by downloading NSSM. It checks a download against
+a fixed SHA-256 hash of the archive. Every copy, from any of those places, must also match a fixed
+SHA-256 hash of `nssm.exe` itself before it is copied in. The installer refuses a `-NssmPath` copy
+that does not match, and a copy already in the folder that does not match. It skips a `PATH` copy
+that does not match, and downloads instead. Each message names both hashes. It then points the
+service's registration at that copy, quoted, and reads it back. On a reinstall that replaces
+whatever `nssm.exe` an earlier registration named. If it cannot, it disables the service.
+
+The copy used to be cached in the data directory, where the engine's service account can modify
+files. From there, code running as the engine could have replaced it, planted a library beside it,
+or redirected the folder, and the next install would have run the result as administrator. A hash
+check alone would have caught only the first of those three.
+
+**The uninstall scripts run no NSSM at all.** Windows stops the service, and `sc.exe` removes it.
 
 `install-net-helper.ps1` downloads nothing. It copies `mefor-net-helper.exe` from `-HelperSource`,
-and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. It checks no hash, and it
-prints the helper's signature status without requiring one. It then starts the helper as
-LocalSystem. It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless
-`-AppExe` names another, to read the address settings. All three scripts run elevated. So a
-planted program on any of those paths would run as administrator, or as LocalSystem.
+and `nssm.exe` from `-NssmPath` or `PATH`, into the helper's folder. `nssm.exe` must match the same
+fixed hash. `mefor-net-helper.exe` must match `-HelperSha256`, a hash the operator has to pass.
+This repository pins none for it, because each release builds the helper again. The script checks
+each file before the copy. It checks the installed copies again, and deletes both if either fails,
+or disables the service when it cannot delete them. It points the registration at the checked
+`nssm.exe`, quoted, and reads it back. It prints the helper's signature status without requiring
+one. It then starts the helper as LocalSystem.
+
+**At least these gaps remain.** An administrator who runs some other `nssm.exe` by hand, such as
+one on `PATH`, runs a copy nothing checked. `Start-Service` and `Restart-Service` need no NSSM.
+`-HelperSha256` is only as good as the channel the operator took it from. With `-AllowBroadAcl`,
+whoever can write the helper's folder can swap a binary, plant a library beside it, or edit its
+configuration file, both between runs and during one.
+
+It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless `-AppExe`
+names another, to read the address settings. It checks no hash on that program, and it runs it
+elevated. So a planted `messagefoundry.exe` on that path would run as administrator.
 
 **What holds the helper.** It refuses any request that names a different address, interface or
 mask from the ones in its configuration file. It hands Windows only the values from that file. Its

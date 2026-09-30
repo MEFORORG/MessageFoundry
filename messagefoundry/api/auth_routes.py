@@ -202,7 +202,8 @@ def _rate_limited(request: Request, label: str) -> HTTPException:
     return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many attempts; please retry later")
 
 
-def _service(request: Request) -> AuthService:
+async def _service(request: Request) -> AuthService:
+    # ``async`` for the reason ``messagefoundry.api.app._get_engine`` gives; keep it non-blocking.
     auth = get_auth(request)
     if auth is None or not auth.enabled:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")
@@ -744,8 +745,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         (a TOTP or recovery code via ``/auth/mfa-verify``) and a fresh password BOUND to this disable
         action (ADR 0077): a hijacked session inside the login window can't silently strip MFA.
 
-        A 400 when TOTP is the caller's last second factor and MFA is still required (#1022) — the
-        caller must enroll another factor first. That is a CLIENT-correctable condition, so it must
+        A 400 whenever ``[security].require_mfa`` covers the caller's local account and TOTP is on
+        (ADR 0197 Amendment A; an administrator's factor reset is the recovery), and otherwise when
+        TOTP is the caller's last second factor and MFA is still required (#1022), where the caller
+        must enroll another factor first. Both are CLIENT conditions, not faults, so they must
         not surface as a 500: an uncaught ValueError here would report a user error as a server
         fault AND swallow the remedy the message carries."""
         try:
@@ -1570,8 +1573,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the NEWEST
         # `limit` rows and nothing older, which is not the full trail and must not be described as one
         # (BACKLOG #1743): this wrapper takes no offset because the store's list_audit has none, so
-        # there is no second page to reach and no total to compare against. Filter + CSV export are the
-        # JSON GET /audit surface, and the export is what produces a complete record. AUDIT_READ is
+        # there is no second page to reach and no total to compare against. The filters are on GET
+        # /audit and the CSV is GET /audit/export, which is capped too (its own `limit`, no offset),
+        # so it does not hold the whole trail either. AUDIT_READ is
         # enforced by the webconsole route's own require_ui dependency, so this wrapper carries no auth
         # dependency of its own. The identity it is handed is the page's caller, and it decides which
         # rows that caller may read (BACKLOG #1131).

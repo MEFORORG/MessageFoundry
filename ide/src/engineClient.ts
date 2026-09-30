@@ -6,7 +6,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 
-import { engineHostKey, trustRemedy } from "./engineTrustModel";
+import { engineHostKey, isRecord, trustRemedy } from "./engineTrustModel";
 
 /** A non-2xx engine response. `status` lets callers branch (e.g. 401 → (re)authenticate). */
 export class HttpError extends Error {
@@ -198,6 +198,10 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
  * an {@link HttpError} (carrying the status) on any non-2xx response — surfacing FastAPI's
  * `{"detail": ...}` when present — and a plain Error when the engine is unreachable, so a caller's
  * try/catch shows a useful message and can special-case 401/403.
+ *
+ * A route dual control can hold answers 202 instead of running the action, so call such a route
+ * through {@link postApprovable}. Here a 202 rejects with a {@link HeldError} rather than decoding as
+ * `T`: a caller that does not handle a hold must not read one as success (BACKLOG #1981).
  */
 export function postJson<T>(
   baseUrl: string,
@@ -205,7 +209,110 @@ export function postJson<T>(
   body: unknown,
   token?: string,
 ): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
+  return postReply(baseUrl, route, body, token).then((reply) => {
+    const outcome = classifyApprovable<T>(reply.status, reply.body);
+    if (outcome.kind === "held") {
+      throw new HeldError(outcome.hold.approvalId);
+    }
+    return outcome.body;
+  });
+}
+
+/**
+ * The status the engine answers when dual control holds an action instead of running it (ADR 0041
+ * D2, ASVS 2.3.5). The engine answers it for nothing else, so the status alone marks a hold, as it
+ * does in the Python client (`_HTTP_PENDING_APPROVAL` in `messagefoundry/apiclient/client.py`).
+ */
+export const HTTP_PENDING_APPROVAL = 202;
+
+/**
+ * What the IDE keeps from a hold. The engine's body is `models.py:PendingApprovalResponse`; only its
+ * id is ever shown, and it is `undefined` when the body did not carry a usable one.
+ */
+export interface Hold {
+  approvalId: string | undefined;
+}
+
+/**
+ * The outcome of a route dual control may hold: the finished result, or the hold. A tagged union,
+ * so a caller has to check `kind` before it can read a result, and a hold can never be read as one.
+ */
+export type Approvable<T> = { kind: "done"; body: T } | { kind: "held"; hold: Hold };
+
+/** A hold reached a caller that only handles a finished result. The action has not run. */
+export class HeldError extends Error {
+  constructor(readonly approvalId: string | undefined) {
+    super(`engine held this action for a second approver (${approvalText(approvalId)}); it has not run`);
+    this.name = "HeldError";
+  }
+}
+
+/**
+ * Sort a decoded 2xx reply into done or held (BACKLOG #1981).
+ *
+ * The status decides, not the body, because the status is what the engine varies. So a 202 is a
+ * hold even when its body is odd: calling it a failure would invite a retry, and each retry leaves
+ * another pending approval whose release runs the action for real.
+ */
+export function classifyApprovable<T>(status: number, body: unknown): Approvable<T> {
+  if (status !== HTTP_PENDING_APPROVAL) {
+    return { kind: "done", body: body as T };
+  }
+  return { kind: "held", hold: { approvalId: approvalIdOf(body) } };
+}
+
+/**
+ * An approval id as the engine issues it (a uuid4 hex): a short token with nothing to hide in. An
+ * id that does not match is dropped rather than cut short, because a cut id matches nothing in the
+ * approvals queue, and this server text is headed for a notification.
+ */
+const APPROVAL_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function approvalIdOf(body: unknown): string | undefined {
+  if (!isRecord(body)) {
+    return undefined;
+  }
+  const id = body.approval_id;
+  return typeof id === "string" && APPROVAL_ID_RE.test(id) ? id : undefined;
+}
+
+/** How a message names a hold's approval: by id, or by saying the engine did not report one. */
+export function approvalText(approvalId: string | undefined): string {
+  return approvalId === undefined
+    ? "the engine did not report an approval id"
+    : `approval ${approvalId}`;
+}
+
+/**
+ * POST to a route dual control may hold, and report whether it ran or was held.
+ *
+ * Same transport, errors and auth as {@link postJson}; only the 2xx handling differs. The engine's
+ * holdable routes are `/config/reload`, `/dead-letters/replay` and `/connections/{name}/purge`.
+ */
+export function postApprovable<T>(
+  baseUrl: string,
+  route: string,
+  body: unknown,
+  token?: string,
+): Promise<Approvable<T>> {
+  return postReply(baseUrl, route, body, token).then((reply) =>
+    classifyApprovable<T>(reply.status, reply.body),
+  );
+}
+
+/** A decoded 2xx POST reply. The status is kept so {@link postApprovable} can tell a hold apart. */
+interface PostReply {
+  status: number;
+  body: unknown;
+}
+
+function postReply(
+  baseUrl: string,
+  route: string,
+  body: unknown,
+  token?: string,
+): Promise<PostReply> {
+  return new Promise<PostReply>((resolve, reject) => {
     let url: URL;
     try {
       // Concatenate (not URL-resolve) so a base URL with a path prefix (e.g. a reverse-proxy
@@ -233,7 +340,7 @@ export function postJson<T>(
         const status = res.statusCode ?? 0;
         if (status >= 200 && status < 300) {
           try {
-            resolve((text ? JSON.parse(text) : {}) as T);
+            resolve({ status, body: text ? (JSON.parse(text) as unknown) : {} });
           } catch {
             reject(new Error(`engine returned a non-JSON response (HTTP ${status})`));
           }

@@ -32,6 +32,11 @@ lifecycle label. Each table is read only up to the next ``### `` heading, so a m
 stand in for a deleted lifecycle row. This checks that each key HAS a mapping row, not that the row
 maps it correctly, and not that the key's lifecycle follows the standard: the mapping itself records
 where it departs. Judging the rows is the reviewer's job.
+
+**The DEK has its own SP 800-57 mapping, keyed by clause (BACKLOG #1162).** It is one key, so its
+table's rows are clauses, not keys. :data:`_DEK_CLAUSES` names every clause row, and the table must
+hold exactly those rows, each written. The rows that name a departure must keep naming it, so a
+departure cannot be edited out of the record while its row stays.
 """
 
 from __future__ import annotations
@@ -57,6 +62,40 @@ _LIFECYCLE_HEADING = "### Key management for the other keys the engine loads or 
 #: The NIST SP 800-57 mapping for the non-DEK keys. Its rows lead with a PLAIN label.
 _MAPPING_HEADING = "### NIST SP 800-57 mapping for the other keys"
 
+#: The clause-by-clause SP 800-57 mapping for the store DEK. Its rows lead with a clause, not a key.
+_DEK_MAPPING_HEADING = "### NIST SP 800-57 mapping for the store DEK"
+#: Every clause row that mapping must hold, spelled exactly as its first cell.
+_DEK_CLAUSES = frozenset(
+    {
+        "5.1.1 key type",
+        "5.2 one purpose",
+        "8.1.5.2.1 generation",
+        "8.1.5.2.2 distribution",
+        "8.1.5.2.2.1 manual distribution",
+        "8.2.4 key derivation",
+        "5.3.6 cryptoperiod",
+        "7.4 deactivated",
+        "7.5 compromised",
+        "Table 7 backup",
+        "Table 9 archive",
+        "B.3.4 data-encryption key backup",
+        "8.3.4 destruction",
+    }
+)
+#: The clause rows that record a departure from the standard. Each must keep saying so.
+_DEK_DEPARTURES = frozenset(
+    {
+        "5.2 one purpose",
+        "8.1.5.2.1 generation",
+        "8.1.5.2.2.1 manual distribution",
+        "8.2.4 key derivation",
+        "5.3.6 cryptoperiod",
+        "7.4 deactivated",
+        "7.5 compromised",
+        "8.3.4 destruction",
+    }
+)
+
 #: A cell or bullet counts as written only if it holds a letter or digit, not just a dash.
 _WORD = re.compile(r"\w")
 
@@ -77,6 +116,7 @@ _API_CLIENT = "Native API client key"
 _NONPROD = "Non-production self-signed key"
 _TOTP = "TOTP shared secret"
 _ANON_SALT = "Anonymizer re-identification salt"
+_SEALED = "Sealed-cache key"
 
 #: Modules that load, mint, derive from, or feed a key, and the lifecycle row(s) governing it.
 _CARRIES_KEY: dict[str, frozenset[str]] = {
@@ -125,6 +165,8 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/__main__.py": frozenset({_ANON_SALT}),
+    # BACKLOG #1174: the per-process key that seals the state and reference caches.
+    "messagefoundry/store/sealed_cache.py": frozenset({_SEALED}),
 }
 
 _KEYLESS = (
@@ -169,9 +211,9 @@ _NO_KEY: dict[str, str] = {
     "loads no key and no trust anchor",
     "messagefoundry/config/models.py": _POSTURE_ONLY,
     "messagefoundry/config/settings.py": _POSTURE_ONLY,
-    "messagefoundry/transports/strict_requests.py": "the Vault clients' reply adapter: it hands "
-    "each connection a TLS context another module builds and narrows (BACKLOG #300), and loads, "
-    "mints and holds no key",
+    "messagefoundry/transports/strict_requests.py": _VERIFY_ONLY + "; the Vault clients' reply "
+    "adapter loads requests' CA onto the https-proxy leg's TLS context, which another module "
+    "builds and narrows (BACKLOG #300)",
     "messagefoundry/config/secretprovider_vault.py": "reads connector credentials from Vault KV over "
     "a verifying hop; the Vault token is a credential in the rotation schedule, and a key it fetches "
     "is governed by the row for the setting it fills",
@@ -470,3 +512,143 @@ def test_the_totp_mapping_row_takes_no_cryptoperiod() -> None:
     assert "**Cryptoperiod: none.**" in row and "#1931" in row, (
         "the TOTP mapping row must state it has no cryptoperiod and cite BACKLOG #1931"
     )
+
+
+def dek_section(doc: str) -> list[str]:
+    """The lines of the DEK mapping subsection, from its heading to the next ``### ``."""
+    lines = doc.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith(_DEK_MAPPING_HEADING)), None)
+    if start is None:
+        return []
+    end = next(
+        (i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.startswith("### ")),
+        len(lines),
+    )
+    return lines[start:end]
+
+
+def dek_clause_rows(doc: str) -> tuple[dict[str, str], list[str]]:
+    """The DEK mapping's WRITTEN rows by clause -> whole row, and any clause written twice.
+
+    Only lines inside the DEK mapping subsection are read, so a row elsewhere in the doc that
+    happens to lead with the same clause can neither stand in for one nor mask an edit to one."""
+    section = dek_section(doc)
+    firsts = _first_cells(section, _DEK_MAPPING_HEADING)
+    rows: dict[str, str] = {}
+    for line in section:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if line.startswith("| ") and cells[0] in firsts:
+            rows.setdefault(cells[0], line)
+    twice = sorted({c for c in firsts if firsts.count(c) > 1})
+    return rows, twice
+
+
+def _claim_cell(row: str) -> str:
+    """The third cell of a mapping row: the claim about the engine, where a departure belongs."""
+    cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+    return cells[2] if len(cells) > 2 else ""
+
+
+def dek_mapping_problems(doc: str) -> list[str]:
+    """Where the DEK mapping departs from :data:`_DEK_CLAUSES` and :data:`_DEK_DEPARTURES`."""
+    rows, twice = dek_clause_rows(doc)
+    problems = [f"clause row written twice: {c}" for c in twice]
+    problems += [f"missing clause row: {c}" for c in sorted(_DEK_CLAUSES - set(rows))]
+    problems += [f"clause row not in _DEK_CLAUSES: {c}" for c in sorted(set(rows) - _DEK_CLAUSES)]
+    problems += [
+        f"departure no longer named: {c}"
+        for c in sorted(_DEK_DEPARTURES & set(rows))
+        if "**Departure" not in _claim_cell(rows[c])
+    ]
+    return problems
+
+
+def test_the_dek_has_a_clause_by_clause_sp800_57_mapping() -> None:
+    """BACKLOG #1162: the DEK's SP 800-57 alignment is mapped, not only claimed. Row PRESENCE and the
+    departure flags only; whether each row reads the standard correctly is the reviewer's job."""
+    doc = _DOC.read_text(encoding="utf-8")
+    assert len(dek_clause_rows(doc)[0]) >= 10, "the DEK mapping table or its heading moved"
+    problems = dek_mapping_problems(doc)
+    assert not problems, f"DEK SP 800-57 mapping under '{_DEK_MAPPING_HEADING}': {problems}"
+
+
+def test_the_dek_mapping_guard_turns_red() -> None:
+    """The mutations, run in-process: delete a clause row, empty one to its clause, strip a
+    departure, and put the DEK table under the other-keys heading. Each must be reported."""
+    doc = _DOC.read_text(encoding="utf-8")
+    assert not dek_mapping_problems(doc), (
+        "the unmutated doc must be clean for this to mean anything"
+    )
+    lines = doc.splitlines()
+    row = "| 5.2 one purpose |"
+    kept = [line for line in lines if not line.startswith(row)]
+    assert len(kept) == len(lines) - 1, "expected one 5.2 row to delete; its clause label moved"
+    assert "missing clause row: 5.2 one purpose" in dek_mapping_problems("\n".join(kept))
+    emptied = [f"{row} - | - | - |" if line.startswith(row) else line for line in lines]
+    assert "missing clause row: 5.2 one purpose" in dek_mapping_problems("\n".join(emptied))
+    stripped = [
+        re.sub(r"\*\*Departure[^*]*\*\*", "", line) if line.startswith(row) else line
+        for line in lines
+    ]
+    assert "departure no longer named: 5.2 one purpose" in dek_mapping_problems("\n".join(stripped))
+    # A departure moved out of the engine-claim column into the site column no longer counts.
+    moved = []
+    for line in lines:
+        if line.startswith(row):
+            cells = line.strip().strip("|").split("|")
+            cells[2] = re.sub(r"\*\*Departure[^*]*\*\*", "", cells[2])
+            cells[3] = cells[3] + " **Departure** "
+            line = "|" + "|".join(cells) + "|"
+        moved.append(line)
+    assert "departure no longer named: 5.2 one purpose" in dek_mapping_problems("\n".join(moved))
+    doubled = [line for line in lines for _ in range(2 if line.startswith(row) else 1)]
+    assert "clause row written twice: 5.2 one purpose" in dek_mapping_problems("\n".join(doubled))
+    # Delete the DEK heading: its rows fall under the other-keys mapping. The DEK guard must report
+    # every clause missing, and the other-keys guard must see the clause rows as strays.
+    headless = "\n".join(line for line in lines if not line.startswith(_DEK_MAPPING_HEADING))
+    assert "missing clause row: 8.3.4 destruction" in dek_mapping_problems(headless)
+    assert "5.2 one purpose" in mapping_labels(headless) - lifecycle_labels(headless)
+    assert "5.2 one purpose" not in mapping_labels(doc)
+
+
+#: Code symbols the DEK mapping cites, by module. A rename leaves the prose pointing at nothing.
+_DEK_CITED_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "messagefoundry/store/crypto.py": (
+        "derive_store_data_key",
+        "_SubkeyDeriver",
+        "_derive_audit_mac_key",
+        "rotation_fingerprint_key",
+        "_WriteKey",
+        "generate_key",
+        "_secure_zero",
+        "_lock_memory",
+    ),
+    "messagefoundry/store/backup_codec.py": ("ArchiveHeader", "frame_key"),
+    "messagefoundry/pipeline/dr_backup.py": ("_resolve_key", "_store_salt"),
+    "messagefoundry/store/store.py": ("settle_audit_ranges",),
+}
+
+
+def test_the_dek_mapping_cites_live_code() -> None:
+    """The symbols and defaults the DEK mapping quotes must still exist and match, so a rename or a
+    changed default turns this red instead of leaving the mapping quietly wrong."""
+    from messagefoundry.config.settings import SecretRotationSettings
+    from messagefoundry.store.crypto import CipherInfo  # noqa: F401 - cited as the fingerprint view
+    from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION
+
+    doc = _DOC.read_text(encoding="utf-8")
+    section = "\n".join(dek_section(doc))
+    for rel, names in _DEK_CITED_SYMBOLS.items():
+        source = (_ROOT / rel).read_text(encoding="utf-8")
+        for name in names:
+            # Inside the DEK subsection only, and inside one code span.
+            assert re.search(rf"`[^`\n]*\b{name}\b[^`\n]*`", section), (
+                f"{name} is listed here but the DEK mapping no longer cites it"
+            )
+            assert re.search(rf"^\s*(?:async\s+)?(?:def|class)\s+{name}\b", source, re.M), (
+                f"{rel} no longer defines {name}, which the DEK mapping cites"
+            )
+    defaults = SecretRotationSettings()
+    assert defaults.store_key_max_age_days == 365 and "`store_key_max_age_days` (365)" in section
+    assert defaults.enforce_grace_days == 30 and "`enforce_grace_days` (30)" in section
+    assert AUDIT_KEY_EPOCH_ACTION == "audit.key_epoch" and "`audit.key_epoch`" in doc

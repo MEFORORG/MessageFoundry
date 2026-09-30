@@ -127,8 +127,9 @@ engine you pair this release with.
       `ENGINE_UI_SEAM` is not in the console's `SUPPORTED_ENGINE_SEAMS`, and set
       `serve_web_console = true`. Startup must fail with `UiSeamMismatch`, which `assert_engine_seam`
       raises. Today no install-time metadata refuses a mismatched pair; this startup check is what
-      does. A pair far enough apart can fail earlier, with a bare `ImportError`, when one package
-      imports a name the other lacks.
+      does. A pair far enough apart fails one step earlier, at the engine's import of the console,
+      with a named refusal rather than `UiSeamMismatch`. [`docs/WEBCONSOLE-PACKAGE.md` section
+      2](../../docs/WEBCONSOLE-PACKAGE.md) states what `serve` and `create_app` print then.
 - [ ] Once steps 1 and 2 have landed and been published, confirm an out-of-range pair also fails at
       resolve (PEP 508). Until then no published metadata declares a range, so nothing fails at
       resolve.
