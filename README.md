@@ -146,10 +146,10 @@ different ecosystem); see *VS Code extension & test harness* below for where to 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow
 > and published with **PEP 740 attestations** — all three publish jobs set `attestations: true`.
 >
-> **Sigstore signing and SLSA build-provenance cover the ENGINE release files (wheel, sdist, SBOM and
-> VEX) and the TOOLKIT wheel only, and the CycloneDX SBOM covers the ENGINE only.** The
-> `messagefoundry-toolkit` wheel is built in the engine's release job, which signs and attests it
-> (BACKLOG #1192). The
+> **Sigstore signing and SLSA build-provenance cover the ENGINE release files and the TOOLKIT wheel
+> only.** The engine files are its wheel, sdist, SBOM and VEX. The CycloneDX SBOM covers the engine
+> only. The `messagefoundry-toolkit` wheel is built in the engine's release job, which signs and
+> attests it (BACKLOG #1192). The
 > `messagefoundry-webconsole` and `messagefoundry-harness` release jobs contain no signing, attestation
 > or SBOM step (BACKLOG #1193) — this note previously said "every release", which is why it is spelled
 > out per artifact rather than tightened in place. So `gh attestation verify` finds a GitHub
@@ -158,7 +158,8 @@ different ecosystem); see *VS Code extension & test harness* below for where to 
 >
 > Verify a downloaded **engine** or **toolkit** wheel against its source commit with
 > `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref refs/tags/v<version>`
-> (keep the last two flags; [docs/SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md) says why), or pull the signed wheel + SBOM
+> (keep the last two flags; [docs/SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md) says why). Use the TAG's
+> spelling of the version: a pre-release tag is `v0.5.0-rc1`, while its wheel says `0.5.0rc1`. Or pull the signed wheel + SBOM
 > from the [GitHub Release assets](https://github.com/MEFORORG/MessageFoundry/releases). For an
 > air-gapped site, mirror the wheel to a private index.
 >

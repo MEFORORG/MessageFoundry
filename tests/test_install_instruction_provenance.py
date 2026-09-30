@@ -583,7 +583,7 @@ def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_pr
 
     readme = (_ROOT / "README.md").read_text(encoding="utf-8")
     # The scoping phrase names the toolkit too since BACKLOG #1192 signed and attested its wheel.
-    assert "and the TOOLKIT wheel only" in readme, (
+    assert "cover the ENGINE release files and the TOOLKIT wheel" in readme, (
         "README must say which artifacts the signing covers, because it does not cover all of them: "
         f"unsigned publish jobs are {sorted(unsigned)}"
     )
