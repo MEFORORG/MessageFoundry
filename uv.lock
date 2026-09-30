@@ -1327,7 +1327,7 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp", marker = "extra == 'otel'", specifier = ">=1.20" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.20" },
     { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=5.0" },
-    { name = "prometheus-client", marker = "extra == 'dev'", specifier = ">=0.20" },
+    { name = "prometheus-client", marker = "extra == 'dev'", specifier = ">=0.26.0" },
     { name = "psutil", specifier = ">=6.0" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pydicom", marker = "extra == 'dicom'", specifier = ">=3.0.2,<3.1" },

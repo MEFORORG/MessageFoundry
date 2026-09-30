@@ -14,8 +14,10 @@ no longer carries the library. A scraper must not see the difference, so the pro
   prometheus_client stays a DEVELOPMENT dependency (the ``dev`` extra) for exactly this, and for its
   parser, which the other metrics tests read the exposition with.
 
-The golden files are ``-text`` in ``.gitattributes``: a CRLF checkout would otherwise rewrite the
-bytes this test compares.
+The golden files are pinned ``text=auto eol=lf`` in ``.gitattributes``: a CRLF checkout would
+otherwise rewrite the bytes this test compares. That pin normalizes line endings on the way in, so
+a snapshot built here must never put a raw carriage return in a label value. The exposition writes
+a CR verbatim, and the pin would strip it from a CRLF pair in the stored golden.
 """
 
 from __future__ import annotations
@@ -253,6 +255,16 @@ def _hostile_families() -> list[_Family]:
     late.add_histogram(["v1"], [("0.5", 0.0), ("+Inf", 2.0)], 3.5)
     empty = _Family("x_nothing", "no samples", "counter", labels=["connection"])
     return [counter, gauge, unlabelled, histogram, unsorted, late, empty]
+
+
+def test_a_family_refuses_samples_of_the_wrong_shape() -> None:
+    """RED when: a histogram takes a plain sample, or a gauge takes buckets, and renders it anyway."""
+    with pytest.raises(TypeError):
+        _Family("x_seconds", "", "histogram").add_metric([], 1.0)
+    with pytest.raises(TypeError):
+        _Family("x_level", "", "gauge").add_histogram([], [("+Inf", 1.0)], 1.0)
+    with pytest.raises(ValueError):
+        _Family("x_level", "", "gauge", labels=["connection"]).add_metric([], 1.0)
 
 
 def test_hostile_families_render_as_the_library_renders_them() -> None:

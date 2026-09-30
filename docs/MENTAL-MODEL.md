@@ -472,7 +472,7 @@ MessageFoundry keeps its dependency surface deliberately small and stdlib-first 
 
 ### What it depends on
 
-The runtime core is around eighteen packages; everything past it is an **opt-in extra that’s lazy-imported**, so a default SQLite install pulls none of them:
+The runtime core is around twenty packages; everything past it is an **opt-in extra that’s lazy-imported**, so a default SQLite install pulls none of them:
 
 | **Group** | **Packages** | **What for** |
 |----|----|----|

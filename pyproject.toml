@@ -300,7 +300,10 @@ dev = [
     # The engine renders /metrics itself (messagefoundry/api/metrics.py). The metrics tests still
     # parse the exposition with this library's parser, and tests/test_metrics_exposition.py renders
     # through it to prove the engine's bytes match. Test-only, so it is not a runtime dependency.
-    "prometheus-client>=0.20",
+    # Floor 0.26.0: the golden files and the float-format comparison are that release's output, and
+    # earlier releases format some exponents differently, so an older one would fail those tests
+    # while blaming the engine.
+    "prometheus-client>=0.26.0",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
     # is no longer declared here.
 ]

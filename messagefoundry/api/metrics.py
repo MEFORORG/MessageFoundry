@@ -177,10 +177,14 @@ class _Family:
         return f"{self.name}_total" if self.type == "counter" else self.name
 
     def _labels(self, values: Sequence[str]) -> dict[str, str]:
+        # strict, where prometheus_client truncated silently: a label-count mismatch is a bug in
+        # the collector below, and every family it builds is rendered by the golden-file tests.
         return dict(zip(self._labelnames, values, strict=True))
 
     def add_metric(self, labels: Sequence[str], value: float) -> None:
         """Add one counter or gauge sample."""
+        if self.type == "histogram":
+            raise TypeError(f"{self.name} is a histogram; use add_histogram")
         self.samples.append(_Sample(self.exposed_name, self._labels(labels), value))
 
     def add_histogram(
@@ -189,7 +193,12 @@ class _Family:
         """Add one histogram: a ``_bucket`` line per ``le`` boundary, then ``_count`` and ``_sum``.
 
         ``buckets`` are cumulative and end with ``+Inf``, whose value is also the count.
+        prometheus_client left out ``_count`` and ``_sum`` for a negative first boundary or a
+        ``None`` sum. Neither can reach here: the boundaries are the non-negative
+        :data:`DEFAULT_LATENCY_BUCKETS` and the sum is typed ``float``.
         """
+        if self.type != "histogram":
+            raise TypeError(f"{self.name} is a {self.type}; use add_metric")
         base = self._labels(labels)
         for boundary, count in buckets:
             self.samples.append(_Sample(f"{self.name}_bucket", {**base, "le": boundary}, count))

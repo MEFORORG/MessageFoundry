@@ -1837,8 +1837,9 @@ class MLLPSource(SourceConnector):
         #
         # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
         # uvicorn runs the engine on uvloop wherever it is installed, and the engine's own uvloop
-        # dependency installs it for CPython outside Windows. Called unguarded, it raised AttributeError here, so a reload's
-        # first stop() failed, left that listener unbound, and the reload restarted nothing.
+        # dependency installs it for CPython outside Windows. Called unguarded, it raised
+        # AttributeError here, so a reload's first stop() failed, left that listener unbound, and
+        # the reload restarted nothing.
         # What uvloop loses, and what still holds there:
         # * stop() does not close a socket still in its handshake. `_TLS_HANDSHAKE_TIMEOUT` still
         #   bounds it, since uvloop honours it, and `_stopping` refuses it unread if it finishes.
