@@ -267,8 +267,9 @@ class AlertSink(Protocol):
         is not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG
         #1898), and its colon keeps ``name`` outside the connection-name grammar as a second line.
         The prefix does not hide the event from rules: a catch-all rule still matches it for
-        severity, routing and mute. Repeated early tries on one request fold into one instance. Nothing resolves the instance
-        when the request is later decided, so an operator resolves it. Carries the key, the
+        severity, routing and mute. Repeated early tries on one request fold into one instance.
+        Nothing resolves the instance when the request is later decided, so an operator resolves
+        it. Carries the key, the
         operation key and a fixed reason string: no username, no params, no PHI. The
         ``approval.too_early`` audit row is the durable record. Emitted by
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""

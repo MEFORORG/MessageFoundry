@@ -114,6 +114,22 @@ def test_the_refusal_names_the_rule_and_the_type_and_not_the_target() -> None:
     assert "OB_SECRETIVE_NAME" not in text
 
 
+def test_control_target_needs_an_action_and_a_connection_name() -> None:
+    AlertRule(
+        event_type="connection_stopped", control_action="restart_inbound", control_target="IB_FEED"
+    )  # ok
+    with pytest.raises(ValidationError, match="control_target without a control_action"):
+        AlertRule(event_type="connection_stopped", control_target="IB_FEED")
+    # "" would fall back to the event's own key at dispatch; the others can only fail there.
+    for bad in ("", "user:admin", "IB FEED", "../IB_FEED"):
+        with pytest.raises(ValidationError, match="not a connection name"):
+            AlertRule(
+                event_type="connection_stopped",
+                control_action="restart_inbound",
+                control_target=bad,
+            )
+
+
 def _unvalidated_catch_all(**kw: Any) -> AlertRule:
     # A rule built past the load validator, as a caller outside AlertRule's loader could.
     return AlertRule.model_construct(event_type="any", connection="*", **kw)

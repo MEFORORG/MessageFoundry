@@ -1,6 +1,8 @@
 # ADR 0128 — Alert-rule connection-control action (auto stop/restart on fire)
 
 - **Status:** Accepted (2026-07-17) — demand-gate build (lane `dg-s1a`); pushes/PR owner-approved.
+  Amended 2026-09-30 (BACKLOG #1898): `control_action` is refused at load on an event type that is not
+  connection-scoped. See the amendment under §1.
 - **Built:** Yes — additive. `AlertRule.control_action` / `control_target` in
   [`config/settings.py`](../../messagefoundry/config/settings.py), carried through
   `AlertRuleSet.decide → _RuleDecision`, dispatched by
@@ -35,10 +37,12 @@ restart is the safe remediation an operator actually wants).
 **Amendment (BACKLOG #1898, 2026-09-30).** `control_action` is now allowed only with a connection-scoped
 `event_type`: the set `_ALERT_CONTROL_EVENT_TYPES` in
 [`config/settings.py`](../../messagefoundry/config/settings.py). `AlertRule` refuses the pair at config
-load for `"any"` and every other type, and `NotifierAlertSink._emit` skips the action, logged, for an
-event outside the set. The other types put a stand-in in `connection` (a username, an approval id, a DB
-path, a cert label), and a stand-in that fits the connection-name grammar would have restarted an
-unrelated connection. `content_match` is left out until an engine caller exists.
+load for `"any"` and every other type. `NotifierAlertSink._emit` also skips the action, logged, for an
+event outside the set. The other types put a stand-in in `connection`, such as a username or a DB path.
+A stand-in that fits the connection-name grammar would have restarted an unrelated connection.
+`content_match` is left out until an engine caller exists. A `control_target`, when set, must be a
+connection name on a rule that has a `control_action`. One gap stays open: two emitters raise
+`connection_stopped` with a stand-in, and the settings comment on the set names them.
 
 ### §2 — The sink is DECOUPLED from the runner: an INJECTED async callback
 

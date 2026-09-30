@@ -88,6 +88,7 @@ from messagefoundry.config.tls_policy import (
     validate_proxy_tls_posture,
     validate_tls_ciphers,
 )
+from messagefoundry.connection_names import is_connection_name
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.service_status import is_safe_service_name
@@ -3828,14 +3829,18 @@ _ALERT_TRANSPORTS = frozenset({"webhook", "email"})
 #: mirror ``RegistryRunner.restart_inbound`` / ``restart_outbound``.
 _ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})
 
-#: BACKLOG #1898: the event types a rule may attach a ``control_action`` to. Each one puts a real
-#: connection (or lane) name in the event's ``connection`` key, so the action's default target is the
-#: connection that fired. Every other type puts a stand-in there (a username, an approval id, a DB
-#: path, a cert label, a node id), and some stand-ins fit the connection-name grammar, so a restart
-#: aimed at one could hit an unrelated real connection. ``content_match`` is left out on purpose: it
-#: has no engine caller yet, and once a Handler calls it, message content would decide when a
-#: connection restarts. Its caller should add it here deliberately, not inherit it. The notifier
-#: checks the same set at dispatch (alert_sinks ``NotifierAlertSink._emit``).
+#: BACKLOG #1898: the event types a rule may attach a ``control_action`` to. These are the types
+#: whose emitters normally put a connection (or lane) name in the event's ``connection`` key. Every
+#: other type puts a stand-in there (a username, an approval id, a DB path, a cert label, a node id).
+#: Some stand-ins fit the connection-name grammar, so a restart aimed at one could hit an unrelated
+#: real connection. ``content_match`` is left out on purpose. It has no engine caller yet, and once a
+#: Handler calls it, message content would decide when a connection restarts, so its caller should
+#: add it here deliberately. The notifier checks the same set at dispatch (``NotifierAlertSink._emit``).
+#:
+#: KNOWN GAP, not closed by this set: two emitters raise ``connection_stopped`` with a stand-in,
+#: ``reference:<name>`` (pipeline/reference_sync.py) and ``transform-state``
+#: (pipeline/state_convergence.py), and the second fits the connection-name grammar. A type allowlist
+#: cannot see that; moving those emitters to their own event types would.
 _ALERT_CONTROL_EVENT_TYPES = frozenset(
     {
         "connection_stopped",
@@ -3983,9 +3988,10 @@ class AlertRule(BaseModel):
     # BACKLOG #1898: allowed only with an event_type in _ALERT_CONTROL_EVENT_TYPES; "any" and every
     # other type are refused at load (_check_control_scope below).
     control_action: str | None = None
-    # The connection the control action targets. None = the event's own connection, which for every
-    # type _ALERT_CONTROL_EVENT_TYPES allows is the connection (or lane) that fired; set it to act on a
-    # DIFFERENT connection than the one that fired (e.g. restart an inbound when its paired outbound stalls).
+    # The connection the control action targets. None = the event's own `connection` key (see the
+    # KNOWN GAP on _ALERT_CONTROL_EVENT_TYPES); set it to act on a DIFFERENT connection than the one
+    # that fired (e.g. restart an inbound when its paired outbound stalls). BACKLOG #1898: when set it
+    # must be a connection name and needs a control_action.
     control_target: str | None = None
     # #143 (ADR 0044 amendment): a static per-rule NOTIFICATION mute. True suppresses the notification for
     # matching events (equivalent to transports=[], but reads as intent) while STILL recording the alert
@@ -4058,9 +4064,17 @@ class AlertRule(BaseModel):
         # that fits the connection-name grammar restarts whatever real connection shares that name.
         # Refuse the pair at load. The message names the rule's own label and event type, never a
         # target or any other value.
+        rule = f"rule {self.id!r}" if self.id is not None else "a rule"
+        if self.control_target is not None:
+            # An empty target would fall back to the event's own key at dispatch (`or`), and a
+            # target outside the grammar can only fail there, logged and swallowed. A target with
+            # no action is dead config. Each is refused here so the rule does what it reads as.
+            if self.control_action is None:
+                raise ValueError(f"{rule} sets control_target without a control_action")
+            if not is_connection_name(self.control_target):
+                raise ValueError(f"{rule} sets a control_target that is not a connection name")
         if self.control_action is None or self.event_type in _ALERT_CONTROL_EVENT_TYPES:
             return self
-        rule = f"rule {self.id!r}" if self.id is not None else "a rule"
         allowed = ", ".join(sorted(_ALERT_CONTROL_EVENT_TYPES))
         raise ValueError(
             f"{rule} sets control_action with event_type {self.event_type!r}; control_action is "
