@@ -15,20 +15,20 @@ uses dated public data.
 
 The set assessed is the **core runtime closure**: every distribution a default engine install
 carries, transitive dependencies included, with no optional extras and no development toolchain.
-That is **37 distributions**, recorded in
+That is **36 distributions**, recorded in
 [`security/runtime-closure-core.txt`](../security/runtime-closure-core.txt).
 
 **Which denominator you pick changes the answer by about half, so it is stated rather than implied:**
 
 | Denominator | Count | Why not this one |
 |---|---|---|
-| Names in `pyproject.toml`, core only | 22 | Misses everything transitive, which is a large share of what runs. |
+| Names in `pyproject.toml`, core only | 21 | Misses everything transitive, which is a large share of what runs. |
 | Names in `pyproject.toml`, core plus every extra | 47 | Still direct-only, and mixes in extras nobody enabled. |
-| **Core runtime closure** | **37** | **Used for the tiers below.** What a default install actually executes. |
-| **`sqlserver` runtime closure** | **39** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
+| **Core runtime closure** | **36** | **Used for the tiers below.** What a default install actually executes. |
+| **`sqlserver` runtime closure** | **38** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
 | `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
-One extra is assessed as well. The `sqlserver` runtime closure is **39 distributions**, recorded in
+One extra is assessed as well. The `sqlserver` runtime closure is **38 distributions**, recorded in
 [`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt). It has its
 own section below, which classifies only the names the extra adds to the core closure.
 
@@ -53,7 +53,7 @@ Native compiled code is treated as an aggravating factor within a tier, not a ti
 memory-safety fault in a compiled parser is not the same class of event as a logic bug in a pure
 Python one, and the tables below say which components carry it.
 
-**Twenty-five of thirty-seven are designated, and the proportion is the finding.** This is an
+**Twenty-five of thirty-six are designated, and the proportion is the finding.** This is an
 integration engine: its job is parsing clinical traffic from partners it does not control and
 terminating network protocols. Most of its runtime closure is therefore in one of those two paths by
 construction. A short list here would be a less honest document, not a safer engine.
@@ -115,11 +115,10 @@ looked at.
 | `psutil` | compiled process and resource inspection, local only |
 | `click` | command-line parsing, operator input on the local shell |
 | `tomlkit` | parses operator-authored TOML from the config directory, which is inside the trust boundary |
-| `prometheus-client` | metric formatting; the scrape surface is the engine's own route |
 | `annotated-doc`, `annotated-types`, `typing-extensions`, `typing-inspection` | typing shims, no runtime input handling |
 | `tzdata` | timezone tables |
 
-That is 12, and 25 plus 12 is 37. The arithmetic is stated so a reader can check the set is closed
+That is 11, and 25 plus 11 is 36. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
 
 ## The `sqlserver` extra
@@ -140,7 +139,7 @@ tables.
 
 None. Both names the extra adds are designated.
 
-So 2 plus 0 is 2, and 37 plus 2 is 39.
+So 2 plus 0 is 2, and 36 plus 2 is 38.
 
 ### The ODBC driver is designated too, and the guard cannot see it
 
@@ -192,7 +191,7 @@ The readings, their sources and their windows are recorded in
 
 ### What is read, and the test for each example
 
-All 39 distributions in the `sqlserver` closure are read: the 37 in the core closure and the 2 the
+All 38 distributions in the `sqlserver` closure are read: the 36 in the core closure and the 2 the
 extra adds. That is the whole assessed set, not only the designated part. A library can be risky on
 these examples even where the tiers did not designate it.
 
@@ -214,8 +213,8 @@ can judge them.
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
 
-**Risky on at least one example: 12 of 39. On maintenance: 4. On support: 0. On vulnerability
-history: 8. Not risky on any: 27. 12 plus 27 is 39.**
+**Risky on at least one example: 12 of 38. On maintenance: 4. On support: 0. On vulnerability
+history: 8. Not risky on any: 26. 12 plus 26 is 38.**
 
 ### Poorly maintained
 
@@ -243,7 +242,7 @@ None on the snapshot date.
 | `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
 | `starlette` | 5 | 2026-06-15 | yes, tier 3 |
 
-On the snapshot date OSV listed no advisory against any pinned version, in any of the 39. The table
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 38. The table
 above counts past advisories only.
 
 Every advisory in the window carries a rating from one of the two sources.
@@ -259,7 +258,7 @@ Every advisory in the window carries a rating from one of the two sources.
 | Components | Designated above |
 |---|---|
 | `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyspnego`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
-| `aiosqlite`, `annotated-doc`, `annotated-types`, `prometheus-client`, `psutil`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
+| `aiosqlite`, `annotated-doc`, `annotated-types`, `psutil`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
 
 ### How this reading and the tiers fit together
 

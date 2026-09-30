@@ -114,7 +114,6 @@ dependencies = [
     "pyspnego>=0.10",       # SPNEGO/Kerberos negotiate for Windows SSO
     "tomlkit>=0.12",        # comment/format-preserving TOML writer for connections.toml (ADR 0007)
     "tzdata>=2024.1",       # IANA tz database for stdlib zoneinfo (Windows has no system tzdata)
-    "prometheus-client>=0.20",  # Prometheus /metrics exposition (BACKLOG #21)
     "defusedxml>=0.7.1",    # hardened XML parse for RawMessage.xml() — XXE/DTD/entity-expansion safe (ADR 0004, BACKLOG #31)
     "psutil>=6.0",          # host CPU/mem gauges on the /metrics surface (BACKLOG #74)
     "httpx>=0.27",          # the shared apiclient HTTP client (messagefoundry.apiclient) — used by the bundled Windows tray's tokenless /health + /ui probes (messagefoundry.tray, ADR 0113, gui-scripts messagefoundry-tray) and the harness monitor; also the ASGI test client. Base (not an extra) so the tray works on every `pip install messagefoundry`.
@@ -298,6 +297,10 @@ dev = [
     # every install through uvicorn[standard]; the base install dropped that extra, so the suite
     # declares it here rather than riding on a runtime dependency it does not otherwise need.
     "pyyaml>=6.0",
+    # The engine renders /metrics itself (messagefoundry/api/metrics.py). The metrics tests still
+    # parse the exposition with this library's parser, and tests/test_metrics_exposition.py renders
+    # through it to prove the engine's bytes match. Test-only, so it is not a runtime dependency.
+    "prometheus-client>=0.20",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
     # is no longer declared here.
 ]

@@ -41,7 +41,6 @@ httptools==0.8.0
 httpx==0.28.1
 idna==3.18
 ldap3==2.9.1
-prometheus-client==0.26.0
 psutil==7.2.2
 pyasn1==0.6.4
 pycparser==3.0
