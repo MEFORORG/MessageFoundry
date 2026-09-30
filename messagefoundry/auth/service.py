@@ -1988,6 +1988,16 @@ class AuthService:
             return True
         return self._admin_write_limiter.allow(actor)
 
+    def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
+        """Wire the out-of-band notice channel after construction (BACKLOG #2081).
+
+        For ``provision-admin`` alone, which builds this service before its password prompt so that
+        building it -- the anchor checks and the directory secrets -- can refuse first, but decides
+        whether it owes a takeover notice only at the write, against the store it writes to. The
+        API lifespan passes the notifier to the constructor and never calls this. Call it before
+        the first operation that could notify; it replaces whatever channel was wired."""
+        self._security_notifier = notifier
+
     @property
     def policy(self) -> PasswordPolicy:
         return self._policy
