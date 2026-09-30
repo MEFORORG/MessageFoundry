@@ -32,13 +32,19 @@ from typing import Any, cast
 
 import ldap3
 import pytest
-from ldap3.core.exceptions import LDAPCertificateError
+from ldap3.core.exceptions import LDAPCertificateError, LDAPSocketOpenError
 
 from messagefoundry.auth import ldap as ldap_auth
 from messagefoundry.auth.ldap_tls import NarrowedTls
 from messagefoundry.config import tls_policy
 from tests.test_tls_cipher_assertion_sites import _ad_settings, _self_signed
-from tests.test_tls_default_suites import _Pki, _tls13
+from tests.test_tls_default_suites import (
+    _DEFAULT_SUITE_NAMES,
+    CBC_ONLY,
+    _Pki,
+    _tls12,
+    _tls13,
+)
 from tests.test_tls_default_suites import pki as pki  # noqa: F401  (the fixture, re-exported)
 
 #: sha256 of ``inspect.getsource(ldap3.Tls.wrap_socket)`` in ldap3 2.9.1, line endings as ``\n``.
@@ -90,6 +96,66 @@ def _bind(tls: Any, server: ssl.SSLContext, host: str = "localhost") -> tuple[st
         left.close()
         right.close()
         thread.join(10)
+
+
+def _open_ldaps(tls: Any, server: ssl.SSLContext) -> Any:
+    """Open a real ``ldap3.Connection`` to ``server`` on a loopback port, so the TLS goes through
+    ldap3's own call site rather than a direct ``wrap_socket`` call. Returns the TLS socket ldap3
+    kept; the caller closes it. ldap3 raises its own ``LDAPSocketOpenError`` on a refusal."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(10)
+    port = listener.getsockname()[1]
+
+    def serve() -> None:
+        with contextlib.suppress(ssl.SSLError, OSError):
+            raw, _addr = listener.accept()
+            raw.settimeout(10)
+            with server.wrap_socket(raw, server_side=True):
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        conn = ldap3.Connection(
+            ldap3.Server(
+                "127.0.0.1",
+                port=port,
+                use_ssl=True,
+                tls=tls,
+                get_info=ldap3.NONE,
+                connect_timeout=10,
+            ),
+            receive_timeout=10,
+        )
+        conn.open()
+        return conn.socket
+    finally:
+        listener.close()
+        thread.join(10)
+
+
+@pytest.mark.skipif(CBC_ONLY not in _DEFAULT_SUITE_NAMES, reason="default lacks the CBC suite")
+def test_a_real_ldap3_connection_uses_the_narrowed_context(pki: _Pki) -> None:
+    """Through ``ldap3.Connection.open``, ldap3's real call site. A DC offering only a CBC-SHA2
+    suite is refused by the engine's ``Tls`` and accepted by ldap3's own, the control, so the
+    refusal can only come from the override having run. Verification is off in both, because the
+    connection is to an IP address the test leaf does not name; the suite is what is measured."""
+    cbc_server = _server(pki)
+    cbc_server.maximum_version = ssl.TLSVersion.TLSv1_2
+    cbc_server.set_ciphers(CBC_ONLY)
+    control = _open_ldaps(ldap3.Tls(validate=ssl.CERT_NONE), cbc_server)
+    try:
+        assert control.cipher()[0] == CBC_ONLY
+    finally:
+        control.close()
+    with pytest.raises(LDAPSocketOpenError):
+        _open_ldaps(_tls(Path(pki.ca).read_text(), ssl.CERT_NONE), cbc_server)
+
+    engine = _open_ldaps(_tls(Path(pki.ca).read_text(), ssl.CERT_NONE), _server(pki))
+    try:
+        assert _tls12(engine.context) == list(tls_policy.APPROVED_TLS12_SUITES)
+    finally:
+        engine.close()
 
 
 def test_ldap3_wrap_socket_is_the_one_narrowed_tls_copies() -> None:

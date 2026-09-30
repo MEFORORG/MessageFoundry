@@ -38,9 +38,13 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
 
     The constructor builds the context factory from ``validate`` and ``ca_certs_data`` and runs it
     once, so a bad context fails here. It hands the same two values to ``ldap3.Tls``, so what ldap3
-    reads off this object stays true: ``validate`` decides its host name check, and a followed
-    referral copies it. It takes no other ldap3 argument, because the engine's context would not
-    carry one. ``ciphers=`` in particular reached TLS 1.2 only.
+    reads off this object stays true: ``validate`` decides its host name check. It takes no other
+    ldap3 argument, because the engine's context would not carry one. ``ciphers=`` in particular
+    reached TLS 1.2 only.
+
+    **Not reached: a followed referral.** ldap3 builds a plain ``ldap3.Tls`` for the referred server
+    from a few of these attributes (``strategy/base.py``, ``create_referral_connection``). That copy
+    carries neither the checked CA bytes nor any of the narrowing. This class does not change it.
     """
 
     def __init__(
