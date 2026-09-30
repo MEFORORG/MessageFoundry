@@ -113,13 +113,17 @@ def test_the_restore_puts_back_handler_level_formatter_and_the_disable_level(
 ) -> None:
     handler, stream = survivor
     formatter = handler.formatter
+    # Compare against the values before the block, not NOTSET, so a session that set either one
+    # does not fail a restore that worked.
+    level = handler.level
+    disabled = logging.root.manager.disable
     with root_logging_restored():
         handler.setLevel(logging.CRITICAL)
         handler.setFormatter(logging.Formatter("LEAKED %(message)s"))
         logging.disable(logging.CRITICAL)
-    assert handler.level == logging.NOTSET
+    assert handler.level == level
     assert handler.formatter is formatter
-    assert logging.root.manager.disable == logging.NOTSET
+    assert logging.root.manager.disable == disabled
     _emit_on_root()
     assert _LINE in stream.getvalue().splitlines()
 

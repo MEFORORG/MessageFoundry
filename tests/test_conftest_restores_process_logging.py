@@ -3,8 +3,9 @@
 """Pins ``tests/conftest.py::_restore_process_logging`` (BACKLOG #2049 follow-up, 2026-09-29).
 
 The tests run in file order, in two pairs. In the first pair, the first leaves the engine's logging
-configured, as a serve or a CLI test does. The second must not see it: before the fixture, the leftover stdout handler wrote a
-later test's records into that test's captured stdout, and two ``audit-verify``/``audit-anchor``
+configured, as a serve or a CLI test does. The second must not see it: before the fixture, the
+leftover stdout handler wrote a later test's records into that test's captured stdout, and two
+``audit-verify``/``audit-anchor``
 tests failed on it. If the fixture stops restoring, the second test fails here, on any worker.
 """
 
@@ -48,6 +49,12 @@ _LINE = "Open Console refused"
 
 def test_3_a_test_that_leaks_a_redaction_filter(caplog: pytest.LogCaptureFixture) -> None:
     from messagefoundry.logging_setup import RedactionFilter
+
+    # Control: test_4 proves the restore only while the filter would rewrite _LINE. If the redactor
+    # ever stops matching it, test_4 would pass against a broken restore, so fail here instead.
+    record = logging.LogRecord("t", logging.WARNING, __file__, 0, _LINE, None, None)
+    RedactionFilter().filter(record)
+    assert record.getMessage() != _LINE, "RedactionFilter no longer rewrites _LINE"
 
     root = logging.getLogger()
     root.addFilter(RedactionFilter())
