@@ -27,15 +27,17 @@ name: quality-advisory
 #                                                         in the step summary of the nightly cron.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
-# TWO JOBS HERE ARE NOT RUBRIC SIGNALS, AND BOTH ARE HERE ON PURPOSE. `dangling-citations` (BACKLOG
-# #1431) reports backlog `#N` references that name no filed item in either ledger; `verdict-divergence`
-# (BACKLOG #1342) reports an open item whose banner `Verdict` contradicts a re-score line in its own
-# body. Both are LEDGER-hygiene checks, not code-quality measurements, and their natural sibling --
-# backlog-hygiene.yml -- is the wrong home: that workflow's only job IS a required context, so a step
-# added there could block every merge. This file is the repository's one place where a check can report
-# without being able to gate, which is the property both jobs need. Promoting either to blocking is an
-# owner decision and is deliberately untaken; see each item for the reasoning and for what its current
-# findings actually are.
+# THE LEDGER-HYGIENE JOBS THIS PARAGRAPH DESCRIBED ARE GONE FROM THIS FILE. CORRECTED 2026-09-30
+# (BACKLOG #1342). It used to open "TWO JOBS HERE ARE NOT RUBRIC SIGNALS" and describe two ledger
+# checks as live jobs here. The note at the top of `jobs:` names them and says why they were removed
+# rather than left running. As of 2026-09-30, every job in this file is a rubric signal, or the
+# `liveness` check on those signals.
+#
+# A ledger check has no corpus here any more, so do not add one back. For any other report-only
+# check, the placement reason still holds: backlog-hygiene.yml is the wrong home, because its only job
+# IS a required context, so a step added there could block every merge. This file is one place where
+# a check can report without being able to gate. Promoting such a check to blocking is an owner
+# decision.
 #
 # WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
 # assumed, and the measurements are recorded here so a future session does not "helpfully" add a SARIF

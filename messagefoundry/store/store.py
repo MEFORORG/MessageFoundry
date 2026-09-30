@@ -2541,6 +2541,41 @@ def audit_rekey_when_keyed(keyed_from: int, ok: bool, msg: str | None) -> tuple[
     return True, f"audit chain already keyed from id={keyed_from}; {msg}"
 
 
+#: Why a server store cannot key its audit chain over an ``audit_chain_meta`` row that records no
+#: watermark (owner ruling R16). The row is written once, by an INSERT, so the runtime login needs no
+#: UPDATE or DELETE on the table; removing a row is the step of the principal that owns the store's
+#: schema. No engine build writes such a row, so one is foreign state. SQLite keeps its own ``INSERT
+#: OR REPLACE`` (owner ruling R17): a local file has no login to hold the two grants apart. The
+#: statement is lower-case because this text is logged, and the log redaction scrubs two adjacent
+#: ALL-CAPS words (``DELETE FROM``, ``IS NULL``) as a possible patient name.
+AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK = (
+    "audit_chain_meta already holds a row that records no keying watermark, and no engine build "
+    "writes one. The engine only inserts that row and never replaces it (owner ruling R16). As the "
+    "principal that owns the store's schema, run `delete from audit_chain_meta where id = 1 and "
+    "keyed_from_id is null`, with the table name qualified by that schema, then retry"
+)
+
+
+#: The keying row went away between the INSERT that found it and the read that followed.
+AUDIT_CHAIN_META_ROW_CHANGED = (
+    "audit_chain_meta changed while this ran: a keying row was there, then was not; run it again"
+)
+
+
+def audit_rekey_refused(row_found: bool, held_keyed_from: object) -> str:
+    """``rekey_audit_chain``'s answer when its watermark INSERT found a row already there, shared by
+    both server backends. ``row_found`` is whether the read after it returned the row, and
+    ``held_keyed_from`` is that row's ``keyed_from_id``."""
+    if not row_found:
+        return AUDIT_CHAIN_META_ROW_CHANGED
+    if held_keyed_from is None:
+        return AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK
+    return (
+        f"another process keyed the audit chain from id={held_keyed_from} while this ran; run "
+        "`messagefoundry rekey-audit` again to verify it"
+    )
+
+
 class AuditRangeHost(Protocol):
     """What :func:`settle_audit_ranges` and :func:`roll_audit_key_range` need from a store backend.
 

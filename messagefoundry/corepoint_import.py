@@ -65,8 +65,8 @@ XML is parsed through **defusedxml** with ``forbid_dtd``/``forbid_entities``/``f
 on, so a billion-laughs or external-entity payload raises instead of expanding.
 Paths ride across as data to :meth:`Message.set` at run time.
 
-Pure (parse + string codegen): no network, no message content, no dependency beyond the already-in-tree
-``defusedxml`` — safe to run anywhere.
+Pure (parse + string codegen): no network, no message content, no dependency beyond the engine's
+vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) — safe to run anywhere.
 """
 
 from __future__ import annotations
@@ -83,9 +83,8 @@ from xml.etree.ElementTree import (  # nosec B405 — exception type only; every
     ParseError,
 )
 
-from defusedxml.common import DefusedXmlException
-from defusedxml.ElementTree import fromstring as _xml_fromstring
-
+from messagefoundry._vendor.defusedxml.common import DefusedXmlException
+from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
 
