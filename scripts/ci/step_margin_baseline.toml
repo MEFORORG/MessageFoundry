@@ -98,8 +98,11 @@ source = "measured 2026-08-08; same pool as the ubuntu row; n=360. 35:47 is the 
 # the gate's RE-DERIVE note fired for each such run, and nothing escalated it.
 #
 # THE SAME HAPPENED AGAIN UNDER THE #1842 ROWS, and it is recorded so the next re-pool sees the
-# pattern. In the pool below, RE-DERIVE fired on 119 of 871 ubuntu, 127 of 874 windows-2022 and 4 of
-# 867 windows-2025 success rows -- every run over 3:13, 4:11 and 5:24. Nothing acted on it until LOW
+# pattern. In the pool below, RE-DERIVE fired on about 119 of 871 ubuntu, 127 of 874 windows-2022 and
+# 4 of 867 windows-2025 success rows. Those counts are runs whose API step duration exceeds 3:13, 4:11
+# and 5:24. The gate times mark to mark instead, which can differ by a second either way: runs
+# 36608371219 and 36640762359 sat exactly at 3:13 and 4:11 by API and still logged RE-DERIVE. So
+# read them as close, not exact. Nothing acted on it until LOW
 # reds began ejecting merge groups and failing pull requests. RE-DERIVE is a note, not a gate.
 
 [[baseline]]
@@ -108,7 +111,7 @@ leg = "ubuntu-latest"
 max_passing = "4:15"
 censored = false
 censored_by = ""
-source = "measured 2026-09-30 UTC (owner request of that date). Pool: every ci.yml run with event merge_group or pull_request created 2026-09-26T02:17:00Z..2026-09-30T19:24:59Z UTC, both ends inclusive, as the runs endpoint's created=A..B filter reads them: 914 runs (merge_group 375, pull_request 539), 3 of them pull_request runs with no web console step. It opens after the #1842 pool's last minute, so no run is in both. Each event was listed on its own, as for the #1842 pool. Jobs fetched with ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at. A re-run-failed-jobs attempt re-lists the jobs it did not re-run under new ids with identical stamps; those copies are dropped (94 across the three legs). Runs still in progress when first listed were re-read after they finished. n=871 (merge_group 375, pull_request 496), min 1:48, median 2:43. Worst 4:15, run 36761620218 (pull_request, 2026-09-30); next 3:50, run 36763693837 (merge_group). The gate went red on 1 of these success rows (that 4:15, pull_request) at the 5:00 cap this row replaces. Uncensored on evidence: the one step failure (run 36518825881, a test failure on all three legs) stopped at 2:14, far under the 9:00 kill; 10 were cancelled, the longest at 3:19; 29 were skipped. push and workflow_dispatch are left out, as in the #1842 pool."
+source = "measured 2026-09-30 UTC (owner request of that date). Pool: every ci.yml run with event merge_group or pull_request created 2026-09-26T02:17:00Z..2026-09-30T19:24:59Z UTC, both ends inclusive, as the runs endpoint's created=A..B filter reads them: 914 runs (merge_group 375, pull_request 539), 3 of them pull_request runs with no web console step. It opens after the #1842 pool's last minute, so no run is in both. Each event was listed on its own, as for the #1842 pool. Jobs fetched with ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at. A re-run-failed-jobs attempt re-lists the jobs it did not re-run under new ids with identical stamps; those copies are dropped (94 across the three legs). Runs still in progress when first listed were re-read after they finished. Jobs were read 2026-09-30 between about 19:15Z and 20:20Z UTC; a later re-run of a run in the window adds an attempt this pool does not hold, so a re-collection can return a larger n. n=871 (merge_group 375, pull_request 496), min 1:48, median 2:43. Worst 4:15, run 36761620218 (pull_request, 2026-09-30); next 3:50, run 36763693837 (merge_group). The gate went red on 1 of these success rows (that 4:15, pull_request) at the 5:00 cap this row replaces. Uncensored on evidence: the one step failure (run 36518825881, a test failure on all three legs) stopped at 2:14, far under the 9:00 kill; 10 were cancelled, the longest at 3:19; 29 were skipped. push and workflow_dispatch are left out, as in the #1842 pool."
 
 [[baseline]]
 step = "Web console tests (pytest)"

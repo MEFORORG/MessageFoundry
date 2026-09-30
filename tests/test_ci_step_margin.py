@@ -1064,7 +1064,7 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
         # step, whose own note in ci.yml offers 2 as "the conservative rung" when engine timing tests
         # flake. Taking that rung halves THIS step's workers, and every margin figure #1879 recorded
         # was measured at 4 -- 1.058x and 1.103x were what the two breaching legs needed at the caps
-        # then in force (windows-2025's cap is lower now, so its need is higher), with no
+        # then in force (every cap has moved since; see ci.yml's "THE THIRD RE-DERIVATION"), with no
         # measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
         # let the merge-group ejections come back while still reading as a parallelism guard.
         assert isinstance(count, int) and count >= 4, (

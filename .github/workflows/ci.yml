@@ -1468,14 +1468,14 @@ jobs:
       # The pool is merge_group plus pull_request. merge_group alone has maxima 2:54 / 4:09 / 5:06,
       # which would size windows-2025 at 7; the wider pool is used because its maximum is higher. push
       # and workflow_dispatch runs in the same window executed this step only 7 times per leg, all
-      # under the rows, because a push that changes no code leaves the job unexpanded. The kills stay
-      # 9 / 10 / 12. Each is still at least 1.30x its cap, and the nesting table above sums the kills,
-      # so that table does not move.
+      # under the rows, because a push that changes no code leaves the job unexpanded. That change left
+      # the kills at 9 / 10 / 12, each still at least 1.30x its cap, so it did not move the nesting
+      # table. The third re-derivation below did move one kill.
       #
       # LOWERING windows-2025 TO 8 HAS A COST, AND IT IS TAKEN ON PURPOSE. At 9 the gate reds above
-      # 6:55; at 8 it reds above 6:09, 14 percent over the worst pooled run of 5:24. The rule leaves
-      # windows-2022 10 percent (4:37 over 4:11) and ubuntu 20 percent (3:51 over 3:13), so 8 puts
-      # windows-2025 between them. The rule keeps the ruler close to the work, so the gate speaks when
+      # 6:55; at 8 it reds above 6:09, 14 percent over the worst pooled run of 5:24. In that pool the
+      # rule left windows-2022 10 percent (4:37 over 4:11) and ubuntu 20 percent (3:51 over 3:13), so 8
+      # put windows-2025 between them. The third re-derivation's figures supersede these. The rule keeps the ruler close to the work, so the gate speaks when
       # the suite grows. Holding 9 would keep a cap that no run in this pool supports, which is the
       # "bound derived from another bound" #344 closed. If windows-2025 starts ejecting merge groups
       # at 8, re-measure; do not restore 9 by hand.
@@ -1498,7 +1498,7 @@ jobs:
       # WHAT THIS MEANS FOR BACKLOG #1842. It was filed against windows-2022 at 5 of 30 merge_group
       # runs red, and it proposed raising that cap to 7. xdist fixed the red first: that leg's worst
       # run in that pool was 4:11, 1.434x under 6:00, and no run in that pool supported the raise.
-      # That held until the suite outgrew it: the third re-derivation below found 5:40 and moved the
+      # That held until the third re-derivation's pool, which found 5:40 and moved the
       # cap to 8.
       #
       # THE HOSTED RUNS CAME IN SLOWER THAN THE PROJECTION, AS IT WARNED THEY MIGHT. Medians, both
@@ -1528,10 +1528,17 @@ jobs:
       # windows-2022's kill moved from 10 to 11 with it, so the kill stays at least 1.30x the cap; the
       # nesting table above carries the new sum.
       #
+      # windows-2022's 8 RESTS ON ONE RUN, and saying so is the point of this paragraph. Its worst is
+      # run 36765488564 at 5:40, created ten seconds before the window closed; the same run's ubuntu leg
+      # took 3:11, so the time is Windows runner time as much as suite size. The next worst, 5:09, would
+      # size the leg at 7. merge_group alone has maxima 3:50 / 5:05 / 5:19, which gives 6 / 7 / 8. The
+      # wider pool is used because its maximum is higher, as in the second re-derivation.
+      #
       # THE STEP IS STILL GETTING SLOWER, AND THESE CAPS WILL NOT HOLD LONG. Daily medians in this pool
       # rose 2:35 -> 3:34 on ubuntu, 3:12 -> 4:24 on windows-2022 and 3:29 -> 4:45 on windows-2025
-      # from 2026-09-26 to 2026-09-30, about 37 percent. Test functions in the suite rose 626 -> 725, 16
-      # percent, over main in the same window, and `test_webui.py` 286 -> 311. So growth alone does not
+      # from 2026-09-26 to 2026-09-30, about 37 percent. Test FUNCTIONS in the suite -- `def test_` lines,
+      # not the collected counts this note gives elsewhere -- rose 626 -> 725, 16 percent, over main in
+      # the same window, and in `test_webui.py` 286 -> 311. So growth alone does not
       # account for the rise; runner contention may, and nobody has measured it. At the new caps the
       # gate reds at 4:37 or longer on ubuntu and 6:10 or longer on both Windows legs -- 9, 9 and 8
       # percent over each leg's worst pooled run. When the next red comes, re-measure again. The
@@ -2168,13 +2175,14 @@ jobs:
           # the nesting invariant has to hold there too: setup(max) + webconsole_step_timeout must fit
           # under it. THE SUM LIVES IN ONE PLACE AND IT IS NOT HERE -- the per-leg table above the
           # `Web console tests (pytest)` step, which tests/test_ci_step_margin.py parses and re-adds.
-          # Its widest leg is 19:35 against 20:00. This paragraph used to carry its own copy of that
+          # This paragraph used to carry its own copy of that
           # arithmetic and the copy went stale the moment `webconsole_step_timeout` moved: it still
           # read `5:22 + 4:30 + 5:00 = 14:52` after the kill became 9, so ci.yml asserted two
           # different worst cases for the same leg 650 lines apart. A second copy is what a checked
           # copy exists to replace, so this one is a pointer now.
           #
-          # 20 clears it with room. It is a DEADLOCK BACKSTOP, not a tightness gate: the drift detector
+          # 20 clears it on every leg; the table states each leg's slack, and the tightest is small since
+          # the third re-derivation. It is a DEADLOCK BACKSTOP, not a tightness gate: the drift detector
           # is the margin check against `webconsole_margin_cap`, so sizing this close to the observed
           # run would buy no detection and cost false reds on green suites. That knob is the gate's
           # ruler and `webconsole_step_timeout` is only the wall -- this sentence named the wall until
