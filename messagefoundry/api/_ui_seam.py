@@ -274,7 +274,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "10a6cc7c95459dcc"
+ENGINE_UI_SEAM: str = "32ad621e6081555e"
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,7 +449,7 @@ class UiDeps:
     #: Whether to interpose the "you are leaving this site" page at all. On by default; off is a
     #: posture decision and the serve gate says so.
     external_link_interstitial: bool = True
-    #: ⚠️ The audited escape — destinations navigated to with NO notification and NO cancel, which is
+    #: WARNING: The audited escape — destinations navigated to with NO notification and NO cancel, which is
     #: exactly what 3.7.3 asks for. Non-empty produces a startup warning naming every entry.
     external_link_allowlist: tuple[str, ...] = ()
     #: Host of the configured IdP authorization endpoint, for DISPLAY on the interstitial. Derived

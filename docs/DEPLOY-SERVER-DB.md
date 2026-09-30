@@ -83,6 +83,9 @@ ALTER ROLE db_datareader  ADD MEMBER [CORP\mefor-svc$];
 ALTER ROLE db_datawriter  ADD MEMBER [CORP\mefor-svc$];
 ```
 
+`db_datawriter` grants `UPDATE` and `DELETE` on every table, `audit_log` included. Step 4 ends by
+taking those two back on the audit tables.
+
 **4. Provision the schema as a separate, DDL-capable principal** (DBA). Run this before the first
 start, and again before the first start of any upgrade whose schema moved. Run it with the engines
 stopped. A schema that is already current is a no-op.
@@ -105,7 +108,23 @@ messagefoundry store provision-schema --service-config <instance dir>\messagefou
 #   --username <provisioning login>
 ```
 
-Until this step has run, `serve` **refuses to start**. The error names the database and this command.
+Then make the audit tables append-only for the gMSA (owner ruling R16). The engine only ever
+inserts audit rows, so the gMSA needs `INSERT` and `SELECT` there and nothing more. Run this once,
+after the first `provision-schema` has created the tables. Replace `dbo` if the tables live in
+another schema.
+
+```sql
+USE [MessageFoundry];
+DENY UPDATE, DELETE ON dbo.audit_log        TO [CORP\mefor-svc$];
+DENY UPDATE, DELETE ON dbo.audit_chain_meta TO [CORP\mefor-svc$];
+```
+
+Without the `DENY`, on a first deployment the engine's own login could rewrite or delete audit rows.
+So the startup probe (§1.3) names each right the `DENY` would remove, and the start refuses under the
+shipped `enforce` dial. `rekey-audit` also runs as the gMSA: it inserts the keying row and never
+replaces one.
+
+Until `provision-schema` has run, `serve` **refuses to start**. The error names the database and the command.
 It runs no schema DDL of its own, so a refused start leaves the database exactly as it found it.
 The refusal names the gMSA's default schema, and `provision-schema` prints the schema it built in.
 The gMSA resolves unqualified names in its default schema and then in `dbo`, so a built-in schema
@@ -141,12 +160,15 @@ own account, it measures your grant rather than the engine's.
 messagefoundry check-privileges --service-config <instance dir>\messagefoundry.toml
 ```
 
-- It **exits 0** when the probe sees no grant beyond `db_datareader` + `db_datawriter`. It does not
-  check that those two are present, or that no `db_deny*` role takes them away. Confirm those by
-  hand; a missing grant may surface only when the engine first touches the table it covers.
+- It **exits 0** when the probe sees no grant beyond `db_datareader` + `db_datawriter`, with the two
+  audit tables' `UPDATE` and `DELETE` denied. It does not check that those two roles are present, or
+  that no `db_deny*` role takes them away. Confirm those by hand; a missing grant may surface only
+  when the engine first touches the table it covers.
 - It **exits 3** when the probe sees a grant beyond that set. Under the `external` default the gMSA
-  must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. Remove
-  it and run the check again.
+  must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. So is
+  `UPDATE`, `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log` or `audit_chain_meta`,
+  and an `UPDATE` granted on one column, which outranks the table-level `DENY`. Remove it and run the check
+  again.
 - It **exits 4** when the probe could not read the login at all, for example on a failed connection
   or a permission read that came back NULL. That is not a clean result.
 - It exits 1 when the service settings do not load.
@@ -168,7 +190,7 @@ grants, so you confirm them by hand. They never change the exit code. The full p
 >
 > | Principal | Grant | When it is used |
 > |---|---|---|
-> | Runtime (the gMSA) | `db_datareader` + `db_datawriter` | every start, all day |
+> | Runtime (the gMSA) | `db_datareader` + `db_datawriter`, with `UPDATE` and `DELETE` denied on `audit_log` and `audit_chain_meta` | every start, all day |
 > | Provisioning (a DBA login) | `db_ddladmin` + `db_datareader` + `db_datawriter`, plus `ALTER` on the database for the two options | step 4 only |
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
@@ -230,11 +252,33 @@ of any upgrade whose schema moved. Put that role's password in `MEFOR_STORE_PASS
 messagefoundry store provision-schema --service-config <instance dir>\messagefoundry.toml --username mefor_owner
 ```
 
+Then make the audit tables append-only for the engine role (owner ruling R16). The default
+privileges above granted it `UPDATE` and `DELETE` on every table, `audit_log` included, and the
+engine only ever inserts audit rows. Run this once, as `mefor_owner`, after the first
+`provision-schema` has created the tables:
+
+```sql
+REVOKE UPDATE, DELETE, TRUNCATE, TRIGGER ON mefor.audit_log, mefor.audit_chain_meta FROM mefor;
+```
+
+Without the `REVOKE`, on a first deployment the engine's own role could rewrite, delete or truncate
+audit rows. `TRIGGER` is not in the default privileges, but a role holding it could attach a
+trigger that rewrites each row as it goes in. So the startup probe (§1.3) names each of those four
+rights, from any role the engine role may assume, and the start refuses under the shipped `enforce`
+dial. A later `provision-schema` does not re-create those tables,
+so the `REVOKE` stays. `rekey-audit` also runs as `mefor`: it inserts the keying row and never
+replaces one.
+
 > **`provision-schema` is what makes posture B work.** It writes the `schema_meta` marker, and the
 > engine role only ever reads it. Hand-creating the tables is not enough: without a current marker
 > the engine refuses to start, by design, and names this command. If the tables already existed
 > before the default privileges above, also run `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES
-> IN SCHEMA mefor TO mefor;` and `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA mefor TO mefor;`.
+> IN SCHEMA mefor TO mefor;` and `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA mefor TO mefor;`,
+> then the `REVOKE` above.
+>
+> **Posture A cannot make the audit tables append-only.** Under `auto` the engine role owns them,
+> and an owner can grant itself any right back. So the probe does not count those rights there, and
+> the audit chain's hash links and off-box copy are what detect a rewrite.
 
 **Posture A — `auto`: the engine role owns its own schema** and bootstraps and upgrades it at open
 (§2). Set `[store].schema_management = "auto"`. It is simpler, and it leaves the runtime role with
@@ -273,8 +317,8 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 
 | Backend | What the probe reads | On SQLite |
 |---|---|---|
-| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess; under `auto` it is prescribed | n/a |
-| PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database. Under `external` it also counts `CREATE` on the store's schema, and ownership of objects in it, as excess; under `auto` both are prescribed | n/a |
+| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess, and so does `UPDATE` (on the table or any one column), `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log` or `audit_chain_meta`; under `auto` `db_ddladmin` is prescribed and the audit-table rights are not counted | n/a |
+| PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database. Under `external` it also counts `CREATE` on the store's schema, ownership of objects in it, and `UPDATE` (on the table or any one column), `DELETE`, `TRUNCATE` or `TRIGGER` on `audit_log` or `audit_chain_meta` held by any role it may assume, as excess; under `auto` the first two are prescribed and the audit-table rights are not counted | n/a |
 | SQLite | — | reported **not applicable**: a local file has no server principal; access is the filesystem ACL on the `.db` and its `-wal`/`-shm` sidecars |
 
 - **Every start reports what it saw.** Every start logs what was observed, writes a
@@ -348,9 +392,8 @@ SQLite is always `auto`: a local file has no server principal to split.
   **either** mode the open **fails** while RCSI is off, naming the statement for a DBA (BACKLOG
   #1628); an `ALLOW_SNAPSHOT_ISOLATION` that is off only warns. So pre-enable RCSI if your policy
   keeps `ALTER` on the database from both logins; with the §1.1 runtime login this is **not
-  conditional**, because that login cannot `ALTER DATABASE`. The runtime login's grants are
-  §1.1: `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `auto`, and never
-  `db_owner` or `sysadmin`.
+  conditional**, because that login cannot `ALTER DATABASE`. The runtime login's grants are in
+  §1.1, the audit-table `DENY` of step 4 included, and never `db_owner` or `sysadmin`.
 
 > **The PostgreSQL role grants are now answered in §1.2** — the two supported postures, why nothing
 > wider, and why posture B needs `provision-schema`. The SQL Server set (§1.1) never transferred and does not

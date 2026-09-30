@@ -555,7 +555,7 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # whether any request is authorized. No login, session, permission or authorization outcome
         # turns on it, and it is never read on an inbound request path at all.
         #
-        # ⚠️ It IS a security-relevant setting and it LOWERS security when non-empty, which is why the
+        # WARNING: It IS a security-relevant setting and it LOWERS security when non-empty, which is why the
         # serve gate warns and names every entry. That makes it a settings-reference concern, not an
         # 8.1.3/8.1.4 contextual-input one — the two are different questions and this list is the
         # place the difference gets recorded rather than assumed.

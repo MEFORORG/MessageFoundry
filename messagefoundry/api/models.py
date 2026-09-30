@@ -1525,7 +1525,6 @@ class AlertRuleInfo(BaseModel):
     mute: bool = False  # #143 — static per-rule NOTIFICATION mute (still records state)
     escalate_tiers: int = 0  # #81 — number of occurrence-driven escalation tiers (0 = none)
     schedule_configured: bool = False  # #81 — whether the rule is schedule-gated (present-or-not)
-    content_label: str | None = None  # #81 — content_match label this rule routes by (None = any)
 
 
 class AlertsConfig(BaseModel):
