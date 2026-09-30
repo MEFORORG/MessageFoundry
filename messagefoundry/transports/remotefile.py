@@ -60,6 +60,7 @@ import hashlib
 import io
 import logging
 import posixpath
+import re
 import ssl
 import threading
 import time
@@ -201,14 +202,45 @@ class _RemoteError(Exception):
     Only auth-refusal sites set it; it is threaded onto the :class:`NegativeAckError` so the delivery
     worker can STOP-and-retain rather than dead-letter the backlog.
 
+    ``config_fault`` (BACKLOG #2083) marks a permanent refusal of the connection's configuration
+    while the FTP session opens: see :func:`_ftp_connect_refusal`. It is threaded the same way, and
+    the worker stops the lane on it too, because every queued row would meet the same refusal.
+
     The connector maps a transient error to :class:`DeliveryError` (retry) and a permanent one to
-    :class:`NegativeAckError` (dead-letter / credential-STOP), so the client layer stays
+    :class:`NegativeAckError` (dead-letter, or a STOP on either marker), so the client layer stays
     transport-detail-only."""
 
-    def __init__(self, message: str, *, permanent: bool, credential_fault: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        permanent: bool,
+        credential_fault: bool = False,
+        config_fault: bool = False,
+    ) -> None:
         super().__init__(message)
         self.permanent = permanent
         self.credential_fault = credential_fault
+        self.config_fault = config_fault
+
+    @property
+    def connection_fault(self) -> bool:
+        """True for a credential or a configuration fault: a fault of the connection, which every
+        row meets alike, rather than of one message or one path."""
+        return self.credential_fault or self.config_fault
+
+    def as_delivery_error(self) -> DeliveryError:
+        """The pipeline error for this failure: a transient one retries, a permanent one is a
+        :class:`NegativeAckError` carrying both markers."""
+        if not self.permanent:
+            return DeliveryError(str(self))
+        return NegativeAckError(
+            str(self),
+            code="remotefile",
+            permanent=True,
+            credential_fault=self.credential_fault,
+            config_fault=self.config_fault,
+        )
 
 
 class _RemoteOversize(Exception):
@@ -439,6 +471,186 @@ def _ftps_ssl_context(
     return ctx
 
 
+#: The steps of opening an FTP session, named so a 5xx reply can be classified by the step it answers.
+_FTP_GREETING = "the greeting"
+_FTP_AUTH_TLS = "AUTH TLS"
+_FTP_LOGIN = "the login"
+_FTP_PROT_P = "PBSZ/PROT P"
+
+#: A reply line that names a connection limit as a whole phrase: ProFTPD's "530 Sorry, the maximum
+#: number of clients (5) for this user are already connected.", Serv-U's "530 Sorry, no more than 10
+#: users allowed", "Too many connections" or "too many users" from several others, and "Connection
+#: limit reached". A "maximum ... clients" must go on to say they are already connected, or that the
+#: limit is reached or exceeded; the word "maximum" and a noun alone are not enough. A full stop
+#: ends the phrase, except one inside a token ("192.0.2.10", "ftp.example.com") or after "max". The
+#: nouns are clients, connections, users and sessions only. "Login" is left out on purpose: "530
+#: Maximum login attempts exceeded" is a credential refusal, not a limit.
+_FTP_CONNECTION_LIMIT = re.compile(
+    r"\bmax(?:imum)?\b\.?(?:[^.\n]|\.(?=\w)){0,60}?\b(?:clients?|connections?|users?|sessions?)\b"
+    r"(?:[^.\n]|\.(?=\w)){0,40}?\b(?:already\s+(?:connected|logged\s+in)|reached|exceeded)\b"
+    r"|\btoo\s+many\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
+    r"|\bno\s+more\s+than\s+\d+\s+(?:\w+\s+){0,2}?(?:clients?|connections?|users?|sessions?)\b"
+    r"|\b(?:client|connection|user|session)s?\s+limit\s+(?:reached|exceeded)\b",
+    re.IGNORECASE,
+)
+
+#: Words that mark a login reply as being about the credential or the account, even when it also
+#: names a limit or a TLS demand. A login reply carrying one anywhere keeps the credential-fault
+#: class. An underscore counts as a space (see :func:`_names_credential`), so "LOGIN_FAILED" and
+#: "USER_NOT_FOUND" are read as words.
+#:
+#: Most stems match inside a word, so "blocked", "Unauthorized", "loginfailed" and "badpassword"
+#: count (BACKLOG #2083, fix round 3). "tries" and "retries" are anchored at both ends, so "entries"
+#: is not "tries".
+#:
+#: Two busy-server words are left out on purpose: "retry" ("please retry later") and "permitted"
+#: ("no more than 10 users permitted"); "not permitted" is in. Others a busy server also says stay
+#: in: "denied", "rejected", "refused", "not allowed", and a banner's "Unauthorized access". Such a
+#: reply stops the lane, the cheaper of the two errors; see :func:`_names_connection_limit`.
+_FTP_CREDENTIAL_WORDS = re.compile(
+    r"lock|auth|passw|fail|invalid|incorrect|wrong|mismatch|unknown|unsuccess|cred|revo[kc]"
+    r"|deactivat|forbid|reject|refus|disabl|disallow|prohibit|inactiv|expir|suspend|terminat"
+    r"|blacklist|\bbad|\bpwd\b|\battempt|\btries\b|\bretries\b|\bden(?:y|ies|ied|ying|ial)"
+    r"|\bbann?ed\b|\bfrozen\b|\bon\s+hold\b|\bclosed\b"
+    r"|\bnot\s+(?:allowed|permitted|found|accepted|recogni[sz]ed|logged\s+in)\b"
+    r"|\bno\s+such\s+user\b|\bdoes\s+not\s+exist\b",
+    re.IGNORECASE,
+)
+
+#: TLS vocabulary taken out before the credential words are looked for, in a TLS demand only: the
+#: ``AUTH TLS`` command ("must use AUTH TLS first"), and "authenticate" ("You must authenticate over
+#: TLS"). There neither is about the credential. "Authentication failed" still counts, by "failed".
+#: Beside a connection limit they stay credential words: "530 Not authenticated; too many
+#: connections" is a refused login, and retrying it would move a partner lockout counter.
+_FTP_TLS_VOCABULARY = re.compile(r"\bAUTH\s+(?:TLS|SSL)\b|\bauthenticat\w*", re.IGNORECASE)
+
+#: A TLS name as a whole token: "SSL", "TLS", "TLSv1.2", "FTPS", or a word starting "encrypt". Not
+#: "SSL-VPN", "ftps-users", "sslhome", "the SSL VPN", "/srv/tls" or "encrypted_users", which name an
+#: account's group or path: a name joined to "-", "_" or "/" is part of a longer token.
+_TLS_NAME_PATTERN = (
+    # "/" joins a path, except between two TLS names, as in ProFTPD's "SSL/TLS required".
+    r"(?:(?<!_)(?:(?<!/)|(?<=ssl/)|(?<=tls/))\b(?:ssl|tls|ftps)(?:v?[\d.]*\d)?\b"
+    r"(?![-_])(?!/(?!(?:ssl|tls)\b))(?!\W{1,3}vpn\b)"
+    r"|(?<![/_])\bencrypt[a-z]*\b(?![-_/]))"
+)
+
+#: A reply line that demands TLS as one phrase: a TLS name then "required" or "mandatory" within
+#: three words, or "must", "have to" or "requires" then a TLS name within four. vsftpd's "530
+#: Non-anonymous sessions must use encryption.", ProFTPD's "550 SSL/TLS required on the control
+#: channel", FileZilla's "You have to use FTP over TLS" and IIS's "534 Policy requires SSL." all
+#: match. "only" is left out: "530 Login for SSL-VPN users only" refuses an account.
+_FTP_TLS_DEMAND = re.compile(
+    rf"{_TLS_NAME_PATTERN}\W+(?:\w+\W+){{0,3}}?(?:requir\w*|mandatory)\b"
+    rf"|\b(?:must|have\s+to|requir\w*)\W+(?:\w+\W+){{0,4}}?{_TLS_NAME_PATTERN}",
+    re.IGNORECASE,
+)
+
+
+def _last_reply_line(reply: str) -> str:
+    """The last non-blank line of a reply, the one that carries the final code."""
+    lines = [line for line in reply.strip().splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _names_credential(reply: str, *, in_tls_demand: bool = False) -> bool:
+    """True when a reply carries a credential or account word anywhere (``_FTP_CREDENTIAL_WORDS``).
+    An underscore is read as a space. With ``in_tls_demand``, TLS vocabulary
+    (``_FTP_TLS_VOCABULARY``) is taken out first."""
+    text = reply.replace("_", " ")
+    if in_tls_demand:
+        text = _FTP_TLS_VOCABULARY.sub(" ", text)
+    return bool(_FTP_CREDENTIAL_WORDS.search(text))
+
+
+def _names_connection_limit(reply: str, *, at_login: bool) -> bool:
+    """True when an FTP reply names a connection limit, and, at the login, says nothing about the
+    credential.
+
+    **An unclear login refusal is a credential fault (BACKLOG #2083).** RFC 959 gives 530 for "not
+    logged in", whatever the reason. So only the text can tell a busy server from a wrong password,
+    and servers word it freely. This function is the narrow test that lets a 5xx login refusal be
+    read as a busy server. :func:`_demands_tls` is another, and there may be more: a 4xx is
+    classified in :meth:`_FtpClient._connect`. A 5xx login refusal that passes neither is a
+    credential fault, which stops the lane under the default policy (ADR 0095).
+
+    The two errors do not cost the same. Reading a busy server as a bad password stops one lane on
+    this engine, with every message kept, until an operator resumes it. Reading a bad password as a
+    busy server retries the login on every delivery. A partner that locks an account after a few
+    failures would lock it, on its own system, where no operator here can undo it.
+
+    So the test is narrow on purpose. The limit phrase must be on the reply's last line, which
+    carries the final code; earlier lines are often a banner. At the login, no credential word may
+    appear anywhere in the reply. Before the login no credential has been sent, so the words are
+    not looked for there."""
+    if not _FTP_CONNECTION_LIMIT.search(_last_reply_line(reply)):
+        return False
+    return not (at_login and _names_credential(reply))
+
+
+def _demands_tls(reply: str) -> bool:
+    """True when a login refusal demands TLS as one phrase, and says nothing about the credential.
+
+    Such a server refuses a plain session's login whatever the credential, so the fault is the
+    connection's TLS setting (BACKLOG #2083, fix round 3). The caller asks only for a plain session;
+    an FTPS control channel is already TLS. The demand must be one phrase on the last line
+    (``_FTP_TLS_DEMAND``), and a credential word anywhere keeps the credential-fault class."""
+    return bool(_FTP_TLS_DEMAND.search(_last_reply_line(reply))) and not _names_credential(
+        reply, in_tls_demand=True
+    )
+
+
+def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _RemoteError:
+    """Classify a 5xx reply received while opening an FTP session (BACKLOG #2083).
+
+    - A reply naming a connection limit is **transient**: the server is busy, and a later attempt
+      gets in. See :func:`_names_connection_limit` for how an ambiguous login reply falls.
+    - A refusal of ``AUTH TLS`` or ``PBSZ``/``PROT P`` is a **configuration** fault: permanent, and
+      not a credential fault. The server does not offer the TLS this connection asks for, so no
+      retry helps and no credential was at fault.
+    - On a plain session, a login refusal that says the server requires TLS is the same
+      configuration fault; see :func:`_demands_tls`.
+    - A refusal of the greeting, before any credential is sent, is permanent and not a credential
+      fault either.
+    - Any other refusal at the login is a **credential** fault (#109, ADR 0095), so the delivery
+      worker stops the lane rather than retrying into an account lockout.
+
+    These are the 5xx rules. A 4xx is transient, except a 4xx at the login that names the credential
+    ("430 Invalid username or password"): :meth:`_FtpClient._connect` makes that a credential fault.
+
+    The configuration faults carry ``config_fault`` (fix round 4). Every queued row would meet the
+    same refusal, so on the delivery path the worker stops the lane and keeps the queue, as it does
+    for a credential fault, rather than dead-letter each row in turn. Both follow
+    ``credential_fault_policy``; ``"dead_letter"`` dead-letters instead. :meth:`_list_or_retry`
+    passes both markers through unchanged.
+    """
+    reply = str(exc)
+    if _names_connection_limit(reply, at_login=step == _FTP_LOGIN):
+        return _RemoteError(
+            f"FTP server refused {step} at its connection limit (retried): {reply}",
+            permanent=False,
+        )
+    if step in (_FTP_AUTH_TLS, _FTP_PROT_P):
+        return _RemoteError(
+            f"FTPS server refused {step}, a TLS configuration fault, not a credential fault: {reply}",
+            permanent=True,
+            config_fault=True,
+        )
+    if step == _FTP_LOGIN and not tls and _demands_tls(reply):
+        return _RemoteError(
+            f"FTP server requires TLS at {step}, a TLS configuration fault, not a credential "
+            f"fault: {reply}",
+            permanent=True,
+            config_fault=True,
+        )
+    if step == _FTP_GREETING:
+        return _RemoteError(
+            f"FTP server refused the connection, a configuration fault: {reply}",
+            permanent=True,
+            config_fault=True,
+        )
+    return _RemoteError(f"FTP login refused: {reply}", permanent=True, credential_fault=True)
+
+
 class _FtpClient(_RemoteClient):
     """FTP / FTPS client over the stdlib ``ftplib``. ``tls`` selects ``FTP_TLS`` (explicit TLS, with
     ``PROT P`` so the data channel is encrypted too) over plain ``FTP``. For FTPS a verifying
@@ -466,16 +678,51 @@ class _FtpClient(_RemoteClient):
         )
 
     def _connect(self) -> ftplib.FTP:
+        """Connect, secure the control channel (FTPS), log in and secure the data channel (FTPS), or
+        raise a classified :class:`_RemoteError`. Each step is named, because the step a 5xx reply
+        answers decides its class (BACKLOG #2083); see :func:`_ftp_connect_refusal`. The connection
+        is closed on every failure."""
         # B321: plain FTP only when explicitly selected; credentials over it are refused unless
         # MEFOR_ALLOW_INSECURE_TLS is set (see _validate_common). FTPS/SFTP are the encrypted defaults.
         if self._tls:
             ftp: ftplib.FTP = ftplib.FTP_TLS(context=self._context, timeout=self._timeout)
         else:
             ftp = ftplib.FTP(timeout=self._timeout)  # nosec B321
-        ftp.connect(self._host, self._port)
-        ftp.login(user=str(self._user or ""), passwd=str(self._password or ""))
-        if isinstance(ftp, ftplib.FTP_TLS):
-            ftp.prot_p()  # encrypt the data channel, not just the control channel
+        step = _FTP_GREETING
+        try:
+            ftp.connect(self._host, self._port)
+            if isinstance(ftp, ftplib.FTP_TLS):
+                # Explicit here rather than left to login(), so a refusal is known to answer AUTH TLS
+                # and not the credential. login() skips its own AUTH once the socket is TLS.
+                step = _FTP_AUTH_TLS
+                ftp.auth()
+            step = _FTP_LOGIN
+            ftp.login(user=str(self._user or ""), passwd=str(self._password or ""))
+            if isinstance(ftp, ftplib.FTP_TLS):
+                step = _FTP_PROT_P
+                ftp.prot_p()  # encrypt the data channel, not just the control channel
+        except ftplib.error_perm as exc:
+            ftp.close()
+            raise _ftp_connect_refusal(step, exc, tls=self._tls) from exc
+        except ftplib.error_temp as exc:
+            ftp.close()
+            if step == _FTP_LOGIN and _names_credential(str(exc)):
+                # A 4xx that names the credential ("430 Invalid username or password") is a refused
+                # login too: retried, it would lock the partner account (BACKLOG #2083, fix round 3).
+                # A credential word wins over a limit phrase here as it does at a 5xx, so "421 Too
+                # many connections; account locked" stops the lane. The word list is broad, so some
+                # busy or closing 4xx replies ("blocked", "terminated") stop it too: the cheaper
+                # error, as :func:`_names_connection_limit` explains (fix round 4 review 2).
+                raise _RemoteError(
+                    f"FTP login refused: {exc}", permanent=True, credential_fault=True
+                ) from exc
+            raise _RemoteError(f"FTP connect failed: {exc}", permanent=False) from exc
+        except ftplib.all_errors as exc:  # connect/timeout/4xx/protocol/OSError -- transient
+            ftp.close()
+            raise _RemoteError(f"FTP connect failed: {exc}", permanent=False) from exc
+        except BaseException:
+            ftp.close()
+            raise
         return ftp
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
@@ -577,21 +824,10 @@ class _FtpClient(_RemoteClient):
         return True
 
     def _op(self, fn: Callable[[ftplib.FTP], _T]) -> _T:
-        """Connect, run ``fn(ftp)``, always close. Maps ``ftplib`` failures to :class:`_RemoteError`:
-        a permanent reply (``error_perm`` — auth/no-such-file/no-perm) is permanent; a connect/IO/
-        timeout/protocol error is transient."""
-        try:
-            ftp = self._connect()
-        except (
-            ftplib.error_perm
-        ) as exc:  # login refused — a permanent credential/permission problem
-            # #109 (ADR 0095): login refusal is a CREDENTIAL fault (account-lockout risk on a retry
-            # storm) — distinct from an operation-level error_perm below (a content/path problem).
-            raise _RemoteError(
-                f"FTP login refused: {exc}", permanent=True, credential_fault=True
-            ) from exc
-        except ftplib.all_errors as exc:  # connect/timeout/protocol/OSError — transient
-            raise _RemoteError(f"FTP connect failed: {exc}", permanent=False) from exc
+        """Connect, run ``fn(ftp)``, always close. A connect fault arrives already classified from
+        :meth:`_connect`. An operation fault is mapped here: a permanent reply (``error_perm`` --
+        no-such-file, no-perm) is permanent; a connect/IO/timeout/protocol error is transient."""
+        ftp = self._connect()
         try:
             return fn(ftp)
         except ftplib.error_perm as exc:
@@ -1447,14 +1683,7 @@ class RemoteFileDestination(DestinationConnector):
         try:
             await asyncio.to_thread(self._upload, payload)
         except _RemoteError as exc:
-            if exc.permanent:
-                raise NegativeAckError(
-                    str(exc),
-                    code="remotefile",
-                    permanent=True,
-                    credential_fault=exc.credential_fault,
-                ) from exc
-            raise DeliveryError(str(exc)) from exc
+            raise exc.as_delivery_error() from exc
 
     async def validate_startup(self) -> None:
         """Opt-in at-start directory validation (#114) — the outbound mirror of
@@ -1488,7 +1717,8 @@ class RemoteFileDestination(DestinationConnector):
         retryable :class:`DeliveryError`. The reclassification is the point: an SFTP/FTP no-such-dir is
         a **permanent** error, so letting the upload fail on its own would dead-letter live traffic over
         a share that is merely unmounted. It costs one extra round trip per delivery, on the opt-in
-        path only. A credential fault is not reclassified; see :meth:`_list_or_retry`."""
+        path only. A credential or configuration fault is not reclassified; see
+        :meth:`_list_or_retry`."""
         if self._validate_directory:
             self._list_or_retry(
                 self._client.list_dir,
@@ -1506,12 +1736,17 @@ class RemoteFileDestination(DestinationConnector):
         """List ``remote_dir`` with ``lister`` on the send path, re-raising a failure as **transient**
         so the row retries under its retry policy rather than dead-lettering on a no-such-dir or a 550.
 
-        A credential fault is the exception and is re-raised unchanged: it keeps its ADR 0095 marker,
-        so the delivery worker STOPs and retains instead of retrying into an account lockout."""
+        A connection fault is the exception and is re-raised unchanged, keeping its marker, so the
+        delivery worker STOPs and retains. A credential fault would otherwise retry into an account
+        lockout (ADR 0095). A configuration fault, such as a refused ``AUTH TLS``, would otherwise
+        reconnect into the same refusal on every row until each row's retry cap dead-lettered it
+        (BACKLOG #2083, fix round 4). This retry is for a directory that is merely not there yet,
+        which neither fault is. An FTP server at its connection limit carries neither marker
+        (:func:`_ftp_connect_refusal`), so it is retried here and never stops the lane."""
         try:
             return lister(self._remote_dir)
         except _RemoteError as exc:
-            if exc.credential_fault:
+            if exc.connection_fault:
                 raise
             raise _RemoteError(
                 f"REMOTEFILE upload directory {_redact(self._host, self._remote_dir)} {why}: {exc}",
@@ -1533,17 +1768,21 @@ class RemoteFileDestination(DestinationConnector):
         except _RemoteError as exc:
             # A store cut off part-way, by the stall bound (#2082) or a dropped connection, can leave
             # a partial temp behind, one more on every retry. Not after a credential fault: another
-            # login would be one more refused attempt against the partner account. A store that
-            # failed before it connected left no temp, so this costs one more connect and a warning
-            # there; _prepare_remote_dir connected just before, so that case is rare.
-            if not exc.credential_fault:
+            # login would be one more refused attempt against the partner account. Nor after a
+            # configuration fault: it refuses the session open, so no temp was written and another
+            # connect would meet the same refusal (#2083). A store that failed before it connected
+            # for any other reason left no temp, so this costs one more connect and a warning there;
+            # _prepare_remote_dir connected just before, so that case is rare.
+            if not exc.connection_fault:
                 self._remove_temp(tmp, name, "store")
             raise
         try:
             self._client.rename(tmp, final)
         except _RemoteError:
             # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so the
-            # delivery is classified (retry/dead-letter) by send().
+            # delivery is classified (retry/dead-letter) by send(). Unlike the store branch, this
+            # tries even after a connection fault: the store succeeded, so a whole message sits in
+            # the temp, and the lane stops right after, so it costs one more login at most.
             self._remove_temp(tmp, name, "rename")
             raise
 
@@ -1566,9 +1805,9 @@ class RemoteFileDestination(DestinationConnector):
 
         **THIS IS THE ONE STATEMENT OF THE RULE (BACKLOG #1936); everything else points here.** With
         ``overwrite`` off, a listing that fails is never read as "nothing to collide with": it is
-        raised through :meth:`_list_or_retry`, which makes it transient unless it is a credential
-        fault, and nothing is written first. Returning the unsuffixed name there would let the store
-        and rename replace a partner file.
+        raised through :meth:`_list_or_retry`, which makes it transient unless it is a credential or
+        configuration fault, and nothing is written first. Returning the unsuffixed name there would
+        let the store and rename replace a partner file.
 
         Every entry counts, not only a regular file (BACKLOG #2082): the rename would replace a
         same-named symlink, or fail on a same-named directory. So this reads
@@ -1610,14 +1849,7 @@ class RemoteFileDestination(DestinationConnector):
             else:
                 await asyncio.to_thread(self._client.ensure_dir_and_list_names, self._remote_dir)
         except _RemoteError as exc:
-            if exc.permanent:
-                raise NegativeAckError(
-                    str(exc),
-                    code="remotefile",
-                    permanent=True,
-                    credential_fault=exc.credential_fault,
-                ) from exc
-            raise DeliveryError(str(exc)) from exc
+            raise exc.as_delivery_error() from exc
 
     async def aclose(self) -> None:
         return None  # connect-per-operation — nothing held open
@@ -1705,14 +1937,7 @@ class RemoteFileSource(SourceConnector):
         try:
             await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
-            if exc.permanent:
-                raise NegativeAckError(
-                    str(exc),
-                    code="remotefile",
-                    permanent=True,
-                    credential_fault=exc.credential_fault,
-                ) from exc
-            raise DeliveryError(str(exc)) from exc
+            raise exc.as_delivery_error() from exc
 
     async def validate_startup(self) -> None:
         """Opt-in at-start directory validation (#114). No-op unless ``validate_directory`` is set; then

@@ -24,8 +24,9 @@ The snapshot captures:
   2. the ``api._ui_seam`` dataclass field names (``UiDeps`` / ``CoreHandlers`` / ``AdminHandlers``)
      via ``dataclasses.fields`` -- the injected handler/reference bundle shape;
   3. the cross-seam surface the console consumes OUTSIDE the injected bundle, discovered from its own
-     imports and uses: ``api.security`` deps, ``AuthService`` members (methods AND properties), and
-     the ``app.state`` attributes it sets/reads;
+     imports and uses: ``api.security`` deps, every other name it imports from ``auth.service``
+     (BACKLOG #2015), ``AuthService`` members (methods AND properties), and the ``app.state``
+     attributes it sets/reads;
   4. the DTO FIELD SETS the console renders, closed over nested models -- one level of field names
      was not enough, because a nested model's fields never appeared at all;
   5. the ENUM MEMBER sets and ``Literal`` VALUE sets those DTOs expose. Field names alone are not the
@@ -54,6 +55,7 @@ redirect for anyone not on 5.1 -- the failure it was warning against.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import hashlib
 import importlib.util
 import inspect
@@ -61,6 +63,8 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONSOLE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
@@ -99,6 +103,7 @@ from messagefoundry.api._ui_seam import (  # noqa: E402
     CoreHandlers,
     UiDeps,
 )
+from messagefoundry.auth import service as auth_service  # noqa: E402
 from messagefoundry.auth.service import AuthService  # noqa: E402
 
 
@@ -144,8 +149,6 @@ def _dto_fields(dto: type) -> list[str]:
     ``model_computed_fields`` is unioned in because a computed field is rendered exactly like a
     declared one; omitting it would be the same class of blind spot as the curated tuples.
     """
-    from pydantic import BaseModel
-
     if isinstance(dto, type) and issubclass(dto, BaseModel):
         return sorted(set(dto.model_fields) | set(dto.model_computed_fields))
     if dataclasses.is_dataclass(dto):
@@ -168,6 +171,61 @@ def _member(obj: Any) -> str:
     if callable(obj):
         return str(inspect.signature(obj))
     return f"attribute: {type(obj).__name__}"
+
+
+def _auth_service_symbol(obj: Any) -> str:
+    """Render a name the console imports from ``auth.service`` (BACKLOG #2015).
+
+    Classes need their own rules, because :func:`_member` renders a class by its constructor
+    signature. That RAISES on an exception class with no ``__init__`` of its own, such as
+    ``NotifyEmailAlreadySet``, so an exception renders its ancestry instead. A result class renders
+    its constructor signature, its field names and its public properties. The console reads the
+    fields and properties, and it also builds ``Elevation()`` with no arguments, so a field losing
+    its default or changing type must move the digest too. A class none of these rules covers
+    RAISES, like every other idiom this gate cannot render exactly.
+
+    A constant renders by its type, not its value. The console imports the value from the installed
+    engine, so both sides agree on it; a digest that moved on a value change would move for a change
+    that cannot break the pair. A value the console HARD-CODES instead of importing is outside this
+    section: it is not an import, so discovery never sees it.
+    """
+    if obj is AuthService:
+        # Its constructor is the engine's to call, never the console's. Its members have their own
+        # section, so rendering the signature here would move the seam for nothing the console uses.
+        return "class; its members are the AuthService section"
+    if not isinstance(obj, type):
+        return _member(obj)
+    is_record = issubclass(obj, BaseModel) or dataclasses.is_dataclass(obj)
+    if issubclass(obj, BaseException):
+        # The whole ancestry, because the console's except clauses match on it.
+        ancestry = " < ".join(c.__name__ for c in obj.__mro__[1:] if c is not object)
+        rendered = f"exception ({ancestry})"
+        return f"{rendered}; fields: {', '.join(_dto_fields(obj))}" if is_record else rendered
+    if issubclass(obj, enum.Enum):
+        return f"enum: {', '.join(sorted(m.name for m in obj))}"
+    if not is_record:
+        raise TypeError(
+            f"auth.service.{obj.__name__}: a class that is not an exception, enum, dataclass or "
+            "pydantic model cannot be rendered exactly; teach _auth_service_symbol its shape"
+        )
+    # BaseModel's own properties (model_extra, model_fields_set) are pydantic's, not the contract.
+    inherited = set(dir(BaseModel)) if issubclass(obj, BaseModel) else set()
+    props = sorted(
+        n
+        for n in dir(obj)
+        if not n.startswith("_")
+        and n not in inherited
+        and isinstance(inspect.getattr_static(obj, n), property)
+    )
+    # The constructor signature carries each parameter's type, default and whether it is required;
+    # the field list adds any field the constructor does not take (``init=False``).
+    return "; ".join(
+        (
+            f"constructor {inspect.signature(obj)}",
+            f"fields: {', '.join(_dto_fields(obj))}",
+            f"properties: {', '.join(props) or 'none'}",
+        )
+    )
 
 
 def contract_sections() -> list[tuple[str, list[tuple[str, str]]]]:
@@ -206,6 +264,15 @@ def contract_sections() -> list[tuple[str, list[tuple[str, str]]]]:
         (
             "api.security surface (imported directly by the console, outside UiDeps)",
             [(s, _member(getattr(security, s))) for s in surface.security_symbols],
+        )
+    )
+    sections.append(
+        (
+            "auth.service names imported by the console",
+            [
+                (s, _auth_service_symbol(getattr(auth_service, s)))
+                for s in surface.auth_service_symbols
+            ],
         )
     )
     sections.append(

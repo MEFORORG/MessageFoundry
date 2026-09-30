@@ -387,6 +387,22 @@ async def test_destination_cleans_temp_on_failed_rename(monkeypatch: pytest.Monk
     assert not client.files  # nothing left behind
 
 
+@pytest.mark.parametrize(
+    "marker", [{"credential_fault": True}, {"config_fault": True}], ids=["credential", "config"]
+)
+async def test_destination_cleans_temp_after_a_connection_fault_on_rename(
+    monkeypatch: pytest.MonkeyPatch, marker: dict[str, bool]
+) -> None:
+    # BACKLOG #2083 fix round 4: unlike the store branch, the rename branch still removes the temp
+    # after a connection fault. The store succeeded, so the temp holds a whole message; the lane
+    # stops right after, so the cleanup costs one more login at most.
+    client = _FakeClient(rename_exc=_RemoteError("refused", permanent=True, **marker))
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    with pytest.raises(NegativeAckError):
+        await dest.send("x")
+    assert any(op == "remove" for op, _ in client.ops)
+
+
 # === source ==================================================================
 
 
@@ -1023,6 +1039,9 @@ def test_ftps_connect_passes_context(monkeypatch: pytest.MonkeyPatch) -> None:
             recorded["timeout"] = timeout
 
         def connect(self, host: str, port: int) -> None:
+            pass
+
+        def auth(self) -> None:
             pass
 
         def login(self, *, user: str, passwd: str) -> None:
@@ -2139,6 +2158,565 @@ def test_sftp_real_handshake_still_needs_an_etm_mac_beside_gcm(
         _connector_handshake(paramiko, ciphers, tmp_path, monkeypatch, encrypt_and_mac)
 
 
+# --- BACKLOG #2083: only a refused credential is a credential fault ---------------------------------
+#
+# A credential fault stops the lane (ADR 0095). Before #2083 every 5xx reply while opening an FTP
+# session was one, so an FTP server at its connection limit, or one that refused TLS, stopped a lane
+# that should have retried or dead-lettered. Why an ambiguous 530 still stops the lane is stated once,
+# in ``remotefile._names_connection_limit``.
+
+
+class _ScriptedFtp:
+    """An ``ftplib.FTP_TLS`` stand-in that refuses one step of the session open with ``reply``."""
+
+    instances: list[_ScriptedFtp] = []
+
+    def __init__(self, *, refuse_at: str, reply: str) -> None:
+        self._refuse_at = refuse_at
+        self._reply = reply
+        self.steps: list[str] = []
+        self.closed = False
+        _ScriptedFtp.instances.append(self)
+
+    def _step(self, name: str) -> None:
+        import ftplib as _ftplib
+
+        self.steps.append(name)
+        if name == self._refuse_at:
+            if self._reply.startswith("4"):
+                raise _ftplib.error_temp(self._reply)
+            raise _ftplib.error_perm(self._reply)
+
+    def connect(self, host: str, port: int) -> None:
+        self._step("greeting")
+
+    def auth(self) -> None:
+        self._step("auth")
+
+    def login(self, *, user: str, passwd: str) -> None:
+        self._step("login")
+
+    def prot_p(self) -> None:
+        self._step("prot_p")
+
+    def mlsd(self, path: str) -> list[tuple[str, dict[str, str]]]:
+        return []
+
+    def quit(self) -> None:
+        self.closed = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _scripted_ftps(monkeypatch: pytest.MonkeyPatch, *, refuse_at: str, reply: str) -> None:
+    """Make ``ftplib.FTP_TLS`` a :class:`_ScriptedFtp` refusing ``refuse_at`` with ``reply``."""
+    import ftplib as _ftplib
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _ScriptedFtp.instances = []
+
+    class _Ftps(_ScriptedFtp):
+        def __init__(self, *, context: Any = None, timeout: float | None = None) -> None:
+            super().__init__(refuse_at=refuse_at, reply=reply)
+
+    monkeypatch.setattr(_ftplib, "FTP_TLS", _Ftps)
+
+
+def _ftps_client() -> _FtpClient:
+    return _FtpClient(
+        {"host": "ftp.example.com", "remote_dir": "/in", "username": "u", "password": "p"}, tls=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("refuse_at", "reply"),
+    [
+        # ProFTPD's MaxClientsPerUser wording, the case the row names.
+        (
+            "login",
+            "530 Sorry, the maximum number of clients (5) for this user are already connected.",
+        ),
+        ("login", "530 Sorry, no more than 10 users allowed"),
+        ("login", "530 Too many connections from your internet address"),
+        ("login", "530 Too many connections, please retry later"),
+        ("login", "530 No more than 10 users permitted"),
+        # "entries" holds "tries"; a busy server's text must not read as a credential word.
+        ("login", "530 Too many connections; see the FAQ entries on our site"),
+        ("login", "530 Connection limit reached"),
+        ("login", "530 Maximum number of users exceeded"),
+        (
+            "greeting",
+            "530 Sorry, the maximum number of allowed clients (20) are already connected.",
+        ),
+        # Before the login no credential has been sent, so a credential word does not veto the limit
+        # there. Review round 3: the widened word list had made these permanent dead-letters.
+        ("greeting", "530 Too many connections from your IP; connections are blocked for 60 s"),
+        ("greeting", "530-Unauthorized access is prohibited.\n530 Too many connections"),
+        # Fix round 4 review: a full stop inside a token, or after "max", does not end the phrase.
+        (
+            "login",
+            "530 Sorry, the maximum number of clients (5) from 192.0.2.10 are already connected.",
+        ),
+        ("login", "530 Maximum connections for host ftp.example.com reached"),
+        ("login", "530 Sorry, max. number of clients reached"),
+    ],
+)
+def test_a_connection_limit_reply_is_transient(
+    monkeypatch: pytest.MonkeyPatch, refuse_at: str, reply: str
+) -> None:
+    _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _ftps_client().list_dir("/in")
+    assert caught.value.permanent is False, "a busy server clears on its own; retry it"
+    assert caught.value.credential_fault is False
+    assert "connection limit" in str(caught.value)
+    (ftp,) = _ScriptedFtp.instances
+    assert ftp.closed, "the refused connection must be closed, not leaked"
+
+
+@pytest.mark.parametrize(
+    ("refuse_at", "reply"),
+    [
+        ("auth", "500 AUTH not understood"),
+        ("auth", "534 Request denied for policy reason."),
+        ("prot_p", "536 Requested PROT level not supported by mechanism."),
+        ("prot_p", "504 PBSZ not implemented"),
+    ],
+)
+def test_a_tls_refusal_is_a_configuration_fault_not_a_credential_fault(
+    monkeypatch: pytest.MonkeyPatch, refuse_at: str, reply: str
+) -> None:
+    _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _ftps_client().list_dir("/in")
+    assert caught.value.permanent is True, "no retry makes the server offer TLS"
+    assert caught.value.credential_fault is False, "no credential was at fault"
+    assert caught.value.config_fault is True, "every row meets it alike, so it stops the lane"
+    assert "TLS configuration fault" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # THE CONTROL: a real credential refusal still stops the lane.
+        "530 Login incorrect.",
+        # A 530 whose text does not plainly name a connection limit falls to the credential fault.
+        "530 Not logged in.",
+        # Names a maximum, but of login ATTEMPTS: a lockout warning, never a busy server.
+        "530 Maximum login attempts exceeded for this user",
+        # Names a limit and the password: the credential words win.
+        "530 Too many users failed the password check",
+        # Read as busy servers by a first, looser pattern. Each is about the credential or the
+        # account, so each must stop the lane rather than retry into a lockout.
+        "530 Maximum retries exceeded for this user",
+        "530 Max auth tries reached for user jdoe",
+        "530-This server allows a maximum of 50 users.\n530 Authentication rejected.",
+        "530 User account disabled: maximum sessions policy",
+        "530 Access denied: user jmax, user not permitted",
+        # Compound replies that name a limit AND the credential or the account.
+        "530 Bad login: too many connections",
+        "530 Too many connections or wrong credentials",
+        "530 Unknown user; too many users",
+        "530 User not found: too many users",
+        "530 Account suspended: maximum sessions exceeded",
+        # Fix round 3. Round 2 anchored "lock" and "auth" at a word boundary, so these four read as
+        # busy servers and the login was retried into a lockout.
+        "530 Too many connections, account temporarily blocked",
+        "530 Unauthorized: too many sessions",
+        "530 Too many connections from this user, try again after unlock",
+        "530 Too many sessions: user unauthenticated",
+        # Fix round 4 review: "authenticated" is TLS vocabulary only inside a TLS demand. Beside a
+        # limit it names the credential, as "unauthenticated" above already did.
+        "530 User not authenticated: too many connections",
+        "530 Not authenticated; too many sessions",
+        # Fix round 3. Round 2's list did not have these words at all.
+        "530 Too many sessions: account deactivated",
+        "530 Too many users; access revoked",
+        "530 Forbidden: too many connections",
+        "530 Too many users; server denies this account",
+        "530 Too many sessions: account inactive",
+        "530 Too many sessions; login prohibited",
+        "530 Too many connections; access refused for this account",
+        "530 Too many connections; user blacklisted",
+        "530 Too many unsuccessful login sessions",
+        # Review of fix round 3. A trailing word boundary on "denied", and machine-style tokens with
+        # an underscore or run together, each let a lockout reply read as a busy server.
+        "530 Too many users; DeniedAccess",
+        "530 Too many users; denied_access",
+        "530 Too many users; LOGIN_FAILED",
+        "530 Too many users; loginfailed",
+        "530 Too many users; E_BADPASS",
+        "530 Too many users; ERR_WRONGPASS",
+        "530 Too many users; wrongpassword",
+        "530 Too many users; badpassword",
+        "530 Too many users; user_unknown",
+        "530 Too many users; USER_NOT_FOUND",
+        # Review of fix round 3. Account-refusal phrases the list did not have.
+        "530 Too many connections; login not permitted",
+        "530 Too many users; no such user",
+        "530 Too many connections; user does not exist",
+        "530 Too many users. Login not accepted.",
+        "530 Too many connections; account terminated",
+        "530 Too many users; pwd mismatch",
+        # On FTPS the control channel is already TLS, so a TLS hint is no TLS demand.
+        "530 Not logged in; SSL/TLS required",
+    ],
+)
+def test_a_refused_credential_is_still_a_credential_fault(
+    monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    _scripted_ftps(monkeypatch, refuse_at="login", reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _ftps_client().list_dir("/in")
+    assert caught.value.permanent is True
+    assert caught.value.credential_fault is True, "a refused credential must stop the lane"
+    assert "login refused" in str(caught.value)
+
+
+def _scripted_plain_ftp(monkeypatch: pytest.MonkeyPatch, *, refuse_at: str, reply: str) -> None:
+    """Make ``ftplib.FTP`` a :class:`_ScriptedFtp`, for plain FTP under the insecure escape."""
+    import ftplib as _ftplib
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    _ScriptedFtp.instances = []
+
+    class _Plain(_ScriptedFtp):
+        def __init__(self, *, timeout: float | None = None) -> None:
+            super().__init__(refuse_at=refuse_at, reply=reply)
+
+    monkeypatch.setattr(_ftplib, "FTP", _Plain)
+
+
+_TLS_DEMANDS = [
+    "530 Non-anonymous sessions must use encryption.",  # vsftpd, force_local_logins_ssl
+    "550 SSL/TLS required on the control channel",  # ProFTPD, TLSRequired
+    "530 This server does not allow plain FTP. You have to use FTP over TLS.",  # FileZilla
+    "534 Policy requires SSL.",  # IIS
+    "530 TLSv1.2 required",
+    "530 Sessions must be encrypted using AUTH TLS first",  # "AUTH TLS" is no credential word
+    "550 SSL/TLS required for authentication",  # "authentication" is TLS vocabulary here
+    "530 You must authenticate over TLS",
+]
+
+
+def _plain_client() -> _FtpClient:
+    return _FtpClient(
+        {"host": "ftp.example.com", "remote_dir": "/in", "username": "u", "password": "p"},
+        tls=False,
+    )
+
+
+@pytest.mark.parametrize("reply", _TLS_DEMANDS)
+def test_a_tls_demand_at_the_login_is_a_configuration_fault(
+    monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    """Fix round 3: a server that demands TLS refuses a plain session's login, whatever the
+    credential. The fault is the connection's TLS setting, so it is classed as a refused ``AUTH TLS``
+    is: permanent, and not a credential fault."""
+    _scripted_plain_ftp(monkeypatch, refuse_at="login", reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _plain_client().list_dir("/in")
+    assert caught.value.permanent is True, "no retry makes the connection use TLS"
+    assert caught.value.credential_fault is False, "no credential was at fault"
+    assert caught.value.config_fault is True, "every row meets it alike, so it stops the lane"
+    assert "TLS configuration fault" in str(caught.value)
+    (ftp,) = _ScriptedFtp.instances
+    assert ftp.closed, "the refused connection must be closed"
+    assert ftp.steps == ["greeting", "login"]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "530 Not logged in; SSL/TLS required",  # RFC 959's own refusal text, with a TLS hint
+        # Names TLS and the credential: the credential words win over the TLS demand.
+        "530 Login incorrect; SSL/TLS required",
+        "530 Login for SSL-VPN users only",  # refuses an account; "only" is no TLS demand
+        "530 Only anonymous logins over TLS accepted",
+        # Review of fix round 3: a TLS demand beside an account refusal.
+        "530 TLS required; no such user",
+        "530 TLS required; user does not exist",
+        "530 Encrypted login required: user not recognised",
+        "530 TLS required for this login (PWD mismatch)",
+        "530 Mandatory SSL: login not accepted",
+        "530 User bob is not permitted; TLS mandatory",
+        "530 TLS required; account closed",
+        # Review of fix round 3: TLS names that are an account's group, path or VPN, not a demand.
+        "530 SSL-VPN users must log in through the portal",
+        "530 Access requires SSL-VPN membership",
+        "530 This account must connect over the SSL VPN",
+        "530 User must be a member of group ftps-users",
+        "530 Home directory must exist (sslhome)",
+        "530 Account must be reactivated at https://tlsportal.example",
+        # Fix round 4 review: a TLS name joined to "/" or "_" is a path or a group, not a demand.
+        "530 Home directory must be under /srv/tls",
+        "530 Users must be in group encrypted_users",
+    ],
+)
+def test_a_tls_hint_on_an_account_refusal_is_still_a_credential_fault(
+    monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    """CONTROL on a plain session: a reply that mentions TLS but refuses the login or the account
+    stays a credential fault. Read as a TLS fault, each row would dead-letter after one more
+    login, and a partner lockout counter would move."""
+    _scripted_plain_ftp(monkeypatch, refuse_at="login", reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _plain_client().list_dir("/in")
+    assert caught.value.credential_fault is True, "a refused credential must stop the lane"
+
+
+@pytest.mark.parametrize("reply", _TLS_DEMANDS[:2])
+def test_a_tls_demand_on_ftps_is_a_credential_fault(
+    monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    """CONTROL: an FTPS control channel is already TLS, so the TLS-demand rule is not asked there,
+    and the refusal falls to the credential fault like any other unclear login reply."""
+    _scripted_ftps(monkeypatch, refuse_at="login", reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _ftps_client().list_dir("/in")
+    assert caught.value.credential_fault is True
+
+
+# --- BACKLOG #2083 fix round 4: a configuration fault stops the lane and keeps the queue -----------
+
+#: Each session-open refusal classed as a configuration fault, with the session kind that meets it.
+_CONFIG_FAULTS = [
+    pytest.param("ftps", "greeting", "550 Access denied for your address", id="greeting"),
+    pytest.param("ftps", "auth", "534 Request denied for policy reason.", id="auth-tls"),
+    pytest.param(
+        "ftps", "prot_p", "536 Requested PROT level not supported by mechanism.", id="prot-p"
+    ),
+    pytest.param("plain", "login", _TLS_DEMANDS[0], id="tls-demand"),
+]
+
+
+def _config_fault_dest(
+    monkeypatch: pytest.MonkeyPatch, kind: str, refuse_at: str, reply: str, **over: Any
+) -> Any:
+    """A real FTP destination whose session open is refused at ``refuse_at`` with ``reply``."""
+    if kind == "ftps":
+        _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
+    else:
+        _scripted_plain_ftp(monkeypatch, refuse_at=refuse_at, reply=reply)
+    return build_destination(
+        _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
+    )
+
+
+@pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)
+async def test_a_configuration_fault_reaches_the_runner_marked_as_one(
+    monkeypatch: pytest.MonkeyPatch, kind: str, refuse_at: str, reply: str
+) -> None:
+    """Through ``send``: each refusal reaches the delivery worker as a permanent
+    :class:`NegativeAckError` carrying ``config_fault`` and not ``credential_fault``. The marker is
+    what makes the worker stop the lane rather than dead-letter every queued row (fix round 4)."""
+    dest = _config_fault_dest(monkeypatch, kind, refuse_at, reply)
+    with pytest.raises(NegativeAckError) as caught:
+        await dest.send(_UPLOAD_BODY)
+    assert caught.value.permanent is True
+    assert caught.value.config_fault is True, "the lane must stop, not dead-letter each row"
+    assert caught.value.credential_fault is False, "no credential was at fault"
+
+
+_E2E_DEST = "OB"
+
+
+async def _e2e_runner(
+    tmp_path: Path, connector: Any, *, batch: bool = False
+) -> tuple[Any, Any, list[str]]:
+    """A store holding three rows queued to ``_E2E_DEST`` and a runner wired to ``connector``, with
+    a recording alert sink. Returns the runner, the sink and the message ids."""
+    from messagefoundry.config.models import BatchConfig, RetryPolicy
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+    from messagefoundry.store import MessageStore
+
+    class _Sink(LoggingAlertSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopped: list[tuple[str, str]] = []
+
+        def connection_stopped(self, name: str, *, detail: str) -> None:
+            self.stopped.append((name, detail))
+
+    store = await MessageStore.open(tmp_path / "config_fault.db")
+    try:
+        mids = []
+        for n in range(3):
+            body = f"MSH|^~\\&|A|B|C|D|20260810||ADT^A01|MSG{n}|P|2.5\r"
+            mids.append(
+                await store.enqueue_message(
+                    channel_id="IB", raw=body, deliveries=[(_E2E_DEST, body)], now=100.0 + n
+                )
+            )
+        sink = _Sink()
+        runner = RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=sink)
+    except BaseException:
+        await store.close()  # the callers' finally closes it only once this returns
+        raise
+    runner._destinations[_E2E_DEST] = connector
+    runner._retry[_E2E_DEST] = RetryPolicy()
+    runner._simulate[_E2E_DEST] = False
+    if batch:
+        runner._batch[_E2E_DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    return runner, sink, mids
+
+
+async def _queue_rows(runner: Any, mids: list[str]) -> list[tuple[str, int, Any]]:
+    """Each message's outbound row as (status, attempts, last_error), in ``mids`` order."""
+    rows = [r for mid in mids for r in await runner.store.outbox_for(mid)]
+    return [(r["status"], r["attempts"], r["last_error"]) for r in rows]
+
+
+async def test_a_refused_auth_tls_stops_the_lane_and_keeps_the_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A single-row outbound whose FTPS server refuses ``AUTH TLS``. Every queued row would meet the
+    same refusal, so dead-lettering the head would dead-letter them all, one per attempt. Before
+    #2083 the refusal was misread as a credential fault and so stopped the lane; #2083 made it a
+    configuration fault and it dead-lettered. Fix round 4 stops the lane again and keeps the row."""
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome
+    from messagefoundry.store import OutboxStatus
+
+    dest = _config_fault_dest(monkeypatch, "ftps", "auth", "534 Request denied for policy reason.")
+    runner, sink, mids = await _e2e_runner(tmp_path, dest)
+    try:
+        item = await runner.store.claim_next_fifo(_E2E_DEST)
+        assert item is not None
+        outcome, retry_until = await runner._process_delivery_item(_E2E_DEST, item)
+
+        assert outcome is _ItemOutcome.STOPPED
+        assert retry_until is None
+        pending = OutboxStatus.PENDING.value
+        assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every row kept"
+        assert await runner.store.count_dead() == 0
+        assert len(sink.stopped) == 1
+        assert sink.stopped[0][0] == _E2E_DEST
+        assert "configuration fault" in sink.stopped[0][1]
+        assert "credential" not in sink.stopped[0][1]
+        assert ("outbound", _E2E_DEST) in runner._stop_held, "the scheduler must not re-arm it"
+        assert len(_ScriptedFtp.instances) == 1, "stopped after one attempt"
+    finally:
+        await runner.store.close()
+
+
+async def test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The batch twin: a batching outbound hands the whole envelope to one ``send``, so a
+    dead-letter there would empty every member of the batch into the DLQ at once."""
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome
+    from messagefoundry.store import OutboxStatus
+
+    dest = _config_fault_dest(monkeypatch, "ftps", "auth", "534 Request denied for policy reason.")
+    runner, sink, mids = await _e2e_runner(tmp_path, dest, batch=True)
+    try:
+        head = await runner.store.claim_next_fifo(_E2E_DEST)
+        assert head is not None
+        outcome, retry_until = await runner._process_delivery_batch(
+            _E2E_DEST, head, runner._batch[_E2E_DEST]
+        )
+
+        assert outcome is _ItemOutcome.STOPPED
+        assert retry_until is None
+        pending = OutboxStatus.PENDING.value
+        assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every member kept"
+        assert await runner.store.count_dead() == 0
+        assert [name for name, _ in sink.stopped] == [_E2E_DEST]
+        assert "configuration fault" in sink.stopped[0][1]
+        assert ("outbound", _E2E_DEST) in runner._stop_held
+    finally:
+        await runner.store.close()
+
+
+@pytest.mark.parametrize(
+    ("reply", "credential_fault"),
+    [
+        ("430 Invalid username or password", True),
+        ("421 Too many connections (8) from this IP", False),  # CONTROL: a busy server
+        # Fix round 4 review 2: a credential word wins over a limit phrase at a 4xx, as at a 5xx.
+        # Retried, the first would log in again into a locked account. The second is a busy
+        # server that stops the lane anyway, the cheaper error; the same word list decides both.
+        ("421 Too many connections; account locked", True),
+        ("421 Too many users - blocked for 60 s", True),
+    ],
+    ids=["430-credential", "421-busy-control", "421-limit-and-lock", "421-busy-blocked"],
+)
+def test_a_4xx_login_refusal_naming_the_credential_is_a_credential_fault(
+    monkeypatch: pytest.MonkeyPatch, reply: str, credential_fault: bool
+) -> None:
+    """Review of fix round 3: ftplib raises ``error_temp`` for a 4xx, which was always transient.
+    A 4xx at the login that names the credential is a refused login, and retried it would lock the
+    partner account."""
+    _scripted_ftps(monkeypatch, refuse_at="login", reply=reply)
+    with pytest.raises(_RemoteError) as caught:
+        _ftps_client().list_dir("/in")
+    assert caught.value.credential_fault is credential_fault
+    assert caught.value.permanent is credential_fault
+    (ftp,) = _ScriptedFtp.instances
+    assert ftp.closed
+
+
+def test_a_refused_greeting_is_permanent_but_not_a_credential_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No credential has been sent when the greeting is refused, so it cannot be a credential fault.
+    _scripted_ftps(monkeypatch, refuse_at="greeting", reply="550 Access denied for your address")
+    with pytest.raises(_RemoteError) as caught:
+        _ftps_client().list_dir("/in")
+    assert caught.value.permanent is True
+    assert caught.value.credential_fault is False
+    assert caught.value.config_fault is True, "every row meets it alike, so it stops the lane"
+    assert _ScriptedFtp.instances[0].steps == ["greeting"]
+
+
+@pytest.mark.parametrize(
+    ("reply", "stops_the_lane"),
+    [
+        (
+            "530 Sorry, the maximum number of clients (5) for this user are already connected.",
+            False,
+        ),
+        ("530 Login incorrect.", True),  # the control
+    ],
+    ids=["connection-limit", "credential-control"],
+)
+async def test_validate_directory_stops_the_lane_only_on_a_refused_credential(
+    monkeypatch: pytest.MonkeyPatch, reply: str, stops_the_lane: bool
+) -> None:
+    """With ``validate_directory`` on, each send lists ``remote_dir`` first and passes a credential
+    fault through unchanged, so a transient fault marked as one would stop the lane. Driven through
+    the real ``_FtpClient`` so the classification under test is the shipped one."""
+    _scripted_ftps(monkeypatch, refuse_at="login", reply=reply)
+    dest = build_destination(
+        _ftp_dest(tls=True, username="u", password="p", validate_directory=True, filename="m.hl7")
+    )
+    with pytest.raises(DeliveryError) as caught:
+        await dest.send(_UPLOAD_BODY)
+    if stops_the_lane:
+        assert isinstance(caught.value, NegativeAckError)
+        assert caught.value.credential_fault is True
+    else:
+        assert not isinstance(caught.value, NegativeAckError), "a busy server is retried"
+
+
+@pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)
+async def test_validate_directory_passes_a_configuration_fault_through(
+    monkeypatch: pytest.MonkeyPatch, kind: str, refuse_at: str, reply: str
+) -> None:
+    """With ``validate_directory`` on, ``_list_or_retry`` re-raises a directory fault as transient
+    but passes a connection fault through unchanged. Fix round 4 makes a configuration fault a
+    connection fault, so it stops the lane here too, as it does with the toggle off. Retried
+    instead, every row would reconnect into the same refusal until its retry cap dead-lettered it."""
+    dest = _config_fault_dest(monkeypatch, kind, refuse_at, reply, validate_directory=True)
+    with pytest.raises(NegativeAckError) as caught:
+        await dest.send(_UPLOAD_BODY)
+    assert caught.value.config_fault is True
+    assert caught.value.credential_fault is False
+
+
 # --- BACKLOG #2071: the settle gate on the remote source -------------------------------------------
 
 _SETTLE_HEAD = b"MSH|^~\\&|A|B|C|D|20260929||ADT^A01|SETTLE1|P|2.5\rPID|1||SYNTH"
@@ -2297,12 +2875,6 @@ def _drop_box(
     _DropBoxFtp.entries = entries
     monkeypatch.setattr(_ftplib, "FTP_TLS", _DropBoxFtp)
     return _DropBoxFtp
-
-
-def _ftps_client() -> _FtpClient:
-    return _FtpClient(
-        {"host": "ftp.example.com", "remote_dir": "/in", "username": "u", "password": "p"}, tls=True
-    )
 
 
 _MLSD_DOTS = [(".", {"type": "cdir"}), ("..", {"type": "pdir"})]
