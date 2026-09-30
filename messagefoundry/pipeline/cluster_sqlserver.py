@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import (
+    STOP_WRITE_TIMEOUT_SECONDS,
     ClusterMember,
     StepdownOutcome,
     StepdownReleaseUnconfirmed,
@@ -150,6 +151,8 @@ class SqlServerCoordinator:
         # respect: only the three FIFO claim paths are epoch-fenced here (current_epoch()), so a
         # re-promoted ex-leader is not fenced out of claim_ready or any terminal resolve.
         self._leadership_lock = asyncio.Lock()
+        # BACKLOG #1987: the per-call bound on stop()'s two writes. Mirrors DbCoordinator's attribute.
+        self._stop_write_timeout = STOP_WRITE_TIMEOUT_SECONDS
         self._monotonic = monotonic
         # Constant, NOT schema-namespaced like DbCoordinator's: this store never reads db_schema, so
         # installs sharing one database share these tables and must share this election and DDL lock.
@@ -201,12 +204,17 @@ class SqlServerCoordinator:
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
         # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
         # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
-        await self._release_leadership()
+        # Forced on may_own_lease_row() so a self-fenced node releases its row, and each write bounded
+        # so a stuck pool cannot hang the shutdown (BACKLOG #1987); DbCoordinator.stop() says why.
+        await self._release_leadership(
+            force_write=self.may_own_lease_row(), timeout=self._stop_write_timeout
+        )
         try:
-            await self._store._execute(
-                "UPDATE nodes SET status=?, last_seen=?, is_leader=0 WHERE node_id=?",
-                ("left", time.time(), self.node_id),
-            )
+            async with asyncio.timeout(self._stop_write_timeout):
+                await self._store._execute(
+                    "UPDATE nodes SET status=?, last_seen=?, is_leader=0 WHERE node_id=?",
+                    ("left", time.time(), self.node_id),
+                )
         except Exception as exc:  # pool may already be closing on shutdown — log, don't raise
             log.warning("cluster: failed to mark node %s left: %s", self.node_id, safe_exc(exc))
 
@@ -566,14 +574,15 @@ class SqlServerCoordinator:
         return self._is_leader or self._lease_release_owed or self._last_renew_ok is not None
 
     async def _release_leadership(
-        self, *, force_write: bool = False
+        self, *, force_write: bool = False, timeout: float | None = None
     ) -> tuple[bool, float | None, bool, bool]:
         """``(was_leader, released_at, wrote, lease_released)`` — mirrors
         ``DbCoordinator._release_leadership``,
         including the demote-the-cached-gate-before-the-DB ordering, the stamp taken at the in-memory
         demotion, the ``wrote`` flag its two callers read in opposite directions, ``force_write``,
-        which re-sends an owed ``UPDATE`` past the not-a-leader early return, and the arm-before-the-
-        write ordering that keeps a CANCELLED write from unwinding with nothing owed."""
+        which re-sends an owed ``UPDATE`` past the not-a-leader early return, the arm-before-the-
+        write ordering that keeps a CANCELLED write from unwinding with nothing owed, and ``timeout``,
+        the bound only :meth:`stop` passes (BACKLOG #1987)."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
@@ -589,10 +598,11 @@ class SqlServerCoordinator:
         # DbCoordinator._release_leadership carries the full reasoning; keep the two in lockstep.
         self._lease_release_owed = True
         try:
-            rows = await self._store._execute(
-                "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ? AND owner = ?",
-                (self._lease_key, self.node_id),
-            )
+            async with asyncio.timeout(timeout):  # None = unbounded, the stepdown's case
+                rows = await self._store._execute(
+                    "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ? AND owner = ?",
+                    (self._lease_key, self.node_id),
+                )
         except Exception as exc:
             log.warning(
                 "cluster: node %s failed to release the leadership lease (it will expire on its "
