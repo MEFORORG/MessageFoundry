@@ -227,9 +227,11 @@ def test_insert_row_of_a_read_field_is_out_of_scope_and_refused() -> None:
         )
 
 
-def test_a_nonliteral_path_refuses_a_scalar_but_takes_an_expr() -> None:
+def test_a_nonliteral_path_is_dynamic_and_refuses_every_edit() -> None:
+    """ADR 0076 AC-M5 (BACKLOG #237). A Name argument is ``dynamic``, so it is read-only: a scalar, an
+    ``expr`` and even an ``expr`` repeating its own source are all refused. This test used to assert the
+    ``expr`` was spliced, which is the passthrough E.6.4 forbids."""
     src = _src("name = msg.field(path_var)")
-    with pytest.raises(LensRewriteError, match="currently an expression"):
-        _edit(src, {"path": "PID-5.1"})
-    out = _edit(src, {"path": {"expr": "other_var"}})
-    assert out == src.replace("msg.field(path_var)", "msg.field(other_var)")
+    for value in ("PID-5.1", {"expr": "other_var"}, {"expr": "path_var"}):
+        with pytest.raises(LensRewriteError, match="dynamic mode"):
+            _edit(src, {"path": value})

@@ -490,15 +490,28 @@ class NegativeAckError(DeliveryError):
     *message*. The delivery worker treats it specially under the ``credential_fault_policy`` — STOP the
     lane and retain the backlog un-errored rather than dead-letter each queued row and hammer the
     partner's auth (which could trip an account lockout). Only meaningful when ``permanent`` is True.
+
+    ``config_fault`` (BACKLOG #2083) marks a permanent failure in the **connection's configuration**
+    rather than in the message or the credential: an FTP server refusing ``AUTH TLS`` or ``PROT P``,
+    demanding TLS of a plain session, or refusing the greeting. Every queued row would fail the same
+    way, so the delivery worker stops the lane and keeps the queue, under the same
+    ``credential_fault_policy`` as a credential fault. Only meaningful when ``permanent`` is True.
     """
 
     def __init__(
-        self, message: str, *, code: str, permanent: bool, credential_fault: bool = False
+        self,
+        message: str,
+        *,
+        code: str,
+        permanent: bool,
+        credential_fault: bool = False,
+        config_fault: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.permanent = permanent
         self.credential_fault = credential_fault
+        self.config_fault = config_fault
 
 
 class TestNotSupportedError(Exception):
