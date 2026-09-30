@@ -1737,7 +1737,9 @@ async def test_a_second_attempt_answers_on_a_slot_its_own_work_does_not_move(
 async def test_a_refusals_answer_slot_does_not_depend_on_its_audit_write_time(
     monkeypatch: pytest.MonkeyPatch, queued: bool
 ) -> None:
-    """RED when: a refused sign-in reads the clock for its answer's slot AFTER its audit writes.
+    """RED when (the ``queued`` arm): a refused sign-in reads the clock for its answer's slot AFTER
+    its audit writes. The ``alone`` arm is a control that passes either way: it pins that the write
+    room keeps an attempt that did not queue in slot 1 on both names.
 
     BACKLOG #2467, ASVS 6.3.8. A refused local sign-in writes its audit rows at a fixed point, the
     equaliser's floor, and a refusal by a live lock writes two rows where an unknown name writes
@@ -1780,13 +1782,14 @@ async def test_a_refusals_answer_slot_does_not_depend_on_its_audit_write_time(
             if queued:
                 first = asyncio.ensure_future(service.login(name, "wrong"))
                 await asyncio.sleep(budget / 2 + margin)
+                # Still inside its padded answer, so it holds the name's queue: the second waits.
+                assert not first.done(), "the first attempt answered early; this proves nothing"
             started = time.monotonic()
             out = await service.login(name, "wrong")
             took = time.monotonic() - started
             assert not out.ok and out.error == error, out
             if first is not None:
                 assert not (await first).ok
-                assert took > budget / 2, "the second attempt did not queue; this proves nothing"
             return round(took / budget)
 
         locked = await slot(ADMIN_USERNAME, "account locked")

@@ -308,15 +308,28 @@ _WRITE_ROOM_SHARE = 0.25
 _BUDGET_OVERRUN_WARNED: set[str] = set()
 
 
-def _warn_budget_overrun(seam: str, took: float) -> None:
-    """Warn, once per seam per process, that a failure on ``seam`` answered a slot late.
+def _warn_budget_overrun(seam: str, took: float, *, writes: bool = False) -> None:
+    """Warn, once per seam and cause per process, that a failure on ``seam`` answered a slot late.
 
     The budget is then too small for this hardware. The answer still cannot fail open
     (:func:`_failure_deadline` always rounds up), but a pair of branches straddling the slot boundary
-    would stay distinguishable. ``took`` leaves out any wait in the account's queue."""
-    if seam in _BUDGET_OVERRUN_WARNED:
+    would stay distinguishable. ``took`` is the work, leaving out any wait in the account's queue,
+    or with ``writes`` the deferred audit writes alone (BACKLOG #2467). The two causes latch apart,
+    so the first to fire does not hide the other."""
+    key = f"{seam}:writes" if writes else seam
+    if key in _BUDGET_OVERRUN_WARNED:
         return
-    _BUDGET_OVERRUN_WARNED.add(seam)
+    _BUDGET_OVERRUN_WARNED.add(key)
+    if writes:
+        _log.warning(
+            "auth: a failed %s challenge's audit writes took %.3fs, over the %.3fs room the pad "
+            "leaves them; responses are being padded to a later slot (further write overruns are "
+            "not logged)",
+            seam,
+            took,
+            _FAILURE_BUDGET_SECONDS * _WRITE_ROOM_SHARE,
+        )
+        return
     _log.warning(
         "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
         "responses are being padded to a later slot (further overruns are not logged)",
@@ -2507,15 +2520,22 @@ class AuthService:
         if writes:
             try:
                 await _sleep_until_write_point(floor)
-            finally:
+            except asyncio.CancelledError:
                 # A caller who drops the request here does not drop the audit trail
-                # (count-and-log), and the account's queue is held until the rows are in.
-                await _write_through_cancellation(writes)
+                # (count-and-log), and the account's queue is held until the rows are in. A write
+                # that fails is logged rather than raised, so the cancel still reaches the caller.
+                try:
+                    await _write_through_cancellation(writes)
+                except Exception:
+                    _log.exception("a refused sign-in's audit write failed after a cancel")
+                raise
+            writing = time.monotonic()
+            await _write_through_cancellation(writes)
             written = time.monotonic()
             if written >= deadline:
                 # The rows outran their room. Rounding up keeps the raw elapsed off the wire.
                 deadline = _failure_deadline(started, written)
-                _warn_budget_overrun(seam, written - started - queued)
+                _warn_budget_overrun(seam, written - writing, writes=True)
         await _sleep_until(deadline)
         return outcome
 

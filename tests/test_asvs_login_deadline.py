@@ -549,23 +549,60 @@ async def test_the_deadline_does_not_move_with_the_number_of_audit_rows(
 
 
 async def test_writes_that_outrun_their_room_answer_on_a_whole_later_slot(
-    engine: Engine, recorder: _DeadlineRecorder, monkeypatch: pytest.MonkeyPatch
+    engine: Engine,
+    recorder: _DeadlineRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Writes longer than their room cannot put the raw elapsed on the wire: the answer waits to the
-    next slot boundary after they finish, the same fail-safe as work over the budget."""
+    next slot boundary after they finish, the same fail-safe as work over the budget. The overrun
+    is logged once, apart from the work overrun's warning, so an operator learns the room is short.
+    """
     budget = 0.2
     monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     started = time.monotonic()
     # The write point is half a budget in and the rows take a whole one, so they end past slot 1.
-    await service._equalize_failure(
-        LoginOutcome(ok=False, error="nope"),
-        started,
-        seam="t",
-        writes=_rows(1, budget),
-        write_room=True,
-    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+        await service._equalize_failure(
+            LoginOutcome(ok=False, error="nope"),
+            started,
+            seam="t",
+            writes=_rows(1, budget),
+            write_room=True,
+        )
     finished = time.monotonic()
+    warnings = [r.getMessage() for r in caplog.records if "audit writes took" in r.getMessage()]
+    assert len(warnings) == 1 and "failed t challenge" in warnings[0], warnings
     slots = (recorder.deadlines[-1] - started) / budget
     assert abs(slots - round(slots)) < 1e-6 and round(slots) >= 2, slots
     assert recorder.deadlines[-1] > finished - 0.001
+
+
+async def test_a_cancel_before_the_write_point_reaches_the_caller_when_a_write_fails(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A caller who drops the request before the write point still gets its cancel back, and the
+    failed write is logged rather than raised in its place, which would turn a disconnect into a
+    500."""
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", 2.0)
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+
+    async def failing() -> None:
+        raise RuntimeError("store down")
+
+    task = asyncio.ensure_future(
+        service._equalize_failure(
+            LoginOutcome(ok=False, error="nope"),
+            time.monotonic(),
+            seam="t",
+            writes=[failing],
+            write_room=True,
+        )
+    )
+    await asyncio.sleep(0.05)  # before the write point, a whole second in
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert "audit write failed after a cancel" in caplog.text
