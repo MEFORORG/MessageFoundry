@@ -1512,8 +1512,8 @@ def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
     checked against uvloop's source here, and uvloop does not run on Windows, where this was built.
     A wrong guess there would stall every TLS connection, so any other loop keeps the loop-level
     handshake, and with it the documented limit: the caps and allowlist apply after the handshake.
-    uvicorn runs the engine on uvloop wherever it is installed, which ``uvicorn[standard]`` does
-    for CPython outside Windows, so on Linux that limit is the one in force.
+    uvicorn runs the engine on uvloop wherever it is installed, and the engine's own uvloop
+    dependency installs it for CPython outside Windows, so on Linux that limit is the one in force.
     """
     return isinstance(loop, asyncio.BaseEventLoop)
 
@@ -2044,9 +2044,10 @@ class MLLPSource(SourceConnector):
         # awaits nothing, so it cannot wedge on the Proactor (#55).
         #
         # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
-        # uvicorn runs the engine on uvloop wherever it is installed, which `uvicorn[standard]` does
-        # for CPython outside Windows. Called unguarded, it raised AttributeError here, so a reload's
-        # first stop() failed, left that listener unbound, and the reload restarted nothing.
+        # uvicorn runs the engine on uvloop wherever it is installed, and the engine's own uvloop
+        # dependency installs it for CPython outside Windows. Called unguarded, it raised
+        # AttributeError here, so a reload's first stop() failed, left that listener unbound, and
+        # the reload restarted nothing.
         # What uvloop loses, and what still holds there:
         # * the same-turn plain-TCP socket above. The one-turn yield below lets it reach
         #   `_on_client`, which refuses it unread on `_stopping`.

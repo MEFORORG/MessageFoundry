@@ -7,6 +7,16 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **BREAKING: `adr-analyze` moved to a separate `messagefoundry-toolkit` command, and out of the
+  engine wheel.** ADR 0201 slice 2 adds a third sibling distribution, `messagefoundry-toolkit`,
+  released in lockstep with the engine and pinned to the engine's own version. It carries the
+  authoring and development commands, and `adr-analyze` is the first to move: its module is
+  `messagefoundry_toolkit/adr_analyze.py`, and the engine wheel no longer ships
+  `messagefoundry/adr_analyze.py`. `messagefoundry adr-analyze` now exits 2 with one line naming
+  `messagefoundry-toolkit adr-analyze`, as `{"error": ...}` on stdout under `--json`, and the engine's
+  `--help` names the moved commands in its epilog. In a checkout, run `python -m
+  messagefoundry_toolkit adr-analyze`. An installed toolkit refuses to run beside an engine of another
+  version. The other toolkit rows of `CLI_TIERS` move in later slices. (`BACKLOG #1192`, ASVS 15.2.3)
 - **Turning the sign-in limiter or the account lockout off is now warned, not silent.** While
   sign-in is on, `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a
   `login_rate_limit_per_ip` or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds`
@@ -292,15 +302,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
-- **A new default limit on the MLLP listener: `max_inflight_frames` (32).** At most this many
-  complete frames of one listener are in the inbound handler (decode, parse, validate, ingress
-  commit) at once. The row measured about 64 MiB of handling cost per 16 MiB message, so the peak
-  was `max_connections` times that, 10 to 16 GiB across 256 frames; it is now a setting of its own.
-  A frame over the limit waits for a slot, first come first served, and is never refused, dropped
-  or NAK'd; once decoded it is always handled, as with the limit off, and a waiter still queued at
-  stop is cancelled past the shutdown grace like a slow handler. It still holds the bytes it arrived
-  in, so the raw buffer bound is unchanged. `None`/`0` turns it off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
-  ([BACKLOG #1725](docs/BACKLOG.md), act 3)
 - **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
   encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
   `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256
@@ -643,6 +644,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
+  the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
+  model defines both. The web console builds its bulk-replay buttons from them, so a channel whose
+  dead deliveries are all past the first page still gets one. The store contract gains
+  `list_replay_targets` on all three backends. (`BACKLOG #1743`, step 2)
 - **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
   The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
   dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
@@ -1337,18 +1343,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
-- **On the stdlib event loop, an MLLP TLS listener now applies `source_ip_allowlist`,
-  `max_connections` and `max_connections_per_host` before the TLS handshake, not after it.** The
-  listener accepts plain TCP, runs those checks exactly as a plaintext listener does, and only then
-  starts TLS on the admitted socket. Before, a socket that never sent a ClientHello sat outside all
-  three for up to the 10 s handshake bound, so a peer could hold as many as its connect rate
-  allowed. Now each one holds a real slot, is refused with the same `at_capacity` or
-  `peer_not_allowlisted` event as a plaintext connection, and is closed by stop(). A socket refused
-  this way never starts a handshake. A handshake that fails or times out gives its slot back and,
-  as before, emits no connection event and logs at DEBUG only. `established` is emitted once the
-  handshake completes. **Under uvloop, which `uvicorn[standard]` installs outside Windows, nothing
-  changes**: the loop still runs the handshake and the three checks apply after it, because the
-  listener's own upgrade could not be verified safe on uvloop. ([BACKLOG #1606](docs/BACKLOG.md))
+- **On Python 3.15 the engine stops offering SHA-224 TLS signature schemes.** Every context the
+  engine narrows drops `rsa_pkcs1_sha224`, `ecdsa_sha224` and `dsa_sha224` through
+  `SSLContext.set_server_sigalgs`. Read from the OpenSSL source, not yet measured on 3.15, that one
+  list covers client offers, server signatures and client certificate requests. The list is
+  OpenSSL's own catalogue minus SHA-224, with the three ML-DSA schemes that catalogue omits put
+  back at the front. Measured with the OpenSSL 3.5.7 command line (`-sigalgs`, not a CPython 3.15
+  run), the offer loses exactly the
+  three SHA-224 schemes; `rsa_pss_rsae_*` now comes before `rsa_pss_pss_*`. A build that refuses
+  the ML-DSA names still drops SHA-224, without ML-DSA, and logs a warning once. Python 3.14 is
+  unchanged. A 3.15
+  on an OpenSSL older than 3.4 pins nothing and logs a warning once. The LDAPS hop is not reached.
+  (`BACKLOG #1171`, ASVS 11.4.1, owner ruling 2026-09-29)
 - **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
   reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
   account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was
@@ -2358,6 +2364,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `/auth/negotiate` legs revoke nothing, because they return a token without
   replacing one; ending the old token is the client's job there.
   ([BACKLOG #1146](docs/BACKLOG.md))
+- **A console release now refuses a wheel whose engine requirement has no floor.** The
+  `release-webconsole` job reads the built wheel's `Requires-Dist` and fails unless its
+  `messagefoundry` requirement has a lower bound and no environment marker. An upper bound is
+  allowed. The console's engine requirement is a floor with no ceiling, set at each console release;
+  `docs/WEBCONSOLE-PACKAGE.md` says why. A bare dependency let `pip` keep an older engine that
+  lacks the functions the console calls. ([BACKLOG #1585](docs/BACKLOG.md))
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,

@@ -143,3 +143,26 @@ def test_the_risky_component_guard_is_IN_the_lane() -> None:
             f"{ref} now classifies docs-only, so a change to it alone skips the guard; "
             "it needs the lane too (BACKLOG #1189)"
         )
+
+
+def test_the_changelog_fragment_guard_is_IN_the_lane() -> None:
+    """A FLOOR MEMBER, NOT A CENSUS (BACKLOG #2080).
+
+    A changelog entry is now a fragment under ``changelog.d/``, and a pull request adding only one is
+    docs-only, so it skips the main suite. ``tests/test_changelog_fragments.py`` refuses a malformed
+    fragment and checks that the live fragments assemble into the live ``CHANGELOG.md``. Without this
+    pin, deleting the module from DOC_GUARDS passes every other check here.
+    """
+    member = "tests/test_changelog_fragments.py"
+    assert member in _doc_guards(), (
+        f"{member} dropped from the documentation-only lane -- a fragment-only PR would skip it "
+        "(BACKLOG #2080)."
+    )
+    patterns = {
+        "alwayscode": _extract("alwayscode"),
+        "noncode": _extract("noncode"),
+        "alwayscodepath": _extract("alwayscodepath"),
+    }
+    assert not classify(["changelog.d/2080.changed.md"], **patterns), (
+        "a fragment is no longer docs-only; re-read whether this pin is still needed"
+    )

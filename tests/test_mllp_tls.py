@@ -776,9 +776,9 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------
 #
-# uvicorn runs the engine on uvloop wherever it is installed, and `uvicorn[standard]` installs it for
-# CPython outside Windows. uvloop's Server (0.22.1) has no close_clients(). stop() called it
-# unguarded, so on Linux every reload failed at its first listener: that listener stayed unbound and
+# uvicorn runs the engine on uvloop wherever it is installed, and the engine's own uvloop dependency
+# installs it for CPython outside Windows. uvloop's Server (0.22.1) has no close_clients(). stop()
+# called it unguarded, so on Linux every reload failed at its first listener: that listener stayed unbound and
 # none was restarted. The connscale smoke caught it on ubuntu only, as "connection(s) never came back
 # after the reload probe". The suite's own loop is the stdlib one on every platform, so without these
 # tests nothing in it runs stop() against that server shape.
