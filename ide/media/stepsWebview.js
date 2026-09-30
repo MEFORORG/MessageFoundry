@@ -208,12 +208,16 @@
     // {parts: [...]}, which the engine renders and checks. A field pick goes through the provider's
     // picker as a `pickPart` request, so the picker yields a {path} part, never source.
     //
-    // A template is written ONCE per editing pass, not per chip: typing marks the editor dirty, and the
-    // write happens when focus leaves the editor, on Enter, or on Remove. Every write rewrites the row and
-    // re-projects the page, so a write per chip would race the next chip's write into a stale-coordinate
-    // refusal (F7) or wipe typing in progress. A pass is also held back, with a visible hint, while the
-    // template has no field or an empty one: the engine refuses both, and its refusal would re-project
-    // the page and throw the pass away. The engine still checks every template it is sent.
+    // A template is written once per editing PASS, not per chip: the write happens when focus leaves the
+    // editor (other than to the argument's own mode selector), on Enter, or on Remove, and only when the
+    // parts differ from the last ones written or projected. Every write rewrites the row and re-projects
+    // the page, so a write per chip, or the same pass written twice (a browser's late `change` after
+    // Enter), would race the next write into a stale-coordinate refusal (F7). A pass is also held back,
+    // with a visible hint, while the template has no field or an empty one: the engine refuses both, and
+    // its refusal would re-project the page and throw the pass away. The template a pick request carries
+    // is not written again by the blur the picker itself causes, because the pick's own write carries
+    // it; a pick that is cancelled leaves that pass to the next change. The engine still checks every
+    // template it is sent. Nothing here listens for a message from the provider.
     // Wrapped like the context menu, so a throw here can never kill the wiring around it.
     try {
       (function wireModedArguments() {
@@ -238,22 +242,29 @@
           const hint = box.querySelector('.tpart-hint');
           if (hint) { hint.hidden = !shown; }
         }
-        // Write the editor's template if it has unsaved changes and at least one field, none empty.
+        // Whether `parts` has a field, and every field filled in (all but `except`, the one a pick fills).
+        function fieldsReady(parts, except) {
+          const paths = parts.filter((p, i) => 'path' in p && i !== except);
+          return (except !== undefined || paths.length > 0) && paths.every((p) => p.path !== '');
+        }
+        // Write the editor's template if it differs from the last written or projected one and is ready.
         function flush(box) {
-          if (box.dataset.dirty !== 'true') { return; }
           const parts = collectParts(box);
-          const paths = parts.filter((p) => 'path' in p);
-          if (paths.length === 0 || paths.some((p) => p.path === '')) { setHint(box, true); return; }
+          const json = JSON.stringify(parts);
+          if (json === box.dataset.lastParts || json === box.dataset.pickParts) { setHint(box, false); return; }
+          if (!fieldsReady(parts)) { setHint(box, true); return; }
           setHint(box, false);
-          box.dataset.dirty = '';
+          box.dataset.lastParts = json;
           vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: parts } }));
         }
         // Ask the provider to pick a field into part `index`. The request carries every chip, typing
-        // included, and its write replaces any pending pass.
+        // included, and the pick's write carries that pass, so `flush` does not write the same parts.
         function postPick(box, index) {
+          const parts = collectParts(box);
+          if (!fieldsReady(parts, index)) { setHint(box, true); return; }
           setHint(box, false);
-          box.dataset.dirty = '';
-          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: collectParts(box), index: index }));
+          box.dataset.pickParts = JSON.stringify(parts);
+          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: parts, index: index }));
         }
         // A new, empty chip of `kind`: a clone of the renderer's own blank chip, so its markup has one
         // source, placed before the Add buttons.
@@ -278,23 +289,24 @@
         }
 
         for (const box of document.querySelectorAll('.tparts')) {
+          box.dataset.lastParts = JSON.stringify(collectParts(box)); // the projected template
+          const modeSel = box.closest('.field') && box.closest('.field').querySelector('select.mode-select');
           // Keep a button's mousedown from blurring a typed chip first, so a click never ends the pass
           // before the button acts; the button's own action carries the typing.
           box.addEventListener('mousedown', (ev) => {
             if (ev.target.closest('button')) { ev.preventDefault(); }
           });
-          box.addEventListener('change', (ev) => {
-            if (ev.target.classList && ev.target.classList.contains('tpart-input')) { box.dataset.dirty = 'true'; }
-          });
           box.addEventListener('keydown', (ev) => {
             if (ev.key === 'Enter' && ev.target.classList && ev.target.classList.contains('tpart-input')) {
               ev.preventDefault();
-              box.dataset.dirty = 'true';
               flush(box);
             }
           });
           box.addEventListener('focusout', (ev) => {
-            if (!(ev.relatedTarget && box.contains(ev.relatedTarget))) { flush(box); }
+            const to = ev.relatedTarget;
+            // Focus moving inside the editor, or to the argument's own mode selector, continues the pass.
+            if (to && (box.contains(to) || to === modeSel)) { return; }
+            flush(box);
           });
           box.addEventListener('click', (ev) => {
             const btn = ev.target.closest('button');
@@ -303,7 +315,6 @@
             const chip = btn.closest('.tpart');
             if (btn.classList.contains('tpart-del') && chip) {
               chip.remove();
-              box.dataset.dirty = 'true';
               flush(box);
             } else if (btn.classList.contains('tpart-pick') && chip) {
               postPick(box, Array.from(box.querySelectorAll('.tpart')).indexOf(chip));

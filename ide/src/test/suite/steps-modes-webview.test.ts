@@ -182,12 +182,16 @@ function click(p: Page, el: DomNode): void {
   el.dispatchEvent(new p.window.MouseEvent("click", { bubbles: true, cancelable: true }));
 }
 
-/** Focus leaving `from` for `to` (null: out of the page), as a browser reports it. */
-function leave(p: Page, from: DomNode, to: DomNode | null): void {
-  const target = from.querySelector(".tpart-input") ?? from;
+/**
+ * Focus leaving the editor `box`'s first chip for `to` (null: out of the page), as a browser reports a
+ * blur: the input's own `change` first, then `focusout`. A browser sends that `change` whether or not a
+ * write already happened, which is exactly the duplicate a pass must not write twice.
+ */
+function leave(p: Page, box: DomNode, to: DomNode | null): void {
+  const target = box.querySelector(".tpart-input") ?? box;
+  target.dispatchEvent(new p.window.Event("change", { bubbles: true }));
   target.dispatchEvent(new p.window.FocusEvent("focusout", { bubbles: true, relatedTarget: to }));
 }
-
 /** Click an editor's Add button and return the chip it added (the last chip). */
 function addChipBy(p: Page, box: DomNode, button: string): DomNode {
   click(p, box.querySelector(button));
@@ -241,15 +245,73 @@ suite("Steps modes webview: the selector and the parts editor post only what the
     assert.strictEqual(sent(p, before).length, 1);
   });
 
-  test("Enter in a chip ends the pass and writes", () => {
+  test("Enter in a chip ends the pass and writes, and the blur after it writes nothing more", () => {
     const p = loadPage([TEMPLATED_VALUE]);
-    const input = p.field(7, "value").querySelectorAll(CHIP_INPUTS)[1];
+    const box = p.field(7, "value").querySelector(".tparts");
+    const input = box.querySelectorAll(CHIP_INPUTS)[1];
     const before = p.posted.length;
     input.value = "PID-3.4";
     input.dispatchEvent(new p.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     const [msg] = sent(p, before);
     assert.deepStrictEqual((msg.value as { parts: unknown[] }).parts[1], { path: "PID-3.4" });
     assert.ok(!JSON.stringify(msg).includes("msg["), "no source is ever built in the webview");
+    // The browser's late `change` and `focusout` for the same pass must not write it a second time,
+    // which would carry the pre-write row source into an F7 refusal.
+    leave(p, box, null);
+    assert.strictEqual(sent(p, before).length, 1, "the same pass is written once");
+  });
+
+  test("leaving the editor for the argument's own mode selector does not end the pass", () => {
+    const p = loadPage([TEMPLATED_VALUE]);
+    const field = p.field(7, "value");
+    const box = field.querySelector(".tparts");
+    box.querySelectorAll(CHIP_INPUTS)[0].value = "ID ";
+    const before = p.posted.length;
+    leave(p, box, field.querySelector("select.mode-select"));
+    assert.deepStrictEqual(sent(p, before), [], "a mode switch never writes the pass first");
+    leave(p, box, null);
+    assert.strictEqual(sent(p, before).length, 1, "leaving the field writes it");
+  });
+
+  test("the blur a picker causes never writes the pass the pick request already carries", () => {
+    const p = loadPage([TEMPLATED_VALUE]);
+    const box = p.field(7, "value").querySelector(".tparts");
+    // Typed, then a pick: the request carries the typing.
+    box.querySelectorAll(CHIP_INPUTS)[0].value = "TYPED ";
+    const before = p.posted.length;
+    click(p, box.querySelectorAll(".tpart")[1].querySelector(".tpart-pick"));
+    assert.strictEqual(sent(p, before).length, 1, "the pick request");
+    // The quick pick takes focus from the page: that blur must not race the pick's own write.
+    leave(p, box, null);
+    assert.strictEqual(sent(p, before).length, 1, "no edit races the pick");
+    // The pick was cancelled and the author types on: that is a new pass, and it is written.
+    box.querySelectorAll(CHIP_INPUTS)[2].value = " + ";
+    leave(p, box, null);
+    const msgs = sent(p, before);
+    assert.strictEqual(msgs.length, 2);
+    assert.deepStrictEqual(msgs[1].value, {
+      parts: [{ text: "TYPED " }, { path: "PID-3.1" }, { text: " + " }, { path: "PID-5.1" }],
+    });
+  });
+
+  test("a field left empty is held back with the hint", () => {
+    const p = loadPage([TEMPLATED_VALUE]);
+    const box = p.field(7, "value").querySelector(".tparts");
+    box.querySelectorAll(CHIP_INPUTS)[1].value = "";
+    const before = p.posted.length;
+    leave(p, box, null);
+    assert.deepStrictEqual(sent(p, before), []);
+    assert.strictEqual(box.querySelector(".tpart-hint").hidden, false);
+  });
+
+  test("a pick is held back while another field is empty, since the engine would refuse it", () => {
+    const p = loadPage([TEMPLATED_VALUE]);
+    const box = p.field(7, "value").querySelector(".tparts");
+    box.querySelectorAll(CHIP_INPUTS)[1].value = "";
+    const before = p.posted.length;
+    click(p, box.querySelectorAll(".tpart")[3].querySelector(".tpart-pick"));
+    assert.deepStrictEqual(sent(p, before), []);
+    assert.strictEqual(box.querySelector(".tpart-hint").hidden, false);
   });
 
   test("a pass with no field, or an empty one, is held back with a hint, not sent", () => {
@@ -265,14 +327,10 @@ suite("Steps modes webview: the selector and the parts editor post only what the
     leave(p, box, null);
     assert.deepStrictEqual(sent(p, before), [], "a template with no field is not sent");
     assert.strictEqual(hint.hidden, false, "the hint says why");
-    // Typing a path into a new field chip completes it; the pass is then written.
+    // Add field asks for a pick. The pick is cancelled, so the path is typed into the empty chip.
     const chip = addChipBy(p, box, ".tpart-add-path");
-    const pickReq = sent(p, before);
-    assert.strictEqual(pickReq.length, 1, "Add field asks for a pick");
-    change(p, chip.querySelector(".tpart-input"), "");
-    leave(p, box, null);
-    assert.strictEqual(sent(p, before).length, 1, "an empty field is held back too");
-    assert.strictEqual(hint.hidden, false);
+    assert.strictEqual(sent(p, before).length, 1, "Add field asks for a pick");
+    assert.strictEqual(hint.hidden, true, "a pick request clears the hint");
     change(p, chip.querySelector(".tpart-input"), "PID-3");
     leave(p, box, null);
     const msgs = sent(p, before);

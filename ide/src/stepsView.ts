@@ -735,8 +735,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             void vscode.window.showErrorMessage(`MessageFoundry: could not apply the edit — ${read.refused}`);
             // Revert the webview's unsent change to the true projection, but never under an edit in
             // flight: then the refresh is owed and runs when the slot frees, as a suppressed save does.
+            // Rows only: nothing was written, so there is no reason to re-run the live-value trace.
             if (guard.shouldReactToDocumentChange()) {
-              scheduleRerender();
+              scheduleRowsOnlyRerender();
             } else {
               guard.noteSuppressedChange();
             }

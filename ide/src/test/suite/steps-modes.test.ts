@@ -984,7 +984,9 @@ suite("Steps modes: the selector offers exactly the writable modes", () => {
     assert.ok(field.includes(`class="tsource" readonly disabled value="f&quot;-{msg.field(`));
     const editor = withoutBlankChip(field.slice(field.indexOf(`<div class="tparts"`)));
     assert.ok(!editor.includes(`class="tpart"`), "no chips: there are no parts to show");
-    assert.ok(field.includes(`<template class="tpart-blank" data-part="path">`), "the blank chip Add text clones is there");
+    for (const kind of ["text", "path"]) {
+      assert.ok(field.includes(`<template class="tpart-blank" data-part="${kind}">`), `the blank ${kind} chip an Add button clones is there`);
+    }
     assert.ok(editor.includes(`class="tpart-add-path"`), "a field can be added to start a template");
   });
 
