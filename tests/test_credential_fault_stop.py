@@ -186,6 +186,53 @@ async def test_dead_letter_policy_dead_letters_the_credential_fault(store: Messa
     assert not sink.stopped
 
 
+def _config_fault() -> NegativeAckError:
+    return NegativeAckError(
+        "FTPS server refused AUTH TLS", code="remotefile", permanent=True, config_fault=True
+    )
+
+
+async def test_configuration_fault_stops_and_retains(store: MessageStore) -> None:
+    # BACKLOG #2083 fix round 4: a permanent CONFIGURATION fault (the connection's TLS setting, a
+    # refused greeting) fails every queued row the same way, so it stops the lane and keeps the row
+    # exactly as a credential fault does. The alert names the configuration, not a credential.
+    await _seed_outbound(store)
+    sink = _RecordingSink()
+    runner = _runner(store, sink)
+    connector = _RaisingConnector(_config_fault())
+    runner._destinations[DEST] = connector  # type: ignore[assignment]
+
+    item = await store.claim_next_fifo(DEST, now=1.0)
+    assert item is not None
+    outcome = await runner._process_delivery_item(DEST, item)
+
+    assert outcome[0] is _ItemOutcome.STOPPED
+    status, attempts, last_error = await _row_state(store, item.message_id)
+    assert (status, attempts, last_error) == (OutboxStatus.PENDING.value, 0, None)
+    assert connector.sends == 1
+    assert [name for name, _ in sink.stopped] == [DEST]
+    assert "configuration fault" in sink.stopped[0][1]
+    assert "credential" not in sink.stopped[0][1]
+
+
+async def test_dead_letter_policy_dead_letters_the_configuration_fault(store: MessageStore) -> None:
+    # The configuration STOP follows credential_fault_policy, as it did while these faults were read
+    # as credential faults: "dead_letter" dead-letters the row and the lane advances.
+    await _seed_outbound(store)
+    sink = _RecordingSink()
+    runner = _runner(store, sink, policy="dead_letter")
+    runner._destinations[DEST] = _RaisingConnector(_config_fault())  # type: ignore[assignment]
+
+    item = await store.claim_next_fifo(DEST, now=1.0)
+    assert item is not None
+    outcome = await runner._process_delivery_item(DEST, item)
+
+    assert outcome[0] is _ItemOutcome.PROCESSED
+    status, _attempts, _last_error = await _row_state(store, item.message_id)
+    assert status == OutboxStatus.DEAD.value
+    assert not sink.stopped
+
+
 def test_credential_fault_policy_validated_at_construction(store: MessageStore) -> None:
     with pytest.raises(AssertionError):
         RegistryRunner(Registry(), store, credential_fault_policy="bogus")

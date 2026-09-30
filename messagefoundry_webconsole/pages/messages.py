@@ -23,6 +23,7 @@ from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
 from ._common import _pager, _seg
+from .approvals import approvals_link
 
 __all__ = [
     "dead_letter_pending",
@@ -987,6 +988,7 @@ def dead_letter_pending(pending: object) -> Markup:
             class_="muted",
         ),
         el("p", text(f"Approval id: {approval_id}"), class_="muted"),
+        approvals_link(),
         el("p", el("a", "← Dead letters", href="/ui/dead-letters")),
         class_="card",
     )

@@ -201,12 +201,25 @@ Stop-Service    MessageFoundry   # NSSM answers with Ctrl+C -> graceful connecti
 Restart-Service MessageFoundry
 ```
 
-Run them from an elevated prompt. `nssm start`, `nssm stop` and `nssm restart` send the same
-request, and Services.msc or `sc.exe` work too. The service's own `nssm.exe` is in
-`C:\Program Files\MessageFoundry\nssm` (the installer's `-NssmDir`). For a command only NSSM has,
-such as `nssm set`, run that copy. The installer checked its hash and keeps it where only
-administrators can write ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8). An
-`nssm` found anywhere else is a copy nothing has checked.
+Run them from an elevated prompt. Services.msc and `sc.exe` work too. NSSM's own start, stop and
+restart commands send the same request, so there is no reason to use them.
+
+The service's own `nssm.exe` is in `C:\Program Files\MessageFoundry\nssm` (the installer's
+`-NssmDir`). The installer checked that copy's hash, and keeps it where only administrators can
+write ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8). It never puts that
+folder on `PATH`. So any other `nssm` is not the copy the service runs, and nothing checks it when
+you run it. For a command only NSSM has, such as its `set`, run the service's copy by its full path:
+
+```powershell
+& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set MessageFoundry <setting> <value>
+Restart-Service MessageFoundry   # the running engine keeps its old settings until it restarts
+```
+
+**`set AppEnvironmentExtra` replaces the service's whole list of extra variables.** Pass every
+variable the service needs in one call, or the ones you leave out are gone at the next start. Keep
+the store key out of that list with the DPAPI key file (see
+[Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)), so
+you never retype it on a command line.
 
 For a one-click desktop alternative to these commands — engine status at a glance plus
 start/stop/restart, the console, and the log from the notification area — run the
@@ -280,8 +293,9 @@ PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI
 The key is a base64 32-byte secret. Two ways to supply it:
 
 - **Environment (cross-platform default).** Set `MEFOR_STORE_ENCRYPTION_KEY` in the service's
-  environment (`& "C:\Program Files\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`,
-  the copy the installer checked; see [Start / stop / status](#start--stop--status)). Simple,
+  environment (`& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`,
+  the copy the installer checked). That `set` replaces the whole list, so add every other
+  variable the service needs to the same call; see [Start / stop / status](#start--stop--status). Simple,
   but the plaintext key sits in the service environment block, readable by any local administrator.
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
