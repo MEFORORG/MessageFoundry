@@ -12,7 +12,7 @@ Those cover the *inventory truth*; this file freezes the *scanner's widened dete
   invisible before);
 * the third-party crypto libraries (hvac / truststore / webauthn / signxml) and every seam import
   form are detected;
-* the walk-set is the pinned five roots (no ``samples/``); and
+* the walk-set is the pinned six roots (no ``samples/``); and
 * the ``ide/``-is-TypeScript exclusion is an **enforced** invariant, not a silent drop.
 
 The last group (BACKLOG #1172, ASVS 11.5.1) freezes the **non-Python randomness arm** the Python
@@ -113,13 +113,14 @@ def test_a_plain_non_crypto_store_import_is_not_a_false_positive() -> None:
     assert gate.crypto_imports_in("from messagefoundry.store import base\n") == set()
 
 
-def test_walk_roots_are_the_pinned_five_with_no_samples() -> None:
+def test_walk_roots_are_the_pinned_six_with_no_samples() -> None:
     # Byte-identical to tests/test_security_static.py's _CRYPTO_ROOTS basenames (#283's pin). A later
     # narrowing (or a stray samples/) has to edit this literal rather than pass a tautology.
     gate = _gate()
     assert gate.WALK_ROOTS == (
         "messagefoundry",
         "messagefoundry_webconsole",
+        "messagefoundry_toolkit",  # ADR 0201: moved code must not leave the walk
         "harness",
         "tee",
         "scripts",
@@ -143,7 +144,7 @@ def test_ide_invariant_flags_a_planted_python_file(tmp_path: Path) -> None:
 
 
 def test_gate_is_clean_on_the_real_tree() -> None:
-    # End-to-end: the widened walk over the five real roots matches the maintained inventory (no drift).
+    # End-to-end: the widened walk over the six real roots matches the maintained inventory (no drift).
     gate = _gate()
     assert gate.main([]) == 0
 

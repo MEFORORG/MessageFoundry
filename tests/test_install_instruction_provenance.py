@@ -40,17 +40,23 @@ _ROOT = Path(__file__).resolve().parent.parent
 #: Distributions this repository builds that are **not yet published to any index**. Until a name is
 #: claimed, no shipped text may tell a user to install it by bare name.
 #:
-#: **Currently empty, and that is the goal state, not a disabled guard.** All three distributions this
-#: repo builds are registered on PyPI (`messagefoundry`, `messagefoundry-harness`,
-#: `messagefoundry-webconsole` -- the last claimed 2026-07-29 by the first `webconsole-v*` release,
-#: closing the ASVS 15.2.4 exposure where README.md instructed an index install of an unclaimed name).
-#: An empty set means "nothing unpublished is being advertised", which is exactly what should hold.
+#: **`messagefoundry-toolkit` is here from ADR 0201 slice 2 until its first upload claims the name.**
+#: The other three distributions this repo builds are registered on PyPI (`messagefoundry`,
+#: `messagefoundry-harness`, `messagefoundry-webconsole` -- the last claimed 2026-07-29 by the first
+#: `webconsole-v*` release, closing the ASVS 15.2.4 exposure where README.md instructed an index
+#: install of an unclaimed name). ADR 0201 slice 3 moves the toolkit to `_PUBLISHED_DISTRIBUTIONS`
+#: after a probe of the first tag's JSON API URL, with the harness as a control, shows the upload
+#: landed. An empty set is the goal state, not a disabled guard.
+#:
+#: This matches an install VERB only, so it cannot see text that names the toolkit without one. ADR
+#: 0201 section 1 does not rely on it to close the window: the release job uploads the toolkit before
+#: the engine, so no engine naming the toolkit reaches PyPI while the name is unclaimed.
 #:
 #: The set exists for the NEXT distribution: add its name here the moment `packaging/<name>/` lands and
 #: before any doc references it, then remove it once the first release claims the name.
 #: `test_a_new_distribution_must_be_classified` fails if a packaged distribution is neither listed here
 #: nor demonstrably published, so this cannot silently rot back to vacuous.
-_UNPUBLISHED_DISTRIBUTIONS: frozenset[str] = frozenset()
+_UNPUBLISHED_DISTRIBUTIONS: frozenset[str] = frozenset({"messagefoundry-toolkit"})
 
 #: Distribution names registered on PyPI and published by this repo's release workflow. Listing one
 #: here asserts the name is CLAIMED -- the property that makes a bare-name install instruction safe.
@@ -69,8 +75,10 @@ _SHIPPED_TEXT_GLOBS = (
     "README.md",
     "messagefoundry/**/*.py",
     "messagefoundry_webconsole/**/*.py",
+    "messagefoundry_toolkit/**/*.py",
     "harness/**/*.py",
     "packaging/messagefoundry-webconsole/README.md",
+    "packaging/messagefoundry-toolkit/README.md",
 )
 
 #: An install command naming a bare distribution -- i.e. one pip will resolve against an INDEX.

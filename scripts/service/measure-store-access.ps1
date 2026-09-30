@@ -91,7 +91,12 @@ param(
     [string]$AppExe,
     [int]$Port = 8765,
     [int]$MllpPort = 2699,
-    [int]$WaitSeconds = 120
+    [int]$WaitSeconds = 120,
+    # Handed to install-service.ps1, which checks the nssm.exe it keeps there against the pin and
+    # refuses one anybody but an administrator can replace. Every nssm call below runs that copy,
+    # never the one on PATH (BACKLOG #2442).
+    # An empty value would resolve to the current directory, so it is refused here.
+    [ValidateNotNullOrEmpty()][string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm"
 )
 
 $ErrorActionPreference = "Stop"
@@ -99,6 +104,7 @@ $ErrorActionPreference = "Stop"
 # $PWD, while the operator's CLI runs from the repository root, so a relative path here would put
 # the two identities on two different stores.
 $DataDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataDir)
+$NssmDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($NssmDir)
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $ServiceIdentity = "NT SERVICE\$ServiceName"
 $Operator = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -610,7 +616,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 if (-not $AppExe) { $AppExe = (Get-Command messagefoundry).Source }
 $Python = (Get-Command python).Source
-$Nssm = (Get-Command nssm).Source
+$Nssm = Join-Path $NssmDir "nssm.exe"
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
 $Work = Join-Path $TempRoot "w0-store-access-$Order"
 $ConfigDir = Join-Path $TempRoot "w0-store-access-config"
@@ -776,7 +782,7 @@ try {
 
     # --- install under the DEFAULT virtual account (no -ServiceAccount, no -AllowLocalSystem) ------
     & (Join-Path $PSScriptRoot "install-service.ps1") -ServiceName $ServiceName -AppExe $AppExe `
-        -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
+        -NssmDir $NssmDir -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
     $startName = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").StartName
     Add-Reading "SCM run-as account for '$ServiceName' is '$startName'"
     # The engine's store rule reads the data directory's OWNER as well as its DACL, so record it.
