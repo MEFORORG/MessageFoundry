@@ -309,6 +309,10 @@ if ($Status) {
             # different times from different checkouts, one recomputed line describes none of them.
             $wired = Get-WiredStateDir $cmd
             $coll = Get-WiredCollectorPath $cmd
+            # A command bash cannot parse publishes nowhere, whatever path it names (BACKLOG #1459).
+            # Said IN ADDITION to the path arms below, not instead of them: the path it names is
+            # still a fact an operator may need, and a root can be PowerShell source AND elsewhere.
+            $psSource = Test-IsPowerShellSourceStatusLine $cmd
             if ($null -eq $wired) {
                 Write-Host "    publishes to  : UNKNOWN (legacy command, no -StateDir -- the collector chooses at run time)"
                 Write-Host "                    re-install this root to bake the path in: -ConfigDir `"$($t.Root)`""
@@ -318,9 +322,17 @@ if ($Status) {
                 Write-Host "    publishes to  : $wired   -- ELSEWHERE; this root reads $wantState" -ForegroundColor Yellow
                 $bad++
             }
+            elseif ($psSource) {
+                Write-Host "    publishes to  : $wired"
+                $bad++
+            }
             else {
                 Write-Host "    publishes to  : $wired"
                 $ok++
+            }
+            if ($psSource) {
+                Write-Host "    but it cannot : the command is PowerShell source, and bash (which runs a statusLine) cannot parse it, so it publishes NOTHING" -ForegroundColor Yellow
+                Write-Host "                    re-install this root to replace it: -ConfigDir `"$($t.Root)`""
             }
             if ($coll) { Write-Host "    collector     : $coll   exists: $(Test-Path -LiteralPath $coll)" }
             else { Write-Host "    collector     : UNKNOWN (command shape not recognised)" }
@@ -521,6 +533,11 @@ foreach ($t in $targets) {
             Write-Host "             replaced a $MARKER statusLine that $why"
             Write-Host "             was: $(if ($wasState) { $wasState } else { '(no -StateDir -- the collector chose its own default)' })"
             Write-Host "             now: $stateDir"
+            # A SEPARATE LINE, NOT A REASON THAT DISPLACES ONE. The old command may ALSO have named
+            # another path or collector; both facts are true and the operator needs both (#1459).
+            if (Test-IsPowerShellSourceStatusLine $existing) {
+                Write-Host "             the old command was PowerShell source, which bash cannot parse, so it published nothing"
+            }
             if ($wasColl -and $wasColl -ne $CollectorPath) {
                 Write-Host "             collector was: $wasColl"
                 Write-Host "             collector now: $CollectorPath"

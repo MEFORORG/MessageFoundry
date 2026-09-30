@@ -193,8 +193,9 @@ try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | Conve
 # no extra cost -- which is what lets it distinguish "not wired" from "wired to publish somewhere
 # else", two states with completely different fixes that the old one-line message merged.
 #
-# EIGHT STATES. The old message named none of them: it said "not installed or has not run yet" and
-# printed the bare installer command with no root -- so following the reader's own advice re-ran the
+# TEN STATES, and the function below is the list. CORRECTED 2026-09-30: this read "EIGHT STATES",
+# already one short before WIRED_POWERSHELL_SOURCE joined for BACKLOG #1459. The old message
+# named none of them: it said "not installed or has not run yet" and printed the bare installer command with no root -- so following the reader's own advice re-ran the
 # exact invocation that produced the false INSTALLED claim in the first place.
 function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
     $settingsPath = Join-Path $Root "settings.json"
@@ -275,6 +276,18 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
         $o.remedy = $reinstall
         return $o
     }
+    # THE LAST ARM BEFORE WIRED_HERE, AND IT REPLACES ONLY THAT ONE. Every arm above already sends the
+    # operator to the installer, which also replaces PowerShell source, so their diagnosis stands. What
+    # was wrong is this: a PowerShell-source command whose `$d = '...'` path matched came back
+    # WIRED_HERE, told to "start a NEW session" -- advice that cannot work, because bash cannot parse
+    # the command and pwsh never starts (BACKLOG #1459; measured on a live account root 2026-09-30).
+    if (Test-IsPowerShellSourceStatusLine $cmd) {
+        $o.state = "WIRED_POWERSHELL_SOURCE"
+        $o.line = "WIRED (ours) but the command is PowerShell source. Claude Code runs a statusLine under bash, which cannot parse it, so pwsh never starts and nothing publishes. WAITING WILL NOT FIX THIS."
+        $o.remedy = @("Re-wire this root; the installer replaces it with a command both shells run:",
+            "  pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1 -ConfigDir `"$Root`"")
+        return $o
+    }
     $o.state = "WIRED_HERE"
     $o.line = "WIRED (ours), and it is wired to publish where this reader is looking"
     $o.remedy = @("Settings are read at session START, so a session already running when it was wired still",
@@ -305,6 +318,10 @@ if (-not $doc) {
             config_root_source = $rootSource
             settings_path     = $dx.settings_path
             statusline_state  = $dx.state
+            # THE CAUSE AND THE FIX TRAVEL WITH THE STATE (BACKLOG #1459). The spawn hook reads only
+            # this document, and a bare state name gave it nothing to say but UNKNOWN.
+            statusline_line   = $dx.line
+            statusline_remedy = @($dx.remedy)
             state_dir         = $StateDir
             wired_state_dir   = $dx.wired_state_dir
             wired_collector   = $dx.wired_collector
@@ -511,7 +528,7 @@ $states = @($five.state, $seven.state)
 # states, or the prose and the exit code describe different situations -- the two-instruments-
 # disagreeing defect this whole change exists to remove, reproduced inside one script.
 $dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE",
-    "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")
+    "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE", "WIRED_POWERSHELL_SOURCE")
 
 $overall = if ($states -contains "CRITICAL") { "CRITICAL" }
 elseif ($states -contains "WARN") { "WARN" }
@@ -629,6 +646,8 @@ if ($Json) {
         # describing a shape the code does not have is worse than no comment.
         cancellation_pending_from = $(if ($avail.state -eq 'PENDING') { $avail.effective_from } else { $null })
         statusline_state = $dx.state
+        statusline_line = $dx.line
+        statusline_remedy = @($dx.remedy)
         wired_state_dir = $dx.wired_state_dir
         config_root  = $readRoot
         config_root_source = $rootSource

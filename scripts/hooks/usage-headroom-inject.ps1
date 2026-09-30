@@ -144,12 +144,45 @@ $AGE_NOTE = "Ages are part of the reading. The collector publishes at statusLine
             "number can be up to about 15 min old and still look current; anything past $MaxAgeMinutes min " +
             "is reported UNKNOWN rather than projected from."
 
+# WHY NOTHING THIS SESSION DOES WILL REFRESH THE FILE, WHEN THAT IS SO (BACKLOG #1459). The collector
+# is a statusLine, and a statusLine runs only in the interactive terminal UI. Measured 2026-09-30
+# across six config roots: every latest.json write lined up with a session whose transcript records
+# entrypoint "cli", and none with the "claude-desktop" sessions that carried nearly all the traffic --
+# one root wired correctly had Desktop sessions that day and a reading four days old. So on a root
+# driven from Desktop an UNKNOWN here is the steady state, and a session told only "UNKNOWN" would
+# wait for a number that cannot arrive. Claude Code sets CLAUDE_CODE_ENTRYPOINT in the environment a
+# hook inherits; said only when it is set and is not "cli", so an unknown client is never guessed at.
+function Get-PublisherNote {
+    $ep = Get-Folded $env:CLAUDE_CODE_ENTRYPOINT 40
+    if (-not $ep -or $ep -eq "cli") { return @() }
+    return @("  publisher: this session's entrypoint is '$ep'. The statusLine that writes this file runs " +
+        "only in an interactive terminal session (entrypoint 'cli'), so nothing this session does will " +
+        "refresh it. A terminal 'claude' session pinned to this config root is what publishes.")
+}
+
+# THE READER'S DIAGNOSIS OF THE WIRING, WHEN IT FOUND A FAULT (BACKLOG #1459). A bare "no data" hid
+# a root whose statusLine can never run -- PowerShell source that bash cannot parse -- behind the
+# same words as a root that simply has not started a session yet. WIRED_HERE adds nothing the
+# publisher note does not, so only a named fault is repeated.
+function Get-WiringNote($Doc) {
+    if (-not $Doc) { return @() }
+    $st = Get-Folded $Doc.statusline_state 60
+    if (-not $st -or $st -eq "WIRED_HERE") { return @() }
+    $out = @("  statusLine ($st): " + (Get-Folded $Doc.statusline_line))
+    foreach ($r in @($Doc.statusline_remedy)) {
+        $f = Get-Folded $r
+        if ($f) { $out += "    $f" }
+    }
+    return $out
+}
+
 # UNKNOWN IS STILL AN INJECTION. Exiting quietly on a failed read would leave the session with no
 # reading and no indication that a reading was attempted, which is the state this hook exists to end.
-function Write-Unknown([string]$Detail) {
+function Write-Unknown([string]$Detail, [string[]]$Extra = @()) {
     Write-Context (@(
             $HEAD
             "  verdict: UNKNOWN -- $Detail"
+            $Extra
             "  UNKNOWN is not zero headroom and it is not full headroom. It is no measurement."
             "  Spawn on your own judgment, and expect a cutoff to be possible at any point."
         ) -join "`n")
@@ -272,7 +305,7 @@ if (-not ($j.PSObject.Properties.Name -contains "five_hour") -or -not $j.five_ho
             $where = "nothing has ever published to " + (Get-Folded $latestPath)
         }
     }
-    Write-Unknown "$why ($where)"
+    Write-Unknown "$why ($where)" (@(Get-WiringNote $j) + @(Get-PublisherNote))
 }
 
 function Format-Window($w, [string]$Short) {
@@ -308,6 +341,12 @@ $lines += (Format-Window $j.seven_day "7d")
 # entitled to know which one it has.
 if ((Get-Folded $j.provenance) -eq "UNVERIFIED") {
     $lines += "  provenance: UNVERIFIED -- the publisher recorded no config root, so the cross-account guard could not run"
+}
+
+# A READING THAT CAME BACK UNKNOWN GETS ITS CAUSE, for the same reason the no-window path does.
+if ($state -eq "UNKNOWN") {
+    $lines += @(Get-WiringNote $j)
+    $lines += @(Get-PublisherNote)
 }
 
 $advice = Get-Folded $j.advice
