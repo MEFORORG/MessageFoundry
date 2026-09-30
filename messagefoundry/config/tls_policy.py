@@ -1368,10 +1368,11 @@ def assert_hvac_tls_suites(
     """Assert an ``hvac`` (requests) hop's narrowed TLS context; return the factory that builds it.
 
     The Vault sibling of :func:`assert_ldap3_tls_suites`. Measured against the pins locked when
-    BACKLOG #300 landed (hvac 2.4.0, requests 2.34.2, urllib3 2.7.0): left alone, an ``hvac.Client`` carries zero
-    ``SSLContext`` attributes, its ``requests.Session`` carries none, and urllib3 builds a fresh
-    context per connection inside ``_ssl_wrap_socket_and_match_hostname``. The engine could never
-    hold that context, so until BACKLOG #300 this function asserted a replica of it.
+    BACKLOG #300 landed (hvac 2.4.0, requests 2.34.2, urllib3 2.7.0): left alone, an
+    ``hvac.Client`` carries zero ``SSLContext`` attributes, its ``requests.Session`` carries none,
+    and urllib3 builds a fresh context per connection inside
+    ``_ssl_wrap_socket_and_match_hostname``. The engine could never hold that context, so until
+    BACKLOG #300 this function asserted a replica of it.
 
     **Since BACKLOG #300 the engine supplies the context instead** (owner ruling 2026-09-27: narrow
     the library-built contexts too). The returned factory builds it with urllib3's **own public
@@ -1396,13 +1397,14 @@ def assert_hvac_tls_suites(
 
     **Peer verification is unchanged by a supplied context. That was measured, not assumed.** Every
     context holds requests' ``ca_certs``: ``verify=<path>`` gives the operator's CA, and
-    ``verify=True`` gives the certifi bundle, as before. Which code loads it differs by leg and by
-    urllib3 release; ``strict_requests._narrowed_pool_classes`` states that once. Nothing loads the
-    OS store onto a supplied context, and ``create_urllib3_context`` loads no roots of its own, so a
-    CA-anchored hop still trusts only that CA. On the Vault leg only, urllib3 also loads a client
-    certificate hvac found in ``VAULT_CLIENT_CERT``, which does not move the suite list. ``tests/test_vault_tls_narrowing.py`` handshakes against a real TLS listener: the right
-    CA verifies, and a wrong CA, a CA removed from the file, a wrong host name and a CBC-only peer are
-    each refused.
+    ``verify=True`` gives the certifi bundle, as before. urllib3 loads it on the Vault leg, and the
+    adapter's connection loads it on the proxy leg; ``strict_requests._narrowed_pool_classes`` says
+    why. Nothing loads the OS store onto a supplied context, and ``create_urllib3_context`` loads no
+    roots of its own, so a CA-anchored hop still trusts only that CA. On the Vault leg only, urllib3
+    also loads a client certificate hvac found in ``VAULT_CLIENT_CERT``, which does not move the
+    suite list. ``tests/test_vault_tls_narrowing.py`` handshakes against a real TLS listener: the
+    right CA verifies, and a wrong CA, a CA removed from the file, a wrong host name and a CBC-only
+    peer are each refused.
 
     **Why the context goes on the mounted adapter and not in through ``session=``.** ``session=`` is
     the documented way to reach this hop's TLS, and it is a trap. Given one, hvac 2.4.0's ``Adapter``

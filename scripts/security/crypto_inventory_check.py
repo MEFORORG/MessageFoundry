@@ -1370,7 +1370,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.transports.rest",
         }
     ),
-    # Loads requests' CA onto each narrowed context; why is in _narrowed_pool_classes (urllib3 2.8.0).
+    # Loads requests' CA onto the https-proxy leg's context; _narrowed_pool_classes says why.
+    # INSTRUMENT LIMIT: the load sits in a class nested in a function reached only through
+    # StrictReplyAdapter.__init__, so no "via" token reaches the Vault callers' rows, and the
+    # CERT_NONE refusal in connect() is a posture decision with no crypto-shaped call.
     "messagefoundry/transports/strict_requests.py": frozenset(
         {"tls_context:.load_verify_locations()"}
     ),

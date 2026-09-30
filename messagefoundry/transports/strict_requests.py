@@ -83,6 +83,7 @@ import requests.adapters
 import requests.utils
 import urllib3.connection
 import urllib3.connectionpool
+import urllib3.exceptions
 import urllib3.poolmanager
 from urllib3.util.ssl_ import resolve_cert_reqs
 
@@ -158,13 +159,13 @@ def _narrowed_pool_classes(
     urllib3's own unnarrowed context. So each connection replaces that field on its OWN copy of the
     config with ``factory()``. ``server_hostname`` on that leg is the proxy's host.
 
-    **The connection loads requests' CA onto BOTH contexts itself** (``_anchored_context``), so the
-    proxy leg verifies against the Vault hop's anchor. This is the one place that fact is stated.
-    Up to urllib3 2.7.0, urllib3 loaded the connection's CA onto a supplied context on both legs.
-    urllib3 2.8.0 uses a supplied proxy context exactly as given and loads no CA onto it, so the
-    proxy handshake failed verification. It still loads the CA on the Vault leg; loading it here too
-    keeps that leg anchored if a later release makes the same change there. OpenSSL keeps one copy
-    of a certificate loaded twice. The factory's contexts already require a verified peer.
+    **The connection loads requests' CA onto the proxy leg's context itself**, so that leg verifies
+    against the Vault hop's anchor. Up to urllib3 2.7.0, urllib3 loaded the connection's CA onto a
+    supplied context on both legs. urllib3 2.8.0 loads no CA onto a supplied PROXY context, so
+    without this load the proxy handshake fails verification. It still loads the CA on the Vault
+    leg, so the engine does not load it there too: one read of the CA file per leg, at handshake
+    time. A later urllib3 that stopped loading it on the Vault leg as well would fail closed, since
+    the factory's contexts require a verified peer, and the on-wire tests would go red.
 
     requests forwards through an ``https://`` proxy only for an ``http://`` Vault, and that shape is
     refused below, before any socket opens.
@@ -197,19 +198,12 @@ def _narrowed_pool_classes(
                     "refusing to connect"
                 )
             self._mefor_proxy_context = self._narrow_the_proxy_leg()
-            self.ssl_context = self._anchored_context()
+            self.ssl_context = factory()
             super().connect()
             if self._mefor_proxy_context is not None:
                 # Through a tunnel, urllib3 wraps the Vault leg in an SSLTransport over the proxy
                 # leg's SSLSocket, which it names `socket`.
                 self._check_the_proxy_leg(getattr(self.sock, "socket", None))
-
-        def _anchored_context(self) -> ssl.SSLContext:
-            """A fresh ``factory()`` context holding requests' CA; see the docstring above."""
-            context = factory()
-            if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
-                context.load_verify_locations(self.ca_certs, self.ca_cert_dir, self.ca_cert_data)
-            return context
 
         def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:
             """Give the TLS leg to an https proxy its own context, or ``None`` if it has none."""
@@ -220,7 +214,17 @@ def _narrowed_pool_classes(
                 or self.proxy_config is None
             ):
                 return None
-            context = self._anchored_context()
+            context = factory()
+            # The Vault anchor; the docstring above says why the connection loads it here.
+            if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
+                try:
+                    context.load_verify_locations(
+                        self.ca_certs, self.ca_cert_dir, self.ca_cert_data
+                    )
+                except OSError as exc:
+                    # urllib3 wraps this the same way when it loads the CA, so an unreadable CA
+                    # file still reaches requests as an SSLError, not a connection error.
+                    raise urllib3.exceptions.SSLError(exc) from exc
             # _replace builds a new tuple, so the pool's shared config is never changed.
             self.proxy_config = self.proxy_config._replace(ssl_context=context)
             return context
