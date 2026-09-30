@@ -3828,6 +3828,25 @@ _ALERT_TRANSPORTS = frozenset({"webhook", "email"})
 #: mirror ``RegistryRunner.restart_inbound`` / ``restart_outbound``.
 _ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})
 
+#: BACKLOG #1898: the event types a rule may attach a ``control_action`` to. Each one puts a real
+#: connection (or lane) name in the event's ``connection`` key, so the action's default target is the
+#: connection that fired. Every other type puts a stand-in there (a username, an approval id, a DB
+#: path, a cert label, a node id), and some stand-ins fit the connection-name grammar, so a restart
+#: aimed at one could hit an unrelated real connection. ``content_match`` is left out on purpose: it
+#: has no engine caller yet, and once a Handler calls it, message content would decide when a
+#: connection restarts. Its caller should add it here deliberately, not inherit it. The notifier
+#: checks the same set at dispatch (alert_sinks ``NotifierAlertSink._emit``).
+_ALERT_CONTROL_EVENT_TYPES = frozenset(
+    {
+        "connection_stopped",
+        "connection_error",
+        "queue_buildup",
+        "message_stall",
+        "saturation",
+        "lane_stuck",
+    }
+)
+
 #: #138 (ADR 0127) — the CLOSED, non-PHI variable allowlist an alert-email template may reference. Every
 #: name here is *structurally* non-PHI (a severity enum / event-type token / connection name / timestamp
 #: / integer count / cooldown / operator rule label), so a template can NEVER interpolate a message body
@@ -3961,9 +3980,11 @@ class AlertRule(BaseModel):
     # (byte-identical). Dispatched OFF the delivery worker + never-raise; throttled WITH the notification
     # (≤ once per cooldown per event+connection); independent of transport suppression (transports=[] ⇒
     # quiet auto-remediation). Requires the notifier (≥1 transport). Pure data — no embedded code.
+    # BACKLOG #1898: allowed only with an event_type in _ALERT_CONTROL_EVENT_TYPES; "any" and every
+    # other type are refused at load (_check_control_scope below).
     control_action: str | None = None
-    # The connection the control action targets. None = the event's own connection (natural for the
-    # connection-scoped events connection_stopped / connection_error / queue_buildup); set it to act on a
+    # The connection the control action targets. None = the event's own connection, which for every
+    # type _ALERT_CONTROL_EVENT_TYPES allows is the connection (or lane) that fired; set it to act on a
     # DIFFERENT connection than the one that fired (e.g. restart an inbound when its paired outbound stalls).
     control_target: str | None = None
     # #143 (ADR 0044 amendment): a static per-rule NOTIFICATION mute. True suppresses the notification for
@@ -4028,6 +4049,23 @@ class AlertRule(BaseModel):
             allowed = ", ".join(sorted(_ALERT_CONTROL_ACTIONS))
             raise ValueError(f"control_action must be one of [{allowed}]; got {v!r}")
         return v
+
+    @model_validator(mode="after")
+    def _check_control_scope(self) -> AlertRule:
+        # BACKLOG #1898: the two field validators above each check one field, and nothing related
+        # them, so a catch-all rule (event_type "any") or one keyed on a non-connection event could
+        # carry a control_action. Its default target is then the event's stand-in key, and a stand-in
+        # that fits the connection-name grammar restarts whatever real connection shares that name.
+        # Refuse the pair at load. The message names the rule's own label and event type, never a
+        # target or any other value.
+        if self.control_action is None or self.event_type in _ALERT_CONTROL_EVENT_TYPES:
+            return self
+        rule = f"rule {self.id!r}" if self.id is not None else "a rule"
+        allowed = ", ".join(sorted(_ALERT_CONTROL_EVENT_TYPES))
+        raise ValueError(
+            f"{rule} sets control_action with event_type {self.event_type!r}; control_action is "
+            f"allowed only with a connection-scoped event_type, one of [{allowed}]"
+        )
 
 
 class AlertsSettings(_Section):
