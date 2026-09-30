@@ -1031,6 +1031,16 @@ def test_a_DATA_heredoc_body_naming_a_tree_swap_is_allowed_too(repo: SimpleNames
         # The reader comes AFTER the heredoc on the same line, which the logical view does not model.
         pytest.param(f"cat <<'EOF' | bash\n{_DISARM}\nEOF", id="piped_into_an_interpreter"),
         pytest.param(f"cat <<'EOF' > s.sh && ./s.sh\n{_DISARM}\nEOF", id="written_then_run"),
+        # Code review round one measured these two ALLOWING against a draft that let "harmless"
+        # programs share the line: the file just written is named like one, or git runs it as a hook.
+        pytest.param(f"cat <<'EOF' > git && ./git\n{_DISARM}\nEOF", id="run_under_an_allowed_name"),
+        pytest.param(
+            f"cat <<'EOF' > .git/hooks/pre-commit && git commit -am x\n{_DISARM}\nEOF",
+            id="written_as_a_hook_then_git_runs_it",
+        ),
+        pytest.param(f"cat <<'EOF' > ls ; ls\n{_DISARM}\nEOF", id="bare_name_beside_the_owner"),
+        # A PATH to cat is not cat: it can be anything, including a script that runs its input.
+        pytest.param(f"./cat <<'EOF' > notes.txt\n{_DISARM}\nEOF", id="owner_spelled_as_a_path"),
         # An UNQUOTED delimiter expands the body, so a substitution in it runs.
         pytest.param(f"cat <<EOF > notes.txt\n$({_DISARM})\nEOF", id="unquoted_word_substitution"),
         # Text OUTSIDE the body.

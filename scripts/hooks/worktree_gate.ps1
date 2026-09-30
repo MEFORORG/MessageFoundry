@@ -1444,30 +1444,35 @@ function Find-SubstitutionEnd([string]$Text, [int]$At, [string]$Convention, [int
 # `source /dev/stdin <<'EOF'` and `at now <<'EOF'` both run the body and neither is on it. An unknown
 # program answers no, and no costs only the over-deny this change removes, never a hole.
 #
-#   * The command that OWNS a heredoc must be `cat` or `tee`, which copy their input and run nothing.
-#     `git commit -F - <<'EOF'` is left out on purpose: a git alias can be a shell command that reads
-#     stdin, so git reading a body is not provably data. It keeps its over-deny.
-#   * Every OTHER command on the line must be one of a short list that cannot run a file just written
-#     either, so `cat <<'EOF' > s.sh && ./s.sh` and `cat <<'EOF' | bash` answer no.
+#   * Every command on the line must OWN a heredoc, and its program must be a BARE `cat` or `tee`,
+#     which copy their input and run nothing. `git commit -F - <<'EOF'` is left out on purpose: a git
+#     alias can be a shell command that reads stdin, so git reading a body is not provably data. It
+#     keeps its over-deny.
+#   * NO OTHER COMMAND MAY SHARE THE LINE, and that is narrower than a first draft on purpose. That
+#     draft allowed a list of "harmless" programs beside the owner, and code review measured two ways
+#     through it: `cat <<'EOF' > git && ./git` (the list was matched on the BASENAME, so `./git` passed
+#     as git and ran the file just written), and `cat <<'EOF' > .git/hooks/pre-commit && git commit`
+#     (git runs a hook it did not write). A bare name is no safer: `cat <<'EOF' > ~/bin/ls && ls` runs
+#     it through PATH. No name on the line can be proved not to run the body, so nothing else is let on
+#     the line. The fleet idiom, `cat > msg.txt <<'EOF'` with `git commit -F msg.txt` on a LATER line,
+#     is unaffected -- and a later line is the stated residual in Get-SegmentView.
+#   * A PATH to cat or tee (`./cat`, `/tmp/tee`) is not the program, so it answers no.
 #
 # THE SPLIT IS DELIBERATELY CRUDE, AND CRUDE FAILS CLOSED. Pieces break on every separator character,
 # quoted or not, and on `(` and a backtick, so a separator inside a quoted word or a substitution only
-# makes a piece start with something off the list. The first word of a piece is its program, after
-# `NAME=value` prefixes; a leading redirection, a keyword such as `if`, or a quoted program name is not
-# on the list, so each answers no. `>&` and `<&` are redirections, not separators.
+# adds a piece that owns no heredoc. The first word of a piece is its program, after `NAME=value`
+# prefixes; a leading redirection, a keyword such as `if`, or a quoted program name is not a bare cat
+# or tee, so each answers no. `>&` and `<&` are redirections, not separators.
 function Test-HeredocLineIsDataOnly([string]$Line) {
     $owners = @('cat', 'tee')
-    $others = @('cat', 'tee', 'echo', 'printf', 'git', 'gh', 'mkdir', 'cd', 'ls', 'true')
     $sawOwner = $false
     foreach ($piece in ($Line -split '[;|()`\r\n]|(?<![<>])&')) {
         $toks = @($piece -split '\s+' | Where-Object { $_ -and $_ -notmatch '^[A-Za-z_][A-Za-z0-9_]*=' })
         if ($toks.Count -eq 0) { continue }
-        $name = (($toks[0] -split '[\\/]')[-1] -replace '(?i)\.exe$', '').ToLowerInvariant()
-        if ($piece.Contains('<<')) {
-            if ($owners -notcontains $name) { return $false }
-            $sawOwner = $true
-        }
-        elseif ($others -notcontains $name) { return $false }
+        if (-not $piece.Contains('<<')) { return $false }
+        $name = ($toks[0] -replace '(?i)\.exe$', '').ToLowerInvariant()
+        if ($owners -notcontains $name) { return $false }
+        $sawOwner = $true
     }
     $sawOwner
 }
@@ -1761,7 +1766,8 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
     #      in the body -- an unquoted body's `$( )` and backtick RUN;
     #   2. the body is TERMINATED by a line the shell accepts, so the model is not guessing its end;
     #   3. the opening line was followed by the quote model rather than handed back as physical lines;
-    #   4. Test-HeredocLineIsDataOnly says every program on the opening line is one that cannot run it.
+    #   4. Test-HeredocLineIsDataOnly says the opening line holds nothing but bare `cat`/`tee` heredoc
+    #      owners -- no other command at all, since no program name can be proved not to run the body.
     # A body the model mis-places, because a quote it reads differently from bash hides or invents a
     # `<<`, is what this fencing cannot see. That is at least the residual set Split-LogicalLines
     # already lists as not modelled.
