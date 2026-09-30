@@ -73,6 +73,8 @@ section reference.
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
+| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0`, or a window of `0` or less turns a limit off) |
+| | `[auth].lockout_minutes`, `lockout_threshold` | `15` / `5` (*conditional* — a loosening only while auth is on; minutes of `0` or less means no lock ever holds, and a threshold above `100` exceeds NIST SP 800-63B) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
@@ -81,13 +83,15 @@ section reference.
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 
-**At least eleven of these do not live in `[security]`.** `[store].aad_bind`,
+**At least seventeen of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
-`[auth].admin_new_ip_step_up`, `[secret_rotation].enforce_store_key_expiry` and
+`[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, `[auth].lockout_minutes`,
+`[auth].lockout_threshold`,
+`[secret_rotation].enforce_store_key_expiry` and
 `[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first six are named by `security_loosenings()` from the loaded
+section settings are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[secret_rotation]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
@@ -537,6 +541,61 @@ This section is kept rather than deleted, because the claim it used to make is t
   `auth.login_new_ip` rows the sign-in signal still writes. That signal has no switch.
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
+### `[auth].login_rate_limit_enabled = false`, or a zeroed limit — sign-in attempts go unpaced
+> **Conditional** on sign-in, like `admin_new_ip_step_up`: with `[security].require_sign_in = false` there
+> is no sign-in to limit. Each of these values turns a limit off, and each is reported under its own key
+> ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). The owner ruled on 2026-09-27 that a silent weakening here
+> keeps ASVS 6.1.1 at partial.
+>
+> | Value | What stops |
+> |---|---|
+> | `login_rate_limit_enabled = false` | Both sign-in limits, per address and across all clients, and the per-user limit on credential ceremonies. None is built. |
+> | `login_rate_limit_window_seconds` of `0` or less | The same three. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
+> | `login_rate_limit_per_ip = 0` | The per-address sign-in limit, and the per-user ceremony limit, which reads the same number. |
+> | `login_rate_limit_global = 0` | The all-clients sign-in limit. |
+>
+> The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
+> second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
+> limiter off, a zeroed count or window changes nothing, so only `login_rate_limit_enabled` is named. A
+> **negative** count, or a window that is not a number or is `+inf`, refuses *more* attempts, not fewer,
+> so it is not reported. **A weak but non-zero value is not reported either**: a huge count or a tiny
+> window paces almost nothing, and there is no published cutoff to judge it by.
+- **What you lose:** a password spray across many usernames never trips one account's lockout, and these
+  limits are what slow it. With the per-address limit off, one client may try as fast as the all-clients
+  limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
+  of addresses the attacker holds. With the ceremony limit off, a session holder guessing a password at
+  re-auth meets no rate limit, only the per-session cap and the account's lockout (each failed re-proof
+  counts toward it), and a second factor at the console's sign-in step is guessed at no set rate.
+- **When acceptable:** load testing on a host no untrusted client can reach. A reverse proxy or web
+  application firewall in front of the engine can replace the per-address and all-clients limits, but it
+  cannot replace the per-user ceremony limit, which keys on the signed-in user. Prefer **raising** a limit
+  to turning it off.
+- **Compensating controls:** front the API with a proxy or WAF limiter, restrict the sign-in surface with
+  `[security].allowed_client_networks`, keep `lockout_minutes` above `0`, and watch the
+  `auth.login_failed` audit rows.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
+### `[auth].lockout_minutes = 0` (or less), or a `lockout_threshold` above 100 — the account lock stops protecting
+> **Conditional** on sign-in, as above ([BACKLOG #1131](BACKLOG.md)). At `lockout_minutes` of `0` or less a
+> lock is still set at `lockout_threshold` failures, but it ends the moment it is set, on the sign-in and
+> the second-step counter alike. No `lockout_threshold` is read as off, since `0` or less locks on the
+> *first* failure. A large one never arms in practice, though, so a threshold above the **100**
+> consecutive failures that NIST SP 800-63B allows (SP 800-63B-4 section 3.2.2, and rev. 3 section
+> 5.2.2 before it) is reported as well.
+- **What you lose:** at `lockout_minutes` of `0` or less, a run of wrong guesses at one account's password
+  or second factor is never refused by a lock. The failures are still counted and audited. Each session is
+  still revoked after `lockout_threshold` failed re-proofs, because that cap does not read
+  `lockout_minutes`. Above a threshold of 100, that many wrong guesses are checked before any lock is set,
+  and a session may fail that many re-proofs before it is revoked.
+- **When acceptable:** rarely. A site whose own sign-in front end already locks accounts may prefer the
+  engine not to set a second lock that a stranger could trigger on purpose. Under
+  [ADR 0197](adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
+  a local account with TOTP enrolled can already sign in past a sign-in lock a stranger set, and an
+  engine-generated credential arms no sign-in lock at all, so check whether that answers the concern first.
+- **Compensating controls:** keep the sign-in limits on, enroll every account in MFA, and review
+  `auth.login_failed` and `auth.mfa_failed` rows.
+- **Reversible:** yes, immediately — restore `15` and `5` (or delete the lines) and restart.
+
 ### `[api].plaintext_upstream_hop_acknowledged = true` — a plaintext proxy-to-engine hop, taken on by the site
 > **Conditional**, like `allowed_client_networks`. It is reported **only** while `[api].tls_terminated_upstream`
 > is set and no `[api].tls_cert_file` is. With an operator certificate the engine serves that hop over TLS,
@@ -872,6 +931,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
+| `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
@@ -889,7 +949,8 @@ carried from that drive-to-pass, not re-derived here.**
 ### Sources
 
 - [OWASP Application Security Verification Standard v5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) — chapter structure.
-- [NIST SP 800-53 Rev. 5, Security and Privacy Controls](https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final) — control catalog (SC-7, SC-8, SC-28, SC-13, IA-2, AC-12, AC-4, AU-2, AU-3, SI-12, RA-2, AC-6).
+- [NIST SP 800-53 Rev. 5, Security and Privacy Controls](https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final) — control catalog (SC-7, SC-8, SC-28, SC-13, IA-2, AC-12, AC-4, AU-2, AU-3, SI-12, RA-2, AC-6, AC-7).
+- [NIST SP 800-63B-4, Digital Identity Guidelines: Authentication and Authenticator Management](https://pages.nist.gov/800-63-4/sp800-63b.html) — section 3.2.2 (section 5.2.2 in the superseded rev. 3), the ceiling of 100 consecutive failed attempts that `[auth].lockout_threshold` is checked against.
 - [NIST SP 800-66 Rev. 2, Implementing the HIPAA Security Rule](https://csrc.nist.gov/pubs/sp/800/66/r2/final) — Appendix D HIPAA → 800-53r5 crosswalk.
 - [45 CFR §164.312 — Technical safeguards](https://www.hhs.gov/hipaa/for-professionals/security/index.html) (HHS).
 - [CISA — Secure by Design](https://www.cisa.gov/securebydesign) — secure defaults + the loosening-guide model.
