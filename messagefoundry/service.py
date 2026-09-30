@@ -118,6 +118,12 @@ def service_state(name: str) -> str:
             [_system_exe("sc.exe"), "query", name],
             capture_output=True,
             text=True,
+            # sc.exe writes its console's code page when piped, OEM unless a parent ran chcp. A byte
+            # the decoding codec cannot map fails in subprocess's reader thread, run() returns
+            # stdout=None, and parse_service_state raises AttributeError. Only the ASCII STATE
+            # field is parsed, so replace the byte.
+            encoding="oem",
+            errors="replace",
             timeout=5,
             creationflags=_NO_WINDOW,  # don't flash a console window from the GUI process
         )  # nosec B603 B607

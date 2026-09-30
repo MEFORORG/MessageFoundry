@@ -35,6 +35,7 @@ a `vX.Y.Z-rc1` pre-release tag.
 
 from __future__ import annotations
 
+import copy
 import functools
 import gzip
 import io
@@ -53,6 +54,7 @@ import pytest
 from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
 from tests._force_include import hatch_build
+from tests._verify_softeners import verification_softeners
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -313,7 +315,8 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 # --- (4b) every mutating step tests the EVENT as well as the ref (BACKLOG #1584) ---------------------
 
 #: Steps in release.yml that mutate a public sink BY PUBLISHING A RELEASE ARTIFACT OR ATTESTING ONE --
-#: the three PyPI publishes, the three GitHub-release mutations (BACKLOG #1584) and the SLSA
+#: the four PyPI publishes (the toolkit's since ADR 0201), the three GitHub-release mutations
+#: (BACKLOG #1584) and the SLSA
 #: build-provenance attestation (BACKLOG #1805). Pinned as a count so a NEW one cannot be added
 #: without either carrying the guard pair or landing here deliberately. An empty scan must never read
 #: as a pass.
@@ -322,7 +325,7 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 #: attestation step. Why `python -m sigstore sign` is NOT is stated in the header's "THE DRY-RUN IS
 #: NOT SILENT" paragraph. Read a green here as "a dispatch neither publishes nor attests a release
 #: artifact", never as "a dispatch writes nothing public".
-_EXPECTED_MUTATING_STEPS = 7
+_EXPECTED_MUTATING_STEPS = 8
 
 #: Actions that publish a release artifact, matched as a `uses:` prefix.
 _PUBLISHING_ACTIONS = (
@@ -631,7 +634,8 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     smokes = {
         # `.get("run") or ""` rather than `step["run"]`, matching _wheel_smoke_steps(): a smoke step
         # written with `uses:` must fail the assertion below with its own message, not a KeyError.
-        name: str(step.get("run") or "")
+        # Keyed by job AND step: the `release` job holds two smokes since ADR 0201 (engine, toolkit).
+        f"{name}/{step.get('name')}": str(step.get("run") or "")
         for name, job in _jobs().items()
         for step in (job.get("steps") or [])
         if isinstance(step, dict) and str(step.get("name") or "").startswith("Smoke-check")
@@ -1192,10 +1196,18 @@ _SMOKE_HEREDOC = re.compile(r"<<'PYSMOKE'\n(.*?)\nPYSMOKE\n", re.S)
 #: in the tree: a fixture that happens to match the real one cannot show the check read the fixture.
 _SMOKE_VERSION = "7.7.7"
 
+#: The toolkit distribution (ADR 0201), built and smoked inside the engine's `release` job.
+_TOOLKIT_DIST = "messagefoundry-toolkit"
+
 
 @functools.cache
 def _wheel_smoke_steps() -> dict[str, dict]:
-    """Every job that builds a wheel of its own distribution, paired with its smoke step.
+    """Every separately-built wheel's smoke step, keyed by the DISTRIBUTION its script installs.
+
+    KEYED BY DISTRIBUTION, NOT JOB, SINCE ADR 0201. The toolkit wheel is built and smoked inside the
+    engine's `release` job, so one job now holds two smoke steps: the engine's (no PYSMOKE script,
+    the stated gap below) and the toolkit's. A job-keyed map could not hold both. A job that builds
+    N wheels with ``python -m build --wheel`` must carry exactly N PYSMOKE smoke steps.
 
     DERIVED from ``python -m build --wheel``, never a list of job names, for the same reason
     :func:`test_both_wheel_smokes_compare_versions_not_strings` counts instead of pinning a number:
@@ -1217,16 +1229,29 @@ def _wheel_smoke_steps() -> dict[str, dict]:
     found: dict[str, dict] = {}
     for name, job in _jobs().items():
         steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
-        if not any("python -m build --wheel" in str(s.get("run") or "") for s in steps):
+        builds = sum(str(s.get("run") or "").count("python -m build --wheel") for s in steps)
+        if not builds:
             continue
-        smoke = [s for s in steps if str(s.get("name") or "").startswith("Smoke-check")]
-        assert len(smoke) == 1, (
-            f"job {name!r} builds a wheel but has {len(smoke)} step(s) named 'Smoke-check...' — these "
-            f"tests cannot know which one inspects the artifact"
+        smoke = [
+            s
+            for s in steps
+            if str(s.get("name") or "").startswith("Smoke-check")
+            and "<<'PYSMOKE'" in str(s.get("run") or "")
+        ]
+        assert len(smoke) == builds, (
+            f"job {name!r} builds {builds} wheel(s) but has {len(smoke)} 'Smoke-check...' step(s) "
+            f"with a PYSMOKE inspection -- a wheel with no smoke publishes an artifact nothing read"
         )
-        found[name] = smoke[0]
-    # A floor, so an empty match can never pass vacuously. Two today: the console and the harness.
-    assert len(found) >= 2, f"expected the console + harness wheel smokes, found {sorted(found)}"
+        for step in smoke:
+            m = _SMOKE_HEREDOC.search(str(step.get("run") or ""))
+            assert m, f"step {step.get('name')!r} has no PYSMOKE heredoc"
+            dist, _pkg = _smoke_names(m.group(1))
+            assert dist not in found, f"two smoke steps install {dist!r}"
+            found[dist] = step
+    # A floor, so an empty match can never pass vacuously: the console, the harness and the toolkit.
+    assert len(found) >= 3, (
+        f"expected the console, harness and toolkit smokes, found {sorted(found)}"
+    )
     return found
 
 
@@ -1288,18 +1313,23 @@ def test_the_engine_smoke_is_the_gap_these_guards_do_not_close() -> None:
     When the rest of #1583 lands, this test is what tells you to fold the engine job into
     `_wheel_smoke_steps`.
     """
-    smoked = {
-        name
+    # By STEP, not by job, since ADR 0201 put the toolkit's covered smoke in the same `release` job
+    # as the engine's uncovered one.
+    covered = {id(step) for step in _wheel_smoke_steps().values()}
+    uncovered = sorted(
+        (name, str(step.get("name")))
         for name, job in _jobs().items()
         for step in (job.get("steps") or [])
-        if isinstance(step, dict) and str(step.get("name") or "").startswith("Smoke-check")
-    }
-    uncovered = smoked - set(_wheel_smoke_steps())
-    assert uncovered == {"release"}, (
-        f"the set of release smokes these guards do NOT cover is {sorted(uncovered)}, expected exactly "
-        f"['release']. A new job with a smoke step is escaping section (8) -- either bring it into "
+        if isinstance(step, dict)
+        and str(step.get("name") or "").startswith("Smoke-check")
+        and id(step) not in covered
+    )
+    assert [job for job, _step in uncovered] == ["release"], (
+        f"the release smokes these guards do NOT cover are {uncovered}, expected exactly one, in "
+        f"['release']. A new smoke step is escaping section (8) -- either bring it into "
         f"_wheel_smoke_steps (it should build with `python -m build --wheel`) or record why not."
     )
+    assert uncovered[0][1].startswith(_WHEEL_SMOKE_STEP_PREFIX), uncovered
 
     engine = _executed_shell(
         str(
@@ -1421,7 +1451,14 @@ def _write_install(
     # right only for the names in play today and wrong for one carrying a dot.
     info = purelib / f"{re.sub(r'[-_.]+', '_', dist)}-{version}.dist-info"
     info.mkdir(parents=True, exist_ok=True)
-    declared = ["messagefoundry[harness]==" + version] if requires is None else requires
+    # The default is each LOCKSTEP distribution's own correct pin: the toolkit's names no extra (ADR
+    # 0201), the harness's names [harness]. The console's script reads neither.
+    default = (
+        f"messagefoundry=={version}"
+        if dist == _TOOLKIT_DIST
+        else f"messagefoundry[harness]=={version}"
+    )
+    declared = [default] if requires is None else requires
     info.joinpath("METADATA").write_text(
         "".join(
             [
@@ -1703,7 +1740,9 @@ def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
     its own wheel (``messagefoundry_webconsole/__init__.py``). The harness reads the ENGINE's
     ``__init__.py``, which the harness wheel does not contain, so there is nothing there to read back.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-webconsole", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared(
+        "messagefoundry-webconsole", venv_template, tmp_path
+    )
     _write_install(purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, "9.9.9"))
 
     rc, _stdout, out = _run_smoke(exe, script, tmp_path)
@@ -1723,8 +1762,19 @@ def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
         (["messagefoundry[harness]>=" + _SMOKE_VERSION], "a range instead of a pin"),
         (["messagefoundry==" + _SMOKE_VERSION], "the [harness] extra dropped"),
         ([], "no requirement on the engine at all"),
+        # BACKLOG #1585 (a): an exact pin wearing an environment marker. The first is TRUE wherever
+        # this suite runs, so it proves a marker is refused even when it would install the engine
+        # here; the second is the shape that passes on ubuntu and installs nothing on Windows.
+        (
+            ["messagefoundry[harness]==" + _SMOKE_VERSION + '; python_version >= "3"'],
+            "an exact pin gated by a marker true on this runner",
+        ),
+        (
+            ["messagefoundry[harness]==" + _SMOKE_VERSION + '; sys_platform == "linux"'],
+            "an exact pin gated by a platform marker",
+        ),
     ],
-    ids=["wrong-version", "range", "no-extra", "absent"],
+    ids=["wrong-version", "range", "no-extra", "absent", "marker-true-here", "platform-marker"],
 )
 def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
     requires: list[str], why: str, venv_template: Path, tmp_path: Path
@@ -1739,7 +1789,7 @@ def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
     Job-specific: the console is deliberately NOT lockstep (its own version root, its own cadence),
     so its dependency on the engine is correctly unpinned and its script does not look.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared("messagefoundry-harness", venv_template, tmp_path)
     _write_install(
         purelib,
         dist,
@@ -1789,7 +1839,7 @@ def test_the_harness_smoke_does_not_count_a_requirement_an_extra_gates(
     the engine already published and the version burnt. The defect is in the workflow's scan, so the
     only test that can catch it before the tag is one that RUNS that scan.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared("messagefoundry-harness", venv_template, tmp_path)
     _write_install(
         purelib,
         dist,
@@ -1847,7 +1897,7 @@ def test_the_extra_filter_did_not_disarm_the_lockstep_check(
     Read beside ``test_the_harness_smoke_does_not_count_a_requirement_an_extra_gates``, which is the
     positive control: without it every arm here passes on a smoke that rejects everything.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared("messagefoundry-harness", venv_template, tmp_path)
     _write_install(
         purelib,
         dist,
@@ -1901,7 +1951,9 @@ def test_the_console_smoke_accepts_every_supported_prerelease_spelling(
     This is the defect the sibling tag-vs-built compare was already fixed for (see
     :func:`test_both_wheel_smokes_compare_versions_not_strings`): the same trap, one comparison over.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-webconsole", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared(
+        "messagefoundry-webconsole", venv_template, tmp_path
+    )
     _write_install(
         purelib,
         dist,
@@ -1941,7 +1993,7 @@ def test_the_harness_smoke_accepts_every_supported_prerelease_pin_spelling(
     that need it most, and the operator sees a "pin drifted" error naming two versions that are the
     same one.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared("messagefoundry-harness", venv_template, tmp_path)
     _write_install(
         purelib,
         dist,
@@ -1971,7 +2023,9 @@ def test_the_console_smoke_still_rejects_a_different_prerelease(
     have to pass -- but it is nowhere near the pre-release territory this change moved, and a fix
     that over-normalised would land exactly there.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-webconsole", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared(
+        "messagefoundry-webconsole", venv_template, tmp_path
+    )
     _write_install(
         purelib,
         dist,
@@ -2012,7 +2066,7 @@ def test_the_harness_smoke_still_rejects_a_pin_that_is_not_the_shipped_version(
     #1585 along with the instruction naming the file to edit -- telling the operator the wheel is
     corrupt when the pyproject is merely wrong. It must reject, and it must reject as a DRIFT.
     """
-    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    script, dist, pkg, exe, purelib = _prepared("messagefoundry-harness", venv_template, tmp_path)
     _write_install(
         purelib,
         dist,
@@ -2051,6 +2105,97 @@ _SHADOW_VERSION = "9999.0.0+checkoutshadow"
 def _squeeze(expr: str) -> str:
     """``expr`` with all whitespace removed — GitHub expressions are whitespace-insensitive."""
     return re.sub(r"\s+", "", expr)
+
+
+@pytest.mark.parametrize(
+    ("requires", "why"),
+    [
+        (["messagefoundry==0.0.1"], "a pin at the wrong version"),
+        (["messagefoundry>=" + _SMOKE_VERSION], "a range instead of a pin"),
+        (["messagefoundry[harness]==" + _SMOKE_VERSION], "an extra added"),
+        ([], "no requirement on the engine at all"),
+        (
+            ["messagefoundry==" + _SMOKE_VERSION, "hl7apy>=1.3"],
+            "a second dependency beside the engine pin",
+        ),
+    ],
+    ids=["wrong-version", "range", "extra", "absent", "second-dependency"],
+)
+def test_the_toolkit_smoke_checks_the_lockstep_pin_on_the_built_artifact(
+    requires: list[str], why: str, venv_template: Path, tmp_path: Path
+) -> None:
+    """ADR 0201 AC-7 where it becomes irreversible. The toolkit uploads BEFORE the engine, so a wheel
+    this smoke lets through is on PyPI before anything else can object."""
+    script, dist, pkg, exe, purelib = _prepared(_TOOLKIT_DIST, venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        requires=requires,
+    )
+    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc != 0, f"the toolkit smoke published a wheel with {why}.\n{out}"
+    assert "ADR 0201" in out, f"the toolkit smoke rejected {why} without naming the ADR.\n{out}"
+
+
+def test_the_toolkit_smoke_refuses_a_wheel_without_its_console_script_target(
+    venv_template: Path, tmp_path: Path
+) -> None:
+    """The console script names ``messagefoundry_toolkit.__main__:main``. The smoke cannot import it
+    under --no-deps, because it imports the engine, so it checks RECORD shipped the file."""
+    script, dist, pkg, exe, purelib = _prepared(_TOOLKIT_DIST, venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files={"__init__.py": f'__version__ = "{_SMOKE_VERSION}"\n'},
+    )
+    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc != 0, f"the toolkit smoke passed a wheel with no __main__.py.\n{out}"
+    assert "console script would fail" in out, out
+
+
+def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
+    """ADR 0201 section 1: the toolkit's first upload claims its name, and the engine names it.
+
+    So, in the `release` job: the toolkit is built, gated and smoked before the reversible GitHub
+    release and far before any upload; its upload is tag-gated like every publish (section 4b); and it
+    runs immediately before the engine's upload, so a failure in it skips the engine's. A separate
+    job gated on a repository variable would reopen the window the order closes.
+    """
+    steps = [s for s in _jobs()["release"]["steps"] if isinstance(s, dict)]
+    names = [str(s.get("name") or s.get("uses") or "") for s in steps]
+
+    def at(prefix: str) -> int:
+        hits = [i for i, n in enumerate(names) if n.startswith(prefix)]
+        assert len(hits) == 1, f"expected one step starting {prefix!r} in `release`, found {hits}"
+        return hits[0]
+
+    build = at("Build the toolkit wheel")
+    gate = at("Member gate — the toolkit wheel")
+    smoke = at("Smoke-check the toolkit wheel")
+    github_release = at("Create or update the GitHub release")
+    toolkit_upload = at("Publish messagefoundry-toolkit to PyPI")
+    engine_upload = at("Publish to PyPI")
+    assert build < gate < smoke < github_release < toolkit_upload, names
+    assert engine_upload == toolkit_upload + 1 == len(steps) - 1, (
+        "the toolkit upload must be the step immediately before the engine's, which stays last"
+    )
+    upload = steps[toolkit_upload]
+    assert upload.get("with", {}).get("packages-dir") == "toolkit-dist/", upload
+    assert upload.get("with", {}).get("skip-existing") is True, (
+        "skip-existing keeps a re-run after a failed engine upload from dying on the toolkit's "
+        "already-uploaded file (the v0.3.1 deadlock)"
+    )
+    assert "PUBLISH_" not in str(upload.get("if") or ""), (
+        "the toolkit upload is gated on a repository variable -- ADR 0201 rejects that, because an "
+        "unset variable lets an engine that names the toolkit reach PyPI with the name unclaimed"
+    )
+    # Never into dist/: that would pull the toolkit into the engine smoke, signing and staged upload.
+    assert "--outdir toolkit-dist" in str(steps[build].get("run") or "")
 
 
 #: The engine smoke's import probe. ``flags`` is what the step passes the interpreter BEFORE ``-c``;
@@ -2320,3 +2465,259 @@ def test_no_step_survives_a_leak_gate_rejection_in_the_release_job() -> None:
         f"`!=` form still uploads — which is the always() behaviour this step exists for. That "
         f"choice has a known cost, recorded beside the `if:` in release.yml; do not flip it here."
     )
+
+
+def test_the_sbomqs_pin_blocks_and_only_the_score_is_advisory() -> None:
+    """A pin failure BLOCKS the release; only the SBOM score stays advisory (BACKLOG #1698).
+
+    Owner ruling 2026-09-30 (BACKLOG #1698). The sbomqs download, its in-repo SHA-256 check and the
+    install used to share ONE step with the score, under a step-level ``continue-on-error: true``.
+    So the event the pin exists to catch -- a substituted or re-uploaded tarball -- ended as a green
+    release with no warning. The step is now split: the verify-and-install half blocks, and the
+    scoring half keeps ``continue-on-error`` because SBOM quality is a signal, not a gate (ADR 0149).
+
+    Mutation: ``test_the_sbomqs_split_refuses_each_way_back_to_a_green_pin_failure`` below applies
+    each one to a copy of this job.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(RELEASE_YML.read_text(encoding="utf-8"))
+    assert "defaults" not in workflow, (
+        "release.yml acquired workflow-level `defaults`. If it sets a shell, that shell can drop "
+        "bash's errexit under the sbomqs install step (BACKLOG #1698); check it and extend this test."
+    )
+    assert _sbomqs_split_offences(_jobs()["release"]) == []
+
+
+def _sbomqs_split_offences(job: dict) -> list[str]:
+    """Why ``job`` lets an sbomqs pin failure pass as a green release; empty when it blocks.
+
+    Located by CONTENT, not by name, so a rename cannot blind this: the blocking half is the step
+    that fetches the sbomqs release asset, and the advisory half is the step that runs
+    ``sbomqs score``. Each must be exactly one step. Factored out so the mutation arms below run it
+    on edited copies of the live job, not only on the live file, where it can only be seen passing.
+    """
+    steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
+
+    def _body(step: dict) -> str:
+        return _executed_shell(str(step.get("run") or ""))
+
+    installs = [
+        i
+        for i, step in enumerate(steps)
+        if "releases/download" in _body(step) and "sbomqs" in _body(step)
+    ]
+    scores = [i for i, step in enumerate(steps) if "sbomqs score" in _body(step)]
+    if len(installs) != 1 or len(scores) != 1:
+        return [
+            f"expected one sbomqs download step and one `sbomqs score` step in `release`, found "
+            f"downloads at {installs} and scores at {scores}"
+        ]
+    install_at, score_at = installs[0], scores[0]
+    install, score = steps[install_at], steps[score_at]
+    name = install.get("name")
+    body = _body(install)
+    offences: list[str] = []
+    if "continue-on-error" in job:
+        offences.append(
+            f"the `release` job acquired job-level `continue-on-error` "
+            f"({job.get('continue-on-error')!r}). A pin failure would still stop this job, but no "
+            "longer the workflow, so a job that `needs: release` could still run (BACKLOG #1698)."
+        )
+    if install_at == score_at:
+        offences.append(
+            "the sbomqs download and the score share one step again. Whatever `continue-on-error` "
+            "that step carries is then wrong for one half: set, a pin failure is a green release; "
+            "unset, a low SBOM score blocks one (owner ruling 2026-09-30, BACKLOG #1698; ADR 0149)."
+        )
+    if "sha256sum -c" not in body:
+        offences.append(
+            f"step {name!r} fetches sbomqs but no longer runs `sha256sum -c`, so the blocking half "
+            "blocks on nothing"
+        )
+    if "continue-on-error" in install:
+        offences.append(
+            f"step {name!r} acquired `continue-on-error` ({install.get('continue-on-error')!r}). A "
+            "pin mismatch would then end as a green release with no warning, which the owner ruled "
+            "out on 2026-09-30 (BACKLOG #1698)."
+        )
+    if "if" in install:
+        offences.append(
+            f"step {name!r} acquired an `if:` ({install.get('if')!r}). A SKIPPED verification is "
+            "not a failed one, and the score below would then run whatever binary was already on "
+            "the runner's PATH."
+        )
+    # One layer down from `continue-on-error`: a `shell:` that drops bash's `-e` lets every line
+    # after a failed check run. The default shell keeps it.
+    shells = [
+        ("step `shell:`", install.get("shell")),
+        ("job `defaults.run.shell`", ((job.get("defaults") or {}).get("run") or {}).get("shell")),
+    ]
+    offences.extend(
+        f"step {name!r} runs under a {where} ({shell!r}), which can drop bash's errexit; the "
+        "default shell keeps it, so a failed check stops the step"
+        for where, shell in shells
+        if shell is not None
+    )
+    # Inside the body: `|| true`, `set +e`, a check run as a condition. Round-2 review finding 3
+    # (BACKLOG #1698): each passed every check above while a mismatch carried on to install. The
+    # helper is the one the in-repo pin rule in tests/test_ci_venv_pinning.py reads.
+    offences.extend(
+        f"step {name!r} lets a failed pin check carry on: {reason}"
+        for reason in verification_softeners(body)
+    )
+    if "||" in body:
+        offences.append(
+            f"step {name!r} carries a `||` fallback. The owner ruled that a pin failure blocks "
+            "(2026-09-30, BACKLOG #1698), so the install step has no fallback to fall to."
+        )
+    if score.get("continue-on-error") is not True:
+        offences.append(
+            f"step {score.get('name')!r} lost `continue-on-error: true`. The SBOM score is a "
+            "signal, not a gate (ADR 0149), so a low score must not block a release."
+        )
+    if install_at != score_at and "releases/download" in _body(score):
+        offences.append(
+            f"step {score.get('name')!r} downloads a release asset under `continue-on-error`, "
+            "which is the shape this split removed: a fetch in an advisory step cannot block on "
+            "its pin"
+        )
+    if install_at > score_at:
+        offences.append("the sbomqs score runs before the step that installs sbomqs")
+    return offences
+
+
+def _release_step(job: dict, needle: str) -> dict:
+    """The one step in ``job`` whose executed shell contains ``needle``."""
+    found = [
+        step
+        for step in job["steps"]
+        if isinstance(step, dict) and needle in _executed_shell(str(step.get("run") or ""))
+    ]
+    assert len(found) == 1, f"expected one step running {needle!r}, found {len(found)}"
+    return found[0]
+
+
+def _edit_install_body(old: str, new: str) -> Callable[[dict], None]:
+    def mutate(job: dict) -> None:
+        step = _release_step(job, "sha256sum -c")
+        assert old in step["run"], f"the mutation's anchor {old!r} is gone from the live step"
+        step["run"] = step["run"].replace(old, new)
+
+    return mutate
+
+
+def _set_on_install(key: str, value: object) -> Callable[[dict], None]:
+    def mutate(job: dict) -> None:
+        _release_step(job, "sha256sum -c")[key] = value
+
+    return mutate
+
+
+def _drop_score_softening(job: dict) -> None:
+    del _release_step(job, "sbomqs score")["continue-on-error"]
+
+
+def _fold_score_into_install(job: dict) -> None:
+    score = _release_step(job, "sbomqs score")
+    install = _release_step(job, "sha256sum -c")
+    install["run"] += score["run"]
+    install["continue-on-error"] = True
+    job["steps"].remove(score)
+
+
+def _set_job_shell(job: dict) -> None:
+    job["defaults"] = {"run": {"shell": "bash {0}"}}
+
+
+def _set_job_continue_on_error(job: dict) -> None:
+    job["continue-on-error"] = True
+
+
+_SBOMQS_VERIFY = 'echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -'
+
+
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        (_set_on_install("continue-on-error", True), "acquired `continue-on-error`"),
+        (_set_on_install("if", "false"), "acquired an `if:`"),
+        (_set_on_install("shell", "bash {0}"), "step `shell:`"),
+        (_set_job_shell, "job `defaults.run.shell`"),
+        (_drop_score_softening, "lost `continue-on-error: true`"),
+        (_fold_score_into_install, "share one step again"),
+        (_edit_install_body(_SBOMQS_VERIFY, _SBOMQS_VERIFY + " || true"), "carry on"),
+        (_edit_install_body(_SBOMQS_VERIFY, _SBOMQS_VERIFY + " || :"), "carry on"),
+        (_edit_install_body(_SBOMQS_VERIFY, "set +e\n" + _SBOMQS_VERIFY), "carry on"),
+        (
+            _edit_install_body(_SBOMQS_VERIFY, f"if ! {_SBOMQS_VERIFY}; then echo bad; fi"),
+            "carry on",
+        ),
+        (
+            _edit_install_body("tar -xzf", 'test -s "${asset}" || exit 1\ntar -xzf'),
+            "carries a `||` fallback",
+        ),
+        (_edit_install_body(_SBOMQS_VERIFY, "trap 'exit 0' EXIT\n" + _SBOMQS_VERIFY), "carry on"),
+        (_set_job_continue_on_error, "job-level `continue-on-error`"),
+    ],
+    ids=[
+        "continue-on-error",
+        "if-false",
+        "step-shell-without-e",
+        "job-shell-without-e",
+        "score-made-blocking",
+        "folded-back-into-one-step",
+        "or-true",
+        "or-colon",
+        "set-plus-e",
+        "as-a-condition",
+        "any-or-fallback",
+        "exit-trap",
+        "job-continue-on-error",
+    ],
+)
+def test_the_sbomqs_split_refuses_each_way_back_to_a_green_pin_failure(
+    mutate: Callable[[dict], None], needle: str
+) -> None:
+    """Each mutation of the LIVE release job that lets a pin failure pass must be refused.
+
+    Round-2 review finding 3 (BACKLOG #1698): ``sha256sum -c - || true`` in the install step passed
+    the split test, because the test asked only whether the check was PRESENT and the step
+    UNSOFTENED at step level. The mutations run on a deep copy of the parsed workflow, so the arms
+    exercise the real step, and a drift in it moves them.
+    """
+    job = copy.deepcopy(_jobs()["release"])
+    mutate(job)
+    offences = _sbomqs_split_offences(job)
+    assert any(needle in o for o in offences), f"expected {needle!r} among {offences}"
+
+
+def test_the_harness_smoke_runs_the_install_resolution_check() -> None:
+    """The install legs of BACKLOG #1585 must run on the BUILT wheel, and nothing else shows it.
+
+    ``tests/test_packaging.py`` runs ``scripts/release/harness_resolution_check.py`` on a synthetic
+    wheel. The call on the real artifact lives only in release.yml, which runs at tag time, after
+    the engine is already on PyPI. So a deleted line or a path typo there would pass every PR check
+    and first fail, or silently not run, on a release. This pins the call and the path.
+
+    Mutation: delete the call, rename the script, or soften it with ``|| true``. Red here.
+    """
+    script = "scripts/release/harness_resolution_check.py"
+    assert (_REPO / script).is_file(), f"{script} is gone, but release.yml still calls it"
+    steps = [
+        step
+        for step in _jobs()["release-harness"]["steps"]
+        if isinstance(step, dict)
+        and str(step.get("name") or "").startswith("Smoke-check the harness wheel")
+    ]
+    assert len(steps) == 1, f"expected one harness wheel smoke step, found {len(steps)}"
+    calls = [
+        line.strip()
+        for line in _executed_shell(str(steps[0].get("run") or "")).splitlines()
+        if script in line
+    ]
+    assert calls == [f"/tmp/harnesssmoke/bin/python -I {script} harness-dist/*.whl"], (
+        f"the harness wheel smoke must run {script} on the built wheel, in the smoke venv, "
+        f"unsoftened; found {calls}"
+    )
+    assert "continue-on-error" not in steps[0], "the harness wheel smoke acquired continue-on-error"
