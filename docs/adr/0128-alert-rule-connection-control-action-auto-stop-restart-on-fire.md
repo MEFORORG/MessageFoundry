@@ -32,6 +32,14 @@ its `_RuleDecision` carries the action; there is **no embedded code/expression**
 `start` alone are not offered (a bare stop with no re-arm is an easy way to silently wedge a feed; a
 restart is the safe remediation an operator actually wants).
 
+**Amendment (BACKLOG #1898, 2026-09-30).** `control_action` is now allowed only with a connection-scoped
+`event_type`: the set `_ALERT_CONTROL_EVENT_TYPES` in
+[`config/settings.py`](../../messagefoundry/config/settings.py). `AlertRule` refuses the pair at config
+load for `"any"` and every other type, and `NotifierAlertSink._emit` skips the action, logged, for an
+event outside the set. The other types put a stand-in in `connection` (a username, an approval id, a DB
+path, a cert label), and a stand-in that fits the connection-name grammar would have restarted an
+unrelated connection. `content_match` is left out until an engine caller exists.
+
 ### §2 — The sink is DECOUPLED from the runner: an INJECTED async callback
 
 The `NotifierAlertSink` **must not** import `RegistryRunner` (that would invert the engine layering and
