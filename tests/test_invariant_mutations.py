@@ -217,6 +217,60 @@ def test_a_row_that_stays_green_under_its_break_survives(
     assert not (tmp_path / "f.py.invariant-mutation-backup").exists()
 
 
+def test_the_printed_reason_reads_the_output_the_verdict_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verdict scores stdout and stderr together, so the reason's count must too."""
+    row = _one_row_repo(tmp_path, monkeypatch)
+    runs = iter(
+        [
+            _completed(0),
+            _MOD.subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="1 failed\n", stderr="FAILED t - boom\n"
+            ),
+            _completed(0),
+        ]
+    )
+    monkeypatch.setattr(_MOD, "_pytest", lambda tests: next(runs))
+    verdict, reason = _MOD.run_one(row)
+    assert (verdict, reason) == (
+        "KILLED",
+        "pytest exit 1, 1 FAILED/ERROR line(s), 1 naming a listed test, first t",
+    )
+
+
+def test_the_reason_names_the_listed_test_that_decided_the_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _one_row_repo(tmp_path, monkeypatch)
+    after = "FAILED other.py::z - x\nFAILED t - boom\n"
+    runs = iter([_completed(0), _completed(1, after), _completed(0)])
+    monkeypatch.setattr(_MOD, "_pytest", lambda tests: next(runs))
+    assert _MOD.run_one(row) == (
+        "KILLED",
+        "pytest exit 1, 2 FAILED/ERROR line(s), 1 naming a listed test, first t",
+    )
+
+
+def test_a_skip_reported_on_stderr_is_still_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _one_row_repo(tmp_path, monkeypatch)
+    skipped = _MOD.subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="1 skipped", stderr="SKIPPED [1] t: no server\n"
+    )
+    monkeypatch.setattr(_MOD, "_pytest", lambda tests: skipped)
+    assert _MOD.run_one(row)[0] == "ERROR"
+
+
+def test_streams_are_joined_on_a_line_break() -> None:
+    """A stdout with no final newline must not swallow the first stderr line's FAILED prefix."""
+    run = _MOD.subprocess.CompletedProcess(
+        args=[], returncode=1, stdout="1 failed", stderr="FAILED t - boom\n"
+    )
+    assert _MOD.failed_nodes(_MOD._output(run)) == ["t"]
+
+
 def test_a_survivor_outranks_an_error_in_the_exit_code() -> None:
     assert _MOD.exit_code({"KILLED": 3, "SURVIVED": 1, "ERROR": 2}) == 1
     assert _MOD.exit_code({"KILLED": 3, "SURVIVED": 0, "ERROR": 1}) == 2

@@ -207,6 +207,11 @@ def _pytest(tests: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _output(run: subprocess.CompletedProcess[str]) -> str:
+    """Both streams, joined on a line break so the first stderr line never fuses onto stdout."""
+    return run.stdout + "\n" + run.stderr
+
+
 def _backup(target: Path) -> Path:
     return target.with_name(target.name + BACKUP_SUFFIX)
 
@@ -247,11 +252,9 @@ def run_one(m: Mutation) -> tuple[str, str]:
     before = _pytest(m.tests)
     if before.returncode != 0:
         return ERROR, f"not green before the break (pytest exit {before.returncode})"
-    if skipped_lines(before.stdout):
-        return (
-            ERROR,
-            f"a listed test was skipped, so it cannot judge: {skipped_lines(before.stdout)}",
-        )
+    skipped = skipped_lines(_output(before))
+    if skipped:
+        return ERROR, f"a listed test was skipped, so it cannot judge: {skipped}"
     original = target.read_bytes()
     broken = break_bytes(m, original)
     backup = _backup(target)
@@ -267,10 +270,17 @@ def run_one(m: Mutation) -> tuple[str, str]:
     reverted = _pytest(m.tests)
     if reverted.returncode != 0:
         return ERROR, f"not green again after the revert (pytest exit {reverted.returncode})"
-    verdict = score(after.returncode, after.stdout + after.stderr, m.tests)
-    nodes = failed_nodes(after.stdout)
-    first = f", first {nodes[0]}" if nodes else ""
-    return verdict, f"pytest exit {after.returncode}, {len(nodes)} FAILED/ERROR line(s){first}"
+    # The reason reads the same output as the verdict, and names a listed test first when one
+    # failed, so it cannot report a count or a node the verdict did not see.
+    output = _output(after)
+    verdict = score(after.returncode, output, m.tests)
+    nodes = failed_nodes(output)
+    listed = [n for n in nodes if _names_a_listed_test(n, m.tests)]
+    first = f", first {(listed or nodes)[0]}" if nodes else ""
+    return verdict, (
+        f"pytest exit {after.returncode}, {len(nodes)} FAILED/ERROR line(s), "
+        f"{len(listed)} naming a listed test{first}"
+    )
 
 
 def judge(rows: list[Mutation]) -> dict[str, int]:
