@@ -65,6 +65,8 @@ _MIX = TypeMix({"ADT^A01": 1.0})
 # A3: a flat cumulative CPU counter over a non-trivial span is a wrong PID binding, not an idle engine —
 # report a gap rather than a fabricated 0.00 (mirrors the connscale runner's guard).
 _CPU_FLAT_GAP_SPAN_S = 5.0
+# A rate window needs a first and a last reading; `_top_up_in_hold` makes up any shortfall at hold end.
+_MIN_IN_HOLD_SAMPLES = 2
 _PROC_BY_SAMPLE: dict[int, ProcSample] = {}
 
 
@@ -201,9 +203,8 @@ async def _run_one(
         sampler_stop.set()
         with contextlib.suppress(asyncio.CancelledError):
             await sample_task
-        # Count the in-hold readings BEFORE the post-drain final is appended below. `_build_record`
-        # cuts the rate window as `samples[:in_hold_samples]`, so a count taken after that append
-        # would put the drain tail back inside every achieved rate (BACKLOG #2011).
+        await _top_up_in_hold(poller, samples)
+        # Count BEFORE the post-drain final is appended below; `_throughput_rates` defines the window.
         in_hold_samples = len(samples)
         # Stop the driver FIRST (flush queued sends + grace in-flight ACKs) BEFORE draining, so all
         # offered messages reach ingress before we wait for the pipeline to empty (the connscale
@@ -356,6 +357,22 @@ async def _sample_loop(
             await asyncio.wait_for(stop.wait(), timeout=interval)
 
 
+async def _top_up_in_hold(poller: EnginePoller, samples: list[EngineSample]) -> None:
+    """Take make-up engine readings at hold end until the rate window has its two endpoints.
+
+    A window needs a first and a last reading. A short hold, or a slow first OS-probe tick inside
+    ``_sample_loop``, can leave one, and ``_throughput_rates`` then reads zero. Each make-up reading
+    lands after the sampler stops and before ``driver.stop``, so it is still outside the drain. It
+    carries no OS-probe reading, so the CPU fields are unaffected. A reading the poller cannot take is
+    not retried: the record's ``in_hold_samples`` then shows the short window.
+    """
+    for _ in range(max(0, _MIN_IN_HOLD_SAMPLES - len(samples))):
+        sample = await poller.sample_once()
+        if sample is None:
+            return
+        samples.append(sample)
+
+
 def _build_record(
     *,
     profile: EstateProfile,
@@ -372,15 +389,15 @@ def _build_record(
     # regardless of it (an estate step CAN send on the order of its connection count).
     no_loss = _reconcile(c, base, final, unconfirmed_budget=profile.count)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
-    # The rate window is the in-hold readings only; `_throughput_rates` says why the drain tail is out.
-    rate_window = samples[:in_hold_samples]
+    rate_window = samples[:in_hold_samples]  # the window is defined in `_throughput_rates`
     read_per_s, written_per_s = _throughput_rates(rate_window)
     # Achieved EVENT rate = in + out over the rate window (the calibration target's own units).
     achieved_total_ev = read_per_s + written_per_s
     achieved_per_conn_ev = achieved_total_ev / profile.count if profile.count else 0.0
     # Drain the per-sample OS-probe side map ONCE (each id(sample) can only be popped once), then derive
-    # both the CPU denominator and the FD/RSS peaks from the same readings.
-    readings = _collect_proc(samples)
+    # both the CPU denominator and the FD/RSS peaks from the same readings. Read over the rate window,
+    # so the CPU span can never reach past the window the event rate was read over.
+    readings = _collect_proc(rate_window)
     cpu_total, cpu_mean, span = _cpu_from(readings)
     # CPU-microseconds per pipeline event over the SAME window: the honest headroom denominator (in+out
     # events, not messages). None when either the CPU probe or the event count is unavailable/zero.
@@ -506,18 +523,25 @@ def _reconcile(
 def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
     """Achieved (read/s, written/s) from the first to the last reading of the list it is handed.
 
-    ``_build_record`` hands it the RATE WINDOW, ``samples[:in_hold_samples]``: every reading
-    ``_sample_loop`` took during the hold. That window EXCLUDES the post-drain final, which
-    ``_run_one`` appends after ``driver.stop(_STOP_GRACE)``, ``poller.await_drain(...)`` and
-    ``asyncio.sleep(_SETTLE)`` (BACKLOG #2011, the estate twin of connscale's #1420). Through the drain
-    the driver has stopped offering, so ``read`` flattens while the span keeps growing, and a window
-    that ran to the final would dilute every achieved rate by the drain time. The no-loss reconcile
-    still reads that final, through ``poller.final``.
+    **THE ESTATE RATE WINDOW IS DEFINED HERE, ONCE** (BACKLOG #2011, the estate twin of connscale's
+    #1420). Every other description of it points here. ``_build_record`` hands this function the
+    slice ``samples[:in_hold_samples]``, which holds every reading ``_sample_loop`` took during the
+    hold, plus any make-up readings ``_top_up_in_hold`` took at hold end to reach two. It starts at
+    hold start, so it still includes the pipeline's fill at the front.
 
-    Readings from before this change ran to the post-drain final and are not comparable with these.
-    Each record's JSON carries ``rate_window`` (:data:`~harness.load.estate.report.RATE_WINDOW`) so a
-    reader can tell the two populations apart. Fewer than two in-hold readings give ``(0.0, 0.0)``;
-    the record's ``in_hold_samples`` shows when that is why.
+    It EXCLUDES the post-drain final, which ``_run_one`` appends after ``driver.stop(_STOP_GRACE)``,
+    ``poller.await_drain(...)`` and ``asyncio.sleep(_SETTLE)``. Through the drain the driver has
+    stopped offering, so ``read`` flattens while the span keeps growing, and a window that ran to the
+    final diluted every rate by the drain time. The no-loss reconcile still reads that final, through
+    ``poller.final``.
+
+    **RECORDS FROM BEFORE THIS CHANGE ARE NOT COMPARABLE WITH RECORDS AFTER IT.** The old window ran
+    to the post-drain final. That moved every value derived from it: both achieved message rates, the
+    achieved total and per-connection event rates, and ``cpu_us_per_event``, whose event count is the
+    achieved event rate times the CPU span. A record carrying ``rate_window``
+    (:data:`~harness.load.estate.report.RATE_WINDOW`) was computed over this window; a record without
+    it was computed over the old one. Fewer than two readings give ``(0.0, 0.0)``, and the record's
+    ``in_hold_samples`` shows when that is why.
     """
     if len(samples) < 2:
         return 0.0, 0.0

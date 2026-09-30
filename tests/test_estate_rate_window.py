@@ -7,12 +7,14 @@
 inside every rate while the docstring said "hold window". Through the drain the driver has stopped
 offering, so ``read`` flattens while the span keeps growing, and the tail dilutes the rate.
 
-These tests pin the window at ``_build_record`` with synthetic samples, pin the call site's order in
-``_run_one``, and pin the ``rate_window`` marker every estate output carries.
+These tests pin the window at ``_build_record`` with synthetic samples, the make-up readings that
+give a short hold its two endpoints, the call site's order in ``_run_one``, and the ``rate_window``
+marker every estate output carries.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from types import SimpleNamespace
@@ -78,6 +80,18 @@ def _record(samples: list[EngineSample], in_hold_samples: int) -> EstateRecord:
     )
 
 
+def _report(record: EstateRecord) -> EstateReport:
+    return EstateReport(
+        profile="estate-smoke",
+        engine_url="https://127.0.0.1:1",
+        db_backend=None,
+        records=[record],
+        slos=[],
+        result_ok=True,
+        exit_code=0,
+    )
+
+
 def test_the_achieved_rates_exclude_the_post_drain_final() -> None:
     samples = _hold_then_final()
     record = _record(samples, in_hold_samples=_HOLD_TICKS)
@@ -111,6 +125,43 @@ def test_a_single_in_hold_reading_reports_zero_and_says_why() -> None:
 
     assert (record.achieved_read_per_s, record.achieved_written_per_s) == (0.0, 0.0)
     assert record.in_hold_samples == 1
+    console = _report(record).render_console()
+    assert f"N={record.count} rates were read over 1 reading(s)" in console
+
+
+class _FakePoller:
+    """Hands out queued readings from ``sample_once``, then ``None``, like a poller that stops answering."""
+
+    def __init__(self, readings: list[EngineSample]) -> None:
+        self._readings = list(readings)
+        self.calls = 0
+
+    async def sample_once(self) -> EngineSample | None:
+        self.calls += 1
+        return self._readings.pop(0) if self._readings else None
+
+
+def _top_up(existing: list[EngineSample], available: list[EngineSample]) -> tuple[int, int]:
+    fake = _FakePoller(available)
+    samples = list(existing)
+    asyncio.run(runner._top_up_in_hold(cast(EnginePoller, fake), samples))
+    return len(samples), fake.calls
+
+
+def test_a_short_hold_is_topped_up_to_two_readings() -> None:
+    a, b, c = _hold_then_final()[:3]
+    assert _top_up([a], [b, c]) == (2, 1)
+    assert _top_up([], [a, b, c]) == (2, 2)
+
+
+def test_a_full_hold_takes_no_make_up_reading() -> None:
+    a, b, c = _hold_then_final()[:3]
+    assert _top_up([a, b], [c]) == (2, 0)
+
+
+def test_a_poller_that_stops_answering_ends_the_top_up() -> None:
+    (a,) = _hold_then_final()[:1]
+    assert _top_up([a], []) == (1, 1)
 
 
 def test_run_one_counts_the_in_hold_readings_before_it_appends_the_final() -> None:
@@ -119,27 +170,25 @@ def test_run_one_counts_the_in_hold_readings_before_it_appends_the_final() -> No
     ``_run_one`` needs a live engine, so its order is pinned on its source text.
     """
     source = inspect.getsource(runner._run_one)
+    joined_at = source.index("await sample_task")
+    topped_up_at = source.index("await _top_up_in_hold(poller, samples)")
     count_at = source.index("in_hold_samples = len(samples)")
     append_at = source.index("samples.append(final)")
-    assert count_at < append_at
+    # After the sampler is joined and topped up, so no in-hold reading is left out of the count;
+    # before the final is appended, so the drain tail is never counted in.
+    assert joined_at < topped_up_at < count_at < append_at
     assert "in_hold_samples=in_hold_samples" in source
 
 
 def test_every_estate_output_carrying_a_rate_carries_the_window_marker() -> None:
     assert RATE_WINDOW == "in_hold_excl_drain"
     record = _record(_hold_then_final(), in_hold_samples=_HOLD_TICKS)
-    report = EstateReport(
-        profile="estate-smoke",
-        engine_url="https://127.0.0.1:1",
-        db_backend=None,
-        records=[record],
-        slos=[],
-        result_ok=True,
-        exit_code=0,
-    )
+    report = _report(record)
 
     payload = json.loads(report.to_json())
     (rec,) = payload["records"]
     assert rec["rate_window"] == RATE_WINDOW
     assert rec["in_hold_samples"] == _HOLD_TICKS
-    assert f"rate_window={RATE_WINDOW}" in report.render_console()
+    console = report.render_console()
+    assert f"rate_window={RATE_WINDOW}" in console
+    assert "WARNING" not in console

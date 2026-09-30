@@ -22,12 +22,11 @@ EXIT_SLO_VIOLATION = 1
 
 SCHEMA_VERSION = 1
 
-#: Which window every achieved rate in an estate record was computed over (BACKLOG #2011). The window
-#: is defined in `harness.load.estate.runner._throughput_rates`; this value names the one that EXCLUDES
-#: the post-drain final. A record without the field was computed over the old window, which ran to
-#: that final, and its rates are not comparable with these. A reader filters on this exact name and
-#: value, so do not rename either. It is owned here, not imported from the connscale report: the two
-#: harnesses mark their own windows.
+#: Names the window an estate record's rates were computed over (BACKLOG #2011). The window, and what
+#: moved when it changed, are defined once in `harness.load.estate.runner._throughput_rates`. No reader
+#: in this tree consumes the field yet; it exists so a later one can tell the two populations apart,
+#: and renaming the name or the value would hide that split from it. It is owned here, not imported
+#: from the connscale report: the two harnesses mark their own windows.
 RATE_WINDOW = "in_hold_excl_drain"
 
 
@@ -82,15 +81,16 @@ class EstateRecord:
     ack_p95_ms: float
     ack_p99_ms: float
 
+    # --- the rate window: how many readings the achieved rates were read over. Required, so a record
+    # can never carry the RATE_WINDOW marker without the count it was read from. ---
+    in_hold_samples: int
+
     # --- headroom: CPU-per-event denominator (None where the OS probe couldn't read) ---
     cpu_seconds_total: float | None = None
     cpu_util_cores_mean: float | None = None
     cpu_us_per_event: float | None = None  # CPU-microseconds per pipeline event = headroom gauge
     working_set_peak_bytes: int | None = None
     fd_count_peak: int | None = None
-
-    # --- the rate window: how many in-hold readings the achieved rates above were read over ---
-    in_hold_samples: int = 0
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -203,6 +203,12 @@ class EstateReport:
         lines.append(
             f"rates: over the in-hold readings, excluding the drain (rate_window={RATE_WINDOW})"
         )
+        for r in self.records:
+            if r.in_hold_samples < 2:
+                lines.append(
+                    f"WARNING: N={r.count} rates were read over {r.in_hold_samples} reading(s); a "
+                    "rate window needs two, so its achieved rates read 0.0, not a measured zero"
+                )
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:
