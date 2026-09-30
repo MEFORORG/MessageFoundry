@@ -146,17 +146,19 @@ different ecosystem); see *VS Code extension & test harness* below for where to 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow
 > and published with **PEP 740 attestations** — all three publish jobs set `attestations: true`.
 >
-> **Sigstore signing and SLSA build-provenance cover the ENGINE wheel and the TOOLKIT wheel only, and
-> the CycloneDX SBOM covers the ENGINE only.** The `messagefoundry-toolkit` wheel is built in the
-> engine's release job, which signs and attests it (BACKLOG #1192). The
+> **Sigstore signing and SLSA build-provenance cover the ENGINE release files (wheel, sdist, SBOM and
+> VEX) and the TOOLKIT wheel only, and the CycloneDX SBOM covers the ENGINE only.** The
+> `messagefoundry-toolkit` wheel is built in the engine's release job, which signs and attests it
+> (BACKLOG #1192). The
 > `messagefoundry-webconsole` and `messagefoundry-harness` release jobs contain no signing, attestation
 > or SBOM step (BACKLOG #1193) — this note previously said "every release", which is why it is spelled
 > out per artifact rather than tightened in place. So `gh attestation verify` finds a GitHub
 > attestation for the engine and toolkit wheels and **will not** find one for the console or harness
 > wheel; those carry the PyPI-side attestation only.
 >
-> Verify a downloaded **engine** wheel against its source commit with
-> `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry`, or pull the signed wheel + SBOM
+> Verify a downloaded **engine** or **toolkit** wheel against its source commit with
+> `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref refs/tags/v<version>`
+> (keep the last two flags; [docs/SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md) says why), or pull the signed wheel + SBOM
 > from the [GitHub Release assets](https://github.com/MEFORORG/MessageFoundry/releases). For an
 > air-gapped site, mirror the wheel to a private index.
 >

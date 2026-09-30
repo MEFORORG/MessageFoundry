@@ -69,9 +69,9 @@ engine version. Both commands should pass. A failure on either file means you sh
 
 ### GitHub release artifacts (Sigstore + SLSA)
 
-`gh attestation verify` checks the GitHub attestations the engine release job writes: the engine
-sdist, the engine wheel, the SBOM and the VEX. For the console, use the PyPI check above. Verify the
-SLSA build provenance of one of those four files:
+`gh attestation verify` checks the GitHub attestations the engine release job writes: at least the
+engine sdist, the engine wheel, the SBOM, the VEX and the toolkit wheel. For the console, use the PyPI
+check above. Verify the SLSA build provenance of one of those files:
 
 ```bash
 gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFoundry \
