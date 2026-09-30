@@ -187,7 +187,8 @@ def test_no_unlisted_file_carries_the_warning_sign() -> None:
         f"the tree walk found no U+26A0 in {_TREE_CONTROL}, an exempt dated record that carries "
         "it. The walk is broken, so its silence about every other file proves nothing."
     )
-    # Implied by the control above; stated on `census` itself, the name the walk below reads.
+    # Cannot fail after the control above. It restates that control in the one form the
+    # vacuous-absence lint reads as a guard; the control above is the real check.
     assert census, "the tree census is empty"
     unlisted = sorted(
         rel for rel in census if rel not in _HELD and not rel.startswith(_DATED_RECORDS)
