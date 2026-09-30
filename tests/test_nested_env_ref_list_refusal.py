@@ -189,6 +189,66 @@ def test_a_reference_inside_a_whole_setting_env_default_is_refused_too(shape: st
     assert SENTINEL not in str(excinfo.value)
 
 
+#: An ``env()`` used as another ``env()``'s default, in both spellings of the INNER one: an
+#: ``EnvRef``, and the raw marker table. Code-first can write either. The file loader leaves an inner
+#: marker raw, but its type check refuses that shape before any factory runs (see the TOML test).
+NESTED_DEFAULTS: dict[str, Callable[[list[Any]], Any]] = {
+    "EnvRef": lambda items: messagefoundry.env(
+        "outer_list", default=messagefoundry.env("inner_list", default=items)
+    ),
+    "raw marker": lambda items: messagefoundry.env(
+        "outer_list", default={"env": "inner_list", "default": items}
+    ),
+}
+
+
+def test_the_nested_default_shape_is_unrefused_by_a_one_level_unwrap() -> None:
+    """Positive control for the shape below. ``resolve_env_settings`` resolves one level only, so an
+    unset outer key hands the INNER reference over with its list default -- and the sentinel -- whole."""
+    nested = NESTED_DEFAULTS["EnvRef"](["x-a", NESTED_SHAPES["code-first"]()])
+    resolved = resolve_env_settings({"capture_response_headers": nested}, {})
+    assert resolved["capture_response_headers"] is nested.default
+    assert SENTINEL in repr(resolved["capture_response_headers"])
+
+
+@pytest.mark.parametrize("item_shape", sorted(NESTED_SHAPES))
+@pytest.mark.parametrize("default_shape", sorted(NESTED_DEFAULTS))
+def test_a_reference_inside_a_nested_env_default_list_is_refused(
+    default_shape: str, item_shape: str
+) -> None:
+    """The remainder of BACKLOG #1820: an env() used as another env()'s default is unwrapped too."""
+    whole = NESTED_DEFAULTS[default_shape](["x-a", NESTED_SHAPES[item_shape]()])
+    with pytest.raises(WiringError) as excinfo:
+        messagefoundry.Rest(url="https://example.invalid/x", capture_response_headers=whole)
+    message = str(excinfo.value)
+    assert "capture_response_headers env() default (nested 2 deep) item 1" in message, message
+    assert SENTINEL not in message, message
+
+
+def test_a_hostile_self_referential_default_is_bounded_and_refused() -> None:
+    """A raw marker whose default is itself. An unbounded unwrap would spin; this one stops and
+    refuses, because a chain it cannot see to the end of cannot be shown clean."""
+    loop: dict[str, Any] = {"env": "loop", "default": SENTINEL}
+    loop["default"] = loop
+    with pytest.raises(WiringError) as excinfo:
+        messagefoundry.Rest(
+            url="https://example.invalid/x",
+            # A whole-setting env() here is resolved by the wiring layer; see the test above.
+            capture_response_headers=messagefoundry.env("outer_list", default=loop),  # type: ignore[arg-type]
+        )
+    message = str(excinfo.value)
+    assert "capture_response_headers env() default (nested more than" in message, message
+    assert SENTINEL not in message, message
+
+
+@pytest.mark.parametrize("default_shape", sorted(NESTED_DEFAULTS))
+def test_a_nested_env_default_with_a_static_list_still_builds(default_shape: str) -> None:
+    """Over-widening control: unwrapping the chain must not refuse a chain that holds no reference."""
+    whole = NESTED_DEFAULTS[default_shape](["x-a", "x-b"])
+    spec = messagefoundry.Rest(url="https://example.invalid/x", capture_response_headers=whole)
+    assert spec.settings["capture_response_headers"] is whole
+
+
 _OUTBOUND_HEAD = (
     "[[outbound]]\n"
     'name = "OB_ACME"\n'
@@ -211,17 +271,17 @@ _HTTP_INBOUND_HEAD = (
 )
 _SOAP_HEAD = _OUTBOUND_HEAD.format(transport="soap") + 'soap_action = "urn:probe"\n'
 
+#: ``(file head, setting)`` for each list-valued setting a ``connections.toml`` transport reaches.
+_TOML_LIST_TARGETS = [
+    (_OUTBOUND_HEAD.format(transport="rest"), "capture_response_headers"),
+    (_OUTBOUND_HEAD.format(transport="rest"), "proxy_no_proxy"),
+    (_SOAP_HEAD, "capture_response_headers"),
+    (_SOAP_HEAD, "proxy_no_proxy"),
+    (_HTTP_INBOUND_HEAD, "intake_client_subjects"),
+]
 
-@pytest.mark.parametrize(
-    ("head", "setting"),
-    [
-        (_OUTBOUND_HEAD.format(transport="rest"), "capture_response_headers"),
-        (_OUTBOUND_HEAD.format(transport="rest"), "proxy_no_proxy"),
-        (_SOAP_HEAD, "capture_response_headers"),
-        (_SOAP_HEAD, "proxy_no_proxy"),
-        (_HTTP_INBOUND_HEAD, "intake_client_subjects"),
-    ],
-)
+
+@pytest.mark.parametrize(("head", "setting"), _TOML_LIST_TARGETS)
 def test_the_toml_surface_refuses_a_list_item(
     tmp_path: pathlib.Path, head: str, setting: str
 ) -> None:
@@ -232,6 +292,25 @@ def test_the_toml_surface_refuses_a_list_item(
         load_connections_file(path, Registry())
     assert f"{setting} item 1" in str(excinfo.value), str(excinfo.value)
     assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
+@pytest.mark.parametrize(("head", "setting"), _TOML_LIST_TARGETS)
+def test_the_toml_surface_refuses_a_nested_env_default_before_the_factory(
+    tmp_path: pathlib.Path, head: str, setting: str
+) -> None:
+    """The file spelling of the nested shape never reaches the factory guard. The loader's type
+    check refuses the outer default first, because the inner marker arrives as a raw table where the
+    annotation wants an array. This pins that, and that its message withholds the sentinel too."""
+    path = _write(
+        tmp_path,
+        f'{head}{setting} = {{ env = "outer_list", default = '
+        f'{{ env = "inner_list", default = ["{_static(setting)}", {TOML_MARKER}] }} }}\n',
+    )
+    with pytest.raises(WiringError) as excinfo:
+        load_connections_file(path, Registry())
+    message = str(excinfo.value)
+    assert f"'{setting}' env() default must be an array, got a table" in message, message
+    assert SENTINEL not in message, message
 
 
 # --- over-widening controls --------------------------------------------------

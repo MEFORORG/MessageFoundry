@@ -452,6 +452,11 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
         )
 
 
+#: How many ``env()`` defaults :func:`_reject_envref_in_lists` follows down one chain. A legitimate
+#: chain is one or two links; the cap exists so a self-referential marker cannot spin the loader.
+_MAX_ENV_DEFAULT_DEPTH = 6
+
+
 def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     """Refuse an ``env()`` reference written as an ITEM of a list-valued setting (BACKLOG #1820).
 
@@ -470,13 +475,23 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
 
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
-    would otherwise arrive at the connector exactly as a list item written directly does. A list
-    that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
+    would otherwise arrive at the connector exactly as a list item written directly does. The same
+    holds for an ``env()`` used as another's default, so the chain is followed, in either spelling,
+    for at most :data:`_MAX_ENV_DEFAULT_DEPTH` links. A chain still going past that is refused, since
+    a code-first author can make a marker its own default and a chain not seen to its end cannot be
+    shown clean. A list that comes from the ENVIRONMENT exists only at resolve time and is not seen
+    here."""
     offenders: list[str] = []
     for name, value in settings.items():
         label = name
-        if isinstance(value, EnvRef):
-            label, value = f"{name} env() default", value.default
+        depth = 0
+        while _is_nested_envref(value) and depth < _MAX_ENV_DEFAULT_DEPTH:
+            depth += 1
+            value = value.default if isinstance(value, EnvRef) else value.get("default")
+            label = f"{name} env() default" + (f" (nested {depth} deep)" if depth > 1 else "")
+        if _is_nested_envref(value):
+            offenders.append(f"{name} env() default (nested more than {depth} deep)")
+            continue
         if isinstance(value, list | tuple | set | frozenset):
             offenders += [
                 f"{label} item {index}"
