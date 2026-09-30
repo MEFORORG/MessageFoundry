@@ -107,6 +107,24 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --report pip-report.json -e ".[dev]"
 
+      # pyyaml, pulled in by uvicorn[standard], has had no cp315 Windows wheel, and its sdist crashed
+      # a 3.15 prerelease interpreter locally. The failed install stays a finding in the verdict;
+      # this fallback only lets the TLS tests still run. The standard extra is not needed by them.
+      - name: Fallback install without uvicorn's standard extra
+        id: fallback
+        if: steps.setup.outcome == 'success' && steps.install.outcome != 'success'
+        continue-on-error: true
+        run: |
+          python -m pip install --no-deps -e .
+          python - > fallback-requirements.txt <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              project = tomllib.load(f)["project"]
+          for req in project["dependencies"] + project["optional-dependencies"]["dev"]:
+              print(req.replace("uvicorn[standard]", "uvicorn"))
+          PY
+          python -m pip install -r fallback-requirements.txt
+
       - name: Name the dependencies that installed from an sdist
         id: wheels
         if: always() && steps.setup.outcome == 'success'
@@ -133,7 +151,7 @@ jobs:
 
       - name: TLS policy and apiclient tests
         id: tls
-        if: steps.install.outcome == 'success'
+        if: steps.install.outcome == 'success' || steps.fallback.outcome == 'success'
         continue-on-error: true
         run: |
           STATUS=0
@@ -148,7 +166,7 @@ jobs:
       # the verdict and the summary; read the log for which tests failed and why.
       - name: Engine suite smoke
         id: suite
-        if: steps.install.outcome == 'success'
+        if: steps.install.outcome == 'success' || steps.fallback.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 50
         run: |
@@ -166,6 +184,7 @@ jobs:
           SETUP: ${{ steps.setup.outcome }}
           PROBE: ${{ steps.probe.outcome }}
           INSTALL: ${{ steps.install.outcome }}
+          FALLBACK: ${{ steps.fallback.outcome }}
           TLS: ${{ steps.tls.outcome }}
           SUITE: ${{ steps.suite.outcome }}
           VERSION: ${{ steps.probe.outputs.version }}
@@ -210,6 +229,7 @@ jobs:
             echo "| provision 3.15 | $SETUP (${VERSION:-n/a}, ${OPENSSL:-n/a}) |"
             echo "| SSLContext.set_groups present | ${SET_GROUPS:-n/a} |"
             echo "| install | $INSTALL |"
+            echo "| fallback install (no uvicorn standard extra) | ${FALLBACK:-n/a} |"
             echo "| built from sdist | ${SDISTS:-n/a} |"
             echo "| TLS and apiclient tests | $TLS: ${TLS_SUMMARY:-n/a} |"
             echo "| engine suite smoke | $SUITE: ${SUITE_SUMMARY:-n/a} |"

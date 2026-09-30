@@ -88,6 +88,7 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
+import os
 import re
 import shutil
 import subprocess
@@ -2726,14 +2727,15 @@ def _run_tool(name: str, cmd: list[str]) -> CheckResult:
         return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
     try:
         # nosec: cmd[0] is a fixed tool name (ruff/mypy), no shell; args are repo paths (low-27).
-        # ruff writes UTF-8; mypy writes its own interpreter's stdout encoding, which is UTF-8 under
-        # PEP 686 and the locale code page before it. The output only feeds a 300-char detail line.
+        # ruff writes UTF-8. mypy writes its interpreter's stdout encoding, the locale code page on
+        # 3.14 and UTF-8 on 3.15, so PYTHONIOENCODING pins it to match the decode on both.
         proc = subprocess.run(  # nosec B603 B607
             cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             check=False,
             timeout=120,
         )
