@@ -2615,9 +2615,9 @@ class AuthSettings(_Section):
     # memory). Only entries at or above password_min_length add coverage — see docs/CONFIGURATION.md.
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
-    # 0 or less expires every lock the moment it is set, a LOOSENING `security_loosenings()` names
-    # (BACKLOG #1131). A threshold of 0 or less locks on the first failure; one above
-    # LOCKOUT_THRESHOLD_CEILING (100, NIST SP 800-63B) is named as a loosening too.
+    # 0 or less expires every lock the moment it is set. Minutes below the default, a threshold above
+    # it and a lockout_max_minutes below its own are each a LOOSENING `security_loosenings()` names
+    # (BACKLOG #1131). A threshold of 0 or less locks on the first failure, which is stricter.
     lockout_minutes: int = 15
     # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
     # doubles per cycle only where the owner has a way past it (the second-step lock on a local
@@ -2826,8 +2826,9 @@ class AuthSettings(_Section):
     # Login rate limiting (AUTH-RATE) — in-process sliding window in front of the per-account
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
-    # of 0 or less disables both. Each off value is a LOOSENING that `security_loosenings()` names
-    # while auth is on (BACKLOG #1131).
+    # of 0 or less disables both. A count above its default, a window below it, and each off value is
+    # a LOOSENING that `security_loosenings()` names while auth is on (BACKLOG #1131); so are the
+    # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
     login_rate_limit_enabled: bool = True
     login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
     login_rate_limit_global: int = 60  # max attempts across all clients per window
@@ -6092,10 +6093,322 @@ def _reconcile_effective_bind(settings: ServiceSettings) -> None:
 
 #: The most consecutive failed attempts NIST SP 800-63B lets a verifier allow on one account before
 #: it acts (SP 800-63B-4 section 3.2.2, "Rate Limiting (Throttling)"; section 5.2.2 in the superseded
-#: rev. 3 set the same number). A ``[auth].lockout_threshold``
-#: above it is named by :func:`security_loosenings` (BACKLOG #1131): a large enough threshold never
-#: arms, which is the lockout turned off in all but name.
+#: rev. 3 set the same number). Any ``[auth].lockout_threshold`` above the shipped default is named
+#: by :func:`security_loosenings` (BACKLOG #1131); one above this ceiling also says it exceeds NIST,
+#: because a large enough threshold never arms, which is the lockout turned off in all but name.
 LOCKOUT_THRESHOLD_CEILING = 100
+
+
+def _is_trust_every_peer(entry: str) -> bool:
+    """Whether a ``[api].trusted_proxies`` entry trusts every peer of its address family, read the
+    way uvicorn reads it: a strict network parse, where a host-bits-set entry is not a network."""
+    try:
+        return ipaddress.ip_network(entry).prefixlen == 0
+    except ValueError:
+        return False
+
+
+def _auth_default(field: str) -> Any:
+    """The SHIPPED default of an ``[auth]`` field, read off the model rather than restated, so the
+    loosening test below and the default it judges against cannot drift apart."""
+    return AuthSettings.model_fields[field].default
+
+
+def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
+    """The ``[auth]`` anti-automation limits set LOOSER THAN THEIR SHIPPED DEFAULT, as
+    ``(switch, risk)`` entries for :func:`security_loosenings`, which calls this only while sign-in is
+    on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2 and 7.1.2 each field cites).
+
+    **Why the default is the cutoff.** The first pass named only the values the code reads as OFF,
+    and a vault re-read then measured near-off values that were just as off in effect and silent: a
+    sign-in window of ``1e-6`` s admitted 10000 of 10000 attempts, and a count of ``1e9`` removed the
+    ceiling. There is ONE shipped posture and an operator may only loosen from it, so the shipped
+    default is the one cutoff that needs no invented number (Manager decision 2026-09-30). A value
+    STRICTER than the default is never named, and the defaults name nothing.
+
+    **The direction is read from each consumer, not from the name.**
+
+    * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
+      falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
+      older than the window, so a SHORTER window admits more, and one of 0 or less (``-inf`` included)
+      prunes each hit before it is counted. A negative count refuses more, and a NaN or ``+inf``
+      window never prunes, so none of those is named. A ``min_interval_seconds`` of 0 turns the gap
+      off, and a shorter gap admits a faster burst.
+    * ``next_lockout_state`` ends a lock at now + ``lockout_minutes`` (shorter is looser; 0 or less
+      ends it at once) and arms it at ``lockout_threshold`` failures (higher is looser; 0 or less locks
+      on the first failure). An escalating lock doubles up to ``lockout_max_minutes`` (ADR 0197), so a
+      lower ceiling is looser, and one equal to ``lockout_minutes`` turns the doubling off. A ceiling
+      at the default or above is not named even when it equals ``lockout_minutes``: every lock then
+      lasts at least as long as the default's longest.
+    * ``_enforce_session_cap`` skips a ``max_sessions_per_user`` of 0 or less, and a higher cap keeps
+      more sessions live.
+    * ``FlowCache`` refuses a new federated flow once it holds ``oidc_flow_cache_max`` pending ones, so
+      a higher cap holds more and 0 or less refuses every flow, which is stricter, not looser.
+
+    A part of a limiter is named only while that limiter is built, as ``email_tls_verify`` sits under
+    ``email_use_tls``: with the limiter off, a weak count or window changes nothing and would only
+    repeat the off entry. A window of 0 or less likewise stands in for its counts."""
+    out: list[tuple[str, str]] = []
+
+    def _count(field: str, value: int, *, what: str, so: str, off: str | None) -> None:
+        """A count limit: named at 0 where ``off`` says what 0 turns off, and above its default."""
+        default = _auth_default(field)
+        if off is not None and value == 0:
+            out.append((field, off))
+        elif value > default:
+            out.append((field, f"{what} is {value}, above the default of {default}, so {so}"))
+
+    def _window(field: str, value: float, *, what: str, off: str | None) -> bool:
+        """A window: named at 0 or less where ``off`` says what that turns off, and below its
+        default. Returns whether the window still counts anything, which gates its counts."""
+        default = _auth_default(field)
+        if off is not None and value <= 0:
+            out.append((field, off))
+            return False
+        if value < default:
+            out.append(
+                (
+                    field,
+                    f"{what} is {value:g} s, shorter than the default of {default:g} s, so each "
+                    f"limit it paces admits its count once per {value:g} s instead of once per "
+                    f"{default:g} s; a short enough window admits nearly every attempt, while the "
+                    "limiter still reads as on",
+                )
+            )
+        return True
+
+    # --- the sign-in limiter. The same keys build the per-user CEREMONY limiter (_reauth_limiter),
+    # which paces re-auth, password change and MFA enrolment, and the console's second-factor step
+    # at sign-in (POST /ui/mfa).
+    ceremonies = (
+        "the per-user limit on credential ceremonies (re-auth, password change, MFA enrolment "
+        "and the console's second-factor step at sign-in)"
+    )
+    if not auth.login_rate_limit_enabled:
+        out.append(
+            (
+                "login_rate_limit_enabled",
+                "sign-in has NO rate limit -- neither the per-address nor the all-clients "
+                f"sign-in limiter is built, and nor is {ceremonies}, so the engine applies no "
+                "attempt-rate limit to a password spray across many usernames",
+            )
+        )
+    elif _window(
+        "login_rate_limit_window_seconds",
+        auth.login_rate_limit_window_seconds,
+        what=(
+            f"the window of the per-address and all-clients sign-in limits, and of {ceremonies},"
+        ),
+        off=(
+            "the sign-in rate-limit window is zero or negative, which ages every attempt out "
+            "before it is counted -- neither the per-address nor the all-clients sign-in "
+            f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
+            "still reads as on"
+        ),
+    ):
+        _count(
+            "login_rate_limit_per_ip",
+            auth.login_rate_limit_per_ip,
+            what="the per-address sign-in limit",
+            so=(
+                "one client address may make that many attempts per window before it is "
+                f"refused; the same number sets {ceremonies}, so that is looser too"
+            ),
+            off=(
+                "there is no per-address sign-in limit, so one client address may make as "
+                "many attempts as the all-clients limit allows; the same number sets "
+                f"{ceremonies}, so that is off too"
+            ),
+        )
+        _count(
+            "login_rate_limit_global",
+            auth.login_rate_limit_global,
+            what="the all-clients sign-in limit",
+            so=(
+                "a password spray spread across many client addresses may make that many "
+                "attempts per window before any is refused"
+            ),
+            off=(
+                "there is no all-clients sign-in limit, so the total rate of a password "
+                "spray spread across many client addresses grows with the number of "
+                "addresses the attacker controls"
+            ),
+        )
+
+    # --- the account lockout, on the sign-in and the second-step counter alike.
+    minutes = auth.lockout_minutes
+    if minutes <= 0:
+        out.append(
+            (
+                "lockout_minutes",
+                "no account lock ever holds -- a lock set at lockout_threshold failures expires "
+                "the moment it is set, on the sign-in and the second-step counter alike, so no "
+                "run of wrong guesses at one account's password or second factor is ever "
+                "refused by a lock",
+            )
+        )
+    elif minutes < _auth_default("lockout_minutes"):
+        out.append(
+            (
+                "lockout_minutes",
+                f"an account lock lasts {minutes} minute(s), shorter than the default of "
+                f"{_auth_default('lockout_minutes')}, on the sign-in and the second-step counter "
+                "alike -- a run of wrong guesses at one account's password or second factor "
+                "resumes sooner after each lock",
+            )
+        )
+    threshold = auth.lockout_threshold
+    if threshold > _auth_default("lockout_threshold"):
+        nist = (
+            f", and above the {LOCKOUT_THRESHOLD_CEILING} that NIST SP 800-63B allows"
+            if threshold > LOCKOUT_THRESHOLD_CEILING
+            else ""
+        )
+        out.append(
+            (
+                "lockout_threshold",
+                f"no account lock is set before {threshold} consecutive failures, above the "
+                f"default of {_auth_default('lockout_threshold')}{nist} -- that many wrong guesses "
+                "at one account's password or second factor are checked before any lock is set, "
+                "and a session may fail that many re-proofs before it is revoked",
+            )
+        )
+    # With no lock holding, a ceiling on how long it grows changes nothing.
+    ceiling = auth.lockout_max_minutes
+    if minutes > 0 and ceiling < _auth_default("lockout_max_minutes"):
+        if ceiling <= minutes:
+            risk = (
+                f"lock escalation is OFF: the ceiling equals lockout_minutes ({minutes}), so a "
+                "repeated lock on one account never grows (ADR 0197), and every run of wrong "
+                f"guesses waits the same {minutes}-minute lock"
+            )
+        else:
+            risk = (
+                f"an escalating lock stops doubling at {ceiling} minutes, below the default of "
+                f"{_auth_default('lockout_max_minutes')} (ADR 0197), so repeated lock cycles on "
+                "one account hold for less time"
+            )
+        out.append(("lockout_max_minutes", risk))
+
+    # --- the PHI-read limiter (WP-8, ASVS 2.4.1): per account, over the PHI-read routes and views.
+    # The all-users count ships OFF (0), so no value of it is looser than the default.
+    if not auth.phi_read_rate_limit_enabled:
+        out.append(
+            (
+                "phi_read_rate_limit_enabled",
+                "PHI reads have NO rate limit -- a signed-in account may read message bodies and "
+                "dead letters through the API and the console as fast as the engine answers, so "
+                "a stolen session can harvest PHI at machine speed",
+            )
+        )
+    elif _window(
+        "phi_read_rate_limit_window_seconds",
+        auth.phi_read_rate_limit_window_seconds,
+        what="the PHI-read rate-limit window",
+        off=(
+            "the PHI-read rate-limit window is zero or negative, which ages every read out before "
+            "it is counted -- no PHI-read limit holds, although phi_read_rate_limit_enabled still "
+            "reads as on"
+        ),
+    ):
+        _count(
+            "phi_read_rate_limit_per_actor",
+            auth.phi_read_rate_limit_per_actor,
+            what="the per-account PHI-read limit",
+            so=(
+                "one signed-in account may make that many PHI reads per window before it is "
+                "refused, and a stolen session harvests more PHI"
+            ),
+            off=(
+                "there is no per-account PHI-read limit, so one signed-in account may read PHI "
+                "as fast as the engine answers (only an all-users limit, if one is set, holds)"
+            ),
+        )
+
+    # --- the admin-write limiter (BACKLOG #193 / #2301, ASVS 2.4.2): per actor, on every non-GET
+    # sensitive action. Its window cannot be 0 or less (gt=0 at load), so it has no off value.
+    if not auth.admin_write_rate_limit_enabled:
+        out.append(
+            (
+                "admin_write_rate_limit_enabled",
+                "state-changing admin actions (purge, replay, config deploy and reload, and every "
+                "other non-GET sensitive action) have NO pacing -- neither the per-actor count nor "
+                "the minimum gap holds, so a script holding a session may fire them as fast as the "
+                "engine answers",
+            )
+        )
+    else:
+        _window(
+            "admin_write_rate_limit_window_seconds",
+            auth.admin_write_rate_limit_window_seconds,
+            what="the admin-write rate-limit window",
+            off=None,
+        )
+        _count(
+            "admin_write_rate_limit_per_actor",
+            auth.admin_write_rate_limit_per_actor,
+            what="the per-actor admin-write limit",
+            so=(
+                "one actor may make that many state-changing admin writes per window before it "
+                "is refused"
+            ),
+            off=(
+                "there is no per-actor admin-write count, so only the minimum gap paces a "
+                "scripted run of purges, replays or config deploys"
+            ),
+        )
+        gap = auth.admin_write_min_interval_seconds
+        gap_default = _auth_default("admin_write_min_interval_seconds")
+        if gap <= 0:
+            out.append(
+                (
+                    "admin_write_min_interval_seconds",
+                    "there is no minimum gap between one actor's admin writes, so the whole "
+                    "per-actor count may be spent back to back at machine speed",
+                )
+            )
+        elif gap < gap_default:
+            out.append(
+                (
+                    "admin_write_min_interval_seconds",
+                    f"the minimum gap between one actor's admin writes is {gap:g} s, shorter than "
+                    f"the default of {gap_default:g} s, which sits just under the fastest write a "
+                    "person can make -- a script may spend the per-actor count faster than any "
+                    "person could",
+                )
+            )
+
+    # --- concurrent sessions (ASVS 7.1.2). 0 or less means unlimited, so a negative cap is off too.
+    sessions = auth.max_sessions_per_user
+    _count(
+        "max_sessions_per_user",
+        max(sessions, 0),
+        what="the per-user cap on live sessions",
+        so=(
+            "a user may hold that many sessions at once before the oldest is revoked, and more "
+            "stolen or forgotten sessions stay live beside the owner's"
+        ),
+        off=(
+            f"a user may hold any number of live sessions at once ({sessions} means unlimited) "
+            "-- signing in again never revokes an old one, so a stolen or forgotten session "
+            "stays live beside the owner's"
+        ),
+    )
+
+    # --- the federated sign-in flow cache. Built only with OIDC on. It refuses at the cap, so 0 or
+    # less refuses every flow, which is stricter; only a cap above the default is looser.
+    if auth.oidc_enabled:
+        _count(
+            "oidc_flow_cache_max",
+            auth.oidc_flow_cache_max,
+            what="the engine-wide cap on pending federated sign-in flows",
+            so=(
+                "a flood of abandoned login starts holds that many flows in memory before a new "
+                "one is refused, and only the per-address cap bounds it below that"
+            ),
+            off=None,
+        )
+    return out
 
 
 def security_loosenings(
@@ -6122,9 +6435,10 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
-    ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288), the
-    ``[auth]`` sign-in limiter switched off or zeroed, ``[auth].lockout_minutes`` at 0 or less and
-    ``[auth].lockout_threshold`` above ``LOCKOUT_THRESHOLD_CEILING`` (#1131),
+    ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288), every
+    ``[auth]`` sign-in, lockout, PHI-read, admin-write, session-cap and OIDC flow-cache limit set
+    looser than its shipped default (#1131, see :func:`_auth_limit_loosenings`), an
+    ``[api].trusted_proxies`` entry with a prefix of 0 (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
@@ -6427,90 +6741,33 @@ def security_loosenings(
                 "mid-session",
             )
         )
-    # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of the sign-in
-    # anti-automation controls keeps ASVS 6.1.1 at partial, so each value the code reads as OFF is
-    # named here. Found by reading the code, not the setting names: SlidingWindowRateLimiter treats a
-    # falsy per_key or glob as "no limit on that dimension", and a window of 0 or less (-inf
-    # included) prunes every hit before it is counted, so the limiter admits everything while it
-    # still reads as enabled. next_lockout_state sets a lock that ends at now + lockout_seconds, so 0
-    # or less expires it at once. No lockout_threshold is read as off (0 or less locks on the FIRST
-    # failure), but a large one never arms in practice -- scripts/security/dast_target.py sets
-    # 1_000_000 for exactly that -- so one above NIST's ceiling of 100 is named too. NOT reported,
-    # because each refuses MORE rather than less: a negative count, and a NaN or +inf window (never
-    # pruned). Also NOT reported, a residual the docs state: a count or window that is merely weak
-    # (a huge count, a tiny window) has no published cutoff to judge it by. Gated on
-    # [security].require_sign_in rather than [auth].enabled (the desugar makes them equal on every
-    # loaded path): `security set` passes the NEW [security] beside the [auth] it read before the
-    # edit, so turning sign-in on there must show these at once. The part-off entries sit under the
-    # enabled check, as email_tls_verify sits under email_use_tls: with the limiter unbuilt they
-    # would only repeat it.
+    # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
+    # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
+    # only an off value; _auth_limit_loosenings says why and how each direction was read.
+    # Gated on [security].require_sign_in rather than [auth].enabled (the desugar makes them equal on
+    # every loaded path): `security set` passes the NEW [security] beside the [auth] it read before
+    # the edit, so turning sign-in on there must show these at once.
     if sec.require_sign_in:
-        # "Credential ceremonies" is the per-user limiter the same keys build (_reauth_limiter): it
-        # paces re-auth, password change and MFA enrolment, and the console's second-factor step at
-        # sign-in (POST /ui/mfa).
-        ceremonies = (
-            "the per-user limit on credential ceremonies (re-auth, password change, MFA enrolment "
-            "and the console's second-factor step at sign-in)"
+        out.extend(_auth_limit_loosenings(auth))
+    # BACKLOG #1131: a trusted_proxies entry of 0.0.0.0/0 or ::/0 contains every peer of its family,
+    # so uvicorn trusts X-Forwarded-For from all of them, which is what the refused "*" does. The
+    # load still accepts it; naming it is the fix. Parsed STRICTLY, as uvicorn's _TrustedHosts parses
+    # it (__main__ hands it the list verbatim): "10.1.2.3/0" loads here (the validator is not strict)
+    # but fails uvicorn's strict parse and becomes a literal that matches nothing, so it trusts no
+    # peer and is not this loosening. Not gated on sign-in: a forged source address poisons the
+    # audit trail either way.
+    trust_all = [entry for entry in api.trusted_proxies if _is_trust_every_peer(entry)]
+    if trust_all:
+        out.append(
+            (
+                "trusted_proxies",
+                f"[api].trusted_proxies includes {', '.join(trust_all)}, a prefix of 0 that covers "
+                "every address of its family, so X-Forwarded-For is trusted from EVERY such peer, "
+                "as the refused '*' would be -- any "
+                "client can declare its own source address, poisoning the audit trail, the "
+                "per-address sign-in limit and the new-client-IP step-up signal",
+            )
         )
-        if not auth.login_rate_limit_enabled:
-            out.append(
-                (
-                    "login_rate_limit_enabled",
-                    "sign-in has NO rate limit -- neither the per-address nor the all-clients "
-                    f"sign-in limiter is built, and nor is {ceremonies}, so the engine applies no "
-                    "attempt-rate limit to a password spray across many usernames",
-                )
-            )
-        elif auth.login_rate_limit_window_seconds <= 0:
-            out.append(
-                (
-                    "login_rate_limit_window_seconds",
-                    "the sign-in rate-limit window is zero or negative, which ages every attempt out "
-                    "before it is counted -- neither the per-address nor the all-clients sign-in "
-                    f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
-                    "still reads as on",
-                )
-            )
-        else:
-            if auth.login_rate_limit_per_ip == 0:
-                out.append(
-                    (
-                        "login_rate_limit_per_ip",
-                        "there is no per-address sign-in limit, so one client address may make as "
-                        "many attempts as the all-clients limit allows; the same number sets "
-                        f"{ceremonies}, so that is off too",
-                    )
-                )
-            if auth.login_rate_limit_global == 0:
-                out.append(
-                    (
-                        "login_rate_limit_global",
-                        "there is no all-clients sign-in limit, so the total rate of a password "
-                        "spray spread across many client addresses grows with the number of "
-                        "addresses the attacker controls",
-                    )
-                )
-        if auth.lockout_minutes <= 0:
-            out.append(
-                (
-                    "lockout_minutes",
-                    "no account lock ever holds -- a lock set at lockout_threshold failures expires "
-                    "the moment it is set, on the sign-in and the second-step counter alike, so no "
-                    "run of wrong guesses at one account's password or second factor is ever "
-                    "refused by a lock",
-                )
-            )
-        if auth.lockout_threshold > LOCKOUT_THRESHOLD_CEILING:
-            out.append(
-                (
-                    "lockout_threshold",
-                    f"no account lock is set before {auth.lockout_threshold} consecutive failures, "
-                    f"above the {LOCKOUT_THRESHOLD_CEILING} that NIST SP 800-63B allows -- that "
-                    "many wrong guesses at one account's password or second factor are checked "
-                    "before any lock is set, and a session may fail that many re-proofs before it "
-                    "is revoked",
-                )
-            )
     # BACKLOG #1179, owner ruling 2026-09-27 (#2006 question (a)): a silent weakening keeps ASVS
     # 12.3.3 at partial, so the acknowledgement is named here as well as warned at serve. Conditional
     # on the hop actually being plaintext, by the predicate serve uses: with an operator tls_cert_file
