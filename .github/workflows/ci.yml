@@ -472,7 +472,9 @@ jobs:
       # --exclude cleanly drops it from the linux build.
       - name: Type-check (mypy, strict — linux platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
-        run: mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'
+        # messagefoundry_toolkit: the toolkit distribution's import package (ADR 0201). It receives code
+        # that moves out of messagefoundry/, so it is type-checked on the same strict terms.
+        run: mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
 
       # BACKLOG #1799: tests/ is type-checked. WHY THE SCOPE IS WHAT IT IS, so the next gap is not
       # found by accident. This is the THIRD directory to fall outside a gate that reads as
@@ -4058,16 +4060,20 @@ jobs:
           python -m build --outdir dist .
           python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
           python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
-          ls -l dist harness-dist webconsole-dist
+          # The fifth artifact (ADR 0201): the toolkit wheel. Its own directory, never dist/, as in
+          # release.yml, where sharing dist/ would pull it into the engine's smoke and upload.
+          python -m build --wheel ./packaging/messagefoundry-toolkit --outdir toolkit-dist
+          ls -l dist harness-dist webconsole-dist toolkit-dist
 
       - name: Member gate over the real artifacts
         run: |
-          # The same script, the same arguments, the same three distribution sets release.yml gates
+          # The same script, the same arguments, the same four distribution sets release.yml gates
           # -- so a refusal here is the refusal a tag would have produced, minutes after the commit
           # instead of at publish time.
           python scripts/release/forbidden_members.py 'dist/*.tar.gz' 'dist/*.whl'
           python scripts/release/forbidden_members.py 'harness-dist/*.whl'
           python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+          python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
 
       - name: Positive control -- the gate must REFUSE a poisoned copy
         run: |
@@ -4138,6 +4144,37 @@ jobs:
           fi
           echo "control fired: the gate refused the planted tests/ member in the console wheel BY NAME"
           rm -rf testcontent-control
+
+      - name: Retired-path control -- the gate must REFUSE an engine wheel carrying a moved module
+        run: |
+          # The third rule's control (ADR 0201 section 4), on its own terms. The rule is keyed on the
+          # distribution name in the archive FILENAME, so the copy keeps the engine wheel's real
+          # filename, in a directory of its own. It is poisoned with the path retired in slice 2; a
+          # later slice may keep it, since a retired path stays retired. Same reason-not-exit-code
+          # check as the two controls above.
+          mkdir -p retired-control
+          cp dist/*.whl retired-control/
+          python - <<'PY'
+          import glob
+          import zipfile
+          [wheel] = glob.glob("retired-control/*.whl")
+          with zipfile.ZipFile(wheel, "a") as zf:
+              zf.writestr("messagefoundry/adr_analyze.py", "# moved to the toolkit\n")
+          PY
+          refusal="ships messagefoundry/adr_analyze.py"
+          status=0
+          log="$(python scripts/release/forbidden_members.py 'retired-control/*.whl' 2>&1)" || status=$?
+          printf '%s\n' "$log"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the member gate ACCEPTED an engine wheel carrying messagefoundry/adr_analyze.py -- the engine and toolkit split rule is broken"
+            exit 1
+          fi
+          if [[ "$log" != *"$refusal"* ]]; then
+            echo "::error::the member gate exited $status without reporting '$refusal', so it did NOT refuse the retired path. This control proved NOTHING about the clean engine result above"
+            exit 1
+          fi
+          echo "control fired: the gate refused the retired engine path BY NAME"
+          rm -rf retired-control
 
   # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
   # Server, Postgres, load, Windows-service smoke). Those legs CANNOT be required directly:

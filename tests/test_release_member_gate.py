@@ -694,7 +694,8 @@ def test_each_job_gates_the_artifacts_it_actually_builds() -> None:
     reason, not about the leak.
     """
     expected = {
-        "release": ("dist/",),
+        # The toolkit wheel is built and published inside the engine job (ADR 0201).
+        "release": ("dist/", "toolkit-dist/"),
         "release-webconsole": ("webconsole-dist/",),
         "release-harness": ("harness-dist/",),
     }
@@ -788,6 +789,7 @@ def _sandbox(tmp_path: Path, *, gate_source: str | None = None) -> Path:
         root / "webconsole-dist" / "messagefoundry_webconsole-0.3.0-py3-none-any.whl",
         ("messagefoundry_webconsole/__init__.py",),
     )
+    _write_wheel(root / "dist" / "messagefoundry-0.3.0-py3-none-any.whl", _CLEAN_WHEEL)
     target = root / "scripts" / "release" / GATE.name
     if gate_source is None:
         shutil.copy2(GATE, target)
@@ -921,4 +923,46 @@ def test_the_test_content_control_fails_when_the_console_is_exempted(tmp_path: P
     proc = _run_control(tmp_path, root, _control_step_script(_TEST_CONTENT_STEP))
     out = _output(proc)
     assert proc.returncode != 0, f"the control passed with the console exempted:\n{out}"
+    assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
+
+
+# --------------------------------------------------------------------------------------------------
+# `ci.yml`'s retired-path control (ADR 0201 AC-6), RUN rather than read, for the same reason again.
+# --------------------------------------------------------------------------------------------------
+
+_RETIRED_PATH_STEP = "Retired-path control"
+
+
+def test_the_retired_path_control_passes_when_the_gate_refuses_the_moved_module(
+    tmp_path: Path,
+) -> None:
+    """ARM ONE. The real gate, an engine wheel under its real filename, the slice 2 retired path."""
+    proc = _run_control(tmp_path, _sandbox(tmp_path), _control_step_script(_RETIRED_PATH_STEP))
+    out = _output(proc)
+    assert proc.returncode == 0, (
+        explain_returncode(proc.returncode, "ci.yml's retired-path control") + "\n" + out
+    )
+    assert "ships messagefoundry/adr_analyze.py" in out, (
+        f"the gate never named the retired path, so the control passed without firing:\n{out}"
+    )
+
+
+def test_the_retired_path_control_fails_when_the_gate_accepts(tmp_path: Path) -> None:
+    """ARM TWO. A gate that accepts everything must red the control, and say why."""
+    root = _sandbox(tmp_path, gate_source=_ACCEPTING_GATE)
+    proc = _run_control(tmp_path, root, _control_step_script(_RETIRED_PATH_STEP))
+    out = _output(proc)
+    assert proc.returncode != 0, f"the control accepted a gate that shipped a moved module:\n{out}"
+    assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
+
+
+def test_the_retired_path_control_fails_when_the_rule_retires_nothing(tmp_path: Path) -> None:
+    """ARM THREE. Emptying the retired-path list is the regression this control exists for."""
+    real = GATE.read_text(encoding="utf-8")
+    emptied = real.replace('    ("messagefoundry", "adr_analyze.py"),\n', "")
+    assert emptied != real, "the retired-path list is not spelled the way this mutation expects"
+    root = _sandbox(tmp_path, gate_source=emptied)
+    proc = _run_control(tmp_path, root, _control_step_script(_RETIRED_PATH_STEP))
+    out = _output(proc)
+    assert proc.returncode != 0, f"the control passed with no retired path listed:\n{out}"
     assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
