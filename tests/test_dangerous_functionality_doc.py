@@ -32,8 +32,8 @@ Section 7's parser tables are held to a scan too (BACKLOG #1190): every parse si
 the page names find, over the engine, the toolkit and the web console's Python, must sit in exactly
 one of the first two tables, and neither may name a site the scan does not find. The third table
 names parsers found by reading the code; each must exist and must not be a site the scan finds, and
-nothing here says it is complete. The VS Code extension's TypeScript under ``ide/src`` has a four-pattern scan
-and three tables of its own, held the same way. The patterns the page states must
+nothing here says it is complete. The VS Code extension's TypeScript under ``ide/src`` has a
+four-pattern scan and three tables of its own, held the same way. The patterns the page states must
 be the ones each detector uses. Which table a site belongs in is a judgement about where its input
 comes from, and no check here reads that.
 Section 9's claim about which extension file builds markup with ``innerHTML`` is pinned to a file
@@ -575,7 +575,7 @@ def test_the_computed_load_naming_check_fires() -> None:
 
 
 def test_the_register_comparison_fires() -> None:
-    live = _start_sites(_package_sources())
+    live = _start_sites(_engine_sources())
     short = {rel: why for rel, why in _ALLOWED_SUBPROCESS_SITES.items() if rel != "tray/app.py"}
     assert _register_gap(live, short) == {"tray/app.py"}
 
@@ -645,16 +645,24 @@ def test_the_scans_read_the_toolkit() -> None:
     read, keyed by its package name, and a site planted in it must reach every inventory."""
     analyzer = f"{_TOOLKIT_PREFIX}adr_analyze.py"
     assert analyzer in _package_sources(), "the toolkit is not scanned"
+    assert analyzer in _parser_scan_sources(), "the parser scan does not read the toolkit"
     assert _unit_exists(analyzer)
     text = _doc_text()
-    planted = dict(_package_sources())
-    planted[f"{_TOOLKIT_PREFIX}new_tool.py"] = (
-        "import ctypes, subprocess, tarfile, json\nsubprocess.run(['x'])\njson.loads(b)\n"
+    # Each plant goes into the same source map its real test reads, so each base is quiet unplanted.
+    new_tool = f"{_TOOLKIT_PREFIX}new_tool.py"
+    source = "import ctypes, subprocess, tarfile, json\nsubprocess.run(['x'])\njson.loads(b)\n"
+    base = _package_sources()
+    assert not (
+        _ctypes_drift(text, _ctypes_modules(base))
+        or _start_drift(text, _start_sites(base))
+        or _archive_drift(text, _archive_modules(base))
     )
+    planted = {**base, new_tool: source}
     assert _ctypes_drift(text, _ctypes_modules(planted))
     assert _start_drift(text, _start_sites(planted))
     assert _archive_drift(text, _archive_modules(planted))
-    assert _parser_drift(text, _parse_sites(planted))
+    assert not _parser_drift(text, _parse_sites(_parser_scan_sources()))
+    assert _parser_drift(text, _parse_sites({**_parser_scan_sources(), new_tool: source}))
 
 
 # --- sections 7 to 10: archives, service scripts, the extension, the web console (BACKLOG #1190) ---

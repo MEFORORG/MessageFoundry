@@ -119,9 +119,9 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_crypto_inventory_scanner.py",
         # AST-scans messagefoundry/**/*.py and messagefoundry_toolkit/**/*.py for every ctypes
         # import and every process start, and holds docs/DANGEROUS-FUNCTIONALITY.md to both
-        # inventories (BACKLOG #1934, #1190). A new site
-        # arrives as an ENGINE diff, which does not trip the tooling path gate, so as tooling it
-        # would face nothing on the change it exists to catch.
+        # inventories (BACKLOG #1934, #1190). A new site arrives as an ENGINE or TOOLKIT .py diff,
+        # which sets code=true and does not trip the tooling path gate, so as tooling it would face
+        # nothing on the change it exists to catch.
         "test_dangerous_functionality_doc.py",
         "test_dependency_boundaries.py",
         "test_ech_record_premise.py",
