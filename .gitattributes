@@ -130,3 +130,8 @@ tee/anon/** text=auto eol=lf
 # checkout still verifies rather than failing with a hex mismatch that names nothing.
 messagefoundry/auth/data/common_passwords.txt text=auto eol=lf
 messagefoundry/auth/data/common_passwords.NOTICE text=auto eol=lf
+
+# The /metrics golden files (BACKLOG #2501). tests/test_metrics_exposition.py compares the engine's
+# scrape to them BYTE FOR BYTE, so a CRLF checkout would fail that test with no defect anywhere.
+# They hold pure LF; `eol=lf` keeps a regenerated copy that way too.
+tests/golden/*.prom text=auto eol=lf

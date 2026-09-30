@@ -1023,6 +1023,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
             "tls_context:.set_ciphersuites()",
+            "tls_context:.set_server_sigalgs()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",
