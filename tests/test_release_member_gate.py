@@ -696,7 +696,10 @@ def test_the_toolkit_gate_keeps_its_id_and_the_upload_reads_it() -> None:
     steps = _steps(_jobs()["release"])
     gates = [s for s in steps if "toolkit-dist/" in str(s.get("run") or "")]
     gates = [s for s in gates if _GATE_INVOCATION in str(s.get("run") or "")]
-    assert [s.get("id") for s in gates] == ["toolkit-member-gate"], gates
+    # The FIRST toolkit gate carries the id. A later re-run on the same directory (the bundle-move
+    # step after signing, BACKLOG #1192) does not, as the engine's dist-pub/ re-gate does not.
+    assert gates and gates[0].get("id") == "toolkit-member-gate", gates
+    assert [s.get("id") for s in gates].count("toolkit-member-gate") == 1, gates
     uploads = [
         s
         for s in steps

@@ -47,6 +47,7 @@ import sys
 import sysconfig
 import tarfile
 import tomllib
+import zipfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -2274,62 +2275,100 @@ def test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle() -> N
 @pytest.fixture
 def toolkit_bundle_step(tmp_path: Path) -> tuple[str, Path, dict[str, str]]:
     """A usable bash and the bundle-move step, written as BYTES, for the leak-gate fixture's
-    reasons: ``require_bash`` fails loudly, and ``write_text`` would hand bash CRLF lines."""
+    reasons: ``require_bash`` fails loudly, and ``write_text`` would hand bash CRLF lines.
+
+    The step re-runs the member gate as ``python scripts/release/forbidden_members.py``, so the env
+    puts a ``python`` shim for THIS interpreter first on PATH, and each work directory gets a copy
+    of the real gate script (see ``_toolkit_dist``). The shim is not the runner's python, but the
+    gate is stdlib-only, so any 3.14 runs it the same way.
+    """
     script = tmp_path / "toolkit_bundle.sh"
     body = _step_script_by_prefix(_TOOLKIT_BUNDLE_STEP_PREFIX, "the toolkit bundle move")
     script.write_bytes(body.encode("utf-8"))
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "python"
+    shim.write_bytes(f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" "$@"\n'.encode())
+    shim.chmod(0o755)
     env = _posix_tool_env()
+    env["PATH"] = os.pathsep.join([str(shim_dir), env["PATH"]])
     return require_bash(tmp_path, env), script, env
-
-
-def _toolkit_dist(root: Path, names: Sequence[str]) -> Path:
-    """A work directory whose toolkit-dist/ holds one small file per name."""
-    (root / "toolkit-dist").mkdir(parents=True)
-    for name in names:
-        (root / "toolkit-dist" / name).write_bytes(b"fixture\n")
-    return root
 
 
 _TOOLKIT_WHEEL_NAME = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
 _TOOLKIT_BUNDLE_NAME = f"{_TOOLKIT_WHEEL_NAME}.sigstore.json"
+_SECOND_TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.1-py3-none-any.whl"
+
+
+def _toolkit_dist(root: Path, names: Sequence[str], leak: bool = False) -> Path:
+    """A work directory with the real member gate script and a toolkit-dist/ holding ``names``.
+
+    A ``.whl`` name gets a real zip, which the re-run gate lists; ``leak`` adds a member that gate
+    refuses. Any other name gets a small plain file.
+    """
+    gate = root / "scripts" / "release" / "forbidden_members.py"
+    gate.parent.mkdir(parents=True)
+    shutil.copyfile(_REPO / "scripts" / "release" / "forbidden_members.py", gate)
+    (root / "toolkit-dist").mkdir()
+    for name in names:
+        path = root / "toolkit-dist" / name
+        if name.endswith(".whl"):
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr("messagefoundry_toolkit/__init__.py", "")
+                if leak:
+                    zf.writestr("messagefoundry_toolkit/CLAUDE.md", "internal\n")
+        else:
+            path.write_bytes(b"fixture\n")
+    return root
 
 
 def test_the_toolkit_bundle_step_moves_the_bundle_and_passes_a_wheel_only_dir(
     toolkit_bundle_step: tuple[str, Path, dict[str, str]], tmp_path: Path
 ) -> None:
     """POSITIVE CONTROL for the refusals below. A harness that cannot run the step at all exits
-    non-zero on every refusal, so those are evidence only while this passes."""
+    non-zero on every refusal, so those are evidence only while this passes. The gate's own
+    success line proves the re-run gate really ran, rather than a shim that exits 0."""
     bash, script, env = toolkit_bundle_step
     work = _toolkit_dist(tmp_path / "ok", [_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME])
 
     rc, out = _run_leak_gate(bash, work, script, env)
     assert rc == 0, out
+    assert "member gate passed" in out, out
     assert [p.name for p in (work / "toolkit-dist").iterdir()] == [_TOOLKIT_WHEEL_NAME]
     assert [p.name for p in (work / "toolkit-sigstore").iterdir()] == [_TOOLKIT_BUNDLE_NAME]
 
 
 @pytest.mark.parametrize(
-    ("names", "why"),
+    ("names", "leak", "expected"),
     [
-        ([_TOOLKIT_WHEEL_NAME], "no bundle was written, so the mv has nothing to move"),
-        ([_TOOLKIT_BUNDLE_NAME], "toolkit-dist/ is empty once the bundle leaves"),
+        # mv exits non-zero on an unmatched glob and names it.
+        ([_TOOLKIT_WHEEL_NAME], False, "toolkit-dist/*.sigstore*"),
+        ([_TOOLKIT_BUNDLE_NAME], False, "toolkit-dist/ is EMPTY"),
+        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, "stray.txt"], False, "holds stray.txt"),
         (
-            [_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, "stray.txt"],
-            "a file the toolkit upload would reject stays behind",
+            [_TOOLKIT_WHEEL_NAME, _SECOND_TOOLKIT_WHEEL, _TOOLKIT_BUNDLE_NAME],
+            False,
+            "holds 2 wheels",
         ),
+        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME], True, "maintainer-internal"),
     ],
+    ids=["no-bundle", "no-wheel", "stray-file", "two-wheels", "leaking-wheel"],
 )
 def test_the_toolkit_bundle_step_refuses(
     toolkit_bundle_step: tuple[str, Path, dict[str, str]],
     tmp_path: Path,
     names: list[str],
-    why: str,
+    leak: bool,
+    expected: str,
 ) -> None:
+    """Each case is graded on its OWN message, so a refusal for some other reason (a harness
+    fault, or another arm catching it) does not read as this arm working."""
     bash, script, env = toolkit_bundle_step
-    work = _toolkit_dist(tmp_path / "bad", names)
+    work = _toolkit_dist(tmp_path / "bad", names, leak=leak)
 
     rc, out = _run_leak_gate(bash, work, script, env)
-    assert rc != 0, f"the step passed although {why}:\n{out}"
+    assert rc != 0, f"the step passed a toolkit-dist/ it should refuse ({expected!r}):\n{out}"
+    assert expected in out, out
 
 
 #: The engine smoke's import probe. ``flags`` is what the step passes the interpreter BEFORE ``-c``;

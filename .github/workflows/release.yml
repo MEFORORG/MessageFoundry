@@ -762,13 +762,17 @@ jobs:
           # `sigstore sign` writes `<input>.sigstore.json` beside each input, and the toolkit's PyPI
           # publish below uploads toolkit-dist/ WHOLE, where twine rejects anything but a distribution
           # (the reason dist-pub/ exists for the engine). So the bundle moves to toolkit-sigstore/,
-          # which carries it to the release assets, and toolkit-dist/ keeps only what its member gate
-          # inspected (BACKLOG #1192). The mv fails the step if no bundle was written.
+          # which carries it to the release assets (BACKLOG #1192). The mv fails the step if no bundle
+          # was written.
           mkdir -p toolkit-sigstore
           mv toolkit-dist/*.sigstore* toolkit-sigstore/
           # THEN CHECK THE DIRECTORY, not only the move: any other file here, from a later edit or an
           # output name the glob above misses, would fail the toolkit upload on a tag, after the
           # GitHub release already exists. tests/test_release_pipeline.py runs this step.
+          #
+          # The suffix check alone would pass a second or rebuilt wheel, so the step also requires
+          # EXACTLY ONE wheel and re-runs the member gate on what the upload will read. That is the
+          # engine's dist-pub/ re-gate, not its byte comparison: nothing here copies the wheel.
           wheels=0
           for f in toolkit-dist/*; do
             # No nullglob, so an empty directory leaves the pattern literal.
@@ -780,8 +784,11 @@ jobs:
               *) echo "::error::toolkit-dist/ holds $(basename "$f"), and the toolkit PyPI upload reads that directory whole"; exit 1 ;;
             esac
           done
+          if [ "$wheels" -ne 1 ]; then
+            echo "::error::toolkit-dist/ holds $wheels wheels; the toolkit builds exactly one"; exit 1
+          fi
+          python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
           ls -l toolkit-dist/ toolkit-sigstore/
-          echo "toolkit-dist/ holds only wheels: $wheels"
 
       # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
       # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
