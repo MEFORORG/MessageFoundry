@@ -6259,7 +6259,10 @@ def create_app(
         """This node's cluster posture: id, whether it's clustered, whether it's the leader, its
         active-passive role, and the cached config version. All cheap in-memory coordinator gates — no DB
         round-trip. Single-node (NullCoordinator) reports clustered=false, is_leader=true,
-        role="single-node", config_version=0."""
+        role="single-node", config_version=0, owns_lease_row=false.
+
+        ``owns_lease_row`` is the coordinator's ``may_own_lease_row()`` (BACKLOG #1988), whose
+        Protocol docstring says what it means."""
         c = engine.coordinator
         clustered = c.is_clustered()
         is_leader = c.is_leader()
@@ -6270,6 +6273,7 @@ def create_app(
             is_leader=is_leader,
             role=role,
             config_version=c.config_version_cached(),
+            owns_lease_row=c.may_own_lease_row(),
         )
 
     @app.get("/cluster/nodes", response_model=ClusterNodeList)
@@ -6381,7 +6385,7 @@ def create_app(
           leads nothing — this branch asserts nothing about who the leader is.
         * ``StepdownReleaseUnconfirmed`` → reason ``release-unconfirmed``. This node **has** demoted
           itself and **this call armed its claim pause** — both hold on every branch that reaches the
-          raise, because the pause is armed on the coordinator's ``_may_own_lease_row()`` and the
+          raise, because the pause is armed on the coordinator's ``may_own_lease_row()`` and the
           write is only attempted under the same condition. What it could not confirm is whether the
           write expiring its lease row committed. A lost response to a committed ``UPDATE`` is
           indistinguishable from an ``UPDATE`` that never ran, so the body is conditional: saying "it

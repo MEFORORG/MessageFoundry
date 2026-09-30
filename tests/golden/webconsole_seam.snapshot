@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-44e3109437ae7510
+ec18643ac47b0039
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -114,6 +114,24 @@ initial_credential_window_hours: (auth: 'AuthService') -> 'float | None'
 pending_credential_deadline: (auth: 'AuthService', user: 'UserRecord | None') -> 'float | None'
 pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float | None'
 
+## auth.service names imported by the console
+AuthService: class; its members are the AuthService section
+Elevation: constructor (token: 'str | None' = None, session_lost: 'bool' = False, recovery_codes: 'tuple[str, ...]' = (), locked: 'bool' = False, idp_step_up_required: 'bool' = False, directory_unconfirmed: 'bool' = False) -> None; fields: directory_unconfirmed, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
+FEDERATED_BINDING_CHANGED: attribute: str
+MfaStatus: constructor (enabled: 'bool', enrolled_at: 'float | None', recovery_codes_remaining: 'int', required: 'bool', webauthn_enrolled: 'bool' = False) -> None; fields: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled; properties: none
+NotifyEmailAlreadySet: exception (RuntimeError < Exception < BaseException)
+OidcStepUp: constructor (elevation: 'Elevation', return_to: 'str' = '/ui', reason: 'str | None' = None, error: 'str | None' = None) -> None; fields: elevation, error, reason, return_to; properties: ok
+STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
+STEP_UP_ACTION_ADMIN_RESET_MFA: attribute: str
+STEP_UP_ACTION_ADMIN_RESET_PASSWORD: attribute: str
+STEP_UP_ACTION_ADMIN_USER_UPDATE: attribute: str
+STEP_UP_ACTION_MFA_CONFIRM: attribute: str
+STEP_UP_ACTION_MFA_DISABLE: attribute: str
+STEP_UP_ACTION_MFA_ENROLL: attribute: str
+STEP_UP_ACTION_SESSION_TERMINATE: attribute: str
+STEP_UP_ACTION_WEBAUTHN_DELETE: attribute: str
+STEP_UP_ACTION_WEBAUTHN_ENROLL: attribute: str
+
 ## AuthService members reached by the console
 abandon_oidc_step_up: (self, flow_id: 'str', *, state: 'str | None', reason: 'str', client: 'str | None') -> 'OidcStepUp'
 action_step_up_required: property -> 'bool'
@@ -209,7 +227,7 @@ messagefoundry.api.models.ClaimPoolInfo: discarded_total, idle, open, opened_tot
 messagefoundry.api.models.ClaimProcInfo: degraded_reason, effective, head_forms
 messagefoundry.api.models.ClusterNode: acquire_delay_seconds, fresh, host, is_leader, last_seen, node_id, pid, promotable, started_at, status
 messagefoundry.api.models.ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
-messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, role
+messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, owns_lease_row, role
 messagefoundry.api.models.ClusterStepdownRequest: force
 messagefoundry.api.models.ClusterStepdownResult: force, lease_released, new_leader_eligible, node_id, released_at, was_leader
 messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded

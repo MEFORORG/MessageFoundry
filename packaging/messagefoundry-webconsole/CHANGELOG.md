@@ -82,6 +82,12 @@ under Changed says why engine 0.4.0 does not work with this console.
   dead-letter list masks each last error the same way and links it to that message's `/errors`.
   The engine masks the text in its response, so the page never carries it. Needs an engine whose
   `get_message` accepts `reveal_errors`.
+- **The engine UI seam moved because the seam gate now covers the `auth.service` names this console
+  imports** (`BACKLOG #2015`). Seam discovery used to read only `AuthService` from
+  `messagefoundry.auth.service`. It now reads every name the console imports from there, such as
+  the step-up action constants, `NotifyEmailAlreadySet` and `Elevation`. So an engine that renames
+  one of them ships a different seam. Nothing the console does changed. Same one-value
+  `SUPPORTED_ENGINE_SEAMS` rule as 0.2.15 (`BACKLOG #279`).
 - **The message detail page shows the body and the summary only when the operator asks**
   (`BACKLOG #2346`, ASVS 14.2.6). `/ui/messages/{id}` now shows the metadata with the summary
   masked and no body. A "Show raw message" link opens `/ui/messages/{id}/body`, and a "Reveal"
@@ -123,6 +129,19 @@ under Changed says why engine 0.4.0 does not work with this console.
 - **The enrol-first notice no longer offers a passkey the engine refuses** (`BACKLOG #1133`, ADR
   0197 Amendment A). A local account `require_mfa` covers that has no TOTP now reads "enroll an
   authenticator app (TOTP)"; other accounts still see both choices.
+- **The High Availability page offers the stepdown control on a self-fenced node** (`BACKLOG
+  #1988`). The engine already drained such a node through the API (`BACKLOG #1508`), but the page
+  offered the control only when both leadership signals named the node, so the operator had to use
+  the API. The page now offers it when the engine would send the release, read from the new
+  `ClusterStatus.owns_lease_row`. It does not guess from `lease_expires_at`, which is on the
+  database clock. A node that has just released its lease, or a standby, stays disabled. So does a
+  node that has just taken the lease, until its heartbeat shows it, as before. On a node whose flag
+  is clear while it still owns the lease row, the page and both confirm pages say it is releasing a
+  lease it no longer serves, and do not call it a failover in progress. Where the lease already
+  names another node, they say to expect a refusal instead. The `409` refusal page now reads "This
+  node holds no lease to release", and it warns about the healthy successor before it tells the
+  operator to open the console on the leader. The post-stepdown notices say "Leadership lease
+  released". Needs an engine that publishes `owns_lease_row`, so the seam digest moved.
 - **The uploaded-file pages explain a refused, throttled or unavailable action** (`BACKLOG #1169`,
   PR 1506 follow-up A). Browse, resend and delete showed the engine's raw JSON for a status they
   did not map. Two new allow-listed codes cover browse: `browse_hop_refused` (the PHI-read hop

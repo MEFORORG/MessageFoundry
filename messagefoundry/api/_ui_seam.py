@@ -192,9 +192,10 @@ from typing import Any
 #:
 #: BACKLOG #1139: ``AuthService`` gained the public static ``suggested_notify_email``, which the
 #: console's ``/ui/account/notify-address`` form calls to pre-fill the address. It was first a
-#: module function in ``auth.service``, which discovery does not read, so the seam did not move and
-#: an older engine passed the handshake and then failed the console's import. A METHOD the console
-#: calls, so it forces a bump for the reason the ``factor_binding_is_blocked`` entry above gives.
+#: module function in ``auth.service``, which discovery did not read then, so the seam did not move
+#: and an older engine passed the handshake and then failed the console's import. A METHOD the
+#: console calls, so it forces a bump for the reason the ``factor_binding_is_blocked`` entry above
+#: gives. (Discovery reads the console's ``auth.service`` imports since BACKLOG #2015, below.)
 #:
 #: BACKLOG #1139, slice 3 (ADR 0182 Amendment A): ``UserUpdateRequest`` gained ``notify_email``, the
 #: one field that moves the notification address. Saving the profile ``email`` no longer moves it.
@@ -255,12 +256,20 @@ from typing import Any
 #: BACKLOG #2436 (ASVS 14.2.6, owner ruling R12): ``get_message`` gained a second keyword,
 #: ``reveal_errors``, on the same terms and with the same blind spot. The digest did not move.
 #:
+#: BACKLOG #2015: discovery now reads every name the console imports from ``auth.service``, not
+#: only ``AuthService``. Those include step-up action constants, an exception, and result
+#: dataclasses whose fields the console reads; ``tests/test_seam_discovery.py`` pins the set.
+#: Renaming one moved nothing before, so a skewed pair passed the gate and failed at import. The
+#: contract did not change; the digest moved because the gate now sees more of it. A skewed pair
+#: still fails at import rather than with ``UiSeamMismatch`` until BACKLOG #1907 lands, because the
+#: console's route modules import these names eagerly.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "44e3109437ae7510"
+ENGINE_UI_SEAM: str = "ec18643ac47b0039"
 
 
 @dataclass(frozen=True, slots=True)
