@@ -3789,7 +3789,6 @@ _ALERT_EVENT_TYPES = frozenset(
         "store_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
-        "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
         # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
         "initial_credential_expiring",
@@ -3984,10 +3983,6 @@ class AlertRule(BaseModel):
     # (default) = always applies (byte-identical). Two rules with different schedules express time-varying
     # thresholds (e.g. page in business hours, email off-hours) — first match wins, per ADR 0014.
     schedule: Schedule | None = None
-    # #81 (ADR 0133): route CONTENT-triggered alerts by their operator label — matches a `content_match`
-    # event only when its `label` equals this (non-PHI operator config, NEVER a matched field value). None
-    # (default) = no label filter. Meaningful with event_type='content_match' (or 'any').
-    content_label: str | None = None
 
     @field_validator("event_type")
     @classmethod
