@@ -2349,12 +2349,16 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
     assert not satisfied(local, "administrators", admin, stamped=False)
     assert not satisfied(local, "every_local_account", other, stamped=False)
     # 3. An enrolled account owes its factor under either value, the freed local non-admin included.
+    #    With require_mfa on, the directory floor answers an `ad` row before enrolment is read, so
+    #    the off arm is the one that tests the enrolled-factor rule for a directory account.
     for provider in (ad, local):
         for scope in scopes:
-            assert not satisfied(provider, scope, other, stamped=False, enrolled=True), (
-                f"an enrolled {provider} session is satisfied under {scope!r} with no stamp; the "
-                "MFA section says an account that has enrolled a factor owes it under either value."
-            )
+            for on in (True, False):
+                assert not satisfied(provider, scope, other, stamped=False, enrolled=True, on=on), (
+                    f"an enrolled {provider} session is satisfied under {scope!r} (require_mfa "
+                    f"{on}) with no stamp; the MFA section says an account that has enrolled a "
+                    "factor owes it under either value."
+                )
     # 4. The directory floor holds only while require_mfa is on: off, an un-enrolled directory
     #    session is satisfied, which is why the directory sentence opens "While require_mfa is on".
     for scope in scopes:
@@ -2395,6 +2399,7 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
         signing_algorithms=(),
         nonce="n",
         max_age_seconds=300,
+        require_mfa_claim=True,
     )
     with pytest.raises(ClaimsError):
         _check_mfa_gate({"amr": ["pwd"]}, policy)
@@ -2411,17 +2416,22 @@ def test_the_tenth_sweep_states_the_mfa_scope_reach_for_both_account_kinds() -> 
     for retired in (
         "and `administrators` narrows it to the **Administrator** role",
         "**A directory account is in scope like any other**",
+        "is refused outright while the knob is on",
     ):
         assert retired not in doc, (
             f"docs/SECURITY.md says {retired!r} again; `_unverified_session_owes_factor` keeps a "
             "directory session with no proven factor pending under either scope (BACKLOG #1133)."
         )
     for token in (
-        "Setting the scope to `administrators` takes only a **local** account without the "
-        "Administrator role out of scope.",
+        "Setting the scope to `administrators` frees only a **local** account without the "
+        "Administrator role from the access gate.",
         "a directory session that proved no factor stays MFA-pending under both "
-        "(`AuthService._unverified_session_owes_factor`). An account that has enrolled a factor "
-        "owes it under either value.",
+        "(`AuthService._unverified_session_owes_factor`).",
+        "A directory account without the Administrator role does leave scope for the `required` "
+        "flag of `GET /me/mfa` and for the last-factor removal guard",
+        "An account that has enrolled a factor owes it under either value while the factor stays "
+        "enrolled; an OIDC sign-in meets it at mint while `[auth].oidc_require_mfa_claim` is on, "
+        "the default.",
         "**While `require_mfa` is on, a directory session that proved no factor owes one under "
         "either scope value** (BACKLOG #1144). That is every Kerberos session, and an OIDC session "
         "minted while `[auth].oidc_require_mfa_claim` is off.",
@@ -2430,7 +2440,7 @@ def test_the_tenth_sweep_states_the_mfa_scope_reach_for_both_account_kinds() -> 
     ):
         assert token in doc, f"docs/SECURITY.md must state {token!r} (BACKLOG #1133)."
     guide = _flat((_ROOT / "docs" / "EARLY-ADOPTER-GUIDE.md").read_text(encoding="utf-8"))
-    assert "a directory account is in scope like any other" not in guide, (
+    assert "a directory account is in scope like any other" not in guide.lower(), (
         "docs/EARLY-ADOPTER-GUIDE.md says a directory account is in scope like any other again; "
         "under `administrators` a directory session with no proven factor owes more (BACKLOG #1133)."
     )
