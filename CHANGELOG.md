@@ -302,11 +302,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
-- **The `[fhir]` extra now needs `fhir-core>=1.1.11`, and annotated-types is no longer capped.**
-  `pyproject.toml` capped annotated-types below 0.8 because fhir-core 1.1.9 imported the `SLOTS`
-  constant that 0.8.0 removed. fhir-core 1.1.10 defines it itself, so the cap is gone from the core
-  dependencies and from `[fhir]`, and the lock moves to annotated-types 0.8.0. fhir-core 1.1.11 also
-  refuses negative `positiveInt` and `unsignedInt` values, which its own changelog says earlier releases let through.
 - **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
   encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
   `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256
@@ -649,18 +644,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
-- **Strict validation no longer rejects an order message for carrying one order detail.**
-  hl7apy 1.3.5 checks a `choice` group as if every alternative were required (upstream
-  crs4/hl7apy issue 151). A strict inbound would have NAKed every `ORM^O01` and `ORR^O02` with
-  an OBR or RXO order detail, with `Missing required child ORM_O01_CHOICE.RQD` or its per-version
-  name, and the same for any other structure with a choice group. The engine now carries the
-  upstream fix (PR 152, unmerged) at its own validation boundary: a choice group needs exactly
-  one alternative, and two in one group are still rejected. Sixteen groups that hl7apy's
-  v2.6+ tables label as choices are really sequences (RSP_E22_QUERY_ACK is QAK then QPD, for
-  one); the engine keeps validating them as sequences, where PR 152 as written would reject
-  every valid message of those structures. The shim stays on while
-  hl7apy itself gets any of three synthetic probe messages wrong, and a test goes red on the first hl7apy release
-  that fixes the bug, so the shim is removed with it.
 - **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
   the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
   model defines both. The web console builds its bulk-replay buttons from them, so a channel whose
