@@ -182,7 +182,7 @@ Start-Service MessageFoundry
 If the package was installed **non-editable** (a plain `pip install .`), the venv holds a
 snapshot of the old code — run `.venv\Scripts\python.exe -m pip install -e .` first, then restart.
 
-> **⚠ Upgrading from ≤ 0.2.5 → ≥ 0.2.6: tighten the config-dir ACLs first.** The config-directory
+> **WARNING: Upgrading from ≤ 0.2.5 → ≥ 0.2.6: tighten the config-dir ACLs first.** The config-directory
 > permission guard (SEC-003 / ADR 0036) did **not** exist in 0.2.5. From 0.2.6 on, `serve` refuses to
 > start against a `--config` directory **writable by a broad principal** (e.g. `Authenticated Users` /
 > `S-1-5-11`) — *"refusing to load config from writable-by-others path …"*. A config dir that inherits
