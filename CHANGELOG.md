@@ -302,6 +302,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **BREAKING: on SQL Server and PostgreSQL, the runtime login may only insert and read audit rows.**
+  Under the `external` schema default, the startup privilege probe now names `UPDATE` or `DELETE`
+  on `audit_log` or `audit_chain_meta` as an over-grant, a column `UPDATE` grant included. It also
+  names `ALTER`, `CONTROL` and `TAKE OWNERSHIP` on SQL Server, and `TRUNCATE` and `TRIGGER` on PostgreSQL, so the
+  start refuses under the shipped `enforce` dial. Without it, on a first
+  deployment the engine's own login could rewrite audit rows. `docs/DEPLOY-SERVER-DB.md` adds the
+  `DENY` (SQL Server) or `REVOKE` (PostgreSQL) to run once after the first `provision-schema`. The
+  engine's own writes no longer need those rights: opening a fresh keyed store and `rekey-audit`
+  insert the keying row and never replace one. The PostgreSQL grants check no longer asks for
+  `UPDATE` or `DELETE` on the two tables. A keying row that records no watermark is no longer
+  overwritten: `rekey-audit` and the open refuse it on both backends, and name the
+  statement that removes it. Two engines keying one fresh store at once now agree on the first
+  one's row on both backends, where the SQL Server loser used to fail its open on the primary key.
+  (owner ruling R16, ASVS 16.4.2)
 - **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
   encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
   `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256

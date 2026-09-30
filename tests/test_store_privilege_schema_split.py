@@ -54,10 +54,16 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     provision_store_schema,
 )
+from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.privilege import (
+    AUDIT_APPEND_ONLY_TABLES,
+    POSTGRES_AUDIT_WRITE_PRIVILEGES,
+    SQLSERVER_AUDIT_WRITE_PRIVILEGES,
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
     SQLSERVER_RUNTIME_DATABASE_ROLES,
     PostgresRoleFacts,
+    audit_write_alias,
+    audit_write_grant,
     postgres_excess,
     sqlserver_excess,
 )
@@ -299,8 +305,14 @@ def test_sqlserver_direct_ddl_grants_are_prescribed_under_auto() -> None:
 
 
 def _postgres_probe(
-    monkeypatch: pytest.MonkeyPatch, *, mode: SchemaManagement | None, create_on_schema: bool | None
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mode: SchemaManagement | None,
+    create_on_schema: bool | None,
+    audit_writes: tuple[str, ...] | None = (),
 ) -> Any:
+    """A real :class:`PostgresStore` over stubbed reads. ``audit_writes=None`` reads every audit-table
+    grant as NULL, which is what a role that cannot resolve the tables gets back."""
     from messagefoundry.store.postgres import PostgresStore
 
     store = PostgresStore(None, _server(StoreBackend.POSTGRES, schema_management=mode))
@@ -327,6 +339,16 @@ def _postgres_probe(
             "store_schema": "mefor",
             "create_on_schema": create_on_schema,
             "owned_in_schema": 0,
+            # Owner ruling R16: the append-only audit tables. ``audit_writes`` names the held rights.
+            **{
+                audit_write_alias(table, privilege): (
+                    None
+                    if audit_writes is None
+                    else audit_write_grant(privilege, table) in audit_writes
+                )
+                for table in AUDIT_APPEND_ONLY_TABLES
+                for privilege in POSTGRES_AUDIT_WRITE_PRIVILEGES
+            },
         }
 
     monkeypatch.setattr(store, "_fetchall", _fetchall)
@@ -385,6 +407,7 @@ class _FakePgConn:
         self._ungranted = ungranted
         self.reads: list[str] = []
         self.writes: list[str] = []
+        self.fetch_args: list[tuple[Any, ...]] = []
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
         self.reads.append(sql)
@@ -398,6 +421,7 @@ class _FakePgConn:
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         self.reads.append(sql)
+        self.fetch_args.append(args)
         return [{"relname": name, "relkind": "r"} for name in self._ungranted]
 
     async def execute(self, sql: str, *args: Any, **kwargs: Any) -> None:
@@ -953,6 +977,473 @@ def test_the_refusal_names_the_command_and_the_escape() -> None:
     assert "'MessageFoundry'" in text
 
 
+# --- owner ruling R16 (ASVS 16.4.2): the audit tables are append-only for the runtime login -------
+#
+# The runtime login needs INSERT and SELECT on audit_log and audit_chain_meta and nothing more, so on a
+# first deployment a login that also held UPDATE or DELETE there could rewrite or drop audit rows. Under
+# external schema management the probe names each such right as excess, which refuses the start under
+# the shipped `enforce` dial (ADR 0199). The engine's own write paths are INSERT-only, pinned below.
+
+_PG_AUDIT_WRITES = tuple(
+    audit_write_grant(privilege, table)
+    for table in AUDIT_APPEND_ONLY_TABLES
+    for privilege in POSTGRES_AUDIT_WRITE_PRIVILEGES
+)
+_SS_AUDIT_WRITES = tuple(
+    audit_write_grant(privilege, table)
+    for table in AUDIT_APPEND_ONLY_TABLES
+    for privilege in SQLSERVER_AUDIT_WRITE_PRIVILEGES
+)
+
+
+@pytest.mark.parametrize(("external", "expected"), [(True, _PG_AUDIT_WRITES), (False, ())])
+def test_postgres_audit_table_writes_are_excess_in_external_mode_only(
+    external: bool, expected: tuple[str, ...]
+) -> None:
+    """Under auto the role owns the audit tables and may grant itself any right back, so no reading
+    of its grants there could show them append-only; the finding is external-only."""
+    assert (
+        postgres_excess(
+            roles=_PLAIN_ROLE,
+            owns_database=False,
+            create_on_database=False,
+            database="messagefoundry",
+            external=external,
+            schema="mefor",
+            audit_writes=_PG_AUDIT_WRITES,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(("external", "expected"), [(True, _SS_AUDIT_WRITES), (False, ())])
+def test_sqlserver_audit_table_writes_are_excess_in_external_mode_only(
+    external: bool, expected: tuple[str, ...]
+) -> None:
+    """db_datawriter grants UPDATE and DELETE on every table, so without the runbook's DENY a
+    row-only login holds both on the audit tables."""
+    assert (
+        sqlserver_excess(
+            server_roles=(),
+            database_roles=("db_datareader", "db_datawriter"),
+            control_server=False,
+            control_database=False,
+            database="MessageFoundry",
+            external=external,
+            audit_writes=_SS_AUDIT_WRITES,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("server_roles", "roles", "control_server", "control_database"),
+    [
+        ((), ("db_owner",), False, False),
+        (("sysadmin",), (), False, False),
+        ((), (), True, False),
+        ((), (), False, True),
+    ],
+    ids=["db_owner", "sysadmin", "control-server", "control-database"],
+)
+def test_sqlserver_audit_table_writes_are_not_restated_under_a_grant_that_carries_them(
+    server_roles: tuple[str, ...],
+    roles: tuple[str, ...],
+    control_server: bool,
+    control_database: bool,
+) -> None:
+    excess = sqlserver_excess(
+        server_roles=server_roles,
+        database_roles=roles,
+        control_server=control_server,
+        control_database=control_database,
+        database="MessageFoundry",
+        external=True,
+        audit_writes=_SS_AUDIT_WRITES,
+    )
+    assert excess, "the carrying grant itself must still be named"
+    assert not set(excess) & set(_SS_AUDIT_WRITES)
+
+
+def test_sqlserver_a_server_role_with_no_table_right_does_not_hide_an_audit_write() -> None:
+    """bulkadmin carries no right on a user table, so it must not stand in for the DENY that is
+    missing: the audit rights are named beside it."""
+    excess = sqlserver_excess(
+        server_roles=("bulkadmin",),
+        database_roles=("db_datareader", "db_datawriter"),
+        control_server=False,
+        control_database=False,
+        database="MessageFoundry",
+        external=True,
+        audit_writes=("UPDATE on table audit_log",),
+    )
+    assert excess == ("server role bulkadmin", "UPDATE on table audit_log")
+
+
+@pytest.mark.parametrize(
+    ("roles", "alter_schema", "table_alter_named"),
+    [
+        (("db_datareader", "db_datawriter", "db_ddladmin"), None, False),
+        (("db_datareader", "db_datawriter"), "app", True),
+    ],
+    ids=["db_ddladmin", "schema-alter"],
+)
+def test_sqlserver_table_alter_is_folded_into_db_ddladmin_only(
+    roles: tuple[str, ...], alter_schema: str | None, table_alter_named: bool
+) -> None:
+    """db_ddladmin carries ALTER on every table. ALTER on the default schema does not: the audit
+    tables may resolve to dbo instead, so the table right is still named beside it."""
+    excess = sqlserver_excess(
+        server_roles=(),
+        database_roles=roles,
+        control_server=False,
+        control_database=False,
+        database="MessageFoundry",
+        external=True,
+        alter_schema=alter_schema,
+        audit_writes=_SS_AUDIT_WRITES,
+    )
+    assert ("ALTER on table audit_log" in excess) is table_alter_named
+    assert "UPDATE on table audit_log" in excess
+    assert "DELETE on table audit_chain_meta" in excess
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [(None, ("UPDATE on table audit_log",)), (SchemaManagement.AUTO, ())],
+    ids=["external", "auto"],
+)
+async def test_postgres_probe_names_an_audit_table_update(
+    monkeypatch: pytest.MonkeyPatch, mode: SchemaManagement | None, expected: tuple[str, ...]
+) -> None:
+    store = _postgres_probe(
+        monkeypatch, mode=mode, create_on_schema=False, audit_writes=("UPDATE on table audit_log",)
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == expected
+
+
+async def test_postgres_probe_that_cannot_see_the_audit_tables_is_unobserved_under_external(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _postgres_probe(monkeypatch, mode=None, create_on_schema=False, audit_writes=None)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert "UPDATE on table audit_log" in report.detail
+
+
+async def test_postgres_unread_audit_grants_never_soften_a_found_over_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With CREATE on the schema already found, the start must still refuse under enforce, so the
+    report stays OBSERVED with that finding, and the unread audit grants are named in the detail."""
+    store = _postgres_probe(monkeypatch, mode=None, create_on_schema=True, audit_writes=None)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == ("CREATE on schema mefor",)
+    assert "audit-table grants read NULL" in report.detail
+
+
+def test_postgres_audit_probe_reads_every_assumable_role_and_column_updates() -> None:
+    """``has_table_privilege(current_user, ...)`` counts only INHERITED rights, and a NOINHERIT member
+    can still SET ROLE to the holder. A column UPDATE grant rewrites row content as well. The probe
+    column must reach both, and must stay NULL for a table it cannot resolve."""
+    from messagefoundry.store.postgres import _audit_write_probe
+
+    update = _audit_write_probe("audit_log", "UPDATE")
+    assert "pg_has_role(current_user, r.oid, 'MEMBER')" in update
+    assert "has_any_column_privilege(r.oid" in update
+    assert "IS NULL THEN NULL" in update
+    delete = _audit_write_probe("audit_log", "DELETE")
+    assert "has_table_privilege(r.oid" in delete
+
+
+def test_sqlserver_audit_probe_reads_column_updates() -> None:
+    """A column-level GRANT outranks a table-level DENY on SQL Server, so UPDATE is read per column."""
+    from messagefoundry.store.sqlserver import _audit_write_probe
+
+    update = _audit_write_probe("audit_log", "UPDATE")
+    assert "c.name, 'COLUMN'" in update and "sys.columns" in update
+    assert "'COLUMN'" not in _audit_write_probe("audit_log", "DELETE")
+
+
+async def test_postgres_probe_that_cannot_see_the_audit_tables_is_still_clean_under_auto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: auto does not count the audit grants, so it does not need them read."""
+    store = _postgres_probe(
+        monkeypatch, mode=SchemaManagement.AUTO, create_on_schema=False, audit_writes=None
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == ()
+
+
+async def test_postgres_runtime_grants_ask_only_insert_and_select_of_the_audit_tables() -> None:
+    """The missing-grants check must not demand UPDATE or DELETE on the audit tables, or a role
+    granted exactly what R16 prescribes would be refused as under-granted."""
+    from messagefoundry.store.postgres import _schema_hash
+
+    conn = _FakePgConn(present=True, schema_hash=_schema_hash())
+    store = _postgres_store_over(conn, None)
+    assert await store._ensure_schema() is False
+    (sql,) = [q for q in conn.reads if "has_table_privilege" in q]
+    assert conn.fetch_args[0] == (list(AUDIT_APPEND_ONLY_TABLES),)
+    audit_arm = sql.split("c.relname = ANY($1::text[])", 1)[1].split(" OR ", 1)[0]
+    assert "'INSERT'" in audit_arm and "'SELECT'" in audit_arm
+    assert "'UPDATE'" not in audit_arm and "'DELETE'" not in audit_arm
+
+
+class _AuditMetaPgConn:
+    """Answers the audit-chain keying reads and records every statement.
+
+    ``meta`` is what successive reads of ``audit_chain_meta`` return, in order; ``insert_status`` is
+    what asyncpg reports for the watermark INSERT (``INSERT 0 0`` when ``DO NOTHING`` skipped it)."""
+
+    def __init__(self, *, meta: list[dict[str, Any] | None], insert_status: str) -> None:
+        self._meta = meta
+        self._insert_status = insert_status
+        self.statements: list[str] = []
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        self.statements.append(sql)
+        if "COUNT(*)" in sql:
+            return {"n": 0}
+        if "MAX(id)" in sql:
+            return {"m": 4}
+        return self._meta.pop(0)
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.statements.append(sql)
+        return self._insert_status if sql.startswith("INSERT") else "SELECT 1"
+
+    def transaction(self) -> Any:
+        return contextlib.nullcontext()
+
+
+def _keyed_postgres_store(conn: _AuditMetaPgConn) -> Any:
+    from messagefoundry.store.postgres import PostgresStore
+
+    store = PostgresStore(None, _server(StoreBackend.POSTGRES))
+    store._audit_mac_key = b"\x01" * 32  # a keying secret in hand, so a fresh chain is keyed
+
+    @contextlib.asynccontextmanager
+    async def _timed_acquire(*, record: bool = True) -> AsyncIterator[Any]:
+        yield conn
+
+    async def _no_lock(conn: Any, classid: int, key: str) -> None:
+        return None
+
+    store._timed_acquire = _timed_acquire  # type: ignore[method-assign]
+    store._advisory_lock = _no_lock  # type: ignore[method-assign]
+    return store
+
+
+def _no_row_change(statements: list[str]) -> None:
+    for sql in statements:
+        assert "DO UPDATE" not in sql
+        assert not sql.lstrip().upper().startswith(("UPDATE", "DELETE"))
+
+
+async def test_postgres_keys_a_fresh_chain_with_insert_alone() -> None:
+    conn = _AuditMetaPgConn(meta=[None], insert_status="INSERT 0 1")
+    store = _keyed_postgres_store(conn)
+    await store._load_audit_chain_meta()
+    assert store._audit_keyed_from == 1
+    assert any("ON CONFLICT (id) DO NOTHING" in sql for sql in conn.statements)
+    _no_row_change(conn.statements)
+
+
+async def test_postgres_adopts_the_watermark_a_peer_wrote_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two engines opening one empty store both try the INSERT. The loser used to overwrite the row;
+    with INSERT alone it reads what the winner wrote and keys from that."""
+    settled: list[str | None] = []
+
+    async def _settle(_host: Any, key_id: str | None) -> None:
+        settled.append(key_id)
+
+    monkeypatch.setattr("messagefoundry.store.postgres.settle_audit_ranges", _settle)
+    conn = _AuditMetaPgConn(
+        meta=[None, {"keyed_from_id": 1, "key_id": "peer-key"}], insert_status="INSERT 0 0"
+    )
+    store = _keyed_postgres_store(conn)
+    await store._load_audit_chain_meta()
+    assert store._audit_keyed_from == 1
+    assert settled == ["peer-key"]
+    _no_row_change(conn.statements)
+
+
+async def test_postgres_refuses_to_key_over_a_row_with_no_watermark() -> None:
+    conn = _AuditMetaPgConn(
+        meta=[None, {"keyed_from_id": None, "key_id": None}], insert_status="INSERT 0 0"
+    )
+    store = _keyed_postgres_store(conn)
+    with pytest.raises(RuntimeError, match="owns the store's schema"):
+        await store._load_audit_chain_meta()
+    assert store._audit_keyed_from is None
+    _no_row_change(conn.statements)
+
+
+async def _verified(**_kw: Any) -> tuple[bool, str]:
+    return True, "verified 4 audit row(s)"
+
+
+@pytest.mark.parametrize(
+    ("held", "expected"),
+    [({"keyed_from_id": None}, "owns the store's schema"), ({"keyed_from_id": 3}, "id=3")],
+    ids=["no-watermark", "keyed-meanwhile"],
+)
+async def test_postgres_rekey_reports_a_row_it_will_not_replace(
+    monkeypatch: pytest.MonkeyPatch, held: dict[str, Any], expected: str
+) -> None:
+    conn = _AuditMetaPgConn(meta=[held], insert_status="INSERT 0 0")
+    store = _keyed_postgres_store(conn)
+    monkeypatch.setattr(store, "verify_audit_chain", _verified)
+    ok, message = await store.rekey_audit_chain()
+    assert not ok and expected in message
+    assert store._audit_keyed_from is None
+    _no_row_change(conn.statements)
+
+
+async def test_postgres_rekey_keys_with_insert_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _AuditMetaPgConn(meta=[], insert_status="INSERT 0 1")
+    store = _keyed_postgres_store(conn)
+    monkeypatch.setattr(store, "verify_audit_chain", _verified)
+    ok, message = await store.rekey_audit_chain()
+    assert ok and "keyed from id=5" in message
+    _no_row_change(conn.statements)
+
+
+class _AuditMetaSsCursor:
+    """``inserted`` is whether the guarded INSERT's OUTPUT returns a row. ``rowcount`` is pinned to -1,
+    what a session under NOCOUNT reports, so a rekey that still read it would misjudge every case."""
+
+    def __init__(self, *, inserted: bool, held: tuple[Any, ...] | None) -> None:
+        self.rowcount = -1
+        self._inserted = inserted
+        self._held = held
+        self._last = ""
+        self.statements: list[str] = []
+
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        self.statements.append(sql)
+        self._last = sql
+
+    async def fetchone(self) -> tuple[Any, ...] | None:
+        if "MAX(id)" in self._last:
+            return (4,)
+        if self._last.startswith("INSERT"):
+            return (1,) if self._inserted else None
+        return self._held
+
+
+@pytest.mark.parametrize(
+    ("inserted", "held", "ok", "expected"),
+    [
+        (True, None, True, "keyed from id=5"),
+        (False, (None,), False, "owns the store's schema"),
+        (False, (3,), False, "id=3"),
+    ],
+    ids=["fresh", "no-watermark", "keyed-meanwhile"],
+)
+async def test_sqlserver_rekey_writes_the_watermark_with_insert_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    inserted: bool,
+    held: tuple[Any, ...] | None,
+    ok: bool,
+    expected: str,
+) -> None:
+    """The UPDATE-then-INSERT upsert needed UPDATE even when it touched no row: SQL Server checks the
+    permission when it compiles the statement. The watermark is now one guarded INSERT."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    cur = _AuditMetaSsCursor(inserted=inserted, held=held)
+    store = SqlServerStore(None, _server(StoreBackend.SQLSERVER))
+    store._audit_mac_key = b"\x01" * 32
+
+    class _Conn:
+        async def rollback(self) -> None:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _acquire() -> AsyncIterator[Any]:
+        yield _Conn()
+
+    @contextlib.asynccontextmanager
+    async def _cursor(_conn: Any) -> AsyncIterator[Any]:
+        yield cur
+
+    async def _commit(_conn: Any) -> None:
+        return None
+
+    monkeypatch.setattr(store, "_acquire", _acquire)
+    monkeypatch.setattr(store, "_cursor", _cursor)
+    monkeypatch.setattr(store, "_commit", _commit)
+    monkeypatch.setattr(store, "verify_audit_chain", _verified)
+    result, message = await store.rekey_audit_chain()
+    assert result is ok and expected in message
+    assert store._audit_keyed_from == (5 if ok else None)
+    assert "WITH (UPDLOCK, HOLDLOCK)" in cur.statements[1]
+    for sql in cur.statements:
+        assert not sql.lstrip().upper().startswith(("UPDATE", "DELETE"))
+
+
+#: An audit table's name as a statement may spell it: bare, bracketed, or schema-qualified.
+_AUDIT_TABLE = r"(?:\[?\w+\]?\.)?\[?audit_(?:log|chain_meta)\]?(?!\w)"
+_TOP = r"(?:TOP\s*\([^)]*\)\s*(?:PERCENT\s+)?)?"
+#: A statement that changes or removes rows of an append-only audit table.
+_AUDIT_ROW_CHANGE = re.compile(
+    rf"\b(?:UPDATE\s+{_TOP}{_AUDIT_TABLE}|DELETE\s+{_TOP}(?:FROM\s+)?{_AUDIT_TABLE}"
+    rf"|TRUNCATE\s+(?:TABLE\s+)?{_AUDIT_TABLE}|MERGE\s+{_TOP}(?:INTO\s+)?{_AUDIT_TABLE})",
+    re.IGNORECASE,
+)
+
+
+def _audit_row_changes(source: str) -> list[str]:
+    """Every LITERAL row-changing statement on an audit table in ``source``, plus any INSERT into one
+    that turns into an update on conflict (the old Postgres watermark upsert). It reads at least the
+    literal shapes, not a statement built from a variable or a schema-qualified name, so the live legs'
+    DENY and REVOKE are the behavioural guard and this is only the cheap early one."""
+    found = [m.group(0) for m in _AUDIT_ROW_CHANGE.finditer(source)]
+    for m in re.finditer(r"INTO\s+audit_(?:log|chain_meta)\b", source, re.IGNORECASE):
+        if "DO UPDATE" in source[m.end() : m.end() + 400]:
+            found.append(source[m.start() : m.end() + 400])
+    return found
+
+
+def test_the_row_change_scan_can_see_the_statements_it_forbids() -> None:
+    """Positive control: the scan must find the shapes it exists to catch, including the Postgres
+    upsert and the SQL Server UPDATE this change removed, or its zero below proves nothing."""
+    removed = (
+        '"INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, $1, $2) "\n'
+        '"ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id, "\n'
+        '"UPDATE audit_chain_meta SET keyed_from_id=?, key_id=? WHERE id=1",\n'
+        '"DELETE FROM audit_log WHERE id < ?"\n'
+        '"DELETE TOP (1000) FROM dbo.audit_log WHERE ts < ?"\n'
+        '"DELETE audit_chain_meta WHERE id=1"\n'
+        '"UPDATE TOP (1) [audit_log] SET detail = ?"\n'
+    )
+    assert len(_audit_row_changes(removed)) == 6
+    # ...and none of the INSERT and SELECT shapes the engine does run.
+    kept = (
+        '"INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) OUTPUT INSERTED.id"\n'
+        '"SELECT keyed_from_id FROM audit_chain_meta WHERE id=1"\n'
+        '"UPDATE audit_log_archive SET x = 1"\n'
+    )
+    assert _audit_row_changes(kept) == []
+
+
+@pytest.mark.parametrize("module", ["postgres", "sqlserver"])
+def test_no_server_store_statement_changes_an_audit_row(module: str) -> None:
+    """The engine's own statements must fit the INSERT and SELECT grant R16 prescribes."""
+    source = (_ROOT / "messagefoundry" / "store" / f"{module}.py").read_text(encoding="utf-8")
+    assert "INSERT INTO audit_chain_meta" in source  # the scan reads the file that writes the row
+    assert _audit_row_changes(source) == []
+
+
 # --- the live legs must actually be RUN somewhere ----------------------------------------------
 
 
@@ -968,6 +1459,13 @@ def test_the_live_legs_of_this_file_are_run_by_a_server_db_ci_step(gate: str) ->
 
 
 # --- live server legs (skipped locally; CI's store-privilege steps run them) -------------------
+
+
+def _update_of(table: str) -> str:
+    """An UPDATE of one ordinary column of ``table``. Not the id: SQL Server refuses an identity column
+    at compile time, before it checks the permission this statement exists to hit."""
+    column = "actor" if table == "audit_log" else "key_id"
+    return f"UPDATE {table} SET {column} = {column}"
 
 
 @pytest.fixture
@@ -1009,7 +1507,9 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
 
     1. external open of an EMPTY database refuses, and the database is still empty afterwards;
     2. provision-schema builds it, and a second run is a no-op;
-    3. a login holding only db_datareader + db_datawriter opens it and probes clean;
+    3. a login holding only db_datareader + db_datawriter is named for UPDATE and DELETE on the audit
+       tables; after the runbook's DENY it opens it, keys the chain with INSERT alone, probes clean,
+       and an UPDATE or DELETE of either audit table is refused (owner ruling R16);
     4. the same login given db_ddladmin is named as over-granted.
     """
     from messagefoundry.store.sqlserver import SqlServerStore
@@ -1048,18 +1548,61 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
     runtime = external.model_copy(
         update={"auth": SqlAuth.SQL, "username": login, "password": password}
     )
-    store = await bounded(sa, "open as the row-only login", SqlServerStore.open(runtime))
+    # Owner ruling R16, the control arm: db_datawriter alone grants UPDATE and DELETE on the audit
+    # tables, and the probe must see them before the DENY below, or its clean read after proves nothing.
+    store = await bounded(sa, "open before the audit DENY", SqlServerStore.open(runtime))
     try:
-        clean = await bounded(sa, "probe", store.probe_principal_privileges())
+        undenied = await bounded(sa, "probe before the DENY", store.probe_principal_privileges())
     finally:
         await store.close()
+    assert "UPDATE on table audit_log" in undenied.excess
+    assert "DELETE on table audit_chain_meta" in undenied.excess
+    for table in AUDIT_APPEND_ONLY_TABLES:
+        await bounded(
+            sa,
+            f"deny writes on {table}",
+            admin.run_in(db, f"DENY UPDATE, DELETE ON {table} TO [{login}]"),
+        )
+    # With a key, the open keys the empty chain, so the watermark INSERT runs as this login.
+    # A keyless row first, so the keyed open below leaves the chain unkeyed and `rekey-audit` writes
+    # the keying row: the guarded INSERT, under the DENY, as this login.
+    keyless = await bounded(sa, "open keyless", SqlServerStore.open(runtime))
+    try:
+        await bounded(sa, "keyless audit row", keyless.record_audit("r16.keyless", actor="live"))
+    finally:
+        await keyless.close()
+    # The audit key rides the cipher, and `open_store` is what hands it over; a direct open must too.
+    cipher = make_cipher(generate_key())
+    keyed = await bounded(
+        sa,
+        "open as the row-only login",
+        SqlServerStore.open(runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()),
+    )
+    try:
+        clean = await bounded(sa, "probe", keyed.probe_principal_privileges())
+        assert keyed.audit_chain_unkeyed(), "the keyless row must leave the chain for rekey-audit"
+        ok, message = await bounded(sa, "rekey under the DENY", keyed.rekey_audit_chain())
+        assert ok, f"the INSERT-only login must still key the chain: {message}"
+        await keyed.record_audit("r16.probe", actor="live-test", detail=None)
+        for table in AUDIT_APPEND_ONLY_TABLES:
+            for statement in (_update_of(table), f"DELETE FROM {table}"):
+                with pytest.raises(Exception, match="permission was denied"):
+                    await bounded(sa, statement, keyed._execute(statement))
+    finally:
+        await keyed.close()
     assert clean.status is StorePrivilegeStatus.OBSERVED
     assert clean.excess == (), f"a row-only runtime login must be silent, got {clean.excess}"
+    rows = f"SELECT COUNT(*) FROM [{db}].dbo.audit_log"
+    assert await bounded(sa, "count audit rows", admin.scalar(rows)) >= 1
 
     await bounded(
         sa, "grant db_ddladmin", admin.run_in(db, f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]")
     )
-    store = await bounded(sa, "reopen with db_ddladmin", SqlServerStore.open(runtime))
+    store = await bounded(
+        sa,
+        "reopen with db_ddladmin",
+        SqlServerStore.open(runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()),
+    )
     try:
         over = await bounded(sa, "probe again", store.probe_principal_privileges())
     finally:
@@ -1070,7 +1613,8 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
 @pytest.mark.skipif(not _POSTGRES_ON, reason="set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env)")
 async def test_live_postgres_external_refuses_then_provisions_then_runs_row_only() -> None:
     """The Postgres twin, in a schema this test creates and drops. The provisioning principal owns
-    every object it creates; the runtime role holds USAGE plus row grants and nothing else."""
+    every object it creates; the runtime role holds USAGE plus row grants and nothing else, and on the
+    two audit tables only INSERT and SELECT (owner ruling R16): an UPDATE or DELETE there is refused."""
     from messagefoundry.store.postgres import PostgresStore
 
     base = load_settings(environ=os.environ).store
@@ -1115,16 +1659,54 @@ async def test_live_postgres_external_refuses_then_provisions_then_runs_row_only
         ):
             await admin._execute(stmt)
         runtime = external.model_copy(update={"username": role, "password": password})
+        # Owner ruling R16, the control arm: the blanket grant above covers the audit tables too, and
+        # the probe must name it there before the REVOKE, or its clean read after proves nothing.
         store = await PostgresStore.open(runtime)
         try:
+            unrevoked = await store.probe_principal_privileges()
+        finally:
+            await store.close()
+        assert "UPDATE on table audit_log" in unrevoked.excess
+        assert "DELETE on table audit_chain_meta" in unrevoked.excess
+        audit_tables = ", ".join(f"{schema}.{table}" for table in AUDIT_APPEND_ONLY_TABLES)
+        await admin._execute(
+            f"REVOKE UPDATE, DELETE, TRUNCATE, TRIGGER ON {audit_tables} FROM {role}"
+        )
+        # With a key, the open keys the empty chain, so the watermark INSERT runs as this role.
+        # A keyless row first, so the keyed open below leaves the chain unkeyed and `rekey-audit`
+        # writes the keying row: the INSERT ... DO NOTHING, under the REVOKE, as this role.
+        keyless = await PostgresStore.open(runtime)
+        try:
+            await keyless.record_audit("r16.keyless", actor="live")
+        finally:
+            await keyless.close()
+        # The audit key rides the cipher; `open_store` hands it over, so a direct open must too.
+        cipher = make_cipher(generate_key())
+        store = await PostgresStore.open(
+            runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
+        try:
             clean = await store.probe_principal_privileges()
+            assert store.audit_chain_unkeyed(), "the keyless row must leave the chain for rekey"
+            ok, message = await store.rekey_audit_chain()
+            assert ok, f"the INSERT-only role must still key the chain: {message}"
+            await store.record_audit("r16.probe", actor="live-test", detail=None)
+            for table in AUDIT_APPEND_ONLY_TABLES:
+                statements = (_update_of(table), f"DELETE FROM {table}", f"TRUNCATE {table}")
+                for statement in statements:
+                    with pytest.raises(Exception, match="permission denied"):
+                        await store._execute(statement)
         finally:
             await store.close()
         assert clean.status is StorePrivilegeStatus.OBSERVED
         assert clean.excess == (), f"a row-only runtime role must be silent, got {clean.excess}"
+        row = await admin._fetchone(f"SELECT count(*) AS n FROM {schema}.audit_log")
+        assert row is not None and int(row["n"]) >= 1
 
         await admin._execute(f"GRANT CREATE ON SCHEMA {schema} TO {role}")
-        store = await PostgresStore.open(runtime)
+        store = await PostgresStore.open(
+            runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
         try:
             over = await store.probe_principal_privileges()
         finally:
