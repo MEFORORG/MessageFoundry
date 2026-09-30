@@ -644,6 +644,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`audit-anchor --json` now reports a bad service settings file as JSON on stdout.** A missing,
+  unparseable or invalid `--service-config` printed plain text to stderr whatever `--json` said, so
+  a caller piping to `jq` got an empty stdout. It now prints `{"error": ...}` on stdout, as the
+  command's other refusals do, and exits 2. A settings section that fails validation is now
+  reported without echoing the section's values, and a directory named as the settings file now
+  exits 2 rather than 1, which this command spends on a broken chain. (`BACKLOG #2094`)
 - **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
   the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
   model defines both. The web console builds its bulk-replay buttons from them, so a channel whose

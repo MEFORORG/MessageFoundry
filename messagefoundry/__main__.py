@@ -6621,7 +6621,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
 
 def _refuse_a_store_that_is_not_an_audit_log(
-    *, is_sqlite: bool, path: str, refusal: str, as_json: bool = False
+    *, is_sqlite: bool, path: str, refusal: str, as_json: bool
 ) -> int | None:
     """Exit code 2 when a SQLite ``--db`` cannot be a real audit log, else ``None`` (BACKLOG #1669).
 
@@ -6720,6 +6720,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
         refusal="refusing to create one and report a false 'verified 0 rows'",
+        as_json=False,  # audit-verify has no --json
     )
     if refused is not None:
         return refused
@@ -6755,7 +6756,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
         # still land in, so both guards stay live.
-        return _emit_store_open_error(exc, settings.store.path)
+        return _emit_store_open_error(exc, settings.store.path, as_json=False)
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
         return 1
@@ -6787,9 +6788,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     gets one. The anchor is a row count plus a digest — no PHI, no secret — so it is safe to store in
     a ticket, an object store, or a compliance job's own database.
     """
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -6800,10 +6799,16 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        # Through `_emit_error` like every other refusal here, so a --json caller gets its JSON object
+        # on stdout rather than an empty stdout and a text line on stderr (BACKLOG #2094). Loaded by
+        # `_load_service_settings`, whose docstring says why: its catch includes `OSError` (a
+        # directory named as the file), and it RENDERS a `ValidationError` rather than stringifying
+        # its `input_value=`, which would put a configured secret into this command's stdout -- the
+        # output its own docstring calls safe to keep in a ticket. Exit 2, not `_emit_error`'s 1:
+        # the command could not start, and 1 is a broken chain's code in the audit family.
+        _emit_error(detail or "could not load the service settings", as_json=args.json)
         return 2
 
     # The SAME guard as _audit_verify, and it matters MORE here: before the read-only open (#1780) a
@@ -6890,6 +6895,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
         refusal="refusing to create one",
+        as_json=False,  # rekey-audit has no --json
     )
     if refused is not None:
         return refused
@@ -6912,7 +6918,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path)
+        return _emit_store_open_error(exc, settings.store.path, as_json=False)
     print(("OK: " if ok else "FAIL: ") + message)
     return 0 if ok else 1
 
@@ -7147,7 +7153,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path)
+        return _emit_store_open_error(exc, settings.store.path, as_json=False)
     done = (
         f"re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
@@ -8233,7 +8239,7 @@ def _paste_safe_option(option: str, value: str) -> str | None:
     return None if unsafe else f'{option}="{value}"'
 
 
-def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool = False) -> int:
+def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:
     """One line and exit 2 for a store that could not be opened (BACKLOG #1670).
 
     EXIT 2 AND NOT 1, DELIBERATELY. These subcommands already spend 1 on a negative *finding* --
@@ -8245,6 +8251,11 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
     ``sqlite3.OperationalError`` needs no separate clause: it subclasses ``DatabaseError``. That
     catches the typo'd path too (a directory at ``--db`` raises "unable to open database file"),
     which used to print a raw traceback.
+
+    ``as_json`` HAS NO DEFAULT, on purpose (BACKLOG #2094). A ``False`` default let a ``--json``
+    caller forget to pass it and print text to stderr with no type error, which is the #1922 shape;
+    each caller now says which mode it is in. The same holds for
+    :func:`_refuse_a_store_that_is_not_an_audit_log`.
     """
     message = f"cannot open the store at {path}: {exc}"
     if as_json:
