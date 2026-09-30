@@ -726,7 +726,7 @@ _ENGINE = _ROOT / "messagefoundry"
 # The toolkit takes code OUT of messagefoundry/ (ADR 0201), so it takes the engine gate with it:
 # a module that moves must not leave the walk. It ships a console entry point of its own. The gate
 # itself is the toolkit's `_REACH_ROOTS` row; this pair only feeds the entry-point rule, which
-# checks each root's __main__.py calls the chokepoint.
+# checks every __main__.py under these roots and harness/ calls the chokepoint.
 _TOOLKIT = _ROOT / "messagefoundry_toolkit"
 _ENGINE_GATE_ROOTS = (_ENGINE, _TOOLKIT)
 
@@ -1141,8 +1141,9 @@ def _main(*body: str) -> tuple[str, ...]:
 
 
 def test_the_engine_hardening_signal_sees_the_real_entry_points() -> None:
-    """Proved against the real files rather than a reconstruction of them: the three entry points
-    the reach gate exempts today must be seen to call the chokepoint."""
+    """Proved against the real files rather than a reconstruction of them: the three shipped console
+    entry points must be seen to call the chokepoint. The reach gate exempts two of them today; the
+    toolkit's carries no glyph."""
     for real in (_ENGINE / "__main__.py", _TOOLKIT / "__main__.py", _HARNESS / "__main__.py"):
         assert _calls_the_chokepoint(ast.parse(real.read_text(encoding="utf-8"))), real
 
@@ -1290,9 +1291,10 @@ _TESTS = _ROOT / "tests"
 #: Pins are relative to the root. A root with only one shape (fuzz/ is all top-level; docker/, docs/
 #: and packaging/ are all nested) pins only that shape, because it has nothing else to lose.
 #:
-#: harness/__main__.py, messagefoundry/__main__.py and messagefoundry_toolkit/__main__.py are the
-#: entry points whose hardening exempts them, and this module is the one file whose disappearance from the walk would make every result
-#: below meaningless.
+#: harness/__main__.py and messagefoundry/__main__.py are the entry points whose hardening exempts
+#: them, and this module is the one file whose disappearance from the walk would make every result
+#: below meaningless. messagefoundry_toolkit/__main__.py is hardened too but carries no glyph, so
+#: nothing in it is exempted today; it is pinned as the toolkit's entry point.
 _REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
     ("messagefoundry", _ENGINE, 250, ("__main__.py", "pipeline/wiring_runner.py")),
     # ADR 0201 moved engine tooling here, so it keeps the engine's gate. All three files are
@@ -1432,8 +1434,8 @@ def test_every_root_holding_tracked_python_is_gated() -> None:
     # The census's own control: an instrument that cannot find these two proves nothing by
     # finding no ungated root.
     assert {"messagefoundry", "scripts"} <= roots, f"the census is blind: {sorted(roots)}"
-    # Counted on `tracked` itself, which the absence check below walks, so an empty listing fails
-    # here instead of reading as "nothing at the root".
+    # The control above already fails on an empty listing. This names `tracked`, which the absence
+    # check below walks, because that is the guard the vacuous-absence lint can read.
     assert tracked, "git listed no tracked python at all -- the census read nothing"
     # A .py at the repository root has no row to go in: `_files_under` walks directories.
     at_root = sorted(rel for rel in tracked if "/" not in rel)
