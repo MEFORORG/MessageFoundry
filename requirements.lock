@@ -12,12 +12,10 @@ annotated-doc==0.0.4 \
     --hash=sha256:571ac1dc6991c450b25a9c2d84a3705e2ae7a53467b5d111c24fa8baabbed320 \
     --hash=sha256:fbcda96e87e9c92ad167c2e53839e57503ecfda18804ea28102353485033faa4
     # via fastapi
-annotated-types==0.7.0 \
-    --hash=sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53 \
-    --hash=sha256:aff07c09a53a08bc8cfccb9c85b05f1aa9a2a6f23728d790723543408344ce89
-    # via
-    #   messagefoundry
-    #   pydantic
+annotated-types==0.8.0 \
+    --hash=sha256:13b2beaad985e05e2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7 \
+    --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
+    # via pydantic
 antlr4-python3-runtime==4.13.2 \
     --hash=sha256:909b647e1d2fc2b70180ac586df3933e38919c85f98ccc656a96cd3f25ef3916 \
     --hash=sha256:fe3835eb8d33daece0e799090eda89719dbccee7aa39ef94eed3818cafa5a7e8
@@ -327,10 +325,12 @@ fastapi==0.141.1 \
     --hash=sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3 \
     --hash=sha256:e8822fc40db1e1858054d7a949a888695bc9bdce70139178e33bd2871a453ca1
     # via messagefoundry
-fhir-core==1.1.9 \
-    --hash=sha256:61f23a711199d8d74390fd473cc5ddf75a1f4def97fd8e9f59a28bc9d5222261 \
-    --hash=sha256:e3ee5912c1203993e915730e3eb23e40234f154822a45f15fadf51c76a17e452
-    # via fhir-resources
+fhir-core==1.1.11 \
+    --hash=sha256:c726bd3da2b46292ddda5fa98330cde4707291ec33db8883779a2e0f539fec4b \
+    --hash=sha256:d41069bc9a683982e4caf87fa13f5e25c7ae2882c5ad53cdceaeb08af3d5024c
+    # via
+    #   fhir-resources
+    #   messagefoundry
 fhir-resources==8.3.0 \
     --hash=sha256:151e6c9b4336e36383cc2aaf2067a6f112a420fce1c7bd289182e55dd950871b \
     --hash=sha256:bdfd1c7bd1b89bfa269c1f435727771f6c632cd857e2848221713b3f8b9f46e8

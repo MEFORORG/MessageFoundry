@@ -6,10 +6,8 @@ aiosqlite==0.22.1
     # via messagefoundry
 annotated-doc==0.0.4
     # via fastapi
-annotated-types==0.7.0
-    # via
-    #   messagefoundry
-    #   pydantic
+annotated-types==0.8.0
+    # via pydantic
 antlr4-python3-runtime==4.13.2
     # via fhirpathpy
 anyio==4.14.2
@@ -68,8 +66,10 @@ execnet==2.1.2
     # via pytest-xdist
 fastapi==0.141.1
     # via messagefoundry
-fhir-core==1.1.9
-    # via fhir-resources
+fhir-core==1.1.11
+    # via
+    #   fhir-resources
+    #   messagefoundry
 fhir-resources==8.3.0
     # via messagefoundry
 fhirpathpy==2.2.4

@@ -58,19 +58,16 @@ updates:
       semver-major-days: 7
     # Dependabot WIDENS a declared cap instead of respecting it, so a load-bearing upper bound in
     # pyproject.toml must be restated here as a version range or the cap is decorative. PR #66 rewrote
-    # `annotated-types<0.8` -> `<0.9` (BOTH declaration sites) and `ruff>=0.4,<0.16` -> `<0.17`; the
+    # `annotated-types<0.8` -> `<0.9` and `ruff>=0.4,<0.16` -> `<0.17`; the
     # resync then propagated 0.8.0/0.16.0 into constraints.lock, so ci.yml's `--constraint` pinned CI
     # *to* the broken versions. `python-deps` groups every minor and patch on `*`, and both of those
     # bumps are minors, so they red the WHOLE batch and hold every benign bump in it hostage. WHY
-    # each is capped lives beside the cap in pyproject.toml (annotated-types in
-    # [project.dependencies] and in the [fhir] extra; ruff in [dev]) — do not
-    # restate it here; lift a cap and delete its entry in the SAME PR. ONE entry covers BOTH
-    # annotated-types declarations: `ignore` filters a candidate VERSION by package name within this
-    # manifest, not by declaration site, so a second entry would describe nothing.
+    # each is capped lives beside the cap in pyproject.toml (ruff in [dev]) — do not
+    # restate it here; lift a cap and delete its entry in the SAME PR.
     # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
-    # routine one (`update-types` is the version-only knob and cannot express a range). A 0.7.x /
-    # 0.15.x advisory fix still flows. Detection is untouched — security.yml's REQUIRED
-    # `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a withheld fix
+    # routine one (`update-types` is the version-only knob and cannot express a range). A 0.15.x
+    # advisory fix still flows. Detection is untouched — security.yml's REQUIRED
+    # `pip-audit -r requirements.lock` covers it on every PR and on the daily cron, so a withheld fix
     # reds a merge-blocking gate within ~24h and a human lifts the cap. Note the ceiling is the
     # pyproject CAP, not this entry: a human would have to lift it either way.
     # NOT IGNORED, deliberately: the exact `==` pins in `[dependency-groups]`, and no blanket
@@ -96,7 +93,7 @@ updates:
     # covered `requirements.lock`, `ci-scanners.lock` and `ci-quality.lock` but NOT
     # `ci/locks/release-tools.lock`, which a9354808e added to the export and byte-diff set without
     # adding to the audit set. That gap is closed in the same commit as this entry, so the
-    # annotated-types / ruff bargain — detection untouched, a withheld fix reds a required gate
+    # ruff bargain — detection untouched, a withheld fix reds a required gate
     # within ~24h, a human lifts the entry — now holds here too. If that audit line is ever removed,
     # REMOVE THIS ENTRY WITH IT.
     #
@@ -105,17 +102,15 @@ updates:
     # ship them (3.5.1, 3.6.7), so a 4.4.1 is possible. This range leaves the 4.4.x patch track open
     # and blocks only the minor bump the ruling declined.
     #
-    # `cyclonedx-bom` is the same WIDENED-CAP case as annotated-types and ruff, not a sigstore-style
+    # `cyclonedx-bom` is the same WIDENED-CAP case as ruff, not a sigstore-style
     # ruling. PR 1552 rewrote the release-tools `~=7.3.1` to `>=7.3.1,<7.5.0` and locked 7.4.0,
     # lifting a deliberate ceiling. test_floored_group_pins_stay_declared caught the spec and redded
-    # the whole batch, so this entry keeps benign bumps from being held behind it, as the two above
-    # do. Why the ceiling exists is the cyclonedx-bom note above `release-tools` in pyproject.toml;
+    # the whole batch, so this entry keeps benign bumps from being held behind it, as ruff's
+    # does. Why the ceiling exists is the cyclonedx-bom note above `release-tools` in pyproject.toml;
     # read it there. The range leaves the 7.3.x patch track open. The trade-off note above holds:
     # security.yml runs pip-audit over ci/locks/release-tools.lock. Lift this entry in the same PR
     # that moves the pyproject spec to a validated 7.4.
     ignore:
-      - dependency-name: "annotated-types"
-        versions: [">=0.8.0"]
       - dependency-name: "ruff"
         versions: [">=0.16.0"]
       - dependency-name: "sigstore"
