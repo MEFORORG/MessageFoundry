@@ -144,6 +144,12 @@ def _python_under(root: Path, prefix: str = "") -> dict[str, str]:
 
 
 @functools.cache
+def _engine_sources() -> dict[str, str]:
+    """The engine's modules alone, for the threat-model register, which reads only the engine."""
+    return _python_under(_PKG)
+
+
+@functools.cache
 def _package_sources() -> dict[str, str]:
     """The engine's modules, and the toolkit's under its package name, as the page names them.
 
@@ -151,12 +157,7 @@ def _package_sources() -> dict[str, str]:
     which ships as its own distribution. A module that moves must not leave the scans, so every
     inventory here reads both roots (BACKLOG #1190). Engine keys carry no prefix, so the toolkit's
     ``__main__.py`` cannot collide with the engine's."""
-    return {**_python_under(_PKG), **_python_under(_TOOLKIT, _TOOLKIT_PREFIX)}
-
-
-def _engine_only(sites: Mapping[str, frozenset[str]]) -> dict[str, frozenset[str]]:
-    """``sites`` without the toolkit's, for the threat-model register, which reads only the engine."""
-    return {rel: forms for rel, forms in sites.items() if not rel.startswith(_TOOLKIT_PREFIX)}
+    return {**_engine_sources(), **_python_under(_TOOLKIT, _TOOLKIT_PREFIX)}
 
 
 def _parse(source: str) -> ast.Module:
@@ -467,7 +468,7 @@ def _register_gap(live: Mapping[str, object], register: Mapping[str, object]) ->
 def test_the_two_process_start_inventories_agree() -> None:
     """``tests/test_threat_model_doc_drift.py`` keeps its own register of process-start modules for
     the vault threat model. Two registers of one fact drift apart unless something compares them."""
-    gap = _register_gap(_engine_only(_start_sites(_package_sources())), _ALLOWED_SUBPROCESS_SITES)
+    gap = _register_gap(_start_sites(_engine_sources()), _ALLOWED_SUBPROCESS_SITES)
     assert not gap, f"the two process-start inventories disagree on {sorted(gap)}"
 
 
@@ -642,20 +643,18 @@ def test_code_drift_is_reported() -> None:
 def test_the_scans_read_the_toolkit() -> None:
     """The toolkit holds no site today, so a scan that skipped it would pass the same way. It must be
     read, keyed by its package name, and a site planted in it must reach every inventory."""
-    toolkit = {rel for rel in _package_sources() if rel.startswith(_TOOLKIT_PREFIX)}
-    assert f"{_TOOLKIT_PREFIX}adr_analyze.py" in toolkit, f"toolkit not scanned: {sorted(toolkit)}"
-    assert f"{_TOOLKIT_PREFIX}adr_analyze.py" in _parser_scan_sources()
-    assert _unit_exists(f"{_TOOLKIT_PREFIX}adr_analyze.py")
+    analyzer = f"{_TOOLKIT_PREFIX}adr_analyze.py"
+    assert analyzer in _package_sources(), "the toolkit is not scanned"
+    assert _unit_exists(analyzer)
     text = _doc_text()
     planted = dict(_package_sources())
-    planted[f"{_TOOLKIT_PREFIX}new_tool.py"] = "import ctypes, subprocess, tarfile, json\n"
-    planted[f"{_TOOLKIT_PREFIX}new_tool.py"] += "subprocess.run(['x'])\njson.loads(b)\n"
+    planted[f"{_TOOLKIT_PREFIX}new_tool.py"] = (
+        "import ctypes, subprocess, tarfile, json\nsubprocess.run(['x'])\njson.loads(b)\n"
+    )
     assert _ctypes_drift(text, _ctypes_modules(planted))
     assert _start_drift(text, _start_sites(planted))
     assert _archive_drift(text, _archive_modules(planted))
     assert _parser_drift(text, _parse_sites(planted))
-    # The threat-model register reads only the engine, so a toolkit start must not be held to it.
-    assert not _register_gap(_engine_only(_start_sites(planted)), _ALLOWED_SUBPROCESS_SITES)
 
 
 # --- sections 7 to 10: archives, service scripts, the extension, the web console (BACKLOG #1190) ---
@@ -1154,7 +1153,8 @@ def _parse_sites(sources: Mapping[str, str]) -> set[str]:
 def _parser_scan_sources() -> dict[str, str]:
     """The engine's and the toolkit's modules, and the web console's under their package name, as
     the page names them."""
-    return {**_package_sources(), **_python_under(_CONSOLE, _CONSOLE_PREFIX)}
+    console = {f"{_CONSOLE_PREFIX}{rel}": source for rel, source in _console_python().items()}
+    return {**_package_sources(), **console}
 
 
 def _table_units(section: str, header: str) -> set[str]:
@@ -1170,11 +1170,9 @@ def _table_units(section: str, header: str) -> set[str]:
 
 
 def _unit_exists(unit: str) -> bool:
-    if unit.startswith(_CONSOLE_PREFIX):
-        return (_CONSOLE / unit.removeprefix(_CONSOLE_PREFIX)).exists()
-    if unit.startswith(_TOOLKIT_PREFIX):
-        return (_TOOLKIT / unit.removeprefix(_TOOLKIT_PREFIX)).exists()
-    return (_PKG / unit).exists()
+    # A prefixed unit names its own top-level package, so it resolves from the repository root.
+    prefixed = unit.startswith((_CONSOLE_PREFIX, _TOOLKIT_PREFIX))
+    return (_ROOT / unit if prefixed else _PKG / unit).exists()
 
 
 def _three_table_drift(
