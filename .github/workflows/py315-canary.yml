@@ -99,13 +99,19 @@ jobs:
       # DELIBERATELY UNCONSTRAINED, as in freethread-smoke.yml: constraints.lock records what
       # resolved on 3.14, and pinning it here measures the lock instead of 3.15. A dependency with no
       # cp315 wheel is a FINDING, so sdists are allowed and the next step names each one.
-      - name: Install the engine (dev extra)
+      #
+      # The extras are ci.yml's full-suite leg's, minus `harness`: PySide6 has no cp315 wheel, and the
+      # canary does not run the Qt harness. Without them, tests whose extra CI always installs (the
+      # vault hops, for one) failed here for a missing import, which read as a 3.15 finding.
+      - name: Install the engine (dev and CI extras)
         id: install
         if: steps.setup.outcome == 'success'
         continue-on-error: true
+        env:
+          EXTRAS: dev,fhir,dicom,x12,xml,webauthn,vault
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --report pip-report.json -e ".[dev]"
+          python -m pip install --report pip-report.json -e ".[$EXTRAS]"
 
       # pyyaml, pulled in by uvicorn[standard], has had no cp315 Windows wheel, and its sdist crashed
       # a 3.15 prerelease interpreter locally. The failed install stays a finding in the verdict;
@@ -114,16 +120,22 @@ jobs:
         id: fallback
         if: steps.setup.outcome == 'success' && steps.install.outcome != 'success'
         continue-on-error: true
+        env:
+          EXTRAS: dev,fhir,dicom,x12,xml,webauthn,vault
         run: |
           python -m pip install --no-deps -e .
           python - > fallback-requirements.txt <<'PY'
-          import tomllib
+          import os, tomllib
           with open("pyproject.toml", "rb") as f:
               project = tomllib.load(f)["project"]
-          for req in project["dependencies"] + project["optional-dependencies"]["dev"]:
+          reqs = list(project["dependencies"])
+          for extra in os.environ["EXTRAS"].split(","):
+              reqs += project["optional-dependencies"][extra]
+          for req in reqs:
               print(req.replace("uvicorn[standard]", "uvicorn"))
           PY
-          python -m pip install -r fallback-requirements.txt
+          # Overwrites the failed install's report, so the next step names THIS path's sdists.
+          python -m pip install --report pip-report.json -r fallback-requirements.txt
 
       - name: Name the dependencies that installed from an sdist
         id: wheels
