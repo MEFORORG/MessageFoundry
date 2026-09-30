@@ -412,7 +412,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
-| Decision records, for `messagefoundry-toolkit adr-analyze`. It reads the Markdown files in the folder `--adr-dir` names, `docs/adr` by default, and matches each one's status, acceptance criteria and open items with regular expressions. It then checks whether each test path a record links to exists. It reads whatever folder the developer names, so the records are only as trusted as their author. | `messagefoundry_toolkit/adr_analyze.py` |
+| Decision records, for `messagefoundry-toolkit adr-analyze`. It reads each `[0-9]*.md` file at the top of the `--adr-dir` folder, `docs/adr` by default. Regular expressions pick out each record's status, acceptance criteria and open items. For each `tests/`, `fixtures/`, `samples/` or `harness/` path a criterion names, it checks whether that path exists under `--repo-root`. Nothing bounds a record's size, and a linked path may climb out of that root with `..`. So a record is only as trusted as its author. | `messagefoundry_toolkit/adr_analyze.py` |
 
 The first two tables rest on a judgement about where each input comes from, and the test cannot
 check that judgement. Re-read a row when its module changes what it reads.

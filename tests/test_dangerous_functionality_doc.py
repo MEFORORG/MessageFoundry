@@ -642,27 +642,26 @@ def test_code_drift_is_reported() -> None:
 
 def test_the_scans_read_the_toolkit() -> None:
     """The toolkit holds no site today, so a scan that skipped it would pass the same way. It must be
-    read, keyed by its package name, and a site planted in it must reach every inventory."""
+    read, keyed by its package name, and a site planted in it must reach at least the five checks
+    below. The real tests hold each unplanted map to the page, so only the plant is checked here."""
     analyzer = f"{_TOOLKIT_PREFIX}adr_analyze.py"
     assert analyzer in _package_sources(), "the toolkit is not scanned"
-    assert analyzer in _parser_scan_sources(), "the parser scan does not read the toolkit"
+    scan = _parser_scan_sources()
+    assert analyzer in scan, "the parser scan does not read the toolkit"
     assert _unit_exists(analyzer)
     text = _doc_text()
-    # Each plant goes into the same source map its real test reads, so each base is quiet unplanted.
     new_tool = f"{_TOOLKIT_PREFIX}new_tool.py"
-    source = "import ctypes, subprocess, tarfile, json\nsubprocess.run(['x'])\njson.loads(b)\n"
-    base = _package_sources()
-    assert not (
-        _ctypes_drift(text, _ctypes_modules(base))
-        or _start_drift(text, _start_sites(base))
-        or _archive_drift(text, _archive_modules(base))
+    source = (
+        "import ctypes, subprocess, tarfile, json\n"
+        "ctypes.CDLL(cfg_path)\nsubprocess.run(['x'])\njson.loads(b)\n"
     )
-    planted = {**base, new_tool: source}
+    # Each plant goes into a copy of the map its real test reads, never into the cached map itself.
+    planted = {**_package_sources(), new_tool: source}
     assert _ctypes_drift(text, _ctypes_modules(planted))
     assert _start_drift(text, _start_sites(planted))
+    assert _computed_loads(planted) != _REVIEWED_COMPUTED_LOADS
     assert _archive_drift(text, _archive_modules(planted))
-    assert not _parser_drift(text, _parse_sites(_parser_scan_sources()))
-    assert _parser_drift(text, _parse_sites({**_parser_scan_sources(), new_tool: source}))
+    assert _parser_drift(text, _parse_sites({**scan, new_tool: source}))
 
 
 # --- sections 7 to 10: archives, service scripts, the extension, the web console (BACKLOG #1190) ---
