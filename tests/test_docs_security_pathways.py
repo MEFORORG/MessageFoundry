@@ -2293,8 +2293,16 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
     admin, other = frozenset({Role.ADMINISTRATOR}), frozenset({Role.OPERATOR})
     ad, local = AuthProvider.AD.value, AuthProvider.LOCAL.value
 
-    def satisfied(provider: str, scope: str, roles: frozenset[Role], *, stamped: bool) -> bool:
-        """``_mfa_satisfied_hash`` for one session with no factor enrolled, ``require_mfa`` on."""
+    def satisfied(
+        provider: str,
+        scope: str,
+        roles: frozenset[Role],
+        *,
+        stamped: bool,
+        enrolled: bool = False,
+        on: bool = True,
+    ) -> bool:
+        """``_mfa_satisfied_hash`` for one session, on a stand-in self that supplies every read."""
         account = SimpleNamespace(id="u1", auth_provider=provider)
         session = SimpleNamespace(
             user_id="u1",
@@ -2312,10 +2320,10 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
             return [r.value for r in roles]
 
         async def second_factor(_user: object) -> bool:
-            return False
+            return enrolled
 
         fake = SimpleNamespace(
-            _settings=SimpleNamespace(require_mfa=True, require_mfa_scope=scope),
+            _settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope),
             _store=SimpleNamespace(
                 get_session=get_session, get_user=get_user, get_user_role_ids=role_ids
             ),
@@ -2327,25 +2335,42 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
         )
         return bool(asyncio.run(AuthService._mfa_satisfied_hash(fake, "h")))  # type: ignore[arg-type]
 
+    scopes = ("administrators", "every_local_account")
     # 1. A directory session that proved no factor (every Kerberos session, and an OIDC one minted
     #    while the claim gate is off) stays pending under BOTH scope values, a non-admin included.
-    for scope in ("administrators", "every_local_account"):
+    for scope in scopes:
         for roles in (admin, other):
             assert not satisfied(ad, scope, roles, stamped=False), (
                 f"an unstamped directory session is satisfied under {scope!r}; the MFA section says "
                 "a directory session that proved no factor owes one under either scope value."
             )
-    # 2. `administrators` frees a local non-Administrator with no factor, and nobody else.
+    # 2. `administrators` takes only a local non-Administrator out of scope.
     assert satisfied(local, "administrators", other, stamped=False)
     assert not satisfied(local, "administrators", admin, stamped=False)
     assert not satisfied(local, "every_local_account", other, stamped=False)
-    # 3. A session minted with its factor met (the OIDC leg with the claim gate on) is satisfied,
+    # 3. An enrolled account owes its factor under either value, the freed local non-admin included.
+    for provider in (ad, local):
+        for scope in scopes:
+            assert not satisfied(provider, scope, other, stamped=False, enrolled=True), (
+                f"an enrolled {provider} session is satisfied under {scope!r} with no stamp; the "
+                "MFA section says an account that has enrolled a factor owes it under either value."
+            )
+    # 4. The directory floor holds only while require_mfa is on: off, an un-enrolled directory
+    #    session is satisfied, which is why the directory sentence opens "While require_mfa is on".
+    for scope in scopes:
+        for roles in (admin, other):
+            assert satisfied(ad, scope, roles, stamped=False, on=False), (
+                "require_mfa = false no longer frees an un-enrolled directory session; restate the "
+                "MFA section's directory sentence and its opt-out."
+            )
+    # 5. A session minted with its factor met (the OIDC leg with the claim gate on) is satisfied,
     #    whatever the scope says.
-    for scope in ("administrators", "every_local_account"):
+    for scope in scopes:
         assert satisfied(ad, scope, other, stamped=True)
 
-    # 4. The OIDC leg's grant IS the claim-gate setting, so the stamp in 3 is what a federated
-    #    session with the claim required gets, and 1 is what it gets with the gate off.
+    # 6. The OIDC leg's grant IS the claim-gate setting, so the stamp in 5 is what a federated
+    #    session with the claim required gets, and 1 is what it gets with the gate off. The gate
+    #    is on by default, as the directory sentence says.
     tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService._authenticate_oidc)))
     grant_sources = [
         node.value
@@ -2361,7 +2386,9 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
         "mfa_verified"
     ]
 
-    # 5. With the claim required, a token with no configured amr/acr is refused, and one with it passes.
+    assert AuthSettings.model_fields["oidc_require_mfa_claim"].default is True
+
+    # 7. With the claim required, a token with no configured amr/acr is refused, and one with it passes.
     policy = OidcClaimPolicy(
         issuer="https://idp.example",
         client_id="c",
@@ -2390,13 +2417,20 @@ def test_the_tenth_sweep_states_the_mfa_scope_reach_for_both_account_kinds() -> 
             "directory session with no proven factor pending under either scope (BACKLOG #1133)."
         )
     for token in (
-        "Setting the scope to `administrators` frees only a **local** account that holds neither "
-        "the Administrator role nor an enrolled factor",
+        "Setting the scope to `administrators` takes only a **local** account without the "
+        "Administrator role out of scope.",
         "a directory session that proved no factor stays MFA-pending under both "
-        "(`AuthService._unverified_session_owes_factor`)",
+        "(`AuthService._unverified_session_owes_factor`). An account that has enrolled a factor "
+        "owes it under either value.",
         "**While `require_mfa` is on, a directory session that proved no factor owes one under "
-        "either scope value**",
-        "Every Kerberos session mints MFA-pending, and so does an OIDC session while "
-        "`[auth].oidc_require_mfa_claim` is off.",
+        "either scope value** (BACKLOG #1144). That is every Kerberos session, and an OIDC session "
+        "minted while `[auth].oidc_require_mfa_claim` is off.",
+        "With the claim required, the default, the engine refuses a token that carries no "
+        "configured `amr`/`acr`, and one that carries it mints the session with its factor met.",
     ):
         assert token in doc, f"docs/SECURITY.md must state {token!r} (BACKLOG #1133)."
+    guide = _flat((_ROOT / "docs" / "EARLY-ADOPTER-GUIDE.md").read_text(encoding="utf-8"))
+    assert "a directory account is in scope like any other" not in guide, (
+        "docs/EARLY-ADOPTER-GUIDE.md says a directory account is in scope like any other again; "
+        "under `administrators` a directory session with no proven factor owes more (BACKLOG #1133)."
+    )

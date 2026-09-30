@@ -1618,10 +1618,11 @@ lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
 loopback bind)** — **every account** must satisfy MFA under the default scope,
 `every_local_account` (a value now wider than its name, BACKLOG #1144). Setting the scope to
-`administrators` frees only a **local** account that holds neither the Administrator role nor an
-enrolled factor: the Administrator role stays in scope under either value
-(`AuthService._mfa_required_for`), and a directory session that proved no factor stays MFA-pending
-under both (`AuthService._unverified_session_owes_factor`). It is an **access gate, not
+`administrators` takes only a **local** account without the Administrator role out of scope. The
+Administrator role stays in scope under either value (`AuthService._mfa_required_for`), and a
+directory session that proved no factor stays MFA-pending under both
+(`AuthService._unverified_session_owes_factor`). An account that has enrolled a factor owes it
+under either value. It is an **access gate, not
 only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **every** authorized route
 until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
 exempt so an un-enrolled user is not stranded. A required-but-unenrolled
@@ -1631,7 +1632,7 @@ directory re-bind, or the IdP leg for an `oidc` session in the console (see
 [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). The documented org opt-out is
 `[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load).
 **While `require_mfa` is on, a directory session that proved no factor owes one under either scope
-value** (BACKLOG #1144). Every Kerberos session mints MFA-pending, and so does an OIDC session while
+value** (BACKLOG #1144). That is every Kerberos session, and an OIDC session minted while
 `[auth].oidc_require_mfa_claim` is off. With the claim required, the default, the engine refuses a
 token that carries no configured `amr`/`acr`, and one that carries it mints the session with its
 factor met. A directory user enrols and satisfies an engine factor on the same routes a local user
