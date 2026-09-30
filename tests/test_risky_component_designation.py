@@ -372,8 +372,8 @@ def test_the_core_lock_parses_to_a_real_closure() -> None:
     """
     pins = _core_lock_pins()
     assert len(pins) >= 20, f"{_CORE_LOCK.name} parsed to {len(pins)} pins, too few to be real"
-    # One transitive (cffi, via cryptography) and one reached only through an extra a core
-    # dependency requests (uvloop, via uvicorn[standard]).
+    # One transitive (cffi, via cryptography) and one whose lock line carries a platform marker
+    # (uvloop, which no Windows install gets).
     assert {"hl7", "cryptography", "cffi", "uvloop"} <= pins.keys(), (
         f"{_CORE_LOCK.name} misses a known transitive or extra-requested core package"
     )

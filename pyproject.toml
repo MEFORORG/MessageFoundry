@@ -95,7 +95,19 @@ dependencies = [
     "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
     # Ceiling: api/protocol_headers.py overrides uvicorn internals, and serve refuses to start if one
     # moves. Raise it only after re-reading uvicorn's protocol modules (BACKLOG #1120).
-    "uvicorn[standard]>=0.29,<0.50",
+    # Plain uvicorn, not uvicorn[standard]: that extra also pulls watchfiles (--reload), python-dotenv
+    # (--env-file), PyYAML (a YAML log config) and colorama (Windows log colour). serve passes no
+    # reload, no env_file and log_config=None, so none of the four is ever imported. The three the
+    # engine does use are declared below with the extra's own markers.
+    "uvicorn>=0.29,<0.50",
+    # The HTTP protocol ``http="auto"`` picks when installed. protocol_headers.py floors both it and h11.
+    "httptools>=0.8.0",
+    # The legacy WebSocket server ``ws="auto"`` resolves to, which protocol_headers.py floors and
+    # /ws/stats runs on. Without a WebSocket library uvicorn serves no WebSocket route at all.
+    "websockets>=16.0",
+    # The event loop uvicorn's ``loop="auto"`` picks; mllp.py's TLS stop path accounts for it. Same
+    # marker as uvicorn[standard], because uvloop has no Windows, PyPy or Cygwin build.
+    "uvloop>=0.22.1; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'",
     "argon2-cffi>=23.1",    # argon2id password hashing (OWASP-recommended)
     "cryptography>=48.0.1", # AES-256-GCM PHI-at-rest encryption for the store (>=48.0.1: GHSA-537c-gmf6-5ccf)
     "ldap3>=2.9",           # Active Directory / LDAP authentication (pure-Python)
@@ -282,6 +294,10 @@ dev = [
     # cap in a deliberate PR that also clears the new findings.
     "ruff>=0.4,<0.16",
     "mypy>=1.10",
+    # Dozens of tests parse the CI workflows and .pre-commit-config.yaml with PyYAML. It used to reach
+    # every install through uvicorn[standard]; the base install dropped that extra, so the suite
+    # declares it here rather than riding on a runtime dependency it does not otherwise need.
+    "pyyaml>=6.0",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
     # is no longer declared here.
 ]
