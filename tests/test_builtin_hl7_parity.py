@@ -235,12 +235,64 @@ def _got(fn: Callable[[], Any]) -> Any:
         return {"raises": type(exc).__name__}
 
 
+#: Where the built-in parser deliberately answers differently from the frozen python-hl7 record,
+#: keyed by (case label, accessor) and mapped to (the record's answer, the answer now required).
+#: Upstream python-hl7 issue 84: its ``unescape`` dropped an escape no second escape character
+#: closed, so ``SMITH\`` read as ``SMITH``. The built-in parser keeps it as data (``_builtin_hl7.
+#: unescape``). The record is left as python-hl7 answered; each divergence is named here instead, and
+#: the old answer is checked too, so a regenerated or edited record cannot move under this table.
+DELIBERATE_DIVERGENCES: dict[tuple[str, str], tuple[Any, Any]] = {
+    ("adv:trailing-escape", f"{surface}.field({path!r})"): (old, new)
+    for surface in ("Peek", "Message")
+    for path, old, new in (
+        ("PID-5.1", "SMITH", "SMITH\\"),
+        ("PID-5.1.1", "SMITH", "SMITH\\"),
+        ("PID-5.2", "JO", "JO\\E"),
+    )
+}
+
+
 def _check(
     failures: list[str], label: str, accessor: str, want: Any, fn: Callable[[], Any]
 ) -> None:
+    divergence = DELIBERATE_DIVERGENCES.get((label, accessor))
+    if divergence is not None:
+        recorded, want = divergence
+        assert _oracle_has(label, accessor, recorded), f"[{label}] {accessor}: record moved"
     got = _got(fn)
     if got != want:
-        failures.append(f"[{label}] {accessor}: python-hl7={want!r} builtins={got!r}")
+        failures.append(f"[{label}] {accessor}: expected={want!r} builtins={got!r}")
+
+
+def _oracle_has(label: str, accessor: str, value: Any) -> bool:
+    """Whether the frozen record answers ``accessor`` on case ``label`` with ``value``."""
+    case = next(c for c in _cases() if c["label"] == label)
+    surface, _, rest = accessor.partition(".field(")
+    path = rest.rstrip(")").strip("'")
+    key = "peek_field" if surface == "Peek" else "message_field"
+    return bool(case[key][path] == value)
+
+
+def test_every_deliberate_divergence_is_exercised() -> None:
+    """A divergence entry that names no real case and accessor would silently excuse nothing."""
+    for label, accessor in DELIBERATE_DIVERGENCES:
+        recorded, _new = DELIBERATE_DIVERGENCES[(label, accessor)]
+        assert _oracle_has(label, accessor, recorded), (label, accessor)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("SMITH\\", "SMITH\\"),  # a lone trailing escape character is data (issue 84)
+        ("JO\\E", "JO\\E"),  # an unterminated run is kept whole
+        ("A\\.in5", "A\\.in5"),  # an unterminated counted escape expands nothing
+        ("O\\S\\Brien", "O^Brien"),  # a terminated escape still unescapes
+        ("x\\E\\", "x\\"),  # an escaped escape character still reads as one
+        ("a\\Z9\\b", "ab"),  # an unmappable, terminated sequence is still dropped
+    ],
+)
+def test_unterminated_escape_is_kept_as_data(value: str, expected: str) -> None:
+    assert _builtin_hl7.unescape(value, ("|", "^", "~", "&", "\\")) == expected
 
 
 def _peek_field(msg: str, path: str) -> Callable[[], Any]:

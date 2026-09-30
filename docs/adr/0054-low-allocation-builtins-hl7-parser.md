@@ -286,10 +286,13 @@ What that costs, stated so nobody reads the record as more than it is:
 - **One synthetic message is left out.** The generated ORU^R30 #1 carries an ORC-2 that the
   forbidden-content gate reads as a site code, so it cannot be committed. ORU^R01 #1 and #2 cover
   the shape.
-- **The record includes python-hl7's bugs, on purpose.** Upstream python-hl7 issue 84: `unescape`
-  drops a trailing, unterminated escape character, so `SMITH\` reads as `SMITH`. The built-in parser
-  reproduces it, and the `adv:trailing-escape` case pins it. Fixing it is a behaviour change for a
-  separate decision; this amendment does not make it.
+- **The record includes python-hl7's bugs, on purpose, and one is now deliberately not followed.**
+  Upstream python-hl7 issue 84: its `unescape` dropped a trailing, unterminated escape character, so
+  `SMITH\` read as `SMITH`. The built-in parser now keeps such a run as data, as its own
+  `unescape_separators` already did, because dropping it loses bytes the sender sent. The record
+  keeps python-hl7's answer for the `adv:trailing-escape` case. `DELIBERATE_DIVERGENCES` in the
+  parity suite names each changed read and checks the record's old answer too. The fix changed
+  those six reads and nothing else across the 39 cases.
 
 ### Other things that moved with it
 

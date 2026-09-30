@@ -552,6 +552,13 @@ def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
     and **drops** sequences it cannot map (matching python-hl7, which logs and discards them). A value
     with no escape character is returned unchanged. MSH-1/MSH-2 are never passed here (the caller
     returns them raw).
+
+    **One deliberate divergence from python-hl7 0.4.5.** An escape character that no second escape
+    character closes (``SMITH\\``, ``JO\\E``) is kept, with the text after it, as data. python-hl7
+    dropped it, so ``SMITH\\`` read as ``SMITH``: upstream python-hl7 issue 84. Nothing in the value
+    says it was a sequence, so dropping it loses bytes the sender sent. :func:`unescape_separators`
+    already keeps an unterminated run the same way. Nothing is expanded, so the ASVS 1.3.3 budget is
+    unaffected.
     """
     field_sep, comp_sep, rep_sep, sub_sep, esc = seps
     if not field or esc not in field:
@@ -615,6 +622,8 @@ def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
             in_seq = True
         else:
             out.append(c)
+    if in_seq:  # unterminated trailing run: keep it as data (python-hl7 issue 84, see above)
+        out.append(esc + "".join(collecting))
     return "".join(out)
 
 
