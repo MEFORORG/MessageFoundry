@@ -11,19 +11,27 @@ They do not. This script builds tiny STUB ``messagefoundry`` wheels in a tempora
 per arm, each holding only metadata, and asks pip to resolve the harness wheel against each with
 ``--no-index --find-links`` and ``--dry-run``. No network, nothing installed:
 
-* an OLDER engine must be refused -- the defect the row names, an engine lacking
+* an OLDER engine (``0.0.1``) must be refused -- the defect the row names, an engine lacking
   ``messagefoundry.apiclient``;
-* a NEWER engine must be refused too, since the harness is lockstep and not a floor;
+* the NEXT MICRO engine must be refused too, since the harness is lockstep and not a floor;
 * the engine at the harness's OWN version must resolve, extra and all, or the refusals prove
   nothing. Aiming at the harness version rather than at the pin is what catches a pin that
   drifted from the version it ships at.
 
-``--ignore-installed`` is load-bearing. Without it pip answers from whatever engine the running
-interpreter already has, and an installed engine at the pinned version satisfies every arm.
+Two probes do not prove a pin EXACT: a range such as ``>0.3,<0.4.1`` passes all three arms. That
+half is the specifier checks' job (``_engine_pin`` and the PYSMOKE lockstep check), which refuse
+anything but a single ``==``. This script adds what they cannot see: that pip refuses.
+
+``--ignore-installed`` and ``--isolated`` are load-bearing. Without the first, pip answers from
+whatever engine the running interpreter already has. Without the second, ``PIP_FIND_LINKS``, any
+other ``PIP_*`` variable, or a user or global ``pip.conf`` adds sources to every arm, and a
+wheelhouse carrying the engine flips the result either way.
 
 WHAT THIS DOES NOT ESTABLISH: that the real engine's dependency tree (PySide6 and the rest)
 resolves. The stub declares the ``harness`` extra with no requirements of its own, so this checks
-the harness-to-engine edge only.
+the harness-to-engine edge only. A harness that declares any OTHER base dependency is refused with
+its own message, because ``--no-index`` could not resolve it and every arm would then read as
+refused, blaming a correct pin.
 
 Usage: ``python scripts/release/harness_resolution_check.py <harness wheel>``. Exit 0 when all
 three arms behave; exit 1, naming the arm, when any does not.
@@ -36,41 +44,69 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from collections.abc import Collection, Iterable
 from email.parser import Parser
 from pathlib import Path
 
+from packaging.requirements import Requirement
 from packaging.version import Version
 
 ENGINE = "messagefoundry"
+ARMS = ("older", "newer", "matched")
 
 
-def _metadata(wheel: Path) -> str:
-    """The ``Version`` the wheel's own METADATA declares."""
+def _metadata(wheel: Path) -> tuple[str, list[str]]:
+    """``(Version, Requires-Dist lines)`` read out of the wheel's own METADATA."""
     with zipfile.ZipFile(wheel) as zf:
         names = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
         if len(names) != 1:
             raise SystemExit(f"::error::{wheel.name} carries {len(names)} METADATA files, not one")
         msg = Parser().parsestr(zf.read(names[0]).decode("utf-8"))
-    return str(msg["Version"])
+    return str(msg["Version"]), msg.get_all("Requires-Dist") or []
 
 
-def _stub_wheel(directory: Path, version: str) -> Path:
-    """A metadata-only ``messagefoundry`` wheel that declares the ``harness`` extra."""
-    dist_info = f"{ENGINE}-{version}.dist-info"
-    path = directory / f"{ENGINE}-{version}-py3-none-any.whl"
+def _other_base_requirements(requires: Iterable[str]) -> list[str]:
+    """Base (non-extra) requirements on anything other than the engine."""
+    others = []
+    for raw in requires:
+        req = Requirement(raw)
+        if req.name.replace("_", "-").lower() == ENGINE:
+            continue
+        if req.marker is not None and not req.marker.evaluate({"extra": ""}):
+            continue
+        others.append(str(req))
+    return others
+
+
+def stub_wheel(
+    directory: Path,
+    name: str,
+    version: str,
+    *,
+    requires: Iterable[str] = (),
+    provides_extra: Iterable[str] = (),
+) -> Path:
+    """A metadata-only wheel. Also used by tests/test_packaging.py for its synthetic harness wheel."""
+    dist = name.replace("-", "_")
+    dist_info = f"{dist}-{version}.dist-info"
+    path = directory / f"{dist}-{version}-py3-none-any.whl"
     files = {
-        f"{dist_info}/METADATA": (
-            f"Metadata-Version: 2.1\nName: {ENGINE}\nVersion: {version}\nProvides-Extra: harness\n"
+        f"{dist_info}/METADATA": "".join(
+            [
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+                *(f"Provides-Extra: {extra}\n" for extra in provides_extra),
+                *(f"Requires-Dist: {req}\n" for req in requires),
+            ]
         ),
         f"{dist_info}/WHEEL": (
             "Wheel-Version: 1.0\nGenerator: harness_resolution_check\nRoot-Is-Purelib: true\n"
             "Tag: py3-none-any\n"
         ),
     }
-    record = "".join(f"{name},,\n" for name in [*files, f"{dist_info}/RECORD"])
+    record = "".join(f"{member},,\n" for member in [*files, f"{dist_info}/RECORD"])
     with zipfile.ZipFile(path, "w") as zf:
-        for name, text in files.items():
-            zf.writestr(name, text)
+        for member, text in files.items():
+            zf.writestr(member, text)
         zf.writestr(f"{dist_info}/RECORD", record)
     return path
 
@@ -79,12 +115,16 @@ def _resolves(harness: Path, engine_version: str, workdir: Path) -> tuple[bool, 
     """Does pip resolve ``harness`` when the only engine it can see is ``engine_version``?"""
     index = workdir / f"index-{engine_version}"
     index.mkdir()
-    _stub_wheel(index, engine_version)
+    stub_wheel(index, ENGINE, engine_version, provides_extra=["harness"])
     argv = [
         sys.executable,
+        "-I",
         "-m",
         "pip",
         "install",
+        "--isolated",
+        "--disable-pip-version-check",
+        "--no-input",
         "--dry-run",
         "--ignore-installed",
         "--no-index",
@@ -92,28 +132,41 @@ def _resolves(harness: Path, engine_version: str, workdir: Path) -> tuple[bool, 
         str(index),
         str(harness),
     ]
-    env = {**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1"}
+    # --isolated ignores PIP_* variables and config files; dropping them here as well means a
+    # future pip that narrows --isolated cannot quietly bring them back.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PIP_")}
     proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, local paths only
         argv, capture_output=True, text=True, env=env, timeout=300, check=False
     )
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
 
 
-def check(harness: Path) -> list[str]:
-    """Every arm that misbehaved, as a message; empty when all three behave."""
+def check(harness: Path, arms: Collection[str] = ARMS) -> list[str]:
+    """Every arm in ``arms`` that misbehaved, as a message; empty when they all behave."""
+    version, requires = _metadata(harness)
+    others = _other_base_requirements(requires)
+    if others:
+        return [
+            f"{harness.name} declares base dependencies besides {ENGINE}: {others}. This check "
+            f"stubs only the engine and runs with --no-index, so every arm would read as refused. "
+            f"Extend scripts/release/harness_resolution_check.py to stub them (BACKLOG #1585)."
+        ]
     # The arms aim at the harness's OWN version, not at whatever its pin says: lockstep means the
     # engine at that version and no other. Aiming at the pin would let a pin that drifted from the
     # version it ships at pass every arm while pointing at the wrong engine.
-    shipped = Version(_metadata(harness))
+    shipped = Version(version)
     major, minor, micro = (list(shipped.release) + [0, 0])[:3]
-    arms = [
-        ("older", "0.0.1", False),
-        ("newer", f"{major}.{minor}.{micro + 1}", False),
-        ("matched", str(shipped), True),
-    ]
+    probes = {
+        "older": ("0.0.1", False),
+        "newer": (f"{major}.{minor}.{micro + 1}", False),
+        "matched": (str(shipped), True),
+    }
     failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="harness-resolution-") as tmp:
-        for arm, engine_version, want in arms:
+        for arm in ARMS:
+            if arm not in arms:
+                continue
+            engine_version, want = probes[arm]
             got, out = _resolves(harness, engine_version, Path(tmp))
             print(
                 f"{arm}: engine {engine_version} -> {'resolves' if got else 'refused'}",

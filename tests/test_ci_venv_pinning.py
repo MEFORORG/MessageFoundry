@@ -1138,9 +1138,6 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
 #: A bare lowercase 64-hex token — the shape of an in-repo SHA-256 pin, as `sha256sum -c` wants it.
 _SHA256_LITERAL = re.compile(r"\b[0-9a-f]{64}\b")
 
-#: `NAME=<64 hex>` — a shell variable holding such a pin, which is how release.yml spells it.
-_SHA256_ASSIGNMENT = re.compile(r"(\w+)=([0-9a-f]{64})\b")
-
 #: A `$VAR` or `${VAR}` reference, for binding a verification line back to one of those assignments.
 _VAR_REF = re.compile(r"\$\{?(\w+)\}?")
 
@@ -1162,9 +1159,13 @@ _SAME_ORIGIN_CHECKSUM_FETCH = re.compile(
 )
 
 
-#: `NAME=value`, `NAME="value"` or `NAME='value'` on a line of its own -- the simple assignments the
-#: filename binding resolves. A value holding a command substitution is left unresolved on purpose:
-#: what it expands to is decided at run time, and guessing would let a detector vouch for it.
+#: Any assignment at the start of a line, simple or not. One the simple pattern below cannot read
+#: makes the walk FORGET the name rather than keep its earlier value: a stale value would let the
+#: rule vouch for a file or a digest bash never sees.
+_ANY_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?(\w+)=")
+
+#: `NAME=value`, `NAME="value"` or `NAME='value'` on a line of its own -- the only assignments the
+#: walk resolves. A value holding a command substitution is decided at run time, so it is forgotten.
 _SIMPLE_ASSIGNMENT = re.compile(r"""^\s*(?:export\s+)?(\w+)=("[^"]*"|'[^']*'|[^\s;&|]*)\s*$""")
 
 #: The file `curl` writes: `-o FILE` or `--output FILE`, the value quoted or bare.
@@ -1187,27 +1188,30 @@ def _expand(text: str, env: dict[str, str]) -> str:
     return _VAR_REF.sub(lambda m: env.get(m.group(1), m.group(0)), text)
 
 
-def _shell_assignments(body: str) -> dict[str, str]:
-    """Simple ``NAME=value`` assignments in a step body, each expanded against the ones before it."""
+def _walk_step(body: str) -> tuple[set[str], list[tuple[str, str]]]:
+    """``(files curl -o wrote, [(verify line, that line expanded)])``, read IN ORDER.
+
+    Each line is expanded against the assignments made BEFORE it, the way bash runs it, so a name
+    reassigned between the download and the check resolves to what each line actually sees.
+    """
     env: dict[str, str] = {}
+    written: set[str] = set()
+    verifies: list[tuple[str, str]] = []
     for line in body.splitlines():
-        m = _SIMPLE_ASSIGNMENT.match(line)
-        if m is None:
+        for m in _CURL_OUTPUT.finditer(line):
+            written.add(_expand(_unquote(m.group(1)), env))
+        if _CHECKSUM_VERIFY in line:
+            verifies.append((line.strip(), _expand(line, env)))
+        assigned = _ANY_ASSIGNMENT.match(line)
+        if assigned is None:
             continue
-        value = _unquote(m.group(2))
-        if "$(" in value or "`" in value:
-            continue
-        env[m.group(1)] = _expand(value, env)
-    return env
-
-
-def _curl_output_files(body: str, env: dict[str, str]) -> set[str]:
-    """Every file a ``curl -o`` in the body writes, with its simple variables resolved."""
-    return {
-        _expand(_unquote(m.group(1)), env)
-        for line in body.splitlines()
-        for m in _CURL_OUTPUT.finditer(line)
-    }
+        simple = _SIMPLE_ASSIGNMENT.match(line)
+        value = _unquote(simple.group(2)) if simple else None
+        if value is None or "$(" in value or "`" in value:
+            env.pop(assigned.group(1), None)
+        else:
+            env[assigned.group(1)] = _expand(value, env)
+    return written, verifies
 
 
 def _oidc_download_offences(body: str) -> list[str]:
@@ -1216,49 +1220,47 @@ def _oidc_download_offences(body: str) -> list[str]:
     Factored out of the walk below so the rule can run against a synthetic step body. A rule whose
     only fixture is the live workflow can only ever be shown passing.
 
-    The first two checks BIND THE DIGEST (see the test's docstring). The third BINDS THE FILE, and
-    it was missing until BACKLOG #1698: `sha256sum -c` reads `<digest>  <file>` and checks THAT
-    file, so a step pinning one name and downloading another passed while verifying nothing it went
-    on to install. The verified filename must now be one a `curl -o` in the same step wrote, both
-    read through the step's simple variable assignments.
+    EVERY `sha256sum -c` line must check a digest that traces to an in-repo 64-hex literal, inline
+    or through a variable assigned one earlier in the step. EVERY file a `curl -o` wrote must be
+    one of the files those lines check. The file half was missing until BACKLOG #1698:
+    `sha256sum -c` reads `<digest>  <file>` and checks THAT file, so a step pinning one name and
+    downloading another passed while verifying nothing it went on to install.
 
-    LIMITS, stated rather than left implicit: only `curl -o` / `--output` is read as a download
-    target (not `-O`, `wget`, or `-o` fused into a flag cluster such as `-sSfLo`), and only a
-    `<digest>  <file>` spelled on the verify line itself is read as the verified name. Each of
-    those shapes is REPORTED, not waved through, so a gap costs a false positive a reader sees.
+    LIMITS, stated rather than left implicit: only `curl -o` / `--output` on the curl line itself is
+    read as a download target (not `-O`, `wget`, `--output-dir`, a `-o` on a continuation line, or
+    `-o` fused into a flag cluster such as `-sSfLo`), and only a `<digest>  <file>` spelled on the
+    verify line is read as the verified name. Each unread shape is REPORTED, not waved through, so a
+    gap costs a false positive a reader sees. Control flow is not modelled: an assignment inside an
+    `if` counts as made.
     """
     offences: list[str] = []
-    pinned = {m.group(1) for m in _SHA256_ASSIGNMENT.finditer(body)}
-    env = _shell_assignments(body)
-    verify_lines = [ln for ln in body.splitlines() if _CHECKSUM_VERIFY in ln]
-    bound = [
-        ln
-        for ln in verify_lines
-        if _SHA256_LITERAL.search(ln) or pinned & {m.group(1) for m in _VAR_REF.finditer(ln)}
-    ]
-    if not verify_lines:
+    written, verifies = _walk_step(body)
+    if not verifies:
         offences.append(
             f"carries no {_CHECKSUM_VERIFY!r}, so nothing compares the bytes against a literal, "
             f"inside `id-token: write`"
         )
-    elif not bound:
+        return offences
+    unbound = [raw for raw, expanded in verifies if not _SHA256_LITERAL.search(expanded)]
+    if unbound:
         offences.append(
             f"runs {_CHECKSUM_VERIFY!r} but the digest it checks traces to no in-repo SHA-256 "
-            f"literal, inside `id-token: write`"
+            f"literal, inside `id-token: write`: {unbound}"
         )
-    else:
-        written = _curl_output_files(body, env)
-        verified = {m.group(1) for ln in bound for m in _DIGEST_AND_FILE.finditer(_expand(ln, env))}
-        if not written:
-            offences.append(
-                "downloads with no `curl -o <file>`, so no verified filename can be tied to the "
-                "bytes it fetched"
-            )
-        elif not verified & written:
-            offences.append(
-                f"verifies {sorted(verified) or 'no resolvable filename'} but `curl -o` wrote "
-                f"{sorted(written)}; the pin checks a file the step did not download"
-            )
+    verified = {
+        m.group(1) for _raw, expanded in verifies for m in _DIGEST_AND_FILE.finditer(expanded)
+    }
+    if not written:
+        offences.append(
+            "downloads with no `curl -o <file>`, so no verified filename can be tied to the "
+            "bytes it fetched"
+        )
+    elif unverified := written - verified:
+        offences.append(
+            f"`curl -o` wrote {sorted(unverified)} and no in-repo digest checks it (the pin checks "
+            f"{sorted(verified) or 'no resolvable filename'}); the step can install bytes nothing "
+            f"verified"
+        )
     if _SAME_ORIGIN_CHECKSUM_FETCH.search(body):
         offences.append(
             "reaches for a checksums file from the asset's own origin; that is replaced by "
@@ -1277,10 +1279,11 @@ def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
     BEFORE the signing step. Anything executing there is in position ahead of every control standing
     after it, so a backdoored binary would carry a VALID signature and VALID provenance downstream.
 
-    TWO CHECKS, and the first is a BINDING rather than a presence test. `sha256sum -c` must run, and
-    the digest it checks must trace to an in-repo 64-hex literal — inline on that line, or through a
-    variable assigned one in the same body. Separately, no checksums file may be FETCHED from the
-    asset's origin.
+    THREE CHECKS, and the first two are BINDINGS rather than presence tests. Every `sha256sum -c`
+    must check a digest that traces to an in-repo 64-hex literal, inline on that line or through a
+    variable assigned one earlier in the same body. Every file `curl -o` wrote must be one of the
+    files those lines check (BACKLOG #1698). Separately, no checksums file may be FETCHED from the
+    asset's origin. `_oidc_download_offences` holds all three.
 
     The binding is the part that took two passes to get right. Measured: three independent whole-body
     searches (a 64-hex exists / `sha256sum -c` appears / no checksums fetch) ALL pass on a step that
@@ -1375,7 +1378,7 @@ curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
 echo "${{PIN}}  b.tgz" | sha256sum -c -
 tar -xzf a.tgz tool
 """,
-            "the pin checks a file the step did not download",
+            "no in-repo digest checks it",
         ),
         (
             # The same mismatch routed through variables, so the resolution is what is under test.
@@ -1386,7 +1389,50 @@ want=b.tgz
 curl -sSfL "https://github.com/o/r/releases/download/v1.0/${{got}}" -o "${{got}}"
 echo "${{PIN}}  ${{want}}" | sha256sum -c -
 """,
-            "the pin checks a file the step did not download",
+            "no in-repo digest checks it",
+        ),
+        (
+            # Two downloads, one verified: the unverified one is what gets installed.
+            "second-download-unverified",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/b.tgz" -o b.tgz
+echo "${{PIN}}  a.tgz" | sha256sum -c -
+tar -xzf b.tgz tool
+""",
+            "no in-repo digest checks it",
+        ),
+        (
+            # A pinned check must not excuse an unpinned one beside it.
+            "second-verify-unpinned",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/b.tgz" -o b.tgz
+echo "${{PIN}}  a.tgz" | sha256sum -c -
+echo "${{REMOTE}}  b.tgz" | sha256sum -c -
+""",
+            "traces to no in-repo SHA-256 literal",
+        ),
+        (
+            # The name is reassigned between the download and the check; bash checks b.tgz.
+            "reassigned-between-download-and-check",
+            f"""PIN={_PINNED_DIGEST}
+f=a.tgz
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o "$f"
+f=b.tgz
+echo "${{PIN}}  $f" | sha256sum -c -
+""",
+            "no in-repo digest checks it",
+        ),
+        (
+            # The pin variable is overwritten from the network before it is used.
+            "pin-reassigned-from-network",
+            f"""PIN={_PINNED_DIGEST}
+curl -sSfL "https://github.com/o/r/releases/download/v1.0/a.tgz" -o a.tgz
+PIN=$(curl -sSfL https://example.com/a.sha256)
+echo "${{PIN}}  a.tgz" | sha256sum -c -
+""",
+            "traces to no in-repo SHA-256 literal",
         ),
         (
             "no-curl-output-file",

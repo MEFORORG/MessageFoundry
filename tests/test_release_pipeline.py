@@ -2393,3 +2393,34 @@ def test_the_sbomqs_pin_blocks_and_only_the_score_is_advisory() -> None:
         "is the shape this split removed: a fetch in an advisory step cannot block on its pin"
     )
     assert install_at < score_at, "the sbomqs score runs before the step that installs sbomqs"
+
+
+def test_the_harness_smoke_runs_the_install_resolution_check() -> None:
+    """The install legs of BACKLOG #1585 must run on the BUILT wheel, and nothing else shows it.
+
+    ``tests/test_packaging.py`` runs ``scripts/release/harness_resolution_check.py`` on a synthetic
+    wheel. The call on the real artifact lives only in release.yml, which runs at tag time, after
+    the engine is already on PyPI. So a deleted line or a path typo there would pass every PR check
+    and first fail, or silently not run, on a release. This pins the call and the path.
+
+    Mutation: delete the call, rename the script, or soften it with ``|| true``. Red here.
+    """
+    script = "scripts/release/harness_resolution_check.py"
+    assert (_REPO / script).is_file(), f"{script} is gone, but release.yml still calls it"
+    steps = [
+        step
+        for step in _jobs()["release-harness"]["steps"]
+        if isinstance(step, dict)
+        and str(step.get("name") or "").startswith("Smoke-check the harness wheel")
+    ]
+    assert len(steps) == 1, f"expected one harness wheel smoke step, found {len(steps)}"
+    calls = [
+        line.strip()
+        for line in _executed_shell(str(steps[0].get("run") or "")).splitlines()
+        if script in line
+    ]
+    assert calls == [f"/tmp/harnesssmoke/bin/python -I {script} harness-dist/*.whl"], (
+        f"the harness wheel smoke must run {script} on the built wheel, in the smoke venv, "
+        f"unsoftened; found {calls}"
+    )
+    assert "continue-on-error" not in steps[0], "the harness wheel smoke acquired continue-on-error"

@@ -512,7 +512,9 @@ jobs:
           SBOMQS_SHA256=14fd58b89d4948265cce0fdb95d9b635ff667f352b5a9a05b3d13dbefa5d0195
           asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
           base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
-          curl -sSfL "${base}/${asset}" -o "${asset}"
+          # --retry covers a transient network error, which now blocks the release too. A pin
+          # MISMATCH is not a curl error, so it is never retried: the `sha256sum -c` below fails it.
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
           # Verify BY the canonical asset name: sha256sum -c reads "<digest>  <filename>" and checks
           # that file, so the name must match what curl wrote.
           echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
@@ -524,11 +526,11 @@ jobs:
         run: |
           # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
           # SBOM completeness is visible in the release log. Advisory: SBOM quality is a signal, not a
-          # gate (ADR 0149). It runs only the binary the BLOCKING step above verified and installed, so
-          # this continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG
-          # #1698).
-          sbomqs score -b messagefoundry-sbom.cdx.json
-          sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
+          # gate (ADR 0149). It calls the binary the BLOCKING step above verified, by the path it was
+          # installed at, so no other `sbomqs` earlier on PATH can stand in for it. This
+          # continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG #1698).
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json
+          /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |

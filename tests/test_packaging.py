@@ -638,9 +638,9 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
     ``messagefoundry.apiclient`` at module level, so an engine without it installs cleanly and then
     fails on the operator's first command.
 
-    WHAT THIS DOES NOT ESTABLISH: that a mismatched engine is refused at install time. That needs an
-    index carrying an older release and cannot run here. What is checked is the specifier the build
-    will emit as ``Requires-Dist``.
+    What is checked HERE is the specifier the build will emit as ``Requires-Dist``. That a mismatched
+    engine is refused at install time is checked separately, offline, by
+    ``test_the_harness_pin_refuses_a_mismatched_engine_at_install_time`` below.
     """
     harness = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))
     # READ FROM `[tool.hatch.version].path`, NOT HARDCODED -- but note what that buys and what it
@@ -691,40 +691,26 @@ def test_the_harness_pin_keeps_the_extra_the_harness_actually_needs() -> None:
 _RESOLUTION_CHECK = _REPO / "scripts" / "release" / "harness_resolution_check.py"
 
 
+@functools.cache
+def _resolution_module() -> Any:
+    """The resolution-check script, loaded by path. Its ``stub_wheel`` builds the synthetic harness
+    wheels below, so the test and the script cannot drift into two wheel writers."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("harness_resolution_check", _RESOLUTION_CHECK)
+    assert spec is not None and spec.loader is not None, f"cannot load {_RESOLUTION_CHECK}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _synthetic_harness_wheel(directory: Path, version: str, requires: list[str]) -> Path:
     """A metadata-only harness wheel carrying ``requires`` as its ``Requires-Dist``."""
-    import zipfile
-
-    dist_info = f"messagefoundry_harness-{version}.dist-info"
-    path = directory / f"messagefoundry_harness-{version}-py3-none-any.whl"
-    files_ = {
-        f"{dist_info}/METADATA": "".join(
-            [
-                "Metadata-Version: 2.1\nName: messagefoundry-harness\n",
-                f"Version: {version}\n",
-                *(f"Requires-Dist: {req}\n" for req in requires),
-            ]
-        ),
-        f"{dist_info}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-    }
-    with zipfile.ZipFile(path, "w") as zf:
-        for name, text in files_.items():
-            zf.writestr(name, text)
-        zf.writestr(f"{dist_info}/RECORD", "".join(f"{n},,\n" for n in [*files_, "RECORD"]))
-    return path
-
-
-def _run_resolution_check(wheel: Path) -> tuple[int, str]:
-    import sys
-
-    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
-        [sys.executable, str(_RESOLUTION_CHECK), str(wheel)],
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
+    return Path(
+        _resolution_module().stub_wheel(
+            directory, "messagefoundry-harness", version, requires=requires
+        )
     )
-    return proc.returncode, proc.stdout + proc.stderr
 
 
 def _require_pip() -> None:
@@ -742,16 +728,28 @@ def test_the_harness_pin_refuses_a_mismatched_engine_at_install_time(tmp_path: P
     ``scripts/release/harness_resolution_check.py`` builds metadata-only STUB engine wheels in a
     temporary directory and resolves against them with ``--no-index --dry-run``. No network.
 
-    The harness wheel here is synthetic too, but its ``Requires-Dist`` is the REAL
+    Run through the script's CLI, the way release.yml's harness wheel smoke runs it on the BUILT
+    wheel. The harness wheel here is synthetic, but its ``Requires-Dist`` is the REAL
     ``[project].dependencies`` table and its version is the shipped one, so a change to that table
-    moves this test. release.yml's harness wheel smoke runs the same script on the BUILT wheel.
+    moves this test.
     """
+    import sys
+
     _require_pip()
     deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
     shipped = _version_literal(version_path(_HARNESS_PYPROJECT))
     wheel = _synthetic_harness_wheel(tmp_path, shipped, deps)
-    rc, out = _run_resolution_check(wheel)
-    assert rc == 0, f"the harness pin did not behave at install time (BACKLOG #1585):\n{out}"
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [sys.executable, str(_RESOLUTION_CHECK), str(wheel)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, (
+        f"the harness pin did not behave at install time (BACKLOG #1585):\n{out}"
+    )
     for arm in ("older", "newer", "matched"):
         assert f"{arm}: engine" in out, f"the resolution check never ran its {arm} arm:\n{out}"
 
@@ -770,15 +768,30 @@ def test_the_install_resolution_check_fails_when_the_pin_is_loose(
 ) -> None:
     """The control: the resolution check must FAIL on the shapes #1585 exists to stop.
 
-    Without this arm the test above could pass because pip refuses everything (a stub the resolver
-    cannot read, say). Each case names the arm that must catch it. ``wrong-pin`` is the case where
-    the harness version and its pin disagree: pip refuses the engine at the harness's own version.
+    Without this the test above could pass because pip refuses everything (a stub the resolver
+    cannot read, say). Each case runs only the arm that must catch it, in process, so the controls
+    cost one pip run each. ``wrong-pin`` is the case where the harness version and its pin
+    disagree: pip refuses the engine at the harness's own version.
     """
     _require_pip()
     wheel = _synthetic_harness_wheel(tmp_path, "0.3.2", requires)
-    rc, out = _run_resolution_check(wheel)
-    assert rc != 0, f"the resolution check passed {requires}, which it exists to refuse:\n{out}"
-    assert f"the {arm} arm" in out, f"expected the {arm} arm to catch {requires}:\n{out}"
+    failures = _resolution_module().check(wheel, arms={arm})
+    assert any(f"the {arm} arm" in f for f in failures), (
+        f"the {arm} arm passed {requires}, which it exists to refuse: {failures}"
+    )
+
+
+def test_the_install_resolution_check_names_an_unstubbed_dependency(tmp_path: Path) -> None:
+    """A second base dependency must be named, not blamed on the pin.
+
+    ``--no-index`` cannot resolve anything the script did not stub, so without this refusal every
+    arm reads as "refused" and the matched arm blames a correct engine pin.
+    """
+    wheel = _synthetic_harness_wheel(
+        tmp_path, "0.3.2", ["messagefoundry[harness]==0.3.2", "httpx>=0.27"]
+    )
+    failures = _resolution_module().check(wheel)
+    assert len(failures) == 1 and "httpx" in failures[0] and "besides" in failures[0], failures
 
 
 def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> None:
