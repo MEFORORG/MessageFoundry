@@ -49,6 +49,9 @@ two is the regression this module exists to make impossible, and it looks exactl
 built wheel's own declared closure resolves, so feeding it a lock would defeat its purpose — but its
 `packaging` install is covered by the version-pin rule below. Pure text checks, no network.
 
+**Amendment, 2026-09-30.** `/tmp/sbomenv` no longer gets the pip `ensurepip` provisions at all, so
+the SBOM lists only the runtime closure; `test_sbom_scan_venv_is_created_without_a_seeded_pip` says why.
+
 SCOPE, stated so it is a boundary rather than an oversight: the version-pin rule is the RELEASE path.
 `security.yml` keeps its `--upgrade pip` bootstraps, registered in `SECURITY_YML_ACCEPTED_UNPINNED`
 rather than pinned, so a NEW unpinned install there still fails — the exception is enumerated, not
@@ -139,11 +142,27 @@ def _code_lines(wf: Path) -> list[str]:
     ]
 
 
-def _install_re(venv: str) -> re.Pattern[str]:
-    """Match an install into ``venv`` in EITHER spelling: ``<venv>/bin/pip install ...`` and
-    ``<venv>/bin/python -m pip install ...``. Matching only the first would leave the second — the form
-    used for the interpreter-level installs in these same workflows — a silent way back in."""
-    return re.compile(rf"{re.escape(venv)}/bin/(?:pip|python\s+-m\s+pip)\s+install\b")
+def _installs_into(venv: str, line: str) -> bool:
+    """True when ``line`` runs a pip install INTO ``venv``, in any of three spellings:
+    ``<venv>/bin/pip install ...``, ``<venv>/bin/python -m pip install ...``, and the OUTER pip driving
+    the venv, ``pip --python <venv>[/bin/python] install ...`` (pip accepts the directory too). The third
+    is how the SBOM steps install into a venv built ``--without-pip``.
+
+    The install grammar is ``_PIP_INSTALL``'s, so the two cannot drift; this only asks whether the venv
+    is named before the subcommand. Each command in a ``&&``/``;``/``|`` chain is judged on its own, so
+    an earlier install on the same line cannot hide a later one.
+    """
+    named = re.compile(rf"{re.escape(venv)}(?:/bin/(?:pip|python)[\d.]*|/)?(?=\s|$)")
+    for command in re.split(r"&&|\|\||[;|]", line):
+        match = _PIP_INSTALL.search(command)
+        if match is not None and named.search(command[: match.end()]):
+            return True
+    return False
+
+
+def _venv_create_re(venv: str) -> re.Pattern[str]:
+    """``python -m venv [flags] <venv>`` — flags allowed, because the SBOM venvs carry ``--without-pip``."""
+    return re.compile(rf"\bpython3?\s+-m\s+venv\s+(?:-\S+\s+)*{re.escape(venv)}(?:\s|$)")
 
 
 @pytest.mark.parametrize(("workflow", "venv"), LOCK_ONLY_VENVS)
@@ -153,12 +172,12 @@ def test_lock_only_scratch_venv_installs_are_hash_pinned(workflow: str, venv: st
 
     # Non-vacuity: if a scratch venv is restructured away, fail loudly rather than pass by finding
     # nothing to check.
-    assert any(f"python -m venv {venv}" in ln for ln in lines), (
+    assert any(_venv_create_re(venv).search(ln) for ln in lines), (
         f"{workflow} no longer creates the {venv} scratch venv — re-point this guard at whatever "
         f"replaced it instead of letting it pass vacuously"
     )
 
-    installs = [ln for ln in lines if _install_re(venv).search(ln)]
+    installs = [ln for ln in lines if _installs_into(venv, ln)]
     assert installs, f"{workflow} creates {venv} but installs nothing into it"
     for ln in installs:
         assert "--require-hashes" in ln, (
@@ -179,14 +198,82 @@ def test_scratch_venvs_do_not_hide_an_unpinned_pip_fetch(workflow: str) -> None:
     )
 
 
+@pytest.mark.parametrize("workflow", ("release.yml", "security.yml"))
+def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str) -> None:
+    """The venv `cyclonedx_py environment` reads must be built ``--without-pip``.
+
+    Environment mode lists EVERY distribution installed in the venv it is pointed at, and a plain
+    ``python -m venv`` seeds the interpreter's bundled (ensurepip) pip. So the SBOM listed pip, the
+    venv's installer, which ``pip install messagefoundry`` never pulls. Listing it at any version is
+    inaccurate, and it draws scanner findings whenever the bundled pip lags a fix: a local Windows 3.14
+    build seeded pip 26.1.2, which scanners flag. So the contract is absence, not a version: once
+    nothing is seeded, the SBOM lists only what the core lock installs.
+
+    Also refused: ``--system-site-packages``, which makes environment mode list the runner
+    interpreter's pip and the whole release toolchain; and seeding the venv, then uninstalling pip.
+    The second reaches the same SBOM, but only while the uninstall line survives, and nothing here
+    would notice it going.
+    """
+    shell = _executed_shell(_sbom_step_run(workflow))
+    scanned = re.search(r"cyclonedx_py\s+environment\s+(\S+)/bin/python\b", shell)
+    assert scanned, f"{workflow}'s SBOM step no longer names the venv interpreter it scans"
+    venv = scanned.group(1)
+    code = [ln.strip() for ln in shell.splitlines()]
+    creates = [ln for ln in code if _venv_create_re(venv).search(ln)]
+    assert len(creates) == 1, (
+        f"{workflow}'s SBOM step should create {venv} exactly once, found {creates}"
+    )
+    flags = creates[0].split()
+    assert "--without-pip" in flags, (
+        f"{workflow} creates the SBOM scan venv WITH a seeded pip: {creates[0]!r}. `cyclonedx_py "
+        f"environment` lists every installed dist, so the shipped SBOM would carry the interpreter's "
+        f"bundled pip, the venv's installer and no part of what `pip install messagefoundry` pulls. "
+        f"Create it with `--without-pip` and install into it with the outer pip's "
+        f"`--python {venv}/bin/python`."
+    )
+    assert "--system-site-packages" not in flags, (
+        f"{workflow} creates the SBOM scan venv with --system-site-packages: {creates[0]!r}. "
+        f"Environment mode would then list the runner interpreter's pip and release toolchain."
+    )
+    assert not [ln for ln in code if re.search(r"\bensurepip\b", ln)], (
+        f"{workflow}'s SBOM step runs ensurepip, which re-seeds the pip `--without-pip` kept out"
+    )
+
+
 # --- the release path: every named package must carry a version ------------------------------------
 
 #: Any `pip install`, in any spelling that reaches a shell: `pip install`, `pip3 install`,
 #: `python -m pip install`, `<venv>/bin/pip install`, and with flags BEFORE the subcommand
 #: (`pip --quiet install X`). Matching only `pip install` would let any of the others through, and a
 #: line this regex does not match is a line the scan below never examines — a silent hole, not a
-#: failure.
-_PIP_INSTALL = re.compile(r"\bpip3?\s+(?:-\S+\s+)*install\b")
+#: failure. A pre-subcommand flag that takes a SEPARATE value (`pip --python /tmp/sbomenv/bin/python
+#: install ...`, which the SBOM steps use) needs its value skipped too, so those flags are listed in
+#: `_PIP_VALUE_FLAGS`: the value-taking general options pip 26.2 lists in `pip --help`, plus its
+#: unlisted aliases (a later pip may add more). A `--flag=value` spelling needs no entry.
+_PIP_VALUE_FLAGS = (
+    "--python",
+    "--log",
+    "--log-file",
+    "--local-log",
+    "--cache-dir",
+    "--proxy",
+    "--retries",
+    "--timeout",
+    "--default-timeout",
+    "--exists-action",
+    "--trusted-host",
+    "--cert",
+    "--client-cert",
+    "--keyring-provider",
+    "--use-feature",
+    "--use-deprecated",
+    "--resume-retries",
+)
+_PIP_INSTALL = re.compile(
+    r"\bpip3?\s+(?:(?:(?:"
+    + "|".join(re.escape(f) for f in _PIP_VALUE_FLAGS)
+    + r")\s+\S+|-\S+)\s+)*install\b"
+)
 
 #: A PIN. `==` fixes the version; `~=X.Y.Z` fixes everything but the patch. `$PKG_PIN` counts — it is
 #: read out of constraints.lock at run time (the quality-advisory.yml ruff-pin pattern), which is MORE
@@ -1313,6 +1400,18 @@ def _installs_in(run_body: str) -> tuple[str, ...]:
     )
 
 
+def _sbom_step_run(workflow: str) -> str:
+    """The ``run:`` body of the ONE step that builds the CycloneDX SBOM, located by what it does
+    (``cyclonedx_py environment``). Shared by the twin check and the seeded-pip check so the two cannot
+    disagree about which step is the SBOM step."""
+    owning = [run for _, run in _run_blocks(workflow) if "cyclonedx_py environment" in run]
+    assert len(owning) == 1, (
+        f"{workflow} has {len(owning)} step(s) running `cyclonedx_py environment`, expected exactly 1. "
+        f"Re-point these SBOM checks rather than letting them read the wrong step."
+    )
+    return owning[0]
+
+
 def _sbom_step_installs(workflow: str) -> tuple[str, ...]:
     """Every `pip install` line inside the step that builds the CycloneDX SBOM, in order.
 
@@ -1327,14 +1426,7 @@ def _sbom_step_installs(workflow: str) -> tuple[str, ...]:
     the two steps are deliberately named differently -- `release.yml` ships its SBOM and `security.yml`
     rehearses it -- and a name is also the one thing here that may be reworded freely.
     """
-    owning = [
-        (label, run) for label, run in _run_blocks(workflow) if "cyclonedx_py environment" in run
-    ]
-    assert len(owning) == 1, (
-        f"{workflow} has {len(owning)} step(s) running `cyclonedx_py environment`, expected exactly 1. "
-        f"Re-point this twin check rather than letting it compare the wrong pair of steps."
-    )
-    installs = _installs_in(owning[0][1])
+    installs = _installs_in(_sbom_step_run(workflow))
     assert installs, (
         f"{workflow}'s SBOM step runs no `pip install` — this check has nothing to compare"
     )
