@@ -2,10 +2,16 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every CLI subcommand has exactly one tier in ``messagefoundry.cli_surface`` (BACKLOG #1192).
 
-The test builds the REAL parser with ``messagefoundry.__main__._build_parser``, the builder ADR 0201
-slice 1 took out of ``main()``. Building runs nothing: no hook, no stream change, no dispatch.
-Two tests below hold that builder to what ``main()`` really parses with, which is the guarantee the
-earlier workaround got by catching the parser at ``main()``'s own ``parse_args`` call.
+The test builds the two REAL parsers: the engine's, with ``messagefoundry.__main__._build_parser``,
+the builder ADR 0201 slice 1 took out of ``main()``, and the toolkit's, with
+``messagefoundry_toolkit.__main__._build_parser`` (slice 2). Building runs nothing: no hook, no
+stream change, no dispatch. Two tests below hold the engine's builder to what ``main()`` really
+parses with, which is the guarantee the earlier workaround got by catching the parser at
+``main()``'s own ``parse_args`` call.
+
+The table is checked against the UNION of the two parsers' rows. ADR 0201 AC-1 adds that the two
+are disjoint and that the toolkit parser registers no production row. That rule holds in every
+slice, so a slice can move some toolkit rows and not others without a hand-kept transition list.
 
 All the table's rules live in one function, :func:`_table_problems`. The real test asserts it finds
 nothing. Each planted test breaks the real data one way and asserts that the same function names the
@@ -16,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import logging
 import subprocess
 import sys
@@ -28,6 +35,7 @@ import pytest
 import messagefoundry.__main__ as cli_module
 import messagefoundry.cli_common as cli_common
 import messagefoundry.cli_surface as cli_surface
+import messagefoundry_toolkit.__main__ as toolkit_cli
 from messagefoundry.cli_common import Dispatch
 from messagefoundry.cli_surface import Tier
 
@@ -93,22 +101,72 @@ def _table_problems(paths: Mapping[str, set[str]], tiers: Mapping[str, Tier]) ->
     return problems
 
 
+def _split_problems(
+    engine: Mapping[str, set[str]], toolkit: Mapping[str, set[str]], tiers: Mapping[str, Tier]
+) -> list[str]:
+    """Every way the engine and toolkit parsers break ADR 0201 AC-1 against ``tiers``.
+
+    The union is not checked here: :func:`_table_problems` checks it, over the merged paths."""
+    problems = [f"on both commands: {p}" for p in sorted(set(engine) & set(toolkit))]
+    problems += [
+        f"production row on the toolkit command: {p}"
+        for p in sorted(toolkit)
+        if tiers.get(p) == "production"
+    ]
+    return problems
+
+
 @pytest.fixture(scope="module")
-def real_paths() -> dict[str, set[str]]:
+def engine_paths() -> dict[str, set[str]]:
     parser, _dispatch = cli_module._build_parser()
     return _command_paths(parser)
 
 
-def test_the_table_matches_the_parser_and_the_ruling(real_paths: dict[str, set[str]]) -> None:
+@pytest.fixture(scope="module")
+def toolkit_paths() -> dict[str, set[str]]:
+    parser, _dispatch = toolkit_cli._build_parser()
+    return _command_paths(parser)
+
+
+@pytest.fixture(scope="module")
+def real_paths(
+    engine_paths: dict[str, set[str]], toolkit_paths: dict[str, set[str]]
+) -> dict[str, set[str]]:
+    return {**engine_paths, **toolkit_paths}
+
+
+def test_the_table_matches_the_parsers_and_the_ruling(real_paths: dict[str, set[str]]) -> None:
     problems = _table_problems(real_paths, cli_surface.CLI_TIERS)
     assert not problems, (
-        "CLI_TIERS in messagefoundry/cli_surface.py disagrees with the parser or the owner ruling "
+        "CLI_TIERS in messagefoundry/cli_surface.py disagrees with the parsers or the owner ruling "
         f"(BACKLOG #1192): {problems}"
     )
 
 
-def test_dispatch_keys_are_the_top_level_subcommands(real_paths: dict[str, set[str]]) -> None:
-    assert set(cli_module._DISPATCH) == {p for p in real_paths if " " not in p}
+def test_the_two_commands_split_the_rows_between_them(
+    engine_paths: dict[str, set[str]], toolkit_paths: dict[str, set[str]]
+) -> None:
+    """ADR 0201 AC-1: disjoint, and no production row on the toolkit command. The union half is the
+    test above, which reads the merged paths."""
+    problems = _split_problems(engine_paths, toolkit_paths, cli_surface.CLI_TIERS)
+    assert not problems, f"the engine and toolkit parsers break ADR 0201 AC-1: {problems}"
+    # Control: slice 2 moved adr-analyze, so the toolkit parser is not empty and the split is real.
+    assert "adr-analyze" in toolkit_paths and "adr-analyze" not in engine_paths
+
+
+def test_dispatch_keys_are_the_top_level_subcommands(engine_paths: dict[str, set[str]]) -> None:
+    assert set(cli_module._DISPATCH) == {p for p in engine_paths if " " not in p}
+
+
+def test_toolkit_dispatch_keys_are_its_top_level_subcommands(
+    toolkit_paths: dict[str, set[str]],
+) -> None:
+    assert set(toolkit_cli._DISPATCH) == {p for p in toolkit_paths if " " not in p}
+
+
+def test_the_toolkit_builder_returns_the_dispatch_map_its_main_uses() -> None:
+    _parser, dispatch = toolkit_cli._build_parser()
+    assert dispatch is toolkit_cli._DISPATCH
 
 
 # --- The builder is what main() parses with, and building changes nothing. ---------------------
@@ -251,6 +309,80 @@ def test_a_mixed_group_must_be_production(real_paths: dict[str, set[str]]) -> No
         "group lens should be production",
         "toolkit differs from the ruling by ['lens parse']",
     ]
+
+
+def test_a_row_on_both_commands_is_named(
+    engine_paths: dict[str, set[str]], toolkit_paths: dict[str, set[str]]
+) -> None:
+    engine = {**engine_paths, "adr-analyze": set()}
+    assert _split_problems(engine, toolkit_paths, cli_surface.CLI_TIERS) == [
+        "on both commands: adr-analyze"
+    ]
+
+
+def test_a_production_row_on_the_toolkit_command_is_named(
+    engine_paths: dict[str, set[str]], toolkit_paths: dict[str, set[str]]
+) -> None:
+    engine = {p: c for p, c in engine_paths.items() if p != "dryrun"}
+    toolkit = {**toolkit_paths, "dryrun": set()}
+    assert _split_problems(engine, toolkit, cli_surface.CLI_TIERS) == [
+        "production row on the toolkit command: dryrun"
+    ]
+
+
+# --- A moved toolkit command is refused by name, before parsing (ADR 0201 AC-3). -----------------
+
+
+def _run_engine(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
+    """Run the engine's ``main()`` without leaking its process-wide changes into later tests."""
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(cli_module, "harden_console_streams", lambda **_kw: None)
+    monkeypatch.setattr(cli_common, "harden_console_streams", lambda **_kw: None)
+    return cli_module.main(argv)
+
+
+def test_a_moved_command_is_refused_on_stderr_alone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arguments the toolkit's adr-analyze accepts. A refusal from argparse would read "invalid
+    # choice"; this one names the toolkit command.
+    assert _run_engine(monkeypatch, ["adr-analyze", "--adr-dir", "docs/adr"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1, captured.err
+    assert "messagefoundry-toolkit adr-analyze" in captured.err
+    assert "invalid choice" not in captured.err
+
+
+def test_a_moved_command_under_json_is_refused_on_stdout_alone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _run_engine(monkeypatch, ["adr-analyze", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert set(payload) == {"error"}
+    assert "messagefoundry-toolkit adr-analyze" in payload["error"]
+
+
+def test_lens_takes_json_mode_without_a_flag(capsys: pytest.CaptureFixture[str]) -> None:
+    """``lens`` has no ``--json`` flag; its children are JSON by default. It is still registered on
+    the engine in slice 2, so the refusal is driven directly rather than through ``main()``."""
+    assert cli_module._refuse_toolkit_command("lens", ["lens", "schema"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "messagefoundry-toolkit lens" in json.loads(captured.out)["error"]
+
+
+def test_only_a_toolkit_row_the_engine_does_not_register_is_refused() -> None:
+    assert cli_module._moved_toolkit_commands() == {"adr-analyze"}
+    # Still registered on the engine in slice 2, so the engine runs it rather than refusing it.
+    assert cli_module._moved_toolkit_command(["generate", "--type", "ADT"]) is None
+    # A production command is never refused, and an option before the command is skipped.
+    assert cli_module._moved_toolkit_command(["--version"]) is None
+    assert cli_module._moved_toolkit_command(["serve", "adr-analyze"]) is None
+    assert cli_module._moved_toolkit_command(["--json", "adr-analyze"]) == "adr-analyze"
 
 
 # --- The module stays cheap to import -----------------------------------------------------------

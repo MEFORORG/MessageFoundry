@@ -31,13 +31,19 @@ MOVING A TOOLKIT ROW HAS A DOCUMENTATION HALF. At least ``init`` and ``generate`
 install and adopter guides as commands a deploying operator runs, so the change that takes a row
 off the engine's entry point must change those guides in the same change.
 
-``tests/test_cli_surface.py`` builds the real parser and fails when a subcommand has no row, when a
-row names no subcommand, when a group breaks the rule above, or when the toolkit rows stop matching
-the ruling.
+WHICH COMMAND REGISTERS WHICH ROWS (ADR 0201). Two parsers register rows: the engine's
+``messagefoundry`` command, and the separate ``messagefoundry-toolkit`` command from the
+distribution of that name. A row's key is the same string on either command. ADR 0201 moves the
+toolkit rows one slice at a time. Slice 2 moved ``adr-analyze``; every other toolkit row is still
+registered on the engine's command and still packed in its wheel. The engine refuses a top-level
+toolkit row it no longer registers, with a line naming the toolkit command.
 
-THIS TABLE CHANGES NOTHING THAT SHIPS YET. The toolkit rows are still registered on the engine's
-entry point and still packed in its wheel. Moving them out is later work under the same item, so do
-not cite this table as the control that keeps development code off a production box.
+``tests/test_cli_surface.py`` builds both real parsers and fails when a subcommand has no row, when a
+row names no subcommand, when a group breaks the rule above, when the toolkit rows stop matching the
+ruling, when the two parsers share a row, or when the toolkit parser registers a production row.
+
+SO THIS TABLE IS NOT YET THE CONTROL THAT KEEPS DEVELOPMENT CODE OFF A PRODUCTION BOX. Until the last
+toolkit row leaves the engine, which is ADR 0201 slice 4, do not cite it as one.
 
 The module imports nothing from the engine and builds no parser, so a wheel build can read it cheaply.
 """
