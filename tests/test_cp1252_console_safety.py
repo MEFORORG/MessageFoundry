@@ -842,7 +842,7 @@ def test_no_engine_module_puts_an_unencodable_character_on_a_console() -> None:
     for root in _ENGINE_GATE_ROOTS:
         assert _modules_under(root), f"the engine gate walks no modules under {root}"
     scans = [_scan_root(root) for root in _ENGINE_GATE_ROOTS]
-    # Pins both roots in the gate: dropping the toolkit (ADR 0201) from the tuple fails here.
+    # The count the vacuous-absence lint reads as this walk's guard; it pins only the tuple's length.
     assert len(scans) >= 2, f"the engine gate scanned {len(scans)} root(s): {_ENGINE_GATE_ROOTS}"
     exempted = [e for scan in scans for e in scan.exempted]
     print(f"console-bound and hardened, therefore allowed: {exempted or 'none'}")
