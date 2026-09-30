@@ -33,9 +33,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-import hl7
-from hl7.containers import Component, Field, Repetition
-
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import (
@@ -77,7 +74,7 @@ from messagefoundry.mllpcodec import (
     build_ack,
     frame,
 )
-from messagefoundry.parsing.message import emit_raw_separators
+from messagefoundry.parsing.message import emit_raw_separators, reencode_with_separators
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.transports.base import (
@@ -495,64 +492,24 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
     Leaf values are carried through **verbatim except for the escape character**: structural delimiters
     never appear literally inside a leaf (they are escaped), and HL7's named escapes (``\\F\\``,
     ``\\S\\`` …) are delimiter-agnostic — only their surrounding escape character changes when the
-    escape character does. Crucially we do **not** round-trip leaves through python-hl7's
-    ``unescape``/``escape`` (which corrupt code points above U+007F — accented/CJK names — and would
-    silently mangle PHI; the same quirk :class:`~messagefoundry.parsing.message.Message` avoids). When
-    the source already uses the target escape character, leaves are byte-identical.
+    escape character does. Crucially we do **not** round-trip leaves through an ``unescape``/``escape``
+    pair (python-hl7's corrupted code points above U+007F — accented/CJK names — and would silently
+    mangle PHI; the same quirk :class:`~messagefoundry.parsing.message.Message` avoids). When the source
+    already uses the target escape character, leaves are byte-identical.
 
     Raises :class:`ValueError` if ``payload`` is not parseable HL7 (no MSH / malformed header), so the
     caller can fail the delivery loud instead of framing a corrupted message."""
     field_sep, comp, rep, esc, sub = target
     try:
-        message = hl7.parse(normalize(payload))
-        seg_sep: str = message.separator  # segment separator (CR) is not part of the override
-        src_esc: str = message.esc  # the source message's own escape character
-    except (hl7.HL7Exception, IndexError, ValueError, AssertionError) as exc:
-        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH"); ValueError
-        # is defensive. AssertionError is python-hl7's own header check, which a header with no field
-        # separator before its first segment break trips ("MSH\rPID|1", "MSH|\rPID|1"; BACKLOG
-        # #1601). A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
-        # safe_exc names the type: python-hl7's AssertionError carries no message of its own.
+        return reencode_with_separators(payload, (field_sep, comp, rep, sub, esc))
+    except (IndexError, ValueError) as exc:
+        # ValueError covers a body with no leading MSH/FHS/BHS (HL7ParseError) and a header whose own
+        # separators repeat. IndexError covers a header too truncated to read MSH-1/MSH-2 ("MSH",
+        # "MSH\rPID|1", "MSH|\rPID|1"; BACKLOG #1601). A non-HL7 body simply cannot be
+        # delimiter-rewritten — surface it, don't corrupt. safe_exc names the type.
         raise ValueError(
             f"cannot re-encode delimiters: payload is not parseable HL7 ({safe_exc(exc)})"
         ) from exc
-
-    def leaf_text(node: object) -> str:
-        # Only the escape character can legitimately change inside a leaf; every other byte (incl.
-        # non-ASCII) is preserved exactly. If the escape char is unchanged this is a no-op copy.
-        text = str(node)
-        return text if src_esc == esc else text.replace(src_esc, esc)
-
-    def join_component(node: object) -> str:
-        if isinstance(node, Component):
-            return sub.join(leaf_text(child) for child in node)
-        return leaf_text(node)
-
-    def join_repetition(node: object) -> str:
-        if isinstance(node, Repetition):
-            return comp.join(join_component(child) for child in node)
-        return join_component(node)
-
-    def join_field(node: object) -> str:
-        if isinstance(node, Field):
-            return rep.join(join_repetition(child) for child in node)
-        return join_repetition(node)
-
-    out_segments: list[str] = []
-    for segment in message:
-        seg_id = str(segment[0])
-        if seg_id == "MSH":
-            # python-hl7 indexes MSH as: [0]="MSH", [1]=MSH-1 (the field sep itself), [2]=MSH-2; MSH-1
-            # is implied by the field join and MSH-2 is rewritten to advertise the new delimiters, so
-            # the real fields start at index 3.
-            parts = ["MSH", comp + rep + esc + sub]
-            tail = list(segment)[3:]
-        else:
-            parts = [seg_id]
-            tail = list(segment)[1:]
-        parts.extend(join_field(node) for node in tail)
-        out_segments.append(field_sep.join(parts))
-    return seg_sep.join(out_segments) + seg_sep
 
 
 # --- destination -------------------------------------------------------------
@@ -925,8 +882,9 @@ class MLLPDestination(DestinationConnector):
                 # than framing a corrupted message; the pipeline records the ERROR.
                 try:
                     payload = emit_raw_separators(payload)
-                except (hl7.HL7Exception, ValueError, IndexError, AssertionError) as exc:
-                    # IndexError and AssertionError: the same truncated-header shapes that
+                except (ValueError, IndexError) as exc:
+                    # ValueError includes HL7PeekError (no leading MSH, or an over-budget escape
+                    # expansion). IndexError: the same truncated-header shapes that
                     # reencode_delimiters maps to ValueError above (BACKLOG #1601).
                     raise DeliveryError(
                         "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "

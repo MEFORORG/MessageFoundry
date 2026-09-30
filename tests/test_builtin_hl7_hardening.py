@@ -23,7 +23,8 @@ passes green over a multi-second pre-ACK event-loop stall; see "the budget's own
 too" below.
 
 These tests assert the clamp/budget and **intentionally diverge** from python-hl7's unbounded
-behavior, so they live outside the byte-parity suite.
+behavior, so they live outside the byte-parity suite. python-hl7 itself is retired; the last
+section pins what replaced its role as a fallback parser.
 """
 
 from __future__ import annotations
@@ -34,11 +35,8 @@ import operator
 from pathlib import Path
 from typing import SupportsIndex
 
-import hl7
-import hl7.parser
 import pytest
 
-import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
@@ -72,11 +70,6 @@ _ESCAPE = "\\.in512\\"
 _ESCAPE_GROWTH = MAX_ESCAPE_REPEAT * 4
 #: Exactly at the budget (not over) — the largest composition that must still parse untouched.
 _AT_BUDGET_REPEATS = DEFAULT_MAX_MESSAGE_BYTES // _ESCAPE_GROWTH
-
-
-def _peek(raw: str) -> Peek:
-    with _backend.backend(builtin=True):
-        return Peek.parse(raw)
 
 
 # --- unit: unescape repeat-count guard --------------------------------------
@@ -146,12 +139,12 @@ def test_peek_field_over_cap_but_under_budget_count_returns_none_not_oom() -> No
     # DELTA-01's in-unescape clamp is still the second line of defence for a count that passes the
     # aggregate budget: 513 > MAX_ESCAPE_REPEAT, but its worst case (513 * 4) is far under the budget,
     # so the message parses and the clamp drops the escape at the field read.
-    peek = _peek(_MSG.format(pid3=f"\\.in{MAX_ESCAPE_REPEAT + 1}\\^^^MRN"))
+    peek = Peek.parse(_MSG.format(pid3=f"\\.in{MAX_ESCAPE_REPEAT + 1}\\^^^MRN"))
     assert peek.field("PID-3.1") is None  # dropped -> "" -> None; completes without OOM
 
 
 def test_peek_field_malformed_count_does_not_raise() -> None:
-    peek = _peek(_MSG.format(pid3="\\.inX\\^^^MRN"))
+    peek = Peek.parse(_MSG.format(pid3="\\.inX\\^^^MRN"))
     assert peek.field("PID-3.1") is None
 
 
@@ -159,19 +152,15 @@ def test_summarize_is_safe_on_hostile_repeat_escape() -> None:
     # summary.summarize() runs on the pre-ACK path (wiring_runner); it must neither OOM nor raise
     # (DELTA-01/02). A well-formed message carrying a hostile PID-3.1 summarizes cleanly.
     for pid3 in (f"\\.in{MAX_ESCAPE_REPEAT + 1}\\^^^MRN", "\\.inX\\^^^MRN"):
-        with _backend.backend(builtin=True):
-            peek = Peek.parse(_MSG.format(pid3=pid3))
-            result = summarize(peek)
+        peek = Peek.parse(_MSG.format(pid3=pid3))
+        result = summarize(peek)
         assert isinstance(result, str)
 
 
 # --- ASVS 1.3.3: the AGGREGATE expansion budget ------------------------------
 #
 # The unit tests above bound ONE escape. These bound the whole message: the budget is measured before
-# either backend parses, so it is a pre-ACK contract error (HL7PeekError), never a fallback into
-# python-hl7's unbounded unescape and never an accept-and-drop.
-
-_BACKENDS = pytest.mark.parametrize("builtin", [True, False], ids=["builtin", "python-hl7"])
+# the parse, so it is a pre-ACK contract error (HL7PeekError), never an accept-and-drop.
 
 
 def test_repeat_widths_track_unescape_output() -> None:
@@ -252,9 +241,9 @@ def test_estimate_counts_the_composition_the_per_escape_clamp_misses() -> None:
     assert escape_expansion_estimate(body) == 3 * _ESCAPE_GROWTH
 
 
-def test_estimate_models_the_unclamped_worst_case_for_backend_uniformity() -> None:
-    # MAX_ESCAPE_REPEAT is deliberately NOT applied here: python-hl7's unescape has no clamp, so a
-    # count the built-in would drop is exactly the count the fallback backend would expand.
+def test_estimate_models_the_unclamped_worst_case() -> None:
+    # MAX_ESCAPE_REPEAT is deliberately NOT applied here. It was written for python-hl7's unclamped
+    # unescape, a fallback parser until its retirement; it stays because it can only over-estimate.
     assert escape_expansion_estimate(_MSG.format(pid3="\\.in2000000000\\")) == 2_000_000_000 * 4
 
 
@@ -289,69 +278,36 @@ def test_escape_char_read_agrees_with_the_parser_on_every_header_shape() -> None
     assert escape_expansion_estimate("not hl7 at all") == 0
 
 
-def test_escape_char_read_agrees_with_python_hl7_or_is_unreachable() -> None:
-    # The budget exists to bound python-hl7's UNBOUNDED unescape, so the FALLBACK backend's notion of
-    # the escape character matters too — and it is derived differently: create_parse_plan searches
-    # `strmsg.find(sep0, 4)` over the whole message, while message_escape_char (like the built-in's
-    # _extract_separators) searches only the MSH line. On a header with no second field separator the
-    # two really do differ (`MSH|^~X` -> `\` here, `X` there). Every such shape is unreachable today —
-    # python-hl7 refuses the message, or lands on `\r`, which no leaf can contain (it is the segment
-    # separator) so its unescape expands nothing. If an upstream change ever makes a divergent shape
-    # parse cleanly with a usable escape char, this goes red instead of the bypass opening silently.
-    for header in ("MSH|", "MSH|^", "MSH|^~", "MSH|^~X", "MSH|^~\\", "MSH|^~\\&|", "MSH|^~\\&|S|F"):
-        body = header + "\rPID|1||X\r"
-        mine = message_escape_char(body)
-        try:
-            parsed = hl7.parse(body)
-        except Exception:  # noqa: BLE001 — refused outright (_ParsePlan assert): unreachable shape
-            continue
-        theirs = hl7.parser.create_parse_plan(body.strip()).esc
-        if mine == theirs:
-            continue
-        assert theirs == "\r", f"{header!r}: divergent escape char {theirs!r} (mine {mine!r})"
-        # ...and a `\r` escape char is inert, because python-hl7 splits segments on `\r` first, so no
-        # leaf it hands to unescape can contain one.
-        assert all("\r" not in str(field) for seg in parsed for field in seg)
-
-
-@_BACKENDS
-def test_composed_escapes_over_budget_are_a_contract_error(builtin: bool) -> None:
+def test_composed_escapes_over_budget_are_a_contract_error() -> None:
     # THE cell: every escape is individually under MAX_ESCAPE_REPEAT, so only the aggregate sees the
-    # breach. Both read surfaces raise the contract error on BOTH backends — the fallback backend is
-    # never handed the message (its unescape is unbounded).
+    # breach. Both read surfaces raise the contract error.
     body = _MSG.format(pid3=_ESCAPE * (_AT_BUDGET_REPEATS + 1))
-    with _backend.backend(builtin=builtin):
-        with pytest.raises(HL7PeekError, match="escape expansion exceeds budget"):
-            Peek.parse(body)
-        with pytest.raises(HL7PeekError, match="escape expansion exceeds budget"):
-            Message.parse(body)
+    with pytest.raises(HL7PeekError, match="escape expansion exceeds budget"):
+        Peek.parse(body)
+    with pytest.raises(HL7PeekError, match="escape expansion exceeds budget"):
+        Message.parse(body)
 
 
-@_BACKENDS
-def test_just_under_budget_parses_byte_identically(builtin: bool) -> None:
+def test_just_under_budget_parses_byte_identically() -> None:
     # Anti-over-rejection: the largest composition that fits the budget is untouched — same parse,
     # byte-identical raw and re-encode, ordinary fields still readable.
     body = _MSG.format(pid3=_ESCAPE * _AT_BUDGET_REPEATS)
-    with _backend.backend(builtin=builtin):
-        peek = Peek.parse(body)
-        message = Message.parse(body)
+    peek = Peek.parse(body)
+    message = Message.parse(body)
     assert peek.raw == body
     assert message.encode() == body
     assert peek.field("MSH-9.1") == "ADT"
     assert message.field("PID-5.1") == "DOE"
 
 
-@_BACKENDS
-def test_single_huge_count_is_a_contract_error_on_both_backends(builtin: bool) -> None:
+def test_single_huge_count_is_a_contract_error() -> None:
     # DELTA-01's ~15-byte payload: previously accepted (the clamp dropped it to a blank field, so the
-    # sender got an AA for a message the engine could not read). Now it is rejected explicitly, and
-    # the python-hl7 backend — which would really have allocated ~8 GB — is never reached.
+    # sender got an AA for a message the engine could not read). Now it is rejected explicitly.
     body = _MSG.format(pid3="\\.in2000000000\\^^^MRN")
-    with _backend.backend(builtin=builtin):
-        with pytest.raises(HL7PeekError):
-            Peek.parse(body)
-        with pytest.raises(HL7PeekError):
-            Message.parse(body)
+    with pytest.raises(HL7PeekError):
+        Peek.parse(body)
+    with pytest.raises(HL7PeekError):
+        Message.parse(body)
 
 
 def test_budget_message_is_numeric_only_never_the_offending_value() -> None:
@@ -597,18 +553,17 @@ async def test_under_budget_message_still_reaches_the_ingress_stage(store: Messa
     assert len(rows) == 1 and rows[0]["status"] == MessageStatus.RECEIVED.value
 
 
-# --- ADR 0054 Phase-1 fallback guard ----------------------------------------
+# --- a parser fault is refused, never accepted and dropped --------------------
 #
-# Each built-ins parse is wrapped so an *unexpected* internal fault falls back to python-hl7 (never
-# crashing a connection) and is logged; the contract errors still re-raise without falling back
-# (Message.parse re-raises hl7.ParseException; Peek.parse raises HL7PeekError from its no-MSH
-# pre-guard, before the try). None of these branches are exercised by the parity or unescape-DoS
-# suites. The forced-fault log also sits on the pre-ACK ingress path (Peek.parse runs inside
-# summarize()), so it must stay PHI-free.
+# Until python-hl7 was retired, an unexpected fault inside the built-in parse fell back to python-hl7
+# (ADR 0054 Phase-1 fallback guard). There is no second parser now, so a fault is refused through the
+# same HL7PeekError the listener already NAKs and records as ERROR (ADR 0054 amendment). The refusal
+# and the log name only the exception CLASS: the parser's own text is not vetted, and the refusal
+# text reaches the sender in MSA-3.
 
-_FALLBACK_MSG = "falling back to python-hl7"
+_FAULT_LOG = "built-in HL7 parse faulted"
 
-# A unique PID-5 marker that must never leak into the fallback log (PHI-safety regression guard).
+# A unique PID-5 marker that must never leak into the refusal or the log (PHI-safety regression guard).
 _PHI_MARKER = "ZZSECRETNAME9137X"
 _PHI_MSG = (
     "MSH|^~\\&|SEND|FAC|RECV|FAC|20260101000000||ADT^A01|MSG00001|P|2.5\r"
@@ -617,117 +572,74 @@ _PHI_MSG = (
 
 
 def _raise_builtin_fault(*_args: object, **_kwargs: object) -> None:
-    # Stand-in for an unexpected internal built-ins bug (anything other than the contract's
-    # ParseException / HL7PeekError). Carries no body text of its own.
-    raise RuntimeError("forced built-ins fault")
+    # Stand-in for an unexpected internal parser bug whose own text quotes the body, which is the
+    # worst case for a refusal that reaches the sender.
+    raise RuntimeError(f"forced built-ins fault near {_PHI_MARKER}")
 
 
-def _fallback_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if _FALLBACK_MSG in r.getMessage()]
-
-
-def test_peek_falls_back_to_python_hl7_on_builtin_fault(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.setattr(_builtin_hl7, "parse", _raise_builtin_fault)
-    with caplog.at_level(logging.WARNING), _backend.backend(builtin=True):
-        peek = Peek.parse(_MSG.format(pid3="MRN001"))
-    # Landed on the proven python-hl7 backend, and the routing read still works.
-    assert isinstance(peek.message, hl7.Message)
-    assert peek.field("MSH-9.1") == "ADT"
-    records = _fallback_records(caplog)
-    assert len(records) == 1
-    assert records[0].levelno == logging.WARNING
-    # exc_info=True is attached, but the PHI-redaction log filter (when installed) redacts it into
-    # exc_text and clears exc_info — so a diagnostic traceback is present in one form or the other.
-    assert records[0].exc_info is not None or records[0].exc_text is not None
-
-
-def test_message_falls_back_to_python_hl7_on_builtin_fault(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.setattr(_builtin_hl7, "parse", _raise_builtin_fault)
-    with caplog.at_level(logging.WARNING), _backend.backend(builtin=True):
-        msg = Message.parse(_MSG.format(pid3="MRN001"))
-    assert msg._builtin is False
-    assert isinstance(msg._m, hl7.Message)
-    assert msg.field("MSH-9.1") == "ADT"
-    records = _fallback_records(caplog)
-    assert len(records) == 1
-    assert records[0].levelno == logging.WARNING
-    # exc_info=True is attached, but the PHI-redaction log filter (when installed) redacts it into
-    # exc_text and clears exc_info — so a diagnostic traceback is present in one form or the other.
-    assert records[0].exc_info is not None or records[0].exc_text is not None
-
-
-def test_message_parse_reraises_parseexception_without_fallback(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # A non-MSH-leading body is the built-ins parser matching python-hl7's contract, not an internal
-    # fault: Message.parse re-raises hl7.ParseException as-is, with no fallback and no warning.
-    with caplog.at_level(logging.WARNING), _backend.backend(builtin=True):  # noqa: SIM117
-        with pytest.raises(hl7.ParseException):
-            Message.parse("PID|1||X\r")
-    assert _fallback_records(caplog) == []
-
-
-def test_peek_parse_raises_hl7peekerror_without_fallback(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Peek's no-MSH pre-guard raises HL7PeekError *before* the try, so the fallback never runs and
-    # nothing is logged.
-    with caplog.at_level(logging.WARNING), _backend.backend(builtin=True):  # noqa: SIM117
-        with pytest.raises(HL7PeekError):
-            Peek.parse("PID|1||X\r")
-    assert _fallback_records(caplog) == []
+def _fault_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if _FAULT_LOG in r.getMessage()]
 
 
 @pytest.mark.parametrize("parse", [Peek.parse, Message.parse], ids=["peek", "message"])
-def test_expansion_budget_never_falls_back_to_python_hl7(
-    parse: object, caplog: pytest.LogCaptureFixture
-) -> None:
-    # ASVS 1.3.3's load-bearing routing property: the budget breach is a CONTRACT error, so neither
-    # entry point logs a fallback or hands the body to python-hl7's UNBOUNDED unescape. (A budget
-    # raised from inside the wrapped call would be swallowed by the bare `except Exception` guards and
-    # turn the clamp into a bypass — the eager placement is what prevents that.)
-    body = _MSG.format(pid3=_ESCAPE * (_AT_BUDGET_REPEATS + 1))
-    with caplog.at_level(logging.WARNING), _backend.backend(builtin=True):  # noqa: SIM117
-        with pytest.raises(HL7PeekError):
-            parse(body)  # type: ignore[operator]
-    assert _fallback_records(caplog) == []
-
-
-@pytest.mark.parametrize("parse", [Peek.parse, Message.parse], ids=["peek", "message"])
-def test_contract_error_from_the_builtins_call_is_re_raised_not_fallen_back(
+def test_a_parser_fault_is_refused_as_a_contract_error(
     parse: object, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Defence in depth for the same property (_backend.py's documented contract): even if a contract
-    # error were ever raised from INSIDE the wrapped built-ins call, the guard re-raises it rather than
-    # retrying on the unbounded backend.
-    def _raise_contract(*_a: object, **_k: object) -> None:
-        raise HL7PeekError("forced contract error")
-
-    monkeypatch.setattr(_builtin_hl7, "parse", _raise_contract)
-    with caplog.at_level(logging.WARNING), _backend.backend(builtin=True):  # noqa: SIM117
-        with pytest.raises(HL7PeekError):
-            parse(_MSG.format(pid3="MRN001"))  # type: ignore[operator]
-    assert _fallback_records(caplog) == []
-
-
-def test_fallback_log_is_phi_free_for_both_entry_points(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    # Regression guard: the fallback warning is a constant string and exc_info=True renders a
-    # traceback *without* local variables, so the message body (held only in the ``norm`` local)
-    # never reaches the log. Fails if the warning ever interpolates the raw, or an exception starts
-    # carrying body text.
     monkeypatch.setattr(_builtin_hl7, "parse", _raise_builtin_fault)
-    with caplog.at_level(logging.WARNING), _backend.backend(builtin=True):
-        peek = Peek.parse(_PHI_MSG)
-        msg = Message.parse(_PHI_MSG)
-    # The body really was carried through the fallback (the marker survives the parse)...
-    assert peek.field("PID-5.1") == _PHI_MARKER
-    assert msg.field("PID-5.1") == _PHI_MARKER
-    # ...both fallbacks logged, yet the marker never appears anywhere in the emitted log text.
-    assert len(_fallback_records(caplog)) == 2
+    with caplog.at_level(logging.WARNING), pytest.raises(HL7PeekError) as excinfo:
+        parse(_PHI_MSG)  # type: ignore[operator]
+    assert str(excinfo.value) == "could not parse HL7 message (RuntimeError)"
+    # Raised after the handler, so the parser's error is not on the chain (BACKLOG #2085).
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+    records = _fault_records(caplog)
+    assert len(records) == 1 and records[0].levelno == logging.ERROR
+    assert records[0].exc_info is None
     assert _PHI_MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("parse", [Peek.parse, Message.parse], ids=["peek", "message"])
+def test_a_body_with_no_msh_is_refused_without_a_fault_log(
+    parse: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A non-MSH body is the contract, not a parser fault: refused, and nothing logged as a fault.
+    with caplog.at_level(logging.WARNING), pytest.raises(HL7PeekError) as excinfo:
+        parse("PID|1||X\r")  # type: ignore[operator]
+    assert "MSH" in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert _fault_records(caplog) == []
+
+
+@pytest.mark.parametrize("parse", [Peek.parse, Message.parse], ids=["peek", "message"])
+def test_expansion_budget_breach_never_reaches_the_parser(
+    parse: object, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # ASVS 1.3.3's routing property: the budget is measured before the parse, so a breach is refused
+    # without the parser ever seeing the body, and it is not reported as a parser fault.
+    monkeypatch.setattr(_builtin_hl7, "parse", _raise_builtin_fault)
+    body = _MSG.format(pid3=_ESCAPE * (_AT_BUDGET_REPEATS + 1))
+    with caplog.at_level(logging.WARNING), pytest.raises(HL7PeekError, match="exceeds budget"):
+        parse(body)  # type: ignore[operator]
+    assert _fault_records(caplog) == []
+
+
+async def test_a_parser_fault_records_error_and_naks_before_any_ingress_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The count-and-log invariant with no fallback parser: the listener still answers AR and records
+    # ERROR, so the message is counted and logged, never accepted and dropped.
+    monkeypatch.setattr(_builtin_hl7, "parse", _raise_builtin_fault)
+    reg = _hl7_registry()
+    runner = RegistryRunner(reg, store)
+
+    ack = await runner._handle_inbound(reg.inbound["IB_HL7"], _PHI_MSG.encode("utf-8"))
+
+    assert ack is not None and "MSA|AR" in ack
+    assert _PHI_MARKER not in ack
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    rows = [dict(r) for r in await cur.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["status"] == MessageStatus.ERROR.value
+    assert "RuntimeError" in rows[0]["error"] and _PHI_MARKER not in rows[0]["error"]
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
+    count = await cur.fetchone()
+    assert count is not None and count["n"] == 0

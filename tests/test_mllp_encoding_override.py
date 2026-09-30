@@ -91,7 +91,7 @@ def test_reencode_to_alt_delimiters_preserves_logical_fields() -> None:
 
 
 def test_reencode_preserves_non_ascii_names() -> None:
-    # python-hl7's unescape/escape corrupt code points above U+007F; the override must not, or it would
+    # python-hl7's unescape/escape corrupted code points above U+007F; the override must not, or it would
     # silently mangle accented/CJK patient names (PHI). The accented ZNM-3 names must survive verbatim.
     out = reencode_delimiters(ADT_DEFAULT, parse_encoding_characters(ALT_OVERRIDE))
     assert "Österreich" in out
@@ -123,10 +123,22 @@ def test_reencode_to_same_delimiters_is_byte_identical() -> None:
     assert out == Message.parse(ADT_DEFAULT).encode()
 
 
-# "MSH\rPID|1" and "MSH|\rPID|1" trip python-hl7's header AssertionError, which used to escape the
-# promised ValueError and so the sender's DeliveryError mapping as well (BACKLOG #1601).
+# "MSH\rPID|1" and "MSH|\rPID|1" tripped python-hl7's header AssertionError, which used to escape the
+# promised ValueError and so the sender's DeliveryError mapping as well (BACKLOG #1601). The
+# built-in parser raises IndexError on them instead, mapped the same way. The last entry repeats a
+# separator in MSH-2, which python-hl7 refused and the rewrite still refuses.
 @pytest.mark.parametrize(
-    "garbage", ["not hl7 at all", "", "PID|1|2", "MSH|", "MSH\rPID|1", "MSH|\rPID|1", "MSH"]
+    "garbage",
+    [
+        "not hl7 at all",
+        "",
+        "PID|1|2",
+        "MSH|",
+        "MSH\rPID|1",
+        "MSH|\rPID|1",
+        "MSH",
+        "MSH|^^\\&|A|B|1||X^Y|1|P\rPID|a^b\r",
+    ],
 )
 def test_reencode_rejects_unparseable_payload(garbage: str) -> None:
     with pytest.raises(ValueError, match="not parseable HL7"):
@@ -255,7 +267,8 @@ async def test_send_non_hl7_raises_before_any_io() -> None:
 
 async def test_send_truncated_header_fails_as_a_delivery_error() -> None:
     # BACKLOG #1601: a Handler output whose header has no field separator reached python-hl7's
-    # AssertionError, which escaped send() as an untyped exception rather than a DeliveryError.
+    # AssertionError, which escaped send() as an untyped exception rather than a DeliveryError. The
+    # built-in parser raises IndexError there instead.
     dest = MLLPDestination(
         Destination(
             name="out",
@@ -270,5 +283,5 @@ async def test_send_truncated_header_fails_as_a_delivery_error() -> None:
     )
     with pytest.raises(DeliveryError, match="encoding-character override failed") as excinfo:
         await dest.send("MSH\rPID|1")
-    # The recorded error names the cause; python-hl7's AssertionError has no message of its own.
-    assert "AssertionError" in str(excinfo.value)
+    # The recorded error names the cause.
+    assert "IndexError" in str(excinfo.value)

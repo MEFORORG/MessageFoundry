@@ -6,10 +6,10 @@ This is the hot path: every inbound message is peeked to pull the handful of MSH
 fields the engine routes on (message type, trigger event, control id, version) and to
 let channel/destination filters test arbitrary fields by path (e.g. ``MSH-9.1``).
 
-It is built on ``python-hl7``, which parses tolerantly — real-world feeds are routinely
-non-conformant and must still route. We never raise on a *structurally* odd-but-parseable
-message; we only raise :class:`HL7PeekError` when the bytes are not an HL7 message at all
-(no MSH) or a field *path* is malformed.
+It is built on the engine's own tolerant parser (:mod:`messagefoundry.parsing._builtin_hl7`,
+ADR 0054) — real-world feeds are routinely non-conformant and must still route. We never raise on a
+*structurally* odd-but-parseable message; we only raise :class:`HL7PeekError` when the bytes are not
+an HL7 message at all (no MSH), break a resource cap, or a field *path* is malformed.
 
 HL7 uses a carriage return (``\\r``) between segments. Inbound bytes arrive with all
 manner of line endings (MLLP strips its own framing; files may be ``\\n`` or ``\\r\\n``),
@@ -21,11 +21,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import cast
 
-import hl7
-
-import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 
 logger = logging.getLogger(__name__)
@@ -43,7 +39,7 @@ __all__ = [
 ]
 
 # Pre-parse resource caps (DoS guards). A complete-but-pathological message — multi-MiB, or
-# tens of thousands of segments — would otherwise be parsed/walked whole (python-hl7 here,
+# tens of thousands of segments — would otherwise be parsed/walked whole (the built-in parser here,
 # hl7apy on the strict path), multiplying memory and CPU. Checked *before* parsing so an
 # oversized message is rejected cheaply. ``None`` disables a cap.
 DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP/file ingress caps
@@ -106,10 +102,9 @@ def enforce_expansion_budget(norm: str) -> None:
     accepted, and a disagreement there would escape the listener's catches and drop the connection with
     no disposition (a count-and-log break).
 
-    Called **before** the parse backends are dispatched, i.e. outside the ADR 0054 fallback guard, so
-    a breach is a *contract* error routed to the listener's existing NAK + ``ERROR`` path — never a
-    fallback into python-hl7's unbounded ``unescape``. The message text is numeric only (no field
-    value, no body fragment): it reaches the sender in MSA-3.
+    Called **before** the parse, so a breach is a *contract* error routed to the listener's existing
+    NAK + ``ERROR`` path, and the parser never sees the body. The message text is numeric only (no
+    field value, no body fragment): it reaches the sender in MSA-3.
 
     **The measurement is itself capped.** Measuring growth means reading each counted escape's count,
     and that is Python-level work an attacker sizes: the cheapest hostile bodies (a zero-width or a
@@ -187,21 +182,46 @@ def drop_blank_segments(norm: str) -> str:
     """``norm`` with every empty segment line removed, before a tolerant parse (BACKLOG #1594).
 
     A sender that ends segments with ``CRLF`` and adds a blank line produces ``\\r\\r`` once
-    :func:`normalize` has run. Both backends parse that into a segment with no id. python-hl7 then
-    raises ``IndexError`` from its by-id segment scan on **any** field read or whole-field set, and
-    the built-ins replicate that for byte parity. On the pre-ACK path that error is not an
+    :func:`normalize` has run. The parser reads that as a segment with no id. python-hl7 raised
+    ``IndexError`` from its by-id segment scan on **any** field read or whole-field set, and the
+    built-in parser replicates that for byte parity. On the pre-ACK path that error is not an
     :class:`HL7PeekError`, so it escaped the listener: no disposition, no NAK, and a dropped
     connection.
 
     An empty line carries nothing, so :meth:`Peek.parse` and :meth:`Message.parse
-    <messagefoundry.parsing.message.Message.parse>` both drop it, on both backends alike, and the two
-    surfaces agree about a body. :attr:`Peek.raw` and the stored message keep the text as received.
+    <messagefoundry.parsing.message.Message.parse>` both drop it, and the two surfaces agree about a
+    body. :attr:`Peek.raw` and the stored message keep the text as received.
     A parsed ``Message`` does not, so its ``encode()`` carries no blank line. Only exactly empty
     lines go; a whitespace-only line is a segment with an odd id, which already parses and reads.
     """
     if "\r\r" not in norm:
         return norm
     return _BLANK_SEGMENT_RUN.sub("\r", norm)
+
+
+def parse_or_refuse(text: str) -> _builtin_hl7.ParsedMessage:
+    """Parse ``text`` with the built-in parser, or raise :class:`HL7PeekError` — the one refusal
+    :meth:`Peek.parse` and :meth:`Message.parse <messagefoundry.parsing.message.Message.parse>` share.
+
+    ``text`` is normalized, budget-checked and free of blank lines already. A body with no leading
+    ``MSH``/``FHS``/``BHS`` is refused with the parser's own fixed text. Any other error is a fault in
+    the parser, not a property of the message (ADR 0054 amendment). It is refused through the same
+    ``HL7PeekError`` the listener NAKs and records as ``ERROR``, so the message is counted and logged,
+    never accepted and dropped.
+
+    Every ``HL7PeekError`` text reaches the sender in MSA-3 and the stored ``ERROR`` reason, and a
+    fault's own text is not vetted. So the refusal and the log name only the error CLASS, and the
+    raise comes after the handler so the parser's error is not on the chain (BACKLOG #2085; the same
+    policy as ``wiring_runner._peek_read_fault``).
+    """
+    try:
+        return _builtin_hl7.parse(text)
+    except _builtin_hl7.HL7ParseError as exc:
+        refused = str(exc)  # fixed text, quotes nothing from the body
+    except Exception as exc:  # noqa: BLE001 — any other error here is a parser fault
+        refused = f"could not parse HL7 message ({type(exc).__name__})"
+        logger.error("built-in HL7 parse faulted with %s; message refused", type(exc).__name__)
+    raise HL7PeekError(refused)
 
 
 def normalize(raw: str | bytes, *, encoding: str = "utf-8", errors: str = "replace") -> str:
@@ -222,15 +242,13 @@ def normalize(raw: str | bytes, *, encoding: str = "utf-8", errors: str = "repla
 class Peek:
     """A parsed view over an inbound message exposing routing fields + path access.
 
-    Construct via :meth:`parse`. ``message`` is the underlying parse — either a built-ins
-    :data:`~messagefoundry.parsing._builtin_hl7.ParsedMessage` (ADR 0054, the default backend) or a
-    legacy ``python-hl7`` :class:`hl7.Message` (when ``_backend.USE_BUILTIN`` is off or the built-ins
-    path fell back). ``raw`` is the normalized (``\\r``-delimited) text as received; the parse ran
-    over that text less its empty segment lines (:func:`drop_blank_segments`). Field access
-    dispatches on the backing type, so the public surface is identical either way.
+    Construct via :meth:`parse`. ``message`` is the underlying parse, a built-in
+    :data:`~messagefoundry.parsing._builtin_hl7.ParsedMessage` (ADR 0054). ``raw`` is the normalized
+    (``\\r``-delimited) text as received; the parse ran over that text less its empty segment lines
+    (:func:`drop_blank_segments`).
     """
 
-    message: _builtin_hl7.ParsedMessage | hl7.Message
+    message: _builtin_hl7.ParsedMessage
     raw: str
 
     @classmethod
@@ -248,36 +266,7 @@ class Peek:
         if not norm.lstrip().startswith("MSH"):
             raise HL7PeekError("message does not start with an MSH segment")
         enforce_expansion_budget(norm)
-        text = drop_blank_segments(norm)
-        if _backend.use_builtin():
-            try:
-                return cls(message=_builtin_hl7.parse(text), raw=norm)
-            except HL7PeekError:
-                # A contract error is never fallen back from (the python-hl7 path would only be the
-                # *unbounded* one): re-raise so the ADR 0054 guard below stays an internal-fault
-                # guard, exactly as _backend.py documents.
-                raise
-            except Exception:  # noqa: BLE001 — fallback guard: any unexpected built-ins error
-                # The contract guards (empty/no-MSH) already ran above and raised HL7PeekError, so
-                # anything here is an *internal* built-ins fault. Fall back to the proven python-hl7
-                # path rather than failing a connection, and log so the gap is visible (ADR 0054
-                # Phase-1 fallback guard).
-                logger.warning(
-                    "built-ins HL7 parse failed; falling back to python-hl7", exc_info=True
-                )
-        # Every HL7PeekError text reaches the sender in MSA-3 and the stored ERROR reason, and the
-        # text of whatever python-hl7 raises here is not vetted: it can be any Python error, and
-        # python-hl7's batch/file parsers already quote a whole segment in theirs. The guards above
-        # make the known quoting shapes unreachable from hl7.parse, so this is the same policy as
-        # wiring_runner._peek_read_fault rather than a measured leak: name only the error CLASS, and
-        # raise after the handler so the parser's error is not on the chain (BACKLOG #2085).
-        try:
-            message = hl7.parse(text)
-        except Exception as exc:  # python-hl7 raises a variety of ValueErrors
-            refused = type(exc).__name__
-        else:
-            return cls(message=message, raw=norm)
-        raise HL7PeekError(f"could not parse HL7 message ({refused})")
+        return cls(message=parse_or_refuse(drop_blank_segments(norm)), raw=norm)
 
     # --- generic field access (for filters) ----------------------------------
 
@@ -288,60 +277,19 @@ class Peek:
         first occurrence of the segment and the first repetition of the field.
         """
         seg, fld, comp, sub = parse_path(path)
-        return self._resolve(seg, fld, comp, sub)
-
-    def _resolve(self, seg: str, fld: int, comp: int | None, sub: int | None) -> str | None:
-        if isinstance(self.message, dict):
-            return self._resolve_builtin(
-                cast("_builtin_hl7.ParsedMessage", self.message), seg, fld, comp, sub
-            )
-        return self._resolve_hl7(self.message, seg, fld, comp, sub)
-
-    @staticmethod
-    def _resolve_builtin(
-        msg: _builtin_hl7.ParsedMessage, seg: str, fld: int, comp: int | None, sub: int | None
-    ) -> str | None:
-        # No blank-segment scan runs here any more (BACKLOG #1594). Peek.parse drops empty lines before
-        # either backend sees them, so the scan ``extract_field`` still runs internally cannot fire on
-        # a peeked message; running it here, outside the catch, is what used to let IndexError escape.
-        # The built-ins ``extract_field`` mirrors python-hl7's ``Segment.extract_field`` exactly,
-        # including the whole-value-no-component rule and the ""-vs-IndexError asymmetry; an
-        # invalid-depth index surfaces here as IndexError, mapped to None like the python-hl7 path.
+        # No blank-segment scan runs here any more (BACKLOG #1594). Peek.parse drops empty lines
+        # before the parse, so the scan ``extract_field`` still runs internally cannot fire on a
+        # peeked message; running it here, outside the catch, is what used to let IndexError escape.
+        # ``extract_field`` mirrors python-hl7's ``Segment.extract_field`` exactly, including the
+        # whole-value-no-component rule and the ""-vs-IndexError asymmetry.
         try:
-            return _builtin_hl7.extract_field(msg, seg, fld, comp, sub)
+            return _builtin_hl7.extract_field(self.message, seg, fld, comp, sub)
         except (IndexError, ValueError):
-            # IndexError = invalid-depth over-index, mapped to None exactly like the python-hl7 path.
+            # IndexError = invalid-depth over-index, mapped to None as python-hl7's path did.
             # ValueError is defense-in-depth for a malformed escape count surfacing from unescape
             # (DELTA-02): a field read on the pre-ACK summarize() path must never crash the
             # connection — an absent/unreadable value is None.
             return None
-
-    @staticmethod
-    def _resolve_hl7(
-        message: hl7.Message, seg: str, fld: int, comp: int | None, sub: int | None
-    ) -> str | None:
-        try:
-            segment = message.segment(seg)
-        except KeyError:
-            return None
-        try:
-            field_obj = segment[fld]
-        except (IndexError, KeyError):
-            return None
-        if comp is None:
-            return str(field_obj) or None
-        # For component/subcomponent access use python-hl7's extractor (first segment, first
-        # repetition). It correctly returns the whole value when the field carries no component
-        # separator — manual indexing would otherwise walk into the *string* and return a single
-        # character (e.g. "ORC-2.1" of "PLACER123" => "P"). Out-of-range parts raise IndexError.
-        try:
-            value = message.extract_field(seg, 1, fld, 1, comp, sub if sub is not None else 1)
-        except (IndexError, ValueError):
-            # ValueError: python-hl7's own unescape runs ``int()`` on a rich-text repeat count, so a
-            # malformed ``\.inX\`` raises it here. The built-ins path already maps that to None
-            # (DELTA-02); this is the fallback backend's half of the same rule (BACKLOG #1594).
-            return None
-        return value or None
 
     # --- named routing fields (the common case) ------------------------------
 
@@ -411,6 +359,4 @@ class Peek:
 
     def segments(self) -> list[str]:
         """Ordered segment ids, e.g. ``["MSH", "EVN", "PID", "PV1"]``."""
-        if isinstance(self.message, dict):
-            return _builtin_hl7.segment_ids(cast("_builtin_hl7.ParsedMessage", self.message))
-        return [str(seg[0]) for seg in self.message]
+        return _builtin_hl7.segment_ids(self.message)

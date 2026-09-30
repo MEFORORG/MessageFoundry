@@ -28,7 +28,7 @@ Posture (ADR 0017 amendment, 2026-06-27):
 
 - **Default = alert-only.** Drift records + alerts but the engine still starts. A legitimate, reviewed
   in-place security hotfix (e.g. the documented vendored-patch contingency for the dormant
-  ``python-hl7``/``hl7apy`` parsers) would itself trip a ``RECORD`` mismatch, so fail-closed-by-default
+  ``hl7apy`` parser) would itself trip a ``RECORD`` mismatch, so fail-closed-by-default
   would brick a legitimate patch at the worst moment.
 - **Opt-in ``[integrity].fail_closed_on_drift``** raises :class:`IntegrityError` before listeners bind
   — refuse to run unattested engine bytes.

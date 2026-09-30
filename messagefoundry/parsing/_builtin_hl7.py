@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Low-allocation built-ins HL7 v2 parser (ADR 0054) — the python-hl7 drop-in.
+"""Low-allocation built-ins HL7 v2 parser (ADR 0054) — the engine's only tolerant HL7 parser.
 
 This module reimplements python-hl7's *tolerant* parse over native ``dict``/``list``/``str``
 with **no per-node custom classes**, so the parsed representation stops contending under
 free-threading (ADR 0053 WS3: per-instance refcounting + shared type objects serialize across
-threads). It backs the existing :class:`~messagefoundry.parsing.peek.Peek` and
-:class:`~messagefoundry.parsing.message.Message` API **byte-for-byte** — see the ADR's preserved
-contract. It is **pure** (no I/O, engine state, or DB) and has **no public exports yet**;
-``peek.py``/``message.py`` switch to it in a later phase.
+threads). It backs the :class:`~messagefoundry.parsing.peek.Peek` and
+:class:`~messagefoundry.parsing.message.Message` API **byte-for-byte** as python-hl7 0.4.5 did — see
+the ADR's preserved contract. python-hl7 itself is retired: ``tests/golden/python_hl7_oracle.json``
+records its answers, and ``tests/test_builtin_hl7_parity.py`` holds this module to them. It is
+**pure** (no I/O, engine state, or DB).
 
 Data model (a plain built-in structure)::
 
@@ -47,11 +48,10 @@ import re
 from functools import lru_cache
 from typing import TypedDict
 
-import hl7  # for byte-parity error types (ParseException) on the no-MSH-leading path
-
 __all__ = [
     "ParsedMessage",
     "FieldEntry",
+    "HL7ParseError",
     "parse",
     "extract_field",
     "extract_part",
@@ -59,6 +59,7 @@ __all__ = [
     "set_field",
     "encode",
     "encode_raw_separators",
+    "encode_with_separators",
     "segment_ids",
     "separators",
     "unescape",
@@ -71,6 +72,14 @@ __all__ = [
     "raise_if_blank_segment_scan",
     "scan_segment_index",
 ]
+
+
+class HL7ParseError(ValueError):
+    """The text does not begin with an ``MSH``, ``FHS`` or ``BHS`` segment, so it is not HL7 v2.
+
+    Raised by :func:`parse`. Its text is fixed and quotes nothing from the body, because callers
+    pass it on to a sender or a log and the body can carry PHI.
+    """
 
 
 class FieldEntry(TypedDict):
@@ -160,17 +169,14 @@ def parse(norm: str) -> ParsedMessage:
     split lazily.
 
     Like ``hl7.create_parse_plan`` it enforces an **MSH/FHS/BHS leading segment**, raising
-    :class:`hl7.exceptions.ParseException` (the same type python-hl7 raises) when the first segment is
-    anything else — so a non-HL7 body fed straight to :meth:`Message.parse` (which, unlike
-    ``Peek.parse``, has no pre-parse no-MSH guard) is rejected identically instead of silently parsed
-    with garbage separators read from arbitrary leading text.
+    :class:`HL7ParseError` when the first segment is anything else — so a non-HL7 body fed straight to
+    :meth:`Message.parse` (which, unlike ``Peek.parse``, has no pre-parse no-MSH guard) is rejected
+    instead of silently parsed with garbage separators read from arbitrary leading text.
     """
     strmsg = norm.strip()
     lines = strmsg.split("\r")
     if lines[0][:3] not in ("MSH", "FHS", "BHS"):
-        # python-hl7's wording (note its literal "MHS" typo in the allowed list is reproduced for the
-        # message text; the parity suite compares exception *type*, not text).
-        raise hl7.ParseException(f"First segment is {lines[0][:3]}, must be one of MHS, FHS or BHS")
+        raise HL7ParseError("message does not start with an MSH, FHS or BHS segment")
     seps = _extract_separators(lines[0])
 
     field_sep = seps[0]
@@ -668,17 +674,6 @@ def message_escape_char(norm: str) -> str:
     budget. It differs only in being defensive: this runs *before* any parse, on bytes that may not be
     HL7 at all, so a short/malformed header falls back to HL7's default ``\\`` rather than indexing off
     the end. Never hardcodes the escape character for a well-formed message (CLAUDE.md §8).
-
-    The **fallback** backend derives it differently: python-hl7's ``create_parse_plan`` searches
-    ``strmsg.find(sep0, 4)`` over the WHOLE stripped message, while this (like
-    :func:`_extract_separators`) searches only the first line. The two therefore pick different
-    characters on a header whose MSH line carries no second field separator — e.g. ``MSH|^~X`` yields
-    ``\\`` here and ``X`` there. No such shape is reachable: python-hl7 either refuses the message
-    (its ``_ParsePlan`` assertion, which :meth:`~messagefoundry.parsing.peek.Peek.parse` converts to
-    ``HL7PeekError``) or lands on ``\\r`` — the segment separator, which no leaf can contain, so its
-    ``unescape`` expands nothing. ``test_escape_char_read_agrees_with_python_hl7_or_is_unreachable``
-    pins that, so an upstream change that made a divergent shape parse cleanly reds the ASVS 1.3.3
-    suite instead of opening the bypass silently.
     """
     line = norm.lstrip().split("\r", 1)[0]
     if len(line) < 4:
@@ -722,10 +717,9 @@ def escape_expansion_estimate(
     boundary would break up is counted anyway, which over-estimates a malformed body but can never
     under-estimate a real one).
 
-    The estimate deliberately ignores :data:`MAX_ESCAPE_REPEAT`: the built-in drops an over-cap count
-    but python-hl7's ``unescape`` expands it without bound, so modelling the *unclamped* worst case is
-    what makes the budget judge a message identically on **either** backend — the built-in clamp then
-    stays a second, in-unescape line of defence for counts that pass the budget.
+    The estimate deliberately ignores :data:`MAX_ESCAPE_REPEAT` and models the *unclamped* worst
+    case, so it can only over-estimate; the clamp stays a second, in-unescape line of defence for
+    counts that pass the budget.
 
     **Cost.** ``limit`` stops the scan once the running total breaches it — but the total alone can
     never bound the work, because the *cheapest* hostile openers are exactly the ones that add
@@ -1002,4 +996,54 @@ def encode_raw_separators(msg: ParsedMessage) -> str:
     raw cache is the escaped form), so it never poisons a later :func:`encode`."""
     seps = msg["seps"]
     lines = [_encode_segment_raw_separators(msg, i, seps) for i in range(len(msg["segments"]))]
+    return "\r".join(lines) + "\r"
+
+
+def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str, str]) -> str:
+    """Serialize ``msg`` with a different set of delimiters, rewriting MSH-2 to advertise them.
+
+    ``target`` is ``(field, component, repetition, subcomponent, escape)``, the same order as
+    :func:`separators`. Each data field is rewritten with a character map from the message's own
+    repetition, component, subcomponent and escape characters to the target ones. That equals splitting
+    the field on its separators and re-joining with the targets, because a split leaf holds no source
+    separator. Leaves are never unescaped or re-escaped, so a character above U+007F passes through
+    byte for byte. A target delimiter that already appears literally inside a leaf is carried as is.
+
+    Where two source separators are the same character, the one split first wins: repetition, then
+    component, then subcomponent, the order python-hl7 split them. The segment id is kept verbatim. On
+    an ``FHS`` or ``BHS`` header the raw MSH-1/MSH-2 leaves change only their escape character. Both
+    match the python-hl7 tree walk this replaced (``transports/mllp.py`` ``reencode_delimiters``). Only
+    an ``MSH`` header has its MSH-2 rewritten. Blank segment lines are kept.
+
+    Raises ``ValueError`` when the message's own field, component, repetition and subcomponent
+    characters are not four distinct characters. Such a header cannot say which structure a character
+    marks, so it is refused rather than rewritten. python-hl7 refused the same headers.
+    """
+    t_field, t_comp, t_rep, t_sub, t_esc = target
+    s_field, s_comp, s_rep, s_sub, s_esc = msg["seps"]
+    if len({s_field, s_comp, s_rep, s_sub}) != 4:
+        raise ValueError(
+            "the message's field, component, repetition and subcomponent separators repeat"
+        )
+    table: dict[int, str] = {}
+    for source, dest in ((s_rep, t_rep), (s_comp, t_comp), (s_sub, t_sub), (s_esc, t_esc)):
+        table.setdefault(ord(source), dest)
+    lines: list[str] = []
+    for index, seg in enumerate(msg["segments"]):
+        _ensure_split(msg, index)
+        texts = [_field_text(f) for f in seg["fields"]]
+        if not texts:
+            lines.append(seg["id"])
+            continue
+        if seg["id"] == "MSH" and len(texts) >= 3:
+            parts = ["MSH", t_comp + t_rep + t_esc + t_sub]
+            tail = texts[3:]
+        elif seg["id"] in ("BHS", "FHS") and len(texts) >= 3:
+            parts = [texts[0], texts[1].replace(s_esc, t_esc), texts[2].replace(s_esc, t_esc)]
+            tail = texts[3:]
+        else:
+            parts = [texts[0]]
+            tail = texts[1:]
+        parts.extend(text.translate(table) for text in tail)
+        lines.append(t_field.join(parts))
     return "\r".join(lines) + "\r"

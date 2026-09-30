@@ -1126,10 +1126,9 @@ local first (`m = f"bad {x}"`; `raise ValueError(m)`), one passed as a keyword o
 unflagged. The convention is what governs; `_check_raise_fstring` catalogues what the check itself
 over- and under-flags. The existing controls — never log full bodies at
 INFO+ and the CR/LF log-injection filter — remain in
-[logging_setup.py](../messagefoundry/logging_setup.py). Silencing python-hl7's PHI-prone loggers
-lives in the stdlib-only [phi_log_silencer.py](../messagefoundry/phi_log_silencer.py), so
-`parsing/` can run it on import without loading the config layer (BACKLOG #1596);
-`configure_logging` still calls it too.
+[logging_setup.py](../messagefoundry/logging_setup.py). The engine used to silence python-hl7's
+loggers, which wrote whole field values at ERROR on an unmapped escape. python-hl7 is retired and
+the built-in parser logs no field value, so that silencer went with it (ADR 0054 amendment).
 
 **Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Four** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
 order, on **every** emitted record and on **every** handler — stdout *and* the off-box forwarder —
@@ -1163,9 +1162,9 @@ installed by `_install_phi_filters`, reached through `configure_logging` in the 
 
 `redact()` rewrites only HL7-shaped spans plus date/DOB runs and multi-token name runs, so ordinary
 operational lines are untouched. This makes `safe_exc()` (above) the explicit chokepoint and the global
-filters the backstop for anything that reaches a handler un-redacted. `configure_logging` additionally
-**silences python-hl7's PHI-prone loggers** (they are named by `__file__`, so they are matched by the
-`hl7` package directory and pinned to `CRITICAL`).
+filters the backstop for anything that reaches a handler un-redacted. `configure_logging` used to
+silence python-hl7's PHI-prone loggers as well; python-hl7 is retired, and the built-in parser that
+replaced it logs no field value.
 
 **A second residual, from the same honesty rule (BACKLOG #1572):** the delimiter sniff reads MSH-1 and
 MSH-2, so a **headerless** custom-delimiter fragment declares nothing and passes through — `mrn

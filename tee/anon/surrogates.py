@@ -369,8 +369,9 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
 def normalized_message(raw: str) -> str:
     """Canonicalize a message for anonymization (ADR 0030 §3) so BOTH adapters see the same structure:
     strip MLLP framing (VT ``\\x0b`` / FS ``\\x1c``), normalize line endings to the HL7 segment
-    separator ``\\r``, and drop empty segments (blank lines). Dropping empties is what keeps python-hl7
-    (engine) from choking on a blank segment and keeps it byte-aligned with the tee's pure splitter."""
+    separator ``\\r``, and drop empty segments (blank lines). Dropping empties is what keeps the
+    engine's parser from choking on a blank segment and keeps it byte-aligned with the tee's pure
+    splitter."""
     text = raw.replace("\x0b", "").replace("\x1c", "")
     text = text.replace("\r\n", "\r").replace("\n", "\r")
     return "\r".join(seg for seg in text.split("\r") if seg)
@@ -380,7 +381,7 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
     """The ``(component/repetition/subcomponent, field)`` separators of an HL7 message, read from its
     own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the **full four**
     encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed identically (the
-    engine's python-hl7 model itself raises when MSH-2 has fewer than four chars). Shared (parity)."""
+    engine's ``Message`` itself raises when MSH-2 has fewer than four chars). Shared (parity)."""
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         if seg[:3].upper() == "MSH" and len(seg) >= 5:
             field = seg[3]
@@ -438,7 +439,7 @@ def scrub_message_site_codes(text: str, keyer: Keyer) -> str:
             head = fields[:1]
             tail = [scrub_site_codes(f, keyer, seps) for f in fields[1:]]
             out_segments.append(field_sep.join(head + tail))
-    # Drop trailing empty segments so the engine's python-hl7 re-encode (which appends a trailing
+    # Drop trailing empty segments so the engine's re-encode (which appends a trailing
     # segment separator) and the tee's pure splitter converge to the same bytes — golden-corpus
     # parity (ADR 0030 §1). A mid-message empty segment is preserved; only the trailing one(s) go.
     while out_segments and out_segments[-1] == "":
