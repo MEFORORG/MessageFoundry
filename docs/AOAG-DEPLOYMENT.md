@@ -344,7 +344,8 @@ The checklist behind those steps:
       the very first failover to R2 leaves the engine in a login-failed retry loop.
 - [ ] **Login grants — least privilege, never `db_owner`.** Two principals, and **no
       server-level role** for either. The engine's runtime database user needs `db_datareader` +
-      `db_datawriter` on `mefor`. The provisioning principal that runs
+      `db_datawriter` on `mefor`, with `UPDATE` and `DELETE` denied on the two audit tables
+      ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 4). The provisioning principal that runs
       `messagefoundry store provision-schema` needs `db_ddladmin` + `db_datareader` +
       `db_datawriter` on `mefor`, and the same default schema as the engine's user.
       [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 carries the T-SQL and §2 the provisioning
