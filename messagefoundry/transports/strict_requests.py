@@ -14,9 +14,9 @@ puts it on the session ``hvac`` built, AFTER ``hvac.Client`` is constructed, so 
 the suite assertion checked (``tls_policy.assert_hvac_tls_suites``) are still the ones the hop
 uses. The adapter subclasses ``HTTPAdapter``. Since BACKLOG #300 it also gives each new verifying
 https connection a fresh context from the factory that assertion returned, so every TLS handshake
-with Vault runs on a narrowed, asserted context; urllib3 still applies requests' ``verify`` to it.
-That includes the TLS leg to an ``https://`` proxy; :func:`_narrowed_pool_classes` says how, and
-which proxy shape is refused. It also changes how the reply BODY is read:
+with Vault runs on a narrowed, asserted context holding requests' CA. That includes the TLS leg to
+an ``https://`` proxy; :func:`_narrowed_pool_classes` says how the CA gets there, and which proxy
+shape is refused. It also changes how the reply BODY is read:
 
 * The body is read eagerly, in :meth:`StrictReplyAdapter.build_response`, from the
   ``http.client.HTTPResponse`` under ``urllib3``'s response, by
@@ -156,13 +156,18 @@ def _narrowed_pool_classes(
     one to the proxy, and one to Vault inside the ``CONNECT`` tunnel. urllib3 builds the first from
     the pool's ``ProxyConfig.ssl_context``, which requests leaves ``None``, and ``None`` means
     urllib3's own unnarrowed context. So each connection replaces that field on its OWN copy of the
-    config with ``factory()``. The proxy leg verifies with requests' ``cert_reqs`` and CA file, as it
-    always did, which is the Vault hop's anchor, and ``server_hostname`` is the proxy's host. The
-    connection loads those onto the proxy context itself, because urllib3 2.8.0 stopped doing so for a
-    supplied proxy context.
+    config with ``factory()``. ``server_hostname`` on that leg is the proxy's host.
+
+    **The connection loads requests' CA onto BOTH contexts itself** (``_anchored_context``), so the
+    proxy leg verifies against the Vault hop's anchor. This is the one place that fact is stated.
+    Up to urllib3 2.7.0, urllib3 loaded the connection's CA onto a supplied context on both legs.
+    urllib3 2.8.0 uses a supplied proxy context exactly as given and loads no CA onto it, so the
+    proxy handshake failed verification. It still loads the CA on the Vault leg; loading it here too
+    keeps that leg anchored if a later release makes the same change there. OpenSSL keeps one copy
+    of a certificate loaded twice. The factory's contexts already require a verified peer.
+
     requests forwards through an ``https://`` proxy only for an ``http://`` Vault, and that shape is
-    refused below. A forwarding connection that did verify would have one TLS leg, to the proxy, on
-    the connection's own ``ssl_context``, which is already the factory's.
+    refused below, before any socket opens.
 
     **It is then CHECKED, not assumed.** The proxy leg's ``SSLSocket`` must hold exactly that
     context, and urllib3 must report the proxy verified. The ``ProxyConfig`` field is urllib3's
@@ -192,12 +197,19 @@ def _narrowed_pool_classes(
                     "refusing to connect"
                 )
             self._mefor_proxy_context = self._narrow_the_proxy_leg()
-            self.ssl_context = factory()
+            self.ssl_context = self._anchored_context()
             super().connect()
             if self._mefor_proxy_context is not None:
                 # Through a tunnel, urllib3 wraps the Vault leg in an SSLTransport over the proxy
                 # leg's SSLSocket, which it names `socket`.
                 self._check_the_proxy_leg(getattr(self.sock, "socket", None))
+
+        def _anchored_context(self) -> ssl.SSLContext:
+            """A fresh ``factory()`` context holding requests' CA; see the docstring above."""
+            context = factory()
+            if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
+                context.load_verify_locations(self.ca_certs, self.ca_cert_dir, self.ca_cert_data)
+            return context
 
         def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:
             """Give the TLS leg to an https proxy its own context, or ``None`` if it has none."""
@@ -208,14 +220,7 @@ def _narrowed_pool_classes(
                 or self.proxy_config is None
             ):
                 return None
-            context = factory()
-            # urllib3 2.8.0 uses a supplied proxy context exactly as given: it takes the context's
-            # own verify_mode and loads no CA onto it. Up to 2.7.0 it applied the connection's
-            # cert_reqs and CA, as it still does on the Vault leg. So the connection applies them
-            # itself, and the proxy leg keeps the Vault hop's anchor on either release.
-            context.verify_mode = resolve_cert_reqs(self.cert_reqs)
-            if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
-                context.load_verify_locations(self.ca_certs, self.ca_cert_dir, self.ca_cert_data)
+            context = self._anchored_context()
             # _replace builds a new tuple, so the pool's shared config is never changed.
             self.proxy_config = self.proxy_config._replace(ssl_context=context)
             return context

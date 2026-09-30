@@ -742,7 +742,7 @@ def test_an_https_proxy_with_the_wrong_host_name_is_refused(
 def test_an_https_proxy_the_anchor_did_not_issue_is_refused(
     pki: _Pki, vault: _TlsVault, proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The proxy leg verifies against the same anchor as the Vault leg, as urllib3 always did."""
+    """The proxy leg verifies against the same anchor as the Vault leg."""
     import requests
 
     monkeypatch.setenv(_CA_ENV, str(pki.other_ca))

@@ -211,9 +211,9 @@ _NO_KEY: dict[str, str] = {
     "loads no key and no trust anchor",
     "messagefoundry/config/models.py": _POSTURE_ONLY,
     "messagefoundry/config/settings.py": _POSTURE_ONLY,
-    "messagefoundry/transports/strict_requests.py": "the Vault clients' reply adapter: it hands "
-    "each connection a TLS context another module builds and narrows (BACKLOG #300), and loads, "
-    "mints and holds no key",
+    "messagefoundry/transports/strict_requests.py": _VERIFY_ONLY + "; the Vault clients' reply "
+    "adapter loads requests' CA onto each TLS context another module builds and narrows (BACKLOG "
+    "#300)",
     "messagefoundry/config/secretprovider_vault.py": "reads connector credentials from Vault KV over "
     "a verifying hop; the Vault token is a credential in the rotation schedule, and a key it fetches "
     "is governed by the row for the setting it fills",

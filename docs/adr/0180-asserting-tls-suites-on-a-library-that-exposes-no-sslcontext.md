@@ -291,8 +291,10 @@ proxy, with no engine setting. hvac's own `proxies=` argument is still refused b
 **An `https://` Vault through an `https://` proxy.** urllib3 builds the proxy leg from the pool's
 `ProxyConfig.ssl_context`, and requests leaves it `None`. Each narrowed connection now replaces that
 field on its own copy of the config with a fresh context from the same factory. The leg keeps
-urllib3's verification: requests' `cert_reqs` and CA file, so the Vault anchor, and the proxy's
-host name. The connection then checks that the proxy leg's socket holds that exact context and that
+requests' CA file, so the Vault anchor, and the proxy's host name. **CORRECTED 2026-09-30:** this
+read "keeps urllib3's verification". urllib3 2.8.0 stopped loading the CA onto a supplied proxy
+context, so the connection now loads it; `transports/strict_requests.py` `_narrowed_pool_classes`
+is the source of record. The connection then checks that the proxy leg's socket holds that exact context and that
 urllib3 reports the proxy verified, and refuses otherwise. Which object urllib3's proxy handshake
 reads is not documented, so this is checked rather than assumed. The check runs in urllib3's private
 `_connect_tls_proxy` hook, before `CONNECT` and any proxy credentials cross the leg, and again after

@@ -571,8 +571,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
-    # and asserts it. It refuses a CERT_NONE connection. For the TLS leg to an https proxy it loads
-    # requests' cert_reqs and CA onto that context itself, which urllib3 2.8.0 stopped doing.
+    # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
     "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
@@ -1371,8 +1370,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.transports.rest",
         }
     ),
+    # Loads requests' CA onto each narrowed context; why is in _narrowed_pool_classes (urllib3 2.8.0).
     "messagefoundry/transports/strict_requests.py": frozenset(
-        {"tls_context:.load_verify_locations()", "tls_context:.verify_mode ="}
+        {"tls_context:.load_verify_locations()"}
     ),
     # BACKLOG #300, owner ruling R3 of 2026-09-27: both verifying contexts are narrowed to a pinned
     # copy of the approved suite list, the apiclient's pattern (tray/ may not import config/).
