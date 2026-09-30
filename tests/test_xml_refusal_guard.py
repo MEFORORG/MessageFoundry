@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pin the XML refusal POLICY at each engine parse site, not just "the parse failed".
 
-The engine parses untrusted XML in three places, and all three rely on defusedxml's refusal flags
-(``forbid_dtd``, ``forbid_entities``, ``forbid_external``) rather than only on expat's amplification
-limits:
+At least three engine sites parse untrusted XML through defusedxml, and each relies on its refusal
+flags (``forbid_dtd``, ``forbid_entities``, ``forbid_external``) rather than only on expat's
+amplification limits. The lxml path in ``parsing/xml/`` and the SOAP gate's ``xml.sax`` parser are
+hardened separately and are not covered here:
 
 * ``RawMessage.xml()`` in ``parsing/message.py`` -- an inbound XML payload, all three flags on.
 * ``api/svg_sanitize.py`` -- the served copy of an SVG attachment, ``forbid_dtd`` OFF by design (ADR
