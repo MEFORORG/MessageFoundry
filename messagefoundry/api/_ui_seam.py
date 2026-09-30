@@ -269,7 +269,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "ec18643ac47b0039"
+ENGINE_UI_SEAM: str = "e14988c64a45577c"
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +357,14 @@ class CoreHandlers:
     # First console→connections.toml write seam (BACKLOG #131, ADR 0007 amendment; seam v9): the
     # object-flag toggle (config:deploy). TOML-managed connections only — a code-first one is refused 409.
     set_connection_flag: Callable[..., Awaitable[Any]]
+    # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
+    # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
+    # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
+    # write the same way. The resolve of an interrupted release is not on the seam: its JSON gate is
+    # require_step_up and the console renders those rows read-only.
+    list_approvals: Callable[..., Awaitable[Any]]
+    approve_action: Callable[..., Awaitable[Any]]
+    reject_action: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)

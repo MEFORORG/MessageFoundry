@@ -86,9 +86,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # and /body, the detail page with the summary, or the summary and the body, revealed on an explicit act.
 # BACKLOG #2436 (ASVS 14.2.6, owner ruling R12) added one /ui route and no JSON route:
 # GET /ui/messages/{message_id}/errors, the detail page with the error text revealed.
+# BACKLOG #1982 added three /ui routes and no JSON route: GET /ui/approvals and the approve and
+# reject POSTs under /ui/approvals/{approval_id}/, the console's side of dual control.
 _ROUTES_DEFAULT = 115
 _ROUTES_WITH_DOCS = 119
-_ROUTES_WITH_UI = 233
+_ROUTES_WITH_UI = 236
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -149,6 +151,11 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/uploaded-logs"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
+        # BACKLOG #1982: the console's approve and reject mirror the JSON approve and reject, both
+        # require_paced, which require_ui charges too. They are flagged only because the JSON
+        # resolve, same method and permission, is require_step_up; the console offers no resolve.
+        ("POST", "/ui/approvals/{approval_id}/approve"),
+        ("POST", "/ui/approvals/{approval_id}/reject"),
         # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload") and BACKLOG #1822 removed
         # ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"): both now carry
         # `require_ui_step_up`, so the derivation below no longer flags them. The confirm page was

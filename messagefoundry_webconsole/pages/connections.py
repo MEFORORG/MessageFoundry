@@ -18,6 +18,7 @@ from messagefoundry.api.models import ConnectionEventInfo, ConnectionRow
 
 from .._html import Markup, el, page, rows_table, text
 from ._common import _num, _secs, _seg
+from .approvals import approvals_link
 
 __all__ = [
     "UNPROVISIONED_NOTICE",
@@ -212,6 +213,7 @@ def purge_pending(pending: object) -> Markup:
         el("h1", "Purge held for approval"),
         el("p", "This queue purge is held for a second approver (dual-control).", class_="muted"),
         el("p", text(f"Approval id: {approval_id}"), class_="muted"),
+        approvals_link(),
         el("p", el("a", "← Connections", href="/ui")),
         class_="card",
     )

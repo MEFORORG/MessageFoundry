@@ -272,7 +272,7 @@ def wordmark(*, tm: bool = False) -> Markup:
 _NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Traffic", ("dashboard", "messages", "dead-letters", "events")),
     ("Monitoring", ("status", "cluster", "alerts", "flow", "audit", "uploaded-logs")),
-    ("Admin", ("users", "config")),
+    ("Admin", ("users", "config", "approvals")),
     ("Account", ("account", "security-events")),
 )
 
