@@ -4,7 +4,7 @@ aioodbc==0.5.0
     # via messagefoundry
 aiosqlite==0.22.1
     # via messagefoundry
-annotated-doc==0.0.4
+annotated-doc==0.0.5
     # via fastapi
 annotated-types==0.7.0
     # via
@@ -12,7 +12,7 @@ annotated-types==0.7.0
     #   pydantic
 antlr4-python3-runtime==4.13.2
     # via fhirpathpy
-anyio==4.14.2
+anyio==4.15.1
     # via
     #   httpx
     #   starlette
@@ -31,7 +31,7 @@ bcrypt==5.0.0
     # via paramiko
 cbor2==6.1.2
     # via webauthn
-certifi==2026.6.17
+certifi==2026.7.22
     # via
     #   httpcore
     #   httpx
@@ -96,7 +96,7 @@ httpx==0.28.1
     # via messagefoundry
 hvac==2.4.0
     # via messagefoundry
-idna==3.18
+idna==3.20
     # via
     #   anyio
     #   httpx
@@ -220,7 +220,7 @@ pytest-xdist==3.8.0
     # via messagefoundry
 python-dateutil==2.9.0.post0
     # via fhirpathpy
-python-dotenv==1.2.2
+python-dotenv==1.2.3
     # via uvicorn
 pyx12==4.0.0
     # via messagefoundry
@@ -251,8 +251,9 @@ tomlkit==0.15.1
     # via messagefoundry
 truststore==0.10.4
     # via messagefoundry
-typing-extensions==4.15.0
+typing-extensions==4.16.0
     # via
+    #   anyio
     #   fastapi
     #   grpcio
     #   mypy
@@ -264,7 +265,7 @@ typing-extensions==4.15.0
     #   pydantic
     #   pydantic-core
     #   typing-inspection
-typing-inspection==0.4.2
+typing-inspection==0.4.4
     # via
     #   fastapi
     #   pydantic
@@ -276,7 +277,7 @@ uvicorn==0.49.0
     # via messagefoundry
 uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
     # via uvicorn
-watchfiles==1.2.0
+watchfiles==1.3.0
     # via uvicorn
 webauthn==3.0.0
     # via messagefoundry
