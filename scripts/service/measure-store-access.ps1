@@ -162,46 +162,32 @@ function Get-Excerpt([string]$Text, [int]$Max = 400) {
     return $flat
 }
 
-function New-SyntheticPassword([string[]]$DenyWords) {
-    # Synthetic and per run: never a literal in the repository, never printed, never on argv.
-    # Screened against the engine's own context-word deny-list, the way generate_policy_password
-    # screens its tokens (messagefoundry/auth/service.py). An unscreened random 32-character string
-    # contains a listed term, almost always "hl7", in about one run in 2,000, and provision-admin
-    # then refuses it: merge group 36766996620 went red that way on 2026-09-30.
-    if (-not $DenyWords -or $DenyWords.Count -eq 0) {
-        # An empty list would screen nothing and pass every candidate, so refuse rather than guess.
-        throw "New-SyntheticPassword was given no context words to screen against"
-    }
-    for ($attempt = 0; $attempt -lt 64; $attempt++) {
-        $bytes = New-Object byte[] 48
-        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-        $candidate = (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
-        $lowered = $candidate.ToLowerInvariant()
-        $hit = $false
-        foreach ($word in $DenyWords) { if ($lowered.Contains($word)) { $hit = $true; break } }
-        if (-not $hit) { return $candidate }
-    }
-    throw "no synthetic password cleared the context-word deny-list in 64 attempts"
-}
-
-function Get-ContextWords {
+function New-SyntheticPassword {
     <#
-      The shipped context-word deny-list, read from the installed engine so this script never keeps
-      a copy of it that could drift. The words are public (docs/SECURITY.md lists them), so printing
-      them is fine. Only lines carrying the probe's prefix count, so a stray warning on stderr cannot
-      become a word.
+      Synthetic and per run: never a literal in the repository, never printed, never on argv.
+      Each candidate goes through the probe's `screen` mode, which applies the policy provision-admin
+      applies, loaded the way it loads it. An unscreened random 32-character string holds a shipped
+      context word, almost always "hl7", in about one draw in 1,900, and provision-admin refuses it:
+      merge group 36766996620 went red that way on 2026-09-30. Exit 3 means the screen refused this
+      candidate, so draw again; any other failure means the screen itself broke, so stop.
     #>
-    $r = Invoke-OperatorCli -Arguments @("context-words") -Secrets @{}
-    if ($r.Code -ne 0) { throw "the probe could not read the context-word deny-list (exit $($r.Code))" }
-    $words = @(
-        $r.Text -split "`r?`n" |
-            Where-Object { $_ -like "context-word *" } |
-            ForEach-Object { $_.Substring("context-word ".Length).Trim().ToLowerInvariant() } |
-            Where-Object { $_ }
-    )
-    if ($words.Count -eq 0) { throw "the probe printed no context words; output: $(Get-Excerpt $r.Text)" }
-    return $words
+    param([string]$ForUsername, [string]$ForDbPath, [hashtable]$Environment)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $bytes = New-Object byte[] 48
+        for ($attempt = 1; $attempt -le 16; $attempt++) {
+            $rng.GetBytes($bytes)
+            $candidate = (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
+            $secrets = @{ MEFOR_W0_ADMIN_PASSWORD = $candidate }
+            foreach ($k in $Environment.Keys) { $secrets[$k] = $Environment[$k] }
+            $r = Invoke-OperatorCli -Arguments @("screen", $ForUsername, $ForDbPath) -Secrets $secrets
+            if ($r.Code -eq 0) { return $candidate }
+            if ($r.Code -ne 3) {
+                throw "the password screen failed (exit $($r.Code)): $(Get-Excerpt $r.Text)"
+            }
+        }
+    } finally { $rng.Dispose() }
+    throw "no synthetic password cleared the policy in 16 attempts"
 }
 
 function Get-Sid([string]$Account) {
@@ -670,13 +656,20 @@ def _provision(argv):
     return cli.main(["provision-admin", *argv])
 
 
-def _context_words():
-    # The shipped deny-list, so the script screens its synthetic password against the engine's own
-    # list rather than a copy. Prefixed lines, so the caller can ignore anything else printed.
-    from messagefoundry.auth.policy import CONTEXT_WORDS
+def _screen(username, db):
+    # The screen provision-admin runs before it opens the store: the same settings load (the working
+    # directory's messagefoundry.toml, the MEFOR_* environment, the --db override) and the same
+    # PasswordPolicy call. Prints only the refused clauses, never the password. Exit 3 is a refusal.
+    from messagefoundry.auth.policy import PasswordPolicy
+    from messagefoundry.config.settings import load_settings
 
-    for word in sorted(CONTEXT_WORDS):
-        print("context-word " + word)
+    password = os.environ.pop("MEFOR_W0_ADMIN_PASSWORD")
+    settings = load_settings(cli={"store": {"path": db}})
+    problems = PasswordPolicy.from_settings(settings.auth).violations(password, username=username)
+    if problems:
+        print("screen refused the candidate: " + "; ".join(problems))
+        return 3
+    print("screen passed")
     return 0
 
 
@@ -735,8 +728,8 @@ def _login(base, cafile, username):
 
 if __name__ == "__main__":
     mode = sys.argv[1]
-    if mode == "context-words":
-        sys.exit(_context_words())
+    if mode == "screen":
+        sys.exit(_screen(sys.argv[2], sys.argv[3]))
     if mode == "provision":
         sys.exit(_provision(sys.argv[2:]))
     if mode == "health":
@@ -749,11 +742,10 @@ Set-Content -LiteralPath $Probe -Value $ProbeSource -Encoding Ascii
 
 $StoreKey = (& $AppExe gen-key).Trim()
 if (-not $StoreKey) { throw "messagefoundry gen-key produced no store key" }
-$Password = New-SyntheticPassword -DenyWords (Get-ContextWords)
 if ($env:GITHUB_ACTIONS -eq "true") {
-    # Both are synthetic and per run. Masked anyway, so no later echo can print either in clear.
+    # Synthetic and per run. Masked anyway, so no later echo can print it in clear. The password is
+    # masked the same way once the try below has drawn it.
     Write-Host "::add-mask::$StoreKey"
-    Write-Host "::add-mask::$Password"
 }
 $BaseUrl = "https://127.0.0.1:$Port"
 
@@ -761,6 +753,17 @@ Write-Host "===== ADR 0183 Wave 0: $Order, operator=$Operator, service=$ServiceI
 Write-Host "store: $DbPath"
 
 try {
+    # Drawn inside the try, so a broken screen reds through Add-Failure and the cleanup below like any
+    # other step. The environment is what provision-admin runs under, so the screen loads the same
+    # settings; the password itself rides MEFOR_W0_ADMIN_PASSWORD, added by the function.
+    $CurrentPhase = "operator password screen"
+    $Password = New-SyntheticPassword -ForUsername $Username -ForDbPath $DbPath -Environment @{
+        MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
+        MEFOR_SECURITY_REQUIRE_MFA = "false"
+    }
+    if ($env:GITHUB_ACTIONS -eq "true") { Write-Host "::add-mask::$Password" }
+    $CurrentPhase = "setup"
+
     # --- install under the DEFAULT virtual account (no -ServiceAccount, no -AllowLocalSystem) ------
     & (Join-Path $PSScriptRoot "install-service.ps1") -ServiceName $ServiceName -AppExe $AppExe `
         -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
