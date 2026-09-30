@@ -8,7 +8,8 @@ and listed a process start in a module whose own docstring says it never runs on
 The nearest guard, ``tests/test_threat_model_doc_drift.py``, reads the vault-only threat model, so
 its page half skips in every engine checkout.
 
-This file derives two inventories from ``messagefoundry/**`` by AST and holds the page to both:
+This file derives two inventories from ``messagefoundry/**`` and ``messagefoundry_toolkit/**`` by
+AST and holds the page to both:
 
 * **Native library calls (section 5).** Every module that imports ``ctypes``, at any depth, must be
   in the section's list, and the list must name nothing else. The counts in the section and in the
@@ -28,11 +29,11 @@ the console's Python holds none of the engine's classes. The TypeScript and Java
 by pattern, not by parser, and skip whole-line comments only.
 
 Section 7's parser tables are held to a scan too (BACKLOG #1190): every parse site the six patterns
-the page names find, over the engine and the web console's Python, must sit in exactly one of the
-first two tables, and neither may name a site the scan does not find. The third table names parsers
-found by reading the code; each must exist and must not be a site the scan finds, and nothing here
-says it is complete. The VS Code extension's TypeScript under ``ide/src`` has a four-pattern scan
-and three tables of its own, held the same way. The patterns the page states must
+the page names find, over the engine, the toolkit and the web console's Python, must sit in exactly
+one of the first two tables, and neither may name a site the scan does not find. The third table
+names parsers found by reading the code; each must exist and must not be a site the scan finds, and
+nothing here says it is complete. The VS Code extension's TypeScript under ``ide/src`` has a
+four-pattern scan and three tables of its own, held the same way. The patterns the page states must
 be the ones each detector uses. Which table a site belongs in is a judgement about where its input
 comes from, and no check here reads that.
 Section 9's claim about which extension file builds markup with ``innerHTML`` is pinned to a file
@@ -65,6 +66,8 @@ from tests.test_threat_model_doc_drift import _ALLOWED_SUBPROCESS_SITES
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PKG = _ROOT / "messagefoundry"
+_TOOLKIT = _ROOT / "messagefoundry_toolkit"
+_TOOLKIT_PREFIX = "messagefoundry_toolkit/"
 _DOC = _ROOT / "docs" / "DANGEROUS-FUNCTIONALITY.md"
 
 _ARGV = "argument list"
@@ -133,12 +136,28 @@ _REVIEWED_COMPUTED_LOADS: dict[str, tuple[str, ...]] = {
 # --- reading the tree ----------------------------------------------------------------------------
 
 
+def _python_under(root: Path, prefix: str = "") -> dict[str, str]:
+    return {
+        f"{prefix}{path.relative_to(root).as_posix()}": path.read_text(encoding="utf-8")
+        for path in sorted(root.rglob("*.py"))
+    }
+
+
+@functools.cache
+def _engine_sources() -> dict[str, str]:
+    """The engine's modules alone, for the threat-model register, which reads only the engine."""
+    return _python_under(_PKG)
+
+
 @functools.cache
 def _package_sources() -> dict[str, str]:
-    return {
-        path.relative_to(_PKG).as_posix(): path.read_text(encoding="utf-8")
-        for path in sorted(_PKG.rglob("*.py"))
-    }
+    """The engine's modules, and the toolkit's under its package name, as the page names them.
+
+    ADR 0201 moved the authoring commands out of ``messagefoundry/`` into ``messagefoundry_toolkit/``,
+    which ships as its own distribution. A module that moves must not leave the scans, so every
+    inventory here reads both roots (BACKLOG #1190). Engine keys carry no prefix, so the toolkit's
+    ``__main__.py`` cannot collide with the engine's."""
+    return {**_engine_sources(), **_python_under(_TOOLKIT, _TOOLKIT_PREFIX)}
 
 
 def _parse(source: str) -> ast.Module:
@@ -449,7 +468,7 @@ def _register_gap(live: Mapping[str, object], register: Mapping[str, object]) ->
 def test_the_two_process_start_inventories_agree() -> None:
     """``tests/test_threat_model_doc_drift.py`` keeps its own register of process-start modules for
     the vault threat model. Two registers of one fact drift apart unless something compares them."""
-    gap = _register_gap(_start_sites(_package_sources()), _ALLOWED_SUBPROCESS_SITES)
+    gap = _register_gap(_start_sites(_engine_sources()), _ALLOWED_SUBPROCESS_SITES)
     assert not gap, f"the two process-start inventories disagree on {sorted(gap)}"
 
 
@@ -556,7 +575,7 @@ def test_the_computed_load_naming_check_fires() -> None:
 
 
 def test_the_register_comparison_fires() -> None:
-    live = _start_sites(_package_sources())
+    live = _start_sites(_engine_sources())
     short = {rel: why for rel, why in _ALLOWED_SUBPROCESS_SITES.items() if rel != "tray/app.py"}
     assert _register_gap(live, short) == {"tray/app.py"}
 
@@ -619,6 +638,30 @@ def test_code_drift_is_reported() -> None:
     sources = dict(_package_sources())
     sources["tray/branding.py"] += "\nimport os\nos.system('x')\n"
     assert _start_drift(text, _start_sites(sources))
+
+
+def test_the_scans_read_the_toolkit() -> None:
+    """The toolkit holds no site today, so a scan that skipped it would pass the same way. It must be
+    read, keyed by its package name, and a site planted in it must reach at least the five checks
+    below. The real tests hold each unplanted map to the page, so only the plant is checked here."""
+    analyzer = f"{_TOOLKIT_PREFIX}adr_analyze.py"
+    assert analyzer in _package_sources(), "the toolkit is not scanned"
+    scan = _parser_scan_sources()
+    assert analyzer in scan, "the parser scan does not read the toolkit"
+    assert _unit_exists(analyzer)
+    text = _doc_text()
+    new_tool = f"{_TOOLKIT_PREFIX}new_tool.py"
+    source = (
+        "import ctypes, subprocess, tarfile, json\n"
+        "ctypes.CDLL(cfg_path)\nsubprocess.run(['x'])\njson.loads(b)\n"
+    )
+    # Each plant goes into a copy of the map its real test reads, never into the cached map itself.
+    planted = {**_package_sources(), new_tool: source}
+    assert _ctypes_drift(text, _ctypes_modules(planted))
+    assert _start_drift(text, _start_sites(planted))
+    assert _computed_loads(planted) != _REVIEWED_COMPUTED_LOADS
+    assert _archive_drift(text, _archive_modules(planted))
+    assert _parser_drift(text, _parse_sites({**scan, new_tool: source}))
 
 
 # --- sections 7 to 10: archives, service scripts, the extension, the web console (BACKLOG #1190) ---
@@ -809,10 +852,7 @@ def _console_scripts() -> dict[str, str]:
 
 @functools.cache
 def _console_python() -> dict[str, str]:
-    return {
-        path.relative_to(_CONSOLE).as_posix(): path.read_text(encoding="utf-8")
-        for path in sorted(_CONSOLE.rglob("*.py"))
-    }
+    return _python_under(_CONSOLE)
 
 
 #: Ways to turn an HTML string into page content, at least: assignment (plain, ``+=`` or logical) to
@@ -1119,8 +1159,8 @@ def _parse_sites(sources: Mapping[str, str]) -> set[str]:
 
 
 def _parser_scan_sources() -> dict[str, str]:
-    """The engine's modules, and the web console's under their package name, as the page names
-    them."""
+    """The engine's and the toolkit's modules, and the web console's under their package name, as
+    the page names them."""
     console = {f"{_CONSOLE_PREFIX}{rel}": source for rel, source in _console_python().items()}
     return {**_package_sources(), **console}
 
@@ -1138,9 +1178,9 @@ def _table_units(section: str, header: str) -> set[str]:
 
 
 def _unit_exists(unit: str) -> bool:
-    if unit.startswith(_CONSOLE_PREFIX):
-        return (_CONSOLE / unit.removeprefix(_CONSOLE_PREFIX)).exists()
-    return (_PKG / unit).exists()
+    # A prefixed unit names its own top-level package, so it resolves from the repository root.
+    prefixed = unit.startswith((_CONSOLE_PREFIX, _TOOLKIT_PREFIX))
+    return (_ROOT / unit if prefixed else _PKG / unit).exists()
 
 
 def _three_table_drift(

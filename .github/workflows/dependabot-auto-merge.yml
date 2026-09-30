@@ -13,10 +13,11 @@ name: Dependabot auto-merge
 # OUT OF SCOPE (left for human review, surfaced same-day by the daily security cron + alerts):
 #   - EVERYTHING ELSE, and that is the default by design. An unnamed dependency, an unrecognised
 #     ecosystem, a MINOR/MAJOR update of a runtime dep, any MAJOR update — every one of them HOLDS.
-#   - EVERY uv and npm bump, because both allow rows ship EMPTY. `python-deps`/`ide-deps` group on
-#     `*`, so one weekly batch carries everything and a non-empty row would have to name each of the
-#     ~98 pinned distributions before it could ever fire. Those two ecosystems were already
-#     review-by-default in practice; they are now review-by-default BY DESIGN rather than by accident.
+#   - EVERY uv and npm bump, because both allow rows ship EMPTY. `python-deps`, `python-deps-major`
+#     and `ide-deps` each group on `*`, so a weekly batch carries every candidate its group admits
+#     and a non-empty row would have to name each of the ~98 pinned distributions before it could
+#     ever fire. Those two ecosystems were already review-by-default in practice; they are now
+#     review-by-default BY DESIGN rather than by accident.
 #   - a github-actions batch carrying any third-party action, since `actions-deps` also groups on `*`.
 #     Measured: PR #75's five-bump batch carried `pypa/gh-action-pypi-publish`, so that same batch
 #     would HOLD under this allow-set. Expect auto-merge to fire RARELY — that is the intent of
@@ -141,10 +142,11 @@ jobs:
               allow_prefixes="actions/ github/ dependabot/"
               ;;
             uv|pip|npm_and_yarn|npm)
-              # Deliberately EMPTY. `python-deps`/`ide-deps` group on `*`, so one weekly batch carries
-              # everything and a non-empty row would have to name every one of the ~98 pinned
-              # distributions before it could ever fire. These ecosystems were already
-              # review-by-default in practice; this makes it review-by-default BY DESIGN.
+              # Deliberately EMPTY. `python-deps`, `python-deps-major` and `ide-deps` each group on
+              # `*`, so a weekly batch carries every candidate its group admits and a non-empty row
+              # would have to name every one of the ~98 pinned distributions before it could ever
+              # fire. These ecosystems were already review-by-default in practice; this makes it
+              # review-by-default BY DESIGN.
               allow_prefixes=""
               ;;
             *)

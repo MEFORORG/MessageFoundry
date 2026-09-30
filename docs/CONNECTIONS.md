@@ -3424,7 +3424,7 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 
 **Dependency note.** A modeled lane means a new parser/validator dependency. The shipped lanes each ride an
 optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<4`, pure‑Python, no numpy), `[fhir]`
-(`fhir.resources` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
+(`fhir.resources` + `fhir-core` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
 lazily imported, so an install that never touches a lane pays nothing. Still to be *evaluated*, not yet
 chosen: an **NCPDP** parser (the XML/CDA question is settled — `lxml` is in tree under `[xml]`). Per the
 project guardrails, each must be **verified as real and reputable, added to `pyproject.toml`, and
