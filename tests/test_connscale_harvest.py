@@ -510,6 +510,8 @@ def test_an_artifact_for_a_leg_with_no_job_says_so() -> None:
 def test_an_artifact_outside_every_job_window_is_listed_not_guessed() -> None:
     api = _fixture()
     api.artifacts[200].append(_artifact(14, "windows-2022", "2026-09-10T15:00:00Z"))
+    # Read before the join since BACKLOG #2013. It names no attempt, so the time join decides.
+    api.blobs[14] = _zip(_payload({"fixed_aggregate": 1.0}))
     result = _harvest(api)
     assert [(a["artifact_id"], a["reason"]) for a in result.unjoined_artifacts] == [
         (14, "no job window contains it")
@@ -743,3 +745,117 @@ def test_main_reports_an_api_failure_with_a_nonzero_exit(
     monkeypatch.setattr(ch, "GhApi", Broken)
     assert ch.main(["--since", "2026-09-01T00:00:00Z", "--quiet"]) == 2
     assert "harvest failed: boom" in capsys.readouterr().err
+
+
+# --- BACKLOG #2013: the payload names its attempt and job, and records the wake pin -------------
+
+
+def _with_context(
+    values: dict[str, float | None], rate_window: str | None = None, **context: str
+) -> bytes:
+    payload = _payload(values, rate_window=rate_window)
+    payload["context"].update(context)
+    return _zip(payload)
+
+
+def _skewed_rerun(api: FakeApi) -> None:
+    """Attempt 2 of windows-2025 starts 10 s after attempt 1 ends, and attempt 1's artifact is
+    stamped 20 s after that end: inside attempt 2's run time, so the time join picks attempt 2."""
+    api.jobs[200][3]["started_at"] = "2026-09-10T10:30:10Z"
+    api.artifacts[200][2]["created_at"] = "2026-09-10T10:30:20Z"
+
+
+def test_a_payload_that_names_its_attempt_joins_that_attempts_job() -> None:
+    api = _fixture()
+    _skewed_rerun(api)
+    api.blobs[13] = _with_context({"fixed_aggregate": 13.12}, run_attempt="1", job="test")
+    by_job = _outcomes(_harvest(api))
+    assert (by_job[3].artifact_id, by_job[3].status) == (13, "harvested")
+    assert (by_job[4].artifact_id, by_job[4].status) == (None, "unknown_adverse")
+
+
+def test_without_an_attempt_the_same_artifact_goes_to_the_wrong_job() -> None:
+    # The control for the test above: the fixture is what makes the time join go wrong, and it is
+    # the attempt in the payload, nothing else, that puts the artifact back on its own job.
+    api = _fixture()
+    _skewed_rerun(api)
+    by_job = _outcomes(_harvest(api))
+    assert (by_job[4].artifact_id, by_job[3].artifact_id) == (13, None)
+
+
+@pytest.mark.parametrize(
+    ("context", "reason"),
+    [
+        ({"run_attempt": "3"}, "payload names run attempt 3; its leg has 0 jobs in it"),
+        ({"run_id": "999"}, "payload names run 999, not this one"),
+        ({"job": "webconsole"}, "payload names job 'webconsole', not 'test'"),
+    ],
+)
+def test_a_payload_that_names_another_job_is_listed_not_joined(
+    context: dict[str, str], reason: str
+) -> None:
+    api = _fixture()
+    api.blobs[13] = _with_context({"fixed_aggregate": 13.12}, **context)
+    result = _harvest(api)
+    assert [(a["artifact_id"], a["reason"]) for a in result.unjoined_artifacts] == [(13, reason)]
+    assert _outcomes(result)[3].status == "unknown_adverse"
+
+
+def test_a_local_run_names_nothing_and_falls_back_to_the_time_join() -> None:
+    api = _fixture()
+    api.blobs[13] = _with_context({"fixed_aggregate": 13.12}, run_id="-", run_attempt="-", job="-")
+    assert _outcomes(_harvest(api))[3].artifact_id == 13
+
+
+def _pinned_fixture(pin_13: str) -> FakeApi:
+    api = _fixture()
+    api.blobs[11] = _with_context({"fixed_aggregate": 40.0}, per_lane_wake="false")
+    api.blobs[12] = _with_context(
+        {"fixed_aggregate": 28.0}, rate_window=ch.POST_1420_RATE_WINDOW, per_lane_wake="false"
+    )
+    api.blobs[13] = _with_context({"fixed_aggregate": 13.12}, per_lane_wake=pin_13)
+    return api
+
+
+def test_the_pin_is_verified_only_when_every_harvested_job_records_it() -> None:
+    result = _harvest(_pinned_fixture("false"))
+    assert ch.pin_verified(result) is True
+    assert "PER_LANE_WAKE pin: VERIFIED; all 3 harvested job(s) record false" in (
+        ch.render_markdown(result)
+    )
+    assert ch.to_json_dict(result)["per_lane_wake_pin_verified"] is True
+    # One harvested job whose payload records nothing leaves the pin unproven.
+    unsaid = _harvest(_pinned_fixture("-"))
+    assert ch.pin_verified(unsaid) is False
+    assert "NOT VERIFIED by this scan; 2 of 3 harvested job(s) record it" in (
+        ch.render_markdown(unsaid)
+    )
+
+
+@pytest.mark.parametrize("pin", ["true", "mixed"])
+def test_a_payload_from_another_engine_is_excluded_not_pooled(pin: str) -> None:
+    result = _harvest(_pinned_fixture(pin))
+    job = _outcomes(result)[3]
+    assert (job.status, job.reason, job.per_lane_wake) == (
+        "excluded",
+        f"per_lane_wake {pin!r}, not the pinned 'false'",
+        pin,
+    )
+    assert not [r for r in result.readings if r.job_id == 3]
+    # The two jobs left all record the pin, so what was harvested is still verified.
+    assert ch.pin_verified(result) is True
+
+
+def test_a_boolean_pin_reads_the_same_as_its_text() -> None:
+    payload = _payload({"fixed_aggregate": 1.0})
+    payload["context"]["per_lane_wake"] = False
+    assert ch.payload_per_lane_wake(payload) == "false"
+    payload["context"]["per_lane_wake"] = True
+    assert ch.payload_per_lane_wake(payload) == "true"
+
+
+def test_an_empty_harvest_does_not_claim_it_read_a_payload() -> None:
+    api = _fixture()
+    api.runs = []
+    text = ch.render_markdown(_harvest(api))
+    assert "PER_LANE_WAKE pin: NOT VERIFIED by this scan; no job was harvested." in text

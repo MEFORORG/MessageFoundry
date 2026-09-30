@@ -79,6 +79,7 @@ from harness.load.connscale.report import (
     ConnScaleRecord,
     ConnScaleReport,
     herd_floor_readings,
+    per_lane_wake_pin,
 )
 from harness.load.connscale.runner import (
     _MIN_IN_HOLD_SAMPLES,
@@ -363,7 +364,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             "empty_claims_per_msg",
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
-            context=_run_context(),
+            context=_run_context(report),
             base_count=min(_SMOKE_COUNTS),
         )
     )
@@ -372,7 +373,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             "empty_claims_per_msg",
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
-            context=_run_context(),
+            context=_run_context(report),
             base_count=min(_SMOKE_COUNTS),
         )
     )
@@ -401,7 +402,7 @@ def _write_readings_json(payload: dict[str, object]) -> None:
         warnings.warn(f"could not write connscale readings JSON: {exc}", stacklevel=2)
 
 
-def _run_context() -> dict[str, str]:
+def _run_context(report: ConnScaleReport) -> dict[str, str]:
     """What a later reader needs to tell one run's samples from another's.
 
     ONE definition, read by BOTH emitters. Two copies would drift, and a reader diffing the two tables
@@ -409,12 +410,22 @@ def _run_context() -> dict[str, str]:
 
     #1211's question is whether the ratio moves with runner contention, so the core count is part of
     the reading rather than trivia.
+
+    BACKLOG #2013 added three. ``run_attempt`` and ``job`` let the #1415 harvest join a payload to the
+    job that wrote it exactly, rather than by its artifact's name and upload time: a re-run attempt
+    is a separate engine run under the same run id. ``job`` is the workflow's job key
+    (``GITHUB_JOB``), not the matrix leg, which the artifact name already carries. ``per_lane_wake``
+    is the value every step's engine ran with, read by the engine's own parser, so the harvest can
+    check the pin #1415 rests on instead of assuming it.
     """
     return {
         "runner_os": os.environ.get("RUNNER_OS", "local"),
         "cpus": str(os.cpu_count()),
         "run_id": os.environ.get("GITHUB_RUN_ID", "-"),
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "-"),
+        "job": os.environ.get("GITHUB_JOB", "-"),
         "sha": os.environ.get("GITHUB_SHA", "-")[:8] or "-",
+        "per_lane_wake": per_lane_wake_pin(report.records),
     }
 
 
@@ -434,7 +445,7 @@ def _record_diagnostics(report: ConnScaleReport) -> None:
     NO BAND AND NO VERDICT -- see `render_diagnostics_markdown`. None of these has an SLO, so any
     threshold printed beside them would be manufactured by the renderer.
     """
-    _append_step_summary(report.render_diagnostics_markdown(context=_run_context()))
+    _append_step_summary(report.render_diagnostics_markdown(context=_run_context(report)))
 
 
 @pytest.fixture(scope="module")
@@ -676,6 +687,29 @@ def test_fd_sampler_reads_self() -> None:
     assert live is None or live > 0  # None only if the OS tool is unavailable on this runner
     dead = FdSampler(2**31 - 1).sample()  # an implausible PID
     assert dead is None
+
+
+def test_every_step_ran_with_the_per_lane_wake_pin(smoke_report: ConnScaleReport) -> None:
+    """BACKLOG #2013, on a real run. Each step records the value its engine resolved, and the
+    payload context reports it; "-" here would mean a step recorded nothing, "mixed" a step that
+    ran a different engine."""
+    assert per_lane_wake_pin(smoke_report.records) == "false"
+    assert _run_context(smoke_report)["per_lane_wake"] == "false"
+
+
+def test_the_run_context_names_its_attempt_and_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #2013: the harvest joins a payload to its job on these, so they must come from the
+    environment Actions sets, and read as "-" off Actions rather than as a guess."""
+    empty = ConnScaleReport("t", "http://127.0.0.1:1", None, False, [], [], True, 0)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setenv("GITHUB_JOB", "test")
+    context = _run_context(empty)
+    assert (context["run_attempt"], context["job"]) == ("2", "test")
+    assert context["per_lane_wake"] == "-"  # no step, so nothing proves the pin
+    monkeypatch.delenv("GITHUB_RUN_ATTEMPT")
+    monkeypatch.delenv("GITHUB_JOB")
+    context = _run_context(empty)
+    assert (context["run_attempt"], context["job"]) == ("-", "-")
 
 
 # The port-allocator's own guards (contiguity, fail-loud exhaustion, the too-narrow window, and
