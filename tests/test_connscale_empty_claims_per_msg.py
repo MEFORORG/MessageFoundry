@@ -1036,14 +1036,24 @@ def test_the_payload_version_moved_and_the_harvested_ratio_ROWS_did_not() -> Non
     values are computed over without changing the row shape, so this top-level field is the only
     thing that splits the corpus where it really splits. A harvest filters on this exact name and
     value; reading the constant back would pass a rename. BACKLOG #2024 moved the window again and
-    changed the value with it, so the literal below is the #2024 one.
+    changed the value with it, so the literal below is the #2024 one. The payload reads it off its
+    records, so the records here carry it as a sweep step's do.
     """
     report = _report(
-        _rec("fixed_aggregate", 12, per_msg=48.0), _rec("fixed_aggregate", 24, per_msg=30.0)
+        *(
+            dataclasses.replace(r, rate_window=RATE_WINDOW)
+            for r in (
+                _rec("fixed_aggregate", 12, per_msg=48.0),
+                _rec("fixed_aggregate", 24, per_msg=30.0),
+            )
+        )
     )
     payload = report.readings_payload(_METRIC, _KEY, tolerance=0.25, base_count=12)
     assert payload["schema_version"] == 2
     assert payload["rate_window"] == "in_hold_excl_drain_reload_tail"
+    # The control: records that say no window give a payload that claims none.
+    unsaid = _report(_rec("fixed_aggregate", 12, per_msg=48.0))
+    assert unsaid.readings_payload(_METRIC, _KEY, tolerance=0.25)["rate_window"] is None
 
     rows = payload["readings"]
     assert isinstance(rows, list) and len(rows) == 2

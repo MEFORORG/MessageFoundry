@@ -844,3 +844,18 @@ def test_a_payload_from_another_engine_is_excluded_not_pooled(pin: str) -> None:
     assert not [r for r in result.readings if r.job_id == 3]
     # The two jobs left all record the pin, so what was harvested is still verified.
     assert ch.pin_verified(result) is True
+
+
+def test_a_boolean_pin_reads_the_same_as_its_text() -> None:
+    payload = _payload({"fixed_aggregate": 1.0})
+    payload["context"]["per_lane_wake"] = False
+    assert ch.payload_per_lane_wake(payload) == "false"
+    payload["context"]["per_lane_wake"] = True
+    assert ch.payload_per_lane_wake(payload) == "true"
+
+
+def test_an_empty_harvest_does_not_claim_it_read_a_payload() -> None:
+    api = _fixture()
+    api.runs = []
+    text = ch.render_markdown(_harvest(api))
+    assert "PER_LANE_WAKE pin: NOT VERIFIED by this scan; no job was harvested." in text

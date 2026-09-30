@@ -452,6 +452,7 @@ async def _run_one_step(
     # probe task keeps walking the process table for the whole REST of the sweep, and `run_connscale`
     # lets a failed step fall through to the next one rather than ending the run.
     sampler_tasks: list[asyncio.Task[Any]] = []
+    hold_task: asyncio.Task[None] | None = None
     reload_task: asyncio.Task[_ReloadAccount] | None = None
     try:
         await sink.start()
@@ -699,6 +700,10 @@ async def _run_one_step(
     finally:
         for task in sampler_tasks:
             task.cancel()
+        if hold_task is not None:
+            # Directly, not through the probe: a step cancelled inside `_await_hold` would otherwise
+            # leave the token bucket emitting until the probe task handled its own cancellation.
+            hold_task.cancel()
         if reload_task is not None:
             reload_task.cancel()
             if reload_task.done() and not reload_task.cancelled():
@@ -723,6 +728,10 @@ def _effective_per_lane_wake(node_env: Mapping[str, str]) -> bool | None:
     parser reads it here. Only the ``MEFOR_PIPELINE_*`` keys go in: they alone decide this value, and
     an unrelated section that fails to validate must not fail the step at this point. None, logged,
     when even those keys do not parse; the engine would refuse to start on them too.
+
+    WHAT IT CANNOT SEE: this is the parse of the environment the engine is given, in this process.
+    It is not read back from the running engine, which reports no such value over its API. A ``serve``
+    CLI flag, which outranks the environment, would not show here; `EngineNode` passes none today.
     """
     from messagefoundry.config.settings import load_settings
 
@@ -1146,7 +1155,8 @@ async def _sample_loop(
     of this loop produced two readings 0.06 s apart against a 0.25 s interval.
 
     The overshoot is bounded and cheap: at most ``min_samples`` further ticks after ``stop``, under one
-    interval each, by which point the driver has stopped offering. ATTEMPTS are counted rather than
+    interval each. The hold has ended by then, but the reload probe may still be offering its extra
+    hold, since the step stops this loop at the hold's end (BACKLOG #2024). ATTEMPTS are counted rather than
     readings, so a poll that keeps answering ``None`` cannot spin here.
     """
     past_stop = 0
@@ -1905,7 +1915,9 @@ def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float
     ``sampler_stop.set()`` fires when the step's HOLD ends, not when the reload probe returns
     (BACKLOG #2024). The probe runs beside the hold. Where a slow reload keeps it waiting for
     connections past the hold's end, or makes it offer an extra hold after it, those seconds are
-    OUTSIDE the window. The reload itself fires mid-hold by design and stays inside.
+    OUTSIDE the window, with one exception: a make-up floor tick is taken after that stop, so on a
+    hold too short for the floor it can land in them. ``in_hold_floor_ticks`` says when that could
+    have happened. The reload itself fires mid-hold by design and stays inside.
 
     It EXCLUDES the post-drain final. ``_run_one_step`` counts ``in_hold_samples`` first, then appends
     that final after ``driver.stop(_STOP_GRACE)``, after ``poller.await_drain(...)`` and after

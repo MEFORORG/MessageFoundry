@@ -136,6 +136,7 @@ def _fake_proc(sent: int, sink: int, read: float, arm_b1: bool) -> dict[str, Any
             "detail": "",
         },
         "throughput": {
+            "rate_window": "hold_bracket",  # what connscale-remote writes (BACKLOG #2012)
             "achieved_aggregate_rate": read,
             "delivered_aggregate_rate": read,
             "in_pipeline_peak": 0,
@@ -582,15 +583,22 @@ async def test_batch_driver_crashed_band_fails_cell_not_absent(
 # --------------------------------------------------------------------------------------------------
 
 
-def test_a_two_box_cell_names_the_hold_bracket_window() -> None:
+def test_a_two_box_cell_names_the_window_its_bands_report() -> None:
     from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, RATE_WINDOW
 
     cell = bb.iter_batch_cells(_profile(), claim_mode="pooled")[3]
-    rec = bb.aggregate_cell_record(cell, [_fake_proc(sent=10, sink=10, read=150.0, arm_b1=True)])
-    failed = bb._failed_cell_record(cell, "boom")
-    for record in (rec, failed):
-        assert record.rate_window == HOLD_BRACKET_RATE_WINDOW
-        assert record.to_json_dict()["rate_window"] == HOLD_BRACKET_RATE_WINDOW
+    band = _fake_proc(sent=10, sink=10, read=150.0, arm_b1=True)
+    rec = bb.aggregate_cell_record(cell, [band, dict(band)])
+    assert rec.rate_window == HOLD_BRACKET_RATE_WINDOW
+    assert rec.to_json_dict()["rate_window"] == HOLD_BRACKET_RATE_WINDOW
+    # The window is read off the bands, not assumed: a band that names none, or another, shows.
+    older = dict(
+        band, throughput={k: v for k, v in band["throughput"].items() if k != "rate_window"}
+    )
+    assert bb.aggregate_cell_record(cell, [older]).rate_window is None
+    assert bb.aggregate_cell_record(cell, [band, older]).rate_window == "hold_bracket|unrecorded"
+    # A cell that measured no rate names no window.
+    assert bb._failed_cell_record(cell, "boom").rate_window is None
     # The control: the two-box window is a different value from the sweep's, so they never pool.
     assert HOLD_BRACKET_RATE_WINDOW != RATE_WINDOW
 

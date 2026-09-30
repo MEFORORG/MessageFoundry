@@ -280,8 +280,15 @@ def payload_run_attempt(payload: dict[str, Any]) -> int | None:
 
 
 def payload_per_lane_wake(payload: dict[str, Any]) -> str | None:
-    """The ``per_lane_wake`` the payload says its engine ran with, or ``None`` when it records none."""
-    return _named(_context(payload).get("per_lane_wake"))
+    """The ``per_lane_wake`` the payload says its engine ran with, or ``None`` when it records none.
+
+    The context writes it as text. A JSON boolean, as a record writes the same fact, reads as the
+    same text, so ``false`` in either spelling is the pin.
+    """
+    value = _context(payload).get("per_lane_wake")
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return _named(value)
 
 
 def exact_join(
@@ -330,8 +337,9 @@ class JobOutcome:
     """One connscale-carrying job and what the harvest made of it.
 
     ``status`` is ``harvested`` (readings taken), ``unknown_adverse`` (no readable artifact, counted
-    against the leg), ``excluded`` (outside both populations, counted by reason) or ``reader_error``
-    (this harvester could not download it; the harvest is incomplete).
+    against the leg), ``excluded`` (outside every population, or recording a wake pin other than
+    false; counted by reason) or ``reader_error`` (this harvester could not download it; the harvest
+    is incomplete).
     """
 
     leg: str
@@ -803,11 +811,13 @@ def _pin_line(result: Harvest) -> str:
             f"MEFOR_PIPELINE_PER_LANE_WAKE pin: VERIFIED; all {len(harvested)} harvested job(s) "
             f"record {PINNED_PER_LANE_WAKE}."
         )
+    if not harvested:
+        return "MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; no job was harvested."
     recorded = sum(1 for j in harvested if j.per_lane_wake is not None)
     return (
         f"MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; {recorded} of "
-        f"{len(harvested)} harvested job(s) record it, and a payload from before BACKLOG #2013 "
-        "does not."
+        f"{len(harvested)} harvested job(s) record it. A payload records none when it predates "
+        "BACKLOG #2013, came from a local run, or had a step that recorded none."
     )
 
 

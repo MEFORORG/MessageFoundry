@@ -324,4 +324,7 @@ def test_the_run_pin_is_proven_only_where_every_step_records_the_same_value() ->
     assert per_lane_wake_pin([off, on]) == "mixed"
     assert per_lane_wake_pin([off, unsaid]) == "-"
     assert per_lane_wake_pin([]) == "-"
+    # A step that ran the other engine is never hidden behind a step that recorded nothing.
+    assert per_lane_wake_pin([on, unsaid]) == "true"
+    assert per_lane_wake_pin([off, on, unsaid]) == "mixed"
     assert off.to_json_dict()["per_lane_wake"] is False

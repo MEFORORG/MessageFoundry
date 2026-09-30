@@ -84,16 +84,17 @@ def records_rate_window(records: Iterable[ConnScaleRecord]) -> str | None:
 def per_lane_wake_pin(records: Iterable[ConnScaleRecord]) -> str:
     """The run's effective ``per_lane_wake``, for a payload context, as text (BACKLOG #2013).
 
-    ``"false"`` or ``"true"`` when every record recorded that value. ``"mixed"`` when they disagree,
-    and ``"-"`` when any record did not record one, or there are none: a pin is proven only where
-    every step says so, so one unsaid step leaves the run unproven.
+    A step that recorded ``True`` decides first, so a run that ran a different engine anywhere is
+    never read as unproven: ``"mixed"`` beside a ``False`` step, else ``"true"``. Otherwise ``"-"``
+    when any record did not record one, or there are none, since a pin is proven only where every
+    step says so. ``"false"`` is left, and only when every step recorded it.
     """
     values = {r.per_lane_wake for r in records}
+    if True in values:
+        return "mixed" if False in values else "true"
     if not values or None in values:
         return "-"
-    if len(values) > 1:
-        return "mixed"
-    return "true" if values.pop() else "false"
+    return "false"
 
 
 # The shared rule (harness/_spreadsheet.py) — this module used to carry its own copy, and was the one
@@ -316,7 +317,9 @@ class ConnScaleRecord:
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),
             # The window the `achieved` and `wall3_empty_claims` rates read (BACKLOG #2012). The
-            # `cpu` fields come from the OS probe's own readings and are not in it.
+            # engine-sample peaks (`in_pipeline_peak`, wall #1 and #2) read the same readings plus
+            # the post-drain final, so they moved with it at #2024 too. The `cpu` fields come from
+            # the OS probe's own readings and are not in it.
             "rate_window": self.rate_window,
             "achieved": {
                 "read_per_s": round(self.achieved_read_per_s, 2),
@@ -1048,8 +1051,9 @@ class ConnScaleReport:
             "context": dict(context or {}),
             # ADDITIVE, so `schema_version` stays 2: every row below keeps its shape. What changed is
             # the window each value was computed over, and this field is how a harvest tells the
-            # populations apart (BACKLOG #1420 and #2024; see `RATE_WINDOW`).
-            "rate_window": RATE_WINDOW,
+            # populations apart (BACKLOG #1420 and #2024; see `RATE_WINDOW`). Read off the records,
+            # so a report whose records do not all say the sweep's window is not labelled as one.
+            "rate_window": records_rate_window(self.records),
             "readings": readings,
         }
         if base_count is not None:
