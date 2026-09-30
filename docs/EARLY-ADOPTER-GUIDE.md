@@ -98,7 +98,7 @@ use the table below alongside them when planning.
 | **`ack_after=delivered`** (defer the ACK until downstream delivery) | ❌ Not built — requesting it is rejected at config load. Only **ACK-on-receipt** exists, so a routing/transform/delivery failure happens **after** the sender was already told `AA` and will **not** NAK back. Operators rely on the message disposition + alerts, not the ACK. |
 | **De-identification framework** | ❌ Not built. The AI assistant's `deidentified` scope falls back to `code_only`. |
 | **In-place SQLite → server-DB migration** | ❌ Not built. Server-DB deployments are **greenfield only** — there is no automatic carry-over of SQLite history. Drain and cut over deliberately (§13). |
-| **A throughput guarantee for your hardware** | ⚠️ By design. A baseline + tuning method is **published** ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), Gate #3) as a two-tier gate — host-independent **conformance** invariants (hard) + **performance** numbers *"as measured on the reference config"*. Because the durable-write path is hardware-dependent, those msg/s are not a promise for your box. **Measure on your own hardware** (§9). |
+| **A throughput guarantee for your hardware** | **CAUTION:** By design. A baseline + tuning method is **published** ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), Gate #3) as a two-tier gate — host-independent **conformance** invariants (hard) + **performance** numbers *"as measured on the reference config"*. Because the durable-write path is hardware-dependent, those msg/s are not a promise for your box. **Measure on your own hardware** (§9). |
 
 **The early-adopter bargain, stated plainly:** you get a durable engine with native TLS, real auth,
 opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
@@ -158,7 +158,7 @@ pip install "messagefoundry==0.5.0"        # pin the exact engine version (core 
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
 as its own `messagefoundry-webconsole` wheel.
 
-> ⚠️ **Early access.** `0.5.0` is an **Early Access** release on public PyPI — feature-complete and
+> **WARNING: Early access.** `0.5.0` is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
 > launch. The exact-pin command above (`==0.5.0`) resolves today; earlier releases, back to the `0.1.0rc1`
 > pre-release, remain installable. You can equally install from the engine's **GitHub Release assets** or your
@@ -228,7 +228,7 @@ The table names the extras an operator reaches for first. The full list, includi
 `x12`, `xml`, `webauthn`, `vault` and `otel`, is `[project.optional-dependencies]` in the engine's
 `pyproject.toml`.
 
-> ⚠️ There is **no friendly preflight** for the `postgres` extra: if you set `backend=postgres` but
+> **WARNING:** There is **no friendly preflight** for the `postgres` extra: if you set `backend=postgres` but
 > forgot `pip install 'messagefoundry[postgres]'`, you get a raw `ImportError` at startup instead of a
 > clear message. Install the extra with the backend.
 
@@ -267,7 +267,7 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 `./messagefoundry.toml` if present), `--db`, `--host`, `--port`, `--log-level`, `--env`
 (a **free-form** environment name, ADR 0017), `--allow-insecure-bind`.
 
-> ⚠️ **The active environment is required.** `serve` refuses to start (exit 2) without `--env <name>`
+> **WARNING: The active environment is required.** `serve` refuses to start (exit 2) without `--env <name>`
 > (or `[ai].environment`) — there is no silent `prod` default, so a missing env can never resolve
 > another environment's values/secrets. Built-in names `dev`/`staging`/`prod` carry a default tier;
 > a custom name (e.g. `test`, `poc`) must declare `[security].production_instance`. There is nothing
@@ -311,7 +311,7 @@ the service, and (with `-ServiceAccount`) auto-grants config-read + data-dir-rea
 account. Service defaults: name `MessageFoundry`, data dir `C:\ProgramData\MessageFoundry`, store
 `<DataDir>\messagefoundry.db`, logs `<DataDir>\logs`, bind `127.0.0.1:8765`.
 
-> ⚠️ **Pinned-wheel operational model.** With a pinned-version install (§4.1), the running service
+> **WARNING: Pinned-wheel operational model.** With a pinned-version install (§4.1), the running service
 > loads the **installed wheel** — a known, pinned version, not a moving checkout. Picking up a new
 > engine version is a deliberate run of the §13 upgrade runbook, which pins the new version, so every
 > upgrade is an explicit, reviewable act. *(A contributor running the **editable** install instead
@@ -660,7 +660,7 @@ affecting any downstream system.
 a dedicated "shadow" outbound. Compare MEFOR's dispositions and transformed output against the
 incumbent's outcomes for the same messages.
 
-> ⚠️ **Do not dual-*write* to real partners in shadow.** At-least-once + non-idempotent downstreams
+> **WARNING: Do not dual-*write* to real partners in shadow.** At-least-once + non-idempotent downstreams
 > make a true dual-write dangerous. Keep shadow outbounds pointed at a sink unless the partner dedupes.
 
 **Exit criteria (→ Stage 2):**
@@ -769,7 +769,7 @@ for a clean drain. Always **drain → stop → back up → change → restart
 - **Engine rollback:** re-pin the prior version (`pip install "messagefoundry==<prev>"`) → restart
   (same runbook above). *(Contributors on the editable install: `git checkout` the prior commit/tag →
   reinstall → restart.)*
-- ⚠️ **Schema/store-level changes are not trivially reversible** against a populated store given the
+- **WARNING: Schema/store-level changes are not trivially reversible** against a populated store given the
   greenfield-only posture (no in-place migration). Plan code/config rollback as your primary path;
   use **dead-letter replay** to recover messages that a bad transform stranded before the rollback.
 

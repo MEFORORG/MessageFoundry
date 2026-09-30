@@ -30,11 +30,11 @@ from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import hl7
-from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 import messagefoundry.parsing.binary as _binary
+from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 from messagefoundry.parsing.peek import (
     HL7PeekError,
     drop_blank_segments,
@@ -764,9 +764,11 @@ class RawMessage:
         attacker-influenceable, PHI-bearing data, so a DOCTYPE is **rejected, not parsed**: a
         billion-laughs or external-entity (``file://`` / ``http://``) payload **raises** instead of
         expanding entities or fetching a resource. The forbidden-construct errors subclass
-        ``ValueError`` (``defusedxml.common.DefusedXmlException``), and malformed XML raises
-        ``xml.etree.ElementTree.ParseError`` — so a Handler can return ``None`` (FILTERED) or let it
-        raise (ERROR / dead-letter), symmetric with :meth:`json`."""
+        ``ValueError`` (``DefusedXmlException``, from the engine's vendored copy in
+        ``messagefoundry/_vendor/defusedxml/``, so catch ``ValueError`` rather than importing the
+        upstream package's class), and malformed XML raises ``xml.etree.ElementTree.ParseError`` —
+        so a Handler can return ``None`` (FILTERED) or let it raise (ERROR / dead-letter), symmetric
+        with :meth:`json`."""
         parsed: Element = _xml_fromstring(
             self.raw, forbid_dtd=True, forbid_entities=True, forbid_external=True
         )

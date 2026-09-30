@@ -330,7 +330,7 @@ def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
     """Text the lexical scan cannot see that a refusal, alert or log line renders verbatim."""
     from messagefoundry.auth import anchor_path
     from messagefoundry.pipeline import secret_rotation
-    from messagefoundry.store import keyprovider_vault, sqlserver
+    from messagefoundry.store import keyprovider_vault, privilege, sqlserver, store
     from messagefoundry.transports import http_auth, smart
 
     texts = [anchor_path.describe_sid(sid) for sid in anchor_path._WELL_KNOWN_NAMES]
@@ -343,6 +343,15 @@ def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
         # rendering would come back with its keywords redacted.
         sqlserver._rcsi_remedy("mefor_test"),
         sqlserver._options_remedy("mefor_test", [name for name, _ in sqlserver._DATABASE_OPTIONS]),
+        store.AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK,
+        store.AUDIT_CHAIN_META_ROW_CHANGED,
+    ]
+    # An audit-table grant is built by a helper and joined into a refusal later, out of the scan.
+    texts += [
+        privilege.audit_write_grant(right, table)
+        for table in privilege.AUDIT_APPEND_ONLY_TABLES
+        for right in privilege.SQLSERVER_AUDIT_WRITE_PRIVILEGES
+        + privilege.POSTGRES_AUDIT_WRITE_PRIVILEGES
     ]
     eaten = {text: redaction.redact(text) for text in texts if redaction.redact(text) != text}
     assert not eaten, eaten

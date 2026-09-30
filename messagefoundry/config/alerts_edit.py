@@ -53,7 +53,6 @@ _RULE_FIELDS = (
     "control_action",  # #144 — restart_inbound/restart_outbound to auto-fire on match
     "control_target",  # #144 — the connection to act on (None = the event's own connection)
     "mute",  # #143 — static per-rule notification mute (bool); False is a real value, kept
-    "content_label",  # #81 — route content_match alerts by their operator label
     # Nested sub-structures LAST (see the note above): escalate is an array-of-tables, schedule a table.
     "escalate",  # #81 — occurrence-driven escalation tiers (list[EscalationTier])
     "schedule",  # #81 — schedule-aware matching window (Schedule | None)
