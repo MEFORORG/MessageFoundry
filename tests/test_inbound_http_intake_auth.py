@@ -362,6 +362,138 @@ async def test_bearer_mode_reads_authorization_and_challenges() -> None:
         await src.stop()
 
 
+def _raw_with(lines: list[str], *, method: str = "POST") -> bytes:
+    head = [f"{method} /ingest HTTP/1.1", "Host: localhost"]
+    body = b""
+    if method == "POST":
+        head.append("Content-Length: 2")
+        body = b"{}"
+    head.extend([*lines, "", ""])
+    return "\r\n".join(head).encode("ascii") + body
+
+
+@pytest.mark.parametrize(
+    ("settings", "lines"),
+    [
+        # BACKLOG #2051's reported shape: a front end reading the FIRST value sees a wrong key, while
+        # the listener kept the LAST one and answered 202.
+        ({"intake_auth": "api_key"}, ["x-api-key: wrong", f"x-api-key: {KEY}"]),
+        # The mirror: the right key first. The old code answered 401.
+        ({"intake_auth": "api_key"}, [f"x-api-key: {KEY}", "x-api-key: wrong"]),
+        # IDENTICAL values are refused too; a proxy may still split or rewrite them.
+        ({"intake_auth": "api_key"}, [f"x-api-key: {KEY}", f"x-api-key: {KEY}"]),
+        # Header names are case-insensitive, so two spellings are still one header twice.
+        ({"intake_auth": "api_key"}, ["X-Api-Key: wrong", f"x-api-key: {KEY}"]),
+        # A front end that folds `_` into `-` (BACKLOG #1913) reads these two as one header twice.
+        ({"intake_auth": "api_key"}, ["x_api_key: wrong", f"x-api-key: {KEY}"]),
+        # The configurable header name is covered, not only the default.
+        (
+            {"intake_auth": "api_key", "intake_api_key_header": "x-acme-key"},
+            ["x-acme-key: wrong", f"x-acme-key: {KEY}"],
+        ),
+        # A configured name that itself holds `_` is folded the same way as the request's names.
+        (
+            {"intake_auth": "api_key", "intake_api_key_header": "x_acme_key"},
+            ["x_acme_key: wrong", f"x_acme_key: {KEY}"],
+        ),
+        # Bearer mode reads Authorization.
+        (
+            {"intake_auth": "bearer"},
+            ["Authorization: Bearer wrong", f"Authorization: Bearer {KEY}"],
+        ),
+        (
+            {"intake_auth": "bearer"},
+            [f"Authorization: Bearer {KEY}", f"Authorization: Bearer {KEY}"],
+        ),
+    ],
+)
+async def test_a_repeated_credential_header_is_refused_before_any_comparison(
+    settings: dict[str, Any], lines: list[str]
+) -> None:
+    """BACKLOG #2051. The head parse keeps the last of two same-named headers, while a front end may
+    authenticate the first. So a listener that reads a credential header refuses a request carrying
+    it twice with 400 before any comparison. The refusal is charged and audited like a failed
+    attempt, and never echoes a value."""
+    audit = _Audit()
+    limiter = _CountingLimiter()
+    events: list[tuple[str, str | None]] = []
+
+    async def sink(kind: str, _peer: str | None, why: str | None) -> None:
+        events.append((kind, why))
+
+    src = await _start(intake_api_key=KEY, **settings)
+    src.on_intake_audit = audit
+    src.intake_rate_limiter = limiter
+    src.on_connection_event = sink
+    try:
+        resp = await _request(src.sockport, raw=_raw_with(lines))
+    finally:
+        await src.stop()
+    assert resp.status in (400, 0), resp.status  # 0: the Proactor loop reset before the flush
+    assert ("intake_auth_failed", "duplicate credential header") in events
+    mode = settings["intake_auth"]
+    assert audit.rows == [("intake.auth_failed", "127.0.0.1", f"mode={mode}")]
+    assert limiter.checks == ["127.0.0.1"] and limiter.charges == ["127.0.0.1"]
+    assert limiter.successes == []
+    blob = resp.body.decode("latin-1") + json.dumps(events) + json.dumps(audit.rows)
+    for leak in (KEY, "wrong"):
+        assert leak not in blob
+    if resp.status and mode == "bearer":
+        assert resp.headers.get("www-authenticate") == 'Bearer error="invalid_request"'
+
+
+async def test_a_repeated_credential_header_from_a_spent_peer_is_429() -> None:
+    """BACKLOG #2051. The limiter runs first, so a peer whose budget is gone cannot keep probing."""
+    limiter = _CountingLimiter(allow=False)
+    src = await _start(intake_auth="api_key", intake_api_key=KEY)
+    src.intake_rate_limiter = limiter
+    try:
+        raw = _raw_with([f"x-api-key: {KEY}", f"x-api-key: {KEY}"])
+        assert (await _request(src.sockport, raw=raw)).status in (429, 0)
+    finally:
+        await src.stop()
+    assert limiter.charges == []
+
+
+async def test_a_repeated_credential_header_on_a_health_probe() -> None:
+    """BACKLOG #2051. A probe inside the gate is held to the rule; an exempt probe reads no credential."""
+    raw = _raw_with(["x-api-key: a", "x-api-key: b"], method="GET")
+    events: list[tuple[str, str | None]] = []
+
+    async def sink(kind: str, _peer: str | None, why: str | None) -> None:
+        events.append((kind, why))
+
+    src = await _start(intake_auth="api_key", intake_api_key=KEY)
+    src.on_connection_event = sink
+    try:
+        assert (await _request(src.sockport, raw=raw)).status in (400, 0)
+    finally:
+        await src.stop()
+    # The event, not the status, carries the proof: a Proactor reset reads as status 0.
+    assert ("intake_auth_failed", "duplicate credential header") in events
+    src = await _start(intake_auth="api_key", intake_api_key=KEY, intake_auth_health="allow")
+    try:
+        assert (await _request(src.sockport, raw=raw)).status == 200
+    finally:
+        await src.stop()
+
+
+async def test_a_repeated_header_the_mode_does_not_read_is_still_accepted() -> None:
+    """BACKLOG #2051 scope: only the header the active mode reads a credential from is refused."""
+    src = await _start(intake_auth="bearer", intake_api_key=KEY)
+    try:
+        raw = _raw_with([f"Authorization: Bearer {KEY}", "x-api-key: a", "x-api-key: b"])
+        assert (await _request(src.sockport, raw=raw)).status == 202
+    finally:
+        await src.stop()
+    src = await _start()  # intake_auth="none" reads no credential at all
+    try:
+        raw = _raw_with(["x-api-key: a", "x-api-key: b", "Authorization: x", "Authorization: y"])
+        assert (await _request(src.sockport, raw=raw)).status == 202
+    finally:
+        await src.stop()
+
+
 async def test_successful_auth_never_consumes_rate_budget() -> None:
     """AC-13: the budget bounds guessing; it must not become a throughput cap."""
     limiter = _CountingLimiter()
@@ -462,6 +594,11 @@ class _FakeWriter:
         return _Ssl()
 
 
+def _writer(peercert: object) -> asyncio.StreamWriter:
+    # get_extra_info is the one StreamWriter call _authorize_peer_cert makes, and the fake answers it.
+    return _FakeWriter(peercert)  # type: ignore[return-value]
+
+
 def _peercert(common_name: str) -> dict[str, object]:
     return {"subject": ((("commonName", common_name),),)}
 
@@ -488,24 +625,24 @@ def test_valid_chain_unlisted_subject_is_403() -> None:
     )
 
     # A chain the CA signed, carrying an allow-listed subject: accepted.
-    assert src._authorize_peer_cert(_FakeWriter(_peercert("partner.example")), "10.0.0.1") is None
+    assert src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1") is None
 
     # The same CA, a subject nobody listed: 403, NOT 401. A bare tls+tls_ca_file would have accepted
     # this — it means "any certificate this CA ever signed".
-    denied = src._authorize_peer_cert(_FakeWriter(_peercert("attacker.example")), "10.0.0.1")
+    denied = src._authorize_peer_cert(_writer(_peercert("attacker.example")), "10.0.0.1")
     assert isinstance(denied, HttpRequestError)
     assert denied.status == 403
     assert denied.kind == "auth_subject_denied"
 
     # No certificate presented at all is an AUTHENTICATION failure instead.
-    missing = src._authorize_peer_cert(_FakeWriter(None), "10.0.0.1")
+    missing = src._authorize_peer_cert(_writer(None), "10.0.0.1")
     assert isinstance(missing, HttpRequestError)
     assert missing.status == 401
     assert missing.kind == "intake_auth_failed"
 
     # A spoofed commonName cannot collide with a pinned SAN — the namespaces are disjoint.
     src._intake_subjects = {"SAN:DNS:partner.example": "SAN:DNS:partner.example"}
-    spoofed = src._authorize_peer_cert(_FakeWriter(_peercert("partner.example")), "10.0.0.1")
+    spoofed = src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1")
     assert isinstance(spoofed, HttpRequestError)
     assert spoofed.status == 403
 

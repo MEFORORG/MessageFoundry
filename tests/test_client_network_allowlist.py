@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +121,8 @@ def _app(engine: Engine, networks: list[str], **kw: Any) -> Any:
 def _client(app: Any, ip: str | None) -> httpx.AsyncClient:
     """A client whose requests originate from ``ip`` on the ASGI scope (``None`` = no client tuple,
     the UNIX-socket / unknown-peer case)."""
-    transport = httpx.ASGITransport(app=app, client=(ip, 12345) if ip else None)
+    # None is outside the declared tuple on purpose: it is the no-client-tuple case under test.
+    transport = httpx.ASGITransport(app=app, client=(ip, 12345) if ip else None)  # type: ignore[arg-type]
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -546,7 +547,8 @@ async def test_health_stays_reachable_and_echoes_the_observed_address(engine: En
     # the observed address fills a key that is already there rather than adding one, so the
     # allow-listed body carries the same three names as the stock one below.
     assert body["status"] == "ok"
-    from messagefoundry.tray.probe import ENGINE_HEALTH_KEYS, HealthProbe, classify_health
+    from messagefoundry.tray.probe import ENGINE_HEALTH_KEYS, classify_health
+    from messagefoundry.tray.state import HealthProbe
 
     assert ENGINE_HEALTH_KEYS.issubset(body)
     assert classify_health(200, body) is HealthProbe.OK
@@ -576,7 +578,8 @@ async def test_stock_health_reads_as_the_engine_and_a_generic_responder_does_not
     assert resp.status_code == 200
     body = resp.json()
 
-    from messagefoundry.tray.probe import ENGINE_HEALTH_KEYS, HealthProbe, classify_health
+    from messagefoundry.tray.probe import ENGINE_HEALTH_KEYS, classify_health
+    from messagefoundry.tray.state import HealthProbe
 
     # Subset BEFORE exact equality, so this diagnostic can actually print: equality implies the
     # subset, so the reverse order makes the tray-specific message unreachable.
@@ -670,10 +673,12 @@ class _WSPeer:
         elif kind == "websocket.send":
             self.frames.append(json.loads(message["text"]))  # type: ignore[arg-type]
         elif kind == "websocket.close":
-            self.close_code = int(message.get("code", 1000))  # type: ignore[arg-type]
+            code = message.get("code", 1000)
+            assert isinstance(code, int)
+            self.close_code = code
 
     async def run(self, timeout: float = 5.0) -> None:
-        scope = {
+        scope: dict[str, Any] = {
             "type": "websocket",
             "path": "/ws/stats",
             "headers": [],
@@ -764,7 +769,14 @@ async def test_lifespan_scope_passes_through(engine: Engine) -> None:
         seen.append(scope["type"])
 
     mw = ClientNetworkMiddleware(inner)
-    await mw({"type": "lifespan"}, lambda: None, lambda m: None)  # type: ignore[arg-type]
+
+    async def _receive() -> dict[str, Any]:
+        raise AssertionError("a lifespan pass-through never receives")
+
+    async def _send(message: MutableMapping[str, Any]) -> None:
+        raise AssertionError("a lifespan pass-through never sends")
+
+    await mw({"type": "lifespan"}, _receive, _send)
     assert seen == ["lifespan"]
 
 

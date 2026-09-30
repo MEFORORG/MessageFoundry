@@ -21,14 +21,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.api.app import create_managed_app
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -37,6 +38,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.transports.base import DestinationConnector
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -79,13 +81,13 @@ def _reg(inbox: Path, outdir: Path) -> Registry:
     return reg
 
 
-class _Collector:
+class _Collector(DestinationConnector):
     """A test outbound connector that records the payloads it 'delivered' (non-capturing → mark_done)."""
 
     def __init__(self) -> None:
         self.deliveries: list[str] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.deliveries.append(payload)
         return None
 
@@ -93,7 +95,7 @@ class _Collector:
         return None
 
 
-async def _until(pred, *, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(pred, *, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if await pred():

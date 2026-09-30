@@ -199,6 +199,143 @@
         });
       });
     }
+    // ---- PER-ARGUMENT INPUT MODES (ADR 0076 Amendment E, BACKLOG #237 step 3) ------------------------
+    // The provider renders a moded argument with its mode, a selector when more than one mode may be
+    // written, and one pane per writable mode (stepsModel.renderModedFieldHtml). The modes offered come
+    // from the engine's lists; nothing here decides a mode or reads Python. Switching the selector only
+    // shows the other pane, so a switch alone never writes. The static pane is today's `input.edit`, so
+    // the listener above posts it. The templated pane edits PARTS and posts the whole template as
+    // {parts: [...]}, which the engine renders and checks. A field pick goes through the provider's
+    // picker as a `pickPart` request, so the picker yields a {path} part, never source.
+    //
+    // A template is written once per editing PASS, not per chip: the write happens when focus leaves the
+    // editor (other than to the argument's own mode selector), on Enter, or on Remove, and only when the
+    // parts differ from the last ones written or projected. Every write rewrites the row and re-projects
+    // the page, so a write per chip, or the same pass written twice (a browser's late `change` after
+    // Enter), would race the next write into a stale-coordinate refusal (F7). A pass is also held back,
+    // with a visible hint, while the template has no field or an empty one: the engine refuses both, and
+    // its refusal would re-project the page and throw the pass away. The template a pick request carries
+    // is not written again by the blur the picker itself causes, because the pick's own write carries
+    // it; a pick that is cancelled leaves that pass to the next change. The engine still checks every
+    // template it is sent. Nothing here listens for a message from the provider.
+    // Wrapped like the context menu, so a throw here can never kill the wiring around it.
+    try {
+      (function wireModedArguments() {
+        // The parts a templated editor holds, in order, unsaved typing included. Each chip is one part.
+        function collectParts(box) {
+          return Array.from(box.querySelectorAll('.tpart')).map((chip) => {
+            const inp = chip.querySelector('.tpart-input');
+            const v = inp ? inp.value : '';
+            return chip.dataset.part === 'path' ? { path: v } : { text: v };
+          });
+        }
+        function coords(box) {
+          return {
+            handler: box.dataset.handler,
+            lineStart: Number(box.dataset.lineStart),
+            lineEnd: Number(box.dataset.lineEnd),
+            name: box.dataset.name,
+            expectSrc: box.dataset.expectSrc,
+          };
+        }
+        function setHint(box, shown) {
+          const hint = box.querySelector('.tpart-hint');
+          if (hint) { hint.hidden = !shown; }
+        }
+        // Whether `parts` has a field, and every field filled in (all but `except`, the one a pick fills).
+        function fieldsReady(parts, except) {
+          const paths = parts.filter((p, i) => 'path' in p && i !== except);
+          return (except !== undefined || paths.length > 0) && paths.every((p) => p.path !== '');
+        }
+        // Write the editor's template if it differs from the last written or projected one and is ready.
+        function flush(box) {
+          const parts = collectParts(box);
+          const json = JSON.stringify(parts);
+          if (json === box.dataset.lastParts || json === box.dataset.pickParts) { setHint(box, false); return; }
+          if (!fieldsReady(parts)) { setHint(box, true); return; }
+          setHint(box, false);
+          box.dataset.lastParts = json;
+          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: parts } }));
+        }
+        // Ask the provider to pick a field into part `index`. The request carries every chip, typing
+        // included, and the pick's write carries that pass, so `flush` does not write the same parts.
+        function postPick(box, index) {
+          const parts = collectParts(box);
+          if (!fieldsReady(parts, index)) { setHint(box, true); return; }
+          setHint(box, false);
+          box.dataset.pickParts = JSON.stringify(parts);
+          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: parts, index: index }));
+        }
+        // A new, empty chip of `kind`: a clone of the renderer's own blank chip, so its markup has one
+        // source, placed before the Add buttons.
+        function addChip(box, kind) {
+          const blank = box.querySelector('template.tpart-blank[data-part="' + kind + '"]');
+          if (!blank) { return null; }
+          const chip = blank.content.firstElementChild.cloneNode(true);
+          box.insertBefore(chip, box.querySelector('.tpart-add'));
+          return chip;
+        }
+
+        for (const field of document.querySelectorAll('.field.moded')) {
+          const modeSel = field.querySelector('select.mode-select');
+          if (!modeSel) { continue; }
+          modeSel.addEventListener('change', () => {
+            for (const pane of field.querySelectorAll('.mode-pane')) {
+              pane.hidden = pane.dataset.pane !== modeSel.value;
+            }
+            const first = field.querySelector('.mode-pane:not([hidden]) input:not([disabled]), .mode-pane:not([hidden]) select');
+            if (first) { first.focus(); }
+          });
+        }
+
+        for (const box of document.querySelectorAll('.tparts')) {
+          box.dataset.lastParts = JSON.stringify(collectParts(box)); // the projected template
+          const modeSel = box.closest('.field') && box.closest('.field').querySelector('select.mode-select');
+          // Keep a button's mousedown from blurring a typed chip first, so a click never ends the pass
+          // before the button acts; the button's own action carries the typing.
+          box.addEventListener('mousedown', (ev) => {
+            if (ev.target.closest('button')) { ev.preventDefault(); }
+          });
+          box.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter' && ev.target.classList && ev.target.classList.contains('tpart-input')) {
+              ev.preventDefault();
+              flush(box);
+            }
+          });
+          box.addEventListener('focusout', (ev) => {
+            const to = ev.relatedTarget;
+            // Focus moving inside the editor, or to the argument's own mode selector, continues the pass.
+            if (to && (box.contains(to) || to === modeSel)) { return; }
+            flush(box);
+          });
+          box.addEventListener('click', (ev) => {
+            const btn = ev.target.closest('button');
+            if (!btn || !box.contains(btn)) { return; }
+            ev.stopPropagation(); // a part button must not also (re)select the row
+            const chip = btn.closest('.tpart');
+            if (btn.classList.contains('tpart-del') && chip) {
+              chip.remove();
+              flush(box);
+            } else if (btn.classList.contains('tpart-pick') && chip) {
+              postPick(box, Array.from(box.querySelectorAll('.tpart')).indexOf(chip));
+            } else if (btn.classList.contains('tpart-add-path')) {
+              // An empty field chip, then the picker for it. Cancelled, or with no picker, the chip
+              // stays for the path to be typed.
+              const added = addChip(box, 'path');
+              if (!added) { return; }
+              added.querySelector('input').focus();
+              postPick(box, Array.from(box.querySelectorAll('.tpart')).indexOf(added));
+            } else if (btn.classList.contains('tpart-add-text')) {
+              const added = addChip(box, 'text');
+              if (added) { added.querySelector('input').focus(); } // written with the pass, not now
+            }
+          });
+        }
+      })();
+    } catch (e) {
+      vscode.postMessage({ command: 'stepsDiag', level: 'error', text: 'mode wiring failed: ' + e });
+    }
+
     // Per-row structural affordances — each posts a delete/move command. The provider runs it as a lone op
     // (never batched) and forces a full re-projection afterwards (ADR 0076 §5 v2). data-op maps to the
     // command; each carries the row's coordinates + projection-time source (F7 stale guard). (The per-row

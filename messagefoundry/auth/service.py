@@ -6443,9 +6443,10 @@ class AuthService:
         BACKLOG #1954 (ASVS 6.3.3). A change revokes every session, so a password holder on a
         pending session must not reach it on the password alone. True for a pending session on
         an account that holds a factor, unless it is a directory (AD) account, and when the session
-        or its user cannot be found. An account with no factor has nothing to prove and
-        rotates as before, and a directory account is left to the route's 400, which changes
-        nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
+        or its user cannot be found. An account with no factor has nothing to prove here; whether
+        it may rotate is :meth:`change_password`'s call, which refuses a covered local account
+        until it has TOTP (ADR 0197 Amendment A). A directory account is left to the route's 400,
+        which changes nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
         the web console's password and factor pages all ask it, so the planes cannot drift."""
         return await self._owes_enrolled_factor(token, local_only=True)
 
@@ -7430,10 +7431,13 @@ class AuthService:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
         the user is notified out-of-band (ASVS 6.3.7).
 
-        Raises :class:`ValueError` when TOTP is the caller's LAST second factor and MFA is still
-        required — the same refusal, on the same condition, as
-        :meth:`delete_webauthn_credential` (ADR 0068 decision 5). BACKLOG #1022: these are two
-        self-service routes to zero factors behind one step-up gate, and only one of them asked.
+        Raises :class:`ValueError` (:data:`TOTP_REMOVAL_REFUSED`) whenever ``[security].require_mfa``
+        covers the caller as a local account and TOTP is on, passkeys or not: in wave 1 TOTP is the
+        only way past the sign-in lock (ADR 0197 Amendment A, AC-A3a). Otherwise it raises when TOTP
+        is the caller's LAST second factor and MFA is still required, the refusal
+        :meth:`delete_webauthn_credential` also makes (ADR 0068 decision 5). BACKLOG #1022: these
+        were two self-service routes to zero factors behind one step-up gate, and only one of them
+        asked. The two no longer refuse on the same condition: passkey removal adds no wave-1 rule.
 
         This is NOT the admin escape hatch — that is :meth:`admin_reset_mfa`, which clears TOTP and
         every passkey and is deliberately unguarded. Nothing here narrows it.

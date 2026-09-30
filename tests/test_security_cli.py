@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 
 
@@ -250,7 +249,7 @@ def test_cli_set_reports_security_json_nested_past_the_decoder(
     RED when: `_load_operator_json`'s `except RecursionError` arm is dropped, or `_security`'s
     `except _OperatorJsonError` arm is dropped -- the decode escapes to `main`'s dispatch floor
     (BACKLOG #1863), whose JSON error names only the exception type, not the input at fault."""
-    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    monkeypatch.setattr(json, "loads", _raise_recursion)
     rc = main(
         ["security", "set", "--service-config", str(tmp_path / "mf.toml"), "--data", "[]", "--json"]
     )

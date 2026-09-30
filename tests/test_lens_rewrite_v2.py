@@ -34,7 +34,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.lens import LensRewriteError, parse_source, rewrite_source
+from messagefoundry.lens import LensRewriteError, _validated_expr, parse_source, rewrite_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "samples" / "config"
@@ -1139,18 +1139,20 @@ def test_set_params_bare_tuple_expr_refused() -> None:
                 "params": {"value": {"expr": "1, 2"}},
             },
         )
-    # A PARENTHESIZED single tuple stays one argument and is allowed (no over-refusal).
-    ok = rewrite_source(
-        DENSE,
-        {
-            "op": "set_params",
-            "line_start": 7,
-            "line_end": 7,
-            "params": {"value": {"expr": "(1, 2)"}},
-        },
-    )
-    assert 'set_field(msg, "PID-3.1", (1, 2))' in ok
-    _assert_first_class(ok)
+    # A PARENTHESIZED single tuple stays one argument, so the arity check does not over-refuse it...
+    assert _validated_expr("(1, 2)", "value") == "(1, 2)"
+    # ...but a tuple is `dynamic` mode, and set_params on an action row never WRITES a dynamic argument
+    # (ADR 0076 E.6.4, BACKLOG #237). Before Amendment E's rewrite gate this edit was accepted.
+    with pytest.raises(LensRewriteError, match="dynamic-mode argument"):
+        rewrite_source(
+            DENSE,
+            {
+                "op": "set_params",
+                "line_start": 7,
+                "line_end": 7,
+                "params": {"value": {"expr": "(1, 2)"}},
+            },
+        )
 
 
 def test_insert_bare_tuple_expr_refused() -> None:

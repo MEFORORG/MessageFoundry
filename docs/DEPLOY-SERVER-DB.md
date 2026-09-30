@@ -62,8 +62,8 @@ Test-ADServiceAccount   -Identity mefor-svc      # must return True (the install
 ```
 
 **2. Install the service under the gMSA** — `install-service.ps1` runs the gMSA preflight and grants
-"Log on as a service" automatically; NSSM's `ObjectName` is the gMSA with a trailing `$` and **no
-password**:
+"Log on as a service" automatically; the service's run-as account (`ObjectName`) is the gMSA with a
+trailing `$` and **no password**:
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod `
@@ -157,7 +157,7 @@ grants, so you confirm them by hand. They never change the exit code. The full p
 [`SECURITY.md`](SECURITY.md) §*Each backend hop's least privilege; the engine probes only the store*.
 
 > **Why the `$`:** a gMSA authenticates as a *computer-class* principal, so its SQL login name carries the
-> trailing `$` (`CORP\mefor-svc$`) — the same name NSSM's `ObjectName` uses.
+> trailing `$` (`CORP\mefor-svc$`) — the same name the service's `ObjectName` uses.
 >
 > **Why two principals, and never `db_owner` / `sysadmin` for either.** The schema batch issues
 > at least `CREATE TABLE` / `CREATE INDEX` / `ALTER TABLE ... ADD` / `DROP INDEX` / `DROP TABLE`,

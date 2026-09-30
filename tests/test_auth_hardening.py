@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -94,9 +95,9 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     )
 
 
-async def _login(c: httpx.AsyncClient, username: str, password: str = PW, provider: str = "local"):
+async def _login(c: httpx.AsyncClient, username: str, password: str = PW):
     return await c.post(
-        "/auth/login", json={"username": username, "password": password, "provider": provider}
+        "/auth/login", json={"username": username, "password": password, "provider": "local"}
     )
 
 
@@ -144,11 +145,11 @@ async def test_summary_redacted_for_caller_without_view_summary(engine: Engine) 
         op_msg = (await c.get("/messages", headers=op)).json()["messages"][0]
         vw_msg = (await c.get("/messages", headers=vw)).json()["messages"][0]
         # The LIST is the census surface, so an authorized operator sees the summary MASKED here
-        # (ASVS 14.2.6); only an explicit per-message reveal lifts it (BACKLOG #2346). `error` is not a masked
-        # property, so it comes through complete in the same response -- which is what keeps this a
-        # test of the mask rather than of redaction.
+        # (ASVS 14.2.6); only an explicit per-message reveal lifts it (BACKLOG #2346). The error text
+        # is masked whole on the list too (BACKLOG #2436), and the viewer's nulls below are what
+        # keep this a test of redaction as well as of the mask.
         assert op_msg["summary"] == "MRN **** · ****"
-        assert op_msg["error"] == "bad PID-5: DOE^JANE"
+        assert op_msg["error"] == "****"
         assert vw_msg["summary"] is None  # redacted: viewer lacks messages:view_summary
         assert vw_msg["error"] is None  # error text is PHI-gated the same way (low-8)
 
@@ -242,24 +243,51 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
         assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
 
 
-async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engine) -> None:
+async def _no_sleep(deadline: float) -> None:
+    """Stands in for ``service._sleep_until``, the failure-equalizing pad, so a refusal costs no
+    wall-clock time. The deadline suite owns the pad's own property."""
+
+
+async def test_ad_login_conflicting_with_local_account_is_rejected(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4, driven through a directory leg that still reaches ``_complete_ad_login`` (BACKLOG #1971).
+
+    This used to post ``/auth/login`` with ``provider="ad"``. Directory PASSWORD sign-in is retired,
+    so ``_dispatch_login`` refused that request before any directory work and the 401 held with the
+    conflict branch deleted. Windows SSO (``POST /auth/negotiate``) is a live leg into the same
+    method, so the principal it resolves meets the like-named LOCAL account there.
+
+    The 401 alone cannot tell the refusals apart, so the test also pins the branch's own audit row,
+    that the directory was really consulted, and that the local account survived unadopted.
+    """
     principal = AdPrincipal(
         username=ADMIN_USERNAME,  # collides with the LOCAL admin created below
         display_name=None,
         email=None,
         dn=f"CN={ADMIN_USERNAME},DC=x",
         groups=frozenset(),
+        # A real immutable id, so the object-id-missing refusal cannot stand in for this one.
+        # Measured with the conflict branch deleted: a later check still refuses, as
+        # ``directory_identity_conflict``, so the 401 holds either way and only the audit reason
+        # below turns red.
+        directory_object_id="12345678-1234-1234-1234-56789abcdef0",
     )
+    resolved: list[str] = []
 
     class _FakeLdap:
-        def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-            return principal if (username == ADMIN_USERNAME and password == "pw") else None
-
         def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
+            resolved.append(username)
             return principal if username == ADMIN_USERNAME else None
 
+    # The SPNEGO acceptor needs a real KDC; the principal it would name is the input under test.
+    monkeypatch.setattr(
+        "messagefoundry.auth.service.kerberos_principal", lambda _t, _s: ADMIN_USERNAME
+    )
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
     settings = AuthSettings(
         ad_enabled=True,
+        kerberos_enabled=True,
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
         ad_bind_dn="CN=svc,DC=x",
@@ -267,9 +295,30 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engin
     )
     service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
     await create_admin(service)  # the LOCAL account the AD login must not adopt
+    before = await engine.store.get_user_by_username(ADMIN_USERNAME)
+    assert before is not None and before.auth_provider == "local"
+
     async with _client(engine, service) as c:
-        r = await _login(c, ADMIN_USERNAME, "pw", provider="ad")
-        assert r.status_code == 401  # the AD bind cannot take over the local account
+        r = await c.post("/auth/negotiate", headers={"Authorization": "Negotiate c3BuZWdv"})
+    assert r.status_code == 401  # the AD sign-in cannot take over the local account
+    assert ADMIN_USERNAME in resolved, "the directory leg never ran, so the branch was not reached"
+
+    failures = [
+        dict(a)
+        for a in await engine.store.list_audit(action="auth.login_failed", actor=ADMIN_USERNAME)
+    ]
+    reasons = [json.loads(str(a["detail"]))["reason"] for a in failures]
+    assert reasons == ["local_account_conflict"], (
+        f"the refusal was not the provider-confusion branch: {failures}"
+    )
+    assert await engine.store.list_audit(action="auth.login_success", actor=ADMIN_USERNAME) == []
+    after = await engine.store.get_user_by_username(ADMIN_USERNAME)
+    assert after is not None
+    assert (after.id, after.auth_provider, after.directory_object_id) == (
+        before.id,
+        "local",
+        before.directory_object_id,
+    ), "the AD sign-in adopted the local account"
 
 
 # --- M5: the last administrator is protected ---------------------------------

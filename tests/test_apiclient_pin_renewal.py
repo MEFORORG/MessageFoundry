@@ -446,17 +446,95 @@ def test_two_threads_failing_together_rebuild_once(
 
 
 def test_close_releases_every_transport_the_client_opened(engine: _RenewableEngine) -> None:
-    """A retired transport is kept until close, because another thread may still be mid-request on
-    it, and closing it under that thread would raise a bare RuntimeError out of a worker."""
+    """A replaced transport closes as soon as no request holds it, and close() takes the rest.
+
+    This test used to assert the opposite: that the replaced transport stayed open until close().
+    That kept one open transport per renewal for the life of the client (BACKLOG #2091). The
+    request that followed the renewal was the only one holding it, so it closes when that request
+    lets go, before ``health()`` returns.
+
+    RED when: a replaced transport is kept until close() again, or close() misses the current one.
+    The in-use table must also be empty, or a count leaked and that transport can never close."""
     client = _pinned(engine)
     first = client._http
     engine.serve(engine.renew_pin())
     client.health()
     assert client._http is not first
-    assert not first.is_closed
+    assert first.is_closed, "the replaced transport outlived the only request that held it"
+    assert client._retired_http == []
+    assert client._in_use == {}
     client.close()
-    assert first.is_closed
     assert client._http.is_closed
+
+
+def test_a_replaced_transport_stays_open_while_another_request_holds_it(
+    engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request on another thread still holds the replaced transport: it stays open until that
+    request lets go, and then it closes (BACKLOG #2091).
+
+    The other thread is parked inside ``send`` on the old transport while this thread follows the
+    renewal. Closing the old transport under the parked thread would raise a bare RuntimeError out
+    of a worker. When the parked thread goes on, its send fails verification against the renewed
+    engine, and it retries on the new transport, so its request succeeds too.
+
+    RED when: the rebuild closes a transport a request still holds (the parked thread errors, or the
+    first ``is_closed`` assert fails), or the last request to let go does not close it."""
+    client = _pinned(engine)
+    first = client._http
+    parked = threading.Event()
+    go_on = threading.Event()
+    real_send = first.send
+
+    def park_then_send(request: httpx.Request, **kwargs: object) -> httpx.Response:
+        if threading.current_thread() is not threading.main_thread():
+            parked.set()
+            assert go_on.wait(timeout=10)
+        return real_send(request, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(first, "send", park_then_send)
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            results.append(client.health().status)
+        except BaseException as exc:  # surfaced below, on the test thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    try:
+        thread.start()
+        assert parked.wait(timeout=10), "the worker never reached send"
+        engine.serve(engine.renew_pin())
+        assert client.health().status == "ok"
+        assert client._http is not first
+        assert not first.is_closed, "the rebuild closed a transport a request still holds"
+        assert client._retired_http == [first]
+        go_on.set()
+        thread.join(timeout=30)
+        assert not errors
+        assert results == ["ok"]
+        assert first.is_closed, "the last request to let go left the replaced transport open"
+        assert client._retired_http == []
+        assert client._in_use == {}
+    finally:
+        go_on.set()
+        thread.join(timeout=30)
+        client.close()
+
+
+def test_a_replaced_transport_no_request_holds_is_closed_at_the_swap(
+    engine: _RenewableEngine,
+) -> None:
+    """A rebuild whose failed transport no request holds closes it straight away, since no request
+    will ever let go of it. RED when it is parked on the retired list instead."""
+    with _pinned(engine) as client:
+        stale = client._http
+        engine.serve(engine.renew_pin())
+        assert client._follow_renewed_pin(stale) is True
+        assert stale.is_closed
+        assert client._retired_http == []
 
 
 def test_a_closed_client_never_rebuilds(engine: _RenewableEngine, builds: list[str | None]) -> None:

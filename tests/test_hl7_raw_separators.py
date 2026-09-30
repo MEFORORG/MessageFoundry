@@ -13,6 +13,8 @@ _dest_config), and the connector applying it on a real loopback socket. SYNTHETI
 
 from __future__ import annotations
 
+from typing import Any
+
 import hl7
 import pytest
 
@@ -216,7 +218,7 @@ def test_destination_reads_raw_separators_flag() -> None:
 
 
 async def _receive_one(
-    payload: str, dest_kwargs: dict[str, object], *, persistent: bool = False
+    payload: str, dest_kwargs: dict[str, Any], *, persistent: bool = False
 ) -> bytes:
     """Deliver ``payload`` through a loopback MLLP destination built with ``dest_kwargs`` (top-level
     Destination fields) and return the exact bytes the receiver saw on the wire."""

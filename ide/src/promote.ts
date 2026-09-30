@@ -8,8 +8,15 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { withAuth } from "./auth";
 import { configDir, engineUrl, environments, runJson, workspaceDir, type EnvironmentTarget } from "./cli";
-import { HttpError, postJson } from "./engineClient";
+import { HttpError, type Approvable } from "./engineClient";
 import { assertTargetAllowed, isLocalEngine } from "./engineTarget";
+import {
+  preflightOutcome,
+  promoteOutcomeMessage,
+  reloadConfig,
+  type PromoteMessage,
+  type ReloadResult,
+} from "./promoteOutcome";
 import { planTargetResolution, resolveTargetUrl, type ResolvedTarget } from "./promoteTarget";
 
 // Shape emitted by `messagefoundry validate --json` (see ide/src/validate.ts).
@@ -17,16 +24,6 @@ interface Diagnostic {
   message: string;
   file: string | null;
   severity: string;
-}
-
-// Mirrors messagefoundry/api/models.py:ReloadResult (the /config/reload response).
-interface ReloadResult {
-  inbound: number;
-  outbound: number;
-  routers: number;
-  handlers: number;
-  running: boolean;
-  dry_run: boolean;
 }
 
 function errText(e: unknown): string {
@@ -142,20 +139,15 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   const configDirForTarget = isLocalEngine(target.url) ? abs : null;
   const reload =
     (dryRun: boolean) =>
-    (token: string): Promise<ReloadResult> =>
-      postJson<ReloadResult>(
-        target.url,
-        "/config/reload",
-        { config_dir: configDirForTarget, dry_run: dryRun },
-        token,
-      );
+    (token: string): Promise<Approvable<ReloadResult>> =>
+      reloadConfig(target.url, configDirForTarget, dryRun, token);
 
   // 3. Pre-flight — dry-run the graph against the TARGET environment. This resolves the graph's
   //    env() values there, so a value the target doesn't define (or a bad spec) fails NOW, not after
   //    the swap. Nothing on the running engine changes.
-  let check: ReloadResult | undefined;
+  let preflight: Approvable<ReloadResult> | undefined;
   try {
-    check = await withAuth(context, target.url, reload(true));
+    preflight = await withAuth(context, target.url, reload(true));
   } catch (e) {
     const hint =
       e instanceof HttpError && e.status === 422
@@ -164,14 +156,21 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
     void vscode.window.showErrorMessage(`MessageFoundry: pre-flight failed${hint}: ${errText(e)}`);
     return;
   }
-  if (check === undefined) {
+  if (preflight === undefined) {
     return; // sign-in cancelled
   }
+  const pre = preflightOutcome(preflight);
+  if (!pre.ok) {
+    showPromoteMessage(pre.message);
+    return;
+  }
+  const check = pre.result;
 
   // 4. Confirm — a live swap is production-affecting, so require an explicit OK.
   const ok = await vscode.window.showWarningMessage(
     `Promote "${cfg}" to ${target.name} (${target.url})?\n\nPre-flight passed: ` +
-      `${check.inbound} inbound, ${check.outbound} outbound. This atomically swaps the live graph.`,
+      `${check.inbound} inbound, ${check.outbound} outbound. This atomically swaps the live graph, ` +
+      "or, where dual control applies, asks a second approver to.",
     { modal: true },
     "Promote",
   );
@@ -179,8 +178,9 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
-  // 5. Promote — apply for real.
-  let result: ReloadResult | undefined;
+  // 5. Promote — apply for real. Dual control may hold it for a second approver (BACKLOG #1981), and
+  //    the message then says so rather than reporting a swap that has not happened.
+  let result: Approvable<ReloadResult> | undefined;
   try {
     result = await withAuth(context, target.url, reload(false));
   } catch (e) {
@@ -190,9 +190,19 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   if (result === undefined) {
     return; // sign-in cancelled
   }
-  void vscode.window.showInformationMessage(
-    `MessageFoundry: promoted to ${target.name} — live graph: ${result.inbound} inbound, ` +
-      `${result.outbound} outbound, ${result.routers} routers, ${result.handlers} handlers` +
-      `${result.running ? " • running" : ""}.`,
-  );
+  showPromoteMessage(promoteOutcomeMessage(target.name, result));
+}
+
+function showPromoteMessage(message: PromoteMessage): void {
+  switch (message.level) {
+    case "error":
+      void vscode.window.showErrorMessage(message.text);
+      return;
+    case "warning":
+      void vscode.window.showWarningMessage(message.text);
+      return;
+    case "info":
+      void vscode.window.showInformationMessage(message.text);
+      return;
+  }
 }

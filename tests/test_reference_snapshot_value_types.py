@@ -90,8 +90,9 @@ async def test_toml_date_snapshot_writes_and_reads_back(tmp_path: Path) -> None:
         await store.write_reference_snapshot(name="payers", version="v1", rows=rows)
         view = store.reference_view()["payers"]
         assert view["acme"]["plan"] == "PPO"
-        # The cache holds the pre-encode value; the point of the arm is that the write COMMITTED.
-        assert view["acme"]["effective"] == date(2026, 1, 1)
+        # The cache holds the ENCODED value, sealed (BACKLOG #1174), so a read before a reopen returns
+        # the same ISO string a read after one does. It used to hand back the writer's own date object.
+        assert view["acme"]["effective"] == "2026-01-01"
     finally:
         await store.close()
 

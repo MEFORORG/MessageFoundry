@@ -29,6 +29,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import EmptyClaimCounters
 from messagefoundry.store import MessageStatus, OutboxStatus
+from messagefoundry.store.base import Store
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -98,7 +99,7 @@ async def test_unsupported_method_returns_405(client: httpx.AsyncClient) -> None
 async def test_chunked_request_body_rejected(client: httpx.AsyncClient) -> None:
     # M-19: a chunked body (no Content-Length) can't be size-bounded up front, so it's refused with
     # 411 rather than buffered unbounded (pre-auth memory DoS guard).
-    async def _stream():  # type: ignore[no-untyped-def]
+    async def _stream():
         yield b"{}"
 
     r = await client.post("/auth/login", content=_stream())
@@ -394,7 +395,11 @@ async def test_dead_letters_list_and_replay(engine: Engine, client: httpx.AsyncC
     assert row["message_id"] == mid
     assert row["destination_name"] == "archive"
     assert row["channel_id"] == "ch1"
-    assert row["attempts"] == 1 and row["last_error"] == "boom"
+    # The list masks the error text and has no reveal of its own (BACKLOG #2436) ...
+    assert row["attempts"] == 1 and row["last_error"] == "****"
+    # ... because the dead letter is one of the message's delivery rows, revealed with it.
+    opened = (await client.get(f"/messages/{mid}?reveal_errors=true")).json()
+    assert opened["outbox"][0]["last_error"] == "boom"
 
     r = await client.post("/dead-letters/replay", json={})
     assert r.status_code == 200
@@ -629,6 +634,42 @@ async def test_list_masks_the_summary_and_only_an_explicit_reveal_lifts_it(
     assert [v["revealed"] for v in views] == [[], ["summary"], []]
 
 
+async def test_the_error_text_is_masked_until_its_own_reveal_act(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """The message's own ``error`` arrives masked whole and only ``reveal_errors`` lifts it
+    (ASVS 14.2.6, BACKLOG #2436, owner ruling R12). The summary reveal is a different act and does
+    not lift it, and the error reveal does not lift the summary. The ``message_view`` row records
+    which it was, read from what the response carried."""
+    stored = "parse error: segment ZQX7 rejected"
+    mid = await engine.store.record_received(
+        channel_id="ch1",
+        raw=ADT,
+        status=MessageStatus.ERROR,
+        error=stored,
+        source_type="file",
+        summary="MRN 100001 · DOE, JANE",
+    )
+    opened = (await client.get(f"/messages/{mid}")).json()
+    assert opened["error"] == "****"
+    summary_only = (await client.get(f"/messages/{mid}?reveal_summary=true")).json()
+    assert summary_only["error"] == "****" and summary_only["summary"] == "MRN 100001 · DOE, JANE"
+    errors_only = (await client.get(f"/messages/{mid}?reveal_errors=true")).json()
+    assert errors_only["error"] == stored
+    assert errors_only["summary"] == "MRN ****0001 · D**, J**"
+    reopened = (await client.get(f"/messages/{mid}")).json()
+    assert reopened["error"] == "****"  # the reveal did not become a status
+
+    views = sorted(
+        (a["id"], json.loads(a["detail"])["revealed"])
+        for a in await engine.store.list_audit()
+        if a["action"] == "message_view"
+    )
+    # The error reveal also returned the earlier opens' `viewed` events whole: their `detail` is
+    # error-tier text too, and the audit records it under its list's name.
+    assert [v for _id, v in views] == [[], ["summary"], ["error", "events.detail"], []]
+
+
 async def test_summary_access_audited_server_side_and_coalesced(engine: Engine) -> None:
     # M-5: summary access is audited SERVER-SIDE (no client flag needed), coalesced into one
     # summary_access row per actor/hour carrying the running count.
@@ -668,7 +709,8 @@ async def test_the_audit_separates_a_masked_list_from_a_real_disclosure(engine: 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         listed = (await c.get("/messages")).json()["messages"][0]
-        await c.get(f"/messages/{listed['id']}?reveal_summary=true")  # the explicit reveal act
+        # Both explicit reveal acts, so every masked property on the open comes back complete.
+        await c.get(f"/messages/{listed['id']}?reveal_summary=true&reveal_errors=true")
         await app.state.summary_auditor.flush(engine.store)
 
     rows = [a for a in await engine.store.list_audit() if a["action"] == "summary_access"]
@@ -678,10 +720,10 @@ async def test_the_audit_separates_a_masked_list_from_a_real_disclosure(engine: 
     assert any('"count": 0' in d and '"masked": 1' in d for d in details)
 
     # The OPEN: a real disclosure, and nothing masked. The count is 3 rather than 1 because the
-    # detail route audits [detail, *outbox, *events] together -- the nested delivery and event rows
-    # carry their own `last_error` / `detail` PHI, which is NOT in MASKED_UNTIL_REVEALED and so was
-    # readable all along. Asserted exactly, because a looser "> 0" would pass if the summary reveal
-    # silently stopped counting and only the nested rows carried it.
+    # detail route audits [detail, *outbox, *events] together -- the nested event rows carry their
+    # own `detail` PHI, which the reveal_errors act unmasks (BACKLOG #2436). Asserted exactly,
+    # because a looser "> 0" would pass if the summary reveal silently stopped counting and only the
+    # nested rows carried it.
     assert any('"count": 3' in d and '"masked": 0' in d for d in details)
 
 
@@ -692,24 +734,25 @@ async def test_summary_audit_coalescer_rolls_over_with_count() -> None:
         def __init__(self) -> None:
             self.rows: list[tuple[str, str | None, str | None, str | None]] = []
 
-        async def record_audit(self, action, *, actor=None, channel_id=None, detail=None):  # type: ignore[no-untyped-def]
+        async def record_audit(self, action, *, actor=None, channel_id=None, detail=None):
             self.rows.append((action, actor, channel_id, detail))
 
-    store = _Rec()
+    rec = _Rec()
+    store: Store = rec  # type: ignore[assignment]  # the coalescer only calls record_audit
     c = _SummaryAuditCoalescer()
     await c.note(store, "alice", "ch1", 3, 0.0)  # hour 0
     await c.note(store, "alice", "ch1", 2, 60.0)  # same hour -> accumulate (count 5), no emit
-    assert store.rows == []
+    assert rec.rows == []
     await c.note(store, "alice", "ch1", 1, 3600.0)  # hour 1 -> flush hour-0 window (count 5)
-    assert len(store.rows) == 1
-    action, actor, channel_id, detail = store.rows[0]
+    assert len(rec.rows) == 1
+    action, actor, channel_id, detail = rec.rows[0]
     assert action == "summary_access" and actor == "alice" and channel_id == "ch1"
     assert detail is not None and '"count": 5' in detail
     # a different actor's later access sweeps alice's still-open hour-1 window
     await c.note(store, "bob", "ch2", 1, 7200.0)  # hour 2
-    assert any(r[1] == "alice" and r[3] and '"count": 1' in r[3] for r in store.rows)
+    assert any(r[1] == "alice" and r[3] and '"count": 1' in r[3] for r in rec.rows)
     await c.flush(store)  # remaining (bob's hour-2 window)
-    assert any(r[1] == "bob" for r in store.rows)
+    assert any(r[1] == "bob" for r in rec.rows)
 
 
 async def test_no_summary_audit_when_the_listed_messages_have_no_summaries(
@@ -1209,7 +1252,7 @@ async def test_connections_one_outbound_with_two_inbound_edges_is_not_also_stand
     for channel in ("in1", "in2"):
         await engine.store.enqueue_message(channel_id=channel, raw=ADT, deliveries=[("out1", ADT)])
     rows = await _await_out1_edges(client, {"in1", "in2"})
-    assert sorted(r["channel_id"] for r in rows) == ["in1", "in2"]
+    assert sorted(str(r["channel_id"]) for r in rows) == ["in1", "in2"]
     assert all(r["role"] == "destination" for r in rows)
 
 

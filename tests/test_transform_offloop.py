@@ -21,9 +21,9 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.active_environment import current_environment
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -46,7 +46,7 @@ async def store(tmp_path: Path):
     await s.close()
 
 
-def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:
     reg = Registry()
     reg.add_outbound(
         OutboundConnection(
@@ -96,7 +96,7 @@ async def test_transform_runs_off_main_thread(store: MessageStore, tmp_path: Pat
     _drop_one(inbox)
     seen: dict[str, bool] = {}
 
-    def handle(m):  # type: ignore[no-untyped-def]
+    def handle(m):
         seen["off_loop"] = threading.current_thread() is not threading.main_thread()
         return Send("file_out", str(m))
 
@@ -115,7 +115,7 @@ async def test_router_runs_off_main_thread(store: MessageStore, tmp_path: Path) 
     _drop_one(inbox)
     seen: dict[str, bool] = {}
 
-    def route(m):  # type: ignore[no-untyped-def]
+    def route(m):
         seen["off_loop"] = threading.current_thread() is not threading.main_thread()
         return ["h"]
 
@@ -142,7 +142,7 @@ async def test_slow_handler_does_not_stall_the_loop(store: MessageStore, tmp_pat
     handler_running = asyncio.Event()
     loop = asyncio.get_running_loop()
 
-    def slow(m):  # type: ignore[no-untyped-def]
+    def slow(m):
         loop.call_soon_threadsafe(handler_running.set)
         time.sleep(0.3)  # blocking stand-in for a heavy transform
         return Send("file_out", str(m))
@@ -182,7 +182,7 @@ async def test_provider_resolves_off_loop(store: MessageStore, tmp_path: Path) -
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     _drop_one(inbox)
 
-    def handle(m):  # type: ignore[no-untyped-def]
+    def handle(m):
         env = current_environment()  # resolves only if the ContextVar copied into this thread
         return Send("file_out", f"env={env}")
 

@@ -461,6 +461,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
     # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #1174: the sealed read-through caches (transform state + reference sets) seal each value
+    # under a per-process AES-256-GCM key built through store.crypto._install_key (lock + wipe of the
+    # key buffer). Memory hygiene for decoded cache values, not at-rest protection.
+    "messagefoundry/store/sealed_cache.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -567,7 +571,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
-    # and asserts it. Its one decision, leaving CERT_NONE hops alone, is on its IMPORT_ONLY row.
+    # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
     "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
@@ -823,12 +827,6 @@ IMPORT_ONLY: dict[str, str] = {
         "carries a trust anchor and a hop posture to the refusal checks; the OAuth2 token hop's "
         "opener is built by the shared base in transports/smart.py (BACKLOG #2115), which is "
         "inventoried"
-    ),
-    "messagefoundry/transports/strict_requests.py": (
-        "INSTRUMENT LIMIT. Gives each verifying Vault https connection a context from a factory "
-        "config/tls_policy.py returns, which builds and narrows it there, and leaves a CERT_NONE "
-        "connection (the TLS hop to an https proxy) on urllib3's own context: a TLS posture "
-        "decision with no crypto-shaped call in it (BACKLOG #300)"
     ),
     "tee/mefor_api.py": (
         "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
@@ -1169,6 +1167,18 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
+    # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
+    # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
+    # sha256) by store.crypto._install_key.
+    "messagefoundry/store/sealed_cache.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "csprng:os.urandom",
+            "hash:via messagefoundry.store.crypto",
+        }
+    ),
     # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
     # tls_policy.assert_hvac_tls_suites and mounts it, so a TLS context is built here now.
     "messagefoundry/store/keyprovider_vault.py": frozenset(
@@ -1359,6 +1369,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.keywrap",
             "tls_context:via messagefoundry.transports.rest",
         }
+    ),
+    # Loads requests' CA onto the https-proxy leg's context; _narrowed_pool_classes says why.
+    # INSTRUMENT LIMIT: the load sits in a class nested in a function reached only through
+    # StrictReplyAdapter.__init__, so no "via" token reaches the Vault callers' rows, and the
+    # CERT_NONE refusal in connect() is a posture decision with no crypto-shaped call.
+    "messagefoundry/transports/strict_requests.py": frozenset(
+        {"tls_context:.load_verify_locations()"}
     ),
     # BACKLOG #300, owner ruling R3 of 2026-09-27: both verifying contexts are narrowed to a pinned
     # copy of the approved suite list, the apiclient's pattern (tray/ may not import config/).
@@ -1940,6 +1957,10 @@ NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
 #: Bidirectional, like every inventory here, and the stale direction is again what lets it fail: a
 #: broken walk leaves these rows unbacked and reds rather than reporting a clean empty scan.
 NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # Not a security control: the Test Bench collection store (BACKLOG #1174) names its SecretStorage
+    # key with a SHA-256 of the workspace storage URI, so the key carries no local path. Truncated to
+    # 32 hex characters; it only has to tell two workspaces apart.
+    "ide/src/collectionStore.ts": frozenset({"hash:createHash[sha256]"}),
     # The single source of CSP nonces for every webview the extension builds (see the randomness
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
@@ -2177,10 +2198,15 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # supply-chain verification of a binary that then runs as a service. The download hop ADDS TLS
     # 1.2 to the enabled protocol set with `-bor`; that is not a floor, so anything the machine
     # already enables stays enabled, and under pwsh 7 ServicePointManager does not govern
-    # Invoke-WebRequest at all. The pinned hash is the control that holds either way.
+    # Invoke-WebRequest at all. The pinned hash is the control that holds either way. A second pin,
+    # on nssm.exe itself, is checked on every copy it runs, whether downloaded, installed or found.
     "scripts/service/install-service.ps1": frozenset(
         {"tls_context:SecurityProtocolType[TLS12]", "hash:Get-FileHash[SHA256]"}
     ),
+    # The same pinned-hash check, a byte-identical copy of install-service.ps1's (BACKLOG #2364): it
+    # hashes the nssm.exe it installs and runs against the pin of the win64 binary, and
+    # mefor-net-helper.exe against -HelperSha256, before starting the helper as LocalSystem.
+    "scripts/service/install-net-helper.ps1": frozenset({"hash:Get-FileHash[SHA256]"}),
     # CI-only measurement (ADR 0183 Wave 0, BACKLOG #1136), run by windows-service-smoke. It draws a
     # synthetic per-run administrator password from the CSPRNG, which provision-admin and then a real
     # sign-in use against a throwaway store. The CSPRNG, not Get-Random, because the account it

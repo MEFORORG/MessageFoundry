@@ -30,12 +30,12 @@ ADT_A01 = (
 )
 
 
-def _out_json(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
-    return json.loads(capsys.readouterr().out)  # type: ignore[no-any-return]
+def _out_json(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    return json.loads(capsys.readouterr().out)
 
 
-def _check(report: dict[str, object], name: str) -> dict[str, object]:
-    return next(c for c in report["checks"] if c["name"] == name)  # type: ignore[union-attr,index]
+def _check(report: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(c for c in report["checks"] if c["name"] == name)
 
 
 def _run_count(detail: object) -> int:
@@ -390,7 +390,9 @@ def test_read_message_sets_single_file_is_unmapped(tmp_path: Path) -> None:
 
 
 def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(checks.shutil, "which", lambda _: None)
+    monkeypatch.setattr(
+        shutil, "which", lambda _: None
+    )  # the module object the checks module calls
     report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
     by_name = {r.name: r for r in report.results}
     for tool in ("ruff", "mypy", "ruff-security"):
@@ -526,7 +528,7 @@ def test_check_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
     main(["check", "--config", str(SAMPLES_CONFIG), "--no-lint", "--json"])
     report = _out_json(capsys)
     assert set(report.keys()) == {"ok", "checks"}
-    for c in report["checks"]:  # type: ignore[union-attr]
+    for c in report["checks"]:
         assert set(c.keys()) == {"name", "ok", "required", "skipped", "detail"}
 
 

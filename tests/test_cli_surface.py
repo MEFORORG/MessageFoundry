@@ -2,10 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every CLI subcommand has exactly one tier in ``messagefoundry.cli_surface`` (BACKLOG #1192).
 
-The test builds the REAL parser by running ``messagefoundry.__main__.main`` up to its
-``parse_args`` call and catching the parser there. ``main()`` builds the parser inline and there is
-no builder function to call, so this is the only way to read it without editing ``__main__.py``.
-Nothing after ``parse_args`` runs, so no subcommand is dispatched.
+The test builds the REAL parser with ``messagefoundry.__main__._build_parser``, the builder ADR 0201
+slice 1 took out of ``main()``. Building runs nothing: no hook, no stream change, no dispatch.
+Two tests below hold that builder to what ``main()`` really parses with, which is the guarantee the
+earlier workaround got by catching the parser at ``main()``'s own ``parse_args`` call.
 
 All the table's rules live in one function, :func:`_table_problems`. The real test asserts it finds
 nothing. Each planted test breaks the real data one way and asserts that the same function names the
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import logging
 import subprocess
 import sys
 import threading
@@ -25,7 +26,9 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.__main__ as cli_module
+import messagefoundry.cli_common as cli_common
 import messagefoundry.cli_surface as cli_surface
+from messagefoundry.cli_common import Dispatch
 from messagefoundry.cli_surface import Tier
 
 # The toolkit per the owner ruling of 2026-09-28: eight rows by name, and the three `lens` children
@@ -54,40 +57,6 @@ _RULED_TOOLKIT = frozenset(
 # `check`'s security lint. The ruling pin above already implies both are production; this names them
 # so a failure says why.
 _MUST_BE_PRODUCTION = ("dryrun", "check")
-
-
-class _Captured(BaseException):
-    """A BaseException, so an ``except Exception`` in ``main()`` cannot swallow the capture."""
-
-    def __init__(self, parser: argparse.ArgumentParser) -> None:
-        super().__init__("parser captured")
-        self.parser = parser
-
-
-def _capture_real_parser() -> argparse.ArgumentParser:
-    """Run ``main()`` until it calls ``parse_args``, and return the parser it called it on.
-
-    ``main()`` calls ``parse_args`` once, on the top-level parser. argparse reaches subparsers
-    through ``parse_known_args``, so the first call is the one wanted.
-    """
-
-    def capture(self: argparse.ArgumentParser, *args: object, **kwargs: object) -> object:
-        raise _Captured(self)
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(argparse.ArgumentParser, "parse_args", capture)
-        # main() sets both process-wide exception hooks and re-wraps the console streams before it
-        # builds the parser. Setting each hook to its current value makes the context put it back on
-        # exit, and the stream change cannot be undone, so it is skipped. A rename of the stream
-        # helper fails here loudly rather than leaking into later tests.
-        mp.setattr(sys, "excepthook", sys.excepthook)
-        mp.setattr(threading, "excepthook", threading.excepthook)
-        mp.setattr(cli_module, "harden_console_streams", lambda **_kw: None)
-        try:
-            cli_module.main([])
-        except _Captured as caught:
-            return caught.parser
-    raise AssertionError("main() returned without parsing its arguments")
 
 
 def _command_paths(parser: argparse.ArgumentParser, prefix: str = "") -> dict[str, set[str]]:
@@ -126,7 +95,8 @@ def _table_problems(paths: Mapping[str, set[str]], tiers: Mapping[str, Tier]) ->
 
 @pytest.fixture(scope="module")
 def real_paths() -> dict[str, set[str]]:
-    return _command_paths(_capture_real_parser())
+    parser, _dispatch = cli_module._build_parser()
+    return _command_paths(parser)
 
 
 def test_the_table_matches_the_parser_and_the_ruling(real_paths: dict[str, set[str]]) -> None:
@@ -139,6 +109,78 @@ def test_the_table_matches_the_parser_and_the_ruling(real_paths: dict[str, set[s
 
 def test_dispatch_keys_are_the_top_level_subcommands(real_paths: dict[str, set[str]]) -> None:
     assert set(cli_module._DISPATCH) == {p for p in real_paths if " " not in p}
+
+
+# --- The builder is what main() parses with, and building changes nothing. ---------------------
+
+
+def test_the_builder_returns_the_dispatch_map_main_uses() -> None:
+    """The very object, not a copy, so a test that patches an entry in ``_DISPATCH`` still reaches
+    ``main()``. At least ``tests/test_cli.py`` relies on that."""
+    _parser, dispatch = cli_module._build_parser()
+    assert dispatch is cli_module._DISPATCH
+
+
+def test_main_parses_with_the_builder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``main()`` must call ``_build_parser`` rather than build a parser of its own. Otherwise the
+    table test above would read one surface while the engine exposes another. The planted builder
+    registers one command nothing else has, and ``main()`` must parse and dispatch it."""
+    ran: list[str] = []
+
+    def handler(args: argparse.Namespace) -> int:
+        ran.append(args.command)
+        return 7
+
+    def planted() -> tuple[argparse.ArgumentParser, Dispatch]:
+        parser = argparse.ArgumentParser(prog="planted")
+        parser.add_subparsers(dest="command", required=True).add_parser("only-in-the-plant")
+        return parser, {"only-in-the-plant": handler}
+
+    # main() installs both process-wide exception hooks. Setting each to its current value makes
+    # the context put it back afterwards, so nothing leaks into later tests. The stream hardening
+    # cannot be undone, so it is skipped at both of its call sites, main() and run_cli().
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(cli_module, "harden_console_streams", lambda **_kw: None)
+    monkeypatch.setattr(cli_common, "harden_console_streams", lambda **_kw: None)
+    monkeypatch.setattr(cli_module, "_build_parser", planted)
+    assert cli_module.main(["only-in-the-plant"]) == 7
+    assert ran == ["only-in-the-plant"]
+
+
+def test_building_the_parser_installs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reading the surface must not change the process. The hooks, the stream hardening and the log
+    sink are what ``main()`` sets, and the builder must call none of them.
+
+    Recorders, not before-and-after state. Under pytest's capture the streams already use
+    ``errors="replace"``, and an earlier ``main()`` call in the same worker has already installed
+    the hooks, so a state comparison would stay green on exactly the regression it is for."""
+    called: list[str] = []
+
+    def recorder(name: str) -> object:
+        return lambda *_a, **_kw: called.append(name)
+
+    import messagefoundry.console_streams as console_streams
+    import messagefoundry.last_resort as last_resort
+    import messagefoundry.logging_setup as logging_setup
+
+    for module, name in (
+        (console_streams, "harden_console_streams"),
+        (cli_module, "harden_console_streams"),
+        (cli_common, "harden_console_streams"),
+        (last_resort, "install_excepthook"),
+        (last_resort, "install_thread_excepthook"),
+        (logging_setup, "configure_stderr_logging"),
+        (cli_common, "configure_stderr_logging"),
+    ):
+        monkeypatch.setattr(module, name, recorder(f"{module.__name__}.{name}"))
+    handlers = list(logging.getLogger().handlers)
+    cli_module._build_parser()
+    assert called == []
+    assert list(logging.getLogger().handlers) == handlers
+    # Control: the recorders are live, so an empty list above means nothing was called.
+    console_streams.harden_console_streams()
+    assert called == ["messagefoundry.console_streams.harden_console_streams"]
 
 
 # --- Planted breaks. Each must be named by the same function the real test uses. ----------------

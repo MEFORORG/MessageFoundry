@@ -12,10 +12,12 @@ import os
 import re
 import shlex
 import ssl
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
@@ -237,7 +239,11 @@ def test_dacl_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.Monke
         stdout = _icacls(r"DESKTOP-A\svc:(F)")
         stderr = ""
 
-    monkeypatch.setattr(ta.subprocess, "run", lambda argv, **kw: (captured.append(argv), _R())[1])
+    def _run(argv: list[str], **kw: object) -> _R:
+        captured.append(argv)
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", _run)  # the module object trust_anchors calls
     # _PATH keeps the faked stdout's own prefix, so the parse behaves as it would on a real read.
     assert dacl_is_owner_only(_PATH) is True
     # Guard the guard: with no call recorded, every assertion below passes over nothing.
@@ -1634,7 +1640,7 @@ _SETTINGS_PINS = [
 @pytest.mark.parametrize("blank", _BLANK_PINS)
 @pytest.mark.parametrize(("model", "field", "setting"), _SETTINGS_PINS)
 def test_a_blank_settings_pin_refuses_at_load(
-    model: type, field: str, setting: str, blank: str
+    model: type[BaseModel], field: str, setting: str, blank: str
 ) -> None:
     """An empty or whitespace pin is a mistake, not "no pin". Absent is the only way to say none.
     Red under: the validator removed, where the blank loads and waits for the anchor code."""

@@ -216,6 +216,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_reply_hint_thread_affinity.py",
         #   adr0071_statement_rt_inventory -> drives a real SqlServerStore through its bench module
         "test_adr0071_statement_rt_inventory.py",
+        # Same shape as adr0071 above, reached through a sibling helper rather than a bench module:
+        # it drives the real SqlServerStore handoffs and pins their round-trip counts (ADR 0075
+        # AC-5), but every engine import lives in tests/adr0075_batch_harness.py, which the
+        # classifier does not follow (BACKLOG #1799). A regression arrives as a
+        # messagefoundry/store/sqlserver.py diff, which the tooling path gate does not see.
+        "test_adr0075_rt_count_gate.py",
         #   install_instruction_provenance -> globs messagefoundry/**/*.py
         "test_install_instruction_provenance.py",
         #   sds_rule_ids_are_stable -> :397 rglobs messagefoundry/**/*.py. Milder than the four above

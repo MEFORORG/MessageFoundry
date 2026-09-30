@@ -1286,3 +1286,30 @@ async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadlin
         assert "temporary password has expired" in r.text
     user = await service.store.get_user(user_id)
     assert user is not None and user.must_change_password is True
+
+
+async def test_the_enrol_first_notice_offers_a_passkey_only_where_one_is_accepted(
+    engine: Engine,
+) -> None:
+    """RED when: the enroll_first notice offers a passkey to a local account ``require_mfa`` covers
+    that has no TOTP. The service refuses that account's passkey as a first factor (ADR 0197
+    Amendment A), so the notice must name the authenticator app alone. With the requirement off
+    nothing is refused, and the notice still offers both."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _login(c)
+        # Pending with no factor: the gate page has nothing to ask, so it sends the session here.
+        r = await c.get("/ui/mfa")
+        assert r.status_code == 303 and r.headers["location"] == _ENROL_FIRST
+        page = await c.get(_ENROL_FIRST)
+    assert page.status_code == 200
+    assert "enroll an authenticator app (TOTP) to continue" in page.text
+    assert "TOTP app or passkey" not in page.text, "the notice offers a passkey the service refuses"
+
+    off = await _service(engine, require_mfa=False)
+    async with _client(engine, off) as c:
+        await _login(c)
+        page = await c.get(_ENROL_FIRST)
+    assert page.status_code == 200
+    assert "TOTP app or passkey" in page.text

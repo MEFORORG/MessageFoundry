@@ -561,6 +561,25 @@ def dec_run_context(node: Any, reader: _Reader) -> RunContext:
     )
 
 
+def _snapshot(view: Mapping[Any, Any]) -> Mapping[Any, Any]:
+    """One copy of a live store view, taken before it is walked.
+
+    The engine's views are live windows onto caches the event loop keeps mutating, while this encoder
+    runs in a worker thread. Walking the live view can hit a key the loop just removed, so copy it
+    first: a ``MappingProxyType``'s ``copy`` calls its target's, which for a store's sealed cache
+    copies ciphertext without decrypting (BACKLOG #1174). Duck-typed on purpose, so this module keeps
+    importing nothing from the store. Anything else is copied into a ``dict``."""
+    copier = getattr(view, "copy", None)
+    if callable(copier):
+        try:
+            snap = copier()
+        except (AttributeError, TypeError):  # a proxy over a mapping with no plain copy()
+            snap = None
+        if isinstance(snap, Mapping):
+            return snap
+    return dict(view)
+
+
 def _enc_table(what: str, table: Mapping[Any, Any], blobs: _Blobs) -> Any:
     """One lookup table (an ADR 0006 reference set, a code set), with a fast path for the shape that
     dominates real traffic.
@@ -571,12 +590,16 @@ def _enc_table(what: str, table: Mapping[Any, Any], blobs: _Blobs) -> Any:
     the pickle it replaced). When every entry fits that shape the table travels as ONE plain JSON
     object and the C encoder/decoder does the walk. This is an ENCODING choice, not a grammar change:
     the decoder still proves every value is a ``str`` before it is used, and either form decodes, so the
-    two ends can never disagree about which one to use."""
+    two ends can never disagree about which one to use.
+
+    The table is read ONCE, into ``entries``: a store's reference set is a sealed cache that decrypts
+    on every read (BACKLOG #1174), so a shape check and then a copy would decrypt each value twice."""
+    entries = dict(_snapshot(table))
     if all(
-        isinstance(k, str) and isinstance(v, str) and len(v) < _BLOB_MIN for k, v in table.items()
+        isinstance(k, str) and isinstance(v, str) and len(v) < _BLOB_MIN for k, v in entries.items()
     ):
-        return {"s": dict(table)}
-    return {"a": [[_req_str(k, f"{what} key"), enc_value(v, blobs)] for k, v in table.items()]}
+        return {"s": entries}
+    return {"a": [[_req_str(k, f"{what} key"), enc_value(v, blobs)] for k, v in entries.items()]}
 
 
 def _dec_table(node: Any, what: str, reader: _Reader) -> dict[str, Any]:
@@ -609,7 +632,7 @@ def _enc_reference_view(view: object, blobs: _Blobs) -> Any:
     if not isinstance(view, Mapping):
         raise SandboxCodecError(f"reference_view must be a mapping, got {type(view).__name__}")
     rows: list[Any] = []
-    for name, table in view.items():
+    for name, table in _snapshot(view).items():
         if not isinstance(name, str):
             raise SandboxCodecError("reference_view names must be strings")
         if not isinstance(table, Mapping):
@@ -638,7 +661,7 @@ def _enc_state_view(view: object, blobs: _Blobs) -> Any:
     if not isinstance(view, Mapping):
         raise SandboxCodecError(f"state_view must be a mapping, got {type(view).__name__}")
     rows: list[Any] = []
-    for key, value in view.items():
+    for key, value in _snapshot(view).items():
         if not (isinstance(key, tuple) and len(key) == 2 and all(isinstance(p, str) for p in key)):
             raise SandboxCodecError("state_view keys must be (namespace, key) string tuples")
         rows.append([key[0], key[1], enc_value(value, blobs)])

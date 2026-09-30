@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -64,7 +65,7 @@ class _FakeLeaseDB:
     def __init__(self, db_clock: _Clock) -> None:
         self._db_clock = db_clock
         # {"owner": str, "lease_expires_at": float, "leader_epoch": int}
-        self.row: dict[str, object] | None = None
+        self.row: dict[str, Any] | None = None
 
     def claim(self, owner: object, ttl: float, delay: float) -> dict[str, object] | None:
         """Acquire-or-renew, returning the ``(owner, leader_epoch)`` the statement would OUTPUT, or
@@ -79,10 +80,10 @@ class _FakeLeaseDB:
         if row is None:
             self.row = {"owner": owner, "lease_expires_at": now + ttl, "leader_epoch": 1}
             return {"owner": owner, "leader_epoch": 1}
-        expired = float(row["lease_expires_at"]) + delay < now  # type: ignore[arg-type]
+        expired = float(row["lease_expires_at"]) + delay < now
         if row["owner"] == owner or expired:
             if row["owner"] != owner:
-                row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
+                row["leader_epoch"] = int(row["leader_epoch"]) + 1
             row["owner"] = owner
             row["lease_expires_at"] = now + ttl
             return {"owner": owner, "leader_epoch": row["leader_epoch"]}
@@ -289,7 +290,7 @@ async def test_self_fence_demotes_when_renew_stalls() -> None:
     mono = _Clock(0.0)
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader, _last_renew_ok = 0
-    a._pool.fail = True  # type: ignore[attr-defined]  # partition: no more renews land
+    a._pool.fail = True  # partition: no more renews land
     mono.t = 20.0
     a._check_fence()
     assert a.is_leader() is True  # exactly at the timeout: not yet (strict >)
@@ -314,7 +315,7 @@ async def test_maintain_does_not_demote_on_db_error_watchdog_does() -> None:
     mono = _Clock(0.0)
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader
-    a._pool.fail = True  # type: ignore[attr-defined]
+    a._pool.fail = True
     with pytest.raises(RuntimeError, match="partitioned"):
         await a._maintain_leadership()
     assert a.is_leader() is True  # the error alone did not demote
@@ -336,7 +337,7 @@ async def test_fence_fires_before_standby_can_acquire() -> None:
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", ttl=30.0, fence=20.0)
 
     await a._maintain_leadership()  # A leader (lease expiry 30)
-    a._pool.fail = True  # type: ignore[attr-defined]  # A partitioned: no more renews
+    a._pool.fail = True  # A partitioned: no more renews
 
     # t = 20+: A self-fences. The standby, querying the (still-live until 30) lease, cannot acquire yet.
     a_mono.t = 20.1
@@ -435,7 +436,7 @@ async def test_epoch_cleared_on_self_fence() -> None:
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader, epoch 1
     assert a.current_epoch() == 1
-    a._pool.fail = True  # type: ignore[attr-defined]  # partition: renews stop
+    a._pool.fail = True  # partition: renews stop
     mono.t = 20.1
     a._check_fence()
     assert a.is_leader() is False
@@ -546,7 +547,9 @@ async def test_a_handicapped_sibling_takes_over_after_a_stepdown() -> None:
     b = _coord(_FakeLeasePool(db), mono_b, node="B", heartbeat=10.0, acquire_delay_seconds=60.0)
     await a._maintain_leadership()
     assert a.is_leader() is True
-    assert await a.step_down_leadership() == (True, pytest.approx(time.time(), abs=60), True)
+    outcome = await a.step_down_leadership()
+    assert outcome.was_leader is True and outcome.lease_released is True
+    assert outcome.released_at == pytest.approx(time.time(), abs=60)
 
     # One heartbeat later, still inside A's 20 s pause and far inside B's 60 s handicap.
     for clock in (db_clock, mono_a, mono_b):
@@ -695,7 +698,8 @@ async def test_step_down_pauses_this_node_so_a_standby_wins_the_expired_lease() 
     # The standby's tick inside the same window wins the expired lease and bumps the epoch (H1).
     await b._maintain_leadership()
     assert b.is_leader() is True
-    assert db.row["owner"] == "B" and db.row["leader_epoch"] == 2
+    lease = db.row  # a fresh name: mypy still holds db.row["owner"] narrowed to "A" from above
+    assert lease is not None and lease["owner"] == "B" and lease["leader_epoch"] == 2
 
     # And the pause is bounded: past it, A contends normally again (it just cannot beat a live lease).
     mono_a.t = 21.0
@@ -948,7 +952,7 @@ async def test_the_retry_arms_a_fresh_pause_measured_from_the_retrys_own_clock()
     # leadership back to the node the endpoint has already reported drained.
     #
     # VACUITY CONTROL, both legs MEASURED: delete the `_lease_release_owed` disjunct from
-    # DbCoordinator._may_own_lease_row and this fails at the pause (`20.0 == 120.0`); silence that
+    # DbCoordinator.may_own_lease_row and this fails at the pause (`20.0 == 120.0`); silence that
     # leg as well and it fails at the behavioural one (`True is False`).
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
@@ -1057,7 +1061,7 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     # "not the current leader" while GET /cluster/nodes still named this node as lease owner, with the
     # row live for another ten seconds. CONTROL ARMS, both measured: against the unfixed coordinator
     # this fails at the unpack (it returned two values); with the fix in place but the
-    # `_last_renew_ok` disjunct dropped from _may_own_lease_row, it fails at the outcome
+    # `_last_renew_ok` disjunct dropped from may_own_lease_row, it fails at the outcome
     # (`lease_released` False), because no write is sent.
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
@@ -1066,7 +1070,9 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     a = _coord(pool, mono, node="A", heartbeat=10.0, fence=20.0, ttl=30.0)
     fired: list[int] = []
     a.set_on_demote(lambda: fired.append(1))
+    assert a.may_own_lease_row() is False, "a node that never held the lease owns no row"
     await a._maintain_leadership()
+    assert a.may_own_lease_row() is True
     # The renews stop landing; the watchdog fences on the node's own clock...
     mono.t = 20.1
     a._check_fence()
@@ -1074,6 +1080,9 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     # ...while the row is still live on the DB clock (15 < 30) and still names this node.
     db_clock.t = 15.0
     assert db.row is not None and db.row["owner"] == "A" and db.row["lease_expires_at"] == 30.0
+    # The public drain test GET /cluster/status publishes as owns_lease_row (BACKLOG #1988): the
+    # gate is clear, and the engine would still drain this node.
+    assert a.may_own_lease_row() is True, "a self-fenced node would not be drained"
 
     releases: list[tuple[object, ...]] = []
     pool.on_execute_args = releases.append
@@ -1086,6 +1095,8 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     # The pause is armed from the release, so the drained node does not renew the row straight back
     # through the unfenced `owner = me` branch the moment its DB comes back.
     assert a._no_claim_until == pytest.approx(20.1 + 20.0)
+    # Just released: the row is expired and nothing is owed, so a second stepdown would drain nothing.
+    assert a.may_own_lease_row() is False, "a node that just released still reads as owning its row"
     assert fired == [1, 1], "the row release fired no demotion edge"
     await a._maintain_leadership()
     assert a.is_leader() is False, "the drained node renewed itself back in"
@@ -1113,6 +1124,7 @@ async def test_a_stepdown_on_a_node_whose_lease_a_sibling_took_changes_nothing()
     await a._maintain_leadership()  # A's DB answers with B's live lease
     assert (a.is_leader(), b.is_leader()) == (False, True)
     assert a._last_renew_ok is None, "a claim that saw another owner kept the hold baseline"
+    assert a.may_own_lease_row() is False  # published as owns_lease_row=false (BACKLOG #1988)
 
     releases: list[tuple[object, ...]] = []
     pool.on_execute_args = releases.append
@@ -1349,7 +1361,7 @@ def _sql_coord(
     # Same timings as _coord above, so the two backends' tests are comparable at a glance. `mono` is
     # passed in when a test needs to move this node's monotonic clock past its own stepdown pause.
     return SqlServerCoordinator(
-        store,  # type: ignore[arg-type]
+        store,
         node,
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=30.0,
@@ -1546,10 +1558,12 @@ async def test_sqlserver_a_self_fenced_node_is_drained_and_says_so_truthfully() 
     a._check_fence()
     assert a.is_leader() is False
     assert db.row is not None and db.row["lease_expires_at"] == 30.0  # still live and ours
+    assert a.may_own_lease_row() is True  # BACKLOG #1988: published as owns_lease_row
 
     assert await a.step_down_leadership() == (False, None, True)
     assert db.row is not None and db.row["lease_expires_at"] == 0.0
     assert a._no_claim_until == pytest.approx(20.1 + 20.0)
+    assert a.may_own_lease_row() is False
 
 
 async def test_sqlserver_a_handicapped_sibling_takes_over_after_a_stepdown() -> None:
@@ -1560,7 +1574,7 @@ async def test_sqlserver_a_handicapped_sibling_takes_over_after_a_stepdown() -> 
     mono_a = _Clock(0.0)
     a = _sql_coord(_FakeSqlLeaseStore(db), "A", mono_a)
     b = SqlServerCoordinator(
-        _FakeSqlLeaseStore(db),  # type: ignore[arg-type]
+        _FakeSqlLeaseStore(db),
         "B",
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=30.0,

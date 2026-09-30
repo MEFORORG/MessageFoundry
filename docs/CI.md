@@ -379,6 +379,10 @@ Two limits, stated so nobody reads more into a green than it carries:
   docs-only PR) reports `NO OBSERVATION` in words rather than a healthy-looking ratio. Recorded
   per-leg maxima — with their pool, their date, and whether they are right-censored — live in
   `scripts/ci/step_margin_baseline.toml`; a capped step with no row there fails the check closed.
+  A success run over an uncensored recorded maximum raises a `::warning` annotation, graded
+  `RE-DERIVE` or `RE-SIZE`, and never changes the exit code. It puts a rotting record on the run page
+  and the checks tab instead of only the step log (BACKLOG #1842). The grades, and the limits of
+  that warning, are defined once in `record_escalation` in `scripts/ci/step_margin.py`.
   **A red here is not a request to raise the cap:** the cap is sized against the work in `ci.yml`,
   and the underlying Windows slowness is its own backlog item.
 - **Pass matrix/expression values through `env:`, don't inline them in `run:`.** A dynamic

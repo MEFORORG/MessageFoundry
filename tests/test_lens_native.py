@@ -397,7 +397,8 @@ def test_native_expression_value_refuses_scalar_but_edits_path() -> None:
         '    msg.set("PV1-2", simplified)\n'
         '    return Send("OB", msg)\n'
     )
-    with pytest.raises(LensRewriteError, match="expression"):
+    # A Name value is dynamic mode, so the refusal is ADR 0076 AC-M5's (BACKLOG #237).
+    with pytest.raises(LensRewriteError, match="dynamic mode"):
         rewrite_source(
             src,
             {"line_start": 6, "line_end": 6, "op": "set_params", "params": {"value": "X"}},

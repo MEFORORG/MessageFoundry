@@ -84,9 +84,13 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # own audited fetch, split from the open -- and no /ui route: the console calls it in-process.
 # BACKLOG #2346 (ASVS 14.2.6) added two /ui routes and no JSON route: GET /ui/messages/{message_id}/summary
 # and /body, the detail page with the summary, or the summary and the body, revealed on an explicit act.
+# BACKLOG #2436 (ASVS 14.2.6, owner ruling R12) added one /ui route and no JSON route:
+# GET /ui/messages/{message_id}/errors, the detail page with the error text revealed.
+# BACKLOG #1982 added three /ui routes and no JSON route: GET /ui/approvals and the approve and
+# reject POSTs under /ui/approvals/{approval_id}/, the console's side of dual control.
 _ROUTES_DEFAULT = 115
 _ROUTES_WITH_DOCS = 119
-_ROUTES_WITH_UI = 232
+_ROUTES_WITH_UI = 236
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -140,11 +144,18 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         # BACKLOG #2346: the detail page with the body, and with the summary, revealed. Same gate and
         # same reason as the bare detail page above; item 4 of the doc block names them.
         ("GET", "/ui/messages/{message_id}/body"),
+        # BACKLOG #2436: the detail page with the error text revealed. Same gate and same reason.
+        ("GET", "/ui/messages/{message_id}/errors"),
         ("GET", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/messages/{message_id}/summary"),
         ("GET", "/ui/uploaded-logs"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
+        # BACKLOG #1982: the console's approve and reject mirror the JSON approve and reject, both
+        # require_paced, which require_ui charges too. They are flagged only because the JSON
+        # resolve, same method and permission, is require_step_up; the console offers no resolve.
+        ("POST", "/ui/approvals/{approval_id}/approve"),
+        ("POST", "/ui/approvals/{approval_id}/reject"),
         # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload") and BACKLOG #1822 removed
         # ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"): both now carry
         # `require_ui_step_up`, so the derivation below no longer flags them. The confirm page was
@@ -1299,6 +1310,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
     ): (
         "absence of a retired mTLS remedy in two docs and a settings.py comment (BACKLOG #1133); "
         "its code claims are pinned by AST and by calling the functions"
+    ),
+    ("test_docs_security_pathways.py", "_config_row"): "slices a CONFIGURATION.md table row",
+    (
+        "test_docs_security_pathways.py",
+        "test_the_ninth_sweep_states_the_local_pathway_after_amendment_a",
+    ): (
+        "absence of eight retired SECURITY.md and CONFIGURATION.md sentences (BACKLOG #1133); the "
+        "code they describe is pinned by calling it in the ninth-sweep probe test"
     ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"

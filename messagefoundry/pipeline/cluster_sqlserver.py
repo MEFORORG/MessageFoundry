@@ -529,8 +529,8 @@ class SqlServerCoordinator:
             # copies: a per-class copy of a safety-relevant timing constant (or of the sentence an
             # operator acts on) is two files that can be retuned independently.
             # Held across the await: _is_leader is False by then. Gated on the ROW as well as the gate
-            # so a self-fenced node is drained too (BACKLOG #1508); see _may_own_lease_row.
-            arming = self._may_own_lease_row()
+            # so a self-fenced node is drained too (BACKLOG #1508); see may_own_lease_row.
+            arming = self.may_own_lease_row()
             prior_pause = self._no_claim_until
             if arming:
                 self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
@@ -559,9 +559,10 @@ class SqlServerCoordinator:
             self._leadership_lock.release()
         return outcome
 
-    def _may_own_lease_row(self) -> bool:
-        """Mirrors ``DbCoordinator._may_own_lease_row`` — read its docstring for the three disjuncts
-        and why the confirmed-hold baseline is what reaches the self-fence window."""
+    def may_own_lease_row(self) -> bool:
+        """Mirrors ``DbCoordinator.may_own_lease_row`` — read its docstring for the three disjuncts,
+        why the confirmed-hold baseline is what reaches the self-fence window, and why it is public
+        (``GET /cluster/status`` publishes it as ``owns_lease_row``, BACKLOG #1988)."""
         return self._is_leader or self._lease_release_owed or self._last_renew_ok is not None
 
     async def _release_leadership(

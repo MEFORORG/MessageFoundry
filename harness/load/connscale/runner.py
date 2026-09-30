@@ -1559,9 +1559,13 @@ def _excusal(c: Counters, *, unconfirmed_budget: int, reload_stranded: int = 0) 
     unconfirmed = c.timeouts - stranded
     population = c.sent - stranded
     # Three quarters, not half — half was sized against a 16% worst-observed and windows-2025 has
-    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message. `excused` is
-    # clamped rather than zeroed so an over-budget failure stops claiming intake loss it cannot show.
-    # `ok` still requires `not over_budget`, so the verdict is unchanged. Full rationale: report.py.
+    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message.
+    #
+    # Over budget, `excused` clamps to 0, apart from the reload-stranded sends. The shortfall check
+    # then treats every other send as confirmed. So an over-budget detail can also print
+    # "lost K on intake", where K is `population - read`: unconfirmed sends that never reached
+    # intake, plus any real loss. Read the budget clause first; it is the verdict (BACKLOG #1866).
+    # The load copy in report.py no longer fails on the budget.
     budget = max(unconfirmed_budget, 3 * population // 4)
     over_budget = unconfirmed > budget
     excused = stranded + (0 if over_budget else unconfirmed)

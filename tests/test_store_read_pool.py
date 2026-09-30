@@ -56,7 +56,9 @@ async def test_memory_store_has_no_pool_and_reads_still_work() -> None:
         assert store._read_conns == []
         assert await store.list_messages() == []
         mid = await _enqueue(store, 1)
-        assert (await store.get_message(mid))["control_id"] == "MSG00001"
+        got = await store.get_message(mid)
+        assert got is not None
+        assert got["control_id"] == "MSG00001"
         assert await store.count_messages() == 1
     finally:
         await store.close()
@@ -65,7 +67,9 @@ async def test_memory_store_has_no_pool_and_reads_still_work() -> None:
 async def test_pooled_connections_are_read_only(file_store: MessageStore) -> None:
     conn = file_store._read_conns[0]
     cur = await conn.execute("PRAGMA query_only")
-    assert (await cur.fetchone())[0] == 1
+    row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == 1
     # query_only is defence in depth: a write on a pooled connection must be refused.
     with pytest.raises(Exception, match="readonly|read-only|read only"):
         await conn.execute("CREATE TABLE should_not_exist (x INTEGER)")

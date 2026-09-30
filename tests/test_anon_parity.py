@@ -19,6 +19,7 @@ from messagefoundry.generators import (
     _hl7data,
     all_types,  # noqa: F401  (registers message types)
 )
+from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import leak as tee_leak
 
@@ -114,7 +115,7 @@ def test_leak_tables_load_empty_without_the_publish_guard(tmp_path: Path) -> Non
     # Where no guard is reachable (an installed wheel with no scripts/ above it) the token tables
     # must load EMPTY -- never a stale or fragmented copy -- so no customer/vendor token ships in
     # the tee. Exercise the loader against a tree that has no scripts/security above it.
-    assert tee_leak._load_publish_guard(tmp_path / "no-guard-here" / "leak.py") is None  # type: ignore[attr-defined]
+    assert tee_leak._load_publish_guard(tmp_path / "no-guard-here" / "leak.py") is None
 
 
 def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
@@ -130,14 +131,14 @@ def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
     Gate on the TOKEN SOURCE instead -- the condition that actually determines whether there is
     anything to source. The assertion still bites: blanking the bridge in tee/anon/leak.py reds it.
     """
-    guard = tee_leak._load_publish_guard()  # type: ignore[attr-defined]
+    guard = tee_leak._load_publish_guard()
     if guard is None:
         pytest.skip("guard absent (e.g. an installed wheel with no scripts/ above it)")
     if not getattr(guard, "TOKENS_PRESENT", False):
         pytest.skip(
             "no token source configured (fork CI / fresh clone) — tables legitimately empty"
         )
-    assert tee_leak.FORBIDDEN and tee_leak.ESTATE_TOKENS  # type: ignore[attr-defined]
+    assert tee_leak.FORBIDDEN and tee_leak.ESTATE_TOKENS
 
 
 # Synthetic-PHI-shape inputs (never a real value) whose UNMAPPED fields carry SSN/phone/MRN shapes,
@@ -171,7 +172,7 @@ def _structural_fields(report: object) -> tuple[object, ...]:
     copy agreement is already pinned by ``test_leak_token_table_matches_publish_guard``; here we guard
     the detectors + coverage report, which are pure functions of (text, rules).
     """
-    return (  # type: ignore[attr-defined]
+    return (
         report.hits,  # type: ignore[attr-defined]
         report.unmapped_fields,  # type: ignore[attr-defined]
         report.structural_hits,  # type: ignore[attr-defined]
@@ -182,10 +183,10 @@ def _structural_fields(report: object) -> tuple[object, ...]:
 def test_leak_check_and_report_engine_equals_tee() -> None:
     for msg in _LEAK_PARITY_INPUTS:
         eng_hits = engine_leak.leak_check(msg, rules=DEFAULT_RULES)
-        tee_hits = tee_leak.leak_check(msg, rules=DEFAULT_RULES)
+        tee_hits = tee_leak.leak_check(msg, rules=TEE_DEFAULT_RULES)
         assert eng_hits == tee_hits, f"leak_check diverged on {msg!r}: {eng_hits!r} != {tee_hits!r}"
         eng_report = _structural_fields(engine_leak.leak_report(msg, rules=DEFAULT_RULES))
-        tee_report = _structural_fields(tee_leak.leak_report(msg, rules=DEFAULT_RULES))
+        tee_report = _structural_fields(tee_leak.leak_report(msg, rules=TEE_DEFAULT_RULES))
         assert eng_report == tee_report, (
             f"leak_report structural fields diverged on {msg!r}:"
             f"\n  ENG {eng_report!r}\n  TEE {tee_report!r}"

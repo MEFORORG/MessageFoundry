@@ -48,9 +48,11 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
+import unicodedata
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 __all__ = [
     "CONTRACT_LATEST",
@@ -116,7 +118,31 @@ class LensRewriteError(ValueError):
     outside the v1 param-edit scope. A subclass of :class:`ValueError`; the CLI turns it into a clean
     ``{"error": …}`` + non-zero exit, exactly like :class:`LensParseError`, so the caller never applies a
     partial or lossy rewrite. Byte-preservation is the contract: an editable row is regenerated **only**
-    within its own line range, every other byte untouched (gate 2)."""
+    within its own line range, every other byte untouched (gate 2).
+
+    ``code`` is a stable machine-readable slug for the refusal FAMILY, which ``lens rewrite`` emits
+    beside the message as ``{"error": ..., "code": ...}``. The IDE keys on it, so a message can be
+    reworded without breaking a consumer. The families with their own code are the ``REFUSAL_*``
+    constants below; any other refusal carries :data:`REFUSAL_GENERIC`. Changing a code's string is a
+    contract change for the IDE."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code if code is not None else REFUSAL_GENERIC
+
+
+#: A dynamic-mode argument: editing one (AC-M5), or an ``expr`` that would write one (E.6.4).
+REFUSAL_DYNAMIC_MODE = "dynamic-mode"
+#: A malformed value object on a moded argument: ``parts`` not a list, a part without exactly one
+#: key, no path part, an empty or unusable path, an unencodable character, a template sent as an
+#: ``expr``, or an object that is neither ``{"parts": [...]}`` nor ``{"expr": <string>}``.
+REFUSAL_TEMPLATE_SHAPE = "template-shape"
+#: A template sent to a param outside the row's ``template_params`` (a literal-only param).
+REFUSAL_LITERAL_ONLY = "literal-only"
+#: A template write that pushes a line past the column limit.
+REFUSAL_COLUMN_LIMIT = "column-limit"
+#: Every other ``lens rewrite`` refusal.
+REFUSAL_GENERIC = "refused"
 
 
 # --- vocabulary registries ---------------------------------------------------
@@ -384,7 +410,7 @@ def _native_action_row(
             "line_end": s.end_lineno or s.lineno,
             "nesting": nesting,
         },
-        {name: _param_mode(node) for name, node in slots_and_display},
+        slots_and_display,
         contract,
     )
     if native.assign_to is not None:
@@ -1054,7 +1080,7 @@ def _classify_simple(s: ast.stmt, nesting: int, ctx: _Ctx) -> dict[str, Any] | N
                 "line_end": line_end,
                 "nesting": nesting,
             },
-            _param_modes_for_call(call, _ACTION_PARAMS[name]),
+            _rendered_param_nodes(call, _ACTION_PARAMS[name]),
             ctx.contract,
         )
     if name in _DIAGNOSTICS and isinstance(s, ast.Expr):
@@ -1068,7 +1094,7 @@ def _classify_simple(s: ast.stmt, nesting: int, ctx: _Ctx) -> dict[str, Any] | N
                 "line_end": line_end,
                 "nesting": nesting,
             },
-            _param_modes_for_call(call, _DIAGNOSTIC_PARAMS[name]),
+            _rendered_param_nodes(call, _DIAGNOSTIC_PARAMS[name]),
             ctx.contract,
         )
     if name in _LOOKUPS:
@@ -1082,7 +1108,7 @@ def _classify_simple(s: ast.stmt, nesting: int, ctx: _Ctx) -> dict[str, Any] | N
                 "line_end": line_end,
                 "nesting": nesting,
             },
-            _param_modes_for_call(call, _LOOKUP_PARAMS[name]),
+            _rendered_param_nodes(call, _LOOKUP_PARAMS[name]),
             ctx.contract,
         )
         if assign_to:
@@ -1264,7 +1290,7 @@ def _delivering_accumulators(node: ast.FunctionDef | ast.AsyncFunctionDef) -> se
 def _rendered_param_nodes(call: ast.Call, param_names: list[str]) -> list[tuple[str, ast.expr]]:
     """``(emitted param name, the node its value comes from)`` for every param the row will carry.
 
-    ONE name mapping, consumed by :func:`_render_params` and :func:`_param_modes_for_call` alike. AC-M1
+    ONE name mapping, consumed by :func:`_render_params` and :func:`_attach_param_modes` alike. AC-M1
     requires ``param_modes`` to be TOTAL over ``params``, and a second copy of this walk would make that
     totality a coincidence that holds until one copy learns a name the other does not."""
     mapped: list[tuple[str, ast.expr]] = []
@@ -1291,33 +1317,53 @@ def _render_params(call: ast.Call, param_names: list[str], source: str) -> dict[
     }
 
 
-def _param_modes_for_call(call: ast.Call, param_names: list[str]) -> dict[str, str]:
-    """The ADR 0076 E.4 mode of every param a wrapper call's row carries (AC-M1: total over ``params``).
+def _attach_param_modes(
+    row: dict[str, Any], nodes: list[tuple[str, ast.expr]], contract: int
+) -> dict[str, Any]:
+    """Add Amendment E's ``param_modes``, ``param_parts`` and ``template_params`` at :data:`CONTRACT_V2`.
 
-    Keyed off :func:`_rendered_param_nodes`, so it covers the synthetic ``*arg1`` / ``**kwargs`` keys and
+    ``nodes`` is ``(emitted param name, argument node)`` for EVERY param the row's ``params`` carries --
+    :func:`_rendered_param_nodes` for a wrapper call, slots plus display keywords for a native one -- so
+    the map is total over ``params`` (AC-M1). That covers the synthetic ``*arg1`` / ``**kwargs`` keys and
     the extra positionals past the signature that ``literal_params`` deliberately skips. That widening is
     correct rather than sloppy because the two fields answer DIFFERENT questions (E.4, E.10):
     ``literal_params`` answers *is this argument editable*, ``param_modes`` answers *what shape is it* —
-    and a shape exists for an argument no edit may splice."""
-    return {name: _param_mode(node) for name, node in _rendered_param_nodes(call, param_names)}
+    and a shape exists for an argument no edit may splice.
 
+    ``param_parts`` maps every ``templated`` param, and only those, to its structured parts
+    (:func:`_template_parts`), or to ``None`` when the interpolation has no parts form. It is the READ
+    half of the templated edit spec (``{"parts": [...]}`` in ``set_params``), and it exists so the IDE
+    never has to take an f-string apart itself: a TypeScript reading of Python source would be the second
+    grammar E.5 refuses. Total over the templated params, so a consumer never interprets a missing key.
 
-def _attach_param_modes(
-    row: dict[str, Any], modes: dict[str, str], contract: int
-) -> dict[str, Any]:
-    """Add ADR 0076 Amendment E's ``param_modes`` to ``row`` at :data:`CONTRACT_V2` and above.
+    ``template_params`` lists the params a ``{"parts": [...]}`` write is accepted into: a value
+    parameter (:data:`_TEMPLATE_PARAMS`) whose current mode is ``static`` or ``templated``. It is the
+    templated counterpart of ``literal_params`` -- the engine's own answer to "may the IDE offer this",
+    so the IDE never re-derives the rule. A param with parts that is NOT listed (a lookup statement, a
+    ``log_note`` template) still shows its parts; it just cannot be written as a template.
 
-    GATED, because AC-M7 requires a contract version that emits no such key at all: ``param_modes`` is
-    Amendment E's only field, so :data:`CONTRACT_V1` stays byte-identical to the pre-amendment parser
-    exactly as it does across Amendments A and D (§A.7 / §D.7).
-
-    It rides :data:`CONTRACT_V2` rather than minting a version of its own because E.8 puts the FORWARD
-    skew on the consumer — an older IDE keeps reading ``params``/``literal_params`` and ignores the key
-    it does not know — and the shipped extension asks for contract 2, so that is a live consumer rather
-    than a hypothetical one. A version of its own would instead make an OLDER engine refuse a NEWER IDE
-    outright, which is the other skew direction and not the one E.8 describes."""
+    GATED, because AC-M7 requires a contract version that emits none of the three: :data:`CONTRACT_V1` stays
+    byte-identical to the pre-amendment parser exactly as it does across Amendments A and D (§A.7 /
+    §D.7). Both ride :data:`CONTRACT_V2` rather than minting a version of their own because E.8 puts the
+    FORWARD skew on the consumer — an older IDE keeps reading ``params``/``literal_params`` and ignores
+    the keys it does not know — and the shipped extension asks for contract 2, so that is a live consumer
+    rather than a hypothetical one. A version of its own would instead make an OLDER engine refuse a NEWER
+    IDE outright, which is the other skew direction and not the one E.8 describes."""
     if contract >= CONTRACT_V2:
+        modes = {name: _param_mode(node) for name, node in nodes}
         row["param_modes"] = modes
+        row["param_parts"] = {
+            name: _template_parts(node) for name, node in nodes if modes[name] == MODE_TEMPLATED
+        }
+        # A multi-line argument is left out: every set_params splice refuses one (it would change the
+        # line count), so listing it would offer an edit certain to fail.
+        row["template_params"] = [
+            name
+            for name, node in nodes
+            if modes[name] != MODE_DYNAMIC
+            and (node.end_lineno or node.lineno) == node.lineno
+            and _template_ok(row["kind"], row.get("action"), name)
+        ]
     return row
 
 
@@ -1389,12 +1435,7 @@ def _is_bounded_message_read(node: ast.expr) -> bool:
     something it cannot round-trip, which is what E.6.3 exists to forbid.
     """
     if isinstance(node, ast.Subscript):
-        return (
-            isinstance(node.value, ast.Name)
-            and node.value.id == "msg"
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        )
+        return _is_msg_subscript(node)
     if isinstance(node, ast.Call):
         func = node.func
         if not isinstance(func, ast.Attribute) or func.attr != "field":
@@ -1407,11 +1448,44 @@ def _is_bounded_message_read(node: ast.expr) -> bool:
     return False
 
 
+def _is_msg_subscript(node: ast.expr) -> bool:
+    """Whether ``node`` is exactly ``msg["LIT"]``, a subscript read with one constant string path."""
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "msg"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    )
+
+
+def _is_empty_fallback_read(node: ast.expr) -> bool:
+    """Whether ``node`` is exactly ``msg["LIT"] or ""`` -- a subscript read that renders an absent field
+    as empty text.
+
+    ADMITTED BY THE 2026-09-29 AMENDMENT NOTE (ADR 0076 E.11), and nothing wider. A bare read renders an
+    absent field as the text ``None`` inside an f-string, because ``Message.field`` returns None; the
+    ``or ""`` fallback is the one ``copy_field`` already writes. The operand must be the empty string
+    and nothing else: ``or "N/A"`` or ``or other`` is a second value source the parts form cannot
+    express, so it stays ``dynamic``. Only the subscript spelling is admitted, because it is the one
+    the renderer writes."""
+    return (
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 2
+        and _is_msg_subscript(node.values[0])
+        and isinstance(node.values[1], ast.Constant)
+        and isinstance(node.values[1].value, str)
+        and node.values[1].value == ""
+    )
+
+
 def _is_bounded_interpolation(node: ast.expr) -> bool:
     """Whether ``node`` is the ONE interpolation shape ADR 0076 E.5 admits as writable.
 
-    An f-string whose every ``FormattedValue`` is a bounded ``Message`` read carrying **no format spec
-    and no conversion**, and whose every remaining part is a constant string.
+    An f-string whose every ``FormattedValue`` is a bounded ``Message`` read, or a subscript read with
+    an empty-string fallback (:func:`_is_empty_fallback_read`, E.11), carrying **no format spec and no
+    conversion**, and whose every remaining part is a constant string.
 
     A format spec or a conversion (``!r``/``!s``/``!a``) is excluded because each is a second rendering
     step the lens does not model: reading the emitted text back would not recover the same parts, and
@@ -1433,7 +1507,7 @@ def _is_bounded_interpolation(node: ast.expr) -> bool:
             # ``conversion`` is -1 when absent; 114/115/97 are !r/!s/!a.
             if part.conversion != -1 or part.format_spec is not None:
                 return False
-            if not _is_bounded_message_read(part.value):
+            if not (_is_bounded_message_read(part.value) or _is_empty_fallback_read(part.value)):
                 return False
             continue
         return False
@@ -1453,6 +1527,256 @@ def _param_mode(node: ast.expr) -> str:
     if _is_bounded_interpolation(node):
         return MODE_TEMPLATED
     return MODE_DYNAMIC
+
+
+# --- the templated edit spec: structured parts (ADR 0076 E.4-E.6, BACKLOG #237) ----------------------
+#
+# A templated argument travels in BOTH directions as a list of parts, never as Python source:
+#
+#     [{"text": "MRN: "}, {"path": "PID-3.1"}, {"text": " / "}, {"path": "PID-5.1"}]
+#
+# ``lens parse`` emits it (``param_parts``) and ``set_params`` accepts it (``{"parts": [...]}``). The
+# engine alone renders it to an f-string and reads an f-string back to it, and the rendered text must
+# pass the EXISTING classifier (:func:`_is_bounded_interpolation`) before it is spliced. So the IDE
+# never builds or re-classifies Python source, which is what keeps this from becoming the second
+# grammar E.5 refuses.
+
+#: The two part kinds. ``text`` is literal text; ``path`` is one bounded read, written as
+#: ``msg[...] or ""`` so an absent field is empty text (ADR 0076 E.11).
+PART_TEXT = "text"
+PART_PATH = "path"
+
+#: The ``(action, param)`` pairs a templated value may be WRITTEN into: the parameters that carry a
+#: field VALUE. A CLOSED list, for the reason E.5 closes its admitted set, and strict on purpose. Every
+#: other argument is a locator or a setting -- a path, a segment id, a separator, an index, a width, a
+#: mode, a date format -- and a template there lets inbound message content choose WHICH field is
+#: overwritten or feed a string where an int belongs. A lookup or diagnostic argument is never here:
+#: :func:`_refuse_templated_write` says why. ``lens parse`` reports the result per row as
+#: ``template_params``, so the IDE offers the mode only where the engine will accept it.
+_TEMPLATE_PARAMS = frozenset(
+    {
+        ("set_field", "value"),
+        ("add_repetition", "value"),
+        ("append_to_field", "suffix"),
+        ("replace_literal", "new"),
+    }
+)
+
+
+def _template_ok(kind: str, action: str | None, pname: str) -> bool:
+    """Whether a templated value may be written into ``pname`` of a ``kind`` row (see above)."""
+    return kind == "action" and (action, pname) in _TEMPLATE_PARAMS
+
+
+def _read_path(node: ast.expr) -> str | None:
+    """The path a bounded read names, when the read is exactly a path read, else None.
+
+    ``msg["X"] or ""``, ``msg["X"]`` and ``msg.field("X")`` all name path ``X``. The renderer writes
+    the first (E.11), which renders an absent field as empty text. The other two are older spellings a
+    hand-written template may carry: ``Message.__getitem__`` is ``self.field(path)``, so they read the
+    same value, but an absent field renders as the text ``None``. Any template write, including one
+    that resends the same parts, rewrites them to the fallback form, which is the fix E.11 was ruled
+    for. Only a template whose reads are ALL already in the fallback form is left alone when its
+    parts are resent unchanged. A ``msg.field`` call with any other argument list has no parts form."""
+    if isinstance(node, ast.BoolOp) and _is_empty_fallback_read(node):
+        node = node.values[0]
+    if (
+        isinstance(node, ast.Subscript)
+        and _is_msg_subscript(node)
+        and isinstance(node.slice, ast.Constant)
+    ):
+        return str(node.slice.value)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "field"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "msg"
+        and not node.keywords
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        return node.args[0].value
+    return None
+
+
+def _normalize_parts(parts: list[dict[str, str]]) -> list[dict[str, str]]:
+    """``parts`` with adjacent text runs merged and empty text runs dropped -- the canonical form.
+
+    Two part lists that render the same source are equal after this, so it is the equality round-trip
+    totality (E.6.3, AC-M4) is stated over. The parser needs it too: CPython may split one literal run
+    of an f-string into several ``Constant`` nodes around an escaped brace."""
+    out: list[dict[str, str]] = []
+    for part in parts:
+        if PART_TEXT in part:
+            if not part[PART_TEXT]:
+                continue
+            if out and PART_TEXT in out[-1]:
+                out[-1] = {PART_TEXT: out[-1][PART_TEXT] + part[PART_TEXT]}
+                continue
+        out.append(dict(part))
+    return out
+
+
+def _template_parts(node: ast.expr) -> list[dict[str, str]] | None:
+    """The structured parts of a ``templated`` argument, or None when it has no parts form.
+
+    None for anything :func:`_is_bounded_interpolation` rejects, and for an admitted shape the edit spec
+    could not send back: a ``msg.field(...)`` read whose arguments are not exactly one path string, a
+    path :func:`_check_parts_spec` refuses, or an f-string with no read at all. Such an argument is
+    still ``templated`` (E.5 admits it), so it keeps its mode; it is just not editable as parts. So a
+    non-None result is always a WELL-FORMED ``{"parts": ...}`` value. Whether the argument accepts a
+    template write at all is a separate question, answered by the row's ``template_params``."""
+    if not isinstance(node, ast.JoinedStr) or not _is_bounded_interpolation(node):
+        return None
+    parts: list[dict[str, str]] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant):
+            # A str by construction: _is_bounded_interpolation refused any other constant part.
+            parts.append({PART_TEXT: str(value.value)})
+            continue
+        path = _read_path(value.value) if isinstance(value, ast.FormattedValue) else None
+        if path is None:
+            return None
+        parts.append({PART_PATH: path})
+    try:
+        return _check_parts_spec(parts, "")
+    except LensRewriteError:
+        return None
+
+
+def _is_encodable(text: str) -> bool:
+    """Whether ``text`` survives UTF-8 encoding (a lone surrogate from a JSON ``\\udXXX`` does not)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _escape_template_text(text: str, quote: str) -> str:
+    """``text`` as the body of an f-string literal run delimited by ``quote``, value-preserving.
+
+    Braces double, a backslash and the delimiting quote are escaped, and every character Python would not
+    print raw -- controls, line and paragraph separators, format characters -- becomes an escape. That
+    keeps the argument on ONE physical line under both the engine's newline model and an editor's, and
+    the value the f-string evaluates to is exactly ``text``."""
+    out: list[str] = []
+    for ch in text:
+        if ch in "{}":
+            out.append(ch * 2)
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == quote:
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch.isprintable():
+            out.append(ch)
+        elif ord(ch) <= 0xFF:
+            out.append(f"\\x{ord(ch):02x}")
+        elif ord(ch) <= 0xFFFF:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(f"\\U{ord(ch):08x}")
+    return "".join(out)
+
+
+#: Characters a ``path`` part may not carry. Each would need escaping inside the ``msg['...']`` read, and
+#: an HL7 path never contains one, so refusing is cheaper and clearer than a second escaping scheme.
+_PATH_FORBIDDEN = frozenset("'\"\\{}")
+
+
+def _check_parts_spec(parts: Any, pname: str) -> list[dict[str, str]]:
+    """Validate a ``{"parts": [...]}`` value's list and return it normalized, or refuse.
+
+    Each part is an object with exactly one key, ``text`` or ``path``, whose value is a string. A path
+    is non-empty, printable, and free of quotes, backslashes and braces. Its GRAMMAR is not checked here:
+    ``msg`` may be an HL7, X12 or other payload's message, each with its own path syntax, and a
+    malformed path already fails that message on the error path at runtime. At least one path is required:
+    a template with no read is plain text, which ``static`` mode writes as a literal, and an f-string with
+    no placeholder is dead weight a linter flags."""
+    if not isinstance(parts, list):
+        raise LensRewriteError(
+            f"parameter {pname!r}: 'parts' must be a list of part objects",
+            code=REFUSAL_TEMPLATE_SHAPE,
+        )
+    checked: list[dict[str, str]] = []
+    for i, part in enumerate(parts):
+        if not isinstance(part, dict) or len(part) != 1:
+            raise LensRewriteError(
+                f"parameter {pname!r}: part {i} must be an object with exactly one key, "
+                f"{PART_TEXT!r} or {PART_PATH!r}",
+                code=REFUSAL_TEMPLATE_SHAPE,
+            )
+        ((key, value),) = part.items()
+        if key not in (PART_TEXT, PART_PATH) or not isinstance(value, str):
+            raise LensRewriteError(
+                f"parameter {pname!r}: part {i} must be {{{PART_TEXT!r}: <string>}} or "
+                f"{{{PART_PATH!r}: <string>}}",
+                code=REFUSAL_TEMPLATE_SHAPE,
+            )
+        if not _is_encodable(value):
+            raise LensRewriteError(
+                f"parameter {pname!r}: part {i} carries a character that cannot be encoded as UTF-8",
+                code=REFUSAL_TEMPLATE_SHAPE,
+            )
+        if key == PART_PATH and (
+            not value or not value.isprintable() or any(c in _PATH_FORBIDDEN for c in value)
+        ):
+            raise LensRewriteError(
+                f"parameter {pname!r}: part {i} path {value!r} must be non-empty, with no quote, "
+                "backslash, brace or non-printable character",
+                code=REFUSAL_TEMPLATE_SHAPE,
+            )
+        checked.append({key: value})
+    normalized = _normalize_parts(checked)
+    if not any(PART_PATH in part for part in normalized):
+        raise LensRewriteError(
+            f"parameter {pname!r}: a template needs at least one {PART_PATH!r} part - plain text is "
+            "static mode, so send it as a literal value instead",
+            code=REFUSAL_TEMPLATE_SHAPE,
+        )
+    return normalized
+
+
+def _render_parts(parts: Any, pname: str) -> str:
+    """Render a templated edit's structured parts to f-string source, or refuse (ADR 0076 E.5, E.6.3).
+
+    The output is ``f"...{msg['PATH'] or ''}..."``: double quotes outside, and inside the subscript read
+    with its empty-string fallback, so an absent field writes empty text rather than ``None`` (E.11).
+    When the text carries more double quotes than single ones the two swap
+    (``f'...{msg["PATH"] or ""}...'``), which is the choice ``ruff format`` makes, so the spliced line
+    stays format-clean. Before it is returned, the EXISTING classifier must call it ``templated`` and
+    read back exactly the parts that were sent.
+    That is round-trip totality (E.6.3) checked on every write rather than trusted, so a renderer
+    defect refuses an edit instead of splicing a shape the lens cannot read back."""
+    normalized = _check_parts_spec(parts, pname)
+    text = "".join(part.get(PART_TEXT, "") for part in normalized)
+    outer, inner = ("'", '"') if text.count('"') > text.count("'") else ('"', "'")
+    body = "".join(
+        _escape_template_text(part[PART_TEXT], outer)
+        if PART_TEXT in part
+        else "{msg[" + inner + part[PART_PATH] + inner + "] or " + inner * 2 + "}"
+        for part in normalized
+    )
+    rendered = "f" + outer + body + outer
+    try:
+        node: ast.expr | None = ast.parse(rendered, mode="eval").body
+    except (SyntaxError, *_PARSER_REFUSALS):
+        node = None
+    if node is None or _param_mode(node) != MODE_TEMPLATED or _template_parts(node) != normalized:
+        raise LensRewriteError(
+            f"parameter {pname!r}: the template did not render to a bounded interpolation that reads "
+            "back to the same parts - refused (no change made)",
+            code=REFUSAL_TEMPLATE_SHAPE,
+        )
+    return rendered
 
 
 def _is_bounded(node: ast.expr) -> bool:
@@ -1918,6 +2242,11 @@ _SEND_TO = "to"
 # so no existing locator applies; a route splices the return's value expression).
 _EDITABLE_KINDS = frozenset({"action", "lookup", "send", "diagnostic", "note", "route"})
 
+# The editable kinds whose ``set_params`` obeys ADR 0076 Amendment E's per-argument modes: the rows that
+# carry typed arguments and emit ``param_modes``. A send row's destination and a route row's handler
+# list carry no mode, and the route path splices its own ``{"expr": ...}``, so neither is gated.
+_MODED_KINDS = frozenset({"action", "lookup", "diagnostic"})
+
 # Ops that AUTHOR a transform verb, a lookup or an outbound send. They are refused inside a ``@router``
 # (ADR 0076 §D.6 / AC-R5): a router stays pure destination-selection, and ``db_lookup``/``fhir_lookup``
 # RAISE outside a live Handler. The IDE's router Add-palette does not offer them; this is the engine-side
@@ -1986,10 +2315,25 @@ def rewrite_source(
 
     It identifies the row by its ``[line_start, line_end]`` span (the same range :func:`parse_source`
     emits — optionally disambiguated by ``handler``) and, for ``op="set_params"``, sets the named
-    parameters. A parameter *value* is either a JSON scalar (rendered as a Python **literal** — only when
-    the current argument is itself a literal) or ``{"expr": "<python source>"}`` (spliced **verbatim** as
-    an expression, e.g. a bounded ``Message`` read). ``params={}`` is a valid **no-op** and returns the
-    source byte-identically. ``contract`` must match the version the caller PROJECTED with
+    parameters. ``params={}`` is a valid **no-op** and returns the source byte-identically.
+
+    On an ``action``, ``lookup`` or ``diagnostic`` row a parameter obeys ADR 0076 Amendment E's modes
+    (:func:`_render_moded_value`). An argument whose current mode is ``dynamic`` is **read-only** and any
+    edit of it is refused (AC-M5). A ``static`` or ``templated`` argument takes one of:
+
+    * a JSON scalar, written as a Python **literal** (``static``);
+    * ``{"parts": [{"text": "..."}, {"path": "PID-3.1"}, ...]}``, written as the bounded interpolation
+      ``f"...{msg['PID-3.1'] or ''}..."`` (``templated``). At least one ``path`` part is required, and only a
+      param ``lens parse`` lists in the row's ``template_params`` accepts it;
+    * ``{"expr": "<python source>"}``, spliced verbatim only if it classifies ``static``. An ``expr``
+      that is ``dynamic`` (a bare ``msg["X"]`` read included) is refused, and so is one that is
+      ``templated``: a template is written as parts, so every templated write passes the round-trip
+      gate in :func:`_render_parts`.
+
+    On a ``send`` row a value is a JSON scalar (only when the current argument is a literal) or
+    ``{"expr": ...}`` spliced verbatim, as before Amendment E. A ``route`` row takes ``{"handlers":
+    [names]}`` and a ``note`` row ``{"text": str}``. ``contract`` must match the version the caller
+    PROJECTED with
     (:data:`CONTRACT_V1` default): the row is located through the same grammar the client saw, so a v1
     client's coordinates resolve against the v1 partition and a v2 client's against the v2 one. Raises
     :class:`LensParseError` on a syntax error, :class:`LensRewriteError` on any refusal."""
@@ -2226,7 +2570,49 @@ def _apply_set_params(
                 "(list-of-sends / dynamic return editing is out of scope)"
             )
         return src
-    return _splice_slots(src, slots, params)
+    if row["kind"] not in _MODED_KINDS:
+        return _splice_slots(src, slots, params)
+    result = _splice_slots(src, slots, params, moded=(row["kind"], row.get("action")))
+    if any(isinstance(v, dict) and set(v) == {"parts"} for v in params.values()):
+        _refuse_overlong_template_lines(src, result, line_start, line_end)
+    return result
+
+
+def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line_end: int) -> None:
+    """Refuse a template write that pushes one of the row's lines past the column limit (gate 3).
+
+    A template is usually longer than the literal it replaces, and ``ruff format`` would re-wrap an
+    over-long call across lines -- output the lens did not write. The lens never wraps a line itself, so
+    it refuses, as :func:`_apply_insert_row` does. A line that was already over the limit and did not
+    grow is left alone: the refusal is about what this edit did. Width is measured as ruff measures it,
+    in display columns (:func:`_display_width`), so wide CJK text cannot slip under the limit."""
+    old_lines = _physical_lines(src)
+    new_lines = _physical_lines(result)
+    for i in range(line_start - 1, line_end):
+        old, new = _display_width(old_lines[i]), _display_width(new_lines[i])
+        if new > _MAX_LINE_LENGTH and new > old:
+            raise LensRewriteError(
+                f"this edit would make line {i + 1} {new} columns wide, past the "
+                f"{_MAX_LINE_LENGTH}-column limit - shorten the template's text, or edit it as text "
+                "(every field read is written with an empty-text fallback, so an older bare read "
+                "grows by 6 columns when the template is rewritten)",
+                code=REFUSAL_COLUMN_LIMIT,
+            )
+
+
+def _display_width(line: str) -> int:
+    """``line``'s width in terminal columns, the unit ruff's ``line-length`` counts.
+
+    An East Asian wide or fullwidth character takes two columns and a combining mark none. Everything
+    else takes one. This approximates ruff's width table rather than copying it. Where the two are
+    known to differ (a zero-width joiner, for one) it over-counts, which errs toward a refusal near the
+    limit rather than a line ruff re-wraps."""
+    width = 0
+    for ch in line:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
 
 
 # --- note rows (ADR 0076 Amendment A) ----------------------------------------
@@ -2484,6 +2870,8 @@ def _splice_slots(
     source: str,
     slots: dict[str, ast.expr],
     params: dict[str, Any],
+    *,
+    moded: tuple[str, str | None] | None = None,
 ) -> str:
     """Replace ONLY each edited parameter's exact byte-span (its arg node in ``slots``) with the newly-
     rendered value; every other byte — the callee, parens, commas, unedited args, a read-only
@@ -2496,7 +2884,12 @@ def _splice_slots(
     mixing them with ``str`` indexing mis-slices whenever a non-ASCII char precedes the arg and eats bytes
     (F1). And because it never rebuilds the argument list, a no-op replaces nothing (byte-identical) and a
     single-arg edit touches only that arg's bytes — no separator canonicalization on non-ruff-formatted
-    source (F3), and a co-located ``occurrence=`` kwarg (not in ``slots``) survives untouched."""
+    source (F3), and a co-located ``occurrence=`` kwarg (not in ``slots``) survives untouched.
+
+    ``moded`` (the row's kind and action name) applies ADR 0076 Amendment E's per-argument modes
+    (:func:`_render_moded_value`). Only ``set_params`` on an action, lookup or diagnostic row passes it:
+    a route row's handler list and a send row's destination have no mode, and route editing splices its
+    own ``{"expr": ...}`` through here."""
     source_bytes = source.encode("utf-8")
     line_starts = _line_byte_starts(source_bytes)
 
@@ -2528,13 +2921,25 @@ def _splice_slots(
     for pname, node in slots.items():
         if pname not in params:
             continue
+        if moded is not None:
+            # Before the multi-line check, so a dynamic argument always reports dynamic-mode.
+            _refuse_dynamic_argument(node, pname)
         _refuse_multiline_arg(node, pname)
-        rendered = _render_new_value(params[pname], isinstance(node, ast.Constant), pname)
+        consumed.add(pname)
+        rendered: str | None
+        if moded is not None:
+            kind, action = moded
+            rendered = _render_moded_value(
+                params[pname], node, pname, kind, _template_ok(kind, action, pname)
+            )
+        else:
+            rendered = _render_new_value(params[pname], isinstance(node, ast.Constant), pname)
+        if rendered is None:
+            continue  # unchanged template: leave the argument's bytes exactly as they are
         start, end = _byte_span(
             node
         )  # for a keyword slot this is the value node, never the ``name=``
         edits.append((start, end, rendered.encode("utf-8")))
-        consumed.add(pname)
 
     unknown = set(params) - consumed
     if unknown:
@@ -2554,8 +2959,9 @@ def _render_new_value(value: Any, original_is_literal: bool, pname: str) -> str:
 
     A JSON scalar renders to a Python **literal** — but only when the argument it replaces was itself a
     literal, so the lens never silently turns an expression slot into a literal (or the reverse). An
-    ``{"expr": "<source>"}`` object splices verbatim (validated to parse as a single expression), which
-    is how a bounded ``Message`` read (``msg["PID-5"]``) or any non-literal is edited."""
+    ``{"expr": "<source>"}`` object splices verbatim (validated to parse as a single expression). On a
+    send row that is how a non-literal destination is edited. On an action, lookup or diagnostic row
+    :func:`_render_moded_value` calls this and then refuses any ``expr`` that is not a literal."""
     if isinstance(value, dict):
         expr = value.get("expr")
         if set(value) != {"expr"} or not isinstance(expr, str):
@@ -2581,6 +2987,124 @@ def _render_new_value(value: Any, original_is_literal: bool, pname: str) -> str:
     return rendered
 
 
+def _refuse_dynamic_argument(node: ast.expr, pname: str) -> None:
+    """Refuse any edit of an argument whose mode is ``dynamic`` (AC-M5, E.6.4)."""
+    if _param_mode(node) == MODE_DYNAMIC:
+        raise LensRewriteError(
+            f"parameter {pname!r} is in dynamic mode (an expression the lens cannot write back "
+            "faithfully) - it is read-only here; edit it as text (ADR 0076 E.6.4)",
+            code=REFUSAL_DYNAMIC_MODE,
+        )
+
+
+def _all_reads_fallback(node: ast.expr) -> bool:
+    """Whether every read in the f-string ``node`` is already the E.11 ``msg["X"] or ""`` form."""
+    return isinstance(node, ast.JoinedStr) and all(
+        _is_empty_fallback_read(v.value) for v in node.values if isinstance(v, ast.FormattedValue)
+    )
+
+
+def _render_moded_value(
+    value: Any, node: ast.expr, pname: str, kind: str, template_ok: bool
+) -> str | None:
+    """Render a ``set_params`` value for a moded argument (ADR 0076 Amendment E), or refuse.
+
+    Returns None when the value is the parts the argument already has and every read is already in
+    the E.11 form, so the caller leaves its bytes alone.
+
+    The CURRENT argument's mode decides what may happen to it:
+
+    * ``dynamic`` -- refused, whatever the value (AC-M5, E.6.4). Its source is an open-set expression the
+      lens does not round-trip, so it is read-only, and passing it through would look like success.
+    * ``static`` or ``templated`` -- writable, and the value picks the NEW mode. A JSON scalar writes a
+      literal (``static``); ``{"parts": [...]}`` writes a bounded interpolation (``templated``,
+      :func:`_render_parts`) where ``template_ok`` allows it. Switching between the two bounded modes is
+      allowed in both directions, because each is a shape the lens can write and read back (E.3).
+
+    ``{"expr": <source>}`` is still accepted, but only when the expression is a literal. A ``dynamic``
+    one would author the open-set shape E.7 keeps read-only; a bare ``msg["X"]`` read is ``dynamic``
+    (only an f-string is ``templated``), so a path pick writes ``{"parts": [{"path": "X"}]}``, which
+    renders ``f"{msg['X'] or ''}"``. A ``templated`` one is refused too, so that every templated write goes
+    through the parts renderer and its round-trip gate: E.5 admits ``msg.field`` reads that no parts
+    list can express, and one of them, ``msg.field("OBX-5", 2)``, raises at runtime."""
+    _refuse_dynamic_argument(node, pname)
+    if isinstance(value, dict):
+        if set(value) == {"parts"}:
+            if not template_ok:
+                _refuse_templated_write(kind, pname)
+            rendered_parts = _render_parts(value["parts"], pname)
+            if _template_parts(node) == _normalize_parts(value["parts"]) and _all_reads_fallback(
+                node
+            ):
+                # The parts the argument already has, every read already in the E.11 form: an edit
+                # that changes nothing changes nothing, so an F-prefix or triple quotes is not
+                # respelled. An older bare or msg.field read is NOT left alone, because resending
+                # its parts is the only way the IDE can apply the E.11 fix to it.
+                return None
+            return rendered_parts
+        if set(value) != {"expr"} or not isinstance(value["expr"], str):
+            raise LensRewriteError(
+                f"parameter {pname!r}: an object value must be {{'parts': [...]}} or "
+                "{'expr': <source string>}",
+                code=REFUSAL_TEMPLATE_SHAPE,
+            )
+    rendered = _render_new_value(value, True, pname)
+    if isinstance(value, dict):
+        new_node = ast.parse(rendered, mode="eval").body
+        if isinstance(new_node, ast.Constant):
+            # Re-render through the literal renderer: that canonicalizes the spelling (gate 3) and
+            # refuses a constant JSON cannot carry (bytes, ``...``, a complex number).
+            return _render_literal(new_node.value, pname)
+        new_mode = _param_mode(new_node)
+        if new_mode == MODE_DYNAMIC:
+            raise LensRewriteError(
+                f"parameter {pname!r}: the expression would write a dynamic-mode argument, which is "
+                "read-only - only a literal or a template may be written here (ADR 0076 E.6.4)",
+                code=REFUSAL_DYNAMIC_MODE,
+            )
+        if new_mode == MODE_TEMPLATED:
+            raise LensRewriteError(
+                f"parameter {pname!r}: write a template as {{'parts': [...]}}, not as an expression, "
+                "so the engine renders it and checks it reads back",
+                code=REFUSAL_TEMPLATE_SHAPE,
+            )
+    return rendered
+
+
+def _refuse_templated_write(kind: str, pname: str) -> NoReturn:
+    """Refuse to WRITE a templated value into an argument outside :data:`_TEMPLATE_PARAMS`. Always raises.
+
+    A template puts message content into the argument, and outside a value parameter that content lands
+    somewhere it must not. A lookup's connection, statement or query built from inbound HL7 is an
+    injection path: the SQL or FHIR search would carry attacker-influenceable text. A diagnostic's
+    template or label is logged UNREDACTED -- ``log_note`` redacts only its operands and ``checkpoint``
+    logs its label verbatim -- so a field read interpolated there would put PHI into the log (CLAUDE.md
+    section 9). An action's path, segment id, index or setting would let the message choose which field
+    is overwritten, or put a string where an int belongs.
+
+    Only the write is refused. An existing templated argument still reads as ``templated`` and may be
+    switched to a literal."""
+    if kind == "lookup":
+        reason = (
+            "a template would build the connection, statement or query from message content "
+            "(an injection path)"
+        )
+    elif kind == "diagnostic":
+        reason = (
+            "a template would log message field values unredacted (log_note redacts only its "
+            "operands)"
+        )
+    else:
+        reason = (
+            "only a value parameter takes a template (set_field or add_repetition value, "
+            "append_to_field suffix, replace_literal new); a path, segment id, index or setting "
+            "chosen by message content is refused"
+        )
+    raise LensRewriteError(
+        f"parameter {pname!r} takes a literal only: {reason}", code=REFUSAL_LITERAL_ONLY
+    )
+
+
 def _render_literal(value: Any, pname: str) -> str:
     """Render a JSON **scalar** as a ruff-canonical Python literal (double-quoted str).
 
@@ -2594,6 +3118,12 @@ def _render_literal(value: Any, pname: str) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
+        # ``repr`` of inf / nan is ``inf`` / ``nan``, a bare NAME, so the spliced call would raise
+        # NameError on every message. There is no literal spelling of either, so refuse.
+        if not math.isfinite(value):
+            raise LensRewriteError(
+                f"parameter {pname!r}: {value!r} has no Python literal form - use a finite number"
+            )
         return repr(value)
     if isinstance(value, str):
         # ``ensure_ascii=False`` is load-bearing: the DEFAULT ``ensure_ascii=True`` \u-escapes every
@@ -2602,6 +3132,12 @@ def _render_literal(value: Any, pname: str) -> str:
         # then raises UnicodeEncodeError when the engine encodes the outbound — and (b) for a BMP char
         # emits a ``\uXXXX`` escape that diverges from ruff's canonical raw-char form (gate 3). Emitting
         # the raw UTF-8 char is value-preserving and ruff-canonical; control chars < U+0020 stay escaped.
+        # A lone surrogate (a JSON "\udXXX" escape) has no UTF-8 form, so the splice would raise
+        # UnicodeEncodeError instead of refusing; refuse it here.
+        if not _is_encodable(value):
+            raise LensRewriteError(
+                f"parameter {pname!r}: the value carries a character that cannot be encoded as UTF-8"
+            )
         return json.dumps(value, ensure_ascii=False)
     raise LensRewriteError(
         f"parameter {pname!r}: cannot render value of type {type(value).__name__} as a literal"

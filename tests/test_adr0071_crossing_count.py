@@ -109,7 +109,8 @@ async def _run_arm(mod: ModuleType, loop: asyncio.AbstractEventLoop, arm: str, d
 
 async def _drive(mod: ModuleType, loop: asyncio.AbstractEventLoop, tmp_path: Path) -> dict:
     ctr = mod.Counters()
-    loop._b5_ctr = ctr  # run_arm reads the loop-level crossing counter off this attribute
+    # run_arm reads the loop-level crossing counter off this attribute, which no loop type declares.
+    setattr(loop, "_b5_ctr", ctr)  # noqa: B010
     mod.instrument_loop(loop, ctr)
     results = {}
     for arm in ("A0", "A1"):
@@ -118,6 +119,8 @@ async def _drive(mod: ModuleType, loop: asyncio.AbstractEventLoop, tmp_path: Pat
 
 
 def test_a0_a1_crossing_count_gate(tmp_path: Path) -> None:
+    if sys.platform != "win32":  # pytestmark already skips it; this line tells mypy
+        pytest.skip("Windows only")
     mod = _load_microbench()
 
     # Pin the Proactor loop (the wall is Proactor-specific). Save/restore the policy so this gate

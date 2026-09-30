@@ -200,8 +200,12 @@ async def _assert_unwound_and_recovered(
         "SELECT COUNT(*) AS n FROM queue WHERE stage=? AND message_id=?",
         (Stage.ROUTED.value, mid),
     )
-    assert (await cur.fetchone())["n"] == 0
-    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
 
     # 5. Recovery: the in-flight row re-pends and the SAME handoff re-runs to success. This is the
     #    at-least-once contract -- a rolled-back handoff must be re-runnable, not merely harmless.
@@ -209,7 +213,9 @@ async def _assert_unwound_and_recovered(
     item = await store.claim_next_fifo(CH, stage=Stage.INGRESS.value)
     assert item is not None and item.message_id == mid
     assert await _route(store, mid, item.id)
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 # --- inline writer transaction (group-commit DISABLED, the default) -----------------------------
@@ -302,12 +308,16 @@ async def test_standalone_dead_letter_writer_unwinds(tmp_path: Path, arm: str) -
         cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
         row = await cur.fetchone()
         assert row is not None and row["status"] == OutboxStatus.INFLIGHT.value
-        assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.RECEIVED.value
 
         # And it re-runs: the row really does go DEAD on the second attempt.
         await _dead()
         cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
-        assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["status"] == OutboxStatus.DEAD.value
     finally:
         await store.close()
 
@@ -348,7 +358,9 @@ async def _reingress(store: MessageStore, work_id: str, *, now: float = 110.0) -
 
 async def _message_count(store: MessageStore) -> int:
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    return int((await cur.fetchone())["n"])
+    row = await cur.fetchone()
+    assert row is not None
+    return int(row["n"])
 
 
 async def _assert_reingress_unwound_and_recovered(
@@ -372,7 +384,9 @@ async def _assert_reingress_unwound_and_recovered(
     #    it, and the origin did not finalize on the strength of a handoff that never committed.
     assert await _message_count(store) == 1
     assert (await store.pending_depth(LOOPBACK, stage=Stage.INGRESS.value))[0] == 0
-    assert (await store.get_message(origin))["status"] != MessageStatus.PROCESSED.value
+    fetched = await store.get_message(origin)
+    assert fetched is not None
+    assert fetched["status"] != MessageStatus.PROCESSED.value
 
     # 5. Recovery: the in-flight token re-pends and the SAME handoff re-runs to success. This is the
     #    at-least-once contract -- a rolled-back handoff must be re-runnable, not merely harmless.
@@ -381,7 +395,9 @@ async def _assert_reingress_unwound_and_recovered(
     assert again is not None and again.id == work_id
     assert await _reingress(store, work_id, now=122.0)
     assert await _message_count(store) == 2
-    assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(origin)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
     assert (await store.pending_depth(LOOPBACK, stage=Stage.INGRESS.value))[0] == 1
 
 

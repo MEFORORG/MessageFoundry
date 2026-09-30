@@ -6,6 +6,7 @@ GET /ui/account/password
 GET /ui/account/sessions
 GET /ui/ad-groups
 GET /ui/alerts
+GET /ui/approvals
 GET /ui/audit
 GET /ui/cluster
 GET /ui/cluster/force-stepdown-confirm
@@ -25,6 +26,7 @@ GET /ui/messages/{message_id}
 GET /ui/messages/{message_id}/attachments/{attachment_id}
 GET /ui/messages/{message_id}/body
 GET /ui/messages/{message_id}/edit
+GET /ui/messages/{message_id}/errors
 GET /ui/messages/{message_id}/parse-tree
 GET /ui/messages/{message_id}/resend-confirm
 GET /ui/messages/{message_id}/summary
@@ -67,6 +69,8 @@ POST /ui/alerts/{alert_id}/ack
 POST /ui/alerts/{alert_id}/resolve
 POST /ui/alerts/{alert_id}/resume
 POST /ui/alerts/{alert_id}/suspend
+POST /ui/approvals/{approval_id}/approve
+POST /ui/approvals/{approval_id}/reject
 POST /ui/cluster/force-stepdown
 POST /ui/cluster/stepdown
 POST /ui/config/reload

@@ -319,7 +319,7 @@ def _two_sends(ref_a: Any, ref_b: Any) -> dict[str, Any]:
 def test_sequential_segment_references_decode() -> None:
     """The happy path the discipline has to keep working: two out-of-band bodies, in order."""
     resp = _decode(_body(_two_sends({"$": 0}, {"$": 1}), (_BIG_A, _BIG_B)))
-    sends, _, _ = _partition(resp.result, NAME)  # type: ignore[arg-type]
+    sends, _, _ = _partition(resp.result, NAME)
     assert [(s.to, s.message) for s in sends] == [("OB_A", _BIG_A), ("OB_B", _BIG_B)]
 
 
@@ -558,9 +558,12 @@ def test_value_grammar_round_trips_exactly() -> None:
 def test_a_setstate_tuple_value_stays_a_tuple() -> None:
     """A JSON-text shortcut would flatten it to a list — a silent value-shape change mode=off does not
     make."""
-    restored = _rt_transform(SetState("ns", "k", (1, 2)))
-    assert isinstance(restored, SetState) and restored.value == (1, 2)
-    assert isinstance(restored.value, tuple)
+    # A tuple is outside SetState's declared value type; the shape it keeps IS the subject.
+    restored = _rt_transform(SetState("ns", "k", (1, 2)))  # type: ignore[arg-type]
+    assert isinstance(restored, SetState)
+    value: object = restored.value
+    assert value == (1, 2)
+    assert isinstance(value, tuple)
 
 
 def test_adr0028_binary_body_is_not_double_encoded() -> None:
@@ -732,7 +735,7 @@ def test_an_empty_dict_return_still_filters() -> None:
     like ``return []`` / ``return ()``. Pinned because the natural over-correction (fault the
     CONTAINER's type instead of its items) would break the documented filter idiom for it while
     leaving every other row of the table green."""
-    assert _partition({}, NAME) == ([], [], [])  # type: ignore[arg-type]
+    assert _partition({}, NAME) == ([], [], [])
     assert enc_result("transform", {}, _Blobs()) == {"r": "items", "shape": "list", "i": []}
 
 

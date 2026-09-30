@@ -1090,6 +1090,11 @@ class ClusterStatus(BaseModel):
     is_leader: bool
     role: str
     config_version: int
+    # Whether a stepdown on this node would SEND the lease-release write (BACKLOG #1988), published so
+    # a client never judges lease liveness from ``lease_expires_at``, which is on the DB clock. The
+    # coordinator's ``may_own_lease_row()``; its Protocol docstring in pipeline/cluster.py is the
+    # source of record for when it is True. It means "may own": the stepdown can still answer 409.
+    owns_lease_row: bool = False
 
 
 class ClusterNode(BaseModel):

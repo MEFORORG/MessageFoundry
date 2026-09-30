@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -30,6 +30,8 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.store.base import Store
+from messagefoundry.transports.base import DestinationConnector
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -49,7 +51,7 @@ async def store(tmp_path: Path):
 # --- helpers -----------------------------------------------------------------
 
 
-def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(inbox: Path, outdir: Path, route, handlers: dict) -> Registry:
     reg = Registry()
     reg.add_outbound(
         OutboundConnection(
@@ -80,9 +82,7 @@ def _deliver_registry(inbox: Path, outdir: Path) -> Registry:
     return _registry(inbox, outdir, lambda m: ["h"], {"h": lambda m: Send("file_out", m)})
 
 
-async def _until_stat(
-    store: MessageStore, status: str, expected: int, timeout: float = 3.0
-) -> None:
+async def _until_stat(store: Store, status: str, expected: int, timeout: float = 3.0) -> None:
     elapsed = 0.0
     while (await store.stats()).get(status, 0) != expected:
         await asyncio.sleep(0.02)
@@ -102,27 +102,27 @@ async def _until_message(
             raise AssertionError(f"no {status} message within timeout")
 
 
-class _Recorder:
+class _Recorder(DestinationConnector):
     """Destination connector that records payloads and returns immediately."""
 
     def __init__(self) -> None:
         self.delivered: list[str] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.delivered.append(payload)
 
     async def aclose(self) -> None:
         return None
 
 
-class _Gate:
+class _Gate(DestinationConnector):
     """Destination connector that blocks every send until ``event`` is set."""
 
     def __init__(self) -> None:
         self.event = asyncio.Event()
         self.delivered: list[str] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         await self.event.wait()
         self.delivered.append(payload)
 

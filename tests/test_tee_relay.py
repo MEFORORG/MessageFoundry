@@ -94,13 +94,13 @@ async def _send_from_epic(address: Endpoint, payload: bytes, timeout: float = 2.
             await writer.wait_closed()
 
 
-async def _wait_until(predicate, timeout: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0.01)
 
 
-async def _wait_until_async(predicate, timeout: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+async def _wait_until_async(predicate, timeout: float = 2.0) -> None:
     async with asyncio.timeout(timeout):
         while not await predicate():
             await asyncio.sleep(0.01)
@@ -481,7 +481,9 @@ async def test_capture_corepoint_copy_only(tmp_path: Path) -> None:
         cur = await store._db.execute(  # noqa: SLF001 — test introspection
             "SELECT COUNT(*) AS n FROM relay_capture WHERE direction='epic_to_corepoint'"
         )
-        assert (await cur.fetchone())["n"] == 0
+        row = await cur.fetchone()
+        assert row is not None
+        assert row["n"] == 0
     finally:
         await relay.stop()
         await corepoint.stop()

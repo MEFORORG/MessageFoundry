@@ -9,6 +9,8 @@ untouched.
 
 from __future__ import annotations
 
+from typing import Any
+
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
@@ -31,7 +33,7 @@ def test_read_host_metrics_returns_sane_values() -> None:
     assert hm.cpu_percent is not None and hm.cpu_percent >= 0.0
 
 
-def _snapshot(**host: float | None) -> _Snapshot:
+def _snapshot(**host: Any) -> _Snapshot:
     return _Snapshot(
         version="test",
         inbound={},

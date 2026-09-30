@@ -270,7 +270,7 @@ typing-inspection==0.4.2
     #   pydantic
 tzdata==2026.4
     # via messagefoundry
-urllib3==2.7.0
+urllib3==2.8.0
     # via requests
 uvicorn==0.49.0
     # via messagefoundry

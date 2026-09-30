@@ -13,11 +13,14 @@ import json
 import logging
 import os
 import time
+from typing import Any
 
 import pytest
 
 from messagefoundry.config.settings import RetentionSettings
 from messagefoundry.pipeline import retention as retention_mod
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore, OutboxStatus
@@ -81,7 +84,9 @@ async def _dead(
 
 async def _payload(store: MessageStore, outbox_id: str) -> str:
     cur = await store._db.execute("SELECT payload FROM queue WHERE id=?", (outbox_id,))
-    return (await cur.fetchone())["payload"]
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return fetched_row["payload"]
 
 
 async def _set_meta(store: MessageStore, message_id: str, bag: dict[str, object]) -> None:
@@ -158,7 +163,9 @@ async def test_purge_sweeps_metadata_left_by_a_pre_upgrade_engine(store: Message
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1  # the pre-upgrade purge
     # Re-attach metadata the way the old engine would have left it: body already blank.
     await _set_meta(store, mid, {"user": {"mrn": "MRN001"}})
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
 
     purged = await store.purge_message_bodies(older_than=10 * DAY)
 
@@ -179,7 +186,9 @@ async def test_purge_skips_recent_messages(store: MessageStore) -> None:
     # Cutoff (older_than) is before the message's received_at → not eligible.
     purged = await store.purge_message_bodies(older_than=9 * DAY)
     assert purged == 0
-    assert (await store.get_message(mid))["raw"] == "MSH|^~\\&|raw-body"
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == "MSH|^~\\&|raw-body"
 
 
 async def test_purge_skips_pending_and_inflight_messages(store: MessageStore) -> None:
@@ -196,8 +205,12 @@ async def test_purge_skips_pending_and_inflight_messages(store: MessageStore) ->
     purged = await store.purge_message_bodies(older_than=10 * DAY)
 
     assert purged == 0  # a body still in the pipeline must never be purged (at-least-once)
-    assert (await store.get_message(a))["raw"] == "MSH|first"  # inflight — kept
-    assert (await store.get_message(b))["raw"] == "MSH|second"  # pending — kept
+    fetched = await store.get_message(a)
+    assert fetched is not None
+    assert fetched["raw"] == "MSH|first"  # inflight — kept
+    fetched = await store.get_message(b)
+    assert fetched is not None
+    assert fetched["raw"] == "MSH|second"  # pending — kept
     # The widened statement must not reach an in-flight row through its metadata arm either: the
     # `metadata IS NOT NULL` disjunct is OR-ed INSIDE the eligible-set guard, never around it.
     assert await store.message_metadata_json(a) is not None
@@ -222,6 +235,7 @@ async def test_error_message_body_is_purged(store: MessageStore) -> None:
     )
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     msg = await store.get_message(eid)
+    assert msg is not None
     assert msg["raw"] == "" and msg["error"] is None  # the error column can embed PHI fragments
 
 
@@ -235,7 +249,9 @@ async def test_messages_window_keeps_dead_payload_for_its_own_window(store: Mess
     # its own window) — and because replay re-queues the row's own payload, never messages.raw, this
     # can't break a later replay.
     await store.purge_message_bodies(older_than=10 * DAY)
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
     assert await _payload(store, dead_id) == "OUT|dead-body"
 
     # The dead-letter window then nulls the dead payload, keeping the row + status.
@@ -316,7 +332,9 @@ async def test_purge_dead_letters_reaches_a_dead_ingress_row(store: MessageStore
     # The hazard this closes: the message window blanks `messages.raw`, so the message READS as
     # purged while the ingress row still holds the same body.
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
-    assert (await store.get_message(mid))["raw"] == ""
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] == ""
     assert await _payload(store, ingress_id) != ""  # ...and the body is still here
 
     # Its own (later) window then blanks it, keeping the row + DEAD status (counts/disposition).
@@ -326,7 +344,9 @@ async def test_purge_dead_letters_reaches_a_dead_ingress_row(store: MessageStore
     assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # idempotent
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (ingress_id,))
-    assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.DEAD.value
 
 
 async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore) -> None:
@@ -339,7 +359,9 @@ async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore)
     assert await store.purge_dead_letters(older_than=10 * DAY) == 0
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (routed_id,))
-    assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.DEAD.value
 
 
 async def test_dead_ingress_row_does_not_pin_a_streaming_attachment_forever(
@@ -378,7 +400,9 @@ async def _attachment_rows(store: MessageStore, message_id: str) -> int:
     cur = await store._db.execute(
         "SELECT COUNT(*) AS n FROM message_attachment WHERE message_id=?", (message_id,)
     )
-    return int((await cur.fetchone())["n"])
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return int(fetched_row["n"])
 
 
 #: Stage predicates each backend's `purge_dead_letters` BODY may still carry, and why. The two body
@@ -400,7 +424,7 @@ def test_no_backend_scopes_the_dead_letter_purge_to_one_stage() -> None:
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
 
-    backends = {
+    backends: dict[str, type[Any]] = {
         "sqlite": MessageStore,
         "postgres": PostgresStore,
         "sqlserver": SqlServerStore,
@@ -599,7 +623,9 @@ async def test_wal_checkpoint_and_vacuum_run_clean(store: MessageStore) -> None:
     await store.wal_checkpoint()
     await store.vacuum()  # must not error (runs outside a txn) and must leave the DB usable
     cur = await store._db.execute("PRAGMA journal_mode")
-    assert str((await cur.fetchone())[0]).lower() == "wal"
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert str(fetched_row[0]).lower() == "wal"
     ok, _ = await store.integrity_check()
     assert ok
 
@@ -607,7 +633,7 @@ async def test_wal_checkpoint_and_vacuum_run_clean(store: MessageStore) -> None:
 # --- RetentionRunner ----------------------------------------------------------
 
 
-class _RecordingSink:
+class _RecordingSink(LoggingAlertSink):
     """An AlertSink that records storage_threshold calls (and ignores the delivery events)."""
 
     def __init__(self) -> None:
@@ -641,10 +667,11 @@ async def test_run_once_purges_and_writes_one_audit_entry(store: MessageStore) -
     assert "raw" not in audit[0]["detail"] and "DOE" not in audit[0]["detail"]
 
 
-class _FollowerCoordinator:
+class _FollowerCoordinator(NullCoordinator):
     """A coordinator whose is_leader() is False — used to prove RetentionRunner no-ops on a follower."""
 
-    node_id = "follower"
+    def __init__(self) -> None:
+        super().__init__("follower")
 
     async def start(self) -> None:
         return None
@@ -688,7 +715,9 @@ async def test_run_once_no_ops_on_follower(store: MessageStore) -> None:
     assert result.messages_purged == 0 and result.dead_purged == 0
     assert not result.did_work
     # Nothing purged: the raw body is still present, and no audit row was written.
-    assert (await store.get_message(mid))["raw"] is not None
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["raw"] is not None
     assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
 
 
@@ -738,6 +767,7 @@ async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageSt
     assert result.messages_purged == 0 and result.dead_purged == 0
     # The PHI body + the delivered payload are untouched; no audit row written.
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["raw"] == "MSH|^~\\&|raw-body"  # body intact, not nulled
     assert msg["summary"] is not None
     assert await _payload(store, outbox_id) == "OUT|delivered-body"  # payload intact
