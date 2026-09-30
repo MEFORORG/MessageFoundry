@@ -22,6 +22,7 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
@@ -36,13 +37,17 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from messagefoundry import __version__
 from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR 0201 slice 1)
     Dispatch,
+    HelpFormatter,
     _emit_error,
     _load_operator_json,
     _OperatorJsonError,
     _print_json,
     _safe_print,
+    argv_wants_json,
+    first_command,
     run_cli,
 )
+from messagefoundry.cli_surface import CLI_TIERS, TOOLKIT_COMMAND  # pure data, stdlib-only imports
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
@@ -106,10 +111,14 @@ def main(argv: list[str] | None = None) -> int:
     # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
     # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
     disable_driver_manager_pooling()
-    # Everything else around dispatch is shared with the planned toolkit command (ADR 0201 slice 1):
+    args = sys.argv[1:] if argv is None else argv
+    moved = _moved_toolkit_command(args)
+    if moved is not None:
+        return _refuse_toolkit_command(moved, args)
+    # Everything else around dispatch is shared with the toolkit command (ADR 0201 slices 1 and 2):
     # the last-resort hooks, parsing, the redacting stderr log sink and the JSON error floor.
     return run_cli(
-        argv,
+        args,
         _build_parser,
         configures_own_logging=_CONFIGURES_OWN_LOGGING,
         floor_code=_floor_error_code,
@@ -128,6 +137,50 @@ def _floor_error_code(args: argparse.Namespace) -> str | None:
     return None
 
 
+@functools.cache
+def _moved_toolkit_commands() -> frozenset[str]:
+    """The top-level toolkit rows of ``CLI_TIERS`` that this engine does not register (ADR 0201).
+
+    Keyed on "not registered here", not on the tier alone. While a slice has moved some toolkit rows
+    and not others, the engine still runs the rows it carries. ``cli_surface`` is pure data with no
+    engine imports, so reading it here costs nothing and loads no toolkit code. Cached: both the
+    pre-parse check and the ``--help`` epilog read it, and neither the table nor the dispatch keys
+    change in a process.
+    """
+    return frozenset(
+        row
+        for row, tier in CLI_TIERS.items()
+        if tier == "toolkit" and " " not in row and row not in _DISPATCH
+    )
+
+
+def _moved_toolkit_command(argv: Sequence[str]) -> str | None:
+    """The moved toolkit command ``argv`` asks for, or None. Read before parsing, so a moved command
+    gets the line naming the toolkit command instead of argparse's "invalid choice"."""
+    command = first_command(argv)
+    return command if command in _moved_toolkit_commands() else None
+
+
+def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
+    """Refuse a toolkit command the engine does not carry, and exit 2 (ADR 0201 AC-3).
+
+    Exit 2, the argparse usage-error code, because the engine does not have this command at all.
+    ``_emit_error`` writes JSON to stdout or one line to stderr, never both, and its own return value
+    is 1, so it is not returned. ``argv_wants_json`` is the one pre-parse JSON rule both commands use.
+
+    The line names no install command. The toolkit distribution is not yet on PyPI, and
+    tests/test_install_instruction_provenance.py refuses shipped text that tells a user to install
+    an unclaimed name.
+    """
+    _emit_error(
+        f"`{command}` is not a messagefoundry command. It is an authoring command: run it as "
+        f"`{TOOLKIT_COMMAND} {command}`, from the separate {TOOLKIT_COMMAND} distribution at "
+        f"this engine's version, {__version__}.",
+        as_json=argv_wants_json(argv),
+    )
+    return 2
+
+
 def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     """Build the engine's argument parser, and return it with the dispatch map (ADR 0201 slice 1).
 
@@ -138,7 +191,17 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     The map returned is :data:`_DISPATCH` itself, not a copy, so a test that patches an entry in it
     still reaches ``main()``.
     """
-    parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
+    # The epilog NAMES the moved commands and the command that runs them. It exposes nothing: the
+    # engine registers none of them and loads no toolkit code (ADR 0201 section 3).
+    moved = ", ".join(sorted(_moved_toolkit_commands()))
+    parser = argparse.ArgumentParser(
+        prog="messagefoundry",
+        formatter_class=HelpFormatter,
+        allow_abbrev=False,  # the pre-parse refusal reads --help and --version by exact spelling
+        description=__doc__,
+        epilog=f"Authoring commands ({moved}) are not in this command. Run them as "
+        f"`{TOOLKIT_COMMAND} <command>`, from the separate {TOOLKIT_COMMAND} distribution.",
+    )
     parser.add_argument(
         "--version",
         action=_VersionAction,
@@ -330,29 +393,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "repeatable. Matches the import root, not the PyPI dist name (ADR 0144)",
     )
     check.add_argument("--json", action="store_true", help="emit JSON")
-
-    adr_analyze = sub.add_parser(
-        "adr-analyze",
-        help="advisory spec-driven ADR coverage: acceptance-criteria->test links, missing criteria, "
-        "open clarifications (Secure Development Standards section 5)",
-    )
-    adr_analyze.add_argument(
-        "--adr-dir",
-        default="docs/adr",
-        help="ADR directory (default: docs/adr). Exits 2, with or without --strict, if it is "
-        "missing, is not a directory, or holds no ADR",
-    )
-    adr_analyze.add_argument(
-        "--repo-root",
-        default=None,
-        help="root for resolving test/fixture refs (default: adr-dir/../..)",
-    )
-    adr_analyze.add_argument(
-        "--strict",
-        action="store_true",
-        help="exit 1 if any acceptance-criterion test ref is missing",
-    )
-    adr_analyze.add_argument("--json", action="store_true", help="emit JSON")
 
     connection = sub.add_parser(
         "connection",
@@ -7578,52 +7618,6 @@ def _check(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
-def _adr_analyze(args: argparse.Namespace) -> int:
-    """Advisory spec-driven ADR coverage (Secure Development Standards §5). Reports acceptance-
-    criteria→test link coverage, Accepted ADRs missing criteria, and open ``- [ ]`` clarifications.
-
-    Two exit codes, and which one a condition gets is the point of the split. A *finding* is
-    advisory: a missing linked test/fixture exits 0, or 1 under ``--strict``. An *absent corpus* —
-    :attr:`~messagefoundry.adr_analyze.AnalysisResult.error`, defined at
-    :func:`~messagefoundry.adr_analyze.analyze_adrs` — exits **2 with or without ``--strict``**,
-    because the analyzer never ran. 2 and not 1 keeps "could not start" apart from "ran and
-    reported a problem", the same split :func:`_emit_store_open_error` spends 2 on; and not 0
-    because this subcommand is otherwise unfailable by default, so a withdrawn ADR set would
-    silently turn a failing report into a passing one.
-
-    That split is between this command's own codes. It does **not** separate 2 from argparse's own
-    usage-error 2, so a caller that must tell a withdrawn corpus from a mistyped flag has to read
-    the output, not the code. Every subcommand here inherits that, ``--json`` disambiguates it, and
-    widening it was not worth a third code."""
-    from messagefoundry.adr_analyze import analyze_adrs
-
-    result = analyze_adrs(args.adr_dir, repo_root=args.repo_root)
-    if args.json:
-        _print_json(result.to_json(), compact=True)
-    if result.error is not None:
-        # JSON on stdout XOR the human line on stderr. Emitting both would reorder under `2>&1`: a
-        # piped stdout is block-buffered and stderr is not, so the error line would land ahead of
-        # the JSON and break the parse it was meant to protect. The JSON body is the full report
-        # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
-        # has to stay readable for a consumer that branches on it and nothing else.
-        if not args.json:
-            print(f"error: {result.error}", file=sys.stderr)  # not _safe_print; see its docstring
-        return 2
-    if not args.json:
-        with_criteria = sum(1 for r in result.reports if r.has_criteria)
-        _safe_print(
-            f"ADRs analyzed: {len(result.reports)} ({with_criteria} with acceptance criteria)"
-        )
-        for adr in result.accepted_without_criteria:
-            _safe_print(f"  recommend: {adr} is Accepted with no acceptance-criteria block")
-        for adr, ref in result.coverage_gaps:
-            _safe_print(f"  COVERAGE GAP: {adr} links a missing test/fixture: {ref}")
-        for adr, item in result.open_clarifications:
-            _safe_print(f"  clarify: {adr} - open item: {item}")
-        _safe_print("ok" if result.ok else "coverage gaps found (advisory)")
-    return 1 if args.strict and not result.ok else 0
-
-
 def _connection(args: argparse.Namespace) -> int:
     """Manage the data-authored ``connections.toml`` (ADR 0007): ``list`` to populate the VS Code
     editor, ``upsert``/``remove`` to save (a developer can also hand-edit the file). ``upsert``/
@@ -8297,7 +8291,6 @@ _DISPATCH = {
     "graph": _graph,
     "dryrun": _dryrun,
     "check": _check,
-    "adr-analyze": _adr_analyze,
     "connection": _connection,
     "codeset": _codeset,
     "impact": _impact,
