@@ -290,7 +290,7 @@ def test_value_formatting_matches_the_library_across_magnitudes() -> None:
     values += [rng.uniform(-1e9, 1e9) for _ in range(500)]
     values += [rng.lognormvariate(0, 12) for _ in range(500)]
     values += [float(rng.randrange(10**12)) for _ in range(200)]
-    assert len(values) >= 1000, f"only {len(values)} values to compare; the sample shrank"
+    assert len(values) >= 1000, f"only {len(values)} values to compare; the ranges above were cut"
     mismatched = [v for v in values if _format_value(v) != floatToGoString(v)]
     assert not mismatched, f"formatted differently from the library: {mismatched[:5]}"
 
