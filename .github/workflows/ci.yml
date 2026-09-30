@@ -326,9 +326,10 @@ jobs:
       # in sync by the DEP-1 gate. Without it, `uv pip install -e ".[extras]"` RE-RESOLVES from
       # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 and
       # annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY open PR on the same
-      # day — see each cap's rationale in pyproject.toml. The constraint pins every version to the lock
-      # while each job still installs only ITS OWN extras (so windows-service-smoke's deliberately
-      # narrow set stays narrow; the docker-smoke job builds from docker/locks/* and installs nothing).
+      # day — see ruff's cap and the fhir-core floor in pyproject.toml. The constraint pins every
+      # version to the lock while each job still installs only ITS OWN extras (so
+      # windows-service-smoke's deliberately narrow set stays narrow; the docker-smoke job builds
+      # from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
