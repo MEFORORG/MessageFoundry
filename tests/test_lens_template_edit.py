@@ -880,6 +880,46 @@ def test_non_utf8_stdin_is_refused_with_a_code_and_no_source_echo(
     assert "SECRETPAYLOAD" not in out
 
 
+def test_a_non_utf8_edit_spec_on_stdin_is_refused_with_a_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    """The other stdin direction: the module is a file and the edit spec arrives on stdin."""
+    import io
+    import json
+
+    from messagefoundry.__main__ import main
+
+    class _Stdin:
+        buffer = io.BytesIO(b'{"line_start": 6, "line_end": 6, "params": {"value": "\xff"}}')
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(_STATIC).encode("utf-8"))
+    monkeypatch.setattr("sys.stdin", _Stdin())
+    rc = main(["lens", "rewrite", str(module)])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"
+    assert payload["error"].startswith("<stdin>: cannot read")
+
+
+def test_an_exception_no_arm_names_still_carries_the_generic_code(
+    tmp_path: Path, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    """main()'s floor adds the generic code for `lens rewrite`, so even an unhashable ``op`` (a
+    TypeError the rewriter does not name) leaves the IDE a code to branch on."""
+    import json
+
+    from messagefoundry.__main__ import main
+
+    module = tmp_path / "h.py"
+    module.write_bytes(_one_row(_STATIC).encode("utf-8"))
+    edit = {"op": ["set_params"], "line_start": 6, "line_end": 6, "params": {"value": "x"}}
+    rc = main(["lens", "rewrite", str(module), "--edit", json.dumps(edit)])
+    payload = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert rc == 1
+    assert payload["code"] == "refused"
+
+
 @pytest.mark.parametrize(("line", "params", "code"), CODED_REFUSALS)
 def test_every_refusal_carries_its_family_code(
     line: str, params: dict[str, Any], code: str

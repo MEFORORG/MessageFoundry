@@ -1574,10 +1574,10 @@ def _read_path(node: ast.expr) -> str | None:
     ``msg["X"] or ""``, ``msg["X"]`` and ``msg.field("X")`` all name path ``X``. The renderer writes
     the first (E.11), which renders an absent field as empty text. The other two are older spellings a
     hand-written template may carry: ``Message.__getitem__`` is ``self.field(path)``, so they read the
-    same value, but an absent field renders as the text ``None``. A template edit that CHANGES the
-    parts rewrites them to the fallback form, which is the fix E.11 was ruled for; resubmitting the
-    same parts leaves the source alone. A ``msg.field`` call with any other argument list has no parts
-    form."""
+    same value, but an absent field renders as the text ``None``. Any template write, including one
+    that resends the same parts, rewrites them to the fallback form, which is the fix E.11 was ruled
+    for. Only a template whose reads are ALL already in the fallback form is left alone when its
+    parts are resent unchanged. A ``msg.field`` call with any other argument list has no parts form."""
     if isinstance(node, ast.BoolOp) and _is_empty_fallback_read(node):
         node = node.values[0]
     if (
@@ -2593,8 +2593,9 @@ def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line
         if new > _MAX_LINE_LENGTH and new > old:
             raise LensRewriteError(
                 f"this edit would make line {i + 1} {new} columns wide, past the "
-                f"{_MAX_LINE_LENGTH}-column limit (each field read is written with an or '' "
-                "fallback, which adds 6 columns) - shorten the text, or edit it as text",
+                f"{_MAX_LINE_LENGTH}-column limit - shorten the template's text, or edit it as text "
+                "(every field read is written with an empty-text fallback, so an older bare read "
+                "grows by 6 columns when the template is rewritten)",
                 code=REFUSAL_COLUMN_LIMIT,
             )
 

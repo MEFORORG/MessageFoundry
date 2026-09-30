@@ -1088,14 +1088,16 @@ field as the text `None`, because `Message.field` returns `None`. A picked path 
 `None` into the outbound message. E.5's admitted set gains exactly one shape: a `FormattedValue` whose
 value is `msg["LIT"] or ""`, a subscript read with an empty-string fallback. It is the same
 empty-text fallback `copy_field` uses, spelled on the subscript read the renderer writes. Nothing
-wider is admitted. A non-empty fallback, a name, a number, a chained or reversed `or`, an `and`, and
-a fallback on a `msg.field(...)` call all stay `dynamic`; the last is `copy_field`'s own spelling,
-excluded so the admitted set holds one shape. A template written through `set_params` renders every
-path part in this form. The bare read and `msg.field("X")` stay admitted and read back as the same
-`{"path": "X"}` part, so round-trip totality (E.6.3) holds; resending such a template's parts
-rewrites its reads to the fallback form, which is how the IDE applies this fix to an older template.
-Structural inserts (`insert_row` and the insert templates) still splice an `{"expr": ...}` verbatim
-and are not covered by this note.
+wider is admitted. These all stay `dynamic`: a non-empty fallback, a name, a number, a chained or
+reversed `or`, an `and`, and a fallback on a `msg.field(...)` call. The last is `copy_field`'s own
+spelling, excluded so the admitted set holds one shape. A template written through `set_params`
+renders every path part in this form.
+
+The bare read and `msg.field("X")` stay admitted. Each reads back as the same `{"path": "X"}` part,
+so round-trip totality (E.6.3) holds. Resending such a template's parts rewrites its reads to the
+fallback form, which is how the IDE applies this fix to an older template. Structural inserts
+(`insert_row` and the insert templates) still splice an `{"expr": ...}` verbatim. This note does not
+cover them.
 
 **4. Template writes go into value params only.** A templated write is accepted into exactly four
 parameters: `set_field.value`, `add_repetition.value`, `append_to_field.suffix` and
