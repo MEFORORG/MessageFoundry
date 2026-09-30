@@ -14,9 +14,9 @@ puts it on the session ``hvac`` built, AFTER ``hvac.Client`` is constructed, so 
 the suite assertion checked (``tls_policy.assert_hvac_tls_suites``) are still the ones the hop
 uses. The adapter subclasses ``HTTPAdapter``. Since BACKLOG #300 it also gives each new verifying
 https connection a fresh context from the factory that assertion returned, so every TLS handshake
-with Vault runs on a narrowed, asserted context; urllib3 still applies requests' ``verify`` to it.
-That includes the TLS leg to an ``https://`` proxy; :func:`_narrowed_pool_classes` says how, and
-which proxy shape is refused. It also changes how the reply BODY is read:
+with Vault runs on a narrowed, asserted context holding requests' CA. That includes the TLS leg to
+an ``https://`` proxy; :func:`_narrowed_pool_classes` says how the CA gets there, and which proxy
+shape is refused. It also changes how the reply BODY is read:
 
 * The body is read eagerly, in :meth:`StrictReplyAdapter.build_response`, from the
   ``http.client.HTTPResponse`` under ``urllib3``'s response, by
@@ -83,6 +83,7 @@ import requests.adapters
 import requests.utils
 import urllib3.connection
 import urllib3.connectionpool
+import urllib3.exceptions
 import urllib3.poolmanager
 from urllib3.util.ssl_ import resolve_cert_reqs
 
@@ -156,11 +157,18 @@ def _narrowed_pool_classes(
     one to the proxy, and one to Vault inside the ``CONNECT`` tunnel. urllib3 builds the first from
     the pool's ``ProxyConfig.ssl_context``, which requests leaves ``None``, and ``None`` means
     urllib3's own unnarrowed context. So each connection replaces that field on its OWN copy of the
-    config with ``factory()``. The proxy leg verifies with requests' ``cert_reqs`` and CA file, as it
-    always did, which is the Vault hop's anchor, and ``server_hostname`` is the proxy's host.
+    config with ``factory()``. ``server_hostname`` on that leg is the proxy's host.
+
+    **The connection loads requests' CA onto the proxy leg's context itself**, so that leg verifies
+    against the Vault hop's anchor. Up to urllib3 2.7.0, urllib3 loaded the connection's CA onto a
+    supplied context on both legs. urllib3 2.8.0 loads no CA onto a supplied PROXY context, so
+    without this load the proxy handshake fails verification. It still loads the CA on the Vault
+    leg, so the engine does not load it there too: one read of the CA file per leg, at handshake
+    time. A later urllib3 that stopped loading it on the Vault leg as well would fail closed, since
+    the factory's contexts require a verified peer, and the on-wire tests would go red.
+
     requests forwards through an ``https://`` proxy only for an ``http://`` Vault, and that shape is
-    refused below. A forwarding connection that did verify would have one TLS leg, to the proxy, on
-    the connection's own ``ssl_context``, which is already the factory's.
+    refused below, before any socket opens.
 
     **It is then CHECKED, not assumed.** The proxy leg's ``SSLSocket`` must hold exactly that
     context, and urllib3 must report the proxy verified. The ``ProxyConfig`` field is urllib3's
@@ -207,6 +215,16 @@ def _narrowed_pool_classes(
             ):
                 return None
             context = factory()
+            # The Vault anchor; the docstring above says why the connection loads it here.
+            if self.ca_certs or self.ca_cert_dir or self.ca_cert_data:
+                try:
+                    context.load_verify_locations(
+                        self.ca_certs, self.ca_cert_dir, self.ca_cert_data
+                    )
+                except OSError as exc:
+                    # urllib3 wraps this the same way when it loads the CA, so an unreadable CA
+                    # file still reaches requests as an SSLError, not a connection error.
+                    raise urllib3.exceptions.SSLError(exc) from exc
             # _replace builds a new tuple, so the pool's shared config is never changed.
             self.proxy_config = self.proxy_config._replace(ssl_context=context)
             return context
