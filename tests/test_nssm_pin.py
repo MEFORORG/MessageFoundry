@@ -323,9 +323,21 @@ _AST_PROBES = """
           $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         ForEach-Object { @{ name = $_.Name; start = $_.Extent.StartOffset; end = $_.Extent.EndOffset } })
       params = @($tree.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-      assigns = @($tree.FindAll({
+    }
+    if ($name -eq 'measure-store-access.ps1') {
+      $ast[$name]['assigns'] = @($tree.FindAll({
           $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
         ForEach-Object { @{ left = $_.Left.Extent.Text; right = $_.Right.Extent.Text } })
+      # Every literal argument of every command, unquoted, so `Start-Process nssm` or `cmd /c nssm`
+      # is seen wherever the name sits, not only in command position.
+      $ast[$name]['words'] = @($tree.FindAll({
+          $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        ForEach-Object {
+          $cmd = $_
+          $cmd.CommandElements | Where-Object {
+            $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+            $_ -is [System.Management.Automation.Language.ExpandableStringExpressionAst] } |
+          ForEach-Object { @{ value = $_.Value; text = $cmd.Extent.Text } } })
     }
   }
   $tree = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -778,20 +790,46 @@ _CHECKED_PATH = '"$env:' + _SMOKE_DIR_VAR + '\\nssm.exe"'
 _CHECKED_CALL = re.compile(re.escape(_CHECKED_PATH) + r"\s+(\w+)\s+MessageFoundry\b")
 # The word nssm or nssm.exe, in any case. It does not match inside -NssmDir or SMOKE_NSSM_DIR.
 _ANY_NSSM = re.compile(r"\bnssm(?:\.exe)?\b", re.I)
-# Commands that look an nssm up, or bind one to a variable, without an assignment statement.
-_LOOKUPS = {"get-command", "gcm", "where", "where.exe", "set-variable", "sv", "new-variable"}
+# A literal argument that is nssm, nssm.exe, or a path ending in either.
+_NSSM_WORD = re.compile(r"(?:^|[\\/])nssm(?:\.exe)?$", re.I)
+# Commands that look an nssm up, bind one to a variable, or run one from a string.
+_LOOKUPS = {
+    "get-command",
+    "gcm",
+    "where",
+    "where.exe",
+    "set-variable",
+    "sv",
+    "new-variable",
+    "invoke-expression",
+    "iex",
+}
+# $Nssm on the left of an assignment, in any case, scope, cast or brace spelling.
+_NSSM_TARGET = re.compile(r"\$\{?(?:\w+:)?nssm\}?\s*$", re.I)
+
+
+def _script_named(name: str, text: str) -> bool:
+    """Whether ``text`` names the script ``name`` in any path spelling. uninstall-* is not install-*."""
+    return re.search(r"(?<![\w-])" + re.escape(name), text, re.I) is not None
+
+
+# A run step re-pointing the folder, in its own shell or for later steps through GITHUB_ENV.
+_REPOINT = re.compile(_SMOKE_DIR_VAR + r"\s*=", re.I)
 
 
 def _runs_unchecked_nssm(script: str) -> list[str]:
     """The lines of a workflow ``run:`` script that name an nssm other than the checked copy.
 
-    Deliberately wider than "runs it": outside a comment, any mention of nssm but the checked path
-    counts, so a quoted name, a literal path, ``Start-Process`` or ``cmd /c`` cannot slip past.
+    Deliberately wider than "runs it": outside a line that starts as a comment, any mention of
+    nssm but the checked path counts, so a quoted name, a literal path, ``Start-Process`` or
+    ``cmd /c`` cannot slip past. So does a line that sets the checked folder's variable. A trailing
+    comment that mentions nssm is reported too; that errs toward a false red.
     """
     return [
         line.strip()
         for line in script.splitlines()
-        if not line.lstrip().startswith("#") and _ANY_NSSM.search(line.replace(_CHECKED_PATH, ""))
+        if not line.lstrip().startswith("#")
+        and (_ANY_NSSM.search(line.replace(_CHECKED_PATH, "")) or _REPOINT.search(line))
     ]
 
 
@@ -804,27 +842,37 @@ def test_the_store_access_measurement_runs_only_the_installers_checked_nssm(
         f"{_MEASURE} takes no -NssmDir, so it cannot name the folder whose nssm.exe the installer "
         "checks"
     )
+    # Compared lower-cased throughout: PowerShell variable names ignore case.
     unchecked = [
         str(c["text"])
         for c in commands
-        if (str(c["first"]) != "$Nssm" and _ANY_NSSM.search(str(c["first"])))
+        if (str(c["first"]).lower() != "$nssm" and _ANY_NSSM.search(str(c["first"])))
         or (str(c.get("name")).lower() in _LOOKUPS and _ANY_NSSM.search(str(c["text"])))
+    ] + [
+        str(w["text"])
+        for w in facts["words"]
+        if _NSSM_WORD.search(str(w["value"]))
+        and not str(w["text"]).lower().startswith("join-path $nssmdir")
     ]
     assert not unchecked, (
         f"{_MEASURE} runs, or looks up, an nssm other than the checked $Nssm: {unchecked}"
     )
-    sources = [str(a["right"]) for a in facts["assigns"] if str(a["left"]).lower() == "$nssm"]
-    assert len(sources) == 1 and "$NssmDir" in sources[0] and "nssm.exe" in sources[0], (
-        f"$Nssm must be the nssm.exe in -NssmDir and nothing else; it is assigned {sources}"
+    targets = [a for a in facts["assigns"] if _NSSM_TARGET.search(str(a["left"]))]
+    assert len(targets) == 1, (
+        f"$Nssm must be assigned once, to the nssm.exe in -NssmDir; it is assigned {targets}"
+    )
+    source = str(targets[0]["right"])
+    assert "$NssmDir" in source and "nssm.exe" in source, (
+        f"$Nssm must be the nssm.exe in -NssmDir and nothing else; it is assigned {source}"
     )
     runs = [
         c for c in commands if str(c["first"]).startswith("$") and "nssm" in str(c["first"]).lower()
     ]
     assert runs, f"CONTROL FAILED: {_MEASURE} no longer runs nssm at all"
-    assert {str(c["first"]) for c in runs} == {"$Nssm"}, (
+    assert {str(c["first"]).lower() for c in runs} == {"$nssm"}, (
         f"{_MEASURE} runs an nssm held in another variable: {[c['text'] for c in runs]}"
     )
-    installs = [c for c in commands if '"install-service.ps1"' in str(c["first"])]
+    installs = [c for c in commands if _script_named("install-service.ps1", str(c["first"]))]
     assert installs, f"CONTROL FAILED: {_MEASURE} no longer runs install-service.ps1"
     assert all("-NssmDir $NssmDir" in str(c["text"]) for c in installs), (
         f"{_MEASURE} does not hand the installer -NssmDir $NssmDir, so the installer checks a copy "
@@ -848,6 +896,8 @@ def test_the_store_access_measurement_runs_only_the_installers_checked_nssm(
         "gcm NSSM",
         '& "C:\\ProgramData\\chocolatey\\bin\\nssm.exe" stop MessageFoundry',
         '& "$env:SMOKE_NSSM_DIR\\nssm.exe" stop MessageFoundry; nssm start MessageFoundry',
+        "$env:SMOKE_NSSM_DIR = 'C:\\ProgramData\\chocolatey\\bin'",
+        '"SMOKE_NSSM_DIR=C:\\ProgramData\\chocolatey\\bin" >> $env:GITHUB_ENV',
     ],
 )
 def test_the_unchecked_nssm_detector_fires(line: str) -> None:
@@ -870,7 +920,7 @@ def test_the_unchecked_nssm_detector_ignores_the_checked_copy_and_comments(line:
 @functools.cache
 def _jobs(workflow: str) -> dict[str, dict[str, Any]]:
     # Imported here, not at module scope: a venv without PyYAML turns that module's import into a
-    # skip, which at module scope would skip every installer test above along with these three.
+    # skip, which at module scope would skip every installer test above along with these two.
     from tests._workflow_contexts import jobs_of
 
     return jobs_of(workflow)
@@ -925,7 +975,7 @@ def test_the_service_smoke_runs_the_copy_it_had_the_installer_check() -> None:
             line
             for script in scripts
             for line in script.splitlines()
-            if f"\\{script_name} " in line and not line.lstrip().startswith("#")
+            if _script_named(script_name, line) and not line.lstrip().startswith("#")
         ]
         assert calls, f"CONTROL FAILED: the {_SMOKE_JOB} job no longer runs {script_name}"
         assert all(handed in line for line in calls), (

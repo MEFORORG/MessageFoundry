@@ -3544,7 +3544,7 @@ jobs:
     # BACKLOG #2442: every install below is handed this folder as -NssmDir, and every nssm call runs
     # the nssm.exe in it by full path, the copy the installer checked (install-service.ps1,
     # Resolve-Nssm). The nssm on the runner's PATH is Chocolatey's, which that check refuses.
-    # tests/test_nssm_pin.py fails on any other nssm in a workflow.
+    # tests/test_nssm_pin.py fails on at least the other spellings of nssm it lists.
     env:
       SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
 
