@@ -418,22 +418,34 @@ Two results, and the second is the one that matters:
       row pointing at it. The only other occurrence in SESSION-MAIL.md is an internal link back to
       that section, which is the shape this box asks for rather than a second statement.
 - [x] Owner decision on whether the urgent `asyncRewake` tier is wired at all, given D11.
-      **DECIDED 2026-08-06: NOT WIRED, and not rebuilt yet.**
-      > **THE SHIPPED STATE CONTRADICTS THIS DECISION (measured 2026-08-25, BACKLOG #1215).**
-      > `scripts/hooks/mail-watch.ps1` is wired at `Stop` in TWO installed config roots, and
-      > `install-coordination.ps1:305` carries a row for it (`Marker = $WAKE_MARKER`, `Async = $true`)
-      > -- so both halves of the sibling claim in [SESSION-MAIL.md](../SESSION-MAIL.md) ("the tier is
-      > not wired and is not in the installer's wiring table") are false too. **This is a recorded
-      > owner decision, so it is NOT re-decided here:** either the decision changed and the record did
-      > not, or the tier was wired without it. Which of those it is, and what the record should say,
-      > is the owner's to settle. The default tier has never delivered
+      **DECIDED 2026-08-06: NOT WIRED, and not rebuilt yet.** The default tier has never delivered
       mail in real use -- everything to date is rig-verified and the code is unmerged -- so building a
       second tier to cut a latency nobody has measured is a demand-gate item, not a gap. The rebuild
       path is recorded in [SESSION-MAIL.md](../SESSION-MAIL.md) so it is not rediscovered: arm on
       `UserPromptSubmit` rather than `SessionStart`. Revisit only if someone hits the latency in
       practice.
+      **CORRECTED 2026-09-30 (BACKLOG #1215).** One premise of that 2026-08-06 rationale is now false:
+      *"the code is unmerged"*. `scripts/hooks/mail-drain.ps1` and `scripts/hooks/mail-watch.ps1` are
+      both on `main`. This note does not re-measure the *"never delivered mail in real use"* premise,
+      and it does not re-decide anything. Whether the decision still holds is part of the
+      contradiction below, which stays the owner's.
+  > **THE SHIPPED STATE CONTRADICTS THIS DECISION (measured 2026-08-25, BACKLOG #1215).**
+  > `scripts/hooks/mail-watch.ps1` is wired at `Stop` in TWO installed config roots, and
+  > `install-coordination.ps1:305` carries a row for it (`Marker = $WAKE_MARKER`, `Async = $true`)
+  > -- so both halves of the sibling claim in [SESSION-MAIL.md](../SESSION-MAIL.md) ("the tier is
+  > not wired and is not in the installer's wiring table") are false too. **This is a recorded
+  > owner decision, so it is NOT re-decided here:** either the decision changed and the record did
+  > not, or the tier was wired without it. Which of those it is, and what the record should say,
+  > is the owner's to settle.
 - [x] Owner approval to wire the drain rows, which places a hook on `SessionStart` and `Stop` for
       every session in this repo. **Given 2026-08-05/06, in two steps:** `Stop` first, then
       `SessionStart` once the show/consume split made a discarded session unable to consume what it
-      displayed. Default config root only. WARNING: The rows are live and the hook still resolves nothing
-      outside a worktree holding this branch — see §"Status and what gates wiring".
+      displayed. Default config root only. WARNING: The rows are live; see §"Status and what gates
+      wiring".
+      **CORRECTED 2026-09-30 (BACKLOG #1215).** This box used to go on to say *"the hook still
+      resolves nothing outside a worktree holding this branch"*. That stopped being true once
+      `scripts/hooks/mail-drain.ps1` reached `main`. `scripts/coord/install-coordination.ps1` wires it
+      at both `SessionStart` and `Stop`. Its hook shim looks for the script in the primary checkout
+      first and the calling worktree second, so a session on a branch without the script still runs
+      the primary's copy. This note is about where the script resolves. It records no approval under
+      [BACKLOG #1028](../BACKLOG.md); §"Status and what gates wiring" says none is recorded.
