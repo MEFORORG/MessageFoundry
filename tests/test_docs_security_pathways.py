@@ -2283,3 +2283,120 @@ def test_the_ninth_sweep_states_the_local_pathway_after_amendment_a() -> None:
     # 8. A combined sign-in is not the owes-a-factor path.
     assert "this is the path every local sign-in takes" not in doc
     assert "every password-only local sign-in takes" in doc
+
+
+def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
+    """The code half of the tenth 6.1.3 re-read (BACKLOG #1133). The MFA section's scope sentence
+    and its directory sentence state these facts, so a change here reds before the prose drifts."""
+    from messagefoundry.auth.oidc.claims import ClaimsError, OidcClaimPolicy, _check_mfa_gate
+
+    admin, other = frozenset({Role.ADMINISTRATOR}), frozenset({Role.OPERATOR})
+    ad, local = AuthProvider.AD.value, AuthProvider.LOCAL.value
+
+    def satisfied(provider: str, scope: str, roles: frozenset[Role], *, stamped: bool) -> bool:
+        """``_mfa_satisfied_hash`` for one session with no factor enrolled, ``require_mfa`` on."""
+        account = SimpleNamespace(id="u1", auth_provider=provider)
+        session = SimpleNamespace(
+            user_id="u1",
+            revoked_at=None,
+            mfa_verified_at="2026-09-30T00:00:00Z" if stamped else None,
+        )
+
+        async def get_session(_hash: str) -> object:
+            return session
+
+        async def get_user(_user_id: str) -> object:
+            return account
+
+        async def role_ids(_user_id: object) -> list[str]:
+            return [r.value for r in roles]
+
+        async def second_factor(_user: object) -> bool:
+            return False
+
+        fake = SimpleNamespace(
+            _settings=SimpleNamespace(require_mfa=True, require_mfa_scope=scope),
+            _store=SimpleNamespace(
+                get_session=get_session, get_user=get_user, get_user_role_ids=role_ids
+            ),
+            _second_factor_enrolled=second_factor,
+        )
+        fake._mfa_required_for = functools.partial(AuthService._mfa_required_for, fake)
+        fake._unverified_session_owes_factor = functools.partial(
+            AuthService._unverified_session_owes_factor, fake
+        )
+        return bool(asyncio.run(AuthService._mfa_satisfied_hash(fake, "h")))  # type: ignore[arg-type]
+
+    # 1. A directory session that proved no factor (every Kerberos session, and an OIDC one minted
+    #    while the claim gate is off) stays pending under BOTH scope values, a non-admin included.
+    for scope in ("administrators", "every_local_account"):
+        for roles in (admin, other):
+            assert not satisfied(ad, scope, roles, stamped=False), (
+                f"an unstamped directory session is satisfied under {scope!r}; the MFA section says "
+                "a directory session that proved no factor owes one under either scope value."
+            )
+    # 2. `administrators` frees a local non-Administrator with no factor, and nobody else.
+    assert satisfied(local, "administrators", other, stamped=False)
+    assert not satisfied(local, "administrators", admin, stamped=False)
+    assert not satisfied(local, "every_local_account", other, stamped=False)
+    # 3. A session minted with its factor met (the OIDC leg with the claim gate on) is satisfied,
+    #    whatever the scope says.
+    for scope in ("administrators", "every_local_account"):
+        assert satisfied(ad, scope, other, stamped=True)
+
+    # 4. The OIDC leg's grant IS the claim-gate setting, so the stamp in 3 is what a federated
+    #    session with the claim required gets, and 1 is what it gets with the gate off.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService._authenticate_oidc)))
+    grant_sources = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "mfa_verified" for t in node.targets)
+    ]
+    assert [ast.unparse(v) for v in grant_sources] == ["self._settings.oidc_require_mfa_claim"], (
+        "the OIDC leg's mfa_verified is no longer the oidc_require_mfa_claim setting; restate the "
+        "MFA section's directory sentence."
+    )
+    assert [ast.unparse(v) for v in mfa_grant_values(AuthService._authenticate_oidc)] == [
+        "mfa_verified"
+    ]
+
+    # 5. With the claim required, a token with no configured amr/acr is refused, and one with it passes.
+    policy = OidcClaimPolicy(
+        issuer="https://idp.example",
+        client_id="c",
+        signing_algorithms=(),
+        nonce="n",
+        max_age_seconds=300,
+    )
+    with pytest.raises(ClaimsError):
+        _check_mfa_gate({"amr": ["pwd"]}, policy)
+    assert _check_mfa_gate({"amr": ["mfa"]}, policy) == (("mfa",), None)
+
+
+def test_the_tenth_sweep_states_the_mfa_scope_reach_for_both_account_kinds() -> None:
+    """ASVS 6.1.3 was held at partial a tenth time (BACKLOG #1133) on one contradiction in the MFA
+    section. One sentence said `administrators` narrows the requirement to the Administrator role,
+    and the next said a directory account is in scope like any other. Under that scope a directory
+    session that proved no factor still owes one, so it is in scope more than a local account is.
+    The probe above pins the code; these assertions red if either old sentence returns."""
+    doc = _flat(_doc_text())
+    for retired in (
+        "and `administrators` narrows it to the **Administrator** role",
+        "**A directory account is in scope like any other**",
+    ):
+        assert retired not in doc, (
+            f"docs/SECURITY.md says {retired!r} again; `_unverified_session_owes_factor` keeps a "
+            "directory session with no proven factor pending under either scope (BACKLOG #1133)."
+        )
+    for token in (
+        "Setting the scope to `administrators` frees only a **local** account that holds neither "
+        "the Administrator role nor an enrolled factor",
+        "a directory session that proved no factor stays MFA-pending under both "
+        "(`AuthService._unverified_session_owes_factor`)",
+        "**While `require_mfa` is on, a directory session that proved no factor owes one under "
+        "either scope value**",
+        "Every Kerberos session mints MFA-pending, and so does an OIDC session while "
+        "`[auth].oidc_require_mfa_claim` is off.",
+    ):
+        assert token in doc, f"docs/SECURITY.md must state {token!r} (BACKLOG #1133)."
