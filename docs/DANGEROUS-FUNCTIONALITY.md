@@ -12,17 +12,21 @@ can shape. None of it is a defect. All of it is worth knowing about before you d
 
 ## What this page covers
 
-Four things:
+Five things:
 
 1. **The engine wheel** -- the `messagefoundry` distribution itself.
 2. **The deployment path the project documents** -- the container image in `docker/`, and the
    Windows service scripts in `scripts/service/` (section 8).
 3. **The VS Code extension** in `ide/` (section 9, and its parsers in section 7).
 4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
+5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.
+   It holds the authoring commands that ADR 0201 moved out of the engine wheel, such as
+   `adr-analyze`. The scans in sections 4, 5 and 7 read it with the engine.
 
 The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
-deployment path in. It says nothing about the extension or the web console. Both ship to the same
-operators, so this page covers them too.
+deployment path in. It says nothing about the other three. The extension and the web console ship
+to the same operators, and the toolkit ships beside the engine at the same version. So this page
+covers all three.
 
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
@@ -292,8 +296,8 @@ real clinical requirement for a paper control.
 - Directory-listing names from a remote share checked as single safe path components before they
   are joined, so a partner cannot return a traversal sequence.
 
-**How the parser list is found.** A test reads the code, so the list comes from the tree rather
-than from memory. You can re-run the same scan over `messagefoundry/` and
+**How the parser list is found.** A test reads the code, so the list comes from the tree, not
+from memory. You can re-run the same scan over `messagefoundry/`, `messagefoundry_toolkit/` and
 `messagefoundry_webconsole/`. A module is a parse site when its syntax tree holds at least one of
 these:
 
@@ -408,6 +412,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
+| The ADRs in the directory `adr-analyze` is given, matched with regular expressions for each one's status, acceptance criteria and open items. A developer command: it reads the repository's own decision records, not input from outside. | `messagefoundry_toolkit/adr_analyze.py` |
 
 The first two tables rest on a judgement about where each input comes from, and the test cannot
 check that judgement. Re-read a row when its module changes what it reads.
