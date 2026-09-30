@@ -162,12 +162,46 @@ function Get-Excerpt([string]$Text, [int]$Max = 400) {
     return $flat
 }
 
-function New-SyntheticPassword {
+function New-SyntheticPassword([string[]]$DenyWords) {
     # Synthetic and per run: never a literal in the repository, never printed, never on argv.
-    $bytes = New-Object byte[] 48
-    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    return (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
+    # Screened against the engine's own context-word deny-list, the way generate_policy_password
+    # screens its tokens (messagefoundry/auth/service.py). An unscreened random 32-character string
+    # contains a listed term, almost always "hl7", in about one run in 2,000, and provision-admin
+    # then refuses it: merge group 36766996620 went red that way on 2026-09-30.
+    if (-not $DenyWords -or $DenyWords.Count -eq 0) {
+        # An empty list would screen nothing and pass every candidate, so refuse rather than guess.
+        throw "New-SyntheticPassword was given no context words to screen against"
+    }
+    for ($attempt = 0; $attempt -lt 64; $attempt++) {
+        $bytes = New-Object byte[] 48
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        $candidate = (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
+        $lowered = $candidate.ToLowerInvariant()
+        $hit = $false
+        foreach ($word in $DenyWords) { if ($lowered.Contains($word)) { $hit = $true; break } }
+        if (-not $hit) { return $candidate }
+    }
+    throw "no synthetic password cleared the context-word deny-list in 64 attempts"
+}
+
+function Get-ContextWords {
+    <#
+      The shipped context-word deny-list, read from the installed engine so this script never keeps
+      a copy of it that could drift. The words are public (docs/SECURITY.md lists them), so printing
+      them is fine. Only lines carrying the probe's prefix count, so a stray warning on stderr cannot
+      become a word.
+    #>
+    $r = Invoke-OperatorCli -Arguments @("context-words") -Secrets @{}
+    if ($r.Code -ne 0) { throw "the probe could not read the context-word deny-list (exit $($r.Code))" }
+    $words = @(
+        $r.Text -split "`r?`n" |
+            Where-Object { $_ -like "context-word *" } |
+            ForEach-Object { $_.Substring("context-word ".Length).Trim().ToLowerInvariant() } |
+            Where-Object { $_ }
+    )
+    if ($words.Count -eq 0) { throw "the probe printed no context words; output: $(Get-Excerpt $r.Text)" }
+    return $words
 }
 
 function Get-Sid([string]$Account) {
@@ -636,6 +670,16 @@ def _provision(argv):
     return cli.main(["provision-admin", *argv])
 
 
+def _context_words():
+    # The shipped deny-list, so the script screens its synthetic password against the engine's own
+    # list rather than a copy. Prefixed lines, so the caller can ignore anything else printed.
+    from messagefoundry.auth.policy import CONTEXT_WORDS
+
+    for word in sorted(CONTEXT_WORDS):
+        print("context-word " + word)
+    return 0
+
+
 def _call(method, url, cafile, body=None, token=None):
     ctx = ssl.create_default_context(cafile=cafile)
     data = None if body is None else json.dumps(body).encode("utf-8")
@@ -691,6 +735,8 @@ def _login(base, cafile, username):
 
 if __name__ == "__main__":
     mode = sys.argv[1]
+    if mode == "context-words":
+        sys.exit(_context_words())
     if mode == "provision":
         sys.exit(_provision(sys.argv[2:]))
     if mode == "health":
@@ -703,7 +749,7 @@ Set-Content -LiteralPath $Probe -Value $ProbeSource -Encoding Ascii
 
 $StoreKey = (& $AppExe gen-key).Trim()
 if (-not $StoreKey) { throw "messagefoundry gen-key produced no store key" }
-$Password = New-SyntheticPassword
+$Password = New-SyntheticPassword -DenyWords (Get-ContextWords)
 if ($env:GITHUB_ACTIONS -eq "true") {
     # Both are synthetic and per run. Masked anyway, so no later echo can print either in clear.
     Write-Host "::add-mask::$StoreKey"
