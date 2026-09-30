@@ -40,6 +40,7 @@ def run_cli(
     build_parser: Callable[[], tuple[argparse.ArgumentParser, Dispatch]],
     *,
     configures_own_logging: frozenset[str] = frozenset(),
+    floor_code: Callable[[argparse.Namespace], str | None] | None = None,
 ) -> int:
     """Run one command line: harden, install the hooks, parse, dispatch, and return the exit code.
 
@@ -48,6 +49,8 @@ def run_cli(
     in ``args.command``, as ``add_subparsers(dest="command", required=True)`` does, because the
     dispatch and the log-sink choice both key on it. ``configures_own_logging`` names the
     subcommands that install their own redacting root handler, so this shell gives them none.
+    ``floor_code`` names the ``"code"`` the JSON error floor adds for a subcommand that promises one
+    on every failure, or None for no code; the command, not this shared shell, knows which do.
     """
     # Every console entry point hardens its streams first (BACKLOG #1875), and a caller's main()
     # has usually done so already. Doing it here too costs nothing, because the call is idempotent,
@@ -150,7 +153,10 @@ def run_cli(
         from messagefoundry.last_resort import report_uncaught
 
         text = report_uncaught(exc)
-        return _emit_error(text, as_json=True) if as_json else 1
+        if not as_json:
+            return 1
+        code = floor_code(args) if floor_code is not None else None
+        return _emit_error(text, as_json=True, code=code)
 
 
 def _safe_print(line: str) -> None:
@@ -221,7 +227,7 @@ def _load_operator_json(raw: str, what: str) -> Any:
     raise _OperatorJsonError(refused)
 
 
-def _emit_error(message: str, *, as_json: bool) -> int:
+def _emit_error(message: str, *, as_json: bool, code: str | None = None) -> int:
     """Report a command failure on the right stream and return its exit code.
 
     Text goes to **stderr**. A shell redirect of a command's output --
@@ -231,9 +237,14 @@ def _emit_error(message: str, *, as_json: bool) -> int:
 
     JSON stays on **stdout**, deliberately. Under ``--json`` the error object IS the command's
     machine-readable output: a consumer piping to ``jq`` reads it there, and the non-zero exit code
-    is what tells it apart from a success payload."""
+    is what tells it apart from a success payload.
+
+    ``code`` adds a machine-readable ``"code"`` key beside ``"error"`` in the JSON form, for a consumer
+    that must branch on the failure family without matching message text (``lens rewrite``, BACKLOG
+    #237)."""
     if as_json:
-        print(json.dumps({"error": message}))
+        payload = {"error": message} if code is None else {"error": message, "code": code}
+        print(json.dumps(payload))
     else:
         print(f"error: {message}", file=sys.stderr)
     return 1

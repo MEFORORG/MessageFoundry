@@ -952,7 +952,7 @@ async def test_the_retry_arms_a_fresh_pause_measured_from_the_retrys_own_clock()
     # leadership back to the node the endpoint has already reported drained.
     #
     # VACUITY CONTROL, both legs MEASURED: delete the `_lease_release_owed` disjunct from
-    # DbCoordinator._may_own_lease_row and this fails at the pause (`20.0 == 120.0`); silence that
+    # DbCoordinator.may_own_lease_row and this fails at the pause (`20.0 == 120.0`); silence that
     # leg as well and it fails at the behavioural one (`True is False`).
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
@@ -1061,7 +1061,7 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     # "not the current leader" while GET /cluster/nodes still named this node as lease owner, with the
     # row live for another ten seconds. CONTROL ARMS, both measured: against the unfixed coordinator
     # this fails at the unpack (it returned two values); with the fix in place but the
-    # `_last_renew_ok` disjunct dropped from _may_own_lease_row, it fails at the outcome
+    # `_last_renew_ok` disjunct dropped from may_own_lease_row, it fails at the outcome
     # (`lease_released` False), because no write is sent.
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
@@ -1070,7 +1070,9 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     a = _coord(pool, mono, node="A", heartbeat=10.0, fence=20.0, ttl=30.0)
     fired: list[int] = []
     a.set_on_demote(lambda: fired.append(1))
+    assert a.may_own_lease_row() is False, "a node that never held the lease owns no row"
     await a._maintain_leadership()
+    assert a.may_own_lease_row() is True
     # The renews stop landing; the watchdog fences on the node's own clock...
     mono.t = 20.1
     a._check_fence()
@@ -1078,6 +1080,9 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     # ...while the row is still live on the DB clock (15 < 30) and still names this node.
     db_clock.t = 15.0
     assert db.row is not None and db.row["owner"] == "A" and db.row["lease_expires_at"] == 30.0
+    # The public drain test GET /cluster/status publishes as owns_lease_row (BACKLOG #1988): the
+    # gate is clear, and the engine would still drain this node.
+    assert a.may_own_lease_row() is True, "a self-fenced node would not be drained"
 
     releases: list[tuple[object, ...]] = []
     pool.on_execute_args = releases.append
@@ -1090,6 +1095,8 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     # The pause is armed from the release, so the drained node does not renew the row straight back
     # through the unfenced `owner = me` branch the moment its DB comes back.
     assert a._no_claim_until == pytest.approx(20.1 + 20.0)
+    # Just released: the row is expired and nothing is owed, so a second stepdown would drain nothing.
+    assert a.may_own_lease_row() is False, "a node that just released still reads as owning its row"
     assert fired == [1, 1], "the row release fired no demotion edge"
     await a._maintain_leadership()
     assert a.is_leader() is False, "the drained node renewed itself back in"
@@ -1117,6 +1124,7 @@ async def test_a_stepdown_on_a_node_whose_lease_a_sibling_took_changes_nothing()
     await a._maintain_leadership()  # A's DB answers with B's live lease
     assert (a.is_leader(), b.is_leader()) == (False, True)
     assert a._last_renew_ok is None, "a claim that saw another owner kept the hold baseline"
+    assert a.may_own_lease_row() is False  # published as owns_lease_row=false (BACKLOG #1988)
 
     releases: list[tuple[object, ...]] = []
     pool.on_execute_args = releases.append
@@ -1550,10 +1558,12 @@ async def test_sqlserver_a_self_fenced_node_is_drained_and_says_so_truthfully() 
     a._check_fence()
     assert a.is_leader() is False
     assert db.row is not None and db.row["lease_expires_at"] == 30.0  # still live and ours
+    assert a.may_own_lease_row() is True  # BACKLOG #1988: published as owns_lease_row
 
     assert await a.step_down_leadership() == (False, None, True)
     assert db.row is not None and db.row["lease_expires_at"] == 0.0
     assert a._no_claim_until == pytest.approx(20.1 + 20.0)
+    assert a.may_own_lease_row() is False
 
 
 async def test_sqlserver_a_handicapped_sibling_takes_over_after_a_stepdown() -> None:

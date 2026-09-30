@@ -13,6 +13,7 @@ from __future__ import annotations
 from messagefoundry.api.models import ConfigProvenance, ReloadResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
+from .approvals import approvals_link
 
 __all__ = ["config_page", "reload_pending", "reload_result"]
 
@@ -103,6 +104,7 @@ def reload_pending(pending: object) -> Markup:
             class_="muted",
         ),
         el("p", text(f"Approval id: {approval_id}"), class_="muted"),
+        approvals_link(),
         el("p", el("a", "← Configuration", href="/ui/config")),
         class_="card",
     )

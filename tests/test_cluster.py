@@ -116,6 +116,11 @@ class _NotLeaderCoordinator:
         # ClusterCoordinator protocol.
         return StepdownOutcome(was_leader=False, released_at=None, lease_released=False)
 
+    def may_own_lease_row(self) -> bool:
+        # A follower that never held the lease owns no row (BACKLOG #1988). Present so this stand-in
+        # still structurally satisfies the ClusterCoordinator protocol.
+        return False
+
 
 # --- NullCoordinator (the byte-identical default) ---------------------------
 
@@ -398,6 +403,14 @@ def test_null_coordinator_satisfies_protocol() -> None:
     # runtime_checkable Protocol: the null + the fake both structurally match the contract.
     assert isinstance(NullCoordinator(), ClusterCoordinator)
     assert isinstance(_NotLeaderCoordinator(), ClusterCoordinator)
+
+
+def test_null_coordinator_owns_no_lease_row() -> None:
+    # Single-node has no lease row, so a stepdown would drain nothing (BACKLOG #1988), even though
+    # its gate always reads True. GET /cluster/status publishes this as owns_lease_row=false.
+    coord = NullCoordinator()
+    assert coord.is_leader() is True
+    assert coord.may_own_lease_row() is False
 
 
 # --- the seam: Engine + RegistryRunner accept + hold a coordinator ----------
