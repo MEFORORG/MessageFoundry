@@ -144,36 +144,45 @@ $AGE_NOTE = "Ages are part of the reading. The collector publishes at statusLine
             "number can be up to about 15 min old and still look current; anything past $MaxAgeMinutes min " +
             "is reported UNKNOWN rather than projected from."
 
-# WHY NOTHING THIS SESSION DOES WILL REFRESH THE FILE, WHEN THAT IS SO (BACKLOG #1459). The collector
-# is a statusLine, and a statusLine runs only in the interactive terminal UI. Measured 2026-09-30
-# across six config roots: every latest.json write lined up with a session whose transcript records
-# entrypoint "cli", and none with the "claude-desktop" sessions that carried nearly all the traffic --
-# one root wired correctly had Desktop sessions that day and a reading four days old. So on a root
-# driven from Desktop an UNKNOWN here is the steady state, and a session told only "UNKNOWN" would
-# wait for a number that cannot arrive. Claude Code sets CLAUDE_CODE_ENTRYPOINT in the environment a
-# hook inherits; said only when it is set and is not "cli", so an unknown client is never guessed at.
-function Get-PublisherNote {
-    $ep = Get-Folded $env:CLAUDE_CODE_ENTRYPOINT 40
-    if (-not $ep -or $ep -eq "cli") { return @() }
-    return @("  publisher: this session's entrypoint is '$ep'. The statusLine that writes this file runs " +
-        "only in an interactive terminal session (entrypoint 'cli'), so nothing this session does will " +
-        "refresh it. A terminal 'claude' session pinned to this config root is what publishes.")
-}
-
-# THE READER'S DIAGNOSIS OF THE WIRING, WHEN IT FOUND A FAULT (BACKLOG #1459). A bare "no data" hid
-# a root whose statusLine can never run -- PowerShell source that bash cannot parse -- behind the
-# same words as a root that simply has not started a session yet. WIRED_HERE adds nothing the
-# publisher note does not, so only a named fault is repeated.
-function Get-WiringNote($Doc) {
-    if (-not $Doc) { return @() }
-    $st = Get-Folded $Doc.statusline_state 60
-    if (-not $st -or $st -eq "WIRED_HERE") { return @() }
-    $out = @("  statusLine ($st): " + (Get-Folded $Doc.statusline_line))
-    foreach ($r in @($Doc.statusline_remedy)) {
-        $f = Get-Folded $r
-        if ($f) { $out += "    $f" }
+# WHY AN UNKNOWN WILL NOT CLEAR ON ITS OWN (BACKLOG #1459). A bare "UNKNOWN" hid two causes that
+# waiting cannot fix, and a session told only "UNKNOWN" waits for a number that cannot arrive. ONE
+# note, never both: their remedies conflict, and the wiring fault has to be fixed first.
+#
+#   A WIRING FAULT the reader named -- for one, PowerShell source that bash cannot parse, which the
+#   reader used to call WIRED_HERE. Any state but WIRED_HERE is named here. That is deliberately
+#   wider than the reader's $dxUntrusted, which decides whether a READING is trusted; this decides
+#   whether a fault is worth naming beside an UNKNOWN, and every one of them is. Skipped under
+#   -StateDir, mirroring the reader: the caller named a directory, and the root above it need not be
+#   wired at all.
+#
+#   A CLIENT THAT NEVER RUNS A statusLine. The collector is a statusLine, and a statusLine runs only
+#   in the terminal UI. Measured 2026-09-30 across six config roots: every latest.json write lined up
+#   with a session whose transcript records entrypoint "cli", and none with the "claude-desktop"
+#   sessions that carried nearly all the traffic -- one correctly wired root had Desktop sessions that
+#   day and a reading four days old. install-usage-statusline.ps1 names the SDK as never running it
+#   either. Only those clients are named; any other entrypoint, an unfamiliar one included, gets no
+#   note rather than a guess.
+#
+# THE REMEDY IS LABELLED AN OWNER ACTION. It rewrites a config root's settings.json, outside git, and
+# this text lands in the context of every session about to spawn, which must not read it as a task.
+function Get-CauseNote($Doc) {
+    $st = if ($Doc) { Get-Folded $Doc.statusline_state 60 } else { "" }
+    if (-not $StateDir -and $st -and $st -ne "WIRED_HERE") {
+        $out = @("  statusLine ($st): " + (Get-Folded $Doc.statusline_line))
+        $rem = @(@($Doc.statusline_remedy) | ForEach-Object { Get-Folded $_ } | Where-Object { $_ })
+        if ($rem.Count -gt 0) {
+            $out += "  remedy, an OWNER action (it writes a config root outside git; do not run it yourself):"
+            $out += @($rem | ForEach-Object { "    $_" })
+        }
+        return $out
     }
-    return $out
+    $ep = Get-Folded $env:CLAUDE_CODE_ENTRYPOINT 40
+    if ($ep -eq "claude-desktop" -or $ep -like "sdk-*") {
+        return @("  publisher: this session's entrypoint is '$ep', which never runs a statusLine, so " +
+            "nothing this session does will refresh this file. Only an interactive terminal 'claude' " +
+            "session pinned to this config root publishes it.")
+    }
+    return @()
 }
 
 # UNKNOWN IS STILL AN INJECTION. Exiting quietly on a failed read would leave the session with no
@@ -305,7 +314,7 @@ if (-not ($j.PSObject.Properties.Name -contains "five_hour") -or -not $j.five_ho
             $where = "nothing has ever published to " + (Get-Folded $latestPath)
         }
     }
-    Write-Unknown "$why ($where)" (@(Get-WiringNote $j) + @(Get-PublisherNote))
+    Write-Unknown "$why ($where)" @(Get-CauseNote $j)
 }
 
 function Format-Window($w, [string]$Short) {
@@ -345,8 +354,7 @@ if ((Get-Folded $j.provenance) -eq "UNVERIFIED") {
 
 # A READING THAT CAME BACK UNKNOWN GETS ITS CAUSE, for the same reason the no-window path does.
 if ($state -eq "UNKNOWN") {
-    $lines += @(Get-WiringNote $j)
-    $lines += @(Get-PublisherNote)
+    $lines += @(Get-CauseNote $j)
 }
 
 $advice = Get-Folded $j.advice

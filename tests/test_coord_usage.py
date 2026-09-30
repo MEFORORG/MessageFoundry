@@ -21,7 +21,8 @@ lies converts "I should check" into "I already know":
 Driven as real subprocesses against fixtures, because these are PowerShell scripts and a Python
 re-implementation of their rules would only assert that the re-implementation agrees with itself.
 
-THE ``pwsh`` LAUNCHES HERE GO THROUGH ``run_single`` (BACKLOG #1304), at 21 call sites. A launch out
+THE ``pwsh`` LAUNCHES HERE GO THROUGH ``run_single`` (BACKLOG #1304), at 22 call sites since #1459
+added ``_hook``. A launch out
 of this file starved past its 60-second ceiling on the ``windows-2025`` harness leg while
 ``test_session_mail.py`` held 16 concurrent ``pwsh`` on a 4-vCPU runner; the evidence, and the rule
 for what may take the lock, live in ``tests/_spawn_lock.py``. Read that module before adding a launch
@@ -29,14 +30,15 @@ here.
 
 AT LEAST ONE ``pwsh`` LAUNCH IN THIS FILE IS STILL UNLOCKED, and it is named rather than counted
 because an enumeration here would be the liability CLAUDE.md section 11 warns about (SDS-3.6). The
-two ``bash`` sites are excluded by ``_LOCKED_INTERPRETERS``, which matches on the binary being
-launched -- and one of them, ``test_bash_runs_the_wired_command_end_to_end_and_it_publishes``, runs
-the wired statusLine command, whose whole job is to invoke ``pwsh``. So that is a real ``pwsh``
-launch on a 60-second ceiling sitting outside the lock. It is left alone: wrapping it means calling
-``single_spawn`` directly around a ``bash`` invocation, which is a behaviour change to a test that
-has produced no #1304 evidence, and the module's rule is not to wrap on a hunch.
+``bash`` sites are excluded by ``_LOCKED_INTERPRETERS``, which matches on the binary being launched
+-- and at least two of them, ``test_bash_runs_the_wired_command_end_to_end_and_it_publishes`` and
+the #1459 helper ``_run_under_bash``, run the wired statusLine command, whose whole job is to invoke
+``pwsh``. So those are real ``pwsh`` launches on a 60-second ceiling sitting outside the lock. They
+are left alone: wrapping them means calling ``single_spawn`` directly around a ``bash`` invocation,
+which is a behaviour change with no #1304 evidence behind it, and the module's rule is not to wrap
+on a hunch.
 
-``tests/test_spawn_lock.py`` gates the 21 direct sites against a 22nd being added unwrapped. That
+``tests/test_spawn_lock.py`` gates the direct sites against one being added unwrapped. That
 gate exists because this paragraph is a convention, and ``run_single``'s own docstring says a
 convention in a docstring does not hold a line.
 """
@@ -2697,13 +2699,16 @@ def test_a_root_the_old_installer_wired_publishes_after_one_reinstall_and_the_ho
     ctx = _hook(pin, fake_home)
     assert "verdict: UNKNOWN" in ctx and WIRED_POWERSHELL_SOURCE in ctx, ctx
     assert str(pin) in ctx, f"the remedy must name the root: {ctx}"
+    # The remedy writes a config root outside git, and this text reaches every spawning session.
+    assert "OWNER action" in ctx, f"the remedy must not read as a task for the session: {ctx}"
     status = install("-Status", pin=pin, home=fake_home, collector=None).stdout
     assert "publishes NOTHING" in status, status
 
-    # 3. One installer run, which says what it replaced.
+    # 3. One installer run, which says what it replaced -- not "some other way".
     proc = install("-ConfigDir", str(pin), pin=None, home=fake_home)
     assert proc.returncode == 0, proc.stdout
-    assert "REWIRED" in proc.stdout and "was PowerShell source" in proc.stdout, proc.stdout
+    assert "REWIRED" in proc.stdout and "that was PowerShell source" in proc.stdout, proc.stdout
+    assert "some other way" not in proc.stdout, proc.stdout
 
     # 4. bash runs the new command and the collector publishes under this root.
     after = _run_under_bash(bash, tmp_path, wired(pin / "settings.json"), pin, payload)

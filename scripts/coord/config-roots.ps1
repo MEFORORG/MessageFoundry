@@ -438,10 +438,11 @@ function Test-IsPowerShellSourceStatusLine {
         a new session and wait" -- advice that cannot work. Measured 2026-09-30 on a live account
         root: `bash -n` over its command returned 2, "syntax error near unexpected token `{'".
 
-        WHAT IT MATCHES: a line that opens with a PowerShell assignment, `$name = ...`. That is the
-        shape every PowerShell-source command this repository ever emitted starts with, and bash
-        never reads it as an assignment (a bash assignment names its variable without a `$`). It is a recogniser for
-        that emitted shape, not a general PowerShell parser.
+        WHAT IT MATCHES: a line that opens with a PowerShell assignment, `$name = ...`. That is how
+        the old installer's command opens (the `$s = '...'` shape Get-WiredCollectorPath also reads),
+        and bash never reads it as an assignment, because a bash assignment names its variable
+        without a `$`. It recognises that emitted shape and is not a PowerShell parser: a hand-written
+        command in some other PowerShell form still reads as whatever the path arms make of it.
     #>
     param([string]$Command)
     if ([string]::IsNullOrWhiteSpace($Command)) { return $false }

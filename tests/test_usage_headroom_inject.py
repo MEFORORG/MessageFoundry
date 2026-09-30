@@ -241,7 +241,7 @@ def test_an_absent_source_is_unknown_and_never_a_number(tmp_path: Path) -> None:
     assert "not zero headroom" in ctx, "UNKNOWN must be distinguished from an empty pool"
 
 
-PUBLISHER_NOTE = "runs only in an interactive terminal session"
+PUBLISHER_NOTE = "which never runs a statusLine"
 
 
 def test_an_unknown_names_a_client_that_can_never_publish_and_only_that_client(
@@ -252,13 +252,15 @@ def test_an_unknown_names_a_client_that_can_never_publish_and_only_that_client(
     The collector is a statusLine, and a statusLine runs only in the terminal UI. Measured across six
     config roots on 2026-09-30: every latest.json write lined up with an entrypoint-"cli" session and
     none with the Desktop sessions carrying nearly all the traffic. So the note must appear for a
-    Desktop entrypoint, and must NOT appear for "cli" or when no entrypoint is set -- a note printed
-    for every client would be decoration, and one printed for an unknown client would be a guess.
+    Desktop or SDK entrypoint, and must NOT appear for "cli", an unfamiliar value, or none at all -- a
+    note printed for every client would be decoration, and one printed for an unknown client a guess.
     """
     where = tmp_path / "never-published"
     arms = {
         "claude-desktop": {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"},
+        "sdk-cli": {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"},
         "cli": {"CLAUDE_CODE_ENTRYPOINT": "cli"},
+        "unfamiliar": {"CLAUDE_CODE_ENTRYPOINT": "some-future-client"},
         "unset": {},
     }
     seen = {}
@@ -267,7 +269,13 @@ def test_an_unknown_names_a_client_that_can_never_publish_and_only_that_client(
         assert code == 0 and ctx is not None, out
         assert "UNKNOWN" in ctx, ctx
         seen[label] = PUBLISHER_NOTE in ctx
-    assert seen == {"claude-desktop": True, "cli": False, "unset": False}, seen
+    assert seen == {
+        "claude-desktop": True,
+        "sdk-cli": True,
+        "cli": False,
+        "unfamiliar": False,
+        "unset": False,
+    }, seen
 
     # A FRESH READING NEEDS NO EXCUSE. The note explains an UNKNOWN; beside a live number it is noise.
     state = tmp_path / "fresh"

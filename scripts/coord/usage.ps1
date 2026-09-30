@@ -193,7 +193,7 @@ try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | Conve
 # no extra cost -- which is what lets it distinguish "not wired" from "wired to publish somewhere
 # else", two states with completely different fixes that the old one-line message merged.
 #
-# TEN STATES, and the function below is the list. CORRECTED 2026-09-30: this read "EIGHT STATES",
+# AT LEAST TEN STATES; the function below is the list. CORRECTED 2026-09-30: this read "EIGHT STATES",
 # already one short before WIRED_POWERSHELL_SOURCE joined for BACKLOG #1459. The old message
 # named none of them: it said "not installed or has not run yet" and printed the bare installer command with no root -- so following the reader's own advice re-ran the
 # exact invocation that produced the false INSTALLED claim in the first place.
@@ -276,16 +276,21 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
         $o.remedy = $reinstall
         return $o
     }
-    # THE LAST ARM BEFORE WIRED_HERE, AND IT REPLACES ONLY THAT ONE. Every arm above already sends the
-    # operator to the installer, which also replaces PowerShell source, so their diagnosis stands. What
-    # was wrong is this: a PowerShell-source command whose `$d = '...'` path matched came back
-    # WIRED_HERE, told to "start a NEW session" -- advice that cannot work, because bash cannot parse
-    # the command and pwsh never starts (BACKLOG #1459; measured on a live account root 2026-09-30).
+    # THE LAST ARM BEFORE WIRED_HERE, AND IT REPLACES ONLY THAT ONE. The arms above keep their
+    # diagnosis: each already offers the installer run, which also replaces PowerShell source, and
+    # WIRED_LEGACY / WIRED_ELSEWHERE name a path fact an operator still needs. What was wrong is this: a
+    # PowerShell-source command whose `$d = '...'` path matched came back WIRED_HERE, told to "start a
+    # NEW session" -- advice that cannot work, because bash cannot parse the command and pwsh never
+    # starts (BACKLOG #1459; measured on a live account root 2026-09-30).
+    #
+    # NOT IN $dxUntrusted, ON PURPOSE. On a box where Claude Code runs the statusLine under bash no
+    # fresh reading can exist, and the age refusal already turns an old one into UNKNOWN. On a box where
+    # it runs under some other shell the command may work, and a fresh reading it wrote is real.
     if (Test-IsPowerShellSourceStatusLine $cmd) {
         $o.state = "WIRED_POWERSHELL_SOURCE"
-        $o.line = "WIRED (ours) but the command is PowerShell source. Claude Code runs a statusLine under bash, which cannot parse it, so pwsh never starts and nothing publishes. WAITING WILL NOT FIX THIS."
-        $o.remedy = @("Re-wire this root; the installer replaces it with a command both shells run:",
-            "  pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1 -ConfigDir `"$Root`"")
+        $o.line = "WIRED (ours) but the command is PowerShell source. Claude Code runs a statusLine under bash where Git Bash is installed, and bash cannot parse it, so pwsh never starts and nothing publishes. WAITING WILL NOT FIX THIS."
+        $o.remedy = @("Re-wire this root (owner, plain terminal); the installer replaces it with a command both shells run:",
+            $reinstall[1])
         return $o
     }
     $o.state = "WIRED_HERE"
@@ -528,7 +533,7 @@ $states = @($five.state, $seven.state)
 # states, or the prose and the exit code describe different situations -- the two-instruments-
 # disagreeing defect this whole change exists to remove, reproduced inside one script.
 $dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE",
-    "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE", "WIRED_POWERSHELL_SOURCE")
+    "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")
 
 $overall = if ($states -contains "CRITICAL") { "CRITICAL" }
 elseif ($states -contains "WARN") { "WARN" }
