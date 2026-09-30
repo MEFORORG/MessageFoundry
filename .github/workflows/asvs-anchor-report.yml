@@ -67,6 +67,8 @@ on:
     paths: &anchor_paths
       - 'messagefoundry/**'
       - 'messagefoundry_webconsole/**'
+      # ADR 0201 moves engine modules here, and a cell's anchor can follow a module it cites.
+      - 'messagefoundry_toolkit/**'
       - 'scripts/asvs/**'
       - 'tests/test_asvs_anchor_report.py'
       - '.github/workflows/asvs-anchor-report.yml'

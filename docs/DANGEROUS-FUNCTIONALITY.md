@@ -288,6 +288,10 @@ real clinical requirement for a paper control.
   cap can be disabled per connection, which is the operator's choice to make.
 - XML hardening in `parsing/xml/harden.py` against external-entity and entity-expansion attacks,
   with the lxml posture recorded in ADR 0015 and ADR 0122.
+- defusedxml's refusal of entity declarations, and of DTDs where the call site asks for that, at
+  the `xml.etree` parse sites: at least `RawMessage.xml()`, the Corepoint import and the SVG
+  sanitizer. It comes from a copy vendored in `_vendor/defusedxml/`. The SOAP gate in
+  `transports/soap.py` hardens its own `xml.sax` parser instead.
 - A pinned pydicom floor in ADR 0025 that excludes a known path-traversal issue.
 - Directory-listing names from a remote share checked as single safe path components before they
   are joined, so a partner cannot return a traversal sequence.
@@ -297,7 +301,8 @@ than from memory. You can re-run the same scan over `messagefoundry/` and
 `messagefoundry_webconsole/`. A module is a parse site when its syntax tree holds at least one of
 these:
 
-1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml`, `xml`,
+1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml` (or the
+   engine's vendored copy, `messagefoundry._vendor.defusedxml`), `xml`,
    `xmlschema`, `signxml`, `pydicom`, `pynetdicom`, `pyx12`, `fhir.resources`, `fhirpathpy`,
    `cbor2`, `webauthn`, `spnego` (the module the pyspnego package installs), `csv`,
    `email.parser`, `email.feedparser`, `pickle`, `marshal` or `shelve`.
@@ -340,9 +345,9 @@ the first table. The rule places at least these modules:
 The scan leaves some parsing out on purpose, and it has limits:
 
 - `tomllib` is not in pattern 1. It reads at least service settings, connection files, environment
-  value files, de-identification rules, the tray's settings and code sets. Of those, only a code set
-  is known to come from another system. `config/code_sets.py` is in the first table through its
-  `csv` import.
+  value files, de-identification rules, the tray's settings, code sets and a reference sync's file.
+  Of those, only the reference sync's file is known to come from another system. The code-set
+  loader, `config/code_sets.py`, parses it, and is in the first table through its `csv` import.
 - Libraries parse their own wire: uvicorn's HTTP server, the HTTP clients, TLS and `ldap3`. FastAPI
   decodes every other API request body as JSON, and checks it against a model before a route sees
   it. [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) covers those libraries. The engine's own HTTP
@@ -366,14 +371,14 @@ The scan leaves some parsing out on purpose, and it has limits:
 | HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
 | JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
-| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply | `parsing/message.py`, `parsing/xml/`, `transports/soap.py` |
+| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply. `_vendor/defusedxml/` is the vendored defusedxml copy the stdlib-parser sites parse through. | `parsing/message.py`, `parsing/xml/`, `_vendor/defusedxml/common.py`, `_vendor/defusedxml/ElementTree.py`, `transports/soap.py` |
 | X12 | An inbound whose content type is `x12` | `parsing/x12/` |
 | DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
 | A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |
 | Captured traffic | The messages the de-identification tools read | `anon/hl7.py` |
 | An SVG attachment inside a stored message | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
 | An uploaded file | The body of `POST /uploads`, or of `POST /ui/uploaded-logs/upload`, which the same handler serves. `api/multipart.py` is a hand-written `multipart/form-data` parser (ADR 0134), and its own comment calls each part's header block attacker-supplied. The route needs the files-upload permission and step-up authentication. | `api/app.py`, `api/multipart.py`, `uploads.py` |
-| Code sets | Files in the config directory, and the exports from another system that the reference sync re-reads | `config/code_sets.py` |
+| A reference sync's file source | A file another system exports. `pipeline/reference_sync.py` re-reads it on a schedule and hands it to the code-set loader, and a dry run's reference preview in `pipeline/dryrun.py` does too. The same loader reads the code sets in the config directory, which are operator input. | `config/code_sets.py` |
 | The sandbox child's replies | The child runs your Routers and Handlers, so the parent treats what it sends back as untrusted | `pipeline/sandbox.py`, `pipeline/_sandbox_codec.py` |
 | Partner and service replies | A partner's HTTP reply headers, a REST peer's Digest challenge, a FHIR server, a DICOMweb server, a SMART token endpoint, the AI provider | `transports/bounded_read.py`, `transports/rest.py`, `transports/fhir.py`, `transports/dicomweb.py`, `transports/smart.py`, `transports/ai_broker.py` |
 | Text a remote peer sizes | A reply field, a traceback or an error text, clamped and redacted before it is logged or shown | `redaction.py` |
@@ -393,7 +398,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 |---|---|
 | It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
-| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
+| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py` |
 
@@ -514,7 +519,7 @@ administrator rights. What each one grants or changes:
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
 | `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
-| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. |
+| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke` runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
 least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
@@ -561,11 +566,14 @@ or disables the service when it cannot delete them. It points the registration a
 `nssm.exe`, quoted, and reads it back. It prints the helper's signature status without requiring
 one. It then starts the helper as LocalSystem.
 
-**At least these gaps remain.** An administrator who runs some other `nssm.exe` by hand, such as
-one on `PATH`, runs a copy nothing checked. `Start-Service` and `Restart-Service` need no NSSM.
-`-HelperSha256` is only as good as the channel the operator took it from. With `-AllowBroadAcl`,
-whoever can write the helper's folder can swap a binary, plant a library beside it, or edit its
-configuration file, both between runs and during one.
+**At least these gaps remain.** The hash check covers only the `nssm.exe` the two installers run
+and register. Nothing checks an `nssm.exe` an administrator runs by hand, such as one on `PATH`.
+`Start-Service` and `Restart-Service` need no NSSM. To run
+NSSM by hand, use the checked copy in `-NssmDir`, or in the helper's folder, by its full path. That
+copy was checked when it was installed, and it stays safe only while its folder is
+administrator-only. `-HelperSha256` is only as good as the channel the operator took it from. With
+`-AllowBroadAcl`, whoever can write the helper's folder can swap a binary, plant a library beside
+it, or edit its configuration file, both between runs and during one.
 
 It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless `-AppExe`
 names another, to read the address settings. It checks no hash on that program, and it runs it

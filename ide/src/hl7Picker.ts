@@ -34,7 +34,7 @@ export interface PickOpts {
 }
 
 const MANUAL_LABEL = "$(edit) Enter path manually…";
-const UNVERIFIED = "⚠ unverified round-trip"; // ⚠ — P3 badge on a path not proven to round-trip
+const UNVERIFIED = "⚠ unverified round-trip"; // the warning sign (U+26A0) — P3 badge on a path not proven to round-trip
 
 function manualItem(): vscode.QuickPickItem {
   return { label: MANUAL_LABEL, alwaysShow: true };

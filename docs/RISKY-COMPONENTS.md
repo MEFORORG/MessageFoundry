@@ -15,20 +15,20 @@ uses dated public data.
 
 The set assessed is the **core runtime closure**: every distribution a default engine install
 carries, transitive dependencies included, with no optional extras and no development toolchain.
-That is **41 distributions**, recorded in
+That is **35 distributions**, recorded in
 [`security/runtime-closure-core.txt`](../security/runtime-closure-core.txt).
 
 **Which denominator you pick changes the answer by about half, so it is stated rather than implied:**
 
 | Denominator | Count | Why not this one |
 |---|---|---|
-| Names in `pyproject.toml`, core only | 19 | Misses everything transitive. Over half of what runs is absent. |
-| Names in `pyproject.toml`, core plus every extra | 42 | Still direct-only, and mixes in extras nobody enabled. |
-| **Core runtime closure** | **41** | **Used for the tiers below.** What a default install actually executes. |
-| **`sqlserver` runtime closure** | **43** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
+| Names in `pyproject.toml`, core only | 20 | Misses everything transitive, which is a large share of what runs. |
+| Names in `pyproject.toml`, core plus every extra | 46 | Still direct-only, and mixes in extras nobody enabled. |
+| **Core runtime closure** | **35** | **Used for the tiers below.** What a default install actually executes. |
+| **`sqlserver` runtime closure** | **37** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
 | `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
-One extra is assessed as well. The `sqlserver` runtime closure is **43 distributions**, recorded in
+One extra is assessed as well. The `sqlserver` runtime closure is **37 distributions**, recorded in
 [`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt). It has its
 own section below, which classifies only the names the extra adds to the core closure.
 
@@ -53,7 +53,7 @@ Native compiled code is treated as an aggravating factor within a tier, not a ti
 memory-safety fault in a compiled parser is not the same class of event as a logic bug in a pure
 Python one, and the tables below say which components carry it.
 
-**Twenty-six of forty-one are designated, and the proportion is the finding.** This is an
+**Twenty-four of thirty-five are designated, and the proportion is the finding.** This is an
 integration engine: its job is parsing clinical traffic from partners it does not control and
 terminating network protocols. Most of its runtime closure is therefore in one of those two paths by
 construction. A short list here would be a less honest document, not a safer engine.
@@ -70,8 +70,19 @@ tolerance applies to the first two.
 | `hl7apy` | strict HL7 validation, opt-in per connection, same input | no |
 | `pydantic` | validates untrusted request and config input | no |
 | `pydantic-core` | the engine underneath it, compiled | **yes** |
-| `defusedxml` | processes hostile XML; it is the hardening, and it is in the path | no |
-| `pyyaml` | deserialization surface | no |
+
+The engine's XML hardening is not in this table, and that is not because it left the path. defusedxml
+0.7.1 is vendored into [`messagefoundry/_vendor/defusedxml/`](../messagefoundry/_vendor/defusedxml/README.md)
+rather than installed, so it is engine code and not a distribution in the closure. It still meets tier
+1: it parses hostile XML, and the refusal it applies is the hardening. The README beside it records its
+source, its hash and what changed.
+
+Read it as designated, tier 1. The ASVS reading further down covers distributions only, so its counts
+no longer include this copy. On that reading's maintenance test it would still be risky: upstream's
+newest upload was 2023-09-29.
+
+What the dependency audit and the SBOM can and cannot see of it is stated once, in
+[`SUPPLY-CHAIN.md`](SUPPLY-CHAIN.md#the-one-vendored-python-source-which-does-ship).
 
 ## Tier 2 — secrets and trust
 
@@ -113,17 +124,13 @@ looked at.
 | `aiosqlite` | an async wrapper over the standard library's `sqlite3`; it adds no parser and no protocol |
 | `anyio` | async primitives, no input handling |
 | `uvloop` | a compiled event loop; it moves bytes but parses none |
-| `watchfiles` | compiled filesystem watching, local paths only |
 | `psutil` | compiled process and resource inspection, local only |
 | `click` | command-line parsing, operator input on the local shell |
-| `colorama` | terminal colour on Windows |
-| `python-dotenv` | reads a local env file |
 | `tomlkit` | parses operator-authored TOML from the config directory, which is inside the trust boundary |
-| `prometheus-client` | metric formatting; the scrape surface is the engine's own route |
 | `annotated-doc`, `annotated-types`, `typing-extensions`, `typing-inspection` | typing shims, no runtime input handling |
 | `tzdata` | timezone tables |
 
-That is 15, and 26 plus 15 is 41. The arithmetic is stated so a reader can check the set is closed
+That is 11, and 24 plus 11 is 35. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
 
 ## The `sqlserver` extra
@@ -144,7 +151,7 @@ tables.
 
 None. Both names the extra adds are designated.
 
-So 2 plus 0 is 2, and 41 plus 2 is 43.
+So 2 plus 0 is 2, and 35 plus 2 is 37.
 
 ### The ODBC driver is designated too, and the guard cannot see it
 
@@ -196,7 +203,7 @@ The readings, their sources and their windows are recorded in
 
 ### What is read, and the test for each example
 
-All 43 distributions in the `sqlserver` closure are read: the 41 in the core closure and the 2 the
+All 37 distributions in the `sqlserver` closure are read: the 35 in the core closure and the 2 the
 extra adds. That is the whole assessed set, not only the designated part. A library can be risky on
 these examples even where the tiers did not designate it.
 
@@ -218,16 +225,14 @@ can judge them.
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
 
-**Risky on at least one example: 13 of 43. On maintenance: 5. On support: 0. On vulnerability
-history: 8. Not risky on any: 30. 13 plus 30 is 43.**
+**Risky on at least one example: 11 of 37. On maintenance: 3. On support: 0. On vulnerability
+history: 8. Not risky on any: 26. 11 plus 26 is 37.**
 
 ### Poorly maintained
 
 | Component | Newest release | Designated above |
 |---|---|---|
 | `aioodbc` | 2023-10-28 | yes, the `sqlserver` extra |
-| `colorama` | 2022-10-25 | no |
-| `defusedxml` | 2023-09-29 | yes, tier 1 |
 | `hl7` | 2022-03-31 | yes, tier 1 |
 | `hl7apy` | 2024-03-13 | yes, tier 1 |
 
@@ -248,7 +253,7 @@ None on the snapshot date.
 | `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
 | `starlette` | 5 | 2026-06-15 | yes, tier 3 |
 
-On the snapshot date OSV listed no advisory against any pinned version, in any of the 43. The table
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 37. The table
 above counts past advisories only.
 
 Every advisory in the window carries a rating from one of the two sources.
@@ -263,22 +268,21 @@ Every advisory in the window carries a rating from one of the two sources.
 
 | Components | Designated above |
 |---|---|
-| `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyspnego`, `pyyaml`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
-| `aiosqlite`, `annotated-doc`, `annotated-types`, `prometheus-client`, `psutil`, `python-dotenv`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop`, `watchfiles` | no |
+| `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyspnego`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
+| `aiosqlite`, `annotated-doc`, `annotated-types`, `psutil`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
 
 ### How this reading and the tiers fit together
 
 The tiers stay the designation. This reading does not move a component into or out of them. Where
 the two agree is where to look first.
 
-10 designated components are also risky on an ASVS example:
+9 designated components are also risky on an ASVS example:
 
 | Component | Designated above | Risky on |
 |---|---|---|
 | `aioodbc` | the `sqlserver` extra | maintenance |
 | `certifi` | tier 2 | vulnerability history |
 | `cryptography` | tier 2 | vulnerability history |
-| `defusedxml` | tier 1 | maintenance |
 | `h11` | tier 3 | vulnerability history |
 | `hl7` | tier 1 | maintenance |
 | `hl7apy` | tier 1 | maintenance |
@@ -286,10 +290,9 @@ the two agree is where to look first.
 | `pyasn1` | tier 2 | vulnerability history |
 | `starlette` | tier 3 | vulnerability history |
 
-3 components are risky here and not designated above: `anyio` (vulnerability history), `click`
-(vulnerability history), `colorama` (maintenance). The tiers did not designate them under the
-exposure criterion. The reading names them so that choice stays visible, and a reviewer can revisit
-it.
+2 components are risky here and not designated above: `anyio` (vulnerability history), `click`
+(vulnerability history). The tiers did not designate them under the exposure criterion. The reading
+names them so that choice stays visible, and a reviewer can revisit it.
 
 <!-- END component-readings -->
 

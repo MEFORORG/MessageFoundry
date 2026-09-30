@@ -69,14 +69,22 @@ _PUBLIC = "MEFORORG/MessageFoundry"
 #: existing kind — "0 downloads on a private repo" (a DIFFERENT project's release channel), "the
 #: mirror-nightly run" (a CI job name), and "the mirror branch does not exist" (a git branch in the
 #: scorecard repo). None claims this repository is a mirror. No genuine hit is lost.
+#:
+#: ``changelog.d/`` joined on BACKLOG #2080. An unreleased entry is written there as a fragment and
+#: folded into ``CHANGELOG.md`` at release, so it is the same record a day earlier. Excluding one and
+#: not the other would count a sentence or not purely by which side of the release it sat on.
+#: ``changelog.d/README.md`` is NOT a record -- it is live contributor guidance -- so
+#: ``_SCANNED_DESPITE_PREFIX`` keeps it in the scan.
 _HISTORICAL = (
     "CHANGELOG.md",
+    "changelog.d/",
     "docs/adr/",
     "docs/releases/",
     "docs/BACKLOG.md",
     "docs/reviews/",
     "docs/benchmarks/results",
 )
+_SCANNED_DESPITE_PREFIX = frozenset({"changelog.d/README.md"})
 
 #: Present-tense mirror/private-repo prose. Lines carrying a retrospective marker are excluded: those
 #: are narrating history, which is the distinction this whole module turns on.
@@ -183,7 +191,11 @@ def _tracked() -> list[str]:
     out = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
         ["git", "ls-files"], capture_output=True, text=True, cwd=_ROOT
     ).stdout
-    return [f for f in out.split() if not f.startswith(_HISTORICAL) and f != _SELF]
+    return [
+        f
+        for f in out.split()
+        if (f in _SCANNED_DESPITE_PREFIX or not f.startswith(_HISTORICAL)) and f != _SELF
+    ]
 
 
 def _read(rel: str) -> str:

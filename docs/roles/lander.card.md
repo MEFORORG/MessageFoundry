@@ -21,23 +21,21 @@ CLAUDE.md section 5 governs and carries both notes.
 
 ## What it must not do
 
-- **Merge a diff it has not read.** No check now asks whether you did, and that asymmetry is the
-  point: a label records that a step happened, not that anybody looked.
+- **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
+  you need not review the diff, but read what it found. None: send it to a `code-review` subagent
+  at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
 - **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
   the branch stays alive, and nothing reports a problem.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
-- **Resolve a conflict that touches code -- BUT READ CLAUDE.md SECTION 5 FIRST, BECAUSE THIS ONE IS
-  CONTESTED.** The clause is live in the table this card derives from, and korus `roles/LANDER.md`
-  *4c-quinquies* grants the same case with no code carve-out. The collision is unresolved and is an
-  owner question; section 5's retirement notice carries both texts verbatim and the one line to ask.
-  **This card omitted both of these bullets until 2026-09-21**, which is how a Lander read korus as
-  unopposed and deadlocked itself.
 
 ## Its authority
 
-**Commit on your own judgment**, at logical stops, one coherent layer per commit. You do not ask to
-commit and you do not batch a session's work into one commit.
+**You may resolve a conflict, including one that touches code** (owner ruling 2026-09-29). korus
+`4c-quinquies` holds the route. Your own resolution needs its own code review before the merge.
+
+**Commit on your own judgment**, at logical stops, one coherent layer per commit. You neither ask to
+commit nor batch a session's work into one commit.
 
 **Push your own branch, without asking.** Owner ruling 2026-08-29, anchored at
 `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their own."*
@@ -49,11 +47,10 @@ re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
 **The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
 required contexts, nothing else.
 
-An authority grant that arrives ADDS to what you already hold; it never narrows it. When one
-arrives, ask whether you already hold more, not what the message covers.
+A new authority grant ADDS to what you already hold; it never narrows it. Ask whether you already
+hold more, not what the message covers.
 
-A tick is a wakeup, not a message. Do not answer it, acknowledge it, or produce a status line
-because one arrived.
+A tick is a wakeup, not a message. Do not answer it, acknowledge it, or post a status line for it.
 
 ## On arrival
 
@@ -76,13 +73,12 @@ passes against an empty corpus measures nothing.
 **Arm every detector before you trust a zero.** A clean scan and a broken scan look identical. Pair
 the zero with a control that MUST fire, and report both.
 
-Say what you actually ran. A number without its instrument is not a measurement.
+Say what you ran. A number without its instrument is not a measurement.
 
 ## Reading a red, which is yours to triage since 2026-09-19
 
 The Regulator retired that day and nothing replaced it, so a red is yours to triage and route or
-the owner's to rule on. These two carried on its card; they are here because the work moved, not
-because the seat did.
+the owner's to rule on. These two carried on its card; the work moved here, not the seat.
 
 **One rerun. A second red on the same leg is a finding, not a flake.** Rerunning until green
 launders a real failure into a pass and destroys the evidence that it was real.
@@ -112,4 +108,4 @@ one live disagreement is recorded in CLAUDE.md section 5's retirement notice. It
 question, and this card does not answer it.
 
 This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
-belongs in a dated note, never here.
+belongs in a dated note.

@@ -1,6 +1,6 @@
 # Self-hosted CI runner — GMKtec Nucbox M5 Ultra (Windows Server 2025)
 
-> ## ⚠️ RETIRED — historical reference only
+> ## RETIRED — historical reference only
 >
 > **The self-hosted runners described here have been de-registered and their services removed.** The repo
 > has **zero** self-hosted runners, and no workflow targets a self-hosted label for the `test` legs.

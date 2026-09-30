@@ -193,7 +193,7 @@ def test_a_cross_site_GET_renders_the_interstitial_and_stages_nothing() -> None:
     way onward is a Continue button that POSTs — and the POST *is* guarded (see the two tests above).
     So a drive-by can cause a harmless page to render; it cannot cause a sign-in to start.
 
-    ⚠️ Asserted here rather than left implicit because the first version of this change claimed the
+    WARNING: Asserted here rather than left implicit because the first version of this change claimed the
     split "closed the standing hole where any external page could start a federated sign-in by linking
     here". Half true: the LINK no longer starts one. What actually closes it is the origin guard on
     the POST, not the split.

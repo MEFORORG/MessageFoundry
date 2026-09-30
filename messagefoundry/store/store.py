@@ -845,9 +845,10 @@ UPLOAD_RESERVATION_STALE_AFTER = 300.0
 #: 3. a store-once row's ``''`` inline payload is a DEREF SENTINEL, not an erasure — it carries a
 #:    live ``body_ref``, and the purge releases that ref *before* it blanks the row.
 #:
-#: Spliced into :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can re-queue
-#: a delivery whose content no longer exists: the connector would be handed a zero-byte frame and the
-#: finalizer would record it as a successful send.
+#: Spliced into at least :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can
+#: re-queue a delivery whose content no longer exists: the connector would be handed a zero-byte
+#: frame and the finalizer would record it as a successful send. :meth:`QueueStore.list_replay_targets`
+#: reads with it too, so the console draws no replay button for such a row (BACKLOG #1743).
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
@@ -872,8 +873,8 @@ PASSTHROUGH_MARKER_HANDLER: Final = "@passthrough-marker"
 
 #: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). Spliced beside
 #: :data:`_REPLAYABLE_BODY` into at least :meth:`QueueStore.replay`, :meth:`QueueStore.replay_dead`,
-#: the source read of :meth:`QueueStore.resend_to`, and (as :data:`_NOT_PT_MARKER_Q`) the attachment
-#: clean-up's live-holder check. A new reader that asks "can this row still be delivered?" needs it
+#: the source read of :meth:`QueueStore.resend_to`, :meth:`QueueStore.list_replay_targets`, and (as
+#: :data:`_NOT_PT_MARKER_Q`) the attachment clean-up's live-holder check. A new reader that asks "can this row still be delivered?" needs it
 #: too. Re-pending a marker created work nothing can drain: the startup
 #: sweep would later dead-letter it and flip a delivered parent to ``ERROR``. A marker is also never a
 #: resend source, because it carries no body.
@@ -2540,6 +2541,41 @@ def audit_rekey_when_keyed(keyed_from: int, ok: bool, msg: str | None) -> tuple[
     return True, f"audit chain already keyed from id={keyed_from}; {msg}"
 
 
+#: Why a server store cannot key its audit chain over an ``audit_chain_meta`` row that records no
+#: watermark (owner ruling R16). The row is written once, by an INSERT, so the runtime login needs no
+#: UPDATE or DELETE on the table; removing a row is the step of the principal that owns the store's
+#: schema. No engine build writes such a row, so one is foreign state. SQLite keeps its own ``INSERT
+#: OR REPLACE`` (owner ruling R17): a local file has no login to hold the two grants apart. The
+#: statement is lower-case because this text is logged, and the log redaction scrubs two adjacent
+#: ALL-CAPS words (``DELETE FROM``, ``IS NULL``) as a possible patient name.
+AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK = (
+    "audit_chain_meta already holds a row that records no keying watermark, and no engine build "
+    "writes one. The engine only inserts that row and never replaces it (owner ruling R16). As the "
+    "principal that owns the store's schema, run `delete from audit_chain_meta where id = 1 and "
+    "keyed_from_id is null`, with the table name qualified by that schema, then retry"
+)
+
+
+#: The keying row went away between the INSERT that found it and the read that followed.
+AUDIT_CHAIN_META_ROW_CHANGED = (
+    "audit_chain_meta changed while this ran: a keying row was there, then was not; run it again"
+)
+
+
+def audit_rekey_refused(row_found: bool, held_keyed_from: object) -> str:
+    """``rekey_audit_chain``'s answer when its watermark INSERT found a row already there, shared by
+    both server backends. ``row_found`` is whether the read after it returned the row, and
+    ``held_keyed_from`` is that row's ``keyed_from_id``."""
+    if not row_found:
+        return AUDIT_CHAIN_META_ROW_CHANGED
+    if held_keyed_from is None:
+        return AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK
+    return (
+        f"another process keyed the audit chain from id={held_keyed_from} while this ran; run "
+        "`messagefoundry rekey-audit` again to verify it"
+    )
+
+
 class AuditRangeHost(Protocol):
     """What :func:`settle_audit_ranges` and :func:`roll_audit_key_range` need from a store backend.
 
@@ -3158,6 +3194,11 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
                 check=False,
                 capture_output=True,
                 text=True,
+                # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+                # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+                # failed decode loses the output this warning logs. Only logged, so replace.
+                encoding="oem",
+                errors="replace",
             )
             if result.returncode != 0:
                 log.warning(
@@ -3190,6 +3231,8 @@ def _grant_read(path: Path, principal: str) -> None:
             check=False,
             capture_output=True,
             text=True,
+            encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
+            errors="replace",
         )
     except OSError as exc:
         log.warning("could not grant read on %s: %s", path, exc)
@@ -4000,6 +4043,14 @@ def _append_channel_scope(
         params.extend(allowed_channels)
     else:
         clauses.append("1=0")  # scoped to no channels
+
+
+def _dead_target_pairs(rows: Iterable[tuple[Any, Any]]) -> list[tuple[str, str]]:
+    """Shape every backend's raw ``list_replay_targets`` rows into one sorted list. Sorting here,
+    not in SQL, gives the three backends one order whatever their collation. A pair with a NULL or
+    empty half is dropped: a replay control names both halves in its path, and an empty segment
+    would address no route."""
+    return sorted({(str(c), str(d)) for c, d in rows if c and d})
 
 
 _SCHEMA = """
@@ -10046,6 +10097,26 @@ class MessageStore:
             cur = await db.execute(f"SELECT COUNT(*) AS n FROM queue o{where}", params)
             row = await cur.fetchone()
         return int(row["n"]) if row else 0
+
+    async def list_replay_targets(
+        self,
+        *,
+        channel_id: str | None = None,
+        destination_name: str | None = None,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
+        narrowed by the two clauses :meth:`replay_dead` applies, so every pair names rows a replay
+        would re-queue."""
+        where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT DISTINCT o.channel_id, o.destination_name"
+                f" FROM queue o{where} AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
+                params,
+            )
+            rows = await cur.fetchall()
+        return _dead_target_pairs((r["channel_id"], r["destination_name"]) for r in rows)
 
     @staticmethod
     def _dead_filter(

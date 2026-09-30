@@ -1,0 +1,176 @@
+# Advisories ALREADY KNOWN against the vendored CLA action's declared closure (BACKLOG #1578).
+#
+# The closure is `.github/actions/cla-assistant-lite/upstream-package-lock.json`, a frozen 2021-era
+# tree. `scripts/security/audit_cla_action_lockfile.py` audits it, and `security.yml`'s
+# `cla-action-audit` job runs that daily. The job fails on any advisory NOT listed here, and on any
+# entry here that the audit no longer reports.
+#
+# ADDING AN ENTRY IS THE ACKNOWLEDGEMENT, the way `--ignore-vuln <ID>` is for pip-audit. Do it in a
+# reviewed pull request, with a comment above the entry saying who triaged it and what they found.
+# The script prints what to check first.
+#
+# NO ENTRY HERE HAS BEEN TRIAGED YET, SO NONE CARRIES THAT COMMENT. The first 35 are the whole
+# result of the first audit, run 2026-09-29 with npm 11.5.2, recorded as found. Nobody has yet judged whether each is reachable in the
+# bundle's runtime path, and listing them here is not that judgement. Some affect packages the
+# lockfile marks `dev` only (the @babel packages, for example). Others do not: lodash, lodash.set
+# and js-yaml are among the packages the lockfile does not mark `dev`.
+#
+# Each entry is one advisory id and the package npm reported it against. Only those two fields are
+# compared. Severity and title are printed live from the audit.
+
+[[advisory]]
+id = "GHSA-4x5r-pxfx-6jf8"
+package = "@babel/core"
+
+[[advisory]]
+id = "GHSA-968p-4wvh-cqc8"
+package = "@babel/helpers"
+
+[[advisory]]
+id = "GHSA-67hx-6x53-jw92"
+package = "@babel/traverse"
+
+[[advisory]]
+id = "GHSA-h5c3-5r3r-rr8q"
+package = "@octokit/plugin-paginate-rest"
+
+[[advisory]]
+id = "GHSA-rmvr-2pp2-xj38"
+package = "@octokit/request"
+
+[[advisory]]
+id = "GHSA-xx4v-prfh-6cgc"
+package = "@octokit/request-error"
+
+[[advisory]]
+id = "GHSA-3jxr-9vmj-r5cp"
+package = "brace-expansion"
+
+[[advisory]]
+id = "GHSA-f886-m6hf-6m8v"
+package = "brace-expansion"
+
+[[advisory]]
+id = "GHSA-mh99-v99m-4gvg"
+package = "brace-expansion"
+
+[[advisory]]
+id = "GHSA-rgw5-rvv9-x895"
+package = "brace-expansion"
+
+[[advisory]]
+id = "GHSA-v6h2-p8h4-qcjw"
+package = "brace-expansion"
+
+[[advisory]]
+id = "GHSA-grv7-fg5c-xmjg"
+package = "braces"
+
+[[advisory]]
+id = "GHSA-73wf-gq98-2v4g"
+package = "browserslist"
+
+[[advisory]]
+id = "GHSA-c83g-rgw3-j3cx"
+package = "browserslist"
+
+[[advisory]]
+id = "GHSA-3xgq-45jj-v275"
+package = "cross-spawn"
+
+[[advisory]]
+id = "GHSA-25h7-pfq9-p65f"
+package = "flatted"
+
+[[advisory]]
+id = "GHSA-rf6f-7fwh-wjgh"
+package = "flatted"
+
+[[advisory]]
+id = "GHSA-2883-xcg3-v3hh"
+package = "js-yaml"
+
+[[advisory]]
+id = "GHSA-52cp-r559-cp3m"
+package = "js-yaml"
+
+[[advisory]]
+id = "GHSA-5p4m-2wfm-xmqj"
+package = "js-yaml"
+
+[[advisory]]
+id = "GHSA-h67p-54hq-rp68"
+package = "js-yaml"
+
+[[advisory]]
+id = "GHSA-mh29-5h37-fv8m"
+package = "js-yaml"
+
+[[advisory]]
+id = "GHSA-f23m-r3pf-42rh"
+package = "lodash"
+
+[[advisory]]
+id = "GHSA-r5fr-rjxr-66jc"
+package = "lodash"
+
+[[advisory]]
+id = "GHSA-xxjr-mmjv-4gpg"
+package = "lodash"
+
+[[advisory]]
+id = "GHSA-p6mc-m468-83gw"
+package = "lodash.set"
+
+[[advisory]]
+id = "GHSA-952p-6rrq-rcjv"
+package = "micromatch"
+
+[[advisory]]
+id = "GHSA-23c5-xmqv-rm74"
+package = "minimatch"
+
+[[advisory]]
+id = "GHSA-3ppc-4f35-3m26"
+package = "minimatch"
+
+[[advisory]]
+id = "GHSA-7r86-cg39-jmmj"
+package = "minimatch"
+
+[[advisory]]
+id = "GHSA-3v7f-55p6-f55p"
+package = "picomatch"
+
+[[advisory]]
+id = "GHSA-c2c7-rcm5-vvqj"
+package = "picomatch"
+
+[[advisory]]
+id = "GHSA-c2qf-rxjj-qqgw"
+package = "semver"
+
+[[advisory]]
+id = "GHSA-w5hq-g745-h8pq"
+package = "uuid"
+
+[[advisory]]
+id = "GHSA-48c2-rrv3-qjmp"
+package = "yaml"
+
+# THREE MORE, RECORDED 2026-09-30, and they are the gate's first live catch. The audit script's own
+# run while this baseline was being built reported them as NEW ADVISORY and exited 1, a day after the
+# first 35 were read. Recorded as found, NOT triaged, like the 35 above. brace-expansion 1.1.11 is
+# not marked `dev` in the lockfile.
+
+[[advisory]]
+id = "GHSA-6j4f-fj2g-mc7p"
+package = "brace-expansion"
+
+[[advisory]]
+id = "GHSA-q2hr-2g5m-vwhr"
+package = "brace-expansion"
+
+[[advisory]]
+id = "GHSA-qhr7-859c-m2p7"
+package = "brace-expansion"

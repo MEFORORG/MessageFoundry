@@ -210,14 +210,14 @@ POOL_ACQUIRE_WAIT_BASELINE_MS = 0.0135
 #: at outbound, grows claim_mean, and is immune to drive and to the drive box's disk, i.e. it is IDENTICAL
 #: to the pooled-claim wall in every column we have ever looked at. This is the discriminator.
 #:
-#: ⚠️ The MEAN is the WEAK instrument and must never be the only one. ``AcquireWaitHistogram.record()`` fires
+#: WARNING: The MEAN is the WEAK instrument and must never be the only one. ``AcquireWaitHistogram.record()`` fires
 #: on EVERY acquire (``store/sqlserver.py``), not only ones that waited — so ``count`` is really a
 #: store-round-trip counter and ``mean_ms`` is DILUTED by the flood of zero-wait acquires. A pool that is dry
 #: 5% of the time (and blocking for 20 ms when it is) still reports a ~1 ms mean. Hence the PRIMARY bar is
 #: p95: at a healthy pool the 95th percentile acquire is still ~free, so a p95 in the milliseconds means one
 #: acquire in twenty is QUEUEING for a connection.
 #:
-#: ⚠️ THE p95 BAR IS NOT ANCHORED TO A MEASUREMENT ON THIS RIG. :data:`POOL_ACQUIRE_WAIT_BASELINE_MS` is a
+#: WARNING: THE p95 BAR IS NOT ANCHORED TO A MEASUREMENT ON THIS RIG. :data:`POOL_ACQUIRE_WAIT_BASELINE_MS` is a
 #: MEAN, and no p95 was recorded at that known-unbound reference point — so only the SECONDARY (mean) bar is
 #: stated as a multiple of a measured baseline. The p95 bar below is imported wholesale from the STEP-4
 #: falsifier doc. The JSON therefore emits ``baseline_p95_ms: null`` beside ``p95_ms``, so a reader cannot

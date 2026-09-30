@@ -161,7 +161,7 @@ Not under `docs/`, and easy to miss:
 | File | What it is |
 |---|---|
 | [../README.md](../README.md) | Project overview. |
-| [../CHANGELOG.md](../CHANGELOG.md) | **Authoritative for build state** — what actually shipped, per release. |
+| [../CHANGELOG.md](../CHANGELOG.md) | **Authoritative for build state** — what actually shipped, per release. A change merged since the last release is a fragment under [../changelog.d/](../changelog.d/README.md) until the next release folds it in. |
 | [../.github/SECURITY.md](../.github/SECURITY.md) | Vulnerability disclosure policy. |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) · [../GOVERNANCE.md](../GOVERNANCE.md) · [../MAINTAINERS.md](../MAINTAINERS.md) | Project process. |
 | [../CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md) · [../CLA.md](../CLA.md) | Participation terms. |

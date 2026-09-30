@@ -282,8 +282,12 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
         "AlertInstanceInfo.reason — route-gated on monitoring:read, scrubbed at both ends, "
         "cipher-encrypted at rest"
     ),
-    "DeadLetterList": "envelope: limit/offset/total + DeadLetterRow rows (mapped)",
+    "DeadLetterList": (
+        "envelope: limit/offset/total + DeadLetterRow rows (mapped) + DeadLetterTarget replay "
+        "targets + the replayable_in_scope flag"
+    ),
     "DeadLetterReplayResult": "requeued count only",
+    "DeadLetterTarget": "channel_id/destination_name connection names only (BACKLOG #1743)",
     "EditResendResult": "ids + routing decision, no body",
     "MessageBody": (
         "raw IS PHI but rides GET /messages/{id}/raw's messages:view_raw whole-body gate (documented "
@@ -533,7 +537,7 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # whether any request is authorized. No login, session, permission or authorization outcome
         # turns on it, and it is never read on an inbound request path at all.
         #
-        # ⚠️ It IS a security-relevant setting and it LOWERS security when non-empty, which is why the
+        # WARNING: It IS a security-relevant setting and it LOWERS security when non-empty, which is why the
         # serve gate warns and names every entry. That makes it a settings-reference concern, not an
         # 8.1.3/8.1.4 contextual-input one — the two are different questions and this list is the
         # place the difference gets recorded rather than assumed.

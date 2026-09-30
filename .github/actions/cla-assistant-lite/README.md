@@ -39,6 +39,10 @@ A clean audit of `upstream-package-lock.json` proves the **declared** dependenci
 
 ### Auditing the declared closure
 
+CI does this daily. `security.yml`'s `cla-action-audit` job runs `scripts/security/audit_cla_action_lockfile.py`, which audits the lockfile with `npm audit` and fails on any advisory not already listed in `scripts/security/cla-action-advisories.toml`. The tree does not audit clean, and nothing here can fix it, so that baseline is what lets a new advisory stand out. Adding an entry to it is the acknowledgement, in a reviewed pull request. The script's docstring says what else it checks, including the false-clean result it guards against. Run it by hand with `python scripts/security/audit_cla_action_lockfile.py` (it needs `npm`).
+
+An auditor with their own tools can point them at the same closure:
+
 ```
 osv-scanner --lockfile package-lock.json:.github/actions/cla-assistant-lite/upstream-package-lock.json
 trivy sbom .github/actions/cla-assistant-lite/provenance.cdx.json
@@ -46,7 +50,7 @@ trivy sbom .github/actions/cla-assistant-lite/provenance.cdx.json
 
 **The two commands do not cover the same set, so run the first one.** `osv-scanner` reads the lockfile and reports on all 403 packages. `trivy sbom` reads the CycloneDX record, where the 242 packages npm marked `dev` carry CycloneDX `scope: excluded` and are skipped. For a compiled ncc/webpack artifact the dev toolchain is exactly what produced the bundle, so the lockfile scan is the wider lane and the SBOM scan is the convenient one.
 
-The lockfile is named `upstream-package-lock.json` rather than `package-lock.json` on purpose. GitHub's dependency graph ingests a file with the stock name anywhere in the repository, and the 2021-era tree it describes carries advisories nobody here can remediate: moving a pin means rebuilding the bundle, which needs the absent toolchain. So the record is **audit-only** — a tool an auditor points at it reads it, and a tool that scans for manifests does not. `.github/dependabot.yml` carries no npm entry for this directory for the same reason.
+The lockfile is named `upstream-package-lock.json` rather than `package-lock.json` on purpose. GitHub's dependency graph ingests a file with the stock name anywhere in the repository, and the 2021-era tree it describes carries advisories nobody here can remediate: moving a pin means rebuilding the bundle, which needs the absent toolchain. So the record is **audit-only** — a tool an auditor points at it reads it, and a tool that scans for manifests does not. The CI audit job keeps that property: it copies the lockfile under the stock name into a temporary directory that is deleted after the run. `.github/dependabot.yml` carries no npm entry for this directory for the same reason.
 
 ### Where the bundle runs
 

@@ -1150,10 +1150,32 @@ _PARSING_MAY_REACH = (
     # static walk below holds it to that.
     "messagefoundry.redaction",
     "messagefoundry.timezone",
+    # The vendored defusedxml copy `parsing/message.py` parses XML through. Upstream code that
+    # imports only the stdlib, and the one leaf that is a package rather than a single file.
+    "messagefoundry._vendor",
 )
 
-#: The allowlisted modules outside `parsing/`. Each is a single top-level file.
+#: The allowlisted modules outside `parsing/`. Each is a top-level file or package.
 _PARSING_LEAVES = tuple(m for m in _PARSING_MAY_REACH if m != "messagefoundry.parsing")
+
+
+def _leaf_files(root: Path, leaves: Sequence[str]) -> list[Path]:
+    """Each leaf's source: its single file, or every file of its package.
+
+    A leaf that is neither raises rather than being skipped, for the reason `_scan` gives."""
+    files: list[Path] = []
+    missing: list[str] = []
+    for leaf in leaves:
+        name = leaf.rsplit(".", 1)[1]
+        if (root / f"{name}.py").is_file():
+            files.append(root / f"{name}.py")
+        elif (root / name / "__init__.py").is_file():
+            files.extend(sorted((root / name).rglob("*.py")))
+        else:
+            missing.append(str(root / name))
+    if missing:
+        raise AssertionError(f"allowlisted leaves not found: {missing}")
+    return files
 
 
 def _parsing_may_reach(module: str) -> bool:
@@ -1187,10 +1209,7 @@ def _parsing_static_scan(root: Path, leaves: Sequence[str] = _PARSING_LEAVES) ->
     directory = root / "parsing"
     if not directory.is_dir():
         raise AssertionError(f"walk target is not a directory: {directory}")
-    leaf_files = [root / f"{leaf.rsplit('.', 1)[1]}.py" for leaf in leaves]
-    missing = [str(f) for f in leaf_files if not f.is_file()]
-    if missing:
-        raise AssertionError(f"allowlisted leaves not found: {missing}")
+    leaf_files = _leaf_files(root, leaves)
     violations: list[str] = []
     walked = {"parsing": 0, "leaves": 0}
     for py, bucket in [
@@ -1212,7 +1231,8 @@ def test_parsing_imports_nothing_outside_its_allowlist() -> None:
     assert not scan.violations, scan.violations
     # A walk that opened nothing gives the same clean answer as a clean package; see `_scan`.
     assert scan.walked["parsing"] >= _MIN_FILES_WALKED["parsing"], dict(scan.walked)
-    assert scan.walked["leaves"] == len(_PARSING_LEAVES), dict(scan.walked)
+    # At least one file per leaf; a package leaf contributes each of its files.
+    assert scan.walked["leaves"] >= len(_PARSING_LEAVES), dict(scan.walked)
 
 
 @pytest.mark.parametrize(
@@ -1334,3 +1354,60 @@ def test_the_parsing_probe_sees_a_planted_engine_import(plant: str, expect: str)
     # allowed leaves load on every run and must not be reported.
     probe = _parsing_import_probe(plant)
     assert expect in probe.outside, f"planted `{plant}`; the probe reported {sorted(probe.outside)}"
+
+
+# --- The engine never names the toolkit (ADR 0201 AC-5, BACKLOG #1192) --------------------------
+#
+# The toolkit may import the engine; the engine must never reach the toolkit. A TEXT SEARCH, not an
+# import scan, and over every file rather than every module: an import scanner cannot see
+# `importlib.import_module("messagefoundry_toolkit.x")`, and a name in a string is one call away
+# from being that. The hyphenated command and distribution name, `messagefoundry-toolkit`, is not
+# the identifier, so the engine may still print it in the line that refuses a moved command.
+#
+# What this cannot see is a module name an OPERATOR supplies at run time, as
+# config/secretprovider.py and store/keyprovider.py load. That is operator configuration choosing
+# to load code, not the engine depending on the toolkit; ADR 0201 section 4 leaves it alone.
+
+_TOOLKIT_IDENTIFIER = b"messagefoundry_toolkit"
+
+
+def _files_naming_the_toolkit(root: Path) -> tuple[list[str], int]:
+    """The files under ``root`` that contain the toolkit identifier, and how many files were read."""
+    named: list[str] = []
+    read = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        read += 1
+        if _TOOLKIT_IDENTIFIER in path.read_bytes():
+            named.append(path.relative_to(root.parent).as_posix())
+    return named, read
+
+
+def test_no_engine_file_names_the_toolkit_package() -> None:
+    named, read = _files_naming_the_toolkit(_ENGINE_ROOT)
+    # A floor, so a walk that found nothing cannot pass by reading nothing.
+    assert read >= 300, f"the engine walk read only {read} files -- it is not reaching the tree"
+    assert not named, (
+        f"these files under messagefoundry/ name the toolkit package: {named}. The engine must work "
+        f"with no toolkit installed (ADR 0201 AC-5). Move the code into messagefoundry_toolkit/, or "
+        f"name the command `messagefoundry-toolkit` with a hyphen if it is only a message."
+    )
+
+
+@pytest.mark.parametrize(
+    "plant",
+    [
+        "import messagefoundry_toolkit\n",
+        "from messagefoundry_toolkit.adr_analyze import analyze_adrs\n",
+        'importlib.import_module("messagefoundry_toolkit.x")\n',
+        "# see messagefoundry_toolkit/ for the authoring commands\n",
+    ],
+    ids=["import", "from-import", "import-module-string", "comment"],
+)
+def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> None:
+    engine = tmp_path / "messagefoundry"
+    engine.mkdir()
+    (engine / "clean.py").write_text("print('messagefoundry-toolkit adr-analyze')\n", "utf-8")
+    (engine / "planted.py").write_text(plant, encoding="utf-8")
+    assert _files_naming_the_toolkit(engine) == (["messagefoundry/planted.py"], 2)
