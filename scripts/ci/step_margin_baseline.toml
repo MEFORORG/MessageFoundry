@@ -93,7 +93,14 @@ source = "measured 2026-08-08; same pool as the ubuntu row; n=360. 35:47 is the 
 # censored by the `test` job's cap, under the retired topology in which this suite ran second in that
 # job. Run 30724385719 shows it: `Tests (pytest)` succeeded at 25:51, then this step was cancelled at
 # 30:14 when job_timeout 30 fired. They predated the separate `webconsole` job (2026-08-16) and xdist
-# on this step (PR 1415, 2026-09-22).
+# on this step (PR 1415, 2026-09-22). Even after xdist, runs kept exceeding them: 236 of 298 on
+# ubuntu, 275 of 298 on windows-2022 and 35 of 297 on windows-2025. While those rows were in force,
+# the gate's RE-DERIVE note fired for each such run, and nothing escalated it.
+#
+# THE SAME HAPPENED AGAIN UNDER THE #1842 ROWS, and it is recorded so the next re-pool sees the
+# pattern. In the pool below, RE-DERIVE fired on 119 of 871 ubuntu, 127 of 874 windows-2022 and 4 of
+# 867 windows-2025 success rows -- every run over 3:13, 4:11 and 5:24. Nothing acted on it until LOW
+# reds began ejecting merge groups and failing pull requests. RE-DERIVE is a note, not a gate.
 
 [[baseline]]
 step = "Web console tests (pytest)"
@@ -101,15 +108,15 @@ leg = "ubuntu-latest"
 max_passing = "4:15"
 censored = false
 censored_by = ""
-source = "measured 2026-09-30 UTC (owner request of that date). Pool: every ci.yml run with event merge_group or pull_request created 2026-09-26T02:16Z..2026-09-30T19:25Z UTC (915 runs: merge_group 375, pull_request 540), which opens where the BACKLOG #1842 pool closed, so the two pools do not overlap. Each event was listed on its own because the runs endpoint returns at most 1,000 rows per query and the two together exceed that. Jobs fetched with ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at. A re-run-failed-jobs attempt re-lists the jobs it did not re-run under new ids with identical stamps; those copies are dropped (94 across the three legs). n=868 (merge_group 372, pull_request 496), min 1:48, median 2:43. Worst 4:15, run 36761620218 (pull_request, 2026-09-30); next 3:50, run 36763693837 (merge_group). Uncensored on evidence: the one step failure (run 36518825881, a test failure on all three legs) stopped at 2:14, far under the 9:00 kill; 10 were cancelled, the longest at 3:19; 29 were skipped; 4 still running at collection were left out. push and workflow_dispatch are left out, as in the #1842 pool."
+source = "measured 2026-09-30 UTC (owner request of that date). Pool: every ci.yml run with event merge_group or pull_request created 2026-09-26T02:17:00Z..2026-09-30T19:24:59Z UTC, both ends inclusive, as the runs endpoint's created=A..B filter reads them: 914 runs (merge_group 375, pull_request 539), 3 of them pull_request runs with no web console step. It opens after the #1842 pool's last minute, so no run is in both. Each event was listed on its own, as for the #1842 pool. Jobs fetched with ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at. A re-run-failed-jobs attempt re-lists the jobs it did not re-run under new ids with identical stamps; those copies are dropped (94 across the three legs). Runs still in progress when first listed were re-read after they finished. n=871 (merge_group 375, pull_request 496), min 1:48, median 2:43. Worst 4:15, run 36761620218 (pull_request, 2026-09-30); next 3:50, run 36763693837 (merge_group). The gate went red on 1 of these success rows (that 4:15, pull_request) at the 5:00 cap this row replaces. Uncensored on evidence: the one step failure (run 36518825881, a test failure on all three legs) stopped at 2:14, far under the 9:00 kill; 10 were cancelled, the longest at 3:19; 29 were skipped. push and workflow_dispatch are left out, as in the #1842 pool."
 
 [[baseline]]
 step = "Web console tests (pytest)"
 leg = "windows-2022"
-max_passing = "5:09"
+max_passing = "5:40"
 censored = false
 censored_by = ""
-source = "measured 2026-09-30 UTC (owner request of that date); same pool and filter as the ubuntu web-console row; n=871 (merge_group 372, pull_request 499), min 2:29, median 3:25. Worst 5:09, run 36751616933 job 110011526026 (PR 1848, whose gate read the same step as 5:10 mark-to-mark); next 5:05, run 36618023819 (merge_group). Uncensored on evidence: the one step failure (run 36518825881) stopped at 3:37, far under the 10:00 kill; 8 were cancelled, the longest at 3:16; 31 were skipped; 4 still running were left out. The gate went red on 15 of these success rows (merge_group 3, pull_request 12) at the 6:00 cap this row replaces."
+source = "measured 2026-09-30 UTC (owner request of that date); same pool and filter as the ubuntu web-console row; n=874 (merge_group 375, pull_request 499), min 2:29, median 3:25. Worst 5:40, run 36765488564 job 110058594002 (pull_request, 2026-09-30T19:24:49Z, in progress when first listed); next 5:09, run 36751616933 job 110011526026 (PR 1848, whose gate read the same step as 5:10 mark-to-mark). The gate went red on 16 of these success rows (merge_group 3, pull_request 13) at the 6:00 cap this row replaces. Uncensored on evidence: the one step failure (run 36518825881) stopped at 3:37, far under the 10:00 kill then in force; 8 were cancelled, the longest at 3:16; 31 were skipped."
 
 [[baseline]]
 step = "Web console tests (pytest)"
@@ -117,4 +124,4 @@ leg = "windows-2025"
 max_passing = "5:43"
 censored = false
 censored_by = ""
-source = "measured 2026-09-30 UTC (owner request of that date); same pool and filter as the ubuntu web-console row; n=864 (merge_group 372, pull_request 492), min 2:23, median 3:45. Worst 5:43, run 36333319041 (pull_request, 2026-09-27); next 5:33, run 36644931814. Uncensored on evidence: the one step failure (run 36518825881) stopped at 4:26, far under the 12:00 kill; 12 were cancelled, the longest at 4:35; 30 were skipped; 4 still running were left out. The gate went red on none of these success rows at its 8:00 cap."
+source = "measured 2026-09-30 UTC (owner request of that date); same pool and filter as the ubuntu web-console row; n=867 (merge_group 375, pull_request 492), min 2:23, median 3:45. Worst 5:43, run 36333319041 (pull_request, 2026-09-27); next 5:33, run 36644931814. The gate went red on none of these success rows at its 8:00 cap. Uncensored on evidence: the one step failure (run 36518825881) stopped at 4:26, far under the 12:00 kill; 12 were cancelled, the longest at 4:35; 30 were skipped."

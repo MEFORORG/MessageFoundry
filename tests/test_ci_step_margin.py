@@ -837,8 +837,9 @@ def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
     be observed as far above the cap, in ratio, as the floor reserves below it. A bare `kill > cap`
     would be satisfied by one minute and would leave the sample censored a hair above the cap.
 
-    Falsified by lowering windows-2025's kill from 12 to 11 (1.222x): RED, naming the leg and both
-    numbers. Restored.
+    Falsified by lowering windows-2022's kill from 11 to 10 against its cap of 8 (1.250x): RED, naming
+    the leg and both numbers. Restored. (The earlier falsification, windows-2025's kill 12 to 11,
+    was measured at a cap of 9; at the cap of 8 it gives 1.375x and no longer reds.)
     """
     legs = _matrix_legs()
     names = {leg["os"] for leg in legs}
@@ -877,10 +878,11 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
     state #1842 was filed against, with 5 of 30 merge groups ejected. A cap raised by hand with no
     new row is the other drift: a bound derived from another bound. So two assertions: the row is
     not LOW at its cap, against the gate's own floor; and the cap is exactly the sizing rule ci.yml's
-    "THE SECOND RE-DERIVATION" note states, ceil_minute(1.35x the row), floored at 5:00.
+    "THE SECOND RE-DERIVATION" note states and "THE THIRD RE-DERIVATION" applies, ceil_minute(1.35x
+    the row), floored at 5:00.
 
-    Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:24 row (7:00 /
-    5:24 = 1.296x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
+    Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:43 row (7:00 /
+    5:43 = 1.224x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
     RED on the rule. Restored both times.
     """
     rows = load_baselines(_BASELINE_FILE)
