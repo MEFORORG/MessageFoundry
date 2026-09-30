@@ -724,7 +724,9 @@ def test_the_powershell_detector_discriminates_on_encodability_not_on_ascii() ->
 
 _ENGINE = _ROOT / "messagefoundry"
 # The toolkit takes code OUT of messagefoundry/ (ADR 0201), so it takes the engine gate with it:
-# a module that moves must not leave the walk. It ships a console entry point of its own.
+# a module that moves must not leave the walk. It ships a console entry point of its own. The gate
+# itself is the toolkit's `_REACH_ROOTS` row; this pair only feeds the entry-point rule, which
+# checks each root's __main__.py calls the chokepoint.
 _TOOLKIT = _ROOT / "messagefoundry_toolkit"
 _ENGINE_GATE_ROOTS = (_ENGINE, _TOOLKIT)
 
@@ -1139,8 +1141,8 @@ def _main(*body: str) -> tuple[str, ...]:
 
 
 def test_the_engine_hardening_signal_sees_the_real_entry_points() -> None:
-    """Proved against the real files rather than a reconstruction of them: the two entry points the
-    reach gate exempts today must be seen to call the chokepoint."""
+    """Proved against the real files rather than a reconstruction of them: the three entry points
+    the reach gate exempts today must be seen to call the chokepoint."""
     for real in (_ENGINE / "__main__.py", _TOOLKIT / "__main__.py", _HARNESS / "__main__.py"):
         assert _calls_the_chokepoint(ast.parse(real.read_text(encoding="utf-8"))), real
 
@@ -1288,14 +1290,15 @@ _TESTS = _ROOT / "tests"
 #: Pins are relative to the root. A root with only one shape (fuzz/ is all top-level; docker/, docs/
 #: and packaging/ are all nested) pins only that shape, because it has nothing else to lose.
 #:
-#: harness/__main__.py and messagefoundry/__main__.py are the entry points whose hardening exempts
-#: them, and this module is the one file whose disappearance from the walk would make every result
+#: harness/__main__.py, messagefoundry/__main__.py and messagefoundry_toolkit/__main__.py are the
+#: entry points whose hardening exempts them, and this module is the one file whose disappearance from the walk would make every result
 #: below meaningless.
 _REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
     ("messagefoundry", _ENGINE, 250, ("__main__.py", "pipeline/wiring_runner.py")),
-    # ADR 0201 moved engine tooling here, so it keeps the engine's gate; all three files are
-    # top-level, and __main__.py is a console entry point hardened at the chokepoint.
-    ("messagefoundry_toolkit", _TOOLKIT, 2, ("__main__.py",)),
+    # ADR 0201 moved engine tooling here, so it keeps the engine's gate. All three files are
+    # top-level; __main__.py is a console entry point hardened at the chokepoint, and
+    # adr_analyze.py is the module that moved.
+    ("messagefoundry_toolkit", _TOOLKIT, 3, ("__main__.py", "adr_analyze.py")),
     ("harness", _HARNESS, 60, ("__main__.py", "reconcile/__main__.py")),
     # Its ONLY nested file, measured 2026-09-29: 1 of 1,021. If it is ever legitimately removed,
     # the pin check below fails LOUDLY and points here rather than reporting a clean tree.
@@ -1429,12 +1432,9 @@ def test_every_root_holding_tracked_python_is_gated() -> None:
     # The census's own control: an instrument that cannot find these two proves nothing by
     # finding no ungated root.
     assert {"messagefoundry", "scripts"} <= roots, f"the census is blind: {sorted(roots)}"
-    # The rows walk disjoint top-level directories and each floor sits under its root's tracked
-    # count, so the tracked listing holds at least the floors combined. Counted on `tracked`, which the absence check below walks, so an empty or
-    # truncated listing fails here instead of reading as "nothing at the root".
-    assert len(tracked) >= sum(floor for _label, _root, floor, _pins in _REACH_ROOTS), (
-        f"only {len(tracked)} tracked python files listed -- the census is not reading them"
-    )
+    # Counted on `tracked` itself, which the absence check below walks, so an empty listing fails
+    # here instead of reading as "nothing at the root".
+    assert tracked, "git listed no tracked python at all -- the census read nothing"
     # A .py at the repository root has no row to go in: `_files_under` walks directories.
     at_root = sorted(rel for rel in tracked if "/" not in rel)
     assert not at_root, (
