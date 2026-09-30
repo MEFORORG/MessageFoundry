@@ -289,6 +289,9 @@ _LOOSER_THAN_DEFAULT = [
     ("admin_write_rate_limit_window_seconds", 0.2),  # still above the 0.15 s gap, so it loads
     ("admin_write_min_interval_seconds", 0.0),
     ("admin_write_min_interval_seconds", 0.1),
+    ("mfa_verify_min_elapsed_seconds", 0.0),
+    ("mfa_verify_min_elapsed_seconds", 0.5),
+    ("mfa_verify_min_elapsed_seconds", 1e-6),
     ("max_sessions_per_user", 0),
     ("max_sessions_per_user", -1),
     ("max_sessions_per_user", 6),
@@ -336,6 +339,8 @@ _STRICTER_OR_DEFAULT = [
     ("admin_write_rate_limit_window_seconds", 16.0),
     ("admin_write_min_interval_seconds", 0.15),
     ("admin_write_min_interval_seconds", 0.2),
+    ("mfa_verify_min_elapsed_seconds", 1.0),
+    ("mfa_verify_min_elapsed_seconds", 2.5),
     ("max_sessions_per_user", 5),
     ("max_sessions_per_user", 4),
     ("max_sessions_per_user", 1),
@@ -740,6 +745,35 @@ def _oidc(**over: object) -> AuthSettings:
 def test_the_oidc_flow_cache_cap_is_named_only_above_its_default(cap: int, named: bool) -> None:
     got = _names(auth=_oidc(oidc_flow_cache_max=cap))
     assert got == (["oidc_flow_cache_max"] if named else [])
+
+
+@pytest.mark.parametrize(
+    ("floor", "named"),
+    [
+        (1.0, False),  # the default
+        (2.5, False),  # stricter; the load keeps it below the flow lifetime
+        (0.5, True),
+        (1e-6, True),
+        (0.0, True),  # off
+    ],
+)
+def test_the_oidc_callback_floor_is_named_only_below_its_default(floor: float, named: bool) -> None:
+    got = _names(auth=_oidc(oidc_callback_min_elapsed_seconds=floor))
+    assert got == (["oidc_callback_min_elapsed_seconds"] if named else [])
+
+
+def test_the_oidc_callback_floor_is_not_named_without_oidc() -> None:
+    """The flows it floors exist only with OIDC on."""
+    assert _names(auth=AuthSettings(oidc_callback_min_elapsed_seconds=0)) == []
+
+
+def test_a_time_floor_says_off_at_zero_and_looser_below_the_default() -> None:
+    off = _risk(AuthSettings(mfa_verify_min_elapsed_seconds=0), "mfa_verify_min_elapsed_seconds")
+    assert off is not None
+    assert "there is no least time" in off
+    weak = _risk(AuthSettings(mfa_verify_min_elapsed_seconds=0.5), "mfa_verify_min_elapsed_seconds")
+    assert weak is not None
+    assert "shorter than the default of 1 s" in weak
 
 
 def test_the_oidc_flow_cache_cap_is_not_named_without_oidc() -> None:

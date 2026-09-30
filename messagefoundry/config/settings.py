@@ -2540,7 +2540,9 @@ class AuthSettings(_Section):
     # becomes MFA-pending and cannot enroll unattended. ``administrators`` frees only a LOCAL account
     # without the Administrator role (AuthService._mfa_required_for keeps that role in scope under
     # either value); ``require_mfa = false`` frees any un-enrolled account, at the exposure gate's
-    # cost. Moving it to AD is NO LONGER an escape: a directory account is in scope like any other.
+    # cost. Moving it to AD is NO LONGER an escape: while require_mfa is on, a directory session that
+    # proved no factor owes one under either require_mfa_scope value (BACKLOG #1144); setting the
+    # scope to administrators takes only a local account without the Administrator role out of scope.
     # Nor is mTLS: require_service_cert (api/security.py) admits a cert identity on
     # GET /service/identity alone, so it cannot carry a working service account.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
@@ -6164,9 +6166,14 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     ``email_use_tls``: with the limiter off, a weak count or window changes nothing and would only
     repeat the off entry. A window of 0 or less likewise stands in for its counts.
 
-    **Not covered, and stated so the gap is visible:** at least the two BACKLOG #2301 time floors,
-    ``mfa_verify_min_elapsed_seconds`` and ``oidc_callback_min_elapsed_seconds``, are not reported;
-    0 turns each off silently. They were outside this change's brief, not judged safe."""
+    * The BACKLOG #2301 time floors (``admin_write_min_interval_seconds``,
+      ``mfa_verify_min_elapsed_seconds``, ``oidc_callback_min_elapsed_seconds``) refuse an action that
+      comes sooner than the floor and skip the check at 0 or less, so a floor below its default is
+      looser and 0 is off. A higher floor is stricter; the load bounds it above.
+
+    **Not covered, and stated so the gap is visible:** ``[approvals].min_dwell_seconds``, the
+    dual-control approval floor, is another time floor of the same kind. It lives in a section this
+    registry does not receive, and reporting it needs a new required parameter at every call site."""
     out: list[tuple[str, str]] = []
 
     def _count(field: str, value: int, *, what: str, so: str, off: str | None) -> None:
@@ -6176,6 +6183,20 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             out.append((field, off))
         elif value > default:
             out.append((field, f"{what} is {value}, above the default of {default}, so {so}"))
+
+    def _floor(field: str, value: float, *, what: str, so: str, off: str) -> None:
+        """A time floor: refused sooner than ``value`` seconds, so 0 or less is off and a value
+        below the default is looser. A floor above the default refuses more and is not named."""
+        default = _auth_default(field)
+        if value <= 0:
+            out.append((field, off))
+        elif value < default:
+            out.append(
+                (
+                    field,
+                    f"{what} is {value:g} s, shorter than the default of {default:g} s, so {so}",
+                )
+            )
 
     def _window(
         field: str, value: float, *, what: str, off: str | None, counts: tuple[int, ...]
@@ -6386,26 +6407,55 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 "scripted run of purges, replays or config deploys"
             ),
         )
-        gap = auth.admin_write_min_interval_seconds
-        gap_default = _auth_default("admin_write_min_interval_seconds")
-        if gap <= 0:
-            out.append(
-                (
-                    "admin_write_min_interval_seconds",
-                    "there is no minimum gap between one actor's admin writes, so the whole "
-                    "per-actor count may be spent back to back at machine speed",
-                )
-            )
-        elif gap < gap_default:
-            out.append(
-                (
-                    "admin_write_min_interval_seconds",
-                    f"the minimum gap between one actor's admin writes is {gap:g} s, shorter than "
-                    f"the default of {gap_default:g} s, which sits just under the fastest write a "
-                    "person can make -- a script may spend the per-actor count faster than any "
-                    "person could",
-                )
-            )
+        _floor(
+            "admin_write_min_interval_seconds",
+            auth.admin_write_min_interval_seconds,
+            what="the minimum gap between one actor's admin writes",
+            so=(
+                "a script may spend the per-actor count faster than the fastest write the "
+                "keystroke-level model allows a person"
+            ),
+            off=(
+                "there is no minimum gap between one actor's admin writes, so the whole "
+                "per-actor count may be spent back to back at machine speed"
+            ),
+        )
+
+    # --- the second-factor time floor (BACKLOG #2301, ASVS 2.4.2): _second_factor_too_early refuses
+    # a code or passkey that completes an MFA-pending session sooner than this after sign-in, and
+    # skips the check at 0 or less. It applies to any account with a factor, whether or not
+    # [security].require_mfa is on, so it is gated on sign-in only.
+    _floor(
+        "mfa_verify_min_elapsed_seconds",
+        auth.mfa_verify_min_elapsed_seconds,
+        what="the least time between sign-in and the second factor",
+        so=(
+            "a script holding a password may submit a guessed or relayed code sooner after "
+            "sign-in than a person could take in the prompt and answer it"
+        ),
+        off=(
+            "there is no least time between sign-in and the second factor, so a script holding "
+            "a password may submit a guessed or relayed code at machine speed"
+        ),
+    )
+
+    # --- the federated callback floor (BACKLOG #2301, ASVS 2.4.2): _oidc_callback_too_early refuses
+    # a callback sooner than this after its flow started, and skips the check at 0 or less. The
+    # flows exist only with OIDC on.
+    if auth.oidc_enabled:
+        _floor(
+            "oidc_callback_min_elapsed_seconds",
+            auth.oidc_callback_min_elapsed_seconds,
+            what="the least time between a federated sign-in's start and its callback",
+            so=(
+                "a scripted flow may complete sooner after it starts than a person could answer "
+                "the identity provider's prompt"
+            ),
+            off=(
+                "there is no least time between a federated sign-in's start and its callback, "
+                "so a scripted flow may complete at machine speed"
+            ),
+        )
 
     # --- concurrent sessions (ASVS 7.1.2). 0 or less means unlimited, so a negative cap is off too.
     sessions = auth.max_sessions_per_user
@@ -6465,8 +6515,8 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, session-cap and OIDC flow-cache settings
-    :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131), an
+    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap and OIDC flow-cache
+    settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131), an
     ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
