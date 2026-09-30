@@ -210,7 +210,7 @@ def test_a_nested_env_default_never_resolves_even_with_a_static_list(default_sha
     """Positive control for the refusal below, driven into a real sink. ``resolve_env_settings``
     resolves one link, so with the outer key unset the INNER reference arrives unresolved -- even
     with the inner key set -- and Rest's proxy-bypass list reads it as empty. That is why a chain with
-    a clean static list is refused too: no two-link chain works, so none is legal to let through."""
+    a clean static list is refused too: its fallback link never works, so no version of it is clean."""
     nested = NESTED_DEFAULTS[default_shape](["bypass.example.invalid"])
     resolved = resolve_env_settings(
         {"proxy_no_proxy": nested}, {"inner_list": ["set.example.invalid"]}
@@ -238,7 +238,21 @@ def test_an_env_used_as_another_envs_default_is_refused(
     with pytest.raises(WiringError) as excinfo:
         LIST_SETTINGS[target](NESTED_DEFAULTS[default_shape](items()))
     message = str(excinfo.value)
-    assert f"{factory} {setting} env() default may not be" in message, message
+    assert f"{factory} {setting} env() default may not itself be" in message, message
+    assert SENTINEL not in message, message
+
+
+def test_an_item_and_a_chain_on_one_factory_are_both_named_with_their_own_remedy() -> None:
+    with pytest.raises(WiringError) as excinfo:
+        messagefoundry.Rest(
+            url="https://example.invalid/x",
+            capture_response_headers=["x-a", NESTED_SHAPES["code-first"]()],
+            proxy_no_proxy=NESTED_DEFAULTS["EnvRef"](["np.example.invalid"]),
+        )
+    message = str(excinfo.value)
+    assert "Rest capture_response_headers item 1 may not be an env() reference" in message, message
+    assert "Rest proxy_no_proxy env() default may not itself be" in message, message
+    assert "static list default instead" in message, message
     assert SENTINEL not in message, message
 
 
@@ -254,7 +268,7 @@ def test_a_self_referential_default_is_refused_at_the_first_link() -> None:
             capture_response_headers=messagefoundry.env("outer_list", default=loop),  # type: ignore[arg-type]
         )
     message = str(excinfo.value)
-    assert "capture_response_headers env() default may not be" in message, message
+    assert "capture_response_headers env() default may not itself be" in message, message
     assert SENTINEL not in message, message
 
 
