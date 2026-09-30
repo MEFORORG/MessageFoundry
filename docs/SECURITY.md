@@ -1952,8 +1952,12 @@ reach — `MessageSummary` × 3, `DeadLetterRow` × 2, `CapturedResponseInfo.det
 refused `GET /messages/{id}` outright, since that route gates on `messages:view_raw`, which a Viewer
 does not hold. The other five rows (`MessageDetail` × 3, `OutboxInfo.last_error`, `EventInfo.detail`)
 are reached only by a role holding `view_raw` — including a custom role granted `view_raw` **without**
-`view_summary`, which is precisely why those rows sit on the `view_summary` tier. Deployment, Coding
-and Auditor hold neither either) — but that is a
+`view_summary`, which is precisely why those rows sit on the `view_summary` tier. The thirteenth row,
+`AlertInstanceInfo.reason`, is reached only by a role holding `monitoring:diagnose`: of the built-in
+roles only Operator and Administrator hold it, and both also hold `view_summary`, so the row is
+withheld only from a custom role granted `monitoring:diagnose` without `view_summary`. Deployment,
+Coding and Auditor hold neither `view_raw` nor `view_summary`, and reach the `ConnectionEventInfo.reason`
+row through `monitoring:read`) — but that is a
 **role-policy** convention, not a permission-model guarantee, and the split is **reachable**: a custom
 role may be granted `view_raw` without `view_summary` (only `users:manage`, `approvals:approve` and
 `dr:operate` are non-assignable). The disposition fields therefore sit on the `view_summary` tier
@@ -1968,9 +1972,11 @@ outside the map.
 `ConnectionEventInfo.reason` (`GET /events`, `GET /connections/{name}/events`) and
 `AlertInstanceInfo.reason` (`GET /alerts/active`) are free text that [PHI.md](PHI.md) §2 classifies as
 ***possibly*** PHI-bearing. **Since BACKLOG #2443 both are in the per-property map**, on the
-`messages:view_summary` tier, because their routes gate only on `monitoring:read` /
-`monitoring:diagnose`, which the built-in Viewer, Deployment, Coding and Auditor roles hold with no PHI
-permission. A holder gets each reason as a fixed `****` until a per-item `reveal=<id>` act, which
+`messages:view_summary` tier, because their routes gate only on a monitoring permission.
+`monitoring:read` (the event routes) is held by every built-in role, and the Viewer, Deployment, Coding
+and Auditor roles hold it with no PHI permission. `monitoring:diagnose` (the alert route) is held only
+by the built-in Operator and Administrator, which both hold `messages:view_summary` too; a custom role
+may hold `monitoring:diagnose` without it, and that role is the one the alert gate masks. A holder gets each reason as a fixed `****` until a per-item `reveal=<id>` act, which
 needs `messages:view_summary`, charges the PHI-read budget, and is audited. They are also still
 defended by `safe_exc()` at the emit site plus `safe_text(reason)[:200]` at the store, then
 cipher-encrypted (PHI.md §2/§7); the scrubber is not de-identification, which is why the gate exists.

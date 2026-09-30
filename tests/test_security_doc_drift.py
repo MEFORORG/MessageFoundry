@@ -288,8 +288,9 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
 #: which is the review the fail-open default (an unmapped model is returned in full) makes mandatory.
 _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     "AlertInstanceList": (
-        "envelope: alerts + total + worst_severity — a count and a severity NAME "
-        "('info'/'warning'/'critical'), both aggregated from alert metadata, no message data"
+        "envelope: AlertInstanceInfo rows (mapped; reason gated, BACKLOG #2443) + total + "
+        "worst_severity — a count and a severity NAME ('info'/'warning'/'critical'), both "
+        "aggregated from alert metadata; the envelope's own fields carry no message data"
     ),
     "AlertRuleInfo": "operator-authored rule name/type/threshold — configuration, not message data",
     "AlertTestEmailResult": (

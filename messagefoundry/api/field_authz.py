@@ -85,10 +85,13 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     CapturedResponseInfo: {
         "detail": Permission.MESSAGES_VIEW_SUMMARY,
     },
-    # The connection event log and the alert list (BACKLOG #2443). Their routes need only
-    # ``monitoring:*``, which the built-in Viewer, Deployment, Coding and Auditor roles hold without
-    # any PHI permission, so the reason is gated here on the same tier as ``messages.error``: the
-    # same ``safe_exc`` text reaches ``connection_event.reason`` and ``alert_instance.reason``.
+    # The connection event log and the alert list (BACKLOG #2443). The event routes need only
+    # ``monitoring:read``, which the built-in Viewer, Deployment, Coding and Auditor roles hold
+    # without any PHI permission. The alert route needs ``monitoring:diagnose``, which only the
+    # built-in Operator and Administrator hold, and both also hold ``messages:view_summary``; a
+    # custom role may hold ``monitoring:diagnose`` without it. So the reason is gated here on the
+    # same tier as ``messages.error``: the same ``safe_exc`` text reaches ``connection_event.reason``
+    # and ``alert_instance.reason``.
     ConnectionEventInfo: {
         "reason": Permission.MESSAGES_VIEW_SUMMARY,
     },
