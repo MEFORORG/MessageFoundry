@@ -857,16 +857,36 @@ _CATALOGUE = (
 _CATALOGUE_WITHOUT_SHA224 = (
     "ecdsa_secp256r1_sha256:ecdsa_sha1:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:dsa_sha256"
 )
+#: The first list tried: ML-DSA put back at the front with OpenSSL's ``?`` prefix.
+_PINNED_MARKED = "?mldsa65:?mldsa87:?mldsa44:" + _CATALOGUE_WITHOUT_SHA224
+#: The second: the same names without the prefix, for a build that refuses ``?``.
+_PINNED_PLAIN = "mldsa65:mldsa87:mldsa44:" + _CATALOGUE_WITHOUT_SHA224
 
 
 class _SigalgCapableContext(ssl.SSLContext):
     """A stand-in for a CPython 3.15 context: a real context that also has ``set_server_sigalgs``.
-    It records the argument instead of applying it, so the branch 3.14 cannot reach runs here."""
+    It records every list it is handed, and refuses (as OpenSSL does, with ``ssl.SSLError``) any
+    list for which ``refuse`` returns True, so each fallback arm can be driven."""
 
     sigalg_calls: list[str]
 
+    def refuse(self, sigalgs: str) -> bool:
+        return False
+
     def set_server_sigalgs(self, sigalgs: str) -> None:
         self.sigalg_calls = [*getattr(self, "sigalg_calls", []), sigalgs]
+        if self.refuse(sigalgs):
+            raise ssl.SSLError("unrecognized signature algorithm")
+
+
+class _RefusesThePrefix(_SigalgCapableContext):
+    def refuse(self, sigalgs: str) -> bool:
+        return "?" in sigalgs
+
+
+class _RefusesMlDsa(_SigalgCapableContext):
+    def refuse(self, sigalgs: str) -> bool:
+        return "mldsa" in sigalgs
 
 
 @pytest.fixture
@@ -886,11 +906,50 @@ def _pin_acts_here() -> bool:
 
 @pytest.mark.usefixtures("catalogue")
 def test_the_pin_passes_openssls_catalogue_minus_sha224_in_order() -> None:
+    """The first list: ML-DSA marked with ``?`` in front, then the catalogue in its own order."""
     ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
     assert tls_policy.narrow_signature_algorithms(ctx) is True
-    assert ctx.sigalg_calls == [_CATALOGUE_WITHOUT_SHA224]
+    assert ctx.sigalg_calls == [_PINNED_MARKED]
     # Control: the catalogue did hold three SHA-224 names, so the filter removed something.
     assert sum("sha224" in n.lower() for n in _CATALOGUE) == 3
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_a_build_refusing_the_prefix_gets_ml_dsa_plain() -> None:
+    ctx = _RefusesThePrefix(ssl.PROTOCOL_TLS_CLIENT)
+    assert tls_policy.narrow_signature_algorithms(ctx) is True
+    assert ctx.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN]
+
+
+@pytest.mark.usefixtures("catalogue")
+def test_a_build_refusing_ml_dsa_still_drops_sha224_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ML-DSA alone never fails closed: the list without it is applied, with one warning."""
+    monkeypatch.setattr(tls_policy, "_SIGALGS_MLDSA_WARNED", False)
+    first, second = _RefusesMlDsa(ssl.PROTOCOL_TLS_CLIENT), _RefusesMlDsa(ssl.PROTOCOL_TLS_CLIENT)
+    with caplog.at_level("WARNING", logger=tls_policy.logger.name):
+        assert tls_policy.narrow_signature_algorithms(first) is True
+        assert tls_policy.narrow_signature_algorithms(second) is True
+    assert first.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN, _CATALOGUE_WITHOUT_SHA224]
+    warned = [r for r in caplog.records if "ML-DSA" in r.getMessage()]
+    assert len(warned) == 1, [r.getMessage() for r in warned]
+
+
+def test_ml_dsa_already_in_the_catalogue_is_not_added_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later OpenSSL may list ML-DSA itself, even only some of it. Then its own list and order
+    are passed as they are, once, and nothing is put in front."""
+    listed = ["mldsa65", "rsa_pkcs1_sha256", "rsa_pkcs1_sha224", "mldsa87", "mldsa44"]
+    monkeypatch.setattr(ssl, "get_sigalgs", lambda: list(listed), raising=False)
+    tls_policy._sigalgs_without_sha224.cache_clear()
+    ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        assert tls_policy.narrow_signature_algorithms(ctx) is True
+    finally:
+        tls_policy._sigalgs_without_sha224.cache_clear()
+    assert ctx.sigalg_calls == ["mldsa65:rsa_pkcs1_sha256:mldsa87:mldsa44"]
 
 
 @pytest.mark.usefixtures("catalogue")
@@ -900,8 +959,8 @@ def test_both_narrowing_routes_reach_the_pin() -> None:
     tls_policy.narrow_to_approved_suites(default)
     operator = _SigalgCapableContext(ssl.PROTOCOL_TLS_SERVER)
     tls_policy.apply_operator_tls_ciphers(operator, "ECDHE-ECDSA-AES256-GCM-SHA384")
-    assert default.sigalg_calls == [_CATALOGUE_WITHOUT_SHA224]
-    assert operator.sigalg_calls == [_CATALOGUE_WITHOUT_SHA224]
+    assert default.sigalg_calls == [_PINNED_MARKED]
+    assert operator.sigalg_calls == [_PINNED_MARKED]
 
 
 @pytest.mark.usefixtures("catalogue")
@@ -915,17 +974,30 @@ def test_the_pin_reaches_the_inner_truststore_context() -> None:
     inner = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx._ctx = inner
     assert tls_policy.narrow_signature_algorithms(ctx) is True
-    assert inner.sigalg_calls == [_CATALOGUE_WITHOUT_SHA224]
+    assert inner.sigalg_calls == [_PINNED_MARKED]
 
 
 @pytest.mark.usefixtures("catalogue")
-def test_a_list_the_build_refuses_raises_runtime_error() -> None:
-    class _Refusing(ssl.SSLContext):
-        def set_server_sigalgs(self, sigalgs: str) -> None:
-            raise ssl.SSLError("unrecognized signature algorithm")
+def test_a_build_refusing_every_list_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only a refusal of the list WITHOUT ML-DSA fails closed, after both ML-DSA lists were tried.
+    No ML-DSA warning is logged, because it would say SHA-224 was removed when it was not."""
 
-    with pytest.raises(RuntimeError, match="without SHA-224"):
-        tls_policy.narrow_signature_algorithms(_Refusing(ssl.PROTOCOL_TLS_CLIENT))
+    class _Refusing(_SigalgCapableContext):
+        def refuse(self, sigalgs: str) -> bool:
+            return True
+
+    monkeypatch.setattr(tls_policy, "_SIGALGS_MLDSA_WARNED", False)
+    ctx = _Refusing(ssl.PROTOCOL_TLS_CLIENT)
+    with (
+        caplog.at_level("WARNING", logger=tls_policy.logger.name),
+        pytest.raises(RuntimeError, match="without SHA-224"),
+    ):
+        tls_policy.narrow_signature_algorithms(ctx)
+    assert ctx.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN, _CATALOGUE_WITHOUT_SHA224]
+    assert not [r for r in caplog.records if "ML-DSA" in r.getMessage()]
+    assert tls_policy._SIGALGS_MLDSA_WARNED is False
 
 
 def test_a_catalogue_of_only_sha224_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -934,7 +1006,7 @@ def test_a_catalogue_of_only_sha224_fails_closed(monkeypatch: pytest.MonkeyPatch
     tls_policy._sigalgs_without_sha224.cache_clear()
     ctx = _SigalgCapableContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
-        with pytest.raises(RuntimeError, match="nothing but SHA-224"):
+        with pytest.raises(RuntimeError, match="no scheme left once SHA-224 is removed"):
             tls_policy.narrow_signature_algorithms(ctx)
     finally:
         tls_policy._sigalgs_without_sha224.cache_clear()
@@ -1004,8 +1076,8 @@ def _version_matched_stock(ctx: ssl.SSLContext) -> ssl.SSLContext:
 def test_destination_sha224_offer_follows_the_runtime(
     site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
 ) -> None:
-    """Where the pin acts, no SHA-224 scheme is offered, and the offer only ever shrinks, by
-    SHA-224 and the ML-DSA schemes the catalogue omits. Where it cannot act, which is 3.14, the
+    """Where the pin acts, no SHA-224 scheme is offered, and the offer shrinks by SHA-224 only:
+    the ML-DSA schemes the catalogue omits are put back. Where it cannot act, which is 3.14, the
     offer equals a stock context's with the same protocol bounds, whole and in order."""
     ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
     offered = client_offer(ctx).sigalgs
@@ -1014,7 +1086,9 @@ def test_destination_sha224_offer_follows_the_runtime(
         assert not set(offered) & SHA224_SCHEMES, f"{site}: SHA-224 still offered: {offered}"
         assert set(offered) <= set(stock), f"{site}: the pin widened the offer"
         dropped = set(stock) - set(offered)
-        assert dropped <= SHA224_SCHEMES | MLDSA_SCHEMES, f"{site}: also dropped {sorted(dropped)}"
+        assert dropped <= SHA224_SCHEMES, f"{site}: also dropped {sorted(dropped)}"
+        kept_mldsa = set(stock) & MLDSA_SCHEMES
+        assert kept_mldsa <= set(offered), f"{site}: ML-DSA left the offer"
     else:
         assert offered == stock, f"{site}: the offer moved on a runtime with no pin"
 

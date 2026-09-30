@@ -1078,8 +1078,16 @@ def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
 #: ``ecdsa_sha224`` and ``dsa_sha224`` (codepoints 0x0301, 0x0303, 0x0302). Matched case-blind.
 _SHA224_SIGALG_MARKER = "sha224"
 
+#: The ML-DSA schemes OpenSSL 3.5 adds through a provider, in the order its stock offer lists them
+#: (0x0905, 0x0906, 0x0904). ``ssl.get_sigalgs`` does not list provider schemes, so these are put
+#: back by name, at the front, where the stock offer has them (Manager ruling on BACKLOG #1171).
+_PROVIDER_MLDSA_SIGALGS = ("mldsa65", "mldsa87", "mldsa44")
+
 #: Set once the "cannot narrow" warning has been logged, so a context built per send logs it once.
 _SIGALGS_PIN_WARNED = False
+
+#: Set once the "ML-DSA left out" warning has been logged, for the same reason.
+_SIGALGS_MLDSA_WARNED = False
 
 
 @functools.cache
@@ -1101,6 +1109,17 @@ def _sigalgs_without_sha224() -> str | None:
     return ":".join(name for name in catalogue if _SHA224_SIGALG_MARKER not in name.lower())
 
 
+def _sigalg_candidates(base: str) -> tuple[str, str, str]:
+    """The lists to try, in order: ML-DSA with OpenSSL's ``?`` (ignore if unknown) prefix, ML-DSA
+    plain for a build without that prefix, then ``base`` alone. If ``base`` already holds any
+    ML-DSA name, a later OpenSSL lists them itself, so its own list and order are used as they are."""
+    held = {name.lower() for name in base.split(":")}
+    if held & set(_PROVIDER_MLDSA_SIGALGS):
+        return base, base, base
+    marked = ":".join(f"?{name}" for name in _PROVIDER_MLDSA_SIGALGS)
+    return f"{marked}:{base}", ":".join([*_PROVIDER_MLDSA_SIGALGS, base]), base
+
+
 def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     """Take the SHA-224 signature schemes out of ``ctx``; return whether it did (BACKLOG #1171).
 
@@ -1119,26 +1138,34 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     and which peer signature a client accepts (read in OpenSSL 3.5 ``ssl/t1_lib.c``,
     ``tls12_get_psigalgs``). No handshake has been run on 3.15 here, so that reading is unmeasured.
 
-    **The list is OpenSSL's own catalogue minus SHA-224, not a hand-picked list.** ``ssl.get_sigalgs``
-    returns every scheme libssl has built in and can use. Two measured facts make it differ from the
-    default offer, and both are accepted rather than hidden:
+    **The list is OpenSSL's own catalogue minus SHA-224, with ML-DSA put back.** ``ssl.get_sigalgs``
+    returns every scheme libssl has built in and can use, so nothing is hand-picked there. It omits
+    the schemes a provider adds, which on OpenSSL 3.5 are the three ML-DSA schemes (0x0904 to
+    0x0906), and the stock ClientHello offers those first. The ruling was no interop change, and the
+    post-quantum roadmap (ADR 0019) needs ML-DSA kept, so :data:`_PROVIDER_MLDSA_SIGALGS` puts them
+    back at the front by name. Three lists are tried in order:
 
-    * It omits schemes a provider adds, which on OpenSSL 3.5 are the three ML-DSA schemes (0x0904 to
-      0x0906). Measured on CPython 3.14.6 / OpenSSL 3.5.7, the stock ClientHello offers them first.
-      So a pinned context stops offering ML-DSA. That matters only to a peer with an ML-DSA
-      certificate, and to an engine side holding one: it would have no scheme left to sign with.
-    * On the wire, once the security level has removed SHA-1, its order differs from the default in
-      one place: ``rsa_pss_rsae_*`` comes before ``rsa_pss_pss_*``. The two apply to different key
-      types, so no certificate can use both. (The default order is read from OpenSSL's source.)
+    1. ML-DSA with OpenSSL's ``?`` prefix, which skips a name the build does not know;
+    2. ML-DSA without it, for a build that does not accept the prefix;
+    3. the catalogue minus SHA-224 alone. This drops ML-DSA and logs a warning once per process.
+
+    ML-DSA alone never makes this fail closed. Only a refusal of the third list raises.
+
+    Measured through the OpenSSL 3.5.7 command line (``-sigalgs``, which sets the same list through
+    the same OpenSSL call; not a CPython 3.15 run): the first list took, and the ClientHello lost
+    exactly 0x0301, 0x0302 and 0x0303. One order change
+    remains on the wire, once the security level has removed SHA-1: ``rsa_pss_rsae_*`` comes before
+    ``rsa_pss_pss_*``. The two apply to different key types, so no certificate can use both.
 
     SHA-1 schemes stay in the list, as they are in the default one. The OpenSSL security level
     filters them out of what is sent, and :func:`refuse_lowered_security_level` holds that level.
 
     **``False`` means SHA-224 is still offered.** That is CPython 3.14, which has no setter, and a
     3.15 linked to an OpenSSL older than 3.4, whose catalogue cannot be read. The second case logs a
-    warning once per process. An OpenSSL that refuses the list, or a catalogue with nothing left once
-    SHA-224 is gone, raises :class:`RuntimeError`, as :func:`narrow_tls13_suites` does, so the
-    failure is never blamed on an operator's ``tls_ciphers``.
+    warning once per process and keeps today's behaviour, as 3.14 does (accepted by the Manager on
+    BACKLOG #1171). An OpenSSL that refuses the list without ML-DSA, or a catalogue with no scheme
+    left once SHA-224 is removed, raises :class:`RuntimeError`, as :func:`narrow_tls13_suites` does,
+    so the failure is never blamed on an operator's ``tls_ciphers``.
 
     **Reach.** Every engine-built context that narrows its suites, through
     :func:`narrow_to_approved_suites` or :func:`apply_operator_tls_ciphers`. At least these are not
@@ -1164,16 +1191,35 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
         return False
     if not names:
         raise RuntimeError(
-            "OpenSSL's signature scheme catalogue holds nothing but SHA-224, so no list is left to "
-            "pin (BACKLOG #1171)"
+            "OpenSSL's signature scheme catalogue has no scheme left once SHA-224 is removed, so "
+            "there is no list to pin (BACKLOG #1171)"
         )
+    marked, plain, base = _sigalg_candidates(names)
+    if marked != base:  # there is ML-DSA to put back
+        for candidate in (marked, plain):
+            try:
+                target.set_server_sigalgs(candidate)
+            except ssl.SSLError:
+                continue  # this build refused the ML-DSA names or the prefix; try the next list
+            return True
     try:
-        target.set_server_sigalgs(names)
+        target.set_server_sigalgs(base)
     except ssl.SSLError as exc:
         raise RuntimeError(
             f"this OpenSSL build refused the engine's signature scheme list, OpenSSL's own "
             f"catalogue without SHA-224 (BACKLOG #1171): {exc}"
         ) from exc
+    global _SIGALGS_MLDSA_WARNED
+    if marked != base and not _SIGALGS_MLDSA_WARNED:
+        # Only after the list without ML-DSA took, so the log never says SHA-224 is gone when the
+        # RuntimeError above says it is not.
+        _SIGALGS_MLDSA_WARNED = True
+        logger.warning(
+            "This OpenSSL (%s) refused the TLS signature scheme list with ML-DSA in it, so "
+            "SHA-224 is removed and ML-DSA is not offered either (BACKLOG #1171). Logged once "
+            "per process.",
+            ssl.OPENSSL_VERSION,
+        )
     return True
 
 
