@@ -351,7 +351,7 @@ directory, where a write lands unseen. A query also takes `-RecordRepo` with a v
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge. Decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge. Decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **THE LANDER MAY RESOLVE A CONFLICT THAT TOUCHES CODE. OWNER RULING 2026-09-29, IN SESSION.** The
@@ -403,7 +403,7 @@ the discriminator was whether the resolution decided *where a row sits* or *what
 **Read the retired text as a GRANT WITH A LIMIT, which is the form it had:** *may resolve a
 positional conflict, and only that*. Retiring it removes the engine-local sentence, both halves.
 **It issues no licence in its place: this notice adds no permission to this repository**, and the
-Must-not column above keeps its code clause untouched. *(That clause was removed by the owner ruling of 2026-09-29, stated above the roster notes.)* What the Lander may now do where the retired
+Must-not column above keeps its code clause untouched. *(The owner ruling of 2026-09-29, in the note directly under the roster table, removed that clause.)* What the Lander may now do where the retired
 rule used to speak is a korus playbook question, named below.
 
 **Three grounds. They are CUMULATIVE, and are laid out separately rather than as three independent
@@ -472,11 +472,12 @@ invisible to a reader who greps only for the heading text:
 
 **RESOLVED 2026-09-29 BY OWNER RULING, IN SESSION: THE LANDER MAY RESOLVE A CONFLICT THAT TOUCHES
 CODE.** korus *4c-quinquies* governs the route, and the Lander's own resolution needs its own code
-review before the merge. The notice below is kept as the record of the collision, and its "raise it"
-and "ask" instructions no longer apply.
+review before the merge. The notice below stays only as the record of the collision. None of its
+instructions apply any more: do not hold a pull request, raise the question, or ask it.
 
 **THE CODE CLAUSE AND korus 4c-quinquies COLLIDE ON ONE CASE. THE COLLISION IS UNRESOLVED AND NO
-SEAT MAY PICK.** Recorded here because a Lander hit it on 2026-09-21 and stopped, correctly, with
+SEAT MAY PICK.** *CORRECTED 2026-09-29: resolved by the owner. This heading is history; the banner
+above governs.* Recorded here because a Lander hit it on 2026-09-21 and stopped, correctly, with
 nothing in either repository telling it what had happened.
 
 **The two texts, verbatim, both live at `origin/main` on 2026-09-21.** This file's roster row,
