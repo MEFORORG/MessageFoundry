@@ -657,17 +657,18 @@ This section is kept rather than deleted, because the claim it used to make is t
 > `[auth].oidc_enabled` is on. These are the BACKLOG #2301 time floors, beside
 > `admin_write_min_interval_seconds` above. Each refuses an action that comes sooner than the floor and
 > skips the check at `0`, so a floor below its default of `1.0` s is named as looser and `0` as off. A
-> higher floor refuses more and is not named; the load keeps it below the idle timeout and the flow
-> lifetime.
+> higher floor refuses more and is not named.
 - **What you lose:** the MFA floor refuses a code or passkey that completes an MFA-pending session too
   soon after sign-in. It applies to any account with a factor, whether or not `require_mfa` is on. The
-  callback floor refuses a federated sign-in that returns too soon after it started. Below the default, a
-  script holding a password, or driving a flow, may finish the second step faster than a person could
-  read the prompt and answer it.
+  callback floor refuses a federated step-up, or a sign-in whose `auth_time` falls inside the flow, that
+  returns too soon after it started. Below the default, a script holding a password, or driving a flow,
+  may finish the second step faster than a person could read the prompt and answer it. The floors bound
+  only the first moments after sign-in; they do not pace guessing after that.
 - **When acceptable:** rarely; the floors cost a person nothing at the default. An automated test
   harness on a host no untrusted client can reach is the usual case.
 - **Compensating controls:** keep the sign-in limits and the lockout at their defaults, and review the
-  `auth.mfa_failed` rows.
+  audit rows with `reason=too_early` (under `auth.mfa_failed`, `auth.webauthn_failed`,
+  `auth.login_failed` and `auth.reauth`).
 - **Reversible:** yes, immediately — restore `1.0` (or delete the line) and restart.
 
 ### `[auth].max_sessions_per_user` of `0` or above `5` — more live sessions per user

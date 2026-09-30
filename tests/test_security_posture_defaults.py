@@ -578,10 +578,19 @@ def test_sign_in_limiter_and_lockout_off_with_sign_in_off_are_NOT_loosenings() -
             phi_read_rate_limit_enabled=False,
             admin_write_rate_limit_enabled=False,
             max_sessions_per_user=0,
+            mfa_verify_min_elapsed_seconds=0,
         ),
     )
     assert "require_sign_in" in named
     assert not _SIGN_IN_FIELDS & set(named)
+    assert "mfa_verify_min_elapsed_seconds" not in named
+    # The OIDC-gated entries sit behind the sign-in gate too.
+    federated = _names(
+        sec=SecuritySettings(require_sign_in=False),
+        auth=_oidc(oidc_callback_min_elapsed_seconds=0, oidc_flow_cache_max=1_000_000_000),
+    )
+    assert "oidc_callback_min_elapsed_seconds" not in federated
+    assert "oidc_flow_cache_max" not in federated
 
 
 def test_gated_on_the_security_switch_not_a_stale_auth_section() -> None:

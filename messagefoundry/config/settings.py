@@ -6169,7 +6169,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     * The BACKLOG #2301 time floors (``admin_write_min_interval_seconds``,
       ``mfa_verify_min_elapsed_seconds``, ``oidc_callback_min_elapsed_seconds``) refuse an action that
       comes sooner than the floor and skip the check at 0 or less, so a floor below its default is
-      looser and 0 is off. A higher floor is stricter; the load bounds it above.
+      looser and 0 is off. A higher floor is stricter, and is not named.
 
     **Not covered, and stated so the gap is visible:** ``[approvals].min_dwell_seconds``, the
     dual-control approval floor, is another time floor of the same kind. It lives in a section this
@@ -6412,8 +6412,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             auth.admin_write_min_interval_seconds,
             what="the minimum gap between one actor's admin writes",
             so=(
-                "a script may spend the per-actor count faster than the fastest write the "
-                "keystroke-level model allows a person"
+                "a script may spend the per-actor count even faster than the default allows, and "
+                "the default already sits just under the fastest keystroke-level write (0.16 s)"
             ),
             off=(
                 "there is no minimum gap between one actor's admin writes, so the whole "
@@ -6430,12 +6430,12 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         auth.mfa_verify_min_elapsed_seconds,
         what="the least time between sign-in and the second factor",
         so=(
-            "a script holding a password may submit a guessed or relayed code sooner after "
-            "sign-in than a person could take in the prompt and answer it"
+            "a script holding a password may complete the second step with a relayed or scripted "
+            "code sooner after sign-in than a person could take in the prompt and answer it"
         ),
         off=(
             "there is no least time between sign-in and the second factor, so a script holding "
-            "a password may submit a guessed or relayed code at machine speed"
+            "a password may complete the second step with a relayed or scripted code at once"
         ),
     )
 
