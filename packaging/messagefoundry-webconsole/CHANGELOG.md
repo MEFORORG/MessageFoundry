@@ -22,7 +22,7 @@ this line.**
 
 ## [0.4.0] — 2026-09-30 — Early Access
 
-**Requires engine 0.5.0. Supported engine UI seam: `10a6cc7c95459dcc`**, the value engine 0.5.0
+**Requires engine 0.5.0. Supported engine UI seam: `32ad621e6081555e`**, the value engine 0.5.0
 ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
 to start. Engine 0.4.0 fails while importing this console, and the entry under Changed says why.
 Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two together.
@@ -90,6 +90,9 @@ Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two togethe
     shown in UTC.
 
 ### Changed
+- **The engine UI seam moved because the engine dropped the `content_match` alert filter**
+  (`BACKLOG #1504`). `AlertRuleInfo` lost its `content_label` field, which is part of the seam.
+  Nothing the console does changed.
 - **The error text is masked until the operator asks** (`BACKLOG #2436`, ASVS 14.2.6, owner
   ruling R12). The detail page shows the message's error, each delivery's last error and each
   event's detail as `****`, each with a "Reveal" link to the new `/ui/messages/{id}/errors`. The
@@ -125,7 +128,7 @@ Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two togethe
   carrying the same change.
 - **BREAKING — the engine UI seam moved again, so this console no longer pairs with engine 0.4.0**
   (`BACKLOG #1141`, PR 1456). `SUPPORTED_ENGINE_SEAMS` no longer holds `75c4117d21fd0b98`, the
-  seam engine 0.4.0 ships. It holds `10a6cc7c95459dcc`, the seam engine 0.5.0 ships. The console now imports three helpers from
+  seam engine 0.4.0 ships. It holds `32ad621e6081555e`, the seam engine 0.5.0 ships. The console now imports three helpers from
   `messagefoundry.api.security`: `pending_credential_deadline`, `pending_credential_deadline_for`
   and `initial_credential_window_hours`. Engine 0.4.0 has none of them. So with the console on,
   engine 0.4.0 fails while importing this console and reports it as not installed. It never reaches

@@ -8,6 +8,18 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [0.5.0] — 2026-09-30 — Early Access
 
+### Removed
+- **BREAKING: the `content_match` alert event type and the `content_label` rule filter are gone.**
+  Nothing outside the tests could ever fire them. An `[[alerts.rules]]` entry naming `event_type =
+  "content_match"` or setting `content_label` is now refused at load, like any unknown event type
+  or key. `GET /alerts/rules` no longer reports `content_label` on a rule, and an alert instance's
+  `reason` no longer falls back to an event `label`. ADR 0133 D3 is retracted and not planned, by
+  owner ruling 2026-09-30; the ADR's "Retraction of D3" bullet says why
+  ([ADR 0133](docs/adr/0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)).
+  D1 escalation tiers, D2 schedule-aware rules and the D4 `escalation_tier` column are unchanged.
+  The engine UI seam digest moved with the `AlertRuleInfo` field set, so the web console's
+  `SUPPORTED_ENGINE_SEAMS` moved with it. (`BACKLOG #1504`)
+
 ### Added
 - **BREAKING: `adr-analyze` moved to a separate `messagefoundry-toolkit` command, and out of the
   engine wheel.** ADR 0201 slice 2 adds a third sibling distribution, `messagefoundry-toolkit`,
@@ -2239,7 +2251,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   release, tagged `webconsole-v0.3.0` beside engine 0.4.0, accepts only `75c4117d21fd0b98`. So
   with the console on, this engine refuses to start with that release installed
   (`UiSeamMismatch`). The version number alone does not tell a matching console apart, so check
-  the constant. Engine 0.5.0 ships `10a6cc7c95459dcc`, which web console 0.4.0 accepts.
+  the constant. Engine 0.5.0 ships `32ad621e6081555e`, which web console 0.4.0 accepts.
   **Migration:** upgrade the web console to 0.4.0 together with the engine. Or set
   `[security].serve_web_console = false` to run the JSON API alone. (`BACKLOG #1141`)
 - **BREAKING — the `403` for a session that must change its password is no longer always the exact

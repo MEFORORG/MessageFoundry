@@ -37,7 +37,7 @@ absent, it serves the JSON API only and prints a warning at startup. Setting
 
 The console pins itself against the engine's `ENGINE_UI_SEAM` (`SUPPORTED_ENGINE_SEAMS` +
 `assert_engine_seam`) and supports **exactly one** seam — the engine build it was released against
-(BACKLOG #279). Console 0.4.0 supports seam `10a6cc7c95459dcc`, which is engine 0.5.0. With the
+(BACKLOG #279). Console 0.4.0 supports seam `32ad621e6081555e`, which is engine 0.5.0. With the
 console on, the engine refuses to start beside any other console. The refusal is `UiSeamMismatch`
 when startup reaches the seam check, and an import error when a mismatched pair fails before it.
 
