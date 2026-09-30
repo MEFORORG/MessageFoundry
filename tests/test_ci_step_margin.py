@@ -837,8 +837,9 @@ def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
     be observed as far above the cap, in ratio, as the floor reserves below it. A bare `kill > cap`
     would be satisfied by one minute and would leave the sample censored a hair above the cap.
 
-    Falsified by lowering windows-2025's kill from 12 to 11 (1.222x): RED, naming the leg and both
-    numbers. Restored.
+    Falsified by lowering windows-2022's kill from 11 to 10 against its cap of 8 (1.250x): RED, naming
+    the leg and both numbers. Restored. (The earlier falsification, windows-2025's kill 12 to 11,
+    was measured at a cap of 9; at the cap of 8 it gives 1.375x and no longer reds.)
     """
     legs = _matrix_legs()
     names = {leg["os"] for leg in legs}
@@ -877,10 +878,11 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
     state #1842 was filed against, with 5 of 30 merge groups ejected. A cap raised by hand with no
     new row is the other drift: a bound derived from another bound. So two assertions: the row is
     not LOW at its cap, against the gate's own floor; and the cap is exactly the sizing rule ci.yml's
-    "THE SECOND RE-DERIVATION" note states, ceil_minute(1.35x the row), floored at 5:00.
+    "THE SECOND RE-DERIVATION" note states and "THE THIRD RE-DERIVATION" applies, ceil_minute(1.35x
+    the row), floored at 5:00.
 
-    Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:24 row (7:00 /
-    5:24 = 1.296x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
+    Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:43 row (7:00 /
+    5:43 = 1.224x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
     RED on the rule. Restored both times.
     """
     rows = load_baselines(_BASELINE_FILE)
@@ -1062,7 +1064,7 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
         # step, whose own note in ci.yml offers 2 as "the conservative rung" when engine timing tests
         # flake. Taking that rung halves THIS step's workers, and every margin figure #1879 recorded
         # was measured at 4 -- 1.058x and 1.103x were what the two breaching legs needed at the caps
-        # then in force (windows-2025's cap is lower now, so its need is higher), with no
+        # then in force (every cap has moved since; see ci.yml's "THE THIRD RE-DERIVATION"), with no
         # measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
         # let the merge-group ejections come back while still reading as a parallelism guard.
         assert isinstance(count, int) and count >= 4, (
