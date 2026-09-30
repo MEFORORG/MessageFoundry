@@ -23,7 +23,7 @@ every one of those tokens on purpose. Under ``scripts`` alone the pattern reads 
 comments and strings blanked (BACKLOG #2040), so the tokens here would go quiet; but the positive
 controls still read that root raw, and this file is a test, not tooling.
 
-⚠️ The ±2-line prohibition window has ONE line of margin, by measurement rather than by design:
+WARNING: The ±2-line prohibition window has ONE line of margin, by measurement rather than by design:
 ``AOAG-DEPLOYMENT.md``'s "the engine login never needs ``ALTER DATABASE`` rights" sits exactly three
 lines from the defect it must not be allowed to excuse. Do not widen the window.
 """
