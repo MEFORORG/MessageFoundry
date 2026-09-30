@@ -6,6 +6,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-30 — Early Access
+
 ### Added
 - **BREAKING: `adr-analyze` moved to a separate `messagefoundry-toolkit` command, and out of the
   engine wheel.** ADR 0201 slice 2 adds a third sibling distribution, `messagefoundry-toolkit`,
@@ -643,6 +645,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   guide give the `--db` the installed service uses. `docs/SECURITY.md` replaces its first-run account sections with one
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
+- **Changelog entries are now fragment files, assembled at release.** A pull request adds one
+  file, `changelog.d/<item>.<category>.md`, instead of editing the `[Unreleased]` section of
+  `CHANGELOG.md`, so two open pull requests no longer conflict there. The release pull request runs
+  `python scripts/release/changelog_fragments.py assemble`, which appends every fragment under
+  `[Unreleased]` and deletes it. CI refuses a malformed fragment, and refuses a release pull
+  request that still has fragments. A pull request that still edits `CHANGELOG.md`
+  gets a warning, not a failure. The release workflow refuses to publish a tag while a fragment is
+  left unassembled. `changelog.d/README.md` has the naming rules. (`BACKLOG #2080`)
 ### Fixed
 - **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
   the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
@@ -4713,7 +4723,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.0...v0.3.1
