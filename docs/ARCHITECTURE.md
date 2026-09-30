@@ -360,7 +360,7 @@ hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`**
 - `hl7apy` — version-aware validation + profiles (opt-in strict path)
 - `pydantic` — config / connector models and validation
 - `aiosqlite` — async SQLite for the message store / queue
-- `fastapi` + `uvicorn[standard]` — localhost engine API
+- `fastapi` + `uvicorn` (with `httptools`, `websockets` and, outside Windows, `uvloop`) — localhost engine API
 - `argon2-cffi` — argon2id password hashing
 - `cryptography` — AES-256-GCM at-rest encryption for the store
 - `ldap3` + `pyspnego` — Active Directory / LDAP auth and Windows SSO (Kerberos)

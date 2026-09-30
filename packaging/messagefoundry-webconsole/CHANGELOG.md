@@ -137,6 +137,15 @@ under Changed says why engine 0.4.0 does not work with this console.
   holds the new value and the one-value rule above still applies.
 
 ### Fixed
+- **The dead-letter replay buttons cover every channel, not only the rows on the page**
+  (`BACKLOG #1743`, step 2). The per-channel and per-destination buttons used to come from the
+  rows drawn, so a channel whose dead deliveries sat past the first page had no button. They now
+  come from the engine's new `DeadLetterList.replay_targets`. A page filtered to one destination
+  draws no per-channel button, which would replay the channel's other destinations too. "Replay
+  all dead (every channel)" stays global and says so; it now shows whenever the engine's
+  `replayable_in_scope` is true, even on a filtered page that matched nothing. Needs the new
+  engine seam: `DeadLetterList` gained `replay_targets` and `replayable_in_scope`, and
+  `DeadLetterTarget` is new, so the seam digest moved.
 - **The enrol-first notice no longer offers a passkey the engine refuses** (`BACKLOG #1133`, ADR
   0197 Amendment A). A local account `require_mfa` covers that has no TOTP now reads "enroll an
   authenticator app (TOTP)"; other accounts still see both choices.

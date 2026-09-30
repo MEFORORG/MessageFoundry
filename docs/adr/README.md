@@ -24,7 +24,9 @@ ADR numbers; the row gets a title/file/link when the ADR is authored.
 Criteria** in EARS form, each linked (`→`) to the test or fixture that verifies it, and resolve the
 **To resolve on acceptance** items before flipping to `Accepted` — the spec-driven practices
 recommended in [Secure Development Standards §5.](../Secure_Development_Standards.md) Run
-`messagefoundry adr-analyze` for an advisory report of criteria→test coverage and open clarifications.
+`python -m messagefoundry_toolkit adr-analyze` from a checkout for an advisory report of criteria→test
+coverage and open clarifications. It is a toolkit command, not an engine one: ADR 0201 moved it out of
+the `messagefoundry` command, so an installed toolkit runs it as `messagefoundry-toolkit adr-analyze`.
 
 **Withheld cross-references.** Several ADRs cite a `docs/security/` document for provenance — the
 threat model, an ASVS assessment, a deployment runbook. Those are maintainer-internal and will not

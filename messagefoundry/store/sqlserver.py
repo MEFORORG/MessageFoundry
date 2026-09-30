@@ -182,6 +182,7 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     _alert_summary,
     _append_channel_scope,
+    _dead_target_pairs,
     _opt_float,
     _qmark_cutoff_case,
     _session_cap_groups,
@@ -428,14 +429,16 @@ _CLAIM_PROC_LANE_MAX = 256
 
 #: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). The SQL
 #: Server twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced
-#: into :meth:`SqlServerStore.replay` and :meth:`SqlServerStore.replay_dead` so neither re-queues a
-#: delivery whose content retention has erased.
+#: into at least :meth:`SqlServerStore.replay` and :meth:`SqlServerStore.replay_dead` so neither
+#: re-queues a delivery whose content retention has erased, and into
+#: :meth:`SqlServerStore.list_replay_targets`.
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
 #: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). The SQL Server twin of
-#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into
+#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into at least
 #: :meth:`SqlServerStore.replay`, :meth:`SqlServerStore.replay_dead` and the source read of
-#: :meth:`SqlServerStore.resend_to`, so none of them turns a marker back into outbound work.
+#: :meth:`SqlServerStore.resend_to`, so none of them turns a marker back into outbound work, and into
+#: :meth:`SqlServerStore.list_replay_targets`.
 _NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
 
 #: The same exclusion over an aliased ``queue q``, DERIVED so the two cannot drift. Used by the
@@ -10496,6 +10499,24 @@ class SqlServerStore:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM queue o{where}", params)
         return int(row["n"]) if row else 0
+
+    async def list_replay_targets(
+        self,
+        *,
+        channel_id: str | None = None,
+        destination_name: str | None = None,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
+        narrowed by the two clauses :meth:`replay_dead` applies. The database collation decides
+        whether two names differing only in case are one pair, as it does for replay itself."""
+        where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
+        rows = await self._fetchall(
+            "SELECT DISTINCT o.channel_id, o.destination_name"
+            f" FROM queue o{where} AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
+            params,
+        )
+        return _dead_target_pairs((r["channel_id"], r["destination_name"]) for r in rows)
 
     @staticmethod
     def _dead_filter(

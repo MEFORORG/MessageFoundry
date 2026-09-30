@@ -7,6 +7,16 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **BREAKING: `adr-analyze` moved to a separate `messagefoundry-toolkit` command, and out of the
+  engine wheel.** ADR 0201 slice 2 adds a third sibling distribution, `messagefoundry-toolkit`,
+  released in lockstep with the engine and pinned to the engine's own version. It carries the
+  authoring and development commands, and `adr-analyze` is the first to move: its module is
+  `messagefoundry_toolkit/adr_analyze.py`, and the engine wheel no longer ships
+  `messagefoundry/adr_analyze.py`. `messagefoundry adr-analyze` now exits 2 with one line naming
+  `messagefoundry-toolkit adr-analyze`, as `{"error": ...}` on stdout under `--json`, and the engine's
+  `--help` names the moved commands in its epilog. In a checkout, run `python -m
+  messagefoundry_toolkit adr-analyze`. An installed toolkit refuses to run beside an engine of another
+  version. The other toolkit rows of `CLI_TIERS` move in later slices. (`BACKLOG #1192`, ASVS 15.2.3)
 - **Turning the sign-in limiter or the account lockout off is now warned, not silent.** While
   sign-in is on, `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a
   `login_rate_limit_per_ip` or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds`
@@ -634,6 +644,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
+  the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
+  model defines both. The web console builds its bulk-replay buttons from them, so a channel whose
+  dead deliveries are all past the first page still gets one. The store contract gains
+  `list_replay_targets` on all three backends. (`BACKLOG #1743`, step 2)
 - **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
   The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
   dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
@@ -2337,6 +2352,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `/auth/negotiate` legs revoke nothing, because they return a token without
   replacing one; ending the old token is the client's job there.
   ([BACKLOG #1146](docs/BACKLOG.md))
+- **A console release now refuses a wheel whose engine requirement has no floor.** The
+  `release-webconsole` job reads the built wheel's `Requires-Dist` and fails unless its
+  `messagefoundry` requirement has a lower bound and no environment marker. An upper bound is
+  allowed. The console's engine requirement is a floor with no ceiling, set at each console release;
+  `docs/WEBCONSOLE-PACKAGE.md` says why. A bare dependency let `pip` keep an older engine that
+  lacks the functions the console calls. ([BACKLOG #1585](docs/BACKLOG.md))
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,

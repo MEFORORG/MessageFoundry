@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""``messagefoundry adr-analyze`` — advisory spec-driven coverage report over the ADRs.
+"""``messagefoundry-toolkit adr-analyze`` — advisory spec-driven coverage report over the ADRs.
 
 The **analyze** half of the Secure Development Standards §5 spec-driven recommendations (R3): scan the
 Architecture Decision Records and report, **advisory-only** (never blocks a commit by default):

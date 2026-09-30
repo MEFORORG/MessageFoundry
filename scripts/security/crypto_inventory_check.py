@@ -3,7 +3,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-L3-02 (ASVS 11.1.3): cryptographic-discovery gate.
 
-Enumerate every cryptographic call site across the five first-party roots (:data:`WALK_ROOTS`) via
+Enumerate every cryptographic call site across the six first-party roots (:data:`WALK_ROOTS`) via
 the AST and diff them against the maintained inventory below. The build **fails** when a module uses a
 crypto primitive it isn't documented to use — so a new (or moved) crypto usage can't slip in
 unreviewed, and the inventory below stays an accurate "where is crypto used" map (it is the
@@ -103,7 +103,7 @@ job runs, and what decides whether it blocks a merge, is stated once, at
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
-    python scripts/security/crypto_inventory_check.py            # scan the five real roots
+    python scripts/security/crypto_inventory_check.py            # scan the six real roots
     python scripts/security/crypto_inventory_check.py --package DIR   # scan an arbitrary package (tests)
     python scripts/security/crypto_inventory_check.py --list-operations   # also print every operation
     python scripts/security/crypto_inventory_check.py --non-python-operations   # TS/JS + PowerShell
@@ -128,7 +128,7 @@ if _HERE not in sys.path:
     sys.path.append(_HERE)
 import crypto_operations  # noqa: E402
 
-# The five first-party roots the gate walks — byte-identical (as basenames) to
+# The six first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
 # ``ide/`` is deliberately absent: it is the TypeScript VS Code extension and contains ZERO ``.py``
 # files, so THIS scanner — which rglobs ``*.py`` and walks the Python AST — has nothing to read there.
@@ -148,7 +148,7 @@ import crypto_operations  # noqa: E402
 # sites would stay invisible while the tree gained a green whose greenness is evidence of nothing.
 # ``ide/`` is covered by a SEPARATE arm instead (:data:`NON_PYTHON_WALK_ROOTS` below, BACKLOG #1172),
 # which reads ``.ts``/``.js`` by pattern rather than by AST and rides this same required context. So
-# this gate's green now means "no undocumented crypto in the PYTHON of five roots, AND no
+# this gate's green now means "no undocumented crypto in the PYTHON of six roots, AND no
 # undocumented or weak RANDOMNESS source in the non-Python roots". The randomness half is the only
 # non-Python claim the REQUIRED run supports. The extension's TLS floor is found by the operation arm
 # (:func:`check_non_python_operations`, BACKLOG #1164), which runs in its own CI job; see
@@ -160,7 +160,14 @@ import crypto_operations  # noqa: E402
 # ``_CRYPTO_ROOTS`` tuple likewise omits ``samples/`` and this walk-set is pinned byte-identical to it,
 # so adding ``samples/`` here would break that pin AND drag author-space into the ReDoS/XML static
 # guards that consume the same tuple.
-WALK_ROOTS = ("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")
+WALK_ROOTS = (
+    "messagefoundry",
+    "messagefoundry_webconsole",
+    "messagefoundry_toolkit",
+    "harness",
+    "tee",
+    "scripts",
+)
 
 # --------------------------------------------------------------------------------------------
 # The NON-PYTHON randomness arm (BACKLOG #1172, ASVS 11.5.1).
@@ -2397,7 +2404,7 @@ def main(argv: list[str] | None = None) -> int:
         "--package",
         type=Path,
         default=None,
-        help="single package directory to scan (default: the five real WALK_ROOTS + built-in inventory)",
+        help="single package directory to scan (default: the six real WALK_ROOTS + built-in inventory)",
     )
     parser.add_argument(
         "--list-operations",
