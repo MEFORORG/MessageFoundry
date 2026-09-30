@@ -195,8 +195,8 @@ try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | Conve
 #
 # AT LEAST TEN STATES; the function below is the list. CORRECTED 2026-09-30: this read "EIGHT STATES",
 # already one short before WIRED_POWERSHELL_SOURCE joined for BACKLOG #1459. The old message
-# named none of them: it said "not installed or has not run yet" and printed the bare installer command with no root -- so following the reader's own advice re-ran the
-# exact invocation that produced the false INSTALLED claim in the first place.
+# named none of them. It said "not installed or has not run yet" and printed the bare installer
+# command with no root. So following the reader's own advice re-ran the exact invocation that produced the false INSTALLED claim in the first place.
 function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
     $settingsPath = Join-Path $Root "settings.json"
     # THE DIRECTORY ITSELF FIRST. A typo'd CLAUDE_CONFIG_DIR otherwise reads as "this root has no
@@ -696,6 +696,15 @@ if ($avail.state -eq 'PENDING') {
 if ($dx.state -in $dxUntrusted) {
     Write-Host ""
     Write-Host "  WARNING -- the numbers below may be a leftover:" -ForegroundColor Yellow
+    Write-Host "  $($dx.line)" -ForegroundColor Yellow
+    foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
+}
+# POWERSHELL SOURCE AND NOTHING FRESH (BACKLOG #1459). This state is kept out of $dxUntrusted so a fresh
+# reading on a box that does not use bash survives. Without this arm, a stale one fell through both
+# warnings and the operator saw no cause and no fix. Same -and rule as the WIRED_HERE arm below.
+elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $five.state -eq "UNKNOWN" -and $seven.state -eq "UNKNOWN") {
+    Write-Host ""
+    Write-Host "  WARNING -- nothing fresh has published here, and the wiring says why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
     foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
 }

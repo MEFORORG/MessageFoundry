@@ -21,8 +21,7 @@ lies converts "I should check" into "I already know":
 Driven as real subprocesses against fixtures, because these are PowerShell scripts and a Python
 re-implementation of their rules would only assert that the re-implementation agrees with itself.
 
-THE ``pwsh`` LAUNCHES HERE GO THROUGH ``run_single`` (BACKLOG #1304), at 22 call sites since #1459
-added ``_hook``. A launch out
+THE DIRECT ``pwsh`` LAUNCHES HERE GO THROUGH ``run_single`` (BACKLOG #1304). A launch out
 of this file starved past its 60-second ceiling on the ``windows-2025`` harness leg while
 ``test_session_mail.py`` held 16 concurrent ``pwsh`` on a 4-vCPU runner; the evidence, and the rule
 for what may take the lock, live in ``tests/_spawn_lock.py``. Read that module before adding a launch
@@ -2720,3 +2719,60 @@ def test_a_root_the_old_installer_wired_publishes_after_one_reinstall_and_the_ho
     assert "verdict: OK" in ctx, ctx
     assert re.search(r"5h\s+64\.0% used", ctx), ctx
     assert WIRED_POWERSHELL_SOURCE not in ctx, ctx
+
+
+def test_a_powershell_source_root_with_a_stale_reading_still_warns_in_the_text_output(
+    fake_home: Path,
+) -> None:
+    """A REGRESSION THE #1459 CHANGE ITSELF OPENED, caught by its own second review round.
+
+    WIRED_POWERSHELL_SOURCE is deliberately not in $dxUntrusted, and the "wired correctly yet nothing
+    fresh" arm fires only for WIRED_HERE. So a root carrying the old command beside an old
+    latest.json fell through both arms: the operator saw a bare "reading is N min old" and neither
+    the cause nor the fix. Before #1459 that root read WIRED_HERE and at least got a warning.
+    """
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    state.mkdir(parents=True)
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {
+                "statusLine": {
+                    "type": "command",
+                    "command": _powershell_source_command(COLLECT, state),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    old = (datetime.now(UTC) - timedelta(minutes=48)).isoformat()
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": old,
+                "five_hour": {
+                    "used_percentage": 64.0,
+                    "resets_at_epoch": int(time.time()) + 780,
+                    "captured_at": old,
+                },
+                "seven_day": {
+                    "used_percentage": 31.0,
+                    "resets_at_epoch": int(time.time()) + 280000,
+                    "captured_at": old,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code, parsed, _ = reader("-Json", pin=pin, home=fake_home)
+    assert code == UNKNOWN, parsed
+    assert parsed["statusline_state"] == WIRED_POWERSHELL_SOURCE, parsed
+
+    _, _, human = reader(pin=pin, home=fake_home)
+    assert "WARNING" in human, f"a PowerShell-source root with a stale reading was silent:\n{human}"
+    assert "PowerShell source" in human, human
+    assert "install-usage-statusline.ps1" in human and str(pin) in human, (
+        f"the warning must carry the fix and name the root:\n{human}"
+    )
+    assert "Start a NEW session" not in human, human
