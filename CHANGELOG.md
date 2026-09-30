@@ -2554,6 +2554,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   that names `rekey-audit` as its fix.
   ([BACKLOG #1916](docs/BACKLOG.md))
 
+### Removed
+- **python-hl7 is no longer a dependency.** The engine's own tolerant parser (ADR 0054) has been the
+  default since it merged, and python-hl7 was only its fallback. The fallback is gone, and so are
+  the `parsing/_backend.py` switch and the logger silencer that existed for python-hl7. A fault
+  inside the parser is now refused as `HL7PeekError`, which the listener NAKs `AR` and records as
+  `ERROR`; before, it fell back to python-hl7. `Message.parse` on a body with no leading `MSH`,
+  `FHS` or `BHS` now raises `HL7PeekError`, a `ValueError`, where it raised `hl7.ParseException`.
+  The outbound MSH encoding-character override now re-encodes through the engine's parser too. The
+  parity suite holds the parser to python-hl7 0.4.5's answers, recorded once before it left. (ADR
+  0054 amendment)
+
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the

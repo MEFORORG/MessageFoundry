@@ -1,6 +1,7 @@
 # 0054 — Low-allocation built-ins HL7 parser (free-threading keystone)
 
-- **Status:** **Accepted** (2026-06-29) — build started on `feat/builtins-hl7-parser` (BACKLOG #88)
+- **Status:** **Accepted** (2026-06-29) — build started on `feat/builtins-hl7-parser` (BACKLOG #88);
+  **amended 2026-09-30:** Phase 2 done, python-hl7 retired (see the amendment at the end)
 - **Date:** 2026-06-29
 - **Related:** [0053](0053-free-threaded-multicore-engine.md) (free-threaded engine — this parser is its
   gating keystone) · [0040](0040-free-threaded-engine-support.md) (the deferral 0053 superseded) ·
@@ -219,3 +220,77 @@ per-dirty-field re-encode in the MVP); the 6.44×/~14× figures are corpus-empir
   parity window.
 - [x] **cp314t runner:** the **265KF dev box** (the ADR 0053 spike's free-threaded venv at
   `…\Temp\mefor-ft`) is the AC-6 scaling-re-measure harness.
+
+## Amendment (2026-09-30) — Phase 2: python-hl7 is retired, and a parser fault is refused
+
+The owner assigned the Phase 2 retirement on 2026-09-30. python-hl7 is no longer a dependency. The
+built-in parser is the only tolerant HL7 parser, and nothing can select another one:
+`parsing/_backend.py` and its `USE_BUILTIN` switch are gone.
+
+### Why Phase 2 did not wait for production traffic
+
+The resolution above kept the fallback "until parity is proven on production traffic". MessageFoundry
+has no deployment (CLAUDE.md section 0), so that condition could never fire before the first one. The
+parity it asked for is held instead by a frozen oracle, described below. This moves the evidence from
+traffic to a recorded corpus. It does not lower the bar the fallback served, which the next section
+replaces.
+
+### The decision: a parser fault is a refusal, never a fallback and never a drop
+
+Until now, an unexpected error inside the built-in parse fell back to python-hl7 and logged a warning.
+With no second parser, a fault now takes the same path as any unparseable message:
+
+| Surface | Before | Now |
+|---|---|---|
+| `Peek.parse`, parser fault | fell back to python-hl7 | raises `HL7PeekError("could not parse HL7 message (<ErrorClass>)")` |
+| `Message.parse`, parser fault | fell back to python-hl7 | raises the same `HL7PeekError` |
+| `Message.parse`, no leading `MSH`/`FHS`/`BHS` | raised python-hl7's `hl7.ParseException` | raises `HL7PeekError`, a `ValueError` |
+
+The listener already NAKs an `HL7PeekError` with AR and records the message as `ERROR` before any
+ingress row. So a fault is counted and logged, and the sender learns it was refused. The reliability
+and count-and-log invariants of CLAUDE.md section 2 hold without a second parser.
+
+The refusal names only the error's class. It is raised after the exception handler, so the parser's
+own error, whose text is not vetted, is not on the chain (BACKLOG #2085). The log line is `ERROR`,
+carries the class name only, and has no traceback. A traceback's messages can quote the body.
+
+Two routes need no second parser to stay safe:
+
+- **The pre-ACK streaming detach.** It re-parses with `Message.parse` a body `Peek.parse` already
+  accepted. Both run the same parse function over the same normalized text, so a fault in one is a
+  fault in both, and `Peek.parse` refuses it first.
+- **The escape expansion budget (ASVS 1.3.3).** It still runs before the parse, so a breach never
+  reaches the parser at all. `test_expansion_budget_breach_never_reaches_the_parser` pins that.
+
+Handler authors see one change: `Message.parse` on a non-HL7 body raises `HL7PeekError`, a
+`ValueError`, where it raised `hl7.ParseException`, which was not one.
+
+### Parity now rests on a frozen oracle
+
+`tests/test_builtin_hl7_parity.py` used to run both parsers side by side. Before the dependency left,
+python-hl7 0.4.5's answers over the same corpus were recorded into
+`tests/golden/python_hl7_oracle.json`: 39 messages, each with its own input, every probe read, a plain
+encode and the encode after each named mutation. AC-1, AC-4 and AC-5 now compare the built-in parser
+to that record. The script that made it was committed and then deleted in the same pull request.
+
+What that costs, stated so nobody reads the record as more than it is:
+
+- **Nothing can regenerate it.** A sample or generator shape added later gets no python-hl7 answer.
+  Its parity is not checked; only its behaviour can be pinned.
+- **One synthetic message is left out.** The generated ORU^R30 #1 carries an ORC-2 that the
+  forbidden-content gate reads as a site code, so it cannot be committed. ORU^R01 #1 and #2 cover
+  the shape.
+- **The record includes python-hl7's bugs, on purpose.** Upstream python-hl7 issue 84: `unescape`
+  drops a trailing, unterminated escape character, so `SMITH\` reads as `SMITH`. The built-in parser
+  reproduces it, and the `adv:trailing-escape` case pins it. Fixing it is a behaviour change for a
+  separate decision; this amendment does not make it.
+
+### Other things that moved with it
+
+- `transports/mllp.py` `reencode_delimiters` walked python-hl7's parse tree. It now calls
+  `_builtin_hl7.encode_with_separators`. Before python-hl7 left, the two were compared over 1,870
+  input and delimiter pairs, including malformed headers, and none differed. A header whose own
+  separators repeat is still refused, as python-hl7 refused it.
+- `phi_log_silencer.py` is deleted. It silenced python-hl7's loggers, which wrote whole field values
+  at `ERROR`. The built-in parser logs no field value, which `tests/test_logging.py` pins.
+- The strict tier is unchanged. `validate()` still builds an hl7apy tree (AC-7).
