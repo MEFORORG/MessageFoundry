@@ -106,6 +106,9 @@ COPYRIGHT_MARKER = "Copyright"
 # the exact git-tracked path (forward slashes, as `git ls-files` emits), never a prefix or glob.
 VENDORED_LICENCES: dict[str, str] = {
     ".github/actions/cla-assistant-lite/dist/index.js": "Apache-2.0",
+    # defusedxml 0.7.1, vendored for the engine's hardened XML parse (see the README beside them).
+    "messagefoundry/_vendor/defusedxml/common.py": "PSF-2.0",
+    "messagefoundry/_vendor/defusedxml/ElementTree.py": "PSF-2.0",
 }
 
 # The tag whose VALUE is asserted. Kept separate from the identifier so a file carrying the tag with

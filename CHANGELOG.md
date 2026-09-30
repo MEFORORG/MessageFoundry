@@ -24,6 +24,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   NIST SP 800-63B allows, so each reaches the `serve` loosening warning, `messagefoundry security
   show` and `GET /security/posture`. The shipped defaults report nothing new. (`BACKLOG #1131`,
   ASVS 6.1.1)
+- **A sign-in rate limit, lockout setting, PHI-read or admin-write limit, sign-in or admin-write
+  time floor, session cap or OIDC flow-cache cap looser than its shipped default is now a named
+  security loosening, not only an off value.** A `1e-6` s window or a count of `1e9` used to pass
+  silently while the control was off in effect. `[api].trusted_proxies` ranges that cover every peer, such as `0.0.0.0/0` or `::/0`, are
+  named too, since they trust every peer as the refused `*` would. Stricter values and the defaults
+  report nothing. (`BACKLOG #1131`; ASVS 6.1.1, 6.3.1, 2.3.2, 2.4.1, 2.4.2, 7.1.2)
 - **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
   before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
   off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and
@@ -302,6 +308,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **BREAKING: on SQL Server and PostgreSQL, the runtime login may only insert and read audit rows.**
+  Under the `external` schema default, the startup privilege probe now names `UPDATE` or `DELETE`
+  on `audit_log` or `audit_chain_meta` as an over-grant, a column `UPDATE` grant included. It also
+  names `ALTER`, `CONTROL` and `TAKE OWNERSHIP` on SQL Server, and `TRUNCATE` and `TRIGGER` on PostgreSQL, so the
+  start refuses under the shipped `enforce` dial. Without it, on a first
+  deployment the engine's own login could rewrite audit rows. `docs/DEPLOY-SERVER-DB.md` adds the
+  `DENY` (SQL Server) or `REVOKE` (PostgreSQL) to run once after the first `provision-schema`. The
+  engine's own writes no longer need those rights: opening a fresh keyed store and `rekey-audit`
+  insert the keying row and never replace one. The PostgreSQL grants check no longer asks for
+  `UPDATE` or `DELETE` on the two tables. A keying row that records no watermark is no longer
+  overwritten: `rekey-audit` and the open refuse it on both backends, and name the
+  statement that removes it. Two engines keying one fresh store at once now agree on the first
+  one's row on both backends, where the SQL Server loser used to fail its open on the primary key.
+  (owner ruling R16, ASVS 16.4.2)
 - **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
   encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
   `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256
@@ -2586,21 +2606,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   refusal 0.4.0 added, which exited 1. And `rekey-audit` no longer prints the keyless-chain warning
   that names `rekey-audit` as its fix.
   ([BACKLOG #1916](docs/BACKLOG.md))
-
-### Removed
-- **python-hl7 is no longer a dependency.** The engine's own tolerant parser (ADR 0054) has been the
-  default since it merged, and python-hl7 was only its fallback. The fallback is gone, and so are
-  the `parsing/_backend.py` switch and the logger silencer that existed for python-hl7. A fault
-  inside the parser is now refused as `HL7PeekError`, which the listener NAKs `AR` and records as
-  `ERROR`; before, it fell back to python-hl7. **BREAKING:** `Message.parse` on a body with no
-  leading `MSH`, `FHS` or `BHS`, or with a header too short to read, now raises `HL7PeekError`, a
-  `ValueError`, where it raised `hl7.ParseException` or an `IndexError`. A Handler that catches
-  `ValueError` around it now catches that refusal too.
-  The outbound MSH encoding-character override now re-encodes through the engine's parser too. A
-  field whose escape character is never closed now reads with that text kept: `SMITH\` reads as
-  `SMITH\`, where python-hl7 dropped it and read `SMITH` (upstream python-hl7 issue 84). The
-  parity suite holds the parser to python-hl7 0.4.5's answers, recorded once before it left. (ADR
-  0054 amendment)
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

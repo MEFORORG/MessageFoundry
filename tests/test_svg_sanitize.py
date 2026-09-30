@@ -16,8 +16,8 @@ import time
 from xml.etree.ElementTree import Element
 
 import pytest
-from defusedxml.ElementTree import fromstring
 
+from messagefoundry._vendor.defusedxml.ElementTree import fromstring
 from messagefoundry.api.svg_sanitize import (
     SVG_NS,
     SvgRejected,

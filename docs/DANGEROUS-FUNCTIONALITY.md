@@ -288,6 +288,10 @@ real clinical requirement for a paper control.
   cap can be disabled per connection, which is the operator's choice to make.
 - XML hardening in `parsing/xml/harden.py` against external-entity and entity-expansion attacks,
   with the lxml posture recorded in ADR 0015 and ADR 0122.
+- defusedxml's refusal of entity declarations, and of DTDs where the call site asks for that, at
+  the `xml.etree` parse sites: at least `RawMessage.xml()`, the Corepoint import and the SVG
+  sanitizer. It comes from a copy vendored in `_vendor/defusedxml/`. The SOAP gate in
+  `transports/soap.py` hardens its own `xml.sax` parser instead.
 - A pinned pydicom floor in ADR 0025 that excludes a known path-traversal issue.
 - Directory-listing names from a remote share checked as single safe path components before they
   are joined, so a partner cannot return a traversal sequence.
@@ -297,7 +301,8 @@ than from memory. You can re-run the same scan over `messagefoundry/` and
 `messagefoundry_webconsole/`. A module is a parse site when its syntax tree holds at least one of
 these:
 
-1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml`, `xml`,
+1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml` (or the
+   engine's vendored copy, `messagefoundry._vendor.defusedxml`), `xml`,
    `xmlschema`, `signxml`, `pydicom`, `pynetdicom`, `pyx12`, `fhir.resources`, `fhirpathpy`,
    `cbor2`, `webauthn`, `spnego` (the module the pyspnego package installs), `csv`,
    `email.parser`, `email.feedparser`, `pickle`, `marshal` or `shelve`.
@@ -366,7 +371,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | HL7 v2 | An inbound connection. Strict validation is opt-in. The tolerant parser is hand-written, so it is in the hand-read table below. | `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
 | JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
-| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply | `parsing/message.py`, `parsing/xml/`, `transports/soap.py` |
+| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply. `_vendor/defusedxml/` is the vendored defusedxml copy the stdlib-parser sites parse through. | `parsing/message.py`, `parsing/xml/`, `_vendor/defusedxml/common.py`, `_vendor/defusedxml/ElementTree.py`, `transports/soap.py` |
 | X12 | An inbound whose content type is `x12` | `parsing/x12/` |
 | DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
 | A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |

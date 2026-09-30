@@ -179,8 +179,9 @@ async def test_fresh_store_auto_keys_on_the_transit_mac(backend: str) -> None:
             async def fetchrow(self, sql: str, *_a: Any) -> Any:
                 return await _fetchone(sql)
 
-            async def execute(self, sql: str, *_a: Any) -> None:
+            async def execute(self, sql: str, *_a: Any) -> str:
                 inserted.append(sql)
+                return "INSERT 0 1"  # asyncpg's tag: one keying row went in
 
         @contextlib.asynccontextmanager
         async def _timed_acquire() -> Any:
@@ -193,6 +194,9 @@ async def test_fresh_store_auto_keys_on_the_transit_mac(backend: str) -> None:
         class _Cur:
             async def execute(self, sql: str, *_a: Any) -> None:
                 inserted.append(sql)
+
+            async def fetchone(self) -> tuple[int]:
+                return (1,)  # the guarded INSERT's OUTPUT: one keying row went in
 
         @contextlib.asynccontextmanager
         async def _acquire() -> Any:

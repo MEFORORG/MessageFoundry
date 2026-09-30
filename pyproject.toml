@@ -69,8 +69,10 @@ dynamic = ["version"]  # single-sourced from messagefoundry/__init__.py (see [to
 description = "Open-source healthcare integration engine — route, transform, and validate messages across many formats and connection types"
 readme = "README.md"
 requires-python = ">=3.14"
-license = "AGPL-3.0-or-later"
-license-files = ["LICENSE", "NOTICE"]  # ship the license + copyright/attribution NOTICE in sdist+wheel (PEP 639)
+# PSF-2.0 covers the two defusedxml modules vendored under messagefoundry/_vendor/defusedxml/, whose
+# licence requires its notice to travel with every copy -- hence the third license-files entry.
+license = "AGPL-3.0-or-later AND PSF-2.0"
+license-files = ["LICENSE", "NOTICE", "messagefoundry/_vendor/defusedxml/LICENSE"]  # ship the licences + attribution NOTICE in sdist+wheel (PEP 639)
 classifiers = [
     "Development Status :: 4 - Beta",  # Early Access
     "Intended Audience :: Healthcare Industry",
@@ -122,7 +124,6 @@ dependencies = [
     "pyspnego>=0.10",       # SPNEGO/Kerberos negotiate for Windows SSO
     "tomlkit>=0.12",        # comment/format-preserving TOML writer for connections.toml (ADR 0007)
     "tzdata>=2024.1",       # IANA tz database for stdlib zoneinfo (Windows has no system tzdata)
-    "defusedxml>=0.7.1",    # hardened XML parse for RawMessage.xml() — XXE/DTD/entity-expansion safe (ADR 0004, BACKLOG #31)
     "psutil>=6.0",          # host CPU/mem gauges on the /metrics surface (BACKLOG #74)
     "httpx>=0.27",          # the shared apiclient HTTP client (messagefoundry.apiclient) — used by the bundled Windows tray's tokenless /health + /ui probes (messagefoundry.tray, ADR 0113, gui-scripts messagefoundry-tray) and the harness monitor; also the ASGI test client. Base (not an extra) so the tray works on every `pip install messagefoundry`.
     "truststore>=0.10",     # verify an https engine URL against the OS trust store (enterprise/AD-CS roots) — apiclient lazily imports it; base so the tray/monitor need no per-PC CA wrangling
@@ -197,8 +198,10 @@ dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
 # the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference
 # implementation-guide validator (e.g. 005010X222A1 for 837P) and also emits the 997/999 ack as a
-# by-product. Its SOLE runtime dependency is defusedxml (already in tree, used to parse pyx12's bundled
-# TRUSTED map XML — not attacker input). >=4.0.0 is the first py3.12+/modern-typing release.
+# by-product. Its SOLE runtime dependency is the upstream defusedxml package, used to parse pyx12's
+# bundled TRUSTED map XML — not attacker input. The engine itself no longer depends on that package: it
+# parses through its own vendored copy (messagefoundry/_vendor/defusedxml/), so this extra is now the
+# only thing that installs upstream defusedxml. >=4.0.0 is the first py3.12+/modern-typing release.
 x12 = ["pyx12>=4.0.0"]
 # Optional XML/SOAP message accessor + schema validation + signature for parsing/xml/ (BACKLOG #31).
 # Lazy-imported, so installs that never touch XML skip it. lxml is the hardened XPath/serialize engine
@@ -508,7 +511,10 @@ target-version = "py313"
 # the exact scripts a published measurement was produced with; reformatting them edits the record, and
 # a number you cannot reproduce from the script filed beside it is worthless. New benchmark code lives
 # outside results/ and is linted normally. `extend-exclude` (not `exclude`) so ruff's defaults survive.
-extend-exclude = ["docs/benchmarks/results"]
+#
+# messagefoundry/_vendor/defusedxml is upstream's byte-pinned code (see its README); a formatter or a
+# fix-on-save would break the pin.
+extend-exclude = ["docs/benchmarks/results", "messagefoundry/_vendor/defusedxml"]
 
 [tool.ruff.lint]
 # Signal 10 (Code Quality & Anti-Slop rubric, docs/Code_Quality_Standards.md): broaden ruff beyond its
@@ -549,7 +555,14 @@ extend-immutable-calls = [
 python_version = "3.14"
 strict = true
 # Data, not modules: the config loader execs these with injected globals, and one has a hyphenated name.
-exclude = ['^tests/fixtures/']
+exclude = ['^tests/fixtures/', '^messagefoundry/_vendor/defusedxml/']
+
+# The vendored defusedxml copy is upstream's untyped, byte-pinned code (see its README). `exclude`
+# keeps it out of discovery and `skip` keeps imports from pulling it back in, so its names reach the
+# engine as Any -- exactly as the stub-less installed package did before it was vendored.
+[[tool.mypy.overrides]]
+module = ["messagefoundry._vendor.defusedxml", "messagefoundry._vendor.defusedxml.*"]
+follow_imports = "skip"
 
 # BACKLOG #1799. CI type-checks tests/ with `mypy --explicit-package-bases tests` (the ci.yml step says
 # why the scope is what it is). THE FLAG IS ON THE COMMAND LINE, NOT HERE, ON PURPOSE. tests/ has no
@@ -582,7 +595,7 @@ check_untyped_defs = true
 # installed (the CI `test` leg, since ADR 0180's assertion needs it) mypy still type-checks them for
 # real -- ignore_missing_imports only suppresses the not-found error on an install without the extra,
 # so a contributor running mypy on a base install is not reddened by a lazy import they never execute.
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*", "urllib3", "urllib3.*", "requests", "requests.*", "yaml", "yaml.*"]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*", "urllib3", "urllib3.*", "requests", "requests.*", "yaml", "yaml.*"]
 # yaml (PyYAML) ships no stubs and types-PyYAML is not a dependency; only tests/ imports it.
 ignore_missing_imports = true
 

@@ -1006,6 +1006,7 @@ _PARSER_LIBS = (
     "hl7apy",
     "lxml",
     "defusedxml",
+    "messagefoundry._vendor.defusedxml",  # the engine's vendored copy
     "xml",
     "xmlschema",
     "signxml",
