@@ -245,19 +245,32 @@ creates it restricted, in the call that creates it, and refuses to replace a fil
 that name. This covers the DPAPI store key file that `protect-key` writes and every TLS private key
 the engine writes: the pair it mints for the API, `cert self-signed` and `cert import`. On POSIX the
 file is created with mode `0600`. On Windows its access list names SYSTEM, Administrators and the
-account that created it, plus read for each `protect-key --grant-account`, and it does not inherit
-from the directory. If the file cannot be created that way, the command fails and writes no file
+account that created it, plus read for the one account `protect-key --grant-account` names, and it
+does not inherit from the directory. A grant to a broad group such as Users is refused. If the file
+cannot be created that way, the command fails and writes no file
 ([restricted_file.py](../messagefoundry/restricted_file.py)).
 
-`serve` also checks two of these files before it uses them: the store key file, when
-`[store].key_provider` reads it, and the TLS key the engine minted. If Everyone, Authenticated Users,
-the local Users group or another broad group can read the file, or its access cannot be read, the
-engine refuses to start under `[security].enforcement = "enforce"` and warns under `"warn"`. On POSIX
-the test is a group or other read bit. Every other command that reads the store key file, such as
-`provision-admin` and `rotate-key`, logs a warning for the same finding and goes on. **What this
-check does not cover:** it judges read access
-only, it does not vet the file's owner or a narrow account you granted yourself, and it does not
-look at an operator-supplied `[api].tls_key_file` or a connection's key file. Restrict those yourself.
+`serve` and `supervise` also check two of these files before they use them: the store key file,
+when `[store].key_provider` loads it, and the TLS key the engine minted. If a broad group can read
+the file, or its access cannot be read, the engine refuses to start under
+`[security].enforcement = "enforce"` and warns under `"warn"`. Every other command that reads the
+store key file, such as `provision-admin` and `rotate-key`, logs a warning and goes on.
+
+**What the check does not cover.** Know these before you rely on it:
+
+- On Windows it looks for known broad groups: at least Everyone, Authenticated Users, the local
+  Users group, the logon classes such as INTERACTIVE, and the LOCAL SERVICE and NETWORK SERVICE
+  accounts when the engine is not running as one. It is a list of known groups. It does not prove
+  that only the accounts you meant can read the file.
+- It judges read access only. It does not vet the file's owner or an account you granted yourself.
+- On POSIX the test is a group or other read bit, whoever is in the group. A volume that makes
+  every file group-readable, such as a Kubernetes volume with `fsGroup`, makes a minted key fail
+  the check. Supply your own certificate there, as the shipped manifest does.
+- It does not look at an operator-supplied `[api].tls_key_file` or a connection's key file.
+  Restrict those yourself.
+- A key file is created for the account that creates it. If an administrator runs `serve` by hand
+  before the service first starts, the minted TLS key is readable by that administrator and not
+  by the service account. Delete the pair and let the service mint its own.
 
 **Git hygiene `[BUILT]`.** `.gitignore` excludes `*.db` / `-wal` / `-shm`, generated message corpora,
 and logs, so runtime PHI is never committed. Keep it that way — never `git add -f` a database or a

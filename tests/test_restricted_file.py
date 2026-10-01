@@ -129,7 +129,7 @@ def test_an_access_list_naming_only_the_intended_accounts_has_no_read_problem() 
         (_ALLOW, _FULL, _CREATOR),
         (_ALLOW, _READ, _SERVICE),
     )
-    assert restricted_file._windows_read_problem(restricted) is None
+    assert restricted_file._windows_read_problem(restricted, _SERVICE) is None
 
 
 @pytest.mark.parametrize(
@@ -140,31 +140,58 @@ def test_an_access_list_naming_only_the_intended_accounts_has_no_read_problem() 
         ((_ALLOW, 0x80000000, "S-1-5-11"), "Authenticated users (S-1-5-11)"),  # GENERIC_READ
         ((_ALLOW, 0x00040000, "S-1-5-4"), "S-1-5-4"),  # WRITE_DAC alone: it can grant itself read
         ((_ALLOW, _READ, "S-1-5-21-9-9-9-513"), "S-1-5-21-9-9-9-513"),  # Domain Users
+        # Broad groups and logon classes beyond the trust-anchor list.
+        ((_ALLOW, _READ, "S-1-2-0"), "S-1-2-0"),  # LOCAL
+        ((_ALLOW, _READ, "S-1-5-14"), "S-1-5-14"),  # REMOTE INTERACTIVE LOGON
+        ((_ALLOW, _READ, "S-1-5-15"), "S-1-5-15"),  # THIS ORGANIZATION
+        ((_ALLOW, _READ, "S-1-5-32-555"), "S-1-5-32-555"),  # Remote Desktop Users
+        ((_ALLOW, _READ, "S-1-5-80-0"), "S-1-5-80-0"),  # ALL SERVICES
+        # An account many unrelated services run as, when the engine is not that account.
+        ((_ALLOW, _READ, "S-1-5-20"), "Network service (S-1-5-20)"),
     ],
 )
 def test_a_broad_account_that_can_read_is_a_problem(ace: tuple[int, int, str], named: str) -> None:
     listed = _security((_ALLOW, _FULL, _SYSTEM), ace)
-    problem = restricted_file._windows_read_problem(listed)
+    problem = restricted_file._windows_read_problem(listed, _SERVICE)
     assert problem is not None and named in problem and "can read it" in problem
+
+
+def test_the_account_the_engine_runs_as_is_never_broad_to_itself() -> None:
+    # An engine running as NETWORK SERVICE reads its own key file. The same entry is a problem
+    # when the engine is some other account (the parametrized case above is that control).
+    listed = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _READ, "S-1-5-20"))
+    assert restricted_file._windows_read_problem(listed, "S-1-5-20") is None
+    assert restricted_file._windows_read_problem(listed, None) is not None
+
+
+def test_an_entry_the_check_cannot_interpret_is_a_problem() -> None:
+    # A conditional allow entry (type 9) is recorded with no rights and no account, so who it lets
+    # in is unknown. That is not a pass. A deny entry (type 1) grants nothing and is the control.
+    conditional = _security((_ALLOW, _FULL, _SYSTEM), (9, 0, ""))
+    assert "cannot interpret" in str(restricted_file._windows_read_problem(conditional, None))
+    denied = _security((_ALLOW, _FULL, _SYSTEM), (_DENY, 0, ""))
+    assert restricted_file._windows_read_problem(denied, None) is None
 
 
 def test_a_broad_account_with_no_read_right_is_not_a_read_problem() -> None:
     # This check is the READ axis. A write-only or deny entry gives nobody the bytes.
     write_only = _security((_ALLOW, 0x00000002, _USERS))  # FILE_WRITE_DATA
-    assert restricted_file._windows_read_problem(write_only) is None
+    assert restricted_file._windows_read_problem(write_only, None) is None
     denied = _security((_DENY, 0, ""), (_ALLOW, _FULL, _CREATOR))
-    assert restricted_file._windows_read_problem(denied) is None
+    assert restricted_file._windows_read_problem(denied, None) is None
 
 
 def test_an_access_list_that_could_not_be_read_is_a_problem() -> None:
     assert "could not be read" in str(
-        restricted_file._windows_read_problem(_WinPathSecurity(status=5, status_text="denied"))
+        restricted_file._windows_read_problem(
+            _WinPathSecurity(status=5, status_text="denied"), None
+        )
     )
     assert "no access list" in str(
-        restricted_file._windows_read_problem(_WinPathSecurity(dacl_present=False))
+        restricted_file._windows_read_problem(_WinPathSecurity(dacl_present=False), None)
     )
     assert "in full" in str(
-        restricted_file._windows_read_problem(_WinPathSecurity(owner_sid=_CREATOR))
+        restricted_file._windows_read_problem(_WinPathSecurity(owner_sid=_CREATOR), None)
     )
 
 
@@ -205,7 +232,7 @@ def test_windows_creates_the_file_with_exactly_the_intended_access(
 
     monkeypatch.setattr(store_mod, "_system_exe", _no_icacls)
     path = tmp_path / "store.key"
-    write_restricted_file(path, b"KEY-MATERIAL-STAND-IN", read_grants=["*S-1-5-19"])
+    write_restricted_file(path, b"KEY-MATERIAL-STAND-IN", read_grants=[f"*{_SERVICE}"])
 
     assert path.read_bytes() == b"KEY-MATERIAL-STAND-IN"
     protected, entries, creator = _windows_access(path)
@@ -215,7 +242,7 @@ def test_windows_creates_the_file_with_exactly_the_intended_access(
         (_ALLOW, _FULL, _SYSTEM),
         (_ALLOW, _FULL, _ADMINS),
         (_ALLOW, _FULL, creator),
-        (_ALLOW, _READ, "S-1-5-19"),
+        (_ALLOW, _READ, _SERVICE),
     }
     assert broad_read_problem(path) is None
 
@@ -235,9 +262,10 @@ def test_windows_restricts_the_file_before_any_byte_is_written(
         seen["protected"], seen["entries"], _creator = _windows_access(path)
         return real_fdopen(fd, *a, **k)
 
-    monkeypatch.setattr(os, "fdopen", _observing_fdopen)
-    write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
-    monkeypatch.undo()
+    # A scoped patch: undoing the shared monkeypatch would also undo the module's serve fixtures.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "fdopen", _observing_fdopen)
+        write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
 
     assert seen["size"] == 0
     assert seen["protected"] is True
@@ -258,6 +286,17 @@ def test_windows_resolves_an_account_name_and_refuses_one_it_cannot(tmp_path: Pa
     with pytest.raises(RestrictedFileError, match="could not be resolved"):
         write_restricted_file(refused, b"k", read_grants=["NO-SUCH-DOMAIN\\no-such-account"])
     assert not refused.exists()
+
+
+@windows_only
+@pytest.mark.parametrize("grant", [f"*{_USERS}", "*S-1-1-0", "*S-1-5-11", "*S-1-5-15"])
+def test_windows_refuses_a_read_grant_to_a_broad_group(tmp_path: Path, grant: str) -> None:
+    # A grant that would make the key file broadly readable is not a restricted create. The control
+    # is the per-service grant in the test above, which is created.
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match="cannot be granted"):
+        write_restricted_file(path, b"KEY-MATERIAL-STAND-IN", read_grants=[grant])
+    assert list(tmp_path.iterdir()) == []
 
 
 @windows_only
@@ -653,3 +692,85 @@ def test_reading_a_key_file_a_broad_account_can_read_is_warned_about(
     with caplog.at_level(logging.WARNING, logger=dpapi_mod.__name__):
         assert dpapi_mod.load_protected_key(broad) == "QUJD"  # warned, and still read
     assert "[store].encryption_key_file is not restricted" in caplog.text
+
+
+# --- supervise makes the same checks once, before it spawns a shard -------------------------------
+
+
+def _supervise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[int, list[str]]:
+    """``supervise`` with the fleet stubbed out: its return code and the configs it would spawn."""
+    import argparse
+
+    from messagefoundry import __main__ as cli
+
+    spawned: list[str] = []
+
+    async def fake_supervise(config: str, **_kwargs: object) -> int:
+        spawned.append(config)
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
+    args = argparse.Namespace(
+        config=str(SAMPLES_CONFIG),
+        db=str(tmp_path / "mefor.db"),
+        base_port=8765,
+        env="dev",
+        service_config=None,
+        project_root=str(tmp_path),
+    )
+    return cli._supervise(args), spawned
+
+
+def test_supervise_refuses_a_broadly_readable_key_file_before_it_spawns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Each shard's ``serve`` would refuse, and the supervisor would only restart it. So the
+    refusal belongs in ``supervise``, once, with nothing spawned."""
+    from messagefoundry.api.tls import _generated_pair
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    # The control: a first run mints a restricted pair and the fleet starts.
+    rc, spawned = _supervise(tmp_path, monkeypatch)
+    assert (rc, len(spawned)) == (0, 1), capsys.readouterr().err
+    _cert, key = _generated_pair(tmp_path)
+    assert key.exists()
+
+    _broaden(key)
+    rc, spawned = _supervise(tmp_path, monkeypatch)
+    err = capsys.readouterr().err
+    assert rc == 2 and spawned == []
+    assert "error: the generated TLS private key" in err and "is not restricted" in err
+
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    rc, spawned = _supervise(tmp_path, monkeypatch)
+    assert (rc, len(spawned)) == (0, 1)
+    assert "warning: the generated TLS private key" in capsys.readouterr().err
+
+
+def test_supervise_refuses_a_broadly_readable_store_key_file_before_it_opens_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    key_file = tmp_path / "store.key.dpapi"
+    key_file.write_bytes(b"BLOB-STAND-IN")
+    _broaden(key_file)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(key_file))
+    rc, spawned = _supervise(tmp_path, monkeypatch)
+    err = capsys.readouterr().err
+    assert rc == 2 and spawned == []
+    assert "error: the store key file named by [store].encryption_key_file" in err
+    assert not (tmp_path / "mefor.db").exists(), "the store was opened before the refusal"
+
+
+def test_serve_exits_cleanly_when_the_tls_key_cannot_be_created_restricted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A host that cannot apply the restriction has no pair to fall back on at a first run. That is
+    # a refusal with a reason and exit 2, as protect-key gives, not a traceback.
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    _refuse_the_create(monkeypatch)
+    assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 2
+    err = capsys.readouterr().err
+    assert "could not be created restricted" in err and "refusing to start" in err

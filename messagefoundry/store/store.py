@@ -3262,7 +3262,7 @@ async def _secure_file_async(path: Path) -> None:
     the ``config/*_edit.py`` writers
     (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
     unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
-    module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
+    module and in no other ``store/`` backend, and several tests patch it by that name.
 
     ``_secure_file`` is resolved through the module global when the call is made, so a test that
     patches the name is honoured through this wrapper too.

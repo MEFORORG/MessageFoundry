@@ -25,6 +25,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
+#: Key files already warned about as broadly readable, so a process that reads the key many
+#: times (each DR backup pass does) says so once.
+_warned_key_files: set[str] = set()
 
 # CryptProtectData flags. LOCAL_MACHINE: any principal on THIS machine can unprotect — required so the
 # low-privilege *service account* (not just the installing admin) can read the key. UI_FORBIDDEN: never
@@ -119,8 +122,8 @@ def protect_key_to_file(
 ) -> None:
     """DPAPI-protect a base64 store key and write the ciphertext to a NEW, restricted ``path``.
 
-    The file is created restricted in the call that creates it, naming SYSTEM, Administrators, the
-    creating account and each account in ``read_grants`` (:func:`write_restricted_file`). Machine
+    The file is created restricted in the call that creates it, with read for each account in
+    ``read_grants`` (``restricted_file.write_restricted_file`` states the access list). Machine
     scope lets any account on the host unprotect the blob, so the file's access list is what keeps
     the key from the others, and it must hold from the file's first moment (vault BACKLOG #2601).
 
@@ -139,8 +142,10 @@ def load_protected_key(path: str | Path) -> str:
     off Windows or :class:`DpapiError` if the file is missing/unreadable/not decryptable here.
 
     Every command that opens the store reads the key here, so this is where a key file a broad
-    account can read is WARNED about, whatever the command (vault BACKLOG #2601). Only ``serve``
-    knows ``[security].enforcement``, and it refuses such a file before this is reached."""
+    account can read is WARNED about, whatever the command (vault BACKLOG #2601). The warning is
+    logged once per file in a process. ``serve`` and ``supervise`` know
+    ``[security].enforcement``, so under ``enforce`` they refuse such a file before they open the
+    store."""
     from messagefoundry.restricted_file import broad_read_problem
 
     p = Path(path)
@@ -148,8 +153,9 @@ def load_protected_key(path: str | Path) -> str:
         blob = p.read_bytes()
     except OSError as exc:
         raise DpapiError(f"cannot read encryption_key_file {p}: {exc}") from exc
-    problem = broad_read_problem(p)
+    problem = None if str(p) in _warned_key_files else broad_read_problem(p)
     if problem is not None:
+        _warned_key_files.add(str(p))
         _log.warning(
             "the store key file named by [store].encryption_key_file is not restricted: %s. "
             "Restrict it to the account the engine runs as, SYSTEM and Administrators.",

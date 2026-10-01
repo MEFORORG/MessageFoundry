@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.auth.anchor_path import (
+    _GRANTING_ACE_TYPES,
     ACCESS_ALLOWED_ACE_TYPE,
     ADMINISTRATORS_SID,
     SYSTEM_SID,
@@ -108,14 +109,50 @@ def _created_mismatch(
 #: WRITE_DAC, WRITE_OWNER, GENERIC_ALL and GENERIC_READ.
 _READ_REACH_MASK = 0x00000001 | 0x00040000 | 0x00080000 | 0x10000000 | 0x80000000
 
+#: Groups and logon classes that many accounts hold, beyond the ones the trust-anchor check already
+#: names (``auth.trust_anchors._is_broad_sid``: Everyone, Authenticated Users, Users, Guests, the
+#: INTERACTIVE, NETWORK, BATCH and SERVICE logon classes, Domain Users and Domain Guests). **At
+#: least these, and never a complete list**: this is a list of known broad groups, so a file that
+#: passes has not been shown readable by the intended accounts alone.
+_MORE_BROAD_GROUP_SIDS: frozenset[str] = frozenset(
+    {
+        "S-1-2-0",  # LOCAL
+        "S-1-2-1",  # CONSOLE LOGON
+        "S-1-5-1",  # DIALUP
+        "S-1-5-13",  # TERMINAL SERVER USER
+        "S-1-5-14",  # REMOTE INTERACTIVE LOGON
+        "S-1-5-15",  # THIS ORGANIZATION
+        "S-1-5-32-547",  # BUILTIN\Power Users
+        "S-1-5-32-555",  # BUILTIN\Remote Desktop Users
+        "S-1-5-80-0",  # NT SERVICE\ALL SERVICES
+        "S-1-15-2-1",  # ALL APPLICATION PACKAGES
+        "S-1-15-2-2",  # ALL RESTRICTED APPLICATION PACKAGES
+    }
+)
+#: Accounts that many unrelated services run as. A key file one of them can read is broad, unless
+#: the engine itself runs as that account.
+_SHARED_SERVICE_ACCOUNT_SIDS: frozenset[str] = frozenset(
+    {
+        "S-1-5-19",  # LOCAL SERVICE
+        "S-1-5-20",  # NETWORK SERVICE
+    }
+)
 
-def _windows_read_problem(security: _WinPathSecurity) -> str | None:
-    """Why a broad account can read the file this access list belongs to, or ``None``.
 
-    A list that could not be read is a problem too: a check that did not finish has not shown the
-    file restricted. Kept free of ctypes so the decision is testable on every platform."""
+def _is_broad_group(sid: str) -> bool:
+    """Whether ``sid`` is a group or logon class that many accounts hold. At least the known ones."""
     from messagefoundry.auth.trust_anchors import _is_broad_sid
 
+    return _is_broad_sid(sid.lower()) or sid in _MORE_BROAD_GROUP_SIDS
+
+
+def _windows_read_problem(security: _WinPathSecurity, engine_sid: str | None) -> str | None:
+    """Why a broad account can read the file this access list belongs to, or ``None``.
+
+    ``engine_sid`` is the account this process runs as, which is never broad to itself. A list that
+    could not be read is a problem too, and so is an entry of a kind this check cannot interpret: a
+    check that did not finish has not shown the file restricted. Kept free of ctypes so the
+    decision is testable on every platform."""
     if security.status != 0:
         detail = f": {security.status_text}" if security.status_text else ""
         return f"its access list could not be read (Win32 error {security.status}{detail})"
@@ -124,9 +161,15 @@ def _windows_read_problem(security: _WinPathSecurity) -> str | None:
     if security.aces is None:
         return "its access list could not be read in full"
     for ace_type, mask, sid in security.aces:
-        if ace_type != ACCESS_ALLOWED_ACE_TYPE or not mask & _READ_REACH_MASK:
+        if ace_type not in _GRANTING_ACE_TYPES:
+            continue  # a deny or audit entry grants nothing
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE:
+            # A conditional or object allow entry. The reader records neither its rights nor its
+            # account, so who it lets in is unknown.
+            return "its access list holds a conditional entry this check cannot interpret"
+        if not mask & _READ_REACH_MASK or sid == engine_sid:
             continue
-        if _is_broad_sid(sid.lower()):
+        if _is_broad_group(sid) or sid in _SHARED_SERVICE_ACCOUNT_SIDS:
             return f"{describe_sid(sid)} can read it"
     return None
 
@@ -141,10 +184,12 @@ def _posix_read_problem(mode: int) -> str | None:
 def broad_read_problem(path: Path) -> str | None:
     """Why ``path`` is readable beyond the accounts a key file is for, or ``None`` when it is not.
 
-    Windows: an allow entry that lets Everyone, Authenticated Users, the local Users group or
-    another broad group read the file, or take it over. POSIX: a group or other read bit. A file
-    whose access cannot be read is reported as a problem, and so is, on Windows, a path that is
-    itself a link, because a link carries its own access list and the file behind it was not read.
+    Windows: an allow entry that lets a known broad group read the file, or take it over. The
+    groups are at least Everyone, Authenticated Users and the local Users group; the whole list is
+    :func:`_is_broad_group` plus the shared service accounts, and it is a list of known groups, not
+    a proof that only the intended accounts can read the file. POSIX: a group or other read bit. A
+    file whose access cannot be read is reported as a problem, and so is, on Windows, a path that
+    is itself a link, because a link carries its own access list and the file behind it was not read.
 
     The answer names accounts and modes only, never the path or the file's contents."""
     try:
@@ -157,7 +202,8 @@ def broad_read_problem(path: Path) -> str | None:
 
         if status.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             return "it is a link, so the access list of the file behind it was not read"
-        return _windows_read_problem(_win32_config_source_probes().read_path(path))
+        probes = _win32_config_source_probes()
+        return _windows_read_problem(probes.read_path(path), probes.self_sid)
     return _posix_read_problem(status.st_mode)
 
 
@@ -236,7 +282,16 @@ def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
             f"{path} was not created: this process's own account could not be read, so the file "
             "could not be restricted to it"
         )
-    expected = _expected_access(probes.self_sid, [_resolve_sid(name) for name in read_grants])
+    read_sids = [_resolve_sid(name) for name in read_grants]
+    for name, sid in zip(read_grants, read_sids, strict=True):
+        if _is_broad_group(sid):
+            # A grant that would make the file broadly readable is not a restricted create.
+            raise RestrictedFileError(
+                f"{path} was not created: {name!r} is {describe_sid(sid)}, a group many accounts "
+                "hold, and a key file cannot be granted to it. Name the one account the engine "
+                "runs as"
+            )
+    expected = _expected_access(probes.self_sid, read_sids)
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

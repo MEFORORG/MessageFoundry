@@ -678,7 +678,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "protect-key",
         help="DPAPI-protect the store key to a file for [store].encryption_key_file (Windows-only)",
     )
-    protect_key.add_argument("--out", required=True, help="path to write the protected key file")
+    protect_key.add_argument(
+        "--out",
+        required=True,
+        help="path to write the protected key file (must not exist; a file is never replaced)",
+    )
     protect_key.add_argument(
         "--generate",
         action="store_true",
@@ -2026,27 +2030,8 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # The store key file is checked BEFORE it is used (vault BACKLOG #2601). Machine-scope DPAPI lets
-    # any account on the host unprotect the blob, so the file's access list is what keeps the key
-    # from the others. `protect-key` creates the file restricted; this catches one that was moved,
-    # copied or re-granted since. The refuse/warn split is [security].enforcement. A file that is
-    # absent is left to the key provider, which fails closed on it at store open and says why.
-    from messagefoundry.store.keyprovider import provider_key_file
-
-    _key_file = provider_key_file(settings.store)
-    if (
-        _key_file is not None
-        and Path(_key_file).exists()
-        and not _key_file_access_gate(
-            _key_file,
-            what="the store key file named by [store].encryption_key_file",
-            remedy=(
-                "Restrict it to the account the engine runs as, SYSTEM and Administrators, or "
-                "write it again with `messagefoundry protect-key` to a new path"
-            ),
-            enforcing=enforcing,
-        )
-    ):
+    # The store key file is checked BEFORE it is used (vault BACKLOG #2601).
+    if not _store_key_file_gate(settings, enforcing=enforcing):
         return 2
 
     # PHI-at-rest invariant (#186b, ASVS 13.2.4): at-rest encryption is effective-by-default on ANY
@@ -4094,46 +4079,36 @@ def _serve(args: argparse.Namespace) -> int:
         GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
-        plan_api_tls_material,
     )
+    from messagefoundry.restricted_file import RestrictedFileError
 
     # A renewal or recovery of the generated pair is reported here and audited by the lifespan once
     # the store is open, which is after this point (ADR 0172 decision 6: never silent).
     _replaced: list[GeneratedPairReplaced] = []
-    _material = ensure_api_tls_material(
-        settings.api,
-        state_dir=generated_state_dir(settings.store.path),
-        replacements=_replaced,
-        # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so a
-        # lone restarted shard cannot leave its siblings serving a different certificate (#1276).
-        renew=args.shard is None,
-    )
+    _state_dir = generated_state_dir(settings.store.path)
+    try:
+        _material = ensure_api_tls_material(
+            settings.api,
+            state_dir=_state_dir,
+            replacements=_replaced,
+            # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so
+            # a lone restarted shard cannot leave its siblings serving a different certificate
+            # (#1276).
+            renew=args.shard is None,
+        )
+    except RestrictedFileError as exc:
+        # The TLS key could not be created restricted, and no usable pair exists to fall back on
+        # (vault BACKLOG #2601). A clean refusal, as protect-key and the cert commands give.
+        print(f"error: {exc}; refusing to start.", file=sys.stderr)
+        return 2
     # Minted HERE, before the app is built, so the expiry monitor below watches the certificate this
     # listener actually presents. [api].tls_cert_file is the PRE-mint config value and is empty
     # exactly when the engine minted, so handing the monitor that value left the generated pair
     # unwatched (BACKLOG #1276). None only behind a declared upstream terminator: the engine then
     # serves no certificate of its own, so it has none to watch.
     _served_api_cert = _material[0] if _material is not None else None
-    # The key the engine minted is checked before it is served (vault BACKLOG #2601). It is created
-    # restricted, so this catches a pair that was copied into a broader directory or re-granted
-    # since. Only the generated pair, as the plan names it: an operator's own key file is not
-    # judged here.
-    _tls_plan = plan_api_tls_material(
-        settings.api, state_dir=generated_state_dir(settings.store.path)
-    )
-    if (
-        _tls_plan.source == "generated"
-        and _tls_plan.key_file is not None
-        and not _key_file_access_gate(
-            _tls_plan.key_file,
-            what=f"the generated TLS private key {_tls_plan.key_file}",
-            remedy=(
-                "Restrict it to the account the engine runs as, or delete it and its certificate "
-                "so the next start mints a new pair"
-            ),
-            enforcing=enforcing,
-        )
-    ):
+    # The key the engine minted is checked before it is served (vault BACKLOG #2601).
+    if not _generated_tls_key_gate(settings, _state_dir, enforcing=enforcing):
         return 2
 
     app = create_managed_app(
@@ -4328,8 +4303,10 @@ def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
         return None
 
 
-def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
+def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> Path:
     """Renew the shared generated API pair, if due, before any engine shard starts (#1276).
+
+    Returns the state dir the pair lives in, which is where each shard will look for it.
 
     Every shard serves this one pair from the state dir beside its store, and a shard never renews
     it (``serve --shard`` passes ``renew=False``), so this is the fleet's only renewal: all shards
@@ -4360,12 +4337,11 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
     if root is not None and not store_path.is_absolute():
         store_path = root / store_path
 
+    state_dir = generated_state_dir(str(store_path))
     replaced: list[GeneratedPairReplaced] = []
-    ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(str(store_path)), replacements=replaced
-    )
+    ensure_api_tls_material(settings.api, state_dir=state_dir, replacements=replaced)
     if not replaced:
-        return
+        return state_dir
     posture = (
         hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
         if settings.ai is not None
@@ -4389,6 +4365,7 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
             await store.close()
 
     run_guarded(_audit())
+    return state_dir
 
 
 def _supervise(args: argparse.Namespace) -> int:
@@ -4456,12 +4433,25 @@ def _supervise(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # Vault BACKLOG #2601: the two key-file checks each shard's `serve` makes, for the same reason
+    # as the gates above: every shard would refuse, and the supervisor would only restart them. The
+    # store key file is checked before the renewal below can open the store and read it.
+    from messagefoundry.config.ai_policy import SecurityEnforcement
+    from messagefoundry.restricted_file import RestrictedFileError
     from messagefoundry.store.base import KeylessAuditChainRefused
 
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+    if not _store_key_file_gate(settings, enforcing=enforcing):
+        return 2
     try:
-        _renew_api_tls_before_spawning(settings, db_base)
+        state_dir = _renew_api_tls_before_spawning(settings, db_base)
     except KeylessAuditChainRefused as exc:  # #1916: a named key the provider did not resolve
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except RestrictedFileError as exc:  # the TLS key could not be created restricted
+        print(f"error: {exc}; refusing to start the fleet.", file=sys.stderr)
+        return 2
+    if not _generated_tls_key_gate(settings, state_dir, enforcing=enforcing):
         return 2
 
     return run_guarded(
@@ -5055,7 +5045,7 @@ def _cert_import(args: argparse.Namespace) -> int:
     which only an unencrypted bundle with no MAC can use, BACKLOG #1352); it is never a CLI arg and
     never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
-    public; key.pem is written ``O_EXCL`` + ``0o600`` + ``_secure_file`` and refuses to overwrite."""
+    public; key.pem is written by :func:`_write_private_key`, which refuses to overwrite."""
     import os
 
     from messagefoundry import pki
@@ -5324,9 +5314,9 @@ def _cert_inventory(args: argparse.Namespace) -> int:
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key for NON-PROD TLS bring-up.
 
-    Writes cert.pem + key.pem to ``--out-dir``; key.pem is written ``O_EXCL`` + ``0o600`` +
-    ``_secure_file`` and refuses to overwrite. Prints a clear DEV/non-prod note (a self-signed cert has
-    no chain of trust)."""
+    Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
+    which refuses to overwrite. Prints a clear DEV/non-prod note (a self-signed cert has no chain of
+    trust)."""
     from messagefoundry import pki
 
     if args.days <= 0:
@@ -5463,8 +5453,10 @@ def _protect_key(args: argparse.Namespace) -> int:
         f"Wrote DPAPI-protected key to {out} (read-granted to {granted}).\n"
         f"Next: set [store].encryption_key_file = {str(out)!r} and unset MEFOR_STORE_ENCRYPTION_KEY. "
         "Leave [store].key_provider at 'auto' or set it to 'dpapi'; 'env' ignores the file. "
-        "If the engine runs as a virtual / gMSA account (not LocalSystem), re-run with "
-        "--grant-account '<that account>' so the service can read the key at startup."
+        "If the engine runs as a virtual / gMSA account (not LocalSystem), the file must be "
+        "created with --grant-account '<that account>' so the service can read the key at "
+        "startup. protect-key does not replace a file, so to add the grant, delete this file and "
+        "run protect-key again with the SAME key in MEFOR_STORE_ENCRYPTION_KEY, not --generate."
     )
     return 0
 
@@ -5999,6 +5991,51 @@ def _key_file_access_gate(path: str, *, what: str, remedy: str, enforcing: bool)
         return False
     print(f"warning: {what} is not restricted: {problem}. {remedy}.", file=sys.stderr)
     return True
+
+
+def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
+    """:func:`_key_file_access_gate` for the DPAPI store key file, when the provider loads one.
+
+    Machine-scope DPAPI lets any account on the host unprotect the blob, so the file's access list
+    is what keeps the key from the others. ``protect-key`` creates the file restricted; this
+    catches one that was moved, copied or re-granted since. A file that is absent is left to the
+    key provider, which fails closed on it at store open and says why."""
+    from messagefoundry.store.keyprovider import provider_key_file
+
+    key_file = provider_key_file(settings.store)
+    if key_file is None or not Path(key_file).exists():
+        return True
+    return _key_file_access_gate(
+        key_file,
+        what="the store key file named by [store].encryption_key_file",
+        remedy=(
+            "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
+            "the key again with `messagefoundry protect-key` to a new path"
+        ),
+        enforcing=enforcing,
+    )
+
+
+def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enforcing: bool) -> bool:
+    """:func:`_key_file_access_gate` for the TLS private key the engine minted into ``state_dir``.
+
+    The key is created restricted, so this catches a pair that was copied into a broader directory
+    or re-granted since. Only the generated pair, as the plan names it: an operator's own
+    ``[api].tls_key_file`` is not judged here."""
+    from messagefoundry.api.tls import plan_api_tls_material
+
+    plan = plan_api_tls_material(settings.api, state_dir=state_dir)
+    if plan.source != "generated" or plan.key_file is None:
+        return True
+    return _key_file_access_gate(
+        plan.key_file,
+        what=f"the generated TLS private key {plan.key_file}",
+        remedy=(
+            "Restrict it to the account the engine runs as, or delete it and its certificate so "
+            "the next start mints a new pair"
+        ),
+        enforcing=enforcing,
+    )
 
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
