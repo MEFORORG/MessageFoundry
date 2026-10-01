@@ -57,7 +57,8 @@ updates:
       default-days: 5
       semver-major-days: 7
     # Dependabot WIDENS a declared cap instead of respecting it, so a load-bearing upper bound in
-    # pyproject.toml must be restated here as a version range or the cap is decorative. PR #66 rewrote
+    # pyproject.toml below major level must be restated here as a version range or the cap is
+    # decorative; the class rule further down says why a major-level cap needs none. PR #66 rewrote
     # `annotated-types<0.8` -> `<0.9` and `ruff>=0.4,<0.16` -> `<0.17`; the
     # resync then propagated 0.8.0/0.16.0 into constraints.lock, so ci.yml's `--constraint` pinned CI
     # *to* the broken versions. `python-deps` groups every minor and patch on `*`, and both of those
@@ -122,7 +123,8 @@ updates:
     # its entry `python-deps` would widen it in the routine minor-and-patch batch.
     #
     # THE CLASS RULE (BACKLOG #2505): a cap at MINOR level or lower needs an entry here. A MAJOR-level
-    # cap (`<N`, such as `hvac<3`, `webauthn<4` and `pynetdicom<4`) needs none, and normally gets
+    # cap, one whose first excluded version is N.0.0 for N above zero (`<4`, but also `~=3.0` or
+    # `==3.*`; so `hvac<3`, `webauthn<4` and `pynetdicom<4`), needs none, and normally gets
     # none; the reasoning is the one pyproject.toml gives beside `hvac`'s cap, so read it there. An
     # entry for a major cap stays legal as an opt-in. Some other caps have NO entry on purpose: at
     # least `hatchling`'s build-system pin and the exact group pins under "NOT IGNORED, deliberately"
