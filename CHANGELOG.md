@@ -664,6 +664,27 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`provision-admin` now refuses before it prompts on a fresh install, and resolves directory
+  secrets the way `serve` does.** It builds its auth service once, before the password prompt and
+  before any store is created, with the `[secrets]` provider and hop posture `serve` passes, and
+  opens the store with that posture too. A trust-anchor refusal at `enforce` on a fresh install no
+  longer comes after the prompt and leaves an empty store. A store key that cannot be resolved,
+  such as `vault` with no Vault environment in the shell or a DPAPI key the shell cannot read, is
+  refused before the prompt with exit 2. An AD bind password or OIDC client secret held by a
+  `[secrets]` provider now resolves here. A secret provider, directory or missing-file failure is
+  refused in fixed words, with no text from the failure, instead of reaching the generic error
+  report. An unusable bundled breach corpus is refused before the prompt. At `warn` an anchor
+  warning now prints once, not twice. Two refusals `serve` already gives now apply here too, at
+  `enforce`: an off-box OIDC identity provider with no `[auth].oidc_tls_crl_file` (exit 1), and a
+  server store hop that `serve` would refuse, such as one with no revocation check (exit 2). The
+  first applies here even with `[auth].enabled = false`, where `serve` builds no auth service.
+  (`BACKLOG #2081`)
+- **`audit-anchor --json` now reports a bad service settings file as JSON on stdout.** A missing,
+  unparseable or invalid `--service-config` printed plain text to stderr whatever `--json` said, so
+  a caller piping to `jq` got an empty stdout. It now prints `{"error": ...}` on stdout, as the
+  command's other refusals do, and exits 2. A settings section that fails validation is now
+  reported without echoing the section's values, and a directory named as the settings file now
+  exits 2 rather than 1, which this command spends on a broken chain. (`BACKLOG #2094`)
 - **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
   the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
   model defines both. The web console builds its bulk-replay buttons from them, so a channel whose
