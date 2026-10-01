@@ -41,7 +41,8 @@ the wheel; and it is inert until a partner publishes an `ECHConfig`).
 A conforming sidecar is a **loopback TLS-terminating re-originator**, not a tunnel:
 
 1. Accept the engine's egress on a loopback listener (same-host → the cleartext loopback hop has no wire
-   exposure, the ADR 0092 same-host posture).
+   exposure, the ADR 0092 same-host posture). The engine dials that listener direct. It uses no web
+   proxy on this hop, whatever `HTTP_PROXY`, `HTTPS_PROXY` or the Windows system proxy says.
 2. For each destination, open a **new** TLS connection with **ECH enabled**, fetching the `ECHConfig` from
    the destination's DNS **HTTPS record over DoH/DoT** (so the hostname is not leaked in cleartext DNS
    either — solving both halves).
@@ -109,7 +110,8 @@ outbound(
 validation, cannot be authored as data, and are invisible to the connection editor. Giving them a
 factory parameter (and therefore a `connections.toml` form) is tracked as **BACKLOG #NNN**.
 
-`ech_sidecar` must be a loopback address and is **mutually exclusive** with the `proxy_url` settings key
+`ech_sidecar` must be a loopback address (a full dotted address in `127.0.0.0/8`, `::1`, or the name
+`localhost`; decided without DNS) and is **mutually exclusive** with the `proxy_url` settings key
 (the sidecar *is* that connection's egress proxy) — refused in `RestDestination.__init__`
 ([`transports/rest.py`](../../messagefoundry/transports/rest.py); named by symbol rather than by line,
 because a line number goes stale silently and a wrong one reads as a working reference forever). It

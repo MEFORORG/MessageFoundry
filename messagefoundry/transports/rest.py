@@ -82,6 +82,7 @@ from messagefoundry.transports.bounded_read import (
     build_strict_opener,
     drain_bounded,
     hop_identity,
+    is_never_proxied_host,
     read_bounded_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -359,7 +360,11 @@ def _no_redirect_opener(
     :data:`_NO_REDIRECT_OPENER` whenever a connection needs a handler the shared one lacks, so the shared
     opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
     default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
-    already covers), so there is never a competing double-proxy.
+    already covers), so there is never a competing double-proxy. So ``ProxyHandler({})`` builds an
+    opener that uses no proxy at all, which is what the ECH sidecar hop passes.
+
+    Whatever proxy the opener ends up with, a loopback host is dialled direct (vault BACKLOG #2579):
+    :func:`~messagefoundry.transports.bounded_read.build_strict_opener` applies that to every opener.
 
     ``trust_anchor`` (#1180) narrows the client trust store to a resolved internal CA. An anchor that
     narrows nothing — the default — leaves the opener handler-for-handler what it was (apart from the
@@ -1163,6 +1168,13 @@ def _proxy_bypasses(host: str, bypass: tuple[str, ...]) -> bool:
     return False
 
 
+def _goes_direct(host: str, bypass: tuple[str, ...]) -> bool:
+    """Whether ``host`` is dialled direct, past a per-connection proxy: a loopback host always
+    (vault BACKLOG #2579, see ``bounded_read.LoopbackDirectProxyHandler``), and a ``proxy_no_proxy``
+    match (#128). The loopback case needs no entry in the list and cannot be switched off."""
+    return is_never_proxied_host(host) or _proxy_bypasses(host, bypass)
+
+
 #: The one Digest algorithm this engine answers a challenge with, on the origin 401 path
 #: (``http_auth._ApprovedDigestAuthHandler``) and the proxy 407 path (:class:`_ApprovedProxyDigestAuthHandler`)
 #: alike (BACKLOG #1171, ASVS 11.4.1).
@@ -1324,7 +1336,8 @@ class ProxyConfig:
     """A resolved per-connection forward proxy (ADR 0126). Carries the proxy address (or the "use default
     web proxy" flag), the NO_PROXY bypass list, the pre-emptive Basic ``Proxy-Authorization`` header (or
     none), and the reactive Digest recipe (or none). :meth:`for_host` resolves it against a specific
-    target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)."""
+    target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)
+    or is a loopback host, which is never proxied (vault BACKLOG #2579)."""
 
     proxies: tuple[tuple[str, str], ...]  # (("http", url), ("https", url)); () when use_default
     use_default: bool  # True → ProxyHandler() reading getproxies() ("Use Default Web Proxy", #112)
@@ -1340,8 +1353,12 @@ class ProxyConfig:
 
     def for_host(self, host: str) -> _HostProxy | None:
         """The proxy resolved for ``host``, or ``None`` if the host is bypassed (#128) — a bypassed host
-        gets NO proxy handler and NO proxy credential (byte-identical to no proxy)."""
-        if _proxy_bypasses(host, self.bypass):
+        gets NO proxy handler and NO proxy credential (byte-identical to no proxy).
+
+        A loopback host is bypassed with no entry in the list (vault BACKLOG #2579). The opener
+        would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
+        attached either: on a direct request it would go to the destination itself."""
+        if _goes_direct(host, self.bypass):
             return None
         return _HostProxy(self)
 
@@ -1472,14 +1489,15 @@ def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
     """Does a ``proxy_no_proxy`` value send ``host`` direct, past the proxy (BACKLOG #1989)?
 
     The predicate :meth:`ProxyConfig.for_host` applies, public so the static-credential hop reader
-    decides a bypass the way the transport does rather than restating it. ``host=None`` is a target
+    decides a bypass the way the transport does rather than restating it. So a loopback host goes
+    direct whatever the list says (vault BACKLOG #2579). ``host=None`` is a target
     whose host cannot be read before the connector is built (an ``env()`` reference): only a
     bypass-everything ``*`` entry is certain to cover it, so nothing else does."""
     bypass = _normalize_no_proxy(no_proxy)
     if host is None:
         # Each entry normalised as _proxy_bypasses does, so "*.", "*:80" and "[*]" count as "*".
         return any(_strip_proxy_host_port(raw).lower().rstrip(".") == "*" for raw in bypass)
-    return _proxy_bypasses(host, bypass)
+    return _goes_direct(host, bypass)
 
 
 def proxy_config_from_settings(
@@ -1547,13 +1565,6 @@ def proxy_config_from_settings(
 
 # --- ECH egress route (ADR 0139, ASVS 12.1.5) ---------------------------------------------------------
 
-_ECH_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-
-
-def _is_loopback_host(host: str) -> bool:
-    h = host.strip().lower().strip("[]")
-    return h in _ECH_LOOPBACK_HOSTS or h.startswith("127.")
-
 
 def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     """The loopback ECH-sidecar base URL for this connection (ADR 0139), or ``None`` when ``ech_egress``
@@ -1575,6 +1586,9 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
 
     Config fails closed: ``ech_egress`` set with no ``ech_sidecar`` raises, and a **non-loopback** sidecar
     is refused (a remote "sidecar" would leak the SNI on the hop to it, defeating the purpose).
+    Loopback is read by the cleartext guards' own predicate (vault BACKLOG #2579), so every sidecar
+    this accepts is a host no opener sends through a proxy. That covers the token-endpoint hop too,
+    which is re-addressed to the sidecar on the token provider's opener.
 
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
@@ -1592,7 +1606,7 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
         raise ValueError(
             f"ech_sidecar must be an http(s):// loopback URL, got {sidecar!r} (ADR 0139)"
         )
-    if not _is_loopback_host(parsed.hostname):
+    if not is_never_proxied_host(parsed.hostname):
         raise ValueError(
             "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
@@ -1875,7 +1889,9 @@ class RestDestination(DestinationConnector):
             # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
             # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
             # never the verify/proxy/insecure opener built above for a direct destination hop.
-            self._opener = _no_redirect_opener()
+            # The empty proxy map is what makes "no proxy" true: without it urllib would add a handler
+            # that reads HTTP_PROXY and the system proxy (vault BACKLOG #2579).
+            self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
 
     def _ech_request(
         self, data: bytes | None, headers: dict[str, str], method: str
