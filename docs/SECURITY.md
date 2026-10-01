@@ -1531,7 +1531,11 @@ with no page.
 - **A directory grant.** An account that gets Administrator because the *directory* added it to a
   group already mapped to Administrator raises no `administrator_granted` alert. The API's
   user-administration routes raise that alert, and a directory change does not pass through them.
-  The engine does see the grant, in one of two places. Neither names the role in an alert.
+  The engine does see the grant, in one of the two places below. Neither names the role in an
+  alert, and the route can end with no alert at all. An account with no live session raises none.
+  Nor does one that signs in again before the next reconciler pass. So watch membership of the
+  mapped group in the directory itself.
+  **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
     with the old and new roles. It also sends a best-effort roles-changed notice to that
     account's own notification address, when the account has one and security notices are set
@@ -1542,10 +1546,6 @@ with no page.
     `auth.ad_session_revoked` with the new roles, sends the same notice, and raises
     `ad_session_revoked` with reason `roles_changed`. The next sign-in then writes no
     `auth.ad_roles_resynced` row. That section lists when a pass revokes or alerts nothing.
-
-  So an account with no live session raises no alert at all. Watch membership of the mapped group
-  in the directory itself.
-  **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
 
 The check also flags some releases that changed nothing. A login that rehashes a password after an
 argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
@@ -3606,7 +3606,11 @@ on. [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit
 which rows are keyed. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless digest
 only, and it said any such change is detectable without that condition. Verify the chain with
 `messagefoundry audit-verify` — exit 0 means at least that no surviving row was edited or
-reordered by someone who could not recompute the chain.
+reordered by someone who could not recompute the chain. Run it with the store key in its
+environment: a keyed chain cannot be verified without that key, and the verify fails. Exit 0 does
+not say the chain is keyed. A store that has a key and opens onto a keyless chain is reported
+apart from the verify, as
+[`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 **A scheduled job reads the exit code and nothing else, so
 these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
 path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an

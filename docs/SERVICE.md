@@ -303,7 +303,8 @@ The key is a base64 32-byte secret. Two ways to supply it:
   only by an administrator. On a default Windows install that key grants local users read by
   inheritance, and the installer does not change it. That was measured on one Windows 11 machine,
   so check who can read that key on your own host. Prefer the DPAPI key file below for the store
-  key. It keeps that one key out of the list, and covers no other secret you put there.
+  key. It keeps that one key out of the list. It covers no other secret you put there, and that
+  includes a retired store key during a rotation.
   **CORRECTED 2026-10-01:** this read "readable by any local administrator".
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
