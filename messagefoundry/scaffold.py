@@ -203,8 +203,8 @@ jobs:
           if [[ ! "$version" =~ ^([0-9]+[.][0-9]+[.][0-9]+)((a|b|rc)[0-9]+)?$ ]]; then
             echo "::error::engine wheel version $version has no release tag spelling"; exit 1
           fi
-          tag="v${BASH_REMATCH[1]}${BASH_REMATCH[2]:+-${BASH_REMATCH[2]}}"
-          gh attestation verify "${wheels[0]}" --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref "refs/tags/$tag"
+          tag_version="${BASH_REMATCH[1]}${BASH_REMATCH[2]:+-${BASH_REMATCH[2]}}"
+          gh attestation verify "${wheels[0]}" --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref "refs/tags/v$tag_version"
 
   check:
     needs: verify-engine

@@ -600,12 +600,12 @@ _CONTINUATION = ("`", "\\")
 #: `--repo` or `--owner` names where the attestation must come from; gh refuses a verify with neither.
 _SCOPE = re.compile(r"--(?:repo|owner)\b")
 
-#: The release workflow, and a source ref that names a tag: `refs/tags/v...` or a variable holding
-#: one, as the PowerShell blocks (`$Tag`) and the scaffolded gate (`$tag`) do.
+#: The release workflow, and a source ref that names a release tag: it must start `refs/tags/v`,
+#: with a literal `v`, so a variable can supply only the version (`v$TagVersion`, `v$tag_version`).
 _SIGNER_WORKFLOW = re.compile(
     r"--signer-workflow\s+MEFORORG/MessageFoundry/\.github/workflows/release\.yml\b"
 )
-_SOURCE_REF = re.compile(r"""--source-ref\s+["']?refs/tags/(?:v|\$[A-Za-z_]+)""")
+_SOURCE_REF = re.compile(r"""--source-ref\s+["']?refs/tags/v""")
 
 
 def _commands_in(lines: list[str]) -> list[tuple[int, str]]:
@@ -697,12 +697,14 @@ def test_the_command_parser_tells_a_command_from_a_mention() -> None:
         "#   --source-ref refs/tags/v<version>",
         "Use `gh attestation verify x.whl --repo MEFORORG/MessageFoundry` here.",
         "The `gh attestation verify --source-ref` flag names the tag.",
+        "gh attestation verify x.whl --repo MEFORORG/MessageFoundry --signer-workflow "
+        'MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref "refs/tags/$Tag"',
     ]
     commands = _commands_in(lines)
-    assert [line for line, _ in commands] == [4, 6, 9], commands
+    assert [line for line, _ in commands] == [4, 6, 9, 11], commands
     verdicts = [_lacks_a_pin(text) for _, text in commands]
-    # --owner but no --signer-workflow; complete; inline --repo alone.
-    assert verdicts == [True, False, True], commands
+    # --owner but no --signer-workflow; complete; inline --repo alone; a ref with no literal v.
+    assert verdicts == [True, False, True, True], commands
 
 
 def test_every_attestation_verify_command_pins_the_release_workflow_and_ref() -> None:

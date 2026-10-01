@@ -308,17 +308,21 @@ def test_block_two_refuses_to_guess_which_file_to_verify(tmp_path: Path, count: 
 def test_each_block_turns_the_wheel_version_into_the_release_tag(
     tmp_path: Path, version: str, tag: str
 ) -> None:
-    """Run each block's own ``$Tag`` line for a final and three pre-releases.
+    """Run each block's own ``$TagVersion`` line for a final and three pre-releases.
 
     The release refuses any tag not spelled ``vX.Y.Z`` or ``vX.Y.Z-(a|b|rc)N``
     (scripts/release/tag_spelling.py), so this one rule names every real tag.
     """
     blocks = _powershell_blocks()
-    lines = [line for block in blocks for line in block.splitlines() if line.startswith("$Tag = ")]
-    assert len(lines) == len(blocks) == 2, f"expected one $Tag line per block, found {lines}"
+    lines = [
+        line for block in blocks for line in block.splitlines() if line.startswith("$TagVersion = ")
+    ]
+    assert len(lines) == len(blocks) == 2, f"expected one $TagVersion line per block, found {lines}"
     for i, line in enumerate(lines):
         script = tmp_path / f"tag{i}.ps1"
-        script.write_text(f'$V = "{version}"\n{line}\nWrite-Output $Tag\n', encoding="utf-8")
+        script.write_text(
+            f'$V = "{version}"\n{line}\nWrite-Output "v$TagVersion"\n', encoding="utf-8"
+        )
         proc = subprocess.run(
             ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
             capture_output=True,

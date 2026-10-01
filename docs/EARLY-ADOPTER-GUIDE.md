@@ -173,23 +173,23 @@ optionally `sigstore` (`pip install sigstore`). Install **only** the file that p
 
 ```powershell
 $V = "0.4.0"   # the exact version you intend to install, as its wheel spells it
-# Its release tag. A pre-release wheel says 0.5.0rc1, while its tag says v0.5.0-rc1.
-$Tag = "v" + ($V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2')
+# Its tag's spelling. A pre-release wheel says 0.5.0rc1, while its tag is v0.5.0-rc1.
+$TagVersion = $V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2'
 
 # Download the wheel + its Sigstore bundle from that release's assets
-gh release download $Tag --repo MEFORORG/MessageFoundry `
+gh release download "v$TagVersion" --repo MEFORORG/MessageFoundry `
   --pattern "messagefoundry-$V-*.whl" --pattern "messagefoundry-$V-*.whl.sigstore*"
 if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit $LASTEXITCODE)" }
 
 # Verify SLSA build provenance:  artifact -> source commit -> builder workflow
 gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry `
   --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml `
-  --source-ref "refs/tags/$Tag"
+  --source-ref "refs/tags/v$TagVersion"
 if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # (defense in depth) Verify the Sigstore signature pins the release workflow identity
 python -m sigstore verify identity "messagefoundry-$V-py3-none-any.whl" `
-  --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/$Tag" `
+  --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v$TagVersion" `
   --cert-oidc-issuer "https://token.actions.githubusercontent.com"
 if ($LASTEXITCODE -ne 0) { throw "sigstore identity verification FAILED (exit $LASTEXITCODE) — do not install this file" }
 
@@ -213,7 +213,7 @@ silently pick a different file than the one you verified. See
 for the exact script, exit-code checks included. A registry/mirror substitution or a relabelled file
 **fails** the check. Keep `--signer-workflow` and `--source-ref`: with `--repo` alone, the check
 accepts an attestation from any workflow in the repository, on any ref. The `--source-ref` and
-`--cert-identity` refs must match the tag you install, which `$Tag` gives: a pre-release wheel
+`--cert-identity` refs must match the tag you install, which `v$TagVersion` gives: a pre-release wheel
 says `0.5.0rc1`, while its tag says `v0.5.0-rc1`.
 
 For a **reproducible pinned** deploy, generate a hash-locked requirements file scoped to the extras you
