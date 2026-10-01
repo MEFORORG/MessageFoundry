@@ -118,6 +118,13 @@ updates:
     # exits 2. Why the cap exists is beside it in pyproject.toml; read it there. The bare name
     # matches `uvicorn[standard]` because dependabot-core's Python NameNormaliser strips extras
     # before it compares names (read 2026-09-30). Lift this entry in the same PR that lifts the cap.
+    #
+    # `pynetdicom`, `pydicom` and `webauthn` are the same WIDENED-CAP case (BACKLOG #2505). Each entry
+    # below carries a one-line pointer to the reason beside its cap in pyproject.toml; read it there.
+    # pydicom's `<3.1` is a MINOR cap, so without its entry `python-deps` would widen it in the routine
+    # minor-and-patch batch. `hvac<3` is the one cap with NO entry, on purpose, and pyproject.toml says
+    # why beside it. tests/test_dependabot_cap_ignores.py holds every upper bound in pyproject.toml to
+    # an entry here or to a stated exemption, and every entry here to a cap that still exists.
     ignore:
       - dependency-name: "ruff"
         versions: [">=0.16.0"]
@@ -127,6 +134,15 @@ updates:
         versions: [">=7.4.0"]
       - dependency-name: "uvicorn"
         versions: [">=0.50.0"]
+      # pyproject.toml's [dicom] extra comment: pynetdicom 3.x pairs with the pydicom 3.x line.
+      - dependency-name: "pynetdicom"
+        versions: [">=4.0.0"]
+      # pyproject.toml's [dicom] extra comment: the deflate guard replays pydicom internals (BACKLOG #1926).
+      - dependency-name: "pydicom"
+        versions: [">=3.1.0"]
+      # pyproject.toml's [webauthn] extra comment: the cbor2 ranges of webauthn's majors are disjoint.
+      - dependency-name: "webauthn"
+        versions: [">=4.0.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates), SPLIT BY UPDATE TYPE (owner
       # decision 2026-09-30) so one bad major cannot hold the routine minors and patches hostage.
