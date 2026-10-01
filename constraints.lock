@@ -226,7 +226,9 @@ pyx12==4.0.0
 pyyaml==6.0.3
     # via messagefoundry
 requests==2.34.2
-    # via hvac
+    # via
+    #   hvac
+    #   messagefoundry
 ruff==0.15.22
     # via messagefoundry
 shiboken6==6.11.2
