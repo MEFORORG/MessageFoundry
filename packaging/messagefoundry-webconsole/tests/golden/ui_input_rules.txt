@@ -3,12 +3,15 @@ GET /ui/account/sessions	m	query	-	-
 GET /ui/approvals	m	query	-	-
 GET /ui/cluster	m	query	-	-
 GET /ui/connection/{name}	name	path	-	-
+GET /ui/connection/{name}/events/{event_id}/reason	name	path	-	-
 GET /ui/connections/purge-confirm	dest	query	-	-
 GET /ui/connections/purge-confirm	scope	query	-	-
 GET /ui/dead-letters	channel_id	query	connection	422
 GET /ui/dead-letters	destination_name	query	connection	422
 GET /ui/events	connection	query	connection	400-rerender
 GET /ui/events	kind	query	event kind	400-rerender
+GET /ui/events/{event_id}/reason	connection	query	connection	400-rerender
+GET /ui/events/{event_id}/reason	kind	query	event kind	400-rerender
 GET /ui/login	e	query	-	-
 GET /ui/messages	channel_id	query	connection	400-rerender
 GET /ui/messages	control_id	query	control id	400-rerender

@@ -193,9 +193,10 @@ try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | Conve
 # no extra cost -- which is what lets it distinguish "not wired" from "wired to publish somewhere
 # else", two states with completely different fixes that the old one-line message merged.
 #
-# EIGHT STATES. The old message named none of them: it said "not installed or has not run yet" and
-# printed the bare installer command with no root -- so following the reader's own advice re-ran the
-# exact invocation that produced the false INSTALLED claim in the first place.
+# AT LEAST TEN STATES; the function below is the list. CORRECTED 2026-09-30: this read "EIGHT STATES",
+# already one short before WIRED_POWERSHELL_SOURCE joined for BACKLOG #1459. The old message
+# named none of them. It said "not installed or has not run yet" and printed the bare installer
+# command with no root. So following the reader's own advice re-ran the exact invocation that produced the false INSTALLED claim in the first place.
 function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
     $settingsPath = Join-Path $Root "settings.json"
     # THE DIRECTORY ITSELF FIRST. A typo'd CLAUDE_CONFIG_DIR otherwise reads as "this root has no
@@ -275,6 +276,23 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
         $o.remedy = $reinstall
         return $o
     }
+    # THE LAST ARM BEFORE WIRED_HERE, AND IT REPLACES ONLY THAT ONE. The arms above keep their
+    # diagnosis: each already offers the installer run, which also replaces PowerShell source, and
+    # WIRED_LEGACY / WIRED_ELSEWHERE name a path fact an operator still needs. What was wrong is this: a
+    # PowerShell-source command whose `$d = '...'` path matched came back WIRED_HERE, told to "start a
+    # NEW session" -- advice that cannot work, because bash cannot parse the command and pwsh never
+    # starts (BACKLOG #1459; measured on a live account root 2026-09-30).
+    #
+    # NOT IN $dxUntrusted, ON PURPOSE. On a box where Claude Code runs the statusLine under bash no
+    # fresh reading can exist, and the age refusal already turns an old one into UNKNOWN. On a box where
+    # it runs under some other shell the command may work, and a fresh reading it wrote is real.
+    if (Test-IsPowerShellSourceStatusLine $cmd) {
+        $o.state = "WIRED_POWERSHELL_SOURCE"
+        $o.line = "WIRED (ours) but the command is PowerShell source. Claude Code runs a statusLine under bash where Git Bash is installed, and bash cannot parse it, so pwsh never starts and nothing publishes. WAITING WILL NOT FIX THIS."
+        $o.remedy = @("Re-wire this root (owner, plain terminal); the installer replaces it with a command both shells run:",
+            $reinstall[1])
+        return $o
+    }
     $o.state = "WIRED_HERE"
     $o.line = "WIRED (ours), and it is wired to publish where this reader is looking"
     $o.remedy = @("Settings are read at session START, so a session already running when it was wired still",
@@ -305,6 +323,10 @@ if (-not $doc) {
             config_root_source = $rootSource
             settings_path     = $dx.settings_path
             statusline_state  = $dx.state
+            # THE CAUSE AND THE FIX TRAVEL WITH THE STATE (BACKLOG #1459). The spawn hook reads only
+            # this document, and a bare state name gave it nothing to say but UNKNOWN.
+            statusline_line   = $dx.line
+            statusline_remedy = @($dx.remedy)
             state_dir         = $StateDir
             wired_state_dir   = $dx.wired_state_dir
             wired_collector   = $dx.wired_collector
@@ -629,6 +651,8 @@ if ($Json) {
         # describing a shape the code does not have is worse than no comment.
         cancellation_pending_from = $(if ($avail.state -eq 'PENDING') { $avail.effective_from } else { $null })
         statusline_state = $dx.state
+        statusline_line = $dx.line
+        statusline_remedy = @($dx.remedy)
         wired_state_dir = $dx.wired_state_dir
         config_root  = $readRoot
         config_root_source = $rootSource
@@ -672,6 +696,15 @@ if ($avail.state -eq 'PENDING') {
 if ($dx.state -in $dxUntrusted) {
     Write-Host ""
     Write-Host "  WARNING -- the numbers below may be a leftover:" -ForegroundColor Yellow
+    Write-Host "  $($dx.line)" -ForegroundColor Yellow
+    foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
+}
+# POWERSHELL SOURCE AND NOTHING FRESH (BACKLOG #1459). This state is kept out of $dxUntrusted so a fresh
+# reading on a box that does not use bash survives. Without this arm, a stale one fell through both
+# warnings and the operator saw no cause and no fix. Same -and rule as the WIRED_HERE arm below.
+elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $five.state -eq "UNKNOWN" -and $seven.state -eq "UNKNOWN") {
+    Write-Host ""
+    Write-Host "  WARNING -- nothing fresh has published here, and the wiring says why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
     foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
 }

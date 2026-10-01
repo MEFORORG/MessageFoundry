@@ -7,13 +7,13 @@ compose.
 
 | Tier | Engine | When | Checks | On failure |
 |---|---|---|---|---|
-| 1. Tolerant peek | `python-hl7` ([parsing/peek.py](../messagefoundry/parsing/peek.py)) | Always (hot path) | Parse + fast field access; size/segment caps; MSH present | Unparseable / oversized → `ERROR` (NAK), never crashes the connection |
+| 1. Tolerant peek | The built-in parser ([parsing/peek.py](../messagefoundry/parsing/peek.py), ADR 0054) | Always (hot path) | Parse + fast field access; size/segment caps; MSH present | Unparseable / oversized → `ERROR` (NAK), never crashes the connection |
 | 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK (AR/AE) at the listener |
 | 3. Business consistency | `parsing/consistency.py` (this WP) | In a Router/Handler | **Cross-field** coherence the schema can't express | Handler decides: `FILTERED` or `ERROR`/dead-letter |
 
 ## Tier 1 — tolerant peek (always on)
 
-The hot path uses `python-hl7` for fast, forgiving field access (`msg["PID-3"]`), so routing never pays
+The hot path uses the built-in tolerant parser for fast, forgiving field access (`msg["PID-3"]`), so routing never pays
 for full structural validation. It enforces only hard safety limits (max message bytes, max segments,
 MSH presence). A message that can't be parsed, or that exceeds a limit, is routed to the error/dead-
 letter path and logged `ERROR` — it never crashes the connection. This is the right default for most

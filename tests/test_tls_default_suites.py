@@ -330,6 +330,10 @@ CLIENT_HOPS: dict[str, Callable[[_Pki], ssl.SSLContext]] = {
     "DICOM destination": lambda p: _built(
         dicom._client_ssl_context({"tls": True, "host": "localhost", "tls_ca_file": p.ca})
     ),
+    # The factory LdapAuthenticator builds, which NarrowedTls calls for each connection (#2494).
+    "LDAPS (AD bind)": lambda p: tls_policy.assert_ldap3_tls_suites(
+        validate=ssl.CERT_REQUIRED, ca_certs_data=Path(p.ca).read_text(), connector="LDAPS (test)"
+    )(),
 }
 
 

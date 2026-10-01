@@ -10,7 +10,7 @@ and a code-first Router/Handler calls it **on demand** against a
 pushed through the engine pipeline as a bespoke object. The X12 content type is referred to by the
 literal string ``"x12"`` (never imported from ``config``) to keep this purity.
 
-Two tiers, mirroring python-hl7 (tolerant) / hl7apy (strict):
+Two tiers, mirroring HL7 v2's built-in tolerant parser / hl7apy (strict):
 
 * **Tolerant (built here):** :class:`X12Peek` (cheap ISA + GS/ST peek for routing), :func:`split` /
   :class:`X12FrameReader` (interchange framing), :class:`X12Message` (read/set/encode for transforms),

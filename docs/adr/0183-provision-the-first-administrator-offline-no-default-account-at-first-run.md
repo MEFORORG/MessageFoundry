@@ -515,6 +515,11 @@ and AC-16's message half as tests, each red at its base first.*
   `::test_a_password_the_policy_refuses_leaves_no_store` and
   `::test_an_existing_administrator_is_refused_before_the_prompt`, with
   `::test_an_existing_store_with_no_administrator_still_prompts_and_provisions` as the control.
+  BACKLOG #2081 extended the "before prompting" half to the refusals building the auth service and
+  resolving the store key can give, on a fresh install as well as an existing store:
+  `::test_a_weak_anchor_is_refused_cleanly_at_enforce`,
+  `::test_a_key_provider_that_cannot_resolve_is_refused_before_the_prompt` and
+  `::test_each_named_build_failure_is_refused_in_fixed_words_before_the_prompt`.
 - **AC-16** — IF the ADR 0167 gate refuses because no enabled Administrator has an address, THEN its
   message SHALL name the offline address setter, AND running it SHALL let the next start pass.
   → Wave 1c for the setter; Wave 2 for the message:

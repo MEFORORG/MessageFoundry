@@ -10,8 +10,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from defusedxml.common import DefusedXmlException
 
+from messagefoundry._vendor.defusedxml.common import DefusedXmlException
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.wiring import (
     ConnectionSpec,

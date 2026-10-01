@@ -403,7 +403,7 @@ def test_a_wrapped_file_does_not_quietly_grow_an_unwrapped_pwsh_launch(name: str
     """THE CONVENTION IN A DOCSTRING, MADE INTO A GATE -- BACKLOG #1304.
 
     ``tests/test_coord_usage.py`` reds ``main``'s harness leg when one of its ``pwsh`` launches
-    starves, and the fix routed all 21 of them through ``run_single``. Nothing stopped a 22nd being
+    starves, and the fix routed every one it had through ``run_single``. Nothing stopped a new one being
     added next to them as a bare ``subprocess.run(["pwsh", ...])``: it would pass review by
     resembling its neighbours, and rejoin the population that produced the reds. ``run_single``'s own
     docstring makes the general point -- "A convention in a docstring would not have held that line."

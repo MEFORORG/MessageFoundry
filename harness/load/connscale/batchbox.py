@@ -332,6 +332,7 @@ def aggregate_cell_record(
     )
 
     return ConnScaleRecord(
+        rate_window=_bands_rate_window(proc_reports),
         sweep_mode=cell.sweep_mode,
         count=cell.count,
         offered_aggregate_rate=offered,
@@ -368,6 +369,21 @@ def aggregate_cell_record(
     )
 
 
+def _bands_rate_window(proc_reports: list[dict[str, Any]]) -> str | None:
+    """The rate window the band reports say their rates were read over (BACKLOG #2012).
+
+    Read off the reports rather than assumed, so a band from a connscale-remote that names another
+    window, or none, shows up on the cell. ``None`` when no band names one; different windows come
+    back joined with ``|``, as ``report.records_rate_window`` joins them.
+    """
+    windows = sorted(
+        {str(r.get("throughput", {}).get("rate_window") or "unrecorded") for r in proc_reports}
+    )
+    if not windows or windows == ["unrecorded"]:
+        return None
+    return "|".join(windows)
+
+
 def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
     """A cell whose >= 6 sink-PROCESS fleet could not be driven or aggregated (a crashed remote band, an
     empty/short fleet, a null engine gauge), materialised as an EXPLICIT failed/loss
@@ -388,6 +404,7 @@ def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
         backlog=0,
         detail=f"cell drive failed: {detail}",
     )
+    # No `rate_window`: the cell measured no rate, so it names no window (BACKLOG #2012).
     return ConnScaleRecord(
         sweep_mode=cell.sweep_mode,
         count=cell.count,
@@ -772,6 +789,7 @@ async def run_batch_driver(
                     "sink_received": record.no_loss.sink_received,
                     "no_loss_ok": record.no_loss.ok,
                     "achieved_read_per_s": round(record.achieved_read_per_s, 2),
+                    "rate_window": record.rate_window,
                 },
             )
         except (ConnScaleError, OSError, ValueError) as exc:

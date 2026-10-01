@@ -28,6 +28,7 @@ from messagefoundry.config import wiring
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.wiring import EnvRef, Registry, WiringError, resolve_env_settings
 from messagefoundry.transports.email import _as_recipients
+from messagefoundry.transports.rest import _normalize_no_proxy
 
 PKG = pathlib.Path(messagefoundry.__file__).resolve().parent
 
@@ -189,6 +190,88 @@ def test_a_reference_inside_a_whole_setting_env_default_is_refused_too(shape: st
     assert SENTINEL not in str(excinfo.value)
 
 
+#: An ``env()`` used as another ``env()``'s default, in both spellings of the INNER one: an
+#: ``EnvRef``, and the raw marker table. Code-first can write either. The file loader leaves an inner
+#: marker raw, but its type check refuses that shape before any factory runs (see the TOML test).
+#: The inner key is ``inner_list`` and the outer one ``outer_list``; the control below sets only the
+#: inner one, to show it is never read.
+NESTED_DEFAULTS: dict[str, Callable[[list[Any]], Any]] = {
+    "EnvRef": lambda items: messagefoundry.env(
+        "outer_list", default=messagefoundry.env("inner_list", default=items)
+    ),
+    "raw marker": lambda items: messagefoundry.env(
+        "outer_list", default={"env": "inner_list", "default": items}
+    ),
+}
+
+
+@pytest.mark.parametrize("default_shape", sorted(NESTED_DEFAULTS))
+def test_a_nested_env_default_never_resolves_even_with_a_static_list(default_shape: str) -> None:
+    """Positive control for the refusal below, driven into a real sink. ``resolve_env_settings``
+    resolves one link, so with the outer key unset the INNER reference arrives unresolved -- even
+    with the inner key set -- and Rest's proxy-bypass list reads it as empty. That is why a chain with
+    a clean static list is refused too: its fallback link never works, so no version of it is clean."""
+    nested = NESTED_DEFAULTS[default_shape](["bypass.example.invalid"])
+    resolved = resolve_env_settings(
+        {"proxy_no_proxy": nested}, {"inner_list": ["set.example.invalid"]}
+    )
+    assert resolved["proxy_no_proxy"] is nested.default
+    assert _normalize_no_proxy(resolved["proxy_no_proxy"]) == ()
+
+
+@pytest.mark.parametrize("target", sorted(LIST_SETTINGS))
+@pytest.mark.parametrize(
+    "items",
+    [
+        pytest.param(lambda: ["static.example.invalid", SENTINEL], id="static-items"),
+        pytest.param(lambda: ["x", NESTED_SHAPES["code-first"]()], id="EnvRef-item"),
+        pytest.param(lambda: ["x", NESTED_SHAPES["connections.toml"]()], id="marker-item"),
+    ],
+)
+@pytest.mark.parametrize("default_shape", sorted(NESTED_DEFAULTS))
+def test_an_env_used_as_another_envs_default_is_refused(
+    default_shape: str, items: Callable[[], list[Any]], target: tuple[str, str]
+) -> None:
+    """The remainder of BACKLOG #1820. Every variant carries the sentinel, so the no-echo check
+    below can fail in each one; the static case carries it as a plain item."""
+    factory, setting = target
+    with pytest.raises(WiringError) as excinfo:
+        LIST_SETTINGS[target](NESTED_DEFAULTS[default_shape](items()))
+    message = str(excinfo.value)
+    assert f"{factory} {setting} env() default may not itself be" in message, message
+    assert SENTINEL not in message, message
+
+
+def test_an_item_and_a_chain_on_one_factory_are_both_named_with_their_own_remedy() -> None:
+    with pytest.raises(WiringError) as excinfo:
+        messagefoundry.Rest(
+            url="https://example.invalid/x",
+            capture_response_headers=["x-a", NESTED_SHAPES["code-first"]()],
+            proxy_no_proxy=NESTED_DEFAULTS["EnvRef"](["np.example.invalid"]),
+        )
+    message = str(excinfo.value)
+    assert "Rest capture_response_headers item 1 may not be an env() reference" in message, message
+    assert "Rest proxy_no_proxy env() default may not itself be" in message, message
+    assert "static list default instead" in message, message
+    assert SENTINEL not in message, message
+
+
+def test_a_self_referential_default_is_refused_at_the_first_link() -> None:
+    """A raw marker whose default list holds the sentinel and the marker itself. The refusal stops at
+    the first link, so nothing walks the cycle, and the message withholds what the cycle holds."""
+    loop: dict[str, Any] = {"env": "loop", "default": [SENTINEL]}
+    loop["default"].append(loop)
+    with pytest.raises(WiringError) as excinfo:
+        messagefoundry.Rest(
+            url="https://example.invalid/x",
+            # A whole-setting env() here is resolved by the wiring layer; see the test above.
+            capture_response_headers=messagefoundry.env("outer_list", default=loop),  # type: ignore[arg-type]
+        )
+    message = str(excinfo.value)
+    assert "capture_response_headers env() default may not itself be" in message, message
+    assert SENTINEL not in message, message
+
+
 _OUTBOUND_HEAD = (
     "[[outbound]]\n"
     'name = "OB_ACME"\n'
@@ -211,17 +294,17 @@ _HTTP_INBOUND_HEAD = (
 )
 _SOAP_HEAD = _OUTBOUND_HEAD.format(transport="soap") + 'soap_action = "urn:probe"\n'
 
+#: ``(file head, setting)`` for each list-valued setting a ``connections.toml`` transport reaches.
+_TOML_LIST_TARGETS = [
+    (_OUTBOUND_HEAD.format(transport="rest"), "capture_response_headers"),
+    (_OUTBOUND_HEAD.format(transport="rest"), "proxy_no_proxy"),
+    (_SOAP_HEAD, "capture_response_headers"),
+    (_SOAP_HEAD, "proxy_no_proxy"),
+    (_HTTP_INBOUND_HEAD, "intake_client_subjects"),
+]
 
-@pytest.mark.parametrize(
-    ("head", "setting"),
-    [
-        (_OUTBOUND_HEAD.format(transport="rest"), "capture_response_headers"),
-        (_OUTBOUND_HEAD.format(transport="rest"), "proxy_no_proxy"),
-        (_SOAP_HEAD, "capture_response_headers"),
-        (_SOAP_HEAD, "proxy_no_proxy"),
-        (_HTTP_INBOUND_HEAD, "intake_client_subjects"),
-    ],
-)
+
+@pytest.mark.parametrize(("head", "setting"), _TOML_LIST_TARGETS)
 def test_the_toml_surface_refuses_a_list_item(
     tmp_path: pathlib.Path, head: str, setting: str
 ) -> None:
@@ -232,6 +315,25 @@ def test_the_toml_surface_refuses_a_list_item(
         load_connections_file(path, Registry())
     assert f"{setting} item 1" in str(excinfo.value), str(excinfo.value)
     assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
+@pytest.mark.parametrize(("head", "setting"), _TOML_LIST_TARGETS)
+def test_the_toml_surface_refuses_a_nested_env_default_before_the_factory(
+    tmp_path: pathlib.Path, head: str, setting: str
+) -> None:
+    """The file spelling of the nested shape never reaches the factory guard. The loader's type
+    check refuses the outer default first, because the inner marker arrives as a raw table where the
+    annotation wants an array. This pins that, and that its message withholds the sentinel too."""
+    path = _write(
+        tmp_path,
+        f'{head}{setting} = {{ env = "outer_list", default = '
+        f'{{ env = "inner_list", default = ["{_static(setting)}", {TOML_MARKER}] }} }}\n',
+    )
+    with pytest.raises(WiringError) as excinfo:
+        load_connections_file(path, Registry())
+    message = str(excinfo.value)
+    assert f"'{setting}' env() default must be an array, got a table" in message, message
+    assert SENTINEL not in message, message
 
 
 # --- over-widening controls --------------------------------------------------
@@ -267,6 +369,20 @@ def test_an_env_ref_standing_for_the_whole_setting_still_builds(target: tuple[st
     assert isinstance(spec.settings[setting], EnvRef)
     resolved = resolve_env_settings(spec.settings, {"whole_list": [_static(setting)]})
     assert resolved[setting] == [_static(setting)]
+
+
+@pytest.mark.parametrize("target", _WHOLE_SETTING_TARGETS)
+def test_a_whole_setting_env_with_a_static_list_default_still_builds(
+    target: tuple[str, str],
+) -> None:
+    """Over-widening control for the nested-default refusal: ONE link with a static list default is
+    the legal shape. It resolves to the default with the key unset and to the environment's list with
+    it set."""
+    _factory, setting = target
+    spec = LIST_SETTINGS[target](messagefoundry.env("whole_list", default=[_static(setting)]))
+    assert resolve_env_settings(spec.settings, {})[setting] == [_static(setting)]
+    from_env = resolve_env_settings(spec.settings, {"whole_list": ["env.example.invalid"]})
+    assert from_env[setting] == ["env.example.invalid"]
 
 
 def test_a_whole_setting_env_ref_in_toml_is_still_decoded_and_resolves(

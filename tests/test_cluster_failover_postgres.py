@@ -250,6 +250,31 @@ async def test_preferred_delay0_wins_expired_lease_race_over_delayed_node(coords
     assert owner == "P"  # the preferred node kept leadership across the whole race
 
 
+@pytest.mark.parametrize("how", ["stepdown", "stop"])
+async def test_a_released_lease_honours_leader_preference(coords, how: str) -> None:
+    # BACKLOG #1986 against the REAL release SQL: a planned stepdown and a clean stop stamp the lease
+    # expiry with clock_timestamp(), so the delay still weighs against a RELEASED lease. The DR node's
+    # 30 s delay is far longer than this test runs, so its refusal does not rest on a timing margin.
+    make, _ = coords
+    a = make("A")
+    p = make("P", acquire_delay_seconds=0.0)
+    dr = make("DR", acquire_delay_seconds=30.0)
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+    if how == "stepdown":
+        await a.step_down_leadership(sibling_acquire_delay_seconds=30.0)
+    else:
+        await a.stop()
+
+    owner, expires = await p.leadership_lease()
+    # Control: the release stamped the DB clock, not the epoch the old statement wrote.
+    assert owner == "A" and expires is not None and expires > 1_000_000_000
+    await dr._maintain_leadership()
+    assert dr.is_leader() is False, "the delayed node took a released lease"
+    await p._maintain_leadership()
+    assert p.is_leader() is True
+
+
 # --- full start()/stop() lifecycle electing exactly one leader --------------
 
 

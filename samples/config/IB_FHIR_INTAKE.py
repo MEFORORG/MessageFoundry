@@ -9,7 +9,7 @@ against FHIR R4B (a non-conformant resource raises → ERROR/dead-letter, the co
 delivers the canonical JSON to a FHIR server with the ``FHIR()`` destination. The server is
 environment-specific, so it's authored with ``env()`` (resolved from ``environments/<env>.toml``).
 
-A real HL7 v2 → FHIR route would do the same, with the Handler mapping a python-hl7 ``Message`` into a
+A real HL7 v2 → FHIR route would do the same, with the Handler mapping an HL7 ``Message`` into a
 ``fhir.resources`` resource before ``Send`` — the mapping stays code-first here, never in the connector.
 
     python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db

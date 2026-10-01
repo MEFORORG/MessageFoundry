@@ -202,7 +202,7 @@ def test_the_closure_file_parses_and_is_not_empty() -> None:
         f"the closure parsed to {len(closure)} names, which is too few to be the real set; "
         "the parser and the file have diverged"
     )
-    assert "hl7" in closure and "cryptography" in closure, (
+    assert "tomlkit" in closure and "cryptography" in closure, (
         "two known core dependencies are missing from the parsed closure"
     )
 
@@ -374,7 +374,7 @@ def test_the_core_lock_parses_to_a_real_closure() -> None:
     assert len(pins) >= 20, f"{_CORE_LOCK.name} parsed to {len(pins)} pins, too few to be real"
     # One transitive (cffi, via cryptography) and one whose lock line carries a platform marker
     # (uvloop, which no Windows install gets).
-    assert {"hl7", "cryptography", "cffi", "uvloop"} <= pins.keys(), (
+    assert {"tomlkit", "cryptography", "cffi", "uvloop"} <= pins.keys(), (
         f"{_CORE_LOCK.name} misses a known transitive or platform-marked core package"
     )
 
@@ -689,7 +689,7 @@ def test_the_readings_snapshot_parses_and_is_not_empty() -> None:
     data = _snapshot()
     readings = _readings(data)
     assert len(readings) >= 20, f"{_READINGS.name} parsed to {len(readings)} readings"
-    assert {"hl7", "cryptography", "pyodbc"} <= readings.keys()
+    assert {"tomlkit", "cryptography", "pyodbc"} <= readings.keys()
     dt.date.fromisoformat(data["snapshot_date"])
     assert data["criteria"] == component_readings.criteria(), (
         "the snapshot records different criteria from the generator's; a changed threshold "

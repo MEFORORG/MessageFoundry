@@ -1943,7 +1943,7 @@ class ConsolidatedLadderReport:
         floor if the climb never collapsed. ``None`` if no rung sustained (or none had a measured drain, or
         none was admissible).
 
-        ⚠️ STILL OFFERED-DERIVED. Read it beside :attr:`pinned_accepted_ingress_rate`, which is built from
+        WARNING: STILL OFFERED-DERIVED. Read it beside :attr:`pinned_accepted_ingress_rate`, which is built from
         what the engine ACTUALLY ACCEPTED. The fidelity gate now bounds the gap (an admissible rung accepted
         >= 95% of its offer), but it does not close it — and it closes it LEAST at the ceiling, which is
         exactly where offered and accepted diverge."""
@@ -1989,7 +1989,7 @@ class ConsolidatedLadderReport:
         """The pinned rung's ACCEPTED-derived ingress (``A / (hold + drain)``) — the honest FLOOR under
         :attr:`pinned_ingress_rate`. ``None`` when nothing pinned or the drain was unmeasured.
 
-        ⚠️ **THIS IS NOT THE UNDER-DRIVE DETECTOR — THE FIDELITY GATE IS.** It reads :attr:`pinned_rung`,
+        **WARNING: THIS IS NOT THE UNDER-DRIVE DETECTOR — THE FIDELITY GATE IS.** It reads :attr:`pinned_rung`,
         which is drawn from :attr:`admissible_climb`, and admissible means ``acked >= 0.95 x offered`` BY
         DEFINITION. So the accepted/offered divergence observable HERE is bounded to ≤ 5%
         (:data:`~harness.load.shardcert.FIDELITY_ACKED_FLOOR`) BY CONSTRUCTION: this is a bounded honest
@@ -2022,7 +2022,7 @@ class ConsolidatedLadderReport:
         the two ceilings agree. Below 1.0 ⇒ the offered-derived ceiling overstates by exactly this much.
         ``None`` when nothing pinned.
 
-        ⚠️ **BOUNDED BY CONSTRUCTION, AND THEREFORE NOT AN UNDER-DRIVE DETECTOR.** The pinned rung is
+        **WARNING: BOUNDED BY CONSTRUCTION, AND THEREFORE NOT AN UNDER-DRIVE DETECTOR.** The pinned rung is
         FIDELITY-ADMISSIBLE, so ``acked >= 0.95 x offered`` and this ratio cannot fall below ~0.95 here (the
         drain term can only push it further DOWN toward that floor, never past what an admissible rung
         accepted). A >5% divergence is UNREACHABLE at the headline. Anyone reading this as "the gate that
@@ -2065,7 +2065,7 @@ class ConsolidatedLadderReport:
         above the top rung). Requires ``engine_reported`` so an INCONCLUSIVE rung (unconfirmed store-truth —
         a coord glitch) can NEVER fabricate a collapse bracket below the real ceiling.
 
-        ⚠️ ALSO REQUIRES THAT THE RATE WAS ESTABLISHED (:attr:`driven_climb`). The fidelity gate was applied
+        WARNING: ALSO REQUIRES THAT THE RATE WAS ESTABLISHED (:attr:`driven_climb`). The fidelity gate was applied
         to :attr:`pinned_rung` and NOT here, so a rung nobody drove still set the bracket TOP — **at its
         OFFERED ingress_rate, a rate that was never driven** — a scored quantity that is a pure function of
         the PLAN.
@@ -2147,7 +2147,7 @@ class ConsolidatedLadderReport:
     def clears_target_events(self) -> bool:
         """Whether the pinned SUSTAINED **RAW** rate clears the 45M/day = ~521 TOTAL events/s target.
 
-        ⚠️ **RAW, NOT PUBLISHABLE.** A publishable 45M/day CLAIM is HALF the measured raw ceiling (the
+        **WARNING: RAW, NOT PUBLISHABLE.** A publishable 45M/day CLAIM is HALF the measured raw ceiling (the
         Phase-5 D4 derate, :data:`PUBLISHABLE_DERATE`), so it needs a raw ~1041 events/s — TWICE what this
         property gates on. Use :attr:`clears_target_events_publishable` for a claim; this one is the raw
         measurement. Under BROADCAST the distinction was academic (the shape capped ingress at ~16 msg/s, so
@@ -2172,7 +2172,7 @@ class ConsolidatedLadderReport:
         """Whether the DERATED (publishable) rate clears the 45M/day target — **the bar a CLAIM must pass**.
         Equivalent to a RAW ceiling of ``TARGET_EVENTS_PER_S / PUBLISHABLE_DERATE`` ≈ 1041 events/s.
 
-        ⚠️ Still OFFERED-derived (it derates :attr:`sustained_events_per_s`). Read it beside
+        WARNING: Still OFFERED-derived (it derates :attr:`sustained_events_per_s`). Read it beside
         :attr:`clears_target_events_accepted_publishable`, the SAME bar on the honest floor — which is the
         one to quote, since a claim must not rest on the offer."""
         e = self.publishable_events_per_s
@@ -2787,7 +2787,7 @@ class ConsolidatedLadderReport:
             #    trip under broadcast (the shape capped ingress at ~16/s), so nobody was misled before.
             #  * each rung's `lanes_observed` is now the UNION of the sinks' lane-key sets, not a MAX.
             #
-            # v6 (THE FOUR BENCH ARTIFACTS, 2026-07-14). ⚠️ **MOSTLY ADDITIVE, WITH ONE DELIBERATE
+            # v6 (THE FOUR BENCH ARTIFACTS, 2026-07-14). **WARNING: MOSTLY ADDITIVE, WITH ONE DELIBERATE
             # REDEFINITION** — do NOT diff a v6 run against a v5 one on the ceiling keys.
             #
             # THE REDEFINITION: the ceiling is now pinned ONLY from FIDELITY-ADMISSIBLE rungs (rungs the rig
@@ -2807,7 +2807,7 @@ class ConsolidatedLadderReport:
             # run's ceiling is auditable from its own artifact:
             #  * `store_pool` (+ per-rung `store_pool`) — the EFFECTIVE MEFOR_STORE_POOL_SIZE, which NOW
             #    DEFAULTS TO THE PRODUCT 40 (it was pinned at 8 by a bare `setdefault`, recorded nowhere) —
-            #    plus the acquire_wait saturation evidence and a PRE-REGISTERED TRIPWIRE. ⚠️ THE DEFAULT
+            #    plus the acquire_wait saturation evidence and a PRE-REGISTERED TRIPWIRE. WARNING: THE DEFAULT
             #    MOVED: a v6 run's fleet is NOT configured like a v5 run's. That is deliberate and loud.
             #  * `ceiling.pinned_accepted_*` / `accepted_events_per_s` / `publishable_accepted_events_per_s`
             #    — the ACCEPTED-derived ceiling carried to the HEADLINE and into the CLAIM currency.
@@ -2847,7 +2847,7 @@ class ConsolidatedLadderReport:
             #      exit 2. The RATE IS STILL PUBLISHED — the number is real — it simply may never be quoted
             #      as the ENGINE's ceiling.
             #  (3) `fidelity` gate v2 — the `sent`-shortfall arm is CAUSE-SPLIT (new per-rung
-            #      `deferred_backpressure` / `deferred_schedule` / `sent_ratio`). ⚠️ NARROWING: a v6
+            #      `deferred_backpressure` / `deferred_schedule` / `sent_ratio`). NARROWING: a v6
             #      `drive_shortfall` verdict is a v7 `backpressure_bind` (AN ENGINE FINDING), `drive_shortfall`
             #      or `offer_shortfall` (cause unattributed). v6 called EVERY sent shortfall a rig failure —
             #      but `sent` is ENGINE-PACED, so v6 would void a real engine bind and send the operator to
@@ -2904,7 +2904,7 @@ class ConsolidatedLadderReport:
             },
             # v6 (ARTIFACT 4): the fidelity roll-up.
             #
-            # ⚠️ IT ITERATES `all_records` — **INCLUDING THE SOAK**. Every one of these keys used to iterate
+            # WARNING: IT ITERATES `all_records` — **INCLUDING THE SOAK**. Every one of these keys used to iterate
             # `self.climb`, which EXCLUDES the soak: the one rung whose job is to CERTIFY the ceiling. An
             # un-driven soak therefore produced `all_admissible: true`, `void_rungs: []` and
             # `any_drive_shortfall: false` — affirmatively FALSE values, emitted by the gate built to
@@ -3024,7 +3024,7 @@ class ConsolidatedLadderReport:
                     else round(self.accepted_events_per_s, 3)
                 ),
                 "clears_target_events_accepted": self.clears_target_events_accepted,
-                # ⚠️ BOUNDED BY CONSTRUCTION to [~0.95, 1.0]: the pinned rung is FIDELITY-ADMISSIBLE, so it
+                # WARNING: BOUNDED BY CONSTRUCTION to [~0.95, 1.0]: the pinned rung is FIDELITY-ADMISSIBLE, so it
                 # accepted >= 95% of its offer BY DEFINITION. This is a <= 5% REFINEMENT of the offered
                 # figure — NOT the under-drive detector (that is `fidelity`; a rung the rig could not drive
                 # never reaches this property). `max_accepted_vs_offered_gap` below is the unbounded view.
@@ -3053,7 +3053,7 @@ class ConsolidatedLadderReport:
                     if self.pinned_measured_delivered_rate_per_s is None
                     else round(self.pinned_measured_delivered_rate_per_s, 3)
                 ),
-                # ⚠️ FIDELITY-GATED (v6). The bracket TOP is drawn from `admissible_climb`, the SAME
+                # WARNING: FIDELITY-GATED (v6). The bracket TOP is drawn from `admissible_climb`, the SAME
                 # candidate set as the floor. A rung that failed fidelity used to set this at its OFFERED
                 # rate — a rate that was never driven — and flip `bracketed` to true on the strength of it.
                 # A collapse at an un-driven rate is a REAL engine event with a FICTIONAL rate label, so it

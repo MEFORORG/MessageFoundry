@@ -1,6 +1,6 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C; amended 2026-09-28 by BACKLOG #300 — see Amendment D)
+- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C; amended 2026-09-28 by BACKLOG #300 — see Amendment D; amended 2026-09-30 by BACKLOG #2494 — see Amendment E)
 - **Date:** 2026-08-28
 - **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
@@ -314,3 +314,9 @@ refused when the client is built, again before each send, and by the connection 
 handshake on narrowed, verifying contexts; a CBC-only proxy, a wrong-name proxy and a proxy the
 anchor did not issue are each refused; and a urllib3 that ignored the supplied context is caught by
 the post-handshake check.
+
+## Amendment E (2026-09-30) -- the LDAPS replica is gone (BACKLOG #2494)
+
+The engine now builds the LDAPS context itself, and an engine subclass of `ldap3.Tls` wraps each
+connection with it, so the replica and the `ciphers=` string of Amendment C are gone. ADR 0188's
+amendment of the same date records the change, what it keeps and what it does not cover.

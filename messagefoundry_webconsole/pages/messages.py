@@ -22,7 +22,7 @@ from messagefoundry.api.models import (
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _pager, _seg
+from ._common import _pager, _reveal_cell, _seg
 from .approvals import approvals_link
 
 __all__ = [
@@ -468,18 +468,6 @@ def _resend_section(detail: MessageDetail) -> list[object]:
             class_="ctl",
         ),
     ]
-
-
-def _reveal_cell(value: str | None, href: str, *, revealed: bool) -> object:
-    """A masked cell: the value as the engine sent it, plus a "Reveal" link to ``href`` while it is
-    masked (BACKLOG #2346, #2436; ASVS 14.2.6).
-
-    ``None`` (a caller without ``messages:view_summary``) and an empty value render as they always
-    did, with no link, because there is nothing to reveal. The masked value is still escaped by the
-    builder: masking is not sanitizing."""
-    if revealed or not value:
-        return value
-    return el("span", value, " ", el("a", "Reveal", href=href, class_="muted"))
 
 
 def message_detail(
