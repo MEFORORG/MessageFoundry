@@ -50,6 +50,7 @@ import tomllib
 import zipfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _bash_resolver import bash_candidates, explain_returncode, require_bash
@@ -3090,3 +3091,219 @@ def test_the_harness_smoke_runs_the_install_resolution_check() -> None:
         f"unsoftened; found {calls}"
     )
     assert "continue-on-error" not in steps[0], "the harness wheel smoke acquired continue-on-error"
+
+
+# --- (10) the GitHub release body is bounded before `gh release` sees it -----------------------------
+
+#: The step that bounds a release body. Loaded by path, the way the workflow runs it.
+_NOTES_SCRIPT = _REPO / "scripts" / "release" / "release_notes.py"
+_NOTES_CALL = "python scripts/release/release_notes.py notes.md"
+#: GitHub's ceiling on a release body: the API answers `body is too long (maximum is 125000
+#: characters)` (cli/cli issue 7815). The REST docs state no limit, so this is the observed figure.
+_GITHUB_BODY_CEILING = 125_000
+
+
+def _notes_module() -> Any:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_mefor_release_notes", _NOTES_SCRIPT)
+    assert spec is not None and spec.loader is not None, f"cannot load {_NOTES_SCRIPT}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _notes_steps() -> list[tuple[str, str]]:
+    """(step name, executed shell) for every step that hands `notes.md` to `gh release`."""
+    found = [
+        (str(step.get("name")), _executed_shell(str(step.get("run") or "")))
+        for job in _jobs().values()
+        for step in (job.get("steps") or [])
+        if isinstance(step, dict) and "--notes-file notes.md" in str(step.get("run") or "")
+    ]
+    assert found, "no release.yml step passes --notes-file notes.md -- the workflow shape moved"
+    return found
+
+
+def test_every_release_body_is_bounded_between_its_extraction_and_gh_release() -> None:
+    """The 0.5.0 CHANGELOG section is about 256,000 characters and GitHub refuses a body over
+    125,000. The step sits before the PyPI publish, so an unbounded body stops the release there.
+
+    Order is the claim, not presence: the bound must run after the last write to `notes.md` and
+    before the first `gh release` call, and nothing after it may touch `notes.md` except as the
+    `--notes-file` it hands over. Mutation: move the call below `gh release view`. Red here.
+    """
+    for name, code in _notes_steps():
+        assert _NOTES_CALL in code, f"{name!r} hands notes.md to gh release without bounding it"
+        bound_at = code.index(_NOTES_CALL)
+        last_write = max(code.rfind("> notes.md"), code.rfind(">notes.md"))
+        first_gh = code.index("gh release ")
+        assert last_write < bound_at < first_gh, (
+            f"{name!r}: the bound must sit after the last write to notes.md and before gh release"
+        )
+        assert "--full-url" in code[bound_at:first_gh], f"{name!r}: a cut body must link the rest"
+        after = code[bound_at + len(_NOTES_CALL) :]
+        assert after.count("notes.md") == after.count("--notes-file notes.md"), (
+            f"{name!r}: something touches notes.md after the bound, other than --notes-file"
+        )
+
+
+def _notes_prefix(run: str) -> str:
+    """The step's lines up to and including the bound call and its continuation lines."""
+    lines = run.splitlines()
+    start = next(i for i, ln in enumerate(lines) if _NOTES_CALL in ln)
+    end = start
+    while lines[end].rstrip().endswith("\\"):
+        end += 1
+    return "\n".join(lines[: end + 1]) + "\n"
+
+
+#: (step-name prefix, the changelog the step reads, its tag, the link a shrunk body must end with).
+_NOTES_CASES = {
+    "engine": (
+        "Create or update the GitHub",
+        "CHANGELOG.md",
+        "v9.9.9",
+        "https://github.com/MEFORORG/MessageFoundry/blob/v9.9.9/CHANGELOG.md",
+    ),
+    "console": (
+        "Create or update the console GitHub",
+        "packaging/messagefoundry-webconsole/CHANGELOG.md",
+        "webconsole-v9.9.9",
+        "https://github.com/MEFORORG/MessageFoundry/blob/webconsole-v9.9.9/"
+        "packaging/messagefoundry-webconsole/CHANGELOG.md",
+    ),
+}
+
+
+def _run_notes_prefix(tmp_path: Path, case: str, changelog: str, *, bounded: bool = True) -> str:
+    """Run a release step's notes-building lines under bash; return notes.md as written."""
+    step, changelog_path, tag, _ = _NOTES_CASES[case]
+    prefix = _notes_prefix(_step_script_by_prefix(step, "release notes"))
+    if not bounded:
+        # The mutation arm: the same lines with the bound call deleted.
+        prefix = prefix[: prefix.index(_NOTES_CALL)]
+    work = tmp_path / "work"
+    (work / "scripts" / "release").mkdir(parents=True)
+    shutil.copy2(_NOTES_SCRIPT, work / "scripts" / "release" / "release_notes.py")
+    (work / changelog_path).parent.mkdir(parents=True, exist_ok=True)
+    (work / changelog_path).write_bytes(changelog.encode("utf-8"))
+    script = tmp_path / "notes.sh"
+    script.write_bytes(prefix.encode("utf-8"))
+    env = _posix_tool_env()
+    env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env["PATH"]])
+    env["GITHUB_REF_NAME"] = tag
+    env["GITHUB_REPOSITORY"] = "MEFORORG/MessageFoundry"
+    bash = require_bash(tmp_path, env)
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [bash, "-e", str(script)], cwd=str(work), env=env, capture_output=True, timeout=60
+    )
+    out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+    assert proc.returncode == 0, (
+        f"the notes lines failed ({explain_returncode(proc.returncode)}):\n{out}"
+    )
+    return (work / "notes.md").read_bytes().decode("utf-8")
+
+
+def _changelog(entries: int) -> str:
+    """A changelog whose 9.9.9 section holds ``entries`` entries, each a bold title and a body,
+    then a Security block with a BREAKING entry at the very end, where a plain cut would lose it.
+    Non-ASCII on purpose: the heading carries an em dash, as the real one does."""
+    body = "".join(
+        f"- **Entry {i}.** Body starts here.\n  " + "x" * 110 + "\n  - nested detail\n"
+        for i in range(entries)
+    )
+    return (
+        "# Changelog\n\n## [Unreleased]\n\n## [9.9.9] — 2026-09-30\n\n### Added\n"
+        f"{body}\n### Security\n- **BREAKING — the last entry\n  wraps its title.** Body.\n"
+        "\n## [9.9.8]\n- old\n"
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_NOTES_CASES))
+def test_an_over_long_release_body_keeps_every_title_and_links_the_full_section(
+    tmp_path: Path, case: str
+) -> None:
+    """Executed, not read: each step's own lines on a section well over GitHub's ceiling."""
+    link = _NOTES_CASES[case][3]
+    changelog = _changelog(2_000)
+    unbounded = _run_notes_prefix(tmp_path / "control", case, changelog, bounded=False)
+    # The control: without the bound, this fixture is a body GitHub would refuse.
+    assert len(unbounded) > _GITHUB_BODY_CEILING, len(unbounded)
+    notes = _run_notes_prefix(tmp_path / "bounded", case, changelog)
+    limit = _notes_module().DEFAULT_LIMIT
+    assert len(notes) <= limit < _GITHUB_BODY_CEILING, len(notes)
+    assert notes.startswith("## [9.9.9] — 2026-09-30\n"), notes[:80]
+    assert notes.rstrip().endswith(f"[CHANGELOG.md]({link})."), notes[-300:]
+    assert "- old" not in notes, "the next version's section leaked into the notes"
+    # Titles survive, bodies do not, and the last block survives whole.
+    assert "- **Entry 1999.**\n" in notes
+    assert "Body starts here" not in notes and "nested detail" not in notes
+    assert "### Security\n\n- **BREAKING — the last entry\n  wraps its title.**\n" in notes
+
+
+@pytest.mark.parametrize("case", sorted(_NOTES_CASES))
+def test_a_release_body_within_the_bound_is_left_exactly_as_extracted(
+    tmp_path: Path, case: str
+) -> None:
+    notes = _run_notes_prefix(tmp_path / "bounded", case, _changelog(3))
+    control = _run_notes_prefix(tmp_path / "control", case, _changelog(3), bounded=False)
+    assert notes == control
+    assert "CHANGELOG.md](" not in notes
+
+
+def test_headlines_that_still_do_not_fit_are_cut_at_a_line_end_on_or_under_the_limit() -> None:
+    mod = _notes_module()
+    url = "https://example.invalid/CHANGELOG.md"
+    tail = mod.footer(url, cut=True)
+    text = "".join(f"- **line {i:05d}**\n" for i in range(2_000))
+    assert mod.headlines(text) == text  # nothing to drop, so only a cut can shrink it
+    for limit in (len(tail) + 1, 500, 5_000, len(text) - 1):
+        out = mod.bound(text, url, limit)
+        assert len(out) <= limit, (limit, len(out))
+        assert out.endswith(tail)
+        kept = out[: -len(tail)]
+        assert text.startswith(kept)
+        # Whole lines only, unless not even one fits.
+        if limit - len(tail) >= len("- **line 00000**"):
+            assert all(len(ln) == len("- **line 00000**") for ln in kept.splitlines()), kept[-40:]
+    assert mod.bound(text, url, len(text)) is text
+    with pytest.raises(ValueError, match="no room"):
+        mod.bound(text, url, 10)
+
+
+def test_headlines_keep_headings_and_titles_and_drop_bodies() -> None:
+    mod = _notes_module()
+    text = (
+        "## [1.0.0]\n### Fixed\n- **Short.** Body on the title line.\n  more body\n"
+        "- **Long title\n  over two lines.** Body.\n- plain entry, first line kept\n  its body\n"
+        "- **Unclosed\n  a\n  b\n  c\n  d\n"
+    )
+    assert mod.headlines(text) == (
+        "## [1.0.0]\n\n### Fixed\n\n- **Short.**\n- **Long title\n  over two lines.**\n"
+        "- plain entry, first line kept\n- **Unclosed\n"
+    )
+
+
+def test_headlines_keep_a_versions_preamble_paragraph() -> None:
+    """The console's preamble names the engine it pairs with; a shrunk page must keep it."""
+    mod = _notes_module()
+    text = (
+        "## [0.4.0]\n\n**Requires engine 0.5.0.** Seam `x`,\nsecond line.\n\n"
+        "### Added\n- **Entry.** Body.\n  more\n\nA closing paragraph.\n"
+    )
+    assert mod.headlines(text) == (
+        "## [0.4.0]\n\n**Requires engine 0.5.0.** Seam `x`,\nsecond line.\n\n"
+        "### Added\n\n- **Entry.**\n\nA closing paragraph.\n"
+    )
+
+
+def test_a_shrunk_body_that_fits_says_titles_only_and_one_that_is_cut_says_so() -> None:
+    mod = _notes_module()
+    url = "https://example.invalid/CHANGELOG.md"
+    text = "".join(f"- **T{i}.** " + "b" * 200 + "\n" for i in range(100))
+    fits = mod.bound(text, url, len(text) - 1)
+    assert fits.endswith(mod.footer(url, cut=False)), fits[-200:]
+    assert "- **T99.**" in fits
+    cut = mod.bound(text, url, 1_000)
+    assert len(cut) <= 1_000 and cut.endswith(mod.footer(url, cut=True)), cut[-200:]
