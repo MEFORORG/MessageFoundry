@@ -67,6 +67,7 @@ _LIVE_SLICE = (
     "docs/AOAG-DEPLOYMENT.md",
     "docs/ASVS-ASSESSMENT-METHOD.md",
     "docs/CI-SELFHOSTED-RUNNER.md",
+    "docs/CONFIGURATION.md",
     "docs/CONTAINER-EXPOSURE-EVALUATION.md",
     "docs/EARLY-ADOPTER-GUIDE.md",
     "docs/LEDGER-GATE.md",
@@ -78,6 +79,7 @@ _LIVE_SLICE = (
     "harness/load/enginepoll.py",
     "messagefoundry/api/_ui_seam.py",
     "messagefoundry/auth/totp.py",
+    "messagefoundry/config/settings.py",
     "messagefoundry_webconsole/_external.py",
     "messagefoundry_webconsole/routes/oidc.py",
     "tests/test_dependabot_automerge_guardrails.py",
@@ -93,9 +95,6 @@ _LIVE_SLICE = (
 #: PLAN-ENGINE-ATTRIBUTION.md -- and are exempt as benchmark records that date themselves inside.
 _DATED_RECORDS = ("docs/benchmarks/",)
 
-_LEFT_FOR_1504 = (
-    "left for the follow-up after BACKLOG #1504 lands: open work on ADR 0133 edits this file"
-)
 _UI_STRING = (
     "the glyph is inside a user-visible string literal, not a comment, so changing it changes "
     "behaviour"
@@ -118,8 +117,6 @@ _HELD: dict[str, tuple[int, str]] = {
     "ide/src/stepsModel.ts": (1, _UI_STRING),
     "harness/load/shardcert_ladder.py": (3, _UI_STRING + " (printed report lines)"),
     "harness/load/shardcert.py": (1, _UI_STRING + " (a printed report line)"),
-    "docs/CONFIGURATION.md": (6, _LEFT_FOR_1504),
-    "messagefoundry/config/settings.py": (1, _LEFT_FOR_1504),
 }
 
 #: A dated record that must stay non-zero: the tree walk's positive control.

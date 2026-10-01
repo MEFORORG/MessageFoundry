@@ -1089,10 +1089,10 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   occurrences across 67 files** — 172 under `docs/`, 37 in `docs/adr/`, 26 in `harness/`, 8 in
   `tests/`, 4 in `ide/`, 3 in engine source, 3 at the repository root, 2 in the web console, 1 under
   `.github/`, and **zero in `scripts/`**. 23 tracked files did not decode and were not counted.
-  **Re-censused 2026-09-30 by codepoint: 223 across 48 files at `a4c42c86e9`, and 161 across 26
-  after the live-docs slice below**, with the control
-  `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` at 93 both times and the same 23 undecodable
-  files skipped. 142 of the 161 sit under `docs/benchmarks/`.
+  **Re-censused 2026-09-30 by codepoint: 223 across 48 files at `a4c42c86e9`, 161 across 26
+  after the live-docs slice below, and 154 across 24 after the `CONFIGURATION.md` slice**, with the
+  control `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` at 93 each time and the same 23
+  undecodable files skipped. 142 of the 154 sit under `docs/benchmarks/`.
 
   **The previous figure was 476, and 218 of those left with the ledger rather than being fixed.** That
   is the whole of the drop: `BACKLOG.md` carried 125 and `BACKLOG-CLOSED.md` 93. A migration is not
@@ -1108,8 +1108,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   separately, not in this sweep."* What still carries the glyph is named in that test with its
   reason: `docs/benchmarks/` and `CHANGELOG.md` as dated records, `CLA.md` and
   `COMMERCIAL-LICENSE.md` for the owner's separate review, seven glyphs inside user-visible string
-  literals, test data in `tests/test_ledger_check.py`, and `docs/CONFIGURATION.md` plus
-  `messagefoundry/config/settings.py`, left until BACKLOG #1504 lands.
+  literals, and test data in `tests/test_ledger_check.py`. `docs/CONFIGURATION.md` and
+  `messagefoundry/config/settings.py` were held until BACKLOG #1504 landed, then swept, 7 sites.
 
   **Two rows of the filed table were instrument errors, both SDS-3.8, and they are kept because the
   errors recur.** It read the web console as zero by counting `packaging/`; the console's source is

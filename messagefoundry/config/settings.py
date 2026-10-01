@@ -5514,7 +5514,7 @@ class SecuritySettings(_Section):
     # The interstitial itself. On by default (ADR-less: this IS the 3.7.3 control). Turning it off is
     # a posture decision, not a convenience one, and the serve gate says so.
     external_link_interstitial: bool = True
-    # ⚠️ THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
+    # WARNING: THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
     # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
     # legitimate high-volume external destinations they do not want to declare as their own domain.
     # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
