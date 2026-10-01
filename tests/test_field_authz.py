@@ -22,6 +22,7 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     CapturedResponseInfo,
     ConnectionEventInfo,
+    ConnectionMetadata,
     ConnectionRow,
     DeadLetterRow,
     EventInfo,
@@ -364,11 +365,16 @@ def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> No
         r"redact_unauthorized\(r, identity, revealed=lift\)\s+if _row_conn\(r\) == reveal\n", source
     )
     assert len(conn_sites) == 1, f"expected the one per-connection reveal site, found {conn_sites}"
+    # And the one connection's metadata route, whose path names the item, behind its reveal flag.
+    meta_sites = re.findall(
+        r"revealed=revealable\(ConnectionMetadata, summary=False, error_text=reveal\)", source
+    )
+    assert len(meta_sites) == 1, f"expected the one metadata reveal site, found {meta_sites}"
     # Every other reveal site reads one of those sets, and together they cover all three models.
     sites = [
         s
         for s in re.findall(r"revealed=([^\n,]+?)(?=[,)\n])", source)
-        if not s.startswith("revealable(type(i") and s != "lift"
+        if not s.startswith(("revealable(type(i", "revealable(ConnectionMetadata")) and s != "lift"
     ]
     models = [m.group(1) for m in (re.fullmatch(r"reveal\[(\w+)\]", s) for s in sites) if m]
     assert len(models) == len(sites), (
@@ -413,6 +419,7 @@ def test_error_text_masking_is_keyed_by_model_and_catches_no_other_surface() -> 
         ConnectionEventInfo: frozenset({"reason"}),
         AlertInstanceInfo: frozenset({"reason"}),
         ConnectionRow: frozenset({"error"}),
+        ConnectionMetadata: frozenset({"error"}),
     }
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
     assert redact_unauthorized(_summary(), holder).error == "****"

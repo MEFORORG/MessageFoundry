@@ -614,3 +614,97 @@ def test_the_multishard_attribution_keeps_a_failed_lane_whose_error_is_withheld(
             "IB_E0_B in: (reason withheld)",
         )
         assert calls == [None, "IB_E0_A"]  # the first refusal stops the rest
+
+
+# --- The same error for ONE connection: GET /connections/{name}/metadata ------------------------
+
+
+async def test_a_holder_gets_the_metadata_error_masked_until_an_audited_reveal(
+    dash: Engine,
+) -> None:
+    """The metadata route names one connection in its path, so its reveal is ``reveal=true``. The
+    control arm: the reveal returns the runner's own reason, so the mask hid something. The sibling
+    connection's metadata, opened bare after it, is still masked."""
+    rr = dash.registry_runner
+    assert rr is not None
+    stored = rr.outbound_failed("OB_A")
+    assert stored
+    service = await _service(dash)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(dash, service) as c:
+        h = await _login(c, "op")
+        bare = (await c.get("/connections/OB_A/metadata", headers=h)).json()
+        assert bare["error"] == "****"
+        assert bare["direction"] == "out" and bare["name"] == "OB_A"  # never masked
+        shown = await c.get("/connections/OB_A/metadata", params={"reveal": "true"}, headers=h)
+        assert shown.status_code == 200 and shown.json()["error"] == stored
+        sibling = (await c.get("/connections/OB_B/metadata", headers=h)).json()
+        assert sibling["error"] == "****"
+        again = (await c.get("/connections/OB_A/metadata", headers=h)).json()
+        assert again["error"] == "****"
+    assert await _reveal_audits(dash, "connection_error_reveal") == [
+        {
+            "actor": "op",
+            "channel": "OB_A",
+            "reveal": "OB_A",
+            "connection": "OB_A",
+            "directions": ["out"],
+            "revealed": ["error"],
+        }
+    ]
+
+
+@pytest.mark.parametrize("role", [Role.VIEWER, Role.DEPLOYMENT, Role.CODING, Role.AUDITOR])
+async def test_a_monitoring_only_role_gets_no_metadata_error_and_its_reveal_is_refused(
+    dash: Engine, role: Role
+) -> None:
+    service = await _service(dash)
+    await _add(service, "mon", role)
+    async with _client(dash, service) as c:
+        h = await _login(c, "mon")
+        bare = (await c.get("/connections/OB_A/metadata", headers=h)).json()
+        assert bare["error"] is None and bare["name"] == "OB_A"
+        refused = await c.get("/connections/OB_A/metadata", params={"reveal": "true"}, headers=h)
+        assert refused.status_code == 403
+    assert await _reveal_audits(dash, "connection_error_reveal") == []
+    denials = [
+        json.loads(dict(a)["detail"])
+        for a in await dash.store.list_audit(limit=200)
+        if dict(a)["action"] == "auth.permission_denied" and dict(a)["actor"] == "mon"
+    ]
+    assert {"path": "/connections/OB_A/metadata", "permission": "messages:view_summary"} in denials
+
+
+async def test_a_metadata_reveal_charges_the_phi_read_budget_and_a_bare_open_does_not(
+    dash: Engine,
+) -> None:
+    service = await _service(dash, phi_read_rate_limit_per_actor=1)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(dash, service) as c:
+        h = await _login(c, "op")
+        for _ in range(3):
+            assert (await c.get("/connections/OB_A/metadata", headers=h)).status_code == 200
+        reveal = {"reveal": "true"}
+        ok = await c.get("/connections/OB_A/metadata", params=reveal, headers=h)
+        assert ok.status_code == 200
+        throttled = await c.get("/connections/OB_A/metadata", params=reveal, headers=h)
+        assert throttled.status_code == 429
+
+
+async def test_a_scoped_caller_revealing_its_own_inbound_metadata_succeeds(dash: Engine) -> None:
+    """The scope check comes first and is unchanged: an outbound is refused to a scoped caller
+    with no budget spent, and its own failed inbound reveals whole."""
+    rr = dash.registry_runner
+    assert rr is not None
+    stored = rr.inbound_failed("IB_MINE")
+    assert stored
+    service = await _service(dash, phi_read_rate_limit_per_actor=1)
+    await _add(service, "scoped", Role.OPERATOR, scope=["IB_MINE"])
+    async with _client(dash, service) as c:
+        h = await _login(c, "scoped")
+        reveal = {"reveal": "true"}
+        refused = await c.get("/connections/OB_A/metadata", params=reveal, headers=h)
+        assert refused.status_code == 403
+        # Budget of one, still unspent by the refusal above, so this reveal is admitted.
+        own = await c.get("/connections/IB_MINE/metadata", params=reveal, headers=h)
+        assert own.status_code == 200 and own.json()["error"] == stored

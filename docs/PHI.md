@@ -166,8 +166,10 @@ The rating is on the FIELD, not only on the start-failure string. So both routes
 `monitoring:read`, which is not a PHI permission. So `ConnectionRow.error` is gated on
 `messages:view_summary` (BACKLOG #2443, owner ruling R12): null without it, a fixed `****` with it,
 and whole only on the audited `reveal=<connection name>` act on `GET /connections`.
-`ConnectionMetadata.error` is **not yet gated**, so it still returns the same string whole to any
-`monitoring:read` holder; [SECURITY.md](SECURITY.md) "Field-level authorization" says why.
+`ConnectionMetadata.error` is gated and masked the same way, whole only on the audited
+`reveal=true` act on `GET /connections/{name}/metadata`. *Corrected 2026-10-01:* this said that
+field was not yet gated; the gate change that closed it is in [SECURITY.md](SECURITY.md)
+"Field-level (property) authorization".
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written

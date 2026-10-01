@@ -1489,11 +1489,18 @@ class SecurityPosture(BaseModel):
     client_address_monoculture: bool = False
 
 
-class ConnectionMetadata(BaseModel):
+class ConnectionMetadata(PhiGatedModel):
     """Static metadata for one connection (operability Tier 4). ``metadata`` is the operator's
     free-form label table (owner / runbook / environment); ``settings`` is **secret-scrubbed**
     (``env()`` refs shown as ``{"env": key}``, inline credentials redacted). No live probe — use
-    ``POST /connections/{name}/test`` for reachability."""
+    ``POST /connections/{name}/test`` for reachability.
+
+    Not PHI-free. ``error`` carries the same live text as ``ConnectionRow.error``, on a route that
+    needs only ``monitoring:read``, so it is gated and masked the same way (BACKLOG #2443) and
+    revealed by ``reveal=true``. Only ``error`` is gated: ``metadata`` is the operator's own label
+    table, a dict, and the gate's serializer covers declared properties only."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"error"})
 
     name: str
     direction: str  # "in" (inbound) | "out" (outbound)
@@ -1504,8 +1511,8 @@ class ConnectionMetadata(BaseModel):
     settings: dict[str, Any]  # secret-scrubbed view
     simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
     # Why this connection failed to start (ADR 0031) or was DR-parked (ADR 0048). Rated in
-    # docs/PHI.md section 2 (BACKLOG #1185). NOT yet gated or masked, unlike ConnectionRow.error
-    # (BACKLOG #2443); docs/SECURITY.md "Field-level (property) authorization" says why.
+    # docs/PHI.md section 2 (BACKLOG #1185). Gated and masked (BACKLOG #2443): null without
+    # messages:view_summary, "****" with it, whole only with reveal=true.
     error: str | None = None
 
 

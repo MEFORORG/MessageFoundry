@@ -36,6 +36,7 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     CapturedResponseInfo,
     ConnectionEventInfo,
+    ConnectionMetadata,
     ConnectionRow,
     DeadLetterRow,
     EventInfo,
@@ -101,9 +102,12 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     },
     # The connections dashboard row (BACKLOG #2443, step 4). ``GET /connections`` needs only
     # ``monitoring:read``, and ``error`` is why a connection failed to start: the same ``safe_exc``
-    # text whose stored copy is an alert reason. ``ConnectionMetadata.error`` carries the same
-    # string and is NOT mapped yet; docs/SECURITY.md "Field-level (property) authorization" says why.
+    # text whose stored copy is an alert reason. ``ConnectionMetadata.error`` on
+    # ``GET /connections/{name}/metadata`` is the same string for one connection.
     ConnectionRow: {
+        "error": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    ConnectionMetadata: {
         "error": Permission.MESSAGES_VIEW_SUMMARY,
     },
 }
@@ -158,6 +162,8 @@ ERROR_TEXT_MASKED_UNTIL_REVEALED: Mapping[type[BaseModel], frozenset[str]] = Map
         # BACKLOG #2443 step 4: why a connection failed to start or was DR-parked. Revealed by the
         # ``reveal=<connection name>`` act on ``GET /connections``, one audited request per name.
         ConnectionRow: frozenset({"error"}),
+        # The same string for one connection, revealed by ``reveal=true`` on its metadata route.
+        ConnectionMetadata: frozenset({"error"}),
     }
 )
 

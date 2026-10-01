@@ -3,7 +3,7 @@
 """End-to-end pin for every field-level redaction site (ASVS 8.1.2).
 
 ``docs/SECURITY.md`` states that the same disposition text gates on ``messages:view_summary`` on
-**every** surface that returns it, and names ten. The map-level guards
+**every** surface that returns it, and names eleven. The map-level guards
 (``tests/test_field_authz.py``, ``tests/test_security_doc_drift.py``) prove the POLICY is complete and
 documented; they cannot prove it is APPLIED — a future PHI-bearing route that forgets the
 ``redact_unauthorized`` call passes all of them, because ``redact_unauthorized`` fails **open**.
@@ -74,6 +74,8 @@ _SURFACES: tuple[tuple[str, str], ...] = (
     # BACKLOG #2443 step 4: the connections dashboard. Its route needs only monitoring:read, so a
     # failed connection's error is gated on its own; the seed starts one outbound that cannot build.
     ("/connections", "viewer"),
+    # And the same error for one connection on its metadata route.
+    ("/connections/OB_BROKEN/metadata", "viewer"),
 )
 
 #: Every property the doc's read table gates, flattened — what must be null for a caller without

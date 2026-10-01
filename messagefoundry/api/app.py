@@ -2889,9 +2889,48 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        # A flag, not a name: the path already names the one connection, as the single-message
+        # open's ``reveal_errors`` flag does. Annotated for the same reason as there.
+        reveal: Annotated[bool, Query()] = False,
     ) -> ConnectionMetadata:
         """Static metadata for one connection (operability Tier 4): operator labels + a secret-scrubbed
-        settings view. No live probe — see ``POST /connections/{name}/test``."""
+        settings view. No live probe — see ``POST /connections/{name}/test``.
+
+        ``error`` is gated and masked as on ``GET /connections`` (BACKLOG #2443): null without
+        ``messages:view_summary``, the fixed mask with it. ``reveal=true`` returns it whole; that
+        needs ``messages:view_summary``, charges the PHI-read budget, and is audited as
+        ``connection_error_reveal``, checked after the per-channel scope so a refused connection
+        spends no budget."""
+        meta = await _connection_metadata_row(engine, identity, name, request)
+        if not reveal:
+            return redact_unauthorized(meta, identity)
+        await _admit_reveal(request, identity, name)
+        out = redact_unauthorized(
+            meta,
+            identity,
+            revealed=revealable(ConnectionMetadata, summary=False, error_text=reveal),
+        )
+        await engine.store.record_audit(
+            "connection_error_reveal",
+            actor=identity.username,
+            channel_id=name,
+            detail=json.dumps(
+                {
+                    "reveal": name,
+                    "connection": name,
+                    "directions": [out.direction] if out.error else [],
+                    "revealed": ["error"] if out.error else [],
+                }
+            ),
+            client=client_ip(request),
+        )
+        return out
+
+    async def _connection_metadata_row(
+        engine: Engine, identity: Identity, name: str, request: Request
+    ) -> ConnectionMetadata:
+        """The UNREDACTED metadata row for ``name``, after the per-channel scope check. Only
+        :func:`connection_metadata` calls it, and it redacts the row before returning it."""
         rr = engine.registry_runner
         if rr is None:
             raise HTTPException(503, "engine not started")

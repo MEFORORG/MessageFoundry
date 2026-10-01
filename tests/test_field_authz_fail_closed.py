@@ -213,11 +213,57 @@ def test_the_gate_does_not_untype_the_published_response_schema() -> None:
             )
 
 
-def test_declaring_a_property_the_serializer_does_not_cover_is_refused() -> None:
-    """The one way this gate could go quietly inert: a gated property outside the set the base
-    class's field serializer is declared over would never reach the serializer at all.
+def test_the_gate_leaves_every_ungated_field_typed_by_its_own_annotation() -> None:
+    """BACKLOG #2443 step 4. The gate's serializer used to cover every field with a gateable name
+    on every gated model, gated or not, and type it ``str | None``. ``ConnectionMetadata.metadata``
+    is a dict, so it could not be gated without publishing it as a string and warning on every
+    response. Now each model's serializer covers only its own gated properties. So on every mapped
+    model, an ungated field's serialization schema equals its validation schema, and a dict
+    ``metadata`` dumps with no serializer warning. A gated field is the control: it differs only in
+    being the serializer's ``str | None``, pinned by the test above."""
+    import warnings
 
-    So class creation refuses it. Proven by construction, not by review.
+    from messagefoundry.api.models import ConnectionMetadata
+
+    for model_cls in PHI_FIELDS:
+        assert issubclass(model_cls, PhiGatedModel)
+        ser = model_cls.model_json_schema(mode="serialization")["properties"]
+        val = model_cls.model_json_schema(mode="validation")["properties"]
+        for field in set(model_cls.model_fields) - model_cls.phi_gated_properties:
+            assert ser[field] == val[field], (
+                f"{model_cls.__name__}.{field} is ungated but its published type changed: "
+                f"{ser[field]} != {val[field]}"
+            )
+    assert (
+        ConnectionMetadata.model_json_schema(mode="serialization")["properties"]["metadata"][
+            "anyOf"
+        ][0]["type"]
+        == "object"
+    )
+    meta = ConnectionMetadata(
+        name="OB",
+        direction="out",
+        method="file",
+        running=False,
+        metadata={"owner": "team", "tier": 1},
+        settings={},
+        error="boom",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        dumped = json.loads(meta.model_dump_json())
+    assert dumped["metadata"] == {"owner": "team", "tier": 1}
+    assert dumped["error"] is None  # unreleased, so withheld: the gate still fires
+
+
+def test_declaring_a_property_the_serializer_does_not_cover_is_refused() -> None:
+    """A gated name outside ``GATEABLE_PROPERTIES``, the reviewed vocabulary, is refused at class
+    creation, and so is a gated name that is not a field (a typo that would gate nothing).
+
+    **CORRECTED (BACKLOG #2443 step 4).** This said the base class's ONE field serializer covers
+    that set, so an outside name would never reach it. Each model now gets a serializer over its
+    own declared names, so coverage holds by construction; the vocabulary check remains so a new
+    PHI-bearing name is added in review rather than in passing.
     """
     with pytest.raises(TypeError, match="phi_gated_properties"):
 

@@ -312,6 +312,11 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
             "written",
         }
     ),
+    # The same ``error`` for one connection, on its metadata route. ``metadata`` is the operator's
+    # own label table and ``settings`` is credential-scrubbed for every role; neither is message data.
+    "ConnectionMetadata": frozenset(
+        {"direction", "metadata", "method", "name", "router", "running", "settings", "simulated"}
+    ),
 }
 
 #: Response models reachable on a message-family route that carry no PHI property, each reviewed once.
@@ -2319,7 +2324,7 @@ def test_field_level_table_equals_phi_fields_in_both_directions() -> None:
         f"code but undocumented: {sorted(derived - documented)}; documented but not gated: "
         f"{sorted(documented - derived)}"
     )
-    assert len(documented) == 14, f"{len(documented)} (object, property) rows, expected 14"
+    assert len(documented) == 15, f"{len(documented)} (object, property) rows, expected 15"
 
 
 def test_field_level_table_parser_detects_a_planted_omission() -> None:
@@ -2331,7 +2336,7 @@ def test_field_level_table_parser_detects_a_planted_omission() -> None:
     mutilated = "\n".join(line for line in text.splitlines() if not line.startswith(dropped))
     remaining = _doc_field_triples(mutilated)
     assert ("MessageSummary", "metadata", Permission.MESSAGES_VIEW_SUMMARY.value) not in remaining
-    assert len(remaining) == 13, (
+    assert len(remaining) == 14, (
         "the parser did not notice a deleted row — it is not actually parsing"
     )
 
