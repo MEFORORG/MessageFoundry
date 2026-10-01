@@ -20,9 +20,10 @@ from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
 from messagefoundry.config.wiring import (
     File,
     Registry,
+    WiringError,
     build_outbound_connection,
 )
-from messagefoundry.pipeline.wiring_runner import WiringError, check_inbound_revocation
+from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 
 
 # --- decision 2: the escape clamp (MEFOR_ALLOW_INSECURE_TLS downgrades REFUSE->WARN, non-enforcing) ---
@@ -274,7 +275,7 @@ def test_outbound_factory_accepts_the_pair_and_validates_it() -> None:
         build_outbound_connection("OB", Tcp(host="10.0.0.5", port=5000), cleartext_reason="why")
 
 
-def test_connections_toml_desugars_to_the_same_declaration(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_connections_toml_desugars_to_the_same_declaration(tmp_path) -> None:
     """ADR 0007's promise: the TOML surface desugars through the SAME factories into an identical
     Registry entry. Asserted on the DISPOSITION, not just the field, so a pair that survives the loader
     but never reaches the hop authority would still fail here."""
@@ -320,7 +321,7 @@ def test_connections_toml_desugars_to_the_same_declaration(tmp_path) -> None:  #
         assert dest.cleartext_reason == "vendor firmware predates TLS"
 
 
-def test_toml_rejects_the_pair_under_settings(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_toml_rejects_the_pair_under_settings(tmp_path) -> None:
     """They are TOP-LEVEL outbound keys, not transport settings. Under `[settings]` they are passed to
     the transport factory (which IS the settings schema) and rejected — pinned so the two surfaces
     cannot silently diverge into accepting both spellings with different semantics.

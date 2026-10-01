@@ -42,9 +42,11 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
     ldap3 argument, because the engine's context would not carry one. ``ciphers=`` in particular
     reached TLS 1.2 only.
 
-    **Not reached: a followed referral.** ldap3 builds a plain ``ldap3.Tls`` for the referred server
-    from a few of these attributes (``strategy/base.py``, ``create_referral_connection``). That copy
-    carries neither the checked CA bytes nor any of the narrowing. This class does not change it.
+    **Not reached: a followed referral, which is why the engine follows none.** ldap3 builds a plain
+    ``ldap3.Tls`` for the referred server from a few of these attributes (``strategy/base.py``,
+    ``create_referral_connection``). That copy carries neither the checked CA bytes nor any of the
+    narrowing, and this class does not change it. :mod:`messagefoundry.auth.ldap` turns referral
+    following off and refuses a referral instead (BACKLOG #2530).
     """
 
     def __init__(

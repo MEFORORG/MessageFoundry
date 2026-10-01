@@ -84,6 +84,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     HopPosture,
     RevocationHopGuard,
+    current_hop_posture,
     harden_cipher_suites,
     harden_crl_check,
     narrow_to_approved_suites,
@@ -986,14 +987,18 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     (:func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`) so ``MEFOR_ALLOW_INSECURE_TLS``
     can NEVER relax a **production-PHI** store hop (the SQL Server twin above is keyed identically). It
     stays a STRICT verify-off cell (no gradient) and keeps NO second escape. ``posture`` (threaded from
-    ``open_store``) ``None`` leaves the escape unclamped — byte-identical to pre-#200."""
+    ``open_store``) ``None`` reads the ambient posture, and with none the escape is NOT permitted
+    (vault BACKLOG #2354). CORRECTED: this read *"``None`` leaves the escape unclamped"*."""
+    if posture is None:
+        posture = current_hop_posture()
     if (
         settings.trust_server_certificate or not settings.encrypt
     ) and not weakened_tls_escape_permitted(posture):
         raise ValueError(
             "Postgres TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
-            f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 to "
-            "explicitly allow it for a trusted-network dev/test bind."
+            f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
+            "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
+            "bind (the escape has no effect while enforcing, the default, or with no posture)."
         )
     if not settings.encrypt:
         return False  # escape set (checked above) — plaintext connection, dev/test only

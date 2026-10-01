@@ -334,7 +334,7 @@ def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
     return insecure_tls_allowed() and not enforcing
 
 
-def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
+def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
     CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
 
@@ -349,19 +349,20 @@ def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
-    be set at all, AND the hop must not be enforcing PHI. ``None``
-    (a backup utility / embedding / test outside the construction gate) falls back to the **unclamped**
-    escape — byte-identical to pre-#200 — since the enforced serve/reload gate already vetted the real
-    production posture, so this fallback never loosens the clamp.
+    be set, AND a posture must be known, AND it must not be enforcing.
+
+    **``None`` FAILS CLOSED (vault BACKLOG #2354).** No posture means the escape is NOT permitted.
+    CORRECTED: this read *"``None`` (a backup utility / embedding / test outside the construction gate)
+    falls back to the **unclamped** escape -- byte-identical to pre-#200 -- since the enforced
+    serve/reload gate already vetted the real production posture"*. That premise was false for every
+    caller the gate never reaches: a reference sync, and every CLI command that opens the store. Each
+    let the escape cross a weakened hop under ``enforce``. A caller that needs the escape on a
+    ``warn`` instance passes that posture explicitly; there is no other way to say "not enforcing".
 
     The clamp used to require an enforcing **PHI** hop. Every instance carries patient data now
     (BACKLOG #1279), so the second conjunct could not vary and is gone: under ``enforce`` the blunt
     escape is inert, full stop."""
-    if not insecure_tls_allowed():
-        return False
-    if posture is None:
-        return True
-    return not posture.enforcing
+    return insecure_tls_allowed() and posture is not None and not posture.enforcing
 
 
 def weakened_tls_escape_permitted_here() -> bool:
@@ -2463,6 +2464,10 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
 #: and ``tests/test_site_context_words.py`` holds the two equal.
 EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 
+#: Upper bound for ``[auth].ad_connect_timeout`` and ``ad_receive_timeout``. An hour is far past any
+#: real directory round trip and far below the point where a socket timeout overflows.
+_AD_TIMEOUT_MAX_SECONDS = 3600.0
+
 
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
@@ -3106,13 +3111,24 @@ class AuthSettings(_Section):
     @field_validator("ad_connect_timeout", "ad_receive_timeout")
     @classmethod
     def _check_ad_timeout(cls, value: float) -> float:
-        # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats 0/None as "wait forever", which is
-        # exactly the unbounded wait these settings exist to remove, and inf/NaN are the same hole by
-        # another spelling. Rejected at config load, not discovered at bind time against a wedged DC.
+        # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats a None, or a 0 connect_timeout, as
+        # "wait forever", which is exactly the unbounded wait these settings exist to remove, and
+        # inf/NaN are the same hole by another spelling. (A 0 receive_timeout instead makes the socket
+        # non-blocking, so every read fails at once.) Rejected at config load, not at bind time.
         if not value > 0 or value == float("inf"):
             raise ValueError(
                 "ad_connect_timeout / ad_receive_timeout must be a finite number of seconds > 0 "
-                "(0, a negative value, inf or NaN would restore an unbounded LDAP wait)"
+                "(inf, NaN or a None connect timeout would mean an unbounded LDAP wait; 0 or a "
+                "negative value would fail every LDAP read or connect)"
+            )
+        # A huge finite value overflows socket.settimeout / setsockopt (measured from about 3e6 s on
+        # Windows) with OverflowError or TypeError. Those are not ldap3 errors, so they would skip
+        # the LdapError mapping and the auth.login_error audit. The cap sits far below that point.
+        if value > _AD_TIMEOUT_MAX_SECONDS:
+            raise ValueError(
+                f"ad_connect_timeout / ad_receive_timeout must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
+                f"seconds (got {value:g}); the cap keeps the value far below where a socket "
+                "timeout overflows"
             )
         return value
 
@@ -5406,8 +5422,9 @@ class SecuritySettings(_Section):
     # `active_hop_posture` scope, so they read the CLAMPED weakened_tls_escape_permitted_here() and an
     # enforcing PHI hop can never be relaxed. The alerts notifier is constructed in the API lifespan,
     # OUTSIDE that scope (measured: the contextvar is stamped only in pipeline/wiring_runner.py), where
-    # current_hop_posture() is None and the clamp degrades to the UNCLAMPED escape — i.e. the connectors'
-    # mechanism would silently provide no refusal at all here. So the refusal is keyed on this explicit
+    # current_hop_posture() is None and the clamp degraded to the UNCLAMPED escape — i.e. the connectors'
+    # mechanism would silently have provided no refusal at all here. (Since vault BACKLOG #2354 a None
+    # posture fails closed instead; this switch is unchanged by that.) So the refusal is keyed on this explicit
     # switch at the serve gate instead, in the shape of allow_unencrypted_phi_under_strict_enforcement.
     # Default FALSE and byte-identical when unset. Setting it TRUE is a LOOSENING: security_loosenings()
     # names it, so the opt-out is never silent.

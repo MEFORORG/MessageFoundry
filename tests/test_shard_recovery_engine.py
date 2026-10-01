@@ -86,7 +86,7 @@ def _write_cfg(cfg: Path, tmp: Path, shards: list[str | None]) -> Path:
     return cfg
 
 
-def _only(shard: str):  # type: ignore[no-untyped-def]
+def _only(shard: str):
     """The per-process shard filter exactly as `serve --shard` builds it."""
 
     def _filter(reg: Registry) -> Registry:
@@ -204,7 +204,9 @@ async def test_start_passes_owned_none_when_unsharded(
 
 
 async def _orphan_status(store: Store, mid: str) -> str:
-    return str((await store.get_message(mid))["status"])
+    msg = await store.get_message(mid)
+    assert msg is not None
+    return str(msg["status"])
 
 
 async def test_start_dead_letters_ingress_rows_of_a_removed_inbound(tmp_path: Path) -> None:
@@ -247,6 +249,7 @@ async def test_start_never_dead_letters_a_sibling_shards_lane(tmp_path: Path) ->
     eng.add_registry(filter_registry_for_shard(full, "a"))
     try:
         await eng.start()
+        assert eng._registry_runner is not None
         assert "IB_B" not in eng._registry_runner.registry.inbound  # not shard a's to run...
         assert (
             await _orphan_status(eng.store, sibling) == "received"

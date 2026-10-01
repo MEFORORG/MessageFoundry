@@ -378,6 +378,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the engine mints, so no client ever races a file that doesn't exist until the engine writes it.
     # Non-prod only: the pair lives in a per-process temp dir and covers loopback names alone.
     "harness/load/tlsmat.py": frozenset({"ssl"}),
+    # Vault BACKLOG #2354: these two rigs open a server store against a self-signed dev container
+    # directly, so they pass an explicit warn HopPosture; a missing posture now refuses the escape.
+    # A value type only: no context is built through it.
+    "harness/load/connscale/runner.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "harness/load/shardcert.py": frozenset({"messagefoundry.config.tls_policy"}),
     # ADR 0041 (D3): SHA-256 hashes of the loaded first-party modules vs the wheel dist-info/RECORD at
     # startup self-attestation — drift detection (integrity/tamper-evidence, not a secret); the engine
     # alerts by default and (opt-in) fails closed on drift.
@@ -582,7 +587,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
     # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
-    "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
+    # BACKLOG #2317 adds the tls_policy import: the cleartext-hop authority (is_loopback_hop_host,
+    # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
+    # is a posture decision on the scheme, and it calls no cipher or context.
+    "messagefoundry/transports/strict_requests.py": frozenset(
+        {"messagefoundry.config.tls_policy", "ssl"}
+    ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
     # engine's cert, it pins trust to exactly that PEM (ssl.create_default_context with cafile=);
@@ -765,6 +775,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #1323 named as the worked example of a seam the store-only set could not match.
     "messagefoundry/pipeline/alert_sinks.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/engine.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2354: stamps the instance hop posture around the DatabaseRef DSN build, so the
+    # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
+    "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/security_notify.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/wiring_runner.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -813,6 +826,10 @@ IMPORT_ONLY: dict[str, str] = {
     ),
     "messagefoundry/pipeline/gcm_invocations.py": (
         "reads the AES-GCM invocation-bound constants and a cipher TYPE; performs no operation"
+    ),
+    "messagefoundry/pipeline/reference_sync.py": (
+        "INSTRUMENT LIMIT. Stamps the hop posture (active_hop_posture) so the DatabaseRef DSN's "
+        "weakened-TLS refusal reads it: a TLS posture decision with no crypto-shaped call in it"
     ),
     "messagefoundry/pipeline/security_notify.py": (
         "carries the trust-anchor policy through to the alert sink it constructs; the SMTP hop's "

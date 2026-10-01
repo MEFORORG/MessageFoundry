@@ -475,6 +475,65 @@ marks the `store_privilege_preflight` audit row `over_grant_accepted`, and is na
 `enforcement = warn` every arm only warns. The key is the dial alone: since ADR 0186 every instance
 is a PHI instance. SQLite has no login, so nothing here applies to it.
 
+### Data-layer hops refuse cleartext on their defaults, except the Vault hops (ASVS 12.3.1 census)
+
+This census was read at engine commit `bca583f2a7` on 2026-09-30, under vault BACKLOG #2354. Two
+rows then changed in the same work, and each says so: the CLI row and the `DatabaseRef` row. At
+`bca583f2a7` both opened their hop with no posture, so `MEFOR_ALLOW_INSECURE_TLS` was unclamped
+there, and `messagefoundry check` never built a `DatabaseRef` DSN. The table names at least the sites that open a database,
+directory, secrets-store or log-collector connection.
+A hop missing from it is not thereby gated. A 2026-08-22 re-scoping counted 14 such sites in 11
+modules but never recorded the list, so this table does not try to match that count.
+
+"Under `enforce`" is the shipped `[security].enforcement`. "Shipped default" asks whether the hop
+crosses in the clear with every setting at its default once the feature is turned on. A cleartext
+crossing that needs an operator relaxation is a recorded delta, not the default (owner ruling R5 of
+2026-09-24).
+
+| Hop | Module and symbol | Transport | Gate | Under `enforce` | Cleartext on the shipped default |
+|---|---|---|---|---|---|
+| Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
+| Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rekey_audit`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
+| Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
+| `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
+| `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
+| `db_lookup` | `transports/database.py` `DatabaseLookupExecutor` | ODBC, SQL Server preset, `ApplicationIntent=ReadOnly` | `_build_dsn`, posture stamped by `RegistryRunner._build_lookup_executor` | refuses | No |
+| `DatabaseRef` reference sync | `pipeline/reference_sync.py` `database_source_dsn`, from `_load_database_source` and from `build_check` | ODBC, SQL Server preset | `_build_dsn`, with the engine's posture at sync time | refuses at `messagefoundry check`, dry-run, reload and every sync. `serve` start does not stop: its first sync fails and the set stays unloaded. CORRECTED: at `bca583f2a7` a sync read no posture and the escape was unclamped | No |
+| Vault KV secrets | `config/secretprovider_vault.py` | hvac over whatever scheme the address names | none on the scheme | an `http://` address is used as given | Off by default; once on, `http://` crosses in the clear. Vault BACKLOG #2317 |
+| Vault store key provider | `store/keyprovider_vault.py` | as above | none on the scheme | as above | as above; #2317 |
+| Vault Transit cipher | `store/crypto_transit.py` | as above | none on the scheme | as above | as above; #2317 |
+| AD (LDAP) binds | `auth/ldap.py` `LdapAuthenticator` | LDAPS through `NarrowedTls`; plain LDAP for an `ldap://` address | verify-off refusal through `weakened_tls_escape_permitted`; an `ldap://` address is refused at settings load unless `[auth].ad_allow_insecure_ldap = true` | verify-off refuses. `ad_allow_insecure_ldap = true` is honoured with no posture check, no audit line and no `security_loosenings()` entry | Off by default; `ldap://` needs the opt-in |
+| Off-box log and audit forwarder (the audit tee in `store/audit_tee.py` writes through it) | `logging_setup.py` `_build_syslog_handler`; decided by `config/settings.py` `forward_hop_disposition` in `serve` | UDP, TCP or TLS syslog | the shared `insecure_hop_disposition` gradient | refuses a non-loopback UDP, TCP or verify-off collector unless `forward_hop_attested` | Off by default; the `udp` default is refused off loopback |
+
+**How the negatives were checked.** Each "no gate" or "not clamped" cell came from a search paired
+with a control that finds a gated site. Line counts, same files: `insecure_hop_disposition` is in 0
+lines of each Vault module and in 3 of `config/settings.py`. `ad_allow_insecure_ldap` is in 0 lines
+under `messagefoundry/auth/` and in 4 of `config/settings.py`. At `bca583f2a7`, `active_hop_posture`
+was in 0 lines of `pipeline/reference_sync.py` and in 15 of `pipeline/wiring_runner.py`. The cluster modules hold 0
+lines matching the extended pattern `create_pool|connect\(`, where `store/sqlserver.py` holds 10.
+
+**The shared cause is closed (vault BACKLOG #2354).** `weakened_tls_escape_permitted` and
+`_weakened_tls_permitted` now fail closed when no posture is known. CORRECTED: this paragraph read
+that both *"fall back to the unclamped escape when no posture is set"*, so each new caller outside
+the construction gate had to remember to pass one. Now a caller that forgets is refused, and one that
+needs the escape on a `warn` instance passes that posture.
+
+**Still open after this census.** At least these:
+
+- The three Vault hops need a scheme gate. That is vault BACKLOG #2317.
+- `ad_allow_insecure_ldap` is to be clamped inert under `enforce`, like every other weakened-TLS
+  escape. That waits on engine PR 1877, which rewrites `auth/ldap.py`.
+- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`, because
+  they pass no posture. At least `provision-admin`, `store provision-schema` and `check-privileges`
+  pass one and keep the escape at `warn`. A site that needs the others on a dev store gives it a
+  verifying certificate, or the command is changed to pass its posture.
+- The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
+  one. `generic_odbc_no_tls_params` records that residual.
+
+Backups and the support bundle write to a path. If that path is a network share, the operating
+system makes the connection, and the engine opens no socket of its own for it.
+
 ---
 
 ## Roles & permissions
@@ -747,8 +806,8 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|
 | `GET` | `/security/posture` | `monitoring:read` | `require` |
 | `GET` | `/channels` | `monitoring:read` | `require` |
-| `GET` | `/connections` | `monitoring:read` | `require` |
-| `GET` | `/connections/{name}/metadata` | `monitoring:read` | `require` — per-channel for inbound; a shared outbound is barred to scoped users; credentials scrubbed unconditionally |
+| `GET` | `/connections` | `monitoring:read` | `require` — `error` gated on `messages:view_summary` and masked; the `reveal=<connection name>` act also needs `messages:view_summary` (BACKLOG #2443) |
+| `GET` | `/connections/{name}/metadata` | `monitoring:read` | `require` — per-channel for inbound; a shared outbound is barred to scoped users; credentials scrubbed unconditionally; `error` gated on `messages:view_summary` and masked; the `reveal=true` act also needs `messages:view_summary` (BACKLOG #2443) |
 | `GET` | `/events` | `monitoring:read` | `require` |
 | `GET` | `/connections/{name}/events` | `monitoring:read` | `require` |
 | `GET` | `/stats` | `monitoring:read` | `require` |
@@ -900,13 +959,20 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 115 route objects a default `create_app()` serves, **sixteen** can put
-PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
+**PHI-egress route set.** Of the 115 route objects a default `create_app()` serves, **at least twenty-one**
+can put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/messages/{id}/raw`, `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
-`GET /uploads/{file_id}/messages`, `POST /uploads/{file_id}/resend` and `GET /logs/tail`. Twelve of
-them carry an explicit PHI-read hop refusal + per-actor budget; the other four (`/search/presets` × 3
-and `POST /uploads/{id}/resend`) return no body content of their own.
+`GET /uploads/{file_id}/messages`, `POST /uploads/{file_id}/resend` and `GET /logs/tail`, plus five
+monitoring reads whose free-text field can carry a fragment the scrubber missed: `GET /events`,
+`GET /connections/{name}/events`, `GET /alerts/active`, `GET /connections` and
+`GET /connections/{name}/metadata` (BACKLOG #2443). Twelve of the first sixteen carry an explicit
+PHI-read hop refusal + per-actor budget; the other four (`/search/presets` × 3 and
+`POST /uploads/{id}/resend`) return no body content of their own. The five monitoring reads return
+that field masked, and take the hop refusal and the budget only on their audited `reveal` act,
+the one request that returns it whole.
+*Corrected 2026-10-01:* this read **sixteen** and named none of the five, although PR 1856 had
+already given the first three a `reveal` act.
 
 **With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **at least thirteen more** emit PHI. **CAUTION: this is deliberately not a closed enumeration**, per CLAUDE.md §11: a fixed count is a liability that the next PHI-emitting route silently falsifies, and this one already was — it read "nine more" and omitted `POST /ui/messages/{id}/edit-resend`, whose `_reject` arm re-renders both the pristine body (from `core.get_message_body`, BACKLOG #2345) and the operator's edited `raw_value`. **The authority is the code, not this list:** a `/ui` route emits PHI if it renders a message body, and the ones that charge the per-actor read budget are those passing `phi=True` to `require_ui` / `require_ui_step_up` (`messagefoundry_webconsole/_auth.py`) **or** that reach `enforce_phi_read_pacing` some other way — a reused engine handler that paces in its own body (`search_messages` / `layered_search` / `browse_uploaded_file`), or a console route that charges it inline on a short-circuit render (BACKLOG #1025). Known today:
 `GET /ui/messages`, `/ui/messages/{id}`, `/ui/messages/{id}/summary`, `/ui/messages/{id}/body`,
@@ -1628,9 +1694,17 @@ way past the sign-in lock (ADR 0197 Amendment A). Such an account's first factor
 An administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions). With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
-loopback bind)** — **every account** must satisfy MFA: the scope is `every_local_account` by
-default (a value now wider than its name, BACKLOG #1144), and `administrators` narrows it to the
-**Administrator** role. It is an **access gate, not
+loopback bind)** — **every account** must satisfy MFA under the default scope,
+`every_local_account` (a value now wider than its name, BACKLOG #1144). Setting the scope to
+`administrators` frees only a **local** account without the Administrator role from the access
+gate. The Administrator role stays in scope under either value (`AuthService._mfa_required_for`),
+and a directory session that proved no factor stays MFA-pending under both
+(`AuthService._unverified_session_owes_factor`). A directory account without the Administrator
+role does leave scope for the `required` flag of `GET /me/mfa` and for the last-factor removal
+guard, so it may remove its only factor, and its next session that proves none is pending again.
+An account that has enrolled a factor owes it under either value while the factor stays enrolled;
+an OIDC sign-in meets it at mint while `[auth].oidc_require_mfa_claim` is on, the default. The
+requirement is an **access gate, not
 only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **every** authorized route
 until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
 exempt so an un-enrolled user is not stranded. A required-but-unenrolled
@@ -1638,9 +1712,13 @@ admin is never locked out — the enroll/confirm routes sit behind an action-bou
 not the MFA gate, so a new administrator enrolls then satisfies it. The re-proof is the password or
 directory re-bind, or the IdP leg for an `oidc` session in the console (see
 [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). The documented org opt-out is
-`[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load). **A
-directory account is in scope like any other** (BACKLOG #1144): the Kerberos leg mints MFA-pending, and
-a directory user enrols and satisfies an engine factor on the same routes a local user does.
+`[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load).
+**While `require_mfa` is on, a directory session that proved no factor owes one under either scope
+value** (BACKLOG #1144). That is every Kerberos session, and an OIDC session minted while
+`[auth].oidc_require_mfa_claim` is off. With the claim required, the default, the engine refuses a
+token that carries no configured `amr`/`acr`, and one that carries it mints the session with its
+factor met. A directory user enrols and satisfies an engine factor on the same routes a local user
+does.
 The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery codes are
 **argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
 clock-skew window** (`[auth].totp_skew_steps`, **default `0` = the current 30 s step only** — strictest
@@ -1859,7 +1937,7 @@ one place — [`api/field_authz.py`](../messagefoundry/api/field_authz.py) — a
 `redact_unauthorized()` helper applied to every returned row, rather than re-implemented inline per
 endpoint (where a new endpoint or field could silently leak PHI — the BOPLA risk, ASVS 8.1.2 / 8.2.3).
 
-**The default for a mapped model denies.** Each of the eight response models below is a `PhiGatedModel`
+**The default for a mapped model denies.** Each of the ten response models below is a `PhiGatedModel`
 ([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)) that withholds every gated property from JSON
 until an authorization decision is recorded on the instance; `redact_unauthorized()` is what records
 one, releasing exactly the properties the caller's permissions unlock. A route that never calls it
@@ -1868,8 +1946,8 @@ clear. The gate is on JSON serialization, which is every path by which one of th
 client; a python-mode `model_dump()` stays ungated by design, because the engine composes
 `MessageDetail` from a `MessageSummary` dump before any authorization decision exists.
 
-**Read rules — one row per (response object, property).** This table is 1:1 with `PHI_FIELDS`: thirteen
-entries over eight response models. Keying on the *object* (not just the property name) is what makes it
+**Read rules — one row per (response object, property).** This table is 1:1 with `PHI_FIELDS`: fifteen
+entries over ten response models. Keying on the *object* (not just the property name) is what makes it
 mechanically comparable to the map — a CI guard asserts set equality in **both** directions, so the
 table can neither omit a row nor invent one.
 
@@ -1888,6 +1966,8 @@ table can neither omit a row nor invent one.
 | `CapturedResponseInfo` | `detail` | captured-reply disposition text | `messages:view_summary` |
 | `ConnectionEventInfo` | `reason` | scrubbed transport error text, the same `safe_exc` text as `last_error` on a `connection_lost` event | `messages:view_summary` |
 | `AlertInstanceInfo` | `reason` | scrubbed alert detail, the same text on a `connection_error` alert | `messages:view_summary` |
+| `ConnectionRow` | `error` | why a connection failed to start or was DR-parked; the start failure is `safe_exc` text | `messages:view_summary` |
+| `ConnectionMetadata` | `error` | as above, for the one connection the route names | `messages:view_summary` |
 
 `DeadLetterRow` has no `metadata` field, so its absence from the map is correct, not an omission.
 
@@ -1922,19 +2002,23 @@ calls `redact_unauthorized`. It is safe because its line emits only
 `id`/`channel_id`/`received_at`/`message_type`/`control_id`/`status`/`raw` — **no map-gated property may
 ever be added to that line** without a `PHI_FIELDS`-equivalent gate.
 
-**Where redaction actually runs.** Nine read surfaces construct a mapped model, and all nine redact:
+**Where redaction actually runs.** At least eleven read surfaces construct a mapped model, and all of
+these redact:
 `GET /dead-letters`, `GET /messages`, `GET /messages/search`, `GET /messages/{id}` (the wrapper **and**
 each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys on the exact type),
 `GET /messages/{id}/responses` (#120), `GET /search/layered`, and the three monitoring reads
-`GET /events`, `GET /connections/{name}/events` and `GET /alerts/active` (BACKLOG #2443). The four
+`GET /events`, `GET /connections/{name}/events` and `GET /alerts/active`, the connections
+dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Four of those nine additionally feed the **coalesced per-actor/hour PHI-summary exposure
+**Audit.** Four of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`), so a scripted bulk read
-cannot harvest the patient census unaudited. The other five do **not** call the coalescer — they write
+cannot harvest the patient census unaudited. The rest do **not** call the coalescer — they write
 their own dedicated audit rows instead (`response.read` for `GET /messages/{id}/responses`,
-`preset.layered_search` for `GET /search/layered`, and a `connection_event_reveal` or `alert_reveal`
-row for each per-item reveal on the three monitoring reads, which write nothing on a masked load). The four census surfaces are audited **only when a
+`preset.layered_search` for `GET /search/layered`, a `connection_event_reveal` or `alert_reveal`
+row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
+each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
+five write nothing on a masked load). The four census surfaces are audited **only when a
 gated property is actually returned** — `count_exposed()` is computed *post*-redaction and the
 coalescer is called under `if exposed:` — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
@@ -1946,18 +2030,18 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
-(Administrator and Operator hold both; Viewer holds neither, so a Viewer sees the **seven** rows it can
+(Administrator and Operator hold both; Viewer holds neither, so a Viewer sees the **nine** rows it can
 reach — `MessageSummary` × 3, `DeadLetterRow` × 2, `CapturedResponseInfo.detail`,
-`ConnectionEventInfo.reason` — as `null`, and is
+`ConnectionEventInfo.reason`, `ConnectionRow.error`, `ConnectionMetadata.error` — as `null`, and is
 refused `GET /messages/{id}` outright, since that route gates on `messages:view_raw`, which a Viewer
 does not hold. The other five rows (`MessageDetail` × 3, `OutboxInfo.last_error`, `EventInfo.detail`)
 are reached only by a role holding `view_raw` — including a custom role granted `view_raw` **without**
-`view_summary`, which is precisely why those rows sit on the `view_summary` tier. The thirteenth row,
+`view_summary`, which is precisely why those rows sit on the `view_summary` tier. The fifteenth row,
 `AlertInstanceInfo.reason`, is reached only by a role holding `monitoring:diagnose`: of the built-in
 roles only Operator and Administrator hold it, and both also hold `view_summary`, so the row is
 withheld only from a custom role granted `monitoring:diagnose` without `view_summary`. Deployment,
-Coding and Auditor hold neither `view_raw` nor `view_summary`, and reach the `ConnectionEventInfo.reason`
-row through `monitoring:read`) — but that is a
+Coding and Auditor hold neither `view_raw` nor `view_summary`, and reach the `ConnectionEventInfo.reason`,
+`ConnectionRow.error` and `ConnectionMetadata.error` rows through `monitoring:read`) — but that is a
 **role-policy** convention, not a permission-model guarantee, and the split is **reachable**: a custom
 role may be granted `view_raw` without `view_summary` (only `users:manage`, `approvals:approve` and
 `dr:operate` are non-assignable). The disposition fields therefore sit on the `view_summary` tier
@@ -1983,6 +2067,30 @@ cipher-encrypted (PHI.md §2/§7); the scrubber is not de-identification, which 
 Every other field of the two models stays readable under the route's monitoring permission, and CI
 asserts each is on a reviewed non-PHI list.
 
+`ConnectionRow.error` (`GET /connections`) joined the map on the same tier, for the same reason
+(BACKLOG #2443, step 4). It says why a connection failed to start or why the DR run-profile parked
+it, and the start failure is `safe_exc()` text. A holder of `messages:view_summary` gets `****`
+until the `reveal=<connection name>` act, which lifts the error on every row of that name. A name
+can be both an inbound and an outbound, so that act can lift two rows. It needs
+`messages:view_summary`, charges the PHI-read budget, and writes a `connection_error_reveal` audit
+row. A channel-scoped caller that names a connection outside its scope gets 403 and an
+`auth.channel_denied` row, as on `GET /connections/{name}/events`, before any PHI-read budget is
+spent. The `status` word and the `errored` count stay readable, so an operator can still tell that a
+connection failed.
+
+`ConnectionMetadata.error` (`GET /connections/{name}/metadata`) is the same string for the one
+connection the path names, gated and masked the same way. Its reveal is `reveal=true`, a flag,
+because the path already names the item, as `reveal_errors` does on `GET /messages/{id}`. The scope
+check runs first, then the reveal is admitted, charged and audited as `connection_error_reveal`.
+Its ungated `fault` field (`failed` or `filtered`) still tells a role without
+`messages:view_summary` that the connection is down, as `status` does on the dashboard.
+*Corrected 2026-10-01 (BACKLOG #2443 step 4):* this paragraph called that field a known gap. It
+said any `monitoring:read` holder got the text whole. The cause was the gate's one shared field
+serializer, which typed every field named `metadata` as a string. This model's `metadata` is a
+dict. Each model now gets a serializer over its own gated properties only
+([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)). So the dict is untouched and the gap is
+closed. The published schema of every other gated model is unchanged.
+
 **Caveat.** With `[security].require_sign_in = false` every route resolves to the built-in system
 identity, which holds every role and therefore every permission, so the per-property gate withholds
 nothing. The gate survives as code only; that posture is out of scope for a PHI deployment.
@@ -1991,7 +2099,7 @@ nothing. The gate survives as code only; that posture is out of scope for a PHI 
 this gate can be forgotten (the previous claim here was overstated: the old pinning tests iterate the
 *map*, so a new model and a new field on a mapped model both passed them silently):
 
-- **The policy is documented** — `tests/test_security_doc_drift.py` asserts the thirteen-row table above
+- **The policy is documented** — `tests/test_security_doc_drift.py` asserts the fifteen-row table above
   equals `PHI_FIELDS` exactly, in **both** directions, permission literal included, plus a
   planted-omission self-test so a reformatted table cannot make the parser silently no-op.
 - **The policy is complete** — the same module asserts every response model reachable on a
@@ -2002,7 +2110,7 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
   `monitoring:diagnose` without it for the alert list) and asserts every gated property
-  comes back `null`, with a companion assertion that an administrator sees all thirteen — matched **per
+  comes back `null`, with a companion assertion that an administrator sees all fifteen — matched **per
   model, not per property name** — so the negative cannot pass vacuously. That distinction is
   load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
   `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
@@ -2011,8 +2119,12 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
-  against each model's own `phi_gated_properties` in both directions, and proves class creation
-  refuses a gated name the serializer does not cover. The enumeration of call sites above keeps the
+  against each model's own `phi_gated_properties` in both directions. Class creation refuses a
+  gated name outside the reviewed vocabulary, a name that is not a field, a gated field that is
+  not `str | None`, and a subclass that ungates a parent's property. It also reads back the
+  serializers pydantic collected and refuses a gated name none of them covers. *Corrected
+  2026-10-01 (BACKLOG #2443 step 4):* this said class creation refuses a gated name the ONE
+  shared serializer does not cover; that serializer is now per model. The enumeration of call sites above keeps the
   *shipped* surfaces honest; this is what makes the route nobody has written yet safe.
 
 **Write side (engine → store).** Exception/disposition text is also scrubbed *before* it is stored: a
@@ -2084,7 +2196,7 @@ slack.
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by a successful step-up, on the **monotonic** clock: `reauth(purpose=…)` for the password or re-bind leg (`POST /me/reauth`, `POST /ui/reauth`), and `complete_oidc_step_up` for an `oidc` session's IdP leg, for the action the operator started from. Never by a sign-in or by `verify_mfa` | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
 | Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`, except a covered local account with a passkey and no TOTP, which the console sends to the enrolment page). This refusal never reaches an account with **no** factor, which has nothing to prove: it enrols its first factor and ends its own sessions from a password-only session, which is what the MFA gate's exemptions are for. Two other rules still bind it. Under `[security].require_mfa` a covered local account's first factor must be TOTP: passkey registration is refused with `enrol an authenticator app first` until TOTP is on, and so is the password change (`FactorEnrolmentRequired`, ADR 0197 Amendment A; console: a 303 to the enrolment page). And a must-change session cannot end its sessions at all, because the must-change confinement does not admit those routes. With the requirement off, such an account changes its password as before | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
-| MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor is refused outright while the knob is on | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
+| MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor stays MFA-pending while the knob is on, whatever the scope (`AuthService._unverified_session_owes_factor`, the one provider-keyed step) | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**. Whether the step-up goes to the IdP depends on how the **session** was minted (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)): an `oidc` session steps up at the IdP and is never asked for a password. Otherwise this attribute picks the leg: for an AD identity, a **live directory re-bind** instead of a local hash compare. Both legs refuse a disabled AD account, because the directory lookup each one runs finds no enabled entry. So a disabled AD account cannot refresh its window **by a step-up**. Nor can it with an engine TOTP or recovery code once the directory reports it disabled: `verify_mfa` asks the directory first, by the row's directory id, and refuses an account the directory does not confirm (BACKLOG #2023) or a row with no directory id (BACKLOG #2027); see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753). The provider does **not** exempt the identity from the engine MFA gate (see the MFA state row): a directory session minted without an engine-verified factor (every Kerberos session, and an OIDC one while `oidc_require_mfa_claim` is off) is refused while `[security].require_mfa` is on, whatever the scope, and with it off is refused only once the account has enrolled a factor. The gate does not fire once the session is MFA-verified: at mint, for an OIDC sign-in whose signed `amr`/`acr` passed the claim gate, or later, once the holder proves the engine factor | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | every directory sign-in -- Kerberos by `GET /ui/sso` or `POST /auth/negotiate`, and the OIDC callback -- mints with `seed_reauth=False`, decided inside `_complete_ad_login` rather than by the caller (BACKLOG #1144 step 5) | **CHALLENGE** — the session is born **without** step-up freshness, so a sensitive action forces an explicit credential step-up **unless** its holder has already proved a TOTP or recovery code at the MFA gate, which stamps a window (a passkey does not; see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
 | Session age | `created_at` / `last_used_at` / `expires_at` vs wall clock, on **every** request | idle > 30 min; past the absolute expiry (12 h, or a tighter federated cap: the signature-verified `id_token.exp`, or `auth_time + oidc_max_age_seconds`); or a **backward** wall-clock step (NTP step-back, VM snapshot revert) | **DENY** — the session is revoked in the store, then 401. The idle clock is refreshed only by user-driven requests, so a background poll cannot keep a session alive | 30 min / 12 h | `[security].sign_out_after_idle_minutes`, `max_session_hours` (the ADR 0118 homes; `[auth].session_idle_timeout_minutes` / `session_absolute_hours` are the retired aliases), plus `[auth].oidc_session_max_hours` for a tighter federated cap and `[auth].oidc_max_age_seconds` for the IdP-authentication recency cap |
@@ -3265,7 +3377,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes (`POST /ui/login`, `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`), plus `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) | logged, **not** audited. **429 + `Retry-After: 30` on `POST /ui/login`** — the only *sign-in-window* route that sends the header (three **ceremony** routes, `POST /ui/reauth`, `POST /ui/reauth/webauthn` and `POST /ui/mfa`, send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on the other console entry routes — `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when it charges at all — because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 5 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/reauth/oidc`, `POST /ui/account/mfa/verify`; the fourth is registered only with federation on), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; `Retry-After: 30` on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/reauth/oidc` (its 429 re-renders the step-up page), `POST /ui/account/mfa/verify` or `POST /ui/account/password`; logged |
 | Account lockout | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` | 5 / 15 min / 24 h | — | **yes** | no | no | **store-backed**, on **two counters** per account (ADR 0197). While the credential in force is engine-generated (an administrator's account creation and both resets set it), a sign-in failure is still counted and audited but arms no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); the second-step lock arms as usual. The **sign-in** counter takes the local password leg, a combined sign-in (password and TOTP code in one request) with both factors wrong, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only). The **second-step** counter takes the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and a combined sign-in with exactly one factor right. Each attempt is counted by one atomic `increment_login_failure` (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — on the password leg the uniform `auth.login_failed` (`bad_credentials`) row and then `auth.login_locked`, which only `users:manage` reads (the sign-in lock does **not** refuse a combined sign-in on a local account with TOTP enrolled; the second-step lock does), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs (the second-step lock only; the sign-in lock refuses neither), `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by either lock, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
-| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 11 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
+| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 11 `/ui` views via `require_ui(phi=True)`, 1 further `/ui` GET that inherits the charge by delegating into the handler body, and the `reveal` act on the monitoring JSON routes that carry one (at least `GET /events`, `GET /connections/{name}/events`, `GET /alerts/active`, `GET /connections` and `GET /connections/{name}/metadata`), charged at admission (BACKLOG #2443) | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | on / 12 / 15 s / 0.15 s gap | 15 s | **yes** (12, and a 0.15 s minimum gap) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + `Retry-After: 1`, logged. `/ui`: 429 + `Retry-After: 10`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login and every completed second factor | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked; see the *Concurrent session count* signal row for sign-ins that still owe a second factor |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |

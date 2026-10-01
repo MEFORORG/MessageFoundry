@@ -70,6 +70,7 @@ from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
 from harness.load.sender import _BACKOFF_MAX
 from harness.load.sink import CorrelationSink
+from messagefoundry.config.tls_policy import HopPosture
 
 # The engine-side env gate for the executor boot-shim (messagefoundry.pipeline.connscale_shim.SHIM_ENV).
 # Hard-coded here (a plain env-var name) so the harness sets it in the engine SUBPROCESS env without
@@ -924,7 +925,10 @@ def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
                 await asyncio.sleep(pause)
             try:
                 # The synthetic load harness decides no at-rest posture (BACKLOG #1916).
-                store = await open_store(settings, keyless_chain_refusal=None)
+                # The escape needs a known warn posture (vault BACKLOG #2354); a rig store.
+                store = await open_store(
+                    settings, keyless_chain_refusal=None, posture=HopPosture(enforcing=False)
+                )
                 break
             except Exception as exc:  # noqa: BLE001 - re-raised below unless it is a SQLite I/O error
                 # Extended codes are `primary | (N << 8)`, so the low byte identifies the family.
@@ -957,7 +961,7 @@ async def _reset_server_store(backend: str, env: Mapping[str, str]) -> tuple[int
     if backend == "sqlserver":
         from messagefoundry.store.sqlserver import SqlServerStore
 
-        ss_store = await SqlServerStore.open(settings)
+        ss_store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
         try:
             async with ss_store._pool.acquire() as conn:
                 cur = await conn.cursor()
@@ -974,7 +978,7 @@ async def _reset_server_store(backend: str, env: Mapping[str, str]) -> tuple[int
     if backend == "postgres":
         from messagefoundry.store.postgres import PostgresStore
 
-        pg_store = await PostgresStore.open(settings)
+        pg_store = await PostgresStore.open(settings, posture=HopPosture(enforcing=False))
         try:
             before = await _count_pipeline_rows_postgres(pg_store)
             # Postgres has no legacy `outbox` table; one CASCADE TRUNCATE clears the staged pipeline.
@@ -1644,9 +1648,13 @@ def _excusal(c: Counters, *, unconfirmed_budget: int, reload_stranded: int = 0) 
     unconfirmed = c.timeouts - stranded
     population = c.sent - stranded
     # Three quarters, not half — half was sized against a 16% worst-observed and windows-2025 has
-    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message. `excused` is
-    # clamped rather than zeroed so an over-budget failure stops claiming intake loss it cannot show.
-    # `ok` still requires `not over_budget`, so the verdict is unchanged. Full rationale: report.py.
+    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message.
+    #
+    # Over budget, `excused` clamps to 0, apart from the reload-stranded sends. The shortfall check
+    # then treats every other send as confirmed. So an over-budget detail can also print
+    # "lost K on intake", where K is `population - read`: unconfirmed sends that never reached
+    # intake, plus any real loss. Read the budget clause first; it is the verdict (BACKLOG #1866).
+    # The load copy in report.py no longer fails on the budget.
     budget = max(unconfirmed_budget, 3 * population // 4)
     over_budget = unconfirmed > budget
     excused = stranded + (0 if over_budget else unconfirmed)

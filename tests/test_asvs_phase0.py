@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from pydantic import ValidationError
+from starlette.types import Message as AsgiMessage
+from starlette.websockets import WebSocket
 
 from messagefoundry.api import create_app
 from messagefoundry.api.models import DeadLetterReplayRequest
@@ -25,6 +27,7 @@ from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import AuthSettings, SqlAuth, StoreBackend, StoreSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.logging_setup import ControlCharScrubFilter, configure_logging
 from messagefoundry.parsing import sniff
 from messagefoundry.parsing.sniff import (
@@ -37,6 +40,9 @@ from messagefoundry.store.sqlserver import connection_string
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.file import _content_matches_declared, _looks_like_hl7
 from tests._admin_account import login_admin
+
+#: The escape is honoured only on a known non-enforcing posture (vault BACKLOG #2354).
+_WARN = HopPosture(enforcing=False)
 
 # --- WP-4: argon2 parameters pinned -----------------------------------------
 
@@ -94,10 +100,20 @@ def test_configure_logging_uses_utc_timestamps() -> None:
 # --- WP-2: WebSocket Origin allowlist ---------------------------------------
 
 
-def _fake_ws(origin: str | None, allowed: tuple[str, ...]) -> SimpleNamespace:
+async def _no_receive() -> AsgiMessage:
+    raise AssertionError("the origin check never reads the socket")
+
+
+async def _no_send(message: AsgiMessage) -> None:
+    raise AssertionError("the origin check never writes the socket")
+
+
+def _fake_ws(origin: str | None, allowed: tuple[str, ...]) -> WebSocket:
+    """A real WebSocket over a hand-built scope: its headers and its app's state are all the check reads."""
     state = SimpleNamespace(ws_allowed_origins=allowed)
-    headers: dict[str, str] = {} if origin is None else {"origin": origin}
-    return SimpleNamespace(headers=headers, app=SimpleNamespace(state=state))
+    headers = [] if origin is None else [(b"origin", origin.encode())]
+    scope = {"type": "websocket", "headers": headers, "app": SimpleNamespace(state=state)}
+    return WebSocket(scope, receive=_no_receive, send=_no_send)
 
 
 def test_ws_origin_allows_native_client_without_origin() -> None:
@@ -175,7 +191,7 @@ def test_webhook_allows_plaintext_http_with_insecure_escape(
 ) -> None:
     # With the explicit escape set, a plaintext target constructs (trusted-network dev only).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    t = WebhookTransport("http://hooks.example/x")
+    t = WebhookTransport("http://hooks.example/x", posture=_WARN)
     assert t.url == "http://hooks.example/x"
 
 
@@ -188,7 +204,7 @@ def test_webhook_rejects_host_outside_allowlist() -> None:
 def test_webhook_no_redirect_handler_refuses_redirects() -> None:
     handler = _NoRedirectHandler()
     req = urllib.request.Request("http://a/x")
-    assert handler.redirect_request(req, None, 302, "Found", {}, "http://b/y") is None  # type: ignore[arg-type]
+    assert handler.redirect_request(req, None, 302, "Found", {}, "http://b/y") is None
 
 
 # --- WP-7c: file content sniff ----------------------------------------------
@@ -383,7 +399,7 @@ def test_sqlserver_connection_string_refuses_weak_tls(monkeypatch: pytest.Monkey
         connection_string(s)
     # The explicit dev escape permits it.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    assert "TrustServerCertificate=yes" in connection_string(s)
+    assert "TrustServerCertificate=yes" in connection_string(s, posture=_WARN)
 
 
 def test_ldap_authenticator_refuses_disabled_cert_verification(
@@ -402,4 +418,4 @@ def test_ldap_authenticator_refuses_disabled_cert_verification(
         LdapAuthenticator(s)
     # With the dev escape, construction is allowed (it only warns; no bind happens here).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    LdapAuthenticator(s)
+    LdapAuthenticator(s, posture=_WARN)

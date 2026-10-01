@@ -953,6 +953,8 @@ class Engine:
             # read cache from the shared snapshot. NullCoordinator (single-node) is always leader, so
             # this materializes from source every pass exactly as before.
             coordinator=self._coordinator,
+            # Vault BACKLOG #2354: clamp the DATABASE source's weakened-TLS escape on this posture.
+            hop_posture=self._hop_posture,
         )
 
     async def _reconcile_reference_sync(self, *, startup: bool) -> None:

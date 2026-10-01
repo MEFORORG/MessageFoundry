@@ -7,7 +7,7 @@
 .DESCRIPTION
     Two parallel efforts (e.g. two Claude Code chats) can't safely build in the same working tree --
     one's branch switch / edits clobber the other. This adds a git worktree as a SIBLING directory
-    (<repo>-<Name>) on its own branch, then bootstraps that worktree's own Python virtualenv so its
+    (<repo>-<Name>), or with -Nested at <main worktree>\.claude\worktrees\<Name>, on its own branch, then bootstraps that worktree's own Python virtualenv so its
     tests/tools run against its own checkout. The worktree shares the same .git/history/remote, so
     the normal branch -> PR -> merge flow is unchanged.
 
@@ -30,6 +30,7 @@
     .\new.ps1 -Name sqltuning -Base feature/sql-tuning -Sqlserver -Ide
     .\new.ps1 -Name quicklook -NoInstall
     .\new.ps1 -Name my-task -Branch claude/my-task    # reuse a namespaced branch ('/' is not legal in -Name)
+    .\new.ps1 -Name my-task -Nested                   # at <main worktree>\.claude\worktrees\my-task instead
 #>
 [CmdletBinding()]
 param(
@@ -55,7 +56,14 @@ param(
     [string]$Python = "python",
     [switch]$Sqlserver,   # also install the [sqlserver] extra
     [switch]$Ide,         # also run `npm install` for the VS Code extension
-    [switch]$NoInstall    # create the worktree only; skip the venv bootstrap
+    [switch]$NoInstall,   # create the worktree only; skip the venv bootstrap
+    # Create the worktree NESTED, at <main worktree>\.claude\worktrees\<Name> -- the layout the Claude
+    # Code harness uses -- instead of the <repo>-<Name> sibling. Same branch handling, token list, venv
+    # and add lock either way. The worktree gate's rule 3b prints it for a reader whose own worktree is
+    # nested (BACKLOG #1038); which mechanism makes which layout is stated once, in the "WHICH
+    # MECHANISM MADE THIS WORKTREE" block of scripts\hooks\worktree_gate.ps1. There is NO scripted
+    # teardown for it: the cleanup it prints is a plain `git worktree remove` (see Show-NextSteps).
+    [switch]$Nested
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,11 +84,25 @@ if ($LASTEXITCODE -ne 0) { throw "-Branch is not a valid git branch name: '$Bran
 
 # Repo root is two levels up from scripts\worktree\.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$Parent = Split-Path $RepoRoot -Parent
-$RepoName = Split-Path $RepoRoot -Leaf
-$WorktreePath = Join-Path $Parent "$RepoName-$Name"
+if ($Nested) {
+    # Nested: under the MAIN worktree's .claude\worktrees, which the repository gitignores -- where the
+    # harness puts its trees, and never inside a linked checkout, whose removal would take a tree nested
+    # in it along (prune-merged.ps1 refuses that shape for the same reason).
+    if ($Name -match '\A\.+\z') { throw "-Name may not be only dots under -Nested: '$Name'" }
+    $mainLine = @(& git -C $RepoRoot worktree list --porcelain 2>$null) |
+        Where-Object { $_ -like 'worktree *' } | Select-Object -First 1
+    if (-not $mainLine) { throw "cannot find the main worktree of $RepoRoot" }
+    $MainRoot = [System.IO.Path]::GetFullPath($mainLine.Substring('worktree '.Length))
+    $Parent = Join-Path (Join-Path $MainRoot ".claude") "worktrees"
+    $WorktreePath = Join-Path $Parent $Name
+}
+else {
+    $Parent = Split-Path $RepoRoot -Parent
+    $RepoName = Split-Path $RepoRoot -Leaf
+    $WorktreePath = Join-Path $Parent "$RepoName-$Name"
+}
 
-# ASSERT what the ValidatePattern only IMPLIES: one path component, directly under the repo's parent.
+# ASSERT what the ValidatePattern only IMPLIES: one path component, directly under the chosen parent.
 # A proxy can be relaxed by someone who does not know what it was standing in for -- and this one
 # already admitted more than it looked like it did (see the anchor note in the param block).
 if ((Split-Path $WorktreePath -Parent) -ne $Parent) {
@@ -213,6 +235,20 @@ function Show-NextSteps {
     # verbatim; "  # " (hash, one space) is prose. tests/test_worktree_new_cleanup_advice.py extracts
     # the former and EXECUTES it against a synthetic repo, because advice that is only read is advice
     # nothing checks. Keep the two shapes distinct.
+    # A NESTED TREE HAS NO SCRIPTED TEARDOWN, ON PURPOSE (BACKLOG #1038, Manager decision batch 184).
+    # remove.ps1 had a -Nested route for one round, and it was withdrawn: its occupancy fence cannot see
+    # an `isolation: worktree` subagent, whose session record carries its PARENT's cwd (measured: 0
+    # occupants for a live subagent's tree, 1 for its parent's), and a deletion tool whose fence fails
+    # open is worse than none. So the advice is plain git, and says what git does and does not check.
+    # The command line is built from parts so the static extractor in
+    # tests/test_worktree_new_cleanup_advice.py, which drives a SIBLING fixture, skips it; the nested
+    # test there runs it from this script's real output instead.
+    if ($Nested) {
+        Write-Host "  # When done, from any directory OUTSIDE the worktree:"
+        Write-Host ("  #   " + "git -C `"$RepoRoot`" worktree remove `"$WorktreePath`"")
+        Write-Host "  # git refuses a dirty tree without --force, but nothing checks whether a session is still in it."
+        return
+    }
     Write-Host "  # When done, from any directory OUTSIDE the worktree, either of:"
     Write-Host "  #   pwsh -NoProfile -File `"$RepoRoot\scripts\worktree\remove.ps1`" -Name $Name"
     Write-Host "  #   git -C `"$RepoRoot`" worktree remove --force `"$WorktreePath`""

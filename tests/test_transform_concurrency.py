@@ -341,7 +341,7 @@ async def test_crash_midbatch_recovers_identical_and_in_order(
     original_handoff = store.transform_handoff
     fired = {"done": False}
 
-    async def failing_handoff(*args: Any, **kwargs: Any) -> None:
+    async def failing_handoff(*args: Any, **kwargs: Any) -> bool:
         deliveries = kwargs.get("deliveries") or []
         if not fired["done"] and any(p == fail_payload for _, p in deliveries):
             fired["done"] = True

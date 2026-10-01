@@ -6,7 +6,8 @@ Each message type (ADT, ORM, …) registers a :class:`MessageSpec` describing it
 trigger→structure map, its segment builders, and which optional segments to sprinkle in.
 Generation walks hl7apy's own 2.5.1 reference tree (``MESSAGES[structure]``): for each
 structure we emit required segments in order plus a valid random subset of allow-listed
-optionals, then gate every message through the engine's strict validator before it counts.
+optionals, and one alternative of each choice group, then gate every message through the
+engine's strict validator before it counts.
 
 A type module contributes builders only for its *own* segments; the broadly shared ones
 (MSH/EVN/PID/PV1/…) live here in :data:`SHARED_BUILDERS`. All data is synthetic — no real PHI.
@@ -25,6 +26,9 @@ from hl7apy import v2_5_1 as _ref
 
 from messagefoundry.generators import _hl7data as d
 from messagefoundry.parsing import validate
+
+# The strict validator's own choice test, so generation and validation agree on what a choice is.
+from messagefoundry.parsing.validate import is_choice_group
 
 _MESSAGES = _ref.MESSAGES
 _SEGMENTS = _ref.SEGMENTS
@@ -74,6 +78,8 @@ class Ctx:
     receiving_fac: str
     current: Patient | None = None
     seq: dict[str, int] = field(default_factory=dict)
+    # The current ORC's placer and filler order numbers (ORC-2, ORC-3), which its OBR repeats.
+    order_numbers: tuple[str, str] | None = None
 
 
 def next_seq(ctx: Ctx, name: str) -> int:
@@ -255,12 +261,16 @@ def _build_obx(rng: random.Random, ctx: Ctx) -> str:
 
 
 def _build_orc(rng: random.Random, ctx: Ctx) -> str:
+    control = rng.choice(d.ORDER_CONTROLS)
+    placer = d.ei(str(rng.randint(100_000, 999_999)))  # placer order number
+    filler = d.ei(str(rng.randint(100_000, 999_999)), "FILLER")
+    ctx.order_numbers = (placer, filler)
     return seg(
         "ORC",
         {
-            1: rng.choice(d.ORDER_CONTROLS),
-            2: d.ei(str(rng.randint(100_000, 999_999))),  # placer order number
-            3: d.ei(str(rng.randint(100_000, 999_999)), "FILLER"),
+            1: control,
+            2: placer,
+            3: filler,
             5: rng.choice(d.ORDER_STATUSES),
             9: d.ts(ctx.msg_dt),
             12: d.xcn(*rng.choice(d.CLINICIANS)),
@@ -270,12 +280,20 @@ def _build_orc(rng: random.Random, ctx: Ctx) -> str:
 
 def _build_obr(rng: random.Random, ctx: Ctx) -> str:
     code, text = rng.choice(d.SERVICES)
+    # Drawn even when an ORC supplies them, so every later value keeps its place in the stream.
+    placer = d.ei(str(rng.randint(100_000, 999_999)))
+    filler = d.ei(str(rng.randint(100_000, 999_999)), "FILLER")
+    if ctx.order_numbers is not None:
+        # OBR-2/OBR-3 repeat the order's ORC-2/ORC-3. Consumed, so an OBR in a later order
+        # without its own ORC does not borrow this one's numbers.
+        placer, filler = ctx.order_numbers
+        ctx.order_numbers = None
     return seg(
         "OBR",
         {
             1: str(next_seq(ctx, "OBR")),
-            2: d.ei(str(rng.randint(100_000, 999_999))),
-            3: d.ei(str(rng.randint(100_000, 999_999)), "FILLER"),
+            2: placer,
+            3: filler,
             4: d.cwe(code, text, "LN"),  # universal service id (required)
             7: d.ts(ctx.msg_dt),
         },
@@ -398,6 +416,12 @@ class MessageSpec:
     # Optional groups to recurse into, matched by name *suffix* (e.g. "_PATIENT") so one spec
     # covers every structure of its type (ORM_O01_PATIENT, SIU_S12_PATIENT, …).
     group_suffixes: frozenset[str] = frozenset()
+    # The alternative a choice group emits when it offers this one (see ``_pick_alternative``).
+    preferred_alternative: str = "OBR"
+
+
+def _builder_for(spec: MessageSpec, name: str) -> SegmentBuilder | None:
+    return spec.builders.get(name) or SHARED_BUILDERS.get(name)
 
 
 _REGISTRY: dict[str, MessageSpec] = {}
@@ -431,6 +455,22 @@ def control_id(code: str, trigger: str, index: int) -> str:
 # --- reference-driven assembly ----------------------------------------------
 
 
+def _pick_alternative(group: str, alternatives: Any, rng: random.Random, spec: MessageSpec) -> Any:
+    """The one alternative of choice group ``group`` to emit.
+
+    ``spec.preferred_alternative`` (OBR by default) when the group offers it and it can be built,
+    without drawing from ``rng``. Otherwise a seeded pick among the segment alternatives that
+    can be built, so a seed reproduces its bytes for a given set of builders; adding a builder
+    can change that pick. No shipped hl7apy choice group has a group as an alternative, so only
+    segments are candidates.
+    """
+    usable = [alt for alt in alternatives if alt[3] == "SEG" and _builder_for(spec, alt[0])]
+    if not usable:
+        raise RuntimeError(f"no builder for any alternative of choice group {group}")
+    preferred = next((alt for alt in usable if alt[0] == spec.preferred_alternative), None)
+    return preferred if preferred is not None else rng.choice(usable)
+
+
 def _emit(
     children: list[Any],
     rng: random.Random,
@@ -443,7 +483,9 @@ def _emit(
 
     Required children (min>=1) are always emitted; optional segments are emitted only if
     allow-listed (a random 0..N for repeating ones), or if named in ``force``. Groups recurse
-    only when the group itself is required.
+    only when the group itself is required or matches ``spec.group_suffixes``. A choice group
+    means "exactly one of", so it emits one alternative rather than every required child. The
+    choice test is the strict validator's, which keeps the sequences hl7apy mislabels as choices.
     """
     for child in children:
         name = child[0]
@@ -451,7 +493,7 @@ def _emit(
         min_card, max_card = child[2][0], child[2][1]
 
         if name in _SEGMENTS:
-            builder = spec.builders.get(name) or SHARED_BUILDERS.get(name)
+            builder = _builder_for(spec, name)
             if min_card >= 1 or name in force:
                 if builder is None:
                     raise RuntimeError(f"no builder for required/forced segment {name}")
@@ -461,7 +503,10 @@ def _emit(
                 for _ in range(rng.randint(0, max_reps)):
                     out.append(builder(rng, ctx))
         elif min_card >= 1 or any(name.endswith(s) for s in spec.group_suffixes):
-            _emit(child_ref[1], rng, ctx, spec, force, out)
+            group_children = child_ref[1]
+            if is_choice_group(name, child_ref):
+                group_children = [_pick_alternative(name, group_children, rng, spec)]
+            _emit(group_children, rng, ctx, spec, force, out)
 
 
 def generate_message(code: str, trigger: str, index: int, *, seed: str = DEFAULT_SEED) -> str:

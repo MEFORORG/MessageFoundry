@@ -39,6 +39,12 @@ from tests._approved_key_wrap import approved_pkcs8_pem
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 
 
+async def _ack_aa(raw: bytes) -> str:
+    """An inbound handler that ACKs. MLLPSource awaits its handler, so a plain lambda returning the
+    ACK string would fail with a TypeError on the first message it ever received."""
+    return build_ack(raw, code="AA")
+
+
 def _cert(tmp_path: Path) -> tuple[str, str]:
     """A self-signed EC cert (SAN 127.0.0.1, CA:TRUE so it doubles as the trust anchor) + key PEM."""
     key = ec.generate_private_key(ec.SECP256R1())
@@ -114,7 +120,9 @@ def test_client_verify_false_refused_without_escape(monkeypatch: pytest.MonkeyPa
         _mllp_ssl_context({"tls": True, "tls_verify": False}, server=False)
 
 
-def test_client_verify_false_allowed_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_client_verify_false_allowed_with_escape(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     ctx = _mllp_ssl_context({"tls": True, "tls_verify": False}, server=False)
     assert ctx is not None
@@ -454,7 +462,7 @@ async def test_test_connection_handshakes_against_a_tls_listener(tmp_path: Path)
             },
         )
     )
-    await source.start(lambda raw: build_ack(raw, code="AA"))
+    await source.start(_ack_aa)
     try:
         dest = MLLPDestination(
             Destination(
@@ -489,7 +497,7 @@ async def test_test_connection_on_a_tls_destination_fails_against_a_cleartext_pe
     plaintext = MLLPSource(
         Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0})
     )
-    await plaintext.start(lambda raw: build_ack(raw, code="AA"))
+    await plaintext.start(_ack_aa)
     try:
         dest = MLLPDestination(
             Destination(
@@ -522,7 +530,7 @@ async def test_a_plaintext_destination_still_probes_plaintext(tmp_path: Path) ->
     plaintext = MLLPSource(
         Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0})
     )
-    await plaintext.start(lambda raw: build_ack(raw, code="AA"))
+    await plaintext.start(_ack_aa)
     try:
         dest = MLLPDestination(
             Destination(
@@ -771,7 +779,8 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
         assert mllp_module._upgrades_tls_itself(stdlib) is True
     finally:
         stdlib.close()
-    assert mllp_module._upgrades_tls_itself(_OtherLoop()) is False
+    # Never run: the probe only asks which class the loop is, so its abstract methods stay unbound.
+    assert mllp_module._upgrades_tls_itself(_OtherLoop()) is False  # type: ignore[abstract]
 
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------

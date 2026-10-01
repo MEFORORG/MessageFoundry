@@ -1840,7 +1840,10 @@ def test_retry_forever_string_spelling_is_case_and_whitespace_insensitive(
 ) -> None:  # #1217
     """Pins the case decision explicitly, both ways -- accepted here, rejected below for anything
     that isn't this one word."""
-    assert DeliverySettings(retry_max_attempts=spelling).retry_max_attempts is None
+    # model_validate: the string is the TOML-shaped input under test, not a typed keyword.
+    assert (
+        DeliverySettings.model_validate({"retry_max_attempts": spelling}).retry_max_attempts is None
+    )
 
 
 def test_retry_forever_spelling_loads_from_a_toml_file(tmp_path: Path) -> None:  # #1217
@@ -1860,14 +1863,14 @@ def test_retry_max_attempts_still_refuses_a_garbage_string(bad: str) -> None:  #
     """The new spelling is exactly one word -- anything else must still fail closed exactly as it
     did before this item, never silently fall back to a default or to retry-forever."""
     with pytest.raises(ValidationError):
-        DeliverySettings(retry_max_attempts=bad)
+        DeliverySettings.model_validate({"retry_max_attempts": bad})
 
 
 def test_retry_max_attempts_as_a_quoted_number_still_hits_the_floor() -> None:  # #1217
     """A quoted `"0"` is not the word "forever", so it must fall through to the SAME `ge=1` floor a
     bare `0` hits -- the new validator must not accidentally widen what a string can smuggle past it."""
     with pytest.raises(ValidationError):
-        DeliverySettings(retry_max_attempts="0")
+        DeliverySettings.model_validate({"retry_max_attempts": "0"})
 
 
 def test_retry_forever_loads_from_a_file_named_messagefoundry_toml(tmp_path: Path) -> None:  # #1217

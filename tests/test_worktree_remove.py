@@ -302,6 +302,49 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert not fx.is_registered(wt)
 
 
+# --- BACKLOG #1038: what the removal must not lose ------------------------------------------------
+#
+# A `remove.ps1 -Nested` route existed for one round and was withdrawn: its occupancy fence could not
+# see an `isolation: worktree` subagent. These two guards stayed, because they hold on the one route
+# this script has.
+
+
+def test_a_detached_HEAD_holding_commits_no_ref_holds_is_refused_even_with_force(
+    fx: Fixture,
+) -> None:
+    """Red before the fix: removal deletes the HEAD reflog with the worktree, so those commits would be
+    reachable from nothing. -Force means "discard changes" and does not override it."""
+    wt = fx.sibling("loose")
+    _git(fx.primary, "worktree", "add", "-q", "--detach", str(wt))
+    tip = _commit(wt, "loose.txt", "only here")
+
+    proc = run(fx, "-Name", "loose", "-Force")
+
+    assert proc.returncode != 0
+    assert "held by no ref" in proc.stderr
+    assert wt.exists() and fx.is_registered(wt)
+    # Control: once a branch holds the commit, the same removal goes through.
+    _git(fx.primary, "branch", "keep-loose", tip)
+    again = run(fx, "-Name", "loose", "-Force")
+    assert again.returncode == 0, again.stderr
+    assert not wt.exists()
+
+
+def test_a_git_status_that_FAILS_refuses_instead_of_reading_as_clean(fx: Fixture) -> None:
+    """Red before the fix: a corrupt index makes `git status` exit 128 and print nothing, which the
+    guard read as "no tracked changes", and the edit below was then force-removed without -Force."""
+    wt = fx.add("broken")
+    (wt / "seed.txt").write_text("an edit nobody committed\n", encoding="utf-8")
+    index = Path(_git(wt, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    index.write_bytes(b"not an index")
+
+    proc = run(fx, "-Name", "broken")
+
+    assert proc.returncode != 0
+    assert "git status failed" in proc.stderr
+    assert (wt / "seed.txt").read_text(encoding="utf-8") == "an edit nobody committed\n"
+
+
 # --- BACKLOG #1295: claims held by a removed worktree --------------------------
 #
 # `claim.ps1 -Release` is WORKTREE-SCOPED, so a claim outliving its holder can never be released

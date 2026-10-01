@@ -149,6 +149,7 @@ async def test_claim_ready_dead_letters_undecryptable_row(tmp_path: Path) -> Non
         assert [i.destination_name for i in items] == ["good"]  # good row still delivered
         cur = await store._db.execute("SELECT status, last_error FROM queue WHERE id=?", (bad_id,))
         row = await cur.fetchone()
+        assert row is not None
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
         # last_error is itself ciphered (WP-5) AND cell-bound (ASVS 11.3.3 / ADR 0019), so decrypt it
         # under the SAME (table, column, row) AAD the store wrote with — a bare decrypt fails closed on
@@ -170,7 +171,9 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
     try:
         mid = await store.enqueue_ingress(channel_id="ch", raw=ADT)
         cur = await store._db.execute("SELECT id FROM queue WHERE stage=?", (Stage.INGRESS.value,))
-        ingress_id = (await cur.fetchone())["id"]
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        ingress_id = fetched_row["id"]
         wrong_key_token = make_cipher(generate_key()).encrypt(ADT)
         await store._db.execute(
             "UPDATE queue SET payload=? WHERE id=?", (wrong_key_token, ingress_id)
@@ -183,6 +186,7 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
             "SELECT status, last_error FROM queue WHERE id=?", (ingress_id,)
         )
         row = await cur.fetchone()
+        assert row is not None
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
         # Ciphered (WP-5) and cell-bound (ADR 0019) — decrypt under the row's own AAD, see the outbound
         # poison-row test above.
@@ -190,7 +194,9 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
             row["last_error"] or "", aad=cell_aad("queue", "last_error", ingress_id)
         )
         # Dead ingress row with no outbound rows → the message is finalized to ERROR.
-        assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.ERROR.value
     finally:
         await store.close()
 
@@ -242,7 +248,9 @@ async def test_error_and_event_detail_encrypted_at_rest_and_decrypt(tmp_path: Pa
         assert err_at_rest.startswith(MARKER_PREFIX) and "SECRET" not in err_at_rest
         assert det_at_rest.startswith(MARKER_PREFIX) and "SECRET" not in det_at_rest
         # ...and decrypt on every read path.
-        assert (await store.get_message(mid))["error"] == PHI_ERR
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["error"] == PHI_ERR
         assert any(m["error"] == PHI_ERR for m in await store.list_messages())
         assert any(e["detail"] == PHI_ERR for e in await store.events_for(mid))
     finally:
@@ -431,7 +439,9 @@ async def test_rotation_reencrypts_and_retired_key_bridges(tmp_path: Path) -> No
     assert isinstance(rotating_cipher, AesGcmCipher)
     rotating = await MessageStore.open(db, cipher=rotating_cipher)
     try:
-        assert (await rotating.get_message(mid))["raw"] == ADT
+        fetched = await rotating.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == ADT
         assert await rotating.reencrypt_to_active() >= 2  # raw + the outbound payload
         assert await rotating.reencrypt_to_active() == 0  # idempotent
     finally:
@@ -447,7 +457,9 @@ async def test_rotation_reencrypts_and_retired_key_bridges(tmp_path: Path) -> No
     # B alone (no retired key) now reads everything — the bridge key is no longer needed.
     final = await MessageStore.open(db, cipher=make_cipher(key_b))
     try:
-        assert (await final.get_message(mid))["raw"] == ADT
+        fetched = await final.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == ADT
     finally:
         await final.close()
 
@@ -573,7 +585,7 @@ def test_active_marker_prefix_v1_and_v2() -> None:
     # The rotation seam: active_marker_prefix carries the key fingerprint in the RIGHT position for each
     # version, and the value the writer emits starts with it (so rotation recognises active-key rows).
     key_b64 = generate_key()
-    fp = AesGcmCipher(base64.b64decode(key_b64)).active_key_id
+    fp = AesGcmCipher(bytearray(base64.b64decode(key_b64))).active_key_id
 
     v1 = make_cipher(key_b64)
     assert isinstance(v1, AesGcmCipher)
@@ -888,6 +900,7 @@ async def test_foreign_key_at_runtime_dead_letters_rather_than_degrading(tmp_pat
             "SELECT status, last_error FROM queue WHERE id=?", (row["id"],)
         )
         dead = await cur.fetchone()
+        assert dead is not None
         assert dead["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
         # last_error is ciphered (WP-5) under the ACTIVE key B, so the reopened store decrypts it —
         # under the row's own cell AAD (ADR 0019), which a v2 value requires and a v1 value ignores.
@@ -1033,13 +1046,16 @@ def test_migration_covers_every_shared_cipher_table_on_all_backends(backend: str
     table. This is a SOURCE-level guard (no DB needed), so it runs on the plain pytest job and fails
     loudly the instant a backend's migration omits a shared PHI-at-rest table — the exact class of bug
     #241 F1 fixed (SQL Server had no `state` pass, leaking legacy state plaintext at rest)."""
-    if backend == "sqlite":
-        from messagefoundry.store.store import MessageStore as store_cls
-    elif backend == "postgres":
-        from messagefoundry.store.postgres import PostgresStore as store_cls
-    else:
-        from messagefoundry.store.sqlserver import SqlServerStore as store_cls
-    src = _migration_source(store_cls)
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from messagefoundry.store.store import MessageStore
+
+    stores: dict[str, type] = {
+        "sqlite": MessageStore,
+        "postgres": PostgresStore,
+        "sqlserver": SqlServerStore,
+    }
+    src = _migration_source(stores[backend])
     missing = [t for t in _SHARED_MIGRATED_TABLES if not _migration_covers(src, t)]
     assert not missing, (
         f"{backend} _encrypt_existing_rows does not migrate {missing} — legacy plaintext in "

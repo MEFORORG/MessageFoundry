@@ -22,9 +22,10 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.settings import BackupSettings, StoreSettings
+from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.dr_backup import BackupError, BackupRunner, _day_key
 from messagefoundry.store import MessageStore
-from messagefoundry.store.backup_codec import decrypt_stream, key_fingerprint
+from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream, key_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
 
 # --- fakes -------------------------------------------------------------------
@@ -47,10 +48,11 @@ class _RecordingAlertSink:
         return lambda *a, **k: None
 
 
-class _FollowerCoordinator:
+class _FollowerCoordinator(NullCoordinator):
     """A coordinator that never leads (for the AC-12 leader-gating test)."""
 
-    node_id = "follower"
+    def __init__(self) -> None:
+        super().__init__("follower")
 
     def is_leader(self) -> bool:
         return False
@@ -82,7 +84,7 @@ async def _store_with_rows(path: Path, key_b64: str | None) -> MessageStore:
 def _settings(dest: Path, key_b64: str | None, **over: object) -> BackupSettings:
     base: dict[str, object] = {"enabled": True, "destination": str(dest)}
     base.update(over)
-    return BackupSettings(**base)
+    return BackupSettings.model_validate(base)
 
 
 def _store_settings(path: Path, key_b64: str | None) -> StoreSettings:
@@ -139,7 +141,8 @@ async def test_snapshot_is_consistent_and_nonmutating(tmp_path, key_b64, snapsho
         config_dir=None,
     )
     result = await runner.run_once(now=1000.0)
-    assert result is not None and result.verify.status == "PASS"
+    assert result is not None and result.verify is not None
+    assert result.verify.status == "PASS"
     assert result.snapshot_method == snapshot_method  # the chosen mechanism actually ran
     # The live queue is untouched (no claim/mutate/reset/complete) and integrity holds in the snapshot.
     assert await store.stats() == before
@@ -231,7 +234,9 @@ async def test_a_real_backup_run_advances_the_persisted_invocation_count(
 
     # Observe the frame count the codec ACTUALLY performs, without changing what the runner does.
     frames: list[int] = []
-    real_encrypt_stream = dr.encrypt_stream
+    real_encrypt_stream = (
+        encrypt_stream  # the codec function dr_backup imports; patched there below
+    )
 
     def _spy(src, dst, key, *, chunk_size=None, on_frames=None, salt=None):
         def _record(n: int) -> None:

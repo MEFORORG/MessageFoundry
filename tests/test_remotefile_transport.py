@@ -37,6 +37,7 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
@@ -968,6 +969,7 @@ def test_plain_ftp_with_credentials_refused_without_escape(
 
 
 def test_plain_ftp_with_credentials_allowed_with_escape(
+    escape_at_warn: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
@@ -1015,7 +1017,7 @@ def test_ftps_insecure_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_ftps_insecure_allowed_with_escape(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
@@ -1198,7 +1200,9 @@ def test_sftp_unknown_host_key_refused_without_escape(monkeypatch: pytest.Monkey
     assert ei.value.permanent is True  # a rejected host key is a permanent security stop
 
 
-def test_sftp_unknown_host_key_accepted_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sftp_unknown_host_key_accepted_with_escape(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _FakeParamiko)
     client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"})
@@ -2505,9 +2509,13 @@ def _config_fault_dest(
         _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
     else:
         _scripted_plain_ftp(monkeypatch, refuse_at=refuse_at, reply=reply)
-    return build_destination(
-        _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
-    )
+    # A credentialed plain-ftp hop needs the escape on a warn posture (vault BACKLOG #2354). FTPS
+    # needs no escape, so it keeps the default (unstamped) posture.
+    posture = HopPosture(enforcing=False) if kind == "plain" else None
+    with active_hop_posture(posture):
+        return build_destination(
+            _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
+        )
 
 
 @pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)

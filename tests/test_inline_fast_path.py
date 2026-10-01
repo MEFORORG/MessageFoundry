@@ -47,7 +47,7 @@ ADT = (
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()
@@ -56,8 +56,8 @@ async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
 def _registry(
     inbox: Path,
     outdir: Path,
-    route,  # type: ignore[no-untyped-def]
-    handlers: dict,  # type: ignore[type-arg]
+    route,
+    handlers: dict,
     *,
     inline: bool = False,
     with_lookup: bool = False,
@@ -238,7 +238,9 @@ async def test_inline_happy_path_fuses_handoff_and_processes(
         "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.ROUTED.value),
     )
-    assert (await cur.fetchone())["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
 
 
 # --- matrix #1/#3: eligibility fallbacks -------------------------------------
@@ -396,7 +398,7 @@ async def test_inline_handler_raises_stop_policy_halts_lane(
         def connection_stopped(self, name: str, *, detail: str = "") -> None:
             self.stopped.append(name)
 
-        def __getattr__(self, _n: str):  # type: ignore[no-untyped-def]
+        def __getattr__(self, _n: str):
             return lambda *a, **k: None
 
     def boom(msg: Message) -> Send:
@@ -463,7 +465,9 @@ async def test_inline_crash_after_claim_repend_pure_rerun_one_outbound(
     assert spy.handoff_calls == 1  # the re-run fused exactly once
     outbound = await store.outbox_for(mid)
     assert len(outbound) == 1  # EXACTLY ONE outbound row — no duplicate from the re-run
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_inline_handoff_after_commit_is_idempotent_noop(
@@ -520,7 +524,9 @@ async def test_inline_g6_dead_letters_at_finite_attempts_ceiling(
         "SELECT attempts FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.INGRESS.value),
     )
-    assert (await cur.fetchone())["attempts"] == 3  # at the cap before the worker's next claim
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["attempts"] == 3  # at the cap before the worker's next claim
 
     reg = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
     runner = await _run(reg, store, delivery_defaults=RetryPolicy(max_attempts=3))

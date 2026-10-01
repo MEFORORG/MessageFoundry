@@ -153,6 +153,20 @@ class DetUUID:
         self.n = 0
 
 
+def current_uuid4() -> Any:
+    """store.sqlserver's module-level ``uuid4`` as it stands now (read for a later restore)."""
+    return vars(ss)["uuid4"]
+
+
+def swap_uuid4(fn: Any) -> Any:
+    """Point store.sqlserver's module-level ``uuid4`` (the name its SQL minting reads) at ``fn`` and
+    return what it replaced. Through the module dict, because the name is an import, not an export."""
+    namespace = vars(ss)
+    previous = namespace["uuid4"]
+    namespace["uuid4"] = fn
+    return previous
+
+
 def bare_store(*, batch: bool = False, command_timeout: int = 30) -> SqlServerStore:
     """A SqlServerStore built WITHOUT opening a pool/DB — just enough state for the handoffs, with the
     ADR 0075 batching flag set explicitly."""

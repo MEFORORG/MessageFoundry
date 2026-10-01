@@ -32,12 +32,12 @@ import pytest
 
 from messagefoundry.config.db_lookup import DbLookupError, db_lookup
 from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.response import response_get
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.state import state_get
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -65,7 +65,7 @@ ESC = "MSH|^~\\&|ESC|F|R|RF|20260101||ADT^A01|MSG3|P|2.5.1\rPID|1||900003||POE^P
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "accepts.db")
     yield s
     await s.close()
@@ -166,7 +166,9 @@ async def test_no_accepts_materializes_every_routed_row(
     item = await _claimed(store)
     await runner._process_ingress_item("IB", item)
     assert await _routed_rows(store, item.message_id) == ["a", "b"]  # both, as today
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 # --- AC-1: the decline lands BEFORE a routed row exists ----------------------
@@ -196,7 +198,9 @@ async def test_accepts_declines_before_a_routed_row_exists(
     # filtered inside route_only, so no routed row for them ever existed to be rolled back.
     assert seen == [["h00", "h01", "h02", "h03"]]
     assert await _routed_rows(store, item.message_id) == ["h00", "h01", "h02", "h03"]
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     # ADR 0051's 2H term: 4 routed rows, not 20 (txn/msg 51 -> 19 for the reference hub).
     assert len(await _routed_rows(store, item.message_id)) == 4
 
@@ -251,7 +255,9 @@ def test_accepts_raise_propagates_out_of_route_only(tmp_path: Path) -> None:
 
 async def _router_stage_state(store: MessageStore, mid: str) -> tuple[str, list[tuple[str, str]]]:
     """(messages.status, [(stage, status)]) — the full router-stage outcome of one message."""
-    status = (await store.get_message(mid))["status"]
+    msg = await store.get_message(mid)
+    assert msg is not None
+    status = msg["status"]
     cur = await store._db.execute(
         "SELECT stage, status FROM queue WHERE message_id=? ORDER BY rowid", (mid,)
     )
@@ -438,7 +444,9 @@ async def test_accepts_lookup_dead_letters_on_the_live_path(
     runner = RegistryRunner(reg, store)
     item = await _claimed(store)
     await runner._process_ingress_item("IB", item)
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 # --- ADR 0057: the inline fast-path now gates on the POST-decline count -------
@@ -475,7 +483,9 @@ async def test_accepts_makes_a_multi_select_message_inline_eligible(
     assert await _routed_rows(store, item.message_id) == []
     outbound = await store.outbox_for(item.message_id)
     assert [o["destination_name"] for o in outbound] == ["OB"]
-    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 # --- registry surface --------------------------------------------------------
@@ -651,7 +661,7 @@ def test_predicates_share_the_routers_payload_and_cannot_reach_a_handler(tmp_pat
         seen.append(id(msg))
         return True
 
-    delivered: list[str] = []
+    delivered: list[str | None] = []
 
     def _h(msg: Message) -> Send:
         delivered.append(msg["MSH-3"])

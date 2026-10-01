@@ -14,6 +14,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,6 +26,7 @@ from messagefoundry.store.crypto import (
     _GCM_MAX_INVOCATIONS,
     _GCM_SOFT_WARN_INVOCATIONS,
     AesGcmCipher,
+    Cipher,
     CipherError,
     IdentityCipher,
     generate_key,
@@ -137,8 +139,10 @@ def test_keyless_hash_is_byte_identical_frozen_fixture() -> None:
     # unkeyed SHA-256 chain, so keyless deployments + every legacy row still verify. Pinned to a frozen
     # digest AND to the exact canonical formula (breaks if either the encoding or the keyless branch
     # changes).
-    args = dict(ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}')  # noqa: C408
-    keyless = audit_row_hash("prev", key=None, **args)  # type: ignore[arg-type]
+    args: dict[str, Any] = dict(  # noqa: C408
+        ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
+    )
+    keyless = audit_row_hash("prev", key=None, **args)
     assert keyless == "f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e"
     canonical = json.dumps(
         ["prev", 1.5, "alice", "view", "ch", '{"n":1}'], sort_keys=True, default=str
@@ -146,7 +150,7 @@ def test_keyless_hash_is_byte_identical_frozen_fixture() -> None:
     assert keyless == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     # Keyed is a DIFFERENT digest (HMAC over the same canonical), and matches stdlib hmac exactly.
     key = b"\x00" * 32
-    keyed = audit_row_hash("prev", key=key, **args)  # type: ignore[arg-type]
+    keyed = audit_row_hash("prev", key=key, **args)
     assert keyed != keyless
     assert keyed == hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -300,7 +304,8 @@ def test_gcm_soft_warn_then_fail_closed(caplog: pytest.LogCaptureFixture) -> Non
 
 
 def test_identity_cipher_has_no_audit_key() -> None:
-    assert IdentityCipher().audit_mac_key() is None
+    identity: Cipher = IdentityCipher()  # through the protocol, whose key is bytes | None
+    assert identity.audit_mac_key() is None
     assert isinstance(make_cipher(generate_key()).audit_mac_key(), bytes)
 
 
@@ -1069,11 +1074,13 @@ def test_absent_client_reproduces_the_legacy_digest_exactly() -> None:
     """The compatibility gate for ADR 0150. The address is a CONDITIONAL 7th element, so a row with no
     client must hash over the same 6-element list as before — otherwise every row written before the
     column existed would fail verification the moment the engine was upgraded."""
-    args = dict(ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}')  # noqa: C408
+    args: dict[str, Any] = dict(  # noqa: C408
+        ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
+    )
     legacy = "f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e"
     # Omitted and explicitly-None must BOTH collapse to the frozen pre-0150 digest.
-    assert audit_row_hash("prev", **args) == legacy  # type: ignore[arg-type]
-    assert audit_row_hash("prev", client=None, **args) == legacy  # type: ignore[arg-type]
+    assert audit_row_hash("prev", **args) == legacy
+    assert audit_row_hash("prev", client=None, **args) == legacy
     # An UNCONDITIONAL 7th element would have produced this instead — the bug this test pins against.
     unconditional = json.dumps(
         ["prev", 1.5, "alice", "view", "ch", '{"n":1}', None], sort_keys=True, default=str
@@ -1084,10 +1091,12 @@ def test_absent_client_reproduces_the_legacy_digest_exactly() -> None:
 def test_client_is_inside_the_chained_payload() -> None:
     """The address must be CHAINED, not an unchained sibling column: attribution an attacker can
     rewrite without breaking tamper-evidence would be worse than no attribution at all."""
-    args = dict(ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}')  # noqa: C408
-    assert audit_row_hash("prev", client="10.0.0.1", **args) != audit_row_hash("prev", **args)  # type: ignore[arg-type]
+    args: dict[str, Any] = dict(  # noqa: C408
+        ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
+    )
+    assert audit_row_hash("prev", client="10.0.0.1", **args) != audit_row_hash("prev", **args)
     # …and two different addresses are two different digests (the field is genuinely covered).
-    assert audit_row_hash("prev", client="10.0.0.1", **args) != audit_row_hash(  # type: ignore[arg-type]
+    assert audit_row_hash("prev", client="10.0.0.1", **args) != audit_row_hash(
         "prev", client="10.0.0.2", **args
     )
 
@@ -1184,7 +1193,7 @@ async def test_migration_adds_client_to_a_preexisting_store(tmp_path: Path) -> N
         assert "client" in {r["name"] for r in await cur.fetchall()}  # the ALTER ran
         # The pre-existing rows were NOT rewritten, and they still verify.
         cur = await store._db.execute("SELECT client, row_hash FROM audit_log ORDER BY id")
-        rows = await cur.fetchall()
+        rows = list(await cur.fetchall())
         assert [r["client"] for r in rows] == [None, None, None]
         assert rows[-1]["row_hash"] == legacy_head
         ok, message = await store.verify_audit_chain()

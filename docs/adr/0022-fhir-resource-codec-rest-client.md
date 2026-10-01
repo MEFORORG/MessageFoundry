@@ -217,7 +217,11 @@ str) -> DeliveryResponse | None`, optional `aclose`/`test_connection` overrides,
    resource/interaction). The configured `url` setting is the **FHIR service base URL** (e.g.
    `https://host/fhir`); each interaction appends to it:
    - **create** — `POST {base}/{ResourceType}` (the server assigns the id);
-   - **update** — `PUT {base}/{ResourceType}/{id}` (the resource carries its id);
+   - **update** — `PUT {base}/{ResourceType}/{id}` (the resource carries its id); **amended (vault BACKLOG
+     #1965, ASVS 14.2.1, owner ruling R3):** the engine now sends an update as the one entry of a `transaction`
+     Bundle POSTed to `{base}`, with `PUT {ResourceType}/{id}` in the entry's `request`, so the message-derived
+     id never appears in the request URL. See [CONNECTIONS.md](../CONNECTIONS.md), "An update keeps the
+     resource id out of the URL";
    - **Bundle transaction/batch** — `POST {base}` with a `Bundle` body (`Bundle.type =
      transaction`/`batch`). The engine *builds/posts* the Bundle; the FHIR **server** applies it (transaction =
      all-or-nothing, batch = independent per entry) — this is a server-side semantic the engine never executes.
@@ -237,8 +241,11 @@ str) -> DeliveryResponse | None`, optional `aclose`/`test_connection` overrides,
      `If-None-Exist`).
    - **`"if-match"` — version-aware update / optimistic locking.** `PUT {base}/{ResourceType}/{id}` (a **known**
      id) with `If-Match: W/"<versionId>"` (the ETag) to prevent a lost update. This is **not** "conditional
-     update" — it locks an already-identified resource.
-   They are **HTTP header / URL** mechanisms, so they ride the existing REST header/URL path. Per the ADR 0015
+     update" — it locks an already-identified resource. **Amended (vault BACKLOG #1965):** it travels like
+     `update`, as a one-entry `transaction` Bundle, and the ETag moves from the `If-Match` header into the
+     entry's `request.ifMatch`.
+   They are **HTTP header / URL** mechanisms, so they ride the existing REST header/URL path (**amended,
+   vault BACKLOG #1965:** except `if-match`, whose ETag now rides the transaction entry in the body). Per the ADR 0015
    **value-placement contract**, any per-call non-deterministic header value (a fresh idempotency token) is minted
    in the transport's `send()` (which runs *after* the staged-queue boundary), **never** in the pure transform; a
    static or resource-derived criterion comes from config/the body. Conditional support is **in scope** for the
@@ -317,7 +324,7 @@ def FHIR(*, url,                               # str | EnvRef — FHIR service B
          fhir_version="R4B",                   # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect.
                                                #   (plain R4 4.0.1 is not in modern fhir.resources; R4B is its replacement)
          format="json",                        # "json" (MVP) | "xml" (experimental, lxml extra) → application/fhir+json | +xml
-         interaction="create",                 # "create" (POST) | "update" (PUT) | "transaction"/"batch" (Bundle POST)
+         interaction="create",                 # "create" (POST) | "update" (PUT entry in a transaction; vault BACKLOG #1965) | "transaction"/"batch" (Bundle POST)
          conditional=None,                     # None | "if-none-exist" (cond. create, header)
                                                #      | "conditional-update" (search-based PUT, URL query)
                                                #      | "if-match" (optimistic lock on a known id, ETag header)

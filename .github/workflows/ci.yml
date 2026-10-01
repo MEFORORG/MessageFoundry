@@ -541,6 +541,15 @@ jobs:
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy --explicit-package-bases tests
 
+      # BACKLOG #1799: the ratchet's ignore_errors hides every error in a listed module, so the step
+      # above cannot see a listed module that has been fixed. This one re-runs mypy over the listed
+      # modules with the exemption switched off, on linux and win32, and fails on a module clean on
+      # both, so the list cannot hold dead entries. The script's docstring says why it cannot pass
+      # by measuring nothing; tests/test_mypy_tests_scope.py pins this step and plants a control.
+      - name: Type-check (mypy, tests ratchet has no dead entries)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        run: python scripts/ci/mypy_ratchet_check.py
+
       # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
       # path argument) plus every other sys.platform=='win32' branch.
       - name: Type-check (mypy, strict — win32 platform)
@@ -1552,7 +1561,8 @@ jobs:
       # sides from the one census, moved 3:20 -> 2:35, 4:20 -> 3:17 and 4:50 -> 3:35. That is 1.29x,
       # 1.32x and 1.35x against the projected 1.563x, so the contention penalty on a 4-vCPU runner is
       # real. Worst runs are not compared here: the projection's inputs came from a 66-row pool and
-      # this one holds about 300 rows per leg, and a maximum grows with the size of its sample.
+      # the second re-derivation's pool holds about 300 rows per leg, and a maximum grows with the
+      # size of its sample.
       #
       # `matrix.pytest_workers` NOW FEEDS TWO SUITES, AND ITS OWN NOTE STILL CALLS IT THE ENGINE'S.
       # That note offers 2 as "the conservative rung" if engine timing tests start flaking. Taking that
@@ -1597,6 +1607,22 @@ jobs:
       # ITSELF under `--dist loadfile`, but it now contends with three sibling workers on a 4-vCPU
       # runner. If MFA enrolment starts flaking here, this paragraph is the first place to look, and
       # the lever is that helper's margin -- not the worker count, which the arithmetic above needs.
+      #
+      # A ROTTING RECORD NOW LEAVES THE STEP LOG (BACKLOG #1842). The second re-derivation's rows
+      # rotted in three days: merge-group run 36531560700 reddened windows-2022 at 4:44 against the
+      # 6:00 cap, above its 4:11 row, with every test passing, and the queue ejected engine PR 1778.
+      # `step_margin.py` used to print RE-DERIVE as a note and exit 0. It now raises a `::warning`
+      # annotation, on the run page and the checks tab, for any success run over its row, graded
+      # RE-DERIVE or RE-SIZE, by that script's `record_escalation`. It never changes the exit code; a
+      # red for a stale table would eject pull requests, which is the defect this item was filed for.
+      #
+      # WHAT IT DOES NOT BUY, SO NOBODY RELIES ON IT FOR MORE. The lead time is set by the sizing rule,
+      # not the annotation: ceil_minute(1.35x) against a 1.30x floor puts the red line under a tenth
+      # over the row; "THE THIRD RE-DERIVATION" note above gives each leg's. A pull_request run shows
+      # the annotation first only when one pull request's growth crosses the row. Growth that crosses
+      # it only when several queued pull requests combine is first annotated on a merge-group run,
+      # which may land or, past the red line, eject them. Widening that band means changing the
+      # sizing rule, which is a separate decision.
       - name: Web console tests (pytest)
         id: webconsole
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'

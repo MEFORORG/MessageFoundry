@@ -696,9 +696,11 @@ def DatabaseRef(
     The engine runs ``statement`` (a read-only ``SELECT``/proc) on the set's refresh cadence and builds
     the snapshot from the rows: ``key_column`` is the lookup key; ``value_column`` (if given) is that
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
-    shape). Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
-    ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
+    shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
+    refused at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is
+    set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at ``[security].enforcement = warn``. The
+    dial-out is gated by the **fail-closed** ``[egress].allowed_db`` allowlist, exactly like a
+    DATABASE poll source — point the engine only at allowed hosts.
 
     ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
     the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
@@ -2627,7 +2629,7 @@ def FHIR(
     format: Literal["json"] = "json",  # "json" (MVP); "xml" is deferred (ADR 0022 Options #5)
     interaction: Literal[
         "create", "update", "transaction", "batch"
-    ] = "create",  # "create" (POST) | "update" (PUT) | "transaction" | "batch" (Bundle POST)
+    ] = "create",  # "create" (POST) | "update" (PUT in a transaction) | "transaction" | "batch"
     conditional: Literal["if-none-exist", "conditional-update", "if-match"]
     | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
@@ -2665,14 +2667,17 @@ def FHIR(
     """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
     The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
     the FHIR service ``url`` (the **base**, e.g. ``https://host/fhir``) using the FHIR HTTP interaction:
-    ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``PUT {base}/{ResourceType}/{id}``,
-    ``transaction``/``batch`` → ``POST {base}`` with the Bundle. ``application/fhir+json`` media type
-    (JSON-only MVP). The three opt-in conditional knobs are the idempotency/concurrency levers:
-    ``if-none-exist`` (conditional create, ``If-None-Exist`` header), ``conditional-update`` (search-based
-    ``PUT`` with ``conditional_query`` in the URL), ``if-match`` (version-aware ``PUT`` whose ``If-Match``
-    ETag is derived from the resource's ``meta.versionId``). A 2xx is delivered; 5xx / a transient
-    OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter. Redirects are refused
-    and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
+    ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``POST {base}`` with a one-entry
+    ``transaction`` Bundle whose entry is ``PUT {ResourceType}/{id}`` (so the message-derived id never
+    appears in the request URL; vault BACKLOG #1965), ``transaction``/``batch`` → ``POST {base}`` with the
+    Bundle. ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
+    idempotency/concurrency levers: ``if-none-exist`` (conditional create, ``If-None-Exist`` header),
+    ``conditional-update`` (search-based ``PUT`` with ``conditional_query`` in the URL), ``if-match``
+    (version-aware update, sent like ``update``, whose ETag is derived from the resource's
+    ``meta.versionId`` and carried in the entry's ``request.ifMatch``). An ``update`` or ``if-match``
+    connection needs a server that supports the ``transaction`` interaction. A 2xx is delivered;
+    5xx / a transient OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter.
+    Redirects are refused and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
     (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022.
 

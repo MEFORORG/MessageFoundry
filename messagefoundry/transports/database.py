@@ -62,11 +62,11 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
-    hop_insecure_escape_downgrades,
-    insecure_tls_allowed,
+    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
+    HopPosture,
     InsecureHopRefused,
     current_hop_posture,
     hop_name_prefix,
@@ -112,7 +112,7 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def _weakened_tls_permitted(*, attested: bool) -> bool:
+def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
     """Whether a weakened (verify-off) customer-DB TLS posture may be used, routed through the ONE
     shared hop authority (#200, ADR 0092).
 
@@ -120,20 +120,16 @@ def _weakened_tls_permitted(*, attested: bool) -> bool:
     means — a proxy-terminated / trusted-segment DB link). Otherwise this stays a **STRICT verify-off
     cell** (decision 5): refused for **both staging and prod PHI** unless the global
     ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and that escape is **CLAMPED to non-production**
-    (decision 2 — :func:`hop_insecure_escape_downgrades`) so it can never relax a production hop.
+    (decision 2) so it can never relax a production hop.
 
-    Keyed on the construction-time posture (:func:`current_hop_posture`, stamped by
-    ``build_check_registry`` — the ENFORCED gate at ``messagefoundry check`` / dry-run / serve-start /
-    reload). When unstamped (``None`` — a runtime delivery build or a direct embedding outside that
-    gate) it falls back to the **unclamped** escape, so a legitimately-escaped non-production instance
-    is not refused at delivery time; the enforced gate already vetted the production case against the
-    real posture, so this fallback never loosens the clamp."""
-    if attested:
-        return True
-    posture = current_hop_posture()
-    if posture is None:
-        return insecure_tls_allowed()
-    return hop_insecure_escape_downgrades(enforcing=posture.enforcing)
+    The escape question is the shared :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`,
+    so this cell and every other weakened-TLS cell answer it in one place. ``posture`` is the
+    construction-time posture; the send-time tripwire passes the one its connector captured, because
+    a delivery worker runs outside the scope that stamped it. ``None`` fails closed (vault BACKLOG
+    #2354). CORRECTED: an unstamped call used to fall back to the unclamped escape, on the premise
+    that the enforced gate had already vetted the real posture; callers the gate never reaches made
+    that false."""
+    return attested or weakened_tls_escape_permitted(posture)
 
 
 def _audit_attested_weakened_tls(cell: str, *, connection: str | None = None) -> None:
@@ -150,12 +146,19 @@ def _audit_attested_weakened_tls(cell: str, *, connection: str | None = None) ->
         )
 
 
-def _assert_send_hop(*, weakened: bool, attested: bool, connection: str | None = None) -> None:
+def _assert_send_hop(
+    *,
+    weakened: bool,
+    attested: bool,
+    posture: HopPosture | None,
+    connection: str | None = None,
+) -> None:
     """Zero-I/O byte-crossing re-assertion (#200 decision 4): before a payload crosses a weakened-TLS
     DB hop, re-confirm the posture-keyed authority still permits it. Raises :class:`InsecureHopRefused`
     (a ``ValueError``) otherwise — a fail-closed tripwire behind the construction-time gate. No-op for
-    a non-weakened (verifying-TLS) hop."""
-    if weakened and not _weakened_tls_permitted(attested=attested):
+    a non-weakened (verifying-TLS) hop. ``posture`` is the one the connector captured when it was
+    built."""
+    if weakened and not _weakened_tls_permitted(attested=attested, posture=posture):
         raise InsecureHopRefused(
             f"{hop_name_prefix(connection)}DATABASE destination: refusing to put a payload on a "
             "weakened-TLS database hop "
@@ -188,7 +191,9 @@ def _build_dsn(
     DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     encrypt = bool(s.get("encrypt", True))
     trust = bool(s.get("trust_server_certificate", False))
-    if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
+    if (trust or not encrypt) and not _weakened_tls_permitted(
+        attested=attested, posture=current_hop_posture()
+    ):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE connection TLS is weakened "
             "(trust_server_certificate=true or encrypt=false), "
@@ -197,7 +202,7 @@ def _build_dsn(
             "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
             f"or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to "
             "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
-            "the default)."
+            "the default, or with no posture)."
         )
     if (trust or not encrypt) and attested:
         _audit_attested_weakened_tls("DATABASE connection", connection=connection)
@@ -1093,6 +1098,8 @@ class DatabaseDestination(DestinationConnector):
         # send-time byte-crossing re-assertion below.
         self._hop_attested = config.tls_hop_attested
         self._connection_name = config.name
+        # The posture this connector was built under, for the send-time tripwire (vault BACKLOG #2354).
+        self._hop_posture = current_hop_posture()
         self._dsn, self._weakened_tls = _build_connection(
             s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
@@ -1161,6 +1168,7 @@ class DatabaseDestination(DestinationConnector):
         _assert_send_hop(
             weakened=self._weakened_tls,
             attested=self._hop_attested,
+            posture=self._hop_posture,
             connection=self._connection_name,
         )
         # BACKLOG #1178: the generic dialect's twin of the line above. That tripwire is keyed on

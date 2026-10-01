@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -82,37 +83,52 @@ def _db_dest(**overrides: object) -> Destination:
 # --- DB: the posture-keyed weakened-TLS permission predicate (_weakened_tls_permitted) ----------
 def test_db_attestation_always_permits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(PROD_PHI):
-        assert _weakened_tls_permitted(attested=True) is True
+    assert _weakened_tls_permitted(attested=True, posture=PROD_PHI) is True
+    assert _weakened_tls_permitted(attested=True, posture=None) is True
 
 
 def test_db_prod_phi_refused_even_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     # decision 2: the global escape is CLAMPED — it can never relax a production-PHI hop.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with active_hop_posture(PROD_PHI):
-        assert _weakened_tls_permitted(attested=False) is False
+    assert _weakened_tls_permitted(attested=False, posture=PROD_PHI) is False
 
 
 def test_db_staging_phi_strict_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     # decision 5: a verify-off cell that refuses staging PHI today MUST stay refused (not warn-and-cross).
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(STAGING_PHI):
-        assert _weakened_tls_permitted(attested=False) is False
+    assert _weakened_tls_permitted(attested=False, posture=STAGING_PHI) is False
 
 
 def test_db_staging_phi_escape_downgrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The control arm for the test below: an explicit warn posture honours the escape.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    assert _weakened_tls_permitted(attested=False, posture=STAGING_PHI) is True
+
+
+def test_db_no_posture_refuses_even_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Vault BACKLOG #2354: no posture FAILS CLOSED. This used to fall back to the unclamped escape,
+    # which let callers the construction gate never reaches cross a weakened hop under enforce.
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    assert _weakened_tls_permitted(attested=False, posture=None) is False
+
+
+def test_db_shared_predicate_fails_closed_with_no_posture(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The one predicate every weakened-TLS cell asks. An explicit warn posture is the control arm.
+    from messagefoundry.config.settings import (
+        weakened_tls_escape_permitted,
+        weakened_tls_escape_permitted_here,
+    )
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    assert weakened_tls_escape_permitted(None) is False
+    with active_hop_posture(None):  # nothing stamped, even under a stamping session fixture
+        assert weakened_tls_escape_permitted_here() is False
+    assert weakened_tls_escape_permitted(STAGING_PHI) is True
+    assert weakened_tls_escape_permitted(PROD_PHI) is False
     with active_hop_posture(STAGING_PHI):
-        assert _weakened_tls_permitted(attested=False) is True  # non-prod escape honored
-
-
-def test_db_unstamped_falls_back_to_unclamped_escape(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Unstamped posture (runtime delivery build / embedding, outside build_check's gate) falls back to
-    # the pre-#200 unclamped escape so a legitimately-escaped dev instance is not refused at delivery.
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    assert _weakened_tls_permitted(attested=False) is True
+        assert weakened_tls_escape_permitted_here() is True
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    assert _weakened_tls_permitted(attested=False) is False
+    assert weakened_tls_escape_permitted(STAGING_PHI) is False
 
 
 # --- DB: _build_dsn routes its verify-off refusal through the predicate --------------------------
@@ -166,15 +182,45 @@ def test_database_destination_prod_phi_attested_constructs(
 def test_assert_send_hop_refuses_weak_unpermitted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with pytest.raises(InsecureHopRefused):
-        _assert_send_hop(weakened=True, attested=False)
+        _assert_send_hop(weakened=True, attested=False, posture=STAGING_PHI)
+
+
+def test_assert_send_hop_with_no_posture_refuses_even_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with pytest.raises(InsecureHopRefused):
+        _assert_send_hop(weakened=True, attested=False, posture=None)
+    _assert_send_hop(weakened=True, attested=False, posture=STAGING_PHI)  # control arm
+
+
+def test_destination_carries_its_build_posture_to_send_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A delivery worker runs outside the scope that stamped the build, so the send-time tripwire
+    # must use the posture captured at construction, or a warn instance's escaped hop would refuse
+    # at every send now that no posture fails closed.
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with active_hop_posture(STAGING_PHI):
+        dest = DatabaseDestination(_db_dest())
+    assert dest._hop_posture is STAGING_PHI
+
+    async def _no_pool() -> object:
+        raise _StopBeforeDial
+
+    # Through send() itself, outside the scope: the tripwire passes on the captured warn posture and
+    # the call reaches the pool. Were send() to read the ambient posture (None here), it would refuse.
+    monkeypatch.setattr(dest, "_get_pool", _no_pool)
+    with active_hop_posture(None), pytest.raises(_StopBeforeDial):
+        asyncio.run(dest.send('{"x": 1}'))
 
 
 def test_assert_send_hop_noop_when_not_weakened() -> None:
-    _assert_send_hop(weakened=False, attested=False)  # verifying TLS — nothing to assert
+    _assert_send_hop(weakened=False, attested=False, posture=None)  # verifying TLS: nothing to do
 
 
 def test_assert_send_hop_permitted_when_attested() -> None:
-    _assert_send_hop(weakened=True, attested=True)  # attested secure by other means
+    _assert_send_hop(weakened=True, attested=True, posture=None)  # attested secure by other means
 
 
 # --- DB: the live-lookup executor and the reference-sync twin honour the attestation (#1666) -----
@@ -261,6 +307,187 @@ def test_reference_source_prod_phi_unattested_still_refused(
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
         asyncio.run(_load_database_source(settings, None))
     assert seen == []  # refused BEFORE the pool was ever built
+
+
+# --- DB: the reference sync carries the posture itself (vault BACKLOG #2354) ----------------------
+#
+# The two tests above stamp the posture AROUND the call, which no production path does: a sync runs
+# after start, outside every active_hop_posture scope. So the refusal read no posture and fell back to
+# the unclamped escape, and under `enforce` a DatabaseRef with encrypt=false crossed in the clear. The
+# runner now passes the instance posture in. None of the tests below open an ambient scope.
+
+_WEAK_REF = {**_WEAK_DB, "statement": "SELECT code FROM t", "key_column": "code"}
+
+
+def test_reference_source_with_no_posture_refuses_even_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The defect's own shape. Before #2354 this built the weakened DSN; no posture now fails closed.
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    with active_hop_posture(None), pytest.raises(ValueError, match="weakened"):
+        asyncio.run(_load_database_source(dict(_WEAK_REF), None))
+    assert seen == []
+
+
+def test_reference_source_enforcing_posture_clamps_the_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    with pytest.raises(ValueError, match="weakened"):
+        asyncio.run(_load_database_source(dict(_WEAK_REF), None, posture=PROD_PHI))
+    assert seen == []
+
+
+def test_reference_source_verifying_tls_passes_under_enforce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Control: the shipped default (encrypt=true, verification on) is not what the gate refuses.
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    settings = {
+        "server": "s",
+        "database": "d",
+        "statement": "SELECT code FROM t",
+        "key_column": "code",
+    }
+    with pytest.raises(_StopBeforeDial):
+        asyncio.run(_load_database_source(settings, None, posture=PROD_PHI))
+    assert "Encrypt=yes" in seen[0]
+    assert "TrustServerCertificate=no" in seen[0]
+
+
+def test_reference_source_non_enforcing_posture_honours_the_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Control: the clamp is keyed on the enforcement dial, so a `warn` instance keeps its escape.
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    with pytest.raises(_StopBeforeDial):
+        asyncio.run(_load_database_source(dict(_WEAK_REF), None, posture=STAGING_PHI))
+    assert "Encrypt=no" in seen[0]
+
+
+def test_reference_runner_threads_its_posture_into_the_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The wiring, not just the helper: a runner built with an enforcing posture refuses the hop.
+    from messagefoundry.config.settings import ReferenceSettings
+    from messagefoundry.config.wiring import ReferenceSourceSpec, ReferenceSpec
+    from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    spec = ReferenceSpec(name="codes", source=ReferenceSourceSpec("database", dict(_WEAK_REF)))
+    store: Any = object()  # never reached: the refusal comes before the snapshot write
+
+    def runner(posture: HopPosture | None) -> ReferenceSyncRunner:
+        return ReferenceSyncRunner(store, lambda: [spec], ReferenceSettings(), hop_posture=posture)
+
+    with pytest.raises(ValueError, match="weakened"):
+        asyncio.run(runner(PROD_PHI)._sync_one(spec))
+    assert seen == []
+    # Control arm: the same runner built with a warn posture honours the escape.
+    with pytest.raises(_StopBeforeDial):
+        asyncio.run(runner(STAGING_PHI)._sync_one(spec))
+    assert "Encrypt=no" in seen[0]
+
+
+def _ref_registry(**ref_kwargs: Any) -> Any:
+    from messagefoundry.config.wiring import DatabaseRef, ReferenceSpec, Registry
+
+    reg = Registry()
+    source = DatabaseRef(
+        server="db.example.org",
+        database="d",
+        statement="SELECT code FROM t",
+        key_column="code",
+        **ref_kwargs,
+    )
+    reg.add_reference(ReferenceSpec(name="codes", source=source))
+    return reg
+
+
+def _build_check(reg: Any, posture: HopPosture | None) -> None:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    build_check_registry(
+        reg, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings(), posture=posture
+    )
+
+
+def test_build_check_refuses_a_weakened_reference_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A source every sync would refuse fails `check`, dry-run and reload, and names the set.
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with pytest.raises(WiringError, match="weakened") as exc:
+        _build_check(_ref_registry(encrypt=False), PROD_PHI)
+    assert "'reference:codes'" in str(exc.value)
+
+
+def test_build_check_passes_a_verifying_reference_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Control: the shipped default passes the same check under the same posture.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _build_check(_ref_registry(), PROD_PHI)
+
+
+def test_build_check_passes_an_attested_reference_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Control: the per-connection attestation is the audited way across, as on every other DB hop.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _build_check(
+        _ref_registry(
+            encrypt=False,
+            tls_hop_attested=True,
+            tls_hop_attested_reason="proxy-terminated TLS on a dedicated segment",
+        ),
+        PROD_PHI,
+    )
+
+
+def test_build_check_leaves_an_unresolved_reference_source_to_its_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A set staged before its env() value exists must not refuse the whole graph; its sync reports
+    # it, as before. The weakened-source test above is the arm that shows the check does run.
+    from messagefoundry.config.wiring import env
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _build_check(_ref_registry(encrypt=False, password=env("REF_PW_NOT_PROVISIONED")), PROD_PHI)
+
+
+def test_build_check_honours_the_escape_on_a_warn_instance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    _build_check(_ref_registry(encrypt=False), STAGING_PHI)
+
+
+async def test_engine_hands_its_posture_to_the_reference_runner(tmp_path: Path) -> None:
+    # The last link: the engine builds the runner, so a runner that CAN carry a posture but is never
+    # given one would leave the clamp inert on every real serve.
+    from messagefoundry.pipeline.engine import Engine
+    from messagefoundry.store.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "ref.db")
+    try:
+        for posture in (PROD_PHI, None):
+            assert (
+                Engine(store, hop_posture=posture)._make_reference_runner()._hop_posture is posture
+            )
+    finally:
+        await store.close()
 
 
 # --- DB: the generic-ODBC dialect's cleartext hop, gated (BACKLOG #1178) -------------------------

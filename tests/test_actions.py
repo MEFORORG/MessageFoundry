@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import sys
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -82,7 +83,7 @@ def test_append_to_absent_field_is_just_suffix() -> None:
     ("mode", "expected"),
     [("upper", "DOE"), ("lower", "doe"), ("title", "Doe")],
 )
-def test_convert_case(mode: str, expected: str) -> None:
+def test_convert_case(mode: Literal["upper", "lower", "title"], expected: str) -> None:
     m = _msg()
     convert_case(m, "PID-5.1", mode)
     assert m["PID-5.1"] == expected
@@ -97,7 +98,7 @@ def test_convert_case_absent_is_noop() -> None:
 def test_convert_case_unknown_mode_raises() -> None:
     m = _msg()
     with pytest.raises(ValueError, match="convert_case mode"):
-        convert_case(m, "PID-5.1", "sentence")
+        convert_case(m, "PID-5.1", "sentence")  # type: ignore[arg-type]  # outside the declared set: the refusal is the subject
 
 
 def test_format_date_hl7_default() -> None:
@@ -250,7 +251,7 @@ def test_pad_field_unknown_side_raises() -> None:
     m = _msg()
     set_field(m, "PID-4.1", "42")
     with pytest.raises(ValueError):
-        pad_field(m, "PID-4.1", 5, side="middle")
+        pad_field(m, "PID-4.1", 5, side="middle")  # type: ignore[arg-type]  # outside the declared set: the refusal is the subject
 
 
 def test_replace_literal() -> None:
@@ -278,7 +279,8 @@ def test_arith_field_unknown_op_raises() -> None:
     m = _msg()
     set_field(m, "PID-4.1", "70")
     with pytest.raises(ValueError):
-        arith_field(m, "PID-4.1", "**", 2)  # not an eval — a closed op set
+        # Not an eval: a closed op set, so "**" is refused.
+        arith_field(m, "PID-4.1", "**", 2)  # type: ignore[arg-type]  # outside the declared set: the refusal is the subject
 
 
 def test_arith_field_divide_by_zero_raises() -> None:
@@ -322,7 +324,7 @@ def test_date_diff_field_unparseable_raises() -> None:
 def test_date_diff_field_unknown_unit_raises() -> None:
     m = _msg()
     with pytest.raises(ValueError):
-        date_diff_field(m, "PID-7", "MSH-7", "PID-4.1", unit="fortnights")
+        date_diff_field(m, "PID-7", "MSH-7", "PID-4.1", unit="fortnights")  # type: ignore[arg-type]  # outside the declared set: the refusal is the subject
 
 
 # --- purity + no-new-dependency (ADR 0076 §6 gate 5) -------------------------
@@ -375,6 +377,7 @@ def test_actions_imports_nothing_doing_io() -> None:
 def test_actions_and_lens_add_no_runtime_dependency() -> None:
     # Every import must be stdlib or first-party — no new third-party dependency (stdlib `ast` only).
     for mod in (actions_mod, lens_mod):
+        assert mod.__file__ is not None
         for top in _top_level_imports(mod.__file__):
             assert top in sys.stdlib_module_names or top == "messagefoundry", (
                 f"{Path(mod.__file__).name} imports non-stdlib, non-first-party {top!r} "

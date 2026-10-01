@@ -45,7 +45,7 @@ ADT_A01 = (
 )
 
 
-def _registry(route, handlers, *, strict: bool = False) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(route, handlers, *, strict: bool = False) -> Registry:
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
@@ -298,7 +298,7 @@ def test_select_inbound_caps_the_names_it_lists() -> None:
 # --- parse-once on the per-message fan-out (hotpath) --------------------------
 
 
-def _raw_registry(route, handlers, *, content_type: ContentType):  # type: ignore[no-untyped-def]
+def _raw_registry(route, handlers, *, content_type: ContentType):
     """A non-HL7 inbound: Router/Handlers receive a RawMessage (ADR 0004)."""
     reg = Registry()
     reg.add_inbound(
@@ -565,7 +565,7 @@ def test_every_admissible_item_type_has_a_partition_bucket() -> None:
 
     The table is keyed on ``HANDLER_ITEM_TYPES`` itself rather than listing the types, so widening
     that tuple fails HERE, on the set comparison, with the reason in the assertion."""
-    samples: dict[type, object] = {
+    samples: dict[type, Send | SetState | SetMeta] = {
         Send: Send("OB_A", "x"),
         SetState: SetState("ns", "k", 1),
         SetMeta: SetMeta("mk", "mv"),
@@ -575,7 +575,7 @@ def test_every_admissible_item_type_has_a_partition_bucket() -> None:
     )
     for kind, sample in samples.items():
         assert handler_item_fault(sample) is None
-        buckets = _partition([sample], "h")  # type: ignore[arg-type]
+        buckets = _partition([sample], "h")
         assert [len(b) for b in buckets].count(1) == 1, f"{kind.__name__} landed in no bucket"
 
 

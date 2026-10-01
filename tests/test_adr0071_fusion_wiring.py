@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,10 +26,10 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -39,12 +39,13 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxItem, OutboxStatus, Stage
 from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.sqlserver import SqlServerStore
+from messagefoundry.transports.base import DestinationConnector
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "fusion.db")
     yield s
     await s.close()
@@ -77,18 +78,18 @@ def _reg(inbox: Path, outdir: Path, *, router: Any = None, handler: Any = None) 
     return reg
 
 
-class _Collector:
+class _Collector(DestinationConnector):
     def __init__(self) -> None:
         self.deliveries: list[str] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.deliveries.append(payload)
 
     async def aclose(self) -> None:
         return None
 
 
-async def _until(pred, *, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(pred, *, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if await pred():

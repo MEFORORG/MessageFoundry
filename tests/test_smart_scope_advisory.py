@@ -132,7 +132,7 @@ outbound(
         "system/Patient.us",
     ),
 )
-# `if-match` is a version-aware PUT whose ETag comes from the outgoing body -- no search, so `u` alone.
+# `if-match` is a version-aware update whose ETag comes from the outgoing body -- no search, so `u` alone.
 outbound(
     "OB_IF_MATCH",
     _smart(

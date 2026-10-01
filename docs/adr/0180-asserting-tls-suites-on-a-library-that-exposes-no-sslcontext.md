@@ -1,6 +1,6 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C; amended 2026-09-28 by BACKLOG #300 — see Amendment D; amended 2026-09-30 by BACKLOG #2494 — see Amendment E)
+- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C; amended 2026-09-28 by BACKLOG #300 — see Amendment D; amended 2026-09-30 by BACKLOG #2494 — see Amendment E; amended 2026-09-30 by BACKLOG #2530 — see Amendment F)
 - **Date:** 2026-08-28
 - **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
@@ -303,7 +303,10 @@ reads is not documented, so this is checked rather than assumed. The check runs 
 `connect`, which still refuses if a later urllib3 renames that hook.
 
 A direct `http://` Vault address is not refused by this amendment. It carries the token in plain
-text, and whether to refuse it is a separate decision.
+text, and whether to refuse it is a separate decision. **UPDATED 2026-09-30:** that decision was
+taken as BACKLOG #2317. The Vault clients now refuse any address that is not `https://`,
+direct or behind an `http://` proxy, except a loopback address reached with no proxy.
+`docs/CONFIGURATION.md`, section `[secrets]`, states the rule.
 
 **An `http://` Vault through an `https://` proxy is refused.** requests clears the CA and sets
 `CERT_NONE` for an `http://` URL, so that connection's only TLS leg, the one to the proxy that
@@ -320,3 +323,25 @@ the post-handshake check.
 The engine now builds the LDAPS context itself, and an engine subclass of `ldap3.Tls` wraps each
 connection with it, so the replica and the `ciphers=` string of Amendment C are gone. ADR 0188's
 amendment of the same date records the change, what it keeps and what it does not cover.
+
+## Amendment F (2026-09-30) -- the AD hop follows no LDAP referral (BACKLOG #2530)
+
+Every context above guards one hop: the one to `[auth].ad_server`. ldap3 2.9.1 could leave it. By
+default it follows a referral, and on a bound connection it binds to the referred host with the
+same user and password (`strategy/base.py`, `create_referral_connection`). It builds a plain
+`ldap3.Tls` for that hop from a few attributes, so the hop has no pinned CA bytes, none of the
+narrowing, and no TLS at all for an `ldap://` referral. A first deployment would therefore send the
+service-account password to whatever host one referral named.
+
+`messagefoundry/auth/ldap.py` now builds every `Connection` with `auto_referrals=False` and every
+`Server` with `allowed_referral_hosts=[]`. Each alone stops the follow, and
+`tests/test_ldap_referrals.py` measures both arms against loopback servers. A referral result
+(resultCode 10) to a search or to the user bind is now an `LdapError` that names the referred hosts
+and nothing else from the URL. Sign-in audits it as `auth.login_error`, and the session reconciler
+reads it as unavailable, so it never revokes. A search continuation reference is not a referral
+result: ldap3 never follows one, and it still reads as no entry from that subtree.
+
+A site whose users or groups live in more than one domain of a forest would need a global catalog,
+or a search base in the bound controller's own domain, instead of referrals. A global catalog
+carries the membership of universal groups only, so roles mapped to another domain's domain-local
+or global groups would not resolve through it.

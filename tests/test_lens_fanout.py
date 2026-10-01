@@ -67,6 +67,7 @@ def _assert_partition(source: str) -> None:
                     else node.name
                 )
                 assert node.end_lineno is not None
+                assert isinstance(name, str)
                 ranges[name] = (node.body[0].lineno, node.end_lineno)
     for contract in parse_source(source):
         rows = contract["rows"]
@@ -647,7 +648,7 @@ _ADT = (
 )
 
 
-def _two_ob_registry(handler) -> Registry:  # type: ignore[no-untyped-def]
+def _two_ob_registry(handler) -> Registry:
     reg = Registry()
     for name in ("OB_A", "OB_B"):
         reg.add_outbound(
@@ -664,13 +665,13 @@ def test_accumulator_delivers_identically_to_returned_list() -> None:
     """An append-built accumulator delivers the SAME destinations/order as the equivalent returned list —
     ``_partition`` materialises whatever container it is handed and never inspects the collector name."""
 
-    def _accumulator(msg):  # type: ignore[no-untyped-def]
+    def _accumulator(msg):
         sends = []
         sends.append(Send("OB_A", msg))
         sends.append(Send("OB_B", msg))
         return sends
 
-    def _returned_list(msg):  # type: ignore[no-untyped-def]
+    def _returned_list(msg):
         return [Send("OB_A", msg), Send("OB_B", msg)]
 
     acc, _, _, _ = transform_one(_two_ob_registry(_accumulator), "H", _ADT, "hl7v2")
@@ -685,8 +686,8 @@ def test_empty_accumulator_delivers_nothing() -> None:
     """``sends = []; return sends`` (the terminal state after deleting every append) delivers nothing —
     the honest FILTERED disposition, no coupled name-scrub needed."""
 
-    def _empty(msg):  # type: ignore[no-untyped-def]
-        sends = []
+    def _empty(msg):
+        sends: list[Send] = []
         return sends
 
     deliveries, _, _, _ = transform_one(_two_ob_registry(_empty), "H", _ADT, "hl7v2")

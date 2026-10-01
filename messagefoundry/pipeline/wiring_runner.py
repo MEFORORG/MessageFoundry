@@ -160,6 +160,7 @@ from messagefoundry.pipeline.phase_timing import (
     DeliveryPhaseTiming,
     delivery_phase_timing_enabled,
 )
+from messagefoundry.pipeline.reference_sync import database_source_dsn, reference_connection_name
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
 from messagefoundry.pipeline.saturation import SaturationDetector
@@ -3726,7 +3727,8 @@ class RegistryRunner:
             # set the runner), so without this the raw/MLLP/DB guards no-op (a prod-PHI plaintext outbound
             # would ship cleartext) and the HTTP guards fail-closed (a legit non-prod cleartext lane would
             # wrongly refuse) on the primary serve path. Mirrors _start_inbound_unsafe threading posture
-            # into the exposure checks. No-op (None) in a test/embedding that derives no posture.
+            # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
+            # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
                 connector = build_destination(dest)
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
@@ -8906,6 +8908,20 @@ def _build_check_connectors(
     if resolved_lookups:
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
         DatabaseLookupExecutor(resolved_lookups)
+    # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
+    # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
+    # than only surfacing as a failed sync after start. TLS and auth only: the egress allowlist and
+    # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
+    # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
+    # refuse the whole graph.
+    for rname, rspec in registry.references.items():
+        if rspec.source.kind != "database":
+            continue
+        try:
+            rsettings = resolve_env_settings(rspec.source.settings, env_values)
+        except WiringError:
+            continue
+        database_source_dsn(rsettings, connection=reference_connection_name(rname))
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         fsettings = _fhir_lookup_settings(fspec, env_values, egress)

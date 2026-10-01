@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -65,7 +66,7 @@ class _FakeLeaseDB:
     def __init__(self, db_clock: _Clock) -> None:
         self._db_clock = db_clock
         # {"owner": str, "lease_expires_at": float, "leader_epoch": int}
-        self.row: dict[str, object] | None = None
+        self.row: dict[str, Any] | None = None
 
     def claim(self, owner: object, ttl: float, delay: float) -> dict[str, object] | None:
         """Acquire-or-renew, returning the ``(owner, leader_epoch)`` the statement would OUTPUT, or
@@ -80,10 +81,10 @@ class _FakeLeaseDB:
         if row is None:
             self.row = {"owner": owner, "lease_expires_at": now + ttl, "leader_epoch": 1}
             return {"owner": owner, "leader_epoch": 1}
-        expired = float(row["lease_expires_at"]) + delay < now  # type: ignore[arg-type]
+        expired = float(row["lease_expires_at"]) + delay < now
         if row["owner"] == owner or expired:
             if row["owner"] != owner:
-                row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
+                row["leader_epoch"] = int(row["leader_epoch"]) + 1
             row["owner"] = owner
             row["lease_expires_at"] = now + ttl
             return {"owner": owner, "leader_epoch": row["leader_epoch"]}
@@ -104,7 +105,7 @@ class _FakeLeaseDB:
         VALUES on SQL Server)."""
         row = self.row
         if row is not None and row["owner"] == owner:
-            row["lease_expires_at"] = min(float(row["lease_expires_at"]), self._db_clock())  # type: ignore[arg-type]
+            row["lease_expires_at"] = min(float(row["lease_expires_at"]), self._db_clock())
             return 1
         return 0
 
@@ -301,7 +302,7 @@ async def test_self_fence_demotes_when_renew_stalls() -> None:
     mono = _Clock(0.0)
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader, _last_renew_ok = 0
-    a._pool.fail = True  # type: ignore[attr-defined]  # partition: no more renews land
+    a._pool.fail = True  # partition: no more renews land
     mono.t = 20.0
     a._check_fence()
     assert a.is_leader() is True  # exactly at the timeout: not yet (strict >)
@@ -326,7 +327,7 @@ async def test_maintain_does_not_demote_on_db_error_watchdog_does() -> None:
     mono = _Clock(0.0)
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader
-    a._pool.fail = True  # type: ignore[attr-defined]
+    a._pool.fail = True
     with pytest.raises(RuntimeError, match="partitioned"):
         await a._maintain_leadership()
     assert a.is_leader() is True  # the error alone did not demote
@@ -348,7 +349,7 @@ async def test_fence_fires_before_standby_can_acquire() -> None:
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", ttl=30.0, fence=20.0)
 
     await a._maintain_leadership()  # A leader (lease expiry 30)
-    a._pool.fail = True  # type: ignore[attr-defined]  # A partitioned: no more renews
+    a._pool.fail = True  # A partitioned: no more renews
 
     # t = 20+: A self-fences. The standby, querying the (still-live until 30) lease, cannot acquire yet.
     a_mono.t = 20.1
@@ -447,7 +448,7 @@ async def test_epoch_cleared_on_self_fence() -> None:
     a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
     await a._maintain_leadership()  # leader, epoch 1
     assert a.current_epoch() == 1
-    a._pool.fail = True  # type: ignore[attr-defined]  # partition: renews stop
+    a._pool.fail = True  # partition: renews stop
     mono.t = 20.1
     a._check_fence()
     assert a.is_leader() is False
@@ -673,7 +674,8 @@ async def test_step_down_pauses_this_node_so_a_standby_wins_the_expired_lease() 
     # The standby's tick inside the same window wins the expired lease and bumps the epoch (H1).
     await b._maintain_leadership()
     assert b.is_leader() is True
-    assert db.row["owner"] == "B" and db.row["leader_epoch"] == 2
+    lease = db.row  # a fresh name: mypy still holds db.row["owner"] narrowed to "A" from above
+    assert lease is not None and lease["owner"] == "B" and lease["leader_epoch"] == 2
 
     # And the pause is bounded: past it, A contends normally again (it just cannot beat a live lease).
     mono_a.t = 21.0
@@ -1343,7 +1345,7 @@ def _sql_coord(
     # Same timings as _coord above, so the two backends' tests are comparable at a glance. `mono` is
     # passed in when a test needs to move this node's monotonic clock past its own stepdown pause.
     return SqlServerCoordinator(
-        store,  # type: ignore[arg-type]
+        store,
         node,
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=30.0,

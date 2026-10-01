@@ -20,9 +20,12 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
-**Requires an engine newer than 0.4.0**, one whose `messagefoundry.api._ui_seam.ENGINE_UI_SEAM` is
-that value. Console 0.3.0 does not work with that engine, so upgrade the two together. The entry
-under Changed says why engine 0.4.0 does not work with this console.
+## [0.4.0] — 2026-10-01 — Early Access
+
+**Requires engine 0.5.0. Supported engine UI seam: `32ad621e6081555e`**, the value engine 0.5.0
+ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
+to start. Engine 0.4.0 fails while importing this console, and the entry under Changed says why.
+Console 0.3.0 does not work with engine 0.5.0 either, so upgrade the two together.
 
 ### Added
 - **An Approvals page releases or rejects a dual-control hold** (`BACKLOG #1982`, ASVS 2.3.5). The
@@ -87,6 +90,9 @@ under Changed says why engine 0.4.0 does not work with this console.
     shown in UTC.
 
 ### Changed
+- **The engine UI seam moved because the engine dropped the `content_match` alert filter**
+  (`BACKLOG #1504`). `AlertRuleInfo` lost its `content_label` field, which is part of the seam.
+  Nothing the console does changed.
 - **The error text is masked until the operator asks** (`BACKLOG #2436`, ASVS 14.2.6, owner
   ruling R12). The detail page shows the message's error, each delivery's last error and each
   event's detail as `****`, each with a "Reveal" link to the new `/ui/messages/{id}/errors`. The
@@ -101,6 +107,11 @@ under Changed says why engine 0.4.0 does not work with this console.
   sees no reason and no link, but still sees each event's kind and each alert's type and state.
   Needs an engine whose `list_connection_events` and `list_active_alerts` accept `reveal`, and
   whose `list_active_alerts` takes `request`. The seam digest does not record those keywords.
+- **The dashboard passes `request` to the engine's connections handler** (`BACKLOG #2443`, step 4).
+  The engine now masks each connection's start-failure `error` until a per-connection reveal, and
+  its `list_connections` takes `request`. The console renders no `error` text, so nothing on the
+  page changes. Needs an engine whose `list_connections` takes `request`; the seam digest does not
+  record that parameter.
 - **The engine UI seam moved because the seam gate now covers the `auth.service` names this console
   imports** (`BACKLOG #2015`). Seam discovery used to read only `AuthService` from
   `messagefoundry.auth.service`. It now reads every name the console imports from there, such as
@@ -130,8 +141,7 @@ under Changed says why engine 0.4.0 does not work with this console.
   carrying the same change.
 - **BREAKING — the engine UI seam moved again, so this console no longer pairs with engine 0.4.0**
   (`BACKLOG #1141`, PR 1456). `SUPPORTED_ENGINE_SEAMS` no longer holds `75c4117d21fd0b98`, the
-  seam engine 0.4.0 ships. The line at the top of this section says where to read the value it
-  holds now, which can move again before the release. The console now imports three helpers from
+  seam engine 0.4.0 ships. It holds `32ad621e6081555e`, the seam engine 0.5.0 ships. The console now imports three helpers from
   `messagefoundry.api.security`: `pending_credential_deadline`, `pending_credential_deadline_for`
   and `initial_credential_window_hours`. Engine 0.4.0 has none of them. So with the console on,
   engine 0.4.0 fails while importing this console and reports it as not installed. It never reaches
@@ -251,6 +261,12 @@ under Changed says why engine 0.4.0 does not work with this console.
   console's seam carries both halves.
 
 ### Notes
+- **pip no longer leaves this console beside an older engine.** The package declares
+  `messagefoundry>=0.5.0`, a floor with no ceiling (`RELEASE.md` step 2). Console 0.3.0 and earlier
+  declared a bare `messagefoundry`, so pip installed them beside any engine. Beside an engine older
+  than 0.5.0, pip now upgrades the engine, and an unpinned upgrade takes the newest release, whose
+  seam may differ. The seam check at engine startup refuses such a pair. Pin both:
+  `messagefoundry==0.5.0` with `messagefoundry-webconsole==0.4.0`.
 - **Not every `/ui` change needs a console change.** PR 1432 touched only a console test fixture,
   yet the console's OIDC sign-in now needs the IdP's `auth_time` claim (`BACKLOG #296`). That rule
   lives in the engine, and the engine's own `CHANGELOG.md` records it. Read that file too for
@@ -397,6 +413,7 @@ two items sat under Unreleased.
   compat ranges, re-lock, add the release job) — see [`RELEASE.md`](RELEASE.md). It was not wired
   when this entry was written; the `release-webconsole` job published this wheel on 2026-07-29.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.3.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.4.0...HEAD
+[0.4.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.4.0
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.3.0
 [0.2.15]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.2.15

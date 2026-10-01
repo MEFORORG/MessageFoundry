@@ -8,6 +8,7 @@ import contextlib
 import inspect
 import ssl
 import types
+from collections.abc import Iterator
 from itertools import product
 from pathlib import Path
 from typing import Any, cast
@@ -735,7 +736,7 @@ def test_the_call_site_scan_examined_real_files() -> None:
 
 
 @pytest.fixture(scope="module")
-def _tls_peer(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, str]:
+def _tls_peer(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[int, str]]:
     """A local TLS server with a self-signed 'localhost' cert. Yields (port, ca_pem_path)."""
     import datetime
     import socket
@@ -1106,7 +1107,7 @@ def _a_sub_floor_suite() -> str | None:
     return None
 
 
-def _weak_entry(name: str = "FAKE-ECDHE-WEAK", bits: int = 64) -> dict[str, object]:
+def _weak_entry(name: str = "FAKE-ECDHE-WEAK", bits: int = 64) -> dict[str, Any]:
     """A synthesised cipher entry that clears all three earlier predicates and is sub-floor. Lets the
     gate be tested where no real OpenSSL suite has this shape."""
     return {
@@ -1133,7 +1134,7 @@ def test_the_synthesised_weak_entry_defeats_all_three_earlier_predicates() -> No
     entry = _weak_entry()
     assert _is_forward_secret(entry) and _is_encrypting(entry) and _is_peer_authenticated(entry)
     assert not _is_strong_enough(entry)
-    assert int(entry["alg_bits"]) >= _MIN_TLS_STRENGTH_BITS  # type: ignore[arg-type]
+    assert int(entry["alg_bits"]) >= _MIN_TLS_STRENGTH_BITS
 
 
 def test_harden_cipher_suites_raises_on_a_sub_floor_context_every_build() -> None:
@@ -1254,7 +1255,7 @@ def test_the_tls_strength_floor_is_not_the_key_material_floor() -> None:
     ctx = ssl.create_default_context()
     assert ctx.security_level == 2
     with pytest.raises(AttributeError):
-        ctx.security_level = 3  # type: ignore[misc]
+        ctx.security_level = 3
 
 
 # --- BACKLOG #1005: opt-in CRL checking on the verifying server contexts -----------------------------

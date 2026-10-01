@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+from typing import Any
 
 import pytest
 
@@ -46,7 +47,7 @@ class _FakeNotifier:
 
 
 async def _service(
-    store: MessageStore, *, notifier: _FakeNotifier | None = None, **settings: object
+    store: MessageStore, *, notifier: _FakeNotifier | None = None, **settings: Any
 ) -> AuthService:
     # These WebAuthn tests assume single-factor unless a test opts in (a few pass require_mfa=True
     # explicitly). BACKLOG #187 flipped the require_mfa default ON, so default it back OFF here unless

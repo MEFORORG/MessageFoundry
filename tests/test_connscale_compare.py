@@ -165,7 +165,7 @@ def test_json_and_table_render() -> None:
 
 def _summary(cmp_obj: object) -> dict[str, object]:
     body = cmp_obj.to_json_dict()  # type: ignore[attr-defined]
-    return body["summary"]  # type: ignore[index,no-any-return]
+    return body["summary"]
 
 
 def test_candidate_loss_is_a_hard_fail() -> None:

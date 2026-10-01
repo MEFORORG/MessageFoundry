@@ -236,8 +236,9 @@ def test_store_tls_refuses_prod_phi_even_with_escape(monkeypatch: pytest.MonkeyP
         connection_string(s, posture=PROD_PHI)
     # Non-production + escape still permitted (the escape downgrades a non-prod hop).
     assert "TrustServerCertificate=yes" in connection_string(s, posture=STAGING_PHI)
-    # Unstamped (backup utility / test) falls back to the unclamped escape — byte-identical to pre-#200.
-    assert "TrustServerCertificate=yes" in connection_string(s, posture=None)
+    # No posture fails closed (vault BACKLOG #2354); it used to fall back to the unclamped escape.
+    with active_hop_posture(None), pytest.raises(ValueError, match="MITM-able"):
+        connection_string(s, posture=None)
 
 
 def test_store_tls_refuses_weakened_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
