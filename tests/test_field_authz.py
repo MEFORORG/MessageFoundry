@@ -367,7 +367,7 @@ def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> No
     assert len(conn_sites) == 1, f"expected the one per-connection reveal site, found {conn_sites}"
     # And the one connection's metadata route, whose path names the item, behind its reveal flag.
     meta_sites = re.findall(
-        r"revealed=revealable\(ConnectionMetadata, summary=False, error_text=reveal\)", source
+        r"revealed=revealable\(ConnectionMetadata, summary=False, error_text=True\)", source
     )
     assert len(meta_sites) == 1, f"expected the one metadata reveal site, found {meta_sites}"
     # Every other reveal site reads one of those sets, and together they cover all three models.

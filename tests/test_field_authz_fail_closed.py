@@ -287,3 +287,43 @@ def test_declaring_a_property_the_serializer_does_not_cover_is_refused() -> None
 
     assert Fine(summary=_SUMMARY).model_dump(mode="json")["summary"] is None
     assert "summary" in GATEABLE_PROPERTIES
+
+
+def test_a_set_brought_in_by_a_mixin_is_still_gated() -> None:
+    """The per-model serializer reads the set as the class resolves it, so a declaration that
+    arrives through a plain mixin is covered like one on the class itself (review finding on
+    BACKLOG #2443 step 4: keyed on the class's own namespace, this serialized the MRN in full)."""
+
+    class GatedMixin:
+        phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary"})
+
+    class Mixed(GatedMixin, PhiGatedModel):
+        summary: str | None = None
+
+    assert json.loads(Mixed(summary=_SUMMARY).model_dump_json())["summary"] is None
+    released = Mixed(summary=_SUMMARY)
+    released.release_phi({"summary"})  # the positive control: release lets it through
+    assert json.loads(released.model_dump_json())["summary"] == _SUMMARY
+
+
+def test_a_subclass_may_not_ungate_a_parent_property_or_gate_a_non_string() -> None:
+    """Two shapes the per-model serializer cannot serve, each refused at class creation. Dropping
+    a parent's gated property would leave the parent's ``str | None`` serializer on a field that
+    is no longer gated. Gating a dict field would publish it as a string and warn on every dump,
+    which is the ``ConnectionMetadata.metadata`` hazard. The well-formed subclass is the control."""
+    with pytest.raises(TypeError, match="ungates"):
+
+        class Lite(MessageSummary):
+            phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary", "error"})
+
+    with pytest.raises(TypeError, match=r"str \| None"):
+
+        class DictGated(PhiGatedModel):
+            phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"metadata"})
+
+            metadata: dict[str, Any] | None = None
+
+    class Wider(MessageSummary):
+        pass
+
+    assert Wider.phi_gated_properties == MessageSummary.phi_gated_properties

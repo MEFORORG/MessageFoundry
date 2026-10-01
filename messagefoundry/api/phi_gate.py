@@ -30,7 +30,7 @@ decision was made*, never *what it should be*. The permission policy stays in on
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, get_args
 
 from pydantic import BaseModel, FieldSerializationInfo, PrivateAttr, field_serializer
 
@@ -71,16 +71,17 @@ class PhiGatedModel(BaseModel):
     _phi_masked: frozenset[str] = PrivateAttr(default=frozenset())
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Give a subclass that declares ``phi_gated_properties`` its own serializer over them.
+        """Give every gated subclass a serializer over its own ``phi_gated_properties``.
 
         Runs inside class creation, before pydantic collects the class's serializers, so the
-        attribute set here is picked up like a decorated method. Set under the same name on every
-        declaring class, so a subclass that re-declares replaces its parent's serializer rather than
-        stacking a second one on a field, and a subclass that does not re-declare inherits its
-        parent's (gated by default). Only the declared fields are covered, so a non-string field
-        that happens to share a gateable name is serialized by its own type, untouched."""
+        attribute set here is picked up like a decorated method. It reads the set as the class
+        RESOLVES it, so a set declared on the class, inherited, or brought in by a mixin is
+        covered alike. Set under one name, so each class replaces its parent's serializer rather
+        than stacking a second one on a field. Only the gated fields are covered, so a non-string
+        field that happens to share a gateable name is serialized by its own type, untouched.
+        :meth:`__pydantic_init_subclass__` then proves the coverage rather than trusting this."""
         super().__init_subclass__(**kwargs)
-        declared = cls.__dict__.get("phi_gated_properties")
+        declared = cls.phi_gated_properties
         if declared:
             serializer = field_serializer(*sorted(declared), when_used="json", check_fields=False)
             setattr(cls, _SERIALIZER_ATTR, serializer(_withhold_unreleased_phi))
@@ -102,6 +103,39 @@ class PhiGatedModel(BaseModel):
                 f"{cls.__name__}.phi_gated_properties names {missing}, which are not fields of "
                 "the model — the declaration gates nothing."
             )
+        # A subclass may add gated properties, never drop one: a dropped property would keep the
+        # parent's serializer on it, published as ``str | None`` while no longer gated.
+        for base in cls.__mro__[1:]:
+            if isinstance(base, type) and issubclass(base, PhiGatedModel):
+                dropped = sorted(base.phi_gated_properties - declared)
+                if dropped:
+                    raise TypeError(
+                        f"{cls.__name__} ungates {dropped}, which {base.__name__} gates. A "
+                        "subclass of a gated model may add gated properties, not remove them."
+                    )
+        # The serializer returns ``str | None``, so a gated field of any other type would be
+        # published as a string and warn on every dump (the ConnectionMetadata.metadata hazard).
+        untyped = sorted(
+            name for name in declared if not _is_optional_str(cls.model_fields[name].annotation)
+        )
+        if untyped:
+            raise TypeError(
+                f"{cls.__name__}.phi_gated_properties names {untyped}, which are not "
+                "``str | None`` fields; the gate's serializer is typed for those only."
+            )
+        # Coverage is PROVEN, not assumed: every gated property must reach the gate's serializer,
+        # read back from what pydantic actually collected. A set assigned to the class AFTER
+        # creation is outside this proof, as any monkeypatch of a built class is.
+        covered: set[str] = set()
+        for dec in cls.__pydantic_decorators__.field_serializers.values():
+            if dec.func is _withhold_unreleased_phi:
+                covered |= set(dec.info.fields)
+        unserialized = sorted(declared - covered)
+        if unserialized:
+            raise TypeError(
+                f"{cls.__name__}.phi_gated_properties names {unserialized}, which no gate "
+                "serializer covers, so they would serialize UNGATED."
+            )
 
     def release_phi(self, properties: Iterable[str]) -> None:
         """Clear ``properties`` (intersected with this model's gate) for JSON serialization."""
@@ -122,8 +156,15 @@ class PhiGatedModel(BaseModel):
         self._phi_masked = frozenset(properties) & type(self).phi_gated_properties
 
 
-#: The class attribute each declaring subclass's serializer is set under (see
-#: :meth:`PhiGatedModel.__init_subclass__`). One name, so a re-declaring subclass replaces it.
+def _is_optional_str(annotation: object) -> bool:
+    """True for ``str`` or ``str | None``, the only field types the gate's serializer handles."""
+    if annotation is str:
+        return True
+    return set(get_args(annotation)) == {str, type(None)}
+
+
+#: The class attribute each gated subclass's serializer is set under (see
+#: :meth:`PhiGatedModel.__init_subclass__`). One name, so a subclass replaces its parent's.
 _SERIALIZER_ATTR = "_withhold_unreleased_phi"
 
 
@@ -134,9 +175,4 @@ def _withhold_unreleased_phi(
     what keeps the OpenAPI response schema typed (an ``Any``-returning serializer collapses the
     property to an untyped one, and a model-level wrap serializer collapses the whole model). It is
     only ever attached over a model's own gated properties, all of which are ``str | None``."""
-    name = info.field_name
-    if name not in type(self).phi_gated_properties:
-        # Inherited from a parent whose set this subclass narrowed, possibly to empty, which
-        # attaches no serializer of its own: the field is no longer gated here.
-        return value
-    return value if name in self._phi_released else None
+    return value if info.field_name in self._phi_released else None

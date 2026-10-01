@@ -900,8 +900,8 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 115 route objects a default `create_app()` serves, **twenty-one** can
-put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
+**PHI-egress route set.** Of the 115 route objects a default `create_app()` serves, **at least twenty-one**
+can put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/messages/{id}/raw`, `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
 `GET /uploads/{file_id}/messages`, `POST /uploads/{file_id}/resend` and `GET /logs/tail`, plus five
@@ -1931,7 +1931,8 @@ calls `redact_unauthorized`. It is safe because its line emits only
 `id`/`channel_id`/`received_at`/`message_type`/`control_id`/`status`/`raw` — **no map-gated property may
 ever be added to that line** without a `PHI_FIELDS`-equivalent gate.
 
-**Where redaction actually runs.** Eleven read surfaces construct a mapped model, and all eleven redact:
+**Where redaction actually runs.** At least eleven read surfaces construct a mapped model, and all of
+these redact:
 `GET /dead-letters`, `GET /messages`, `GET /messages/search`, `GET /messages/{id}` (the wrapper **and**
 each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys on the exact type),
 `GET /messages/{id}/responses` (#120), `GET /search/layered`, and the three monitoring reads
@@ -1939,9 +1940,9 @@ each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys o
 dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Four of those eleven additionally feed the **coalesced per-actor/hour PHI-summary exposure
+**Audit.** Four of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`), so a scripted bulk read
-cannot harvest the patient census unaudited. The other seven do **not** call the coalescer — they write
+cannot harvest the patient census unaudited. The rest do **not** call the coalescer — they write
 their own dedicated audit rows instead (`response.read` for `GET /messages/{id}/responses`,
 `preset.layered_search` for `GET /search/layered`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
@@ -2010,11 +2011,11 @@ connection failed.
 connection the path names, gated and masked the same way. Its reveal is `reveal=true`, a flag,
 because the path already names the item, as `reveal_errors` does on `GET /messages/{id}`. The scope
 check runs first, then the reveal is admitted, charged and audited as `connection_error_reveal`.
-*Corrected 2026-10-01 (BACKLOG #2443 step 4):* this paragraph called that field a known gap,
-returned whole to any `monitoring:read` holder, because the gate's ONE shared field serializer
-typed every field named `metadata` as a string and this model's `metadata` is a dict. The gate now
-gives each model a serializer over its own gated properties only
-([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)), so the dict is untouched and the gap is
+*Corrected 2026-10-01 (BACKLOG #2443 step 4):* this paragraph called that field a known gap. It
+said any `monitoring:read` holder got the text whole. The cause was the gate's one shared field
+serializer, which typed every field named `metadata` as a string. This model's `metadata` is a
+dict. Each model now gets a serializer over its own gated properties only
+([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)). So the dict is untouched and the gap is
 closed. The published schema of every other gated model is unchanged.
 
 **Caveat.** With `[security].require_sign_in = false` every route resolves to the built-in system
@@ -2045,8 +2046,12 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
-  against each model's own `phi_gated_properties` in both directions, and proves class creation
-  refuses a gated name the serializer does not cover. The enumeration of call sites above keeps the
+  against each model's own `phi_gated_properties` in both directions. Class creation refuses a
+  gated name outside the reviewed vocabulary, a name that is not a field, a gated field that is
+  not `str | None`, and a subclass that ungates a parent's property. It also reads back the
+  serializers pydantic collected and refuses a gated name none of them covers. *Corrected
+  2026-10-01 (BACKLOG #2443 step 4):* this said class creation refuses a gated name the ONE
+  shared serializer does not cover; that serializer is now per model. The enumeration of call sites above keeps the
   *shipped* surfaces honest; this is what makes the route nobody has written yet safe.
 
 **Write side (engine → store).** Exception/disposition text is also scrubbed *before* it is stored: a

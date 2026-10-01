@@ -2436,23 +2436,44 @@ def create_app(
             # The audit records what the response carried, not what was asked for: an in-scope
             # name with no row on the dashboard, or no error, is recorded as revealing nothing.
             shown = [r for r in out if _row_conn(r) == reveal]
-            directions = sorted({r.direction for r in shown if r.error})
-            await engine.store.record_audit(
-                "connection_error_reveal",
-                actor=identity.username,
-                # The connection, so the row sits beside that channel's other audit rows.
-                channel_id=reveal if shown else None,
-                detail=json.dumps(
-                    {
-                        "reveal": reveal,
-                        "connection": reveal if shown else None,
-                        "directions": directions,
-                        "revealed": ["error"] if directions else [],
-                    }
-                ),
-                client=client_ip(request),
+            await _audit_connection_error_reveal(
+                engine,
+                identity,
+                request,
+                reveal,
+                found=bool(shown),
+                directions=sorted({r.direction for r in shown if r.error}),
             )
         return out
+
+    async def _audit_connection_error_reveal(
+        engine: Engine,
+        identity: Identity,
+        request: Request,
+        name: str,
+        *,
+        found: bool,
+        directions: list[str],
+    ) -> None:
+        """The one writer of a ``connection_error_reveal`` row, for both routes that reveal a
+        connection's error (BACKLOG #2443). It records what the response carried: ``found`` is
+        whether any returned row stands for ``name``, and ``directions`` the ones whose error was
+        actually returned, so an empty one is not recorded as a disclosure."""
+        await engine.store.record_audit(
+            "connection_error_reveal",
+            actor=identity.username,
+            # The connection, so the row sits beside that channel's other audit rows.
+            channel_id=name if found else None,
+            detail=json.dumps(
+                {
+                    "reveal": name,
+                    "connection": name if found else None,
+                    "directions": directions,
+                    "revealed": ["error"] if directions else [],
+                }
+            ),
+            client=client_ip(request),
+        )
 
     def _row_conn(row: ConnectionRow) -> str:
         """The raw connection name a dashboard row stands for: the outbound name on a destination
@@ -2908,21 +2929,15 @@ def create_app(
         out = redact_unauthorized(
             meta,
             identity,
-            revealed=revealable(ConnectionMetadata, summary=False, error_text=reveal),
+            revealed=revealable(ConnectionMetadata, summary=False, error_text=True),
         )
-        await engine.store.record_audit(
-            "connection_error_reveal",
-            actor=identity.username,
-            channel_id=name,
-            detail=json.dumps(
-                {
-                    "reveal": name,
-                    "connection": name,
-                    "directions": [out.direction] if out.error else [],
-                    "revealed": ["error"] if out.error else [],
-                }
-            ),
-            client=client_ip(request),
+        await _audit_connection_error_reveal(
+            engine,
+            identity,
+            request,
+            name,
+            found=True,
+            directions=[out.direction] if out.error else [],
         )
         return out
 
@@ -3247,7 +3262,8 @@ def create_app(
         Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
         A reveal hands out one reason or one connection's error whole, which is
         ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
-        connection name on ``GET /connections``. A caller without that permission is refused,
+        connection name on ``GET /connections`` and, for its ``reveal=true`` flag, on
+        ``GET /connections/{name}/metadata``. A caller without that permission is refused,
         and the refusal is audited as
         ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
         also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web

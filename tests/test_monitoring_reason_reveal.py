@@ -658,6 +658,10 @@ async def test_a_holder_gets_the_metadata_error_masked_until_an_audited_reveal(
 async def test_a_monitoring_only_role_gets_no_metadata_error_and_its_reveal_is_refused(
     dash: Engine, role: Role
 ) -> None:
+    rr = dash.registry_runner
+    assert rr is not None
+    # The positive control: OB_A really carries an error, so the null below is the gate.
+    assert rr.outbound_failed("OB_A")
     service = await _service(dash)
     await _add(service, "mon", role)
     async with _client(dash, service) as c:
@@ -692,19 +696,30 @@ async def test_a_metadata_reveal_charges_the_phi_read_budget_and_a_bare_open_doe
 
 
 async def test_a_scoped_caller_revealing_its_own_inbound_metadata_succeeds(dash: Engine) -> None:
-    """The scope check comes first and is unchanged: an outbound is refused to a scoped caller
-    with no budget spent, and its own failed inbound reveals whole."""
+    """The scope check comes first and is unchanged: an outbound, and an inbound outside the
+    scope, are each refused and audited as a channel denial with no budget spent, and the
+    caller's own failed inbound reveals whole."""
     rr = dash.registry_runner
     assert rr is not None
     stored = rr.inbound_failed("IB_MINE")
     assert stored
     service = await _service(dash, phi_read_rate_limit_per_actor=1)
     await _add(service, "scoped", Role.OPERATOR, scope=["IB_MINE"])
+    await _add(service, "other", Role.OPERATOR, scope=["IB_ELSEWHERE"])
     async with _client(dash, service) as c:
-        h = await _login(c, "scoped")
         reveal = {"reveal": "true"}
+        other = await _login(c, "other")
+        not_mine = await c.get("/connections/IB_MINE/metadata", params=reveal, headers=other)
+        assert not_mine.status_code == 403
+        h = await _login(c, "scoped")
         refused = await c.get("/connections/OB_A/metadata", params=reveal, headers=h)
         assert refused.status_code == 403
         # Budget of one, still unspent by the refusal above, so this reveal is admitted.
         own = await c.get("/connections/IB_MINE/metadata", params=reveal, headers=h)
         assert own.status_code == 200 and own.json()["error"] == stored
+    audits = [dict(a) for a in await dash.store.list_audit(limit=200)]
+    denied = [(a["actor"], a["channel_id"]) for a in audits if a["action"] == "auth.channel_denied"]
+    assert sorted(denied) == [("other", "IB_MINE"), ("scoped", "OB_A")]
+    assert [
+        (a["actor"], a["reveal"]) for a in await _reveal_audits(dash, "connection_error_reveal")
+    ] == [("scoped", "IB_MINE")]
