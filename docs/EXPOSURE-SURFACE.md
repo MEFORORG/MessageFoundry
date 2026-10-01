@@ -88,10 +88,9 @@ for some of these hops. It says to mirror each outbound firewall rule with its a
 
 ## Startup guards stop `serve`, and a listener guard stops only its own Connection
 
-[DEPLOYMENT.md](DEPLOYMENT.md#bind-guard-behavior-summary) describes the guards and their overrides,
-and [Before you expose off-loopback](DEPLOYMENT.md#before-you-expose-off-loopback) is the checklist.
-Under the default `[security].enforcement = enforce`, `serve` would exit with code 2, before it
-starts the web server, on at least these:
+[DEPLOYMENT.md](DEPLOYMENT.md#bind-guard-behavior-summary) describes the bind guards and their
+overrides, and [Before you expose off-loopback](DEPLOYMENT.md#before-you-expose-off-loopback) is the
+checklist. `serve` would exit with code 2, before it starts the web server, on at least these:
 
 | Guard | What it refuses |
 |---|---|
@@ -99,22 +98,25 @@ starts the web server, on at least these:
 | Operator bind | A non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator |
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
-| Proxy attestations | A non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
-| Open egress | Outbound egress that is fully open: no destination list is populated and `[security].block_unlisted_outbound` is not set to true |
+| Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
+| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `[egress].allowed_proxy` never counts. `allowed_smtp` and `allowed_direct` count only while that switch is unset |
 
-`serve` refuses on more than this table. It also checks at least the web console on an exposed
-instance, `[security].require_mfa` turned off on an exposed instance, and off-box log forwarding.
-The checklist covers those settings. So clearing one guard does not mean `serve` starts. A site that
-sets `[api].tls_cert_file` on a network bind would meet the revocation guard next.
+Setting `enforcement = warn` turns the last two into warnings. It does not, by itself, lift the
+first four. `serve` also refuses on more than this table. At least these can stop it too: a web
+console switched on by name (`[security].serve_web_console = true`) on an exposed instance,
+`[security].require_mfa` turned off on an exposed instance, and off-box log forwarding that is not
+set up. The checklist covers those settings. So clearing one guard does not mean `serve` starts. A
+site that sets `[api].tls_cert_file` on a network bind would meet the revocation guard next.
 
-A listener guard is different: it stops one listener, and `serve` keeps going. A non-loopback MLLP,
-HTTP, DICOM, raw TCP or X12 listener that has no TLS does not bind, and its Connection shows as
-failed. Raw TCP and X12 have no TLS to turn on. A Connection that sets `tls_hop_attested` with a
-reason crosses this guard, and the engine reports it as a loosening. At least two more listener
-checks act the same way under `enforce`: client-certificate revocation on a mutual-TLS listener, and
-peer control on a non-loopback HTTP listener. These checks run when each inbound Connection starts,
-in `RegistryRunner` in `messagefoundry/pipeline/wiring_runner.py`. So a running engine does not
-prove that every listener passed.
+A listener guard is different. At startup it stops one listener, and `serve` keeps going. A
+non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS does not bind, and its
+Connection shows as failed. Raw TCP and X12 have no TLS to turn on. A Connection that sets
+`tls_hop_attested` with a reason crosses this guard, and the engine reports it as a loosening. At
+least one more listener check acts the same way under `enforce`: client-certificate revocation on a
+mutual-TLS listener. These checks run when each inbound Connection starts, in `RegistryRunner` in
+`messagefoundry/pipeline/wiring_runner.py`. So a running engine does not prove that every listener
+passed. On a config reload the same refusal fails the whole reload, and the engine keeps the graph
+it had.
 
 **The operator socket serves TLS in every topology but one.** With no operator certificate, the
 engine mints a self-signed pair on first run and serves TLS with it. The exception is
@@ -129,11 +131,12 @@ by default, which means no restriction. At least these limits apply:
 
 - The check runs after the engine accepts the connection.
 - `/health` is exempt, and loopback is always allowed.
-- It does nothing behind a proxy on the engine host that the engine was not told about. Every
-  request then shows a loopback address, so the list admits all of them and refuses none. The engine
-  logs a warning once it has seen that pattern. The warning detects the gap and does not close it.
-- Behind an undeclared proxy on another host, or behind address translation, every client shows one
-  address that is not loopback. The list then passes all of them or none.
+- It does nothing behind a proxy on the engine host that the engine was not told about, when that
+  proxy forwards over loopback. Every request then shows a loopback address, so the list admits all
+  of them and refuses none. The engine may log one warning after many such requests. One request
+  from any other address stops that warning, so do not count on it.
+- Behind any other proxy the engine was not told about, or behind address translation, every client
+  shows one address that is not loopback. The list then passes all of them or none.
 - It does not cover the inbound Connection listeners. Each of those takes its own
   `source_ip_allowlist`.
 
@@ -161,7 +164,7 @@ No one command gives the whole answer. Each row below has a stated gap.
 | Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` | It imports the config modules, so it runs their code. It prints each Connection's type and authored settings. It does not print the bind address, and an `env()` value shows as a placeholder |
 | What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It shows no bind address, and it fills a port for MLLP rows only. It shows only what the caller's scope and the answering engine shard cover |
 | Which protective switches are off on a running engine? | `GET /security/posture` | It reports the engine shard that answers |
-| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | Its `values` and `set` fields are the `[security]` table of the authored file. Its loosening list also reads `[store]`, `[auth]`, `[alerts]`, `[secret_rotation]` and `[api]`, and for those five it applies the `MEFOR_*` variables of the shell that runs it, which may differ from the service's. It leaves out at least `MEFOR_SECURITY_*` environment overrides, a `serve --host` override and every per-Connection loosening. Its `loosenings_scope` field names some of these gaps |
+| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | Its `values` and `set` fields come from the `[security]` table of the authored file, with no environment override applied. Its loosening list also reads at least `[store]`, `[auth]`, `[alerts]`, `[secret_rotation]` and `[api]`. That read applies `MEFOR_*` variables from the shell that runs the command, not from the service. If that read fails, `loosenings_partial` is true and those sections show shipped defaults. The command leaves out at least a `serve --host` override and every per-Connection loosening. Its `loosenings_scope` field names some of these gaps |
 | Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` | It also runs the config modules. It opens no store |
 
 ## `messagefoundry verify` does not measure exposure
