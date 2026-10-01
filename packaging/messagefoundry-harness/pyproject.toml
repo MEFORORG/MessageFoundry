@@ -21,6 +21,11 @@ description = "Test harness for MessageFoundry — synthetic-only send/receive (
 readme = "README.md"
 requires-python = ">=3.14"
 license = "AGPL-3.0-or-later"
+# Ship the license + NOTICE in the wheel (PEP 639), as the engine, console and toolkit do (BACKLOG
+# #2513). They are COPIES in this directory, not `../../LICENSE`, which hatchling would write into the
+# wheel as `dist-info/licenses/../../LICENSE` (see the toolkit pyproject). tests/test_packaging.py
+# pins the LICENSE copy byte-identical to the root one.
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "MessageFoundry Foundation, LLC and contributors" }]
 keywords = ["hl7", "healthcare", "integration", "load-testing", "failover", "mllp", "testing"]
 classifiers = [

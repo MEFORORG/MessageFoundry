@@ -1096,7 +1096,10 @@ jobs:
         # a BARE always() there, so a refused wheel was uploaded as a downloadable artifact
         # regardless -- the engine job's leak gate already had this guard and these did not.
         id: member-gate
-        run: python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+        run: |
+          python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+          # And the wheel's own dist-info carries LICENSE and NOTICE (BACKLOG #2513).
+          python scripts/release/wheel_license_files.py 'webconsole-dist/*.whl'
 
       - name: Smoke-check the console wheel (clean venv, install, then the console's OWN __version__ == tag)
         run: |
@@ -1458,7 +1461,10 @@ jobs:
         # a BARE always() there, so a refused wheel was uploaded as a downloadable artifact
         # regardless -- the engine job's leak gate already had this guard and these did not.
         id: member-gate
-        run: python scripts/release/forbidden_members.py 'harness-dist/*.whl'
+        run: |
+          python scripts/release/forbidden_members.py 'harness-dist/*.whl'
+          # And the wheel's own dist-info carries LICENSE and NOTICE (BACKLOG #2513).
+          python scripts/release/wheel_license_files.py 'harness-dist/*.whl'
 
       - name: Smoke-check the harness wheel (clean venv, install, import, version == engine == tag)
         run: |

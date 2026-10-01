@@ -950,20 +950,27 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
 
 
-def test_the_toolkit_wheel_ships_the_license_and_notice() -> None:
-    """BACKLOG #1192: the toolkit wheel carried no LICENSE or NOTICE, unlike the engine and console.
+@pytest.mark.parametrize(
+    "distribution",
+    ["messagefoundry-toolkit", "messagefoundry-webconsole", "messagefoundry-harness"],
+)
+def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> None:
+    """The toolkit (BACKLOG #1192) and harness (BACKLOG #2513) wheels carried no LICENSE or NOTICE.
 
-    It declares both as PEP 639 ``license-files`` from its own directory, and its LICENSE is a copy
-    of the root one, so this pins the copy byte-identical: a license text edited in one place only
-    would ship two different licenses under one project name.
+    Each separate distribution declares both as PEP 639 ``license-files`` from its own directory,
+    and its LICENSE is a copy of the root one, so this pins each copy byte-identical: a license text
+    edited in one place only would ship two different licenses under one project name. On a Windows
+    checkout the compare also fails if a copy lost its ``eol=lf`` pin, as the console's had.
     """
-    toolkit_dir = _TOOLKIT_PYPROJECT.parent
-    declared = _toolkit_project().get("license-files")
+    project_dir = _REPO / "packaging" / distribution
+    declared = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ].get("license-files")
     assert declared == ["LICENSE", "NOTICE"], declared
     # LICENSE needs no is_file() check: the byte compare below raises if it is missing.
-    assert (toolkit_dir / "NOTICE").is_file(), f"NOTICE is declared but missing from {toolkit_dir}"
-    assert (toolkit_dir / "LICENSE").read_bytes() == (_REPO / "LICENSE").read_bytes(), (
-        "packaging/messagefoundry-toolkit/LICENSE differs from the root LICENSE"
+    assert (project_dir / "NOTICE").is_file(), f"NOTICE is declared but missing from {project_dir}"
+    assert (project_dir / "LICENSE").read_bytes() == (_REPO / "LICENSE").read_bytes(), (
+        f"packaging/{distribution}/LICENSE differs from the root LICENSE"
     )
 
 

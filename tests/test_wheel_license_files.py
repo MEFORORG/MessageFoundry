@@ -2,9 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``scripts/release/wheel_license_files.py``: what it refuses, and that both workflows run it.
 
-BACKLOG #1192. The toolkit wheel shipped no LICENSE or NOTICE. The declaration is checked in
-tests/test_packaging.py; this script checks the BUILT wheel, in ci.yml's packaging-build job and
-in release.yml's toolkit gate.
+BACKLOG #1192 and #2513. The toolkit and harness wheels shipped no LICENSE or NOTICE. The
+declarations are checked in tests/test_packaging.py; this script checks each BUILT wheel, in
+ci.yml's packaging-build job and in the release.yml job that builds it.
 """
 
 from __future__ import annotations
@@ -85,11 +85,32 @@ def _step_runs(workflow: str, job: str) -> list[str]:
     return [str(s.get("run") or "") for s in data["jobs"][job]["steps"] if isinstance(s, dict)]
 
 
+_SCRIPT = "python scripts/release/wheel_license_files.py "
+
+
 @pytest.mark.parametrize(
-    ("workflow", "job"), [("ci.yml", "packaging-build"), ("release.yml", "release")]
+    ("workflow", "job", "wheels"),
+    [
+        ("ci.yml", "packaging-build", "toolkit-dist/*.whl"),
+        ("ci.yml", "packaging-build", "webconsole-dist/*.whl"),
+        ("ci.yml", "packaging-build", "harness-dist/*.whl"),
+        ("release.yml", "release", "toolkit-dist/*.whl"),
+        ("release.yml", "release-webconsole", "webconsole-dist/*.whl"),
+        ("release.yml", "release-harness", "harness-dist/*.whl"),
+    ],
 )
-def test_both_workflows_check_the_built_toolkit_wheel(workflow: str, job: str) -> None:
-    """The script guards nothing unless a workflow runs it on the toolkit wheel it built."""
-    call = "python scripts/release/wheel_license_files.py 'toolkit-dist/*.whl'"
-    runs = [r for r in _step_runs(workflow, job) if call in r]
-    assert len(runs) == 1, f"{workflow} `{job}` runs {call!r} in {len(runs)} steps"
+def test_each_workflow_checks_the_wheels_it_built(workflow: str, job: str, wheels: str) -> None:
+    """The script guards nothing unless a workflow runs it on each separate wheel it built.
+
+    The toolkit (BACKLOG #1192), web console and harness (BACKLOG #2513) wheels, in CI's
+    packaging-build job and in the release job that builds each one.
+    """
+    calls = [
+        line.strip()
+        for run in _step_runs(workflow, job)
+        for line in run.splitlines()
+        if line.strip().startswith(_SCRIPT)
+    ]
+    assert calls, f"{workflow} `{job}` never runs {_SCRIPT.strip()}"
+    naming = [call for call in calls if f"'{wheels}'" in call]
+    assert len(naming) == 1, f"{workflow} `{job}` checks {wheels!r} in {len(naming)} calls: {calls}"

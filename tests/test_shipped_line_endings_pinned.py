@@ -29,6 +29,7 @@ this pin, so every check below is scoped to a class the shipped-set stanza actua
 from __future__ import annotations
 
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -41,11 +42,24 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: "the root files hatchling ships" -- pyproject.toml is the source of record for the list.
 SHIPPED_ROOT_FILES = ("LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "pyproject.toml")
 
-#: The toolkit wheel's license files, which its own `[project].license-files` ships (BACKLOG #1192).
-SHIPPED_TOOLKIT_FILES = (
-    "packaging/messagefoundry-toolkit/LICENSE",
-    "packaging/messagefoundry-toolkit/NOTICE",
-)
+
+def _packaging_license_files() -> tuple[str, ...]:
+    """Every separate wheel's own license files, read from its `[project].license-files`.
+
+    Derived, not listed: the toolkit's pin came with its files (BACKLOG #1192), while the console's
+    shipped unpinned until BACKLOG #2513. A distribution added under `packaging/` is covered
+    the day it declares `license-files`, with no list here to forget.
+    """
+    paths: list[str] = []
+    for pyproject in sorted((REPO_ROOT / "packaging").glob("*/pyproject.toml")):
+        project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+        base = pyproject.parent.relative_to(REPO_ROOT).as_posix()
+        paths += [f"{base}/{name}" for name in project.get("license-files", [])]
+    return tuple(paths)
+
+
+#: The toolkit, web console and harness wheels each ship a LICENSE and a NOTICE.
+SHIPPED_PACKAGING_FILES = _packaging_license_files()
 
 #: The vendored HAPI fixtures carry their own `-text` pin in
 #: `samples/messages/hapi-hl7v2/.gitattributes`, because they are stored byte-verbatim and EOL
@@ -93,12 +107,14 @@ def _check_attr(paths: list[str]) -> dict[str, dict[str, str]]:
 
 @pytest.fixture(scope="module")
 def shipped_paths() -> list[str]:
+    # At least six, so a parse that quietly found no `license-files` cannot shrink the set unseen.
+    assert len(SHIPPED_PACKAGING_FILES) >= 6, SHIPPED_PACKAGING_FILES
     # The toolkit ships in its own wheel (ADR 0201), so its tree is shipped text on the same terms.
     paths = (
         _tracked("messagefoundry")
         + _tracked("messagefoundry_toolkit")
         + list(SHIPPED_ROOT_FILES)
-        + list(SHIPPED_TOOLKIT_FILES)
+        + list(SHIPPED_PACKAGING_FILES)
     )
     assert len(paths) > 100, f"expected the package to have many tracked files, got {len(paths)}"
     return paths
@@ -163,7 +179,7 @@ def test_the_root_patterns_stay_anchored() -> None:
         for path in _tracked()
         if Path(path).name in SHIPPED_ROOT_FILES
         and path not in SHIPPED_ROOT_FILES  # not the root copy itself
-        and path not in SHIPPED_TOOLKIT_FILES  # pinned by their own anchored lines
+        and path not in SHIPPED_PACKAGING_FILES  # pinned by their own anchored lines
         and not path.startswith("messagefoundry/")  # covered on purpose by the package glob
     ]
     assert len(candidates) > 10, (
