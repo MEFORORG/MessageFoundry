@@ -182,8 +182,9 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # folded into [dicom].
 # pydicom is capped below 3.1 because the deflate guard replays private pydicom header readers, and the
 # agreement test (tests/test_dicom_deflate_guard.py) only proves the locked release (BACKLOG #1926).
-# pynetdicom is capped below 4 because no 4.x exists to vet: PyPI and the GitHub tags end at 3.0.4, and
-# upstream main is 3.1.0.dev0, still pydicom>=3,<4 (checked 2026-10-01, BACKLOG #2505). Sources:
+# pynetdicom stays capped below 4 (its original reason is unrecorded) because no 4.x exists to vet: none on
+# PyPI or in the GitHub tags, and upstream main is 3.1.0.dev0, still pydicom>=3,<4 (checked 2026-10-01,
+# BACKLOG #2505). Sources:
 # https://pypi.org/pypi/pynetdicom/json and https://github.com/pydicom/pynetdicom/tags
 dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so

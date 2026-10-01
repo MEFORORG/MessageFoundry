@@ -122,8 +122,8 @@ updates:
     # `pydicom`, `webauthn` and `pynetdicom` are the same WIDENED-CAP case (BACKLOG #2505). A major
     # cap needs its entry as much as a minor one: `python-deps-major` is one batch on `*`, so a
     # widened major cap holds that batch hostage too. pyproject.toml's [dicom] comment says why
-    # `pynetdicom<4` holds: no pynetdicom 4.x has been released to vet, so the cap guards an unseen
-    # major, not a known break.
+    # `pynetdicom<4` holds: no pynetdicom 4.x has been released to vet, so the cap now guards an
+    # unseen major, not a known break.
     #
     # THE RULE (BACKLOG #2505): every upper bound in pyproject.toml has an entry here, exactly `>=`
     # the version the test derives (a `<` cap's bound; for an exact `==` pin, the next minor), unless
