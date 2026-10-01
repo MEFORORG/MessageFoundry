@@ -26,6 +26,9 @@ from hl7apy import v2_5_1 as _ref
 from messagefoundry.generators import _hl7data as d
 from messagefoundry.parsing import validate
 
+# The strict validator's own choice test, so generation and validation agree on what a choice is.
+from messagefoundry.parsing.validate import _is_choice
+
 _MESSAGES = _ref.MESSAGES
 _SEGMENTS = _ref.SEGMENTS
 
@@ -398,6 +401,12 @@ class MessageSpec:
     # Optional groups to recurse into, matched by name *suffix* (e.g. "_PATIENT") so one spec
     # covers every structure of its type (ORM_O01_PATIENT, SIU_S12_PATIENT, …).
     group_suffixes: frozenset[str] = frozenset()
+    # The alternative a choice group emits when it offers this one (see ``_pick_alternative``).
+    preferred_alternative: str = "OBR"
+
+
+def _builder_for(spec: MessageSpec, name: str) -> SegmentBuilder | None:
+    return spec.builders.get(name) or SHARED_BUILDERS.get(name)
 
 
 _REGISTRY: dict[str, MessageSpec] = {}
@@ -431,6 +440,20 @@ def control_id(code: str, trigger: str, index: int) -> str:
 # --- reference-driven assembly ----------------------------------------------
 
 
+def _pick_alternative(group: str, alternatives: Any, rng: random.Random, spec: MessageSpec) -> Any:
+    """The one alternative of choice group ``group`` to emit.
+
+    ``spec.preferred_alternative`` (OBR by default) when the group offers it and it can be built,
+    without drawing from ``rng``. Otherwise a seeded pick among the alternatives that can be
+    built, so a seed still reproduces its bytes.
+    """
+    usable = [alt for alt in alternatives if alt[3] == "GRP" or _builder_for(spec, alt[0])]
+    if not usable:
+        raise RuntimeError(f"no builder for any alternative of choice group {group}")
+    preferred = next((alt for alt in usable if alt[0] == spec.preferred_alternative), None)
+    return preferred if preferred is not None else rng.choice(usable)
+
+
 def _emit(
     children: list[Any],
     rng: random.Random,
@@ -443,7 +466,9 @@ def _emit(
 
     Required children (min>=1) are always emitted; optional segments are emitted only if
     allow-listed (a random 0..N for repeating ones), or if named in ``force``. Groups recurse
-    only when the group itself is required.
+    only when the group itself is required or matches ``spec.group_suffixes``. A choice group
+    means "exactly one of", so it emits one alternative rather than every required child. The
+    choice test is the strict validator's, which keeps the sequences hl7apy mislabels as choices.
     """
     for child in children:
         name = child[0]
@@ -451,7 +476,7 @@ def _emit(
         min_card, max_card = child[2][0], child[2][1]
 
         if name in _SEGMENTS:
-            builder = spec.builders.get(name) or SHARED_BUILDERS.get(name)
+            builder = _builder_for(spec, name)
             if min_card >= 1 or name in force:
                 if builder is None:
                     raise RuntimeError(f"no builder for required/forced segment {name}")
@@ -461,7 +486,10 @@ def _emit(
                 for _ in range(rng.randint(0, max_reps)):
                     out.append(builder(rng, ctx))
         elif min_card >= 1 or any(name.endswith(s) for s in spec.group_suffixes):
-            _emit(child_ref[1], rng, ctx, spec, force, out)
+            group_children = child_ref[1]
+            if _is_choice(name, child_ref):
+                group_children = [_pick_alternative(name, group_children, rng, spec)]
+            _emit(group_children, rng, ctx, spec, force, out)
 
 
 def generate_message(code: str, trigger: str, index: int, *, seed: str = DEFAULT_SEED) -> str:
