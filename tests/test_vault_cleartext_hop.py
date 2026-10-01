@@ -23,6 +23,7 @@ Synthetic data only: the token, key names and host names are made up.
 
 from __future__ import annotations
 
+import re
 import socket
 import threading
 from collections.abc import Callable, Iterator
@@ -598,19 +599,50 @@ def test_control_an_https_vault_behind_these_proxies_is_built_and_sent(
     assert listener.connections >= 1
 
 
+@pytest.mark.parametrize(
+    "form",
+    [
+        "http://{auth}@127.0.0.1:{port}",
+        # Will not parse: requests' own error for this quoted the whole URL, password included,
+        # when the send-time check ran only after requests parsed it (code-review round 2).
+        "http://{auth}@127.0.0.1:99999",
+        # requests' InvalidProxyURL, not the refusal, when the check ran after its parse.
+        "{auth}@127.0.0.1:{port}",
+    ],
+    ids=["well-formed", "unparseable-port", "no-scheme"],
+)
 def test_a_credentialed_proxy_that_appears_after_construction_is_refused_before_sending(
-    monkeypatch: pytest.MonkeyPatch, listener: _Listener
+    form: str, monkeypatch: pytest.MonkeyPatch, listener: _Listener
 ) -> None:
     """The construction check reads the proxy settings once, so the adapter checks again before
-    each send. Mutation: drop the send-time call; red, the CONNECT reaches the proxy."""
+    each send, before requests parses the proxy URL. Mutation: drop the send-time calls; red, the
+    CONNECT reaches the proxy. Mutation: drop only the first one; red on the second and third
+    arms."""
     from messagefoundry.config import secretprovider_vault
 
     client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
-    monkeypatch.setenv("HTTPS_PROXY", f"http://{_PROXY_AUTH}@127.0.0.1:{listener.port}")
+    monkeypatch.setenv("HTTPS_PROXY", form.format(auth=_PROXY_AUTH, port=listener.port))
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL") as caught:
         client.adapter.get("v1/secret/data/mefor/ad")
     _assert_names_no_proxy_part(str(caught.value), listener.port)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert listener.connections == 0, "a socket reached the proxy"
+
+
+def test_proxy_manager_for_refuses_on_its_own() -> None:
+    """The second send-time check, where requests reads the credentials. On this requests the
+    hook check above runs first, so it is driven directly: it is the one that still runs on a
+    requests too old to call the hook. Mutation: drop it; red."""
+    import ssl
+
+    from messagefoundry.transports.strict_requests import StrictReplyAdapter
+
+    adapter = StrictReplyAdapter(
+        connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+    )
+    with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
+        adapter.proxy_manager_for(f"http://{_PROXY_AUTH}@127.0.0.1:3128")
+    assert adapter.proxy_manager == {}, "a manager was built for the refused proxy"
 
 
 def test_a_configured_credentialed_proxy_is_refused_at_construction(
@@ -675,46 +707,74 @@ def test_the_build_check_picks_the_proxy_the_send_picks(
     if refused:
         with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
             mount()
-    else:
-        mount()
+        assert listener.connections == 0
     # The environment's proxies were not written into hvac's own: requests' merge mutates the
-    # dict it is given, so the build check must hand it a copy.
+    # dict it is given, so the build check must hand it a copy. This also pins hvac's private
+    # name for the dict, which the build check reads.
     assert set(client.adapter._kwargs["proxies"]) == {"https"}
-    assert listener.connections == 0
+    if not refused:
+        mount()
+        # And the send agrees: it goes through the clean configured proxy, which hangs up, rather
+        # than being refused for the credentialed environment one.
+        import requests
+
+        with pytest.raises(requests.exceptions.RequestException):
+            client.adapter.get("v1/secret/data/mefor/ad")
+        assert listener.connections >= 1
 
 
-def test_an_https_vault_whose_proxy_lookup_fails_is_still_built(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The build check looks the proxy up for an https:// address now. If that lookup raises, the
-    address is not refused as malformed and the error does not escape: the send-time check still
-    sees the proxy the send picks. Mutation: let the lookup error escape; red."""
+def _failing_proxy_lookup(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
     import requests
 
-    from messagefoundry.config import secretprovider_vault
-
     def boom(*args: object, **kwargs: object) -> None:
-        raise OSError("synthetic: the proxy settings could not be read")
+        raise error
 
     monkeypatch.setattr(requests.Session, "merge_environment_settings", boom)
+
+
+_LOOKUP_ERRORS = pytest.mark.parametrize(
+    "error",
+    [
+        OSError("synthetic: the proxy settings could not be read"),
+        # What proxy_bypass_registry raises on a Windows ProxyOverride entry that is no pattern.
+        re.error("synthetic: not a pattern"),
+        ValueError("synthetic: not a proxy setting"),
+    ],
+    ids=["OSError", "re.error", "ValueError"],
+)
+
+
+@_LOOKUP_ERRORS
+def test_an_https_vault_whose_proxy_lookup_fails_is_still_built(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The build check looks the proxy up for an https:// address now. If that lookup raises, the
+    address is not refused as malformed and the error does not escape: the send-time checks still
+    see the proxy the send picks. Mutation: let the lookup error escape; red."""
+    from messagefoundry.config import secretprovider_vault
+
+    _failing_proxy_lookup(monkeypatch, error)
     secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
 
 
-def test_an_http_vault_whose_proxy_lookup_fails_is_refused(
-    monkeypatch: pytest.MonkeyPatch,
+@_LOOKUP_ERRORS
+def test_an_http_vault_whose_proxy_lookup_fails_behaves_as_before(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The http:// arm of the same failure fails closed, with the fixed cleartext text."""
-    import requests
-
+    """The http:// arm keeps engine PR 1880's behaviour. A ValueError is refused with the fixed
+    cleartext text. Any other error is raised as it is, because its own text points at the proxy
+    settings, where a 'malformed address' refusal would point at a valid address."""
     from messagefoundry.config import secretprovider_vault
 
-    def boom(*args: object, **kwargs: object) -> None:
-        raise OSError("synthetic: the proxy settings could not be read")
-
-    monkeypatch.setattr(requests.Session, "merge_environment_settings", boom)
-    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
-        secretprovider_vault._build_client(f"http://127.0.0.1:{_closed_port()}", _TOKEN)
-    _assert_refused(caught)
+    _failing_proxy_lookup(monkeypatch, error)
+    address = f"http://127.0.0.1:{_closed_port()}"
+    if isinstance(error, ValueError):
+        with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
+            secretprovider_vault._build_client(address, _TOKEN)
+        _assert_refused(caught)
+    else:
+        with pytest.raises(type(error)):
+            secretprovider_vault._build_client(address, _TOKEN)
 
 
 def test_a_configured_credentialed_proxy_is_refused_before_sending(

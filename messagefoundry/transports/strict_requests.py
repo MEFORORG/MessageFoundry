@@ -345,9 +345,10 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
 
     def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
         # BACKLOG #2547, before each send: checked at construction too; this catches a proxy that
-        # appeared since. Here because this is where requests reads credentials out of the proxy
-        # URL (the Proxy-Authorization header, or the SOCKS user and password), on every proxied
-        # request, before any connection opens and before a manager is cached.
+        # appeared since. get_connection_with_tls_context checks first, before requests parses the
+        # URL. This second check is where requests reads credentials out of the proxy URL (the
+        # Proxy-Authorization header, or the SOCKS user and password), on every proxied request on
+        # any requests version, before any connection opens and before a manager is cached.
         _refuse_cleartext_proxy_credentials(proxy, connector=self._connector)
         manager = super().proxy_manager_for(proxy, **proxy_kwargs)
         # Only a plain proxy manager's pools are the stock ones. A SOCKS manager's pools open SOCKS
@@ -365,7 +366,12 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         proxies: dict[str, str] | None = None,
         cert: Any = None,
     ) -> urllib3.connectionpool.HTTPConnectionPool:
-        # BACKLOG #2547's send-time check runs inside this call, in proxy_manager_for.
+        # BACKLOG #2547, before requests parses the proxy URL: a credentialed URL that will not
+        # parse would otherwise fail in requests' own parser, whose error can quote the password.
+        # proxy_manager_for checks again, on a requests too old to call this hook.
+        _refuse_cleartext_proxy_credentials(
+            requests.utils.select_proxy(request.url or "", proxies), connector=self._connector
+        )
         pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
         # Both halves: the class is one of ours, and nothing below it put the stock reader back.
         if not (
@@ -621,8 +627,9 @@ def _prepared_vault_hop(
 
     It is looked up for an ``https://`` address too, because that proxy's URL can carry
     credentials (BACKLOG #2547). If the lookup itself fails, an ``https://`` address goes on with no
-    proxy, because the send-time check in :meth:`StrictReplyAdapter.proxy_manager_for` still sees
-    whatever proxy the send picks. Any other address is refused, as before."""
+    proxy, because the adapter's send-time check still sees whatever proxy the send picks. Any
+    other address behaves as before: refused on a ``ValueError`` or a requests error, and the error
+    raised as it is otherwise, since its own text points at the proxy settings."""
     if not isinstance(url, str):
         return None
     try:
@@ -638,9 +645,13 @@ def _prepared_vault_hop(
     try:
         settings = session.merge_environment_settings(sent, proxies, None, None, None)
         return sent, requests.utils.select_proxy(sent, settings["proxies"])
-    # re.error: proxy_bypass_registry compiles each Windows ProxyOverride entry as a pattern.
-    except (ValueError, OSError, re.error, requests.exceptions.RequestException):
+    except (ValueError, requests.exceptions.RequestException):
         return (sent, None) if _scheme_of(sent) == "https" else None
+    # re.error: proxy_bypass_registry compiles each Windows ProxyOverride entry as a pattern.
+    except (OSError, re.error):
+        if _scheme_of(sent) == "https":
+            return sent, None
+        raise
 
 
 def _refuse_an_insecure_vault_hop(
@@ -712,7 +723,7 @@ def mount_strict_reply_adapter(
         )
     # hvac keeps the proxies it passes with every request in `_kwargs`, private but the only place
     # they live. Read here so the build-time proxy is the one the send picks; when the attribute
-    # is missing, the send-time check in proxy_manager_for still covers them.
+    # is missing, the adapter's send-time checks still cover them. A test pins the name.
     request_kwargs = getattr(client.adapter, "_kwargs", None)
     _refuse_an_insecure_vault_hop(
         session,

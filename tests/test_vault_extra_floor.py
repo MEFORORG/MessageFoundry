@@ -52,12 +52,7 @@ def test_the_vault_extra_declares_a_requests_floor_at_the_hook_version() -> None
     """RED before the change: the extra held only hvac. Mutation: lower the floor to
     ``requests>=2.32``; red, 2.32.0 is admitted and never calls the hook."""
     requirement = _vault_requests_requirement()
-    floors = [
-        Version(spec.version) for spec in requirement.specifier if spec.operator in (">=", ">")
-    ]
-    assert floors, f"{requirement} has no lower bound"
-    assert max(floors) >= _HOOK_SINCE, f"{requirement} admits a requests below {_HOOK_SINCE}"
-    # The set as a whole, so another operator in it cannot reopen the gap below the floor.
+    # Probed by containment, so the floor may be written with any operator (>=, ~=, ==2.34.*).
     for below in ("2.32.1", "2.32.0", "2.31.0", "2.0.0"):
         assert not requirement.specifier.contains(below), f"{requirement} admits {below}"
 
@@ -67,9 +62,11 @@ def test_the_vault_extra_declares_a_requests_floor_at_the_hook_version() -> None
     reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
 )
 def test_the_floor_is_for_the_hook_the_adapter_overrides() -> None:
-    """The adapter defines the hook itself, and the installed requests calls it. If the checks
-    ever move to another hook, this goes red, so the floor gets re-derived rather than kept by
-    habit."""
+    """The adapter defines the hook, and the installed requests' ``send`` calls it. If the checks
+    ever move to another hook, or requests stops calling this one, this goes red, so the floor gets
+    re-derived rather than kept by habit. The BACKLOG #2547 check also runs in
+    ``proxy_manager_for``, which every requests version calls; that half does not need the floor."""
+    import inspect
     from importlib.metadata import version
 
     import requests.adapters
@@ -77,5 +74,7 @@ def test_the_floor_is_for_the_hook_the_adapter_overrides() -> None:
     from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
     assert _HOOK in vars(StrictReplyAdapter), "the send-time checks no longer override the hook"
-    assert hasattr(requests.adapters.HTTPAdapter, _HOOK)
+    assert f"self.{_HOOK}(" in inspect.getsource(requests.adapters.HTTPAdapter.send), (
+        "the installed requests' HTTPAdapter.send no longer calls the hook"
+    )
     assert Version(version("requests")) >= _HOOK_SINCE
