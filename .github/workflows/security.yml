@@ -568,7 +568,8 @@ jobs:
             --output-format JSON --output-file sbom-python.cdx.json
           # Declare the SBOM lifecycle (CISA "Build" type) + backfill the hatchling-dynamic root version.
           python scripts/security/sbom_finalize.py sbom-python.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
       - name: Generate the VS Code extension SBOM (npm, install-free)
         # if: always() so a Python-SBOM failure above doesn't skip this independent generator.
         if: always()
@@ -585,6 +586,9 @@ jobs:
         # continue-on-error: sbomqs is advisory HERE, so a download/checksum/parse hiccup must never skip
         # the SBOM-artifact upload below (the actual deliverable). This no longer matches release.yml:
         # there the install and pin check BLOCK and only the score is advisory (BACKLOG #1698).
+        # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
+        # unscored (BACKLOG #2521).
+        if: always()
         continue-on-error: true
         run: |
           # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA
@@ -598,9 +602,12 @@ jobs:
           grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
-          sbomqs score -b sbom-python.cdx.json
-          sbomqs score -b sbom-ide.cdx.json
+          # Each score runs whatever the other did; the step still fails if either did (BACKLOG #2521).
+          rc=0
+          sbomqs score -b sbom-python.cdx.json || rc=1
+          sbomqs score -b sbom-ide.cdx.json || rc=1
           sbomqs compliance --ntia sbom-python.cdx.json || true
+          exit "$rc"
       - name: Upload the SBOM artifacts
         # if: always() + if-no-files-found: ignore so whichever SBOM(s) generated are retained even if a
         # sibling generator failed. SHA-pinned for supply-chain integrity, matching ci.yml's upload pin.
@@ -647,7 +654,28 @@ jobs:
             --pyproject pyproject.toml --mc-type application \
             --output-format JSON --output-file sbom-python-windows.cdx.json
           python scripts/security/sbom_finalize.py sbom-python-windows.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
+      - name: Score the Windows SBOM's quality (sbomqs -- advisory)
+        # The pre-tag dry-run of release.yml's score of this file (BACKLOG #2521). It rehearses the FILE:
+        # the release uses sbomqs's Linux build, this runner its Windows build. Advisory, like `sbom`'s.
+        continue-on-error: true
+        shell: bash
+        run: |
+          # PINNED IN-REPO, as release.yml's sbomqs step is, rather than verified against a
+          # checksums.txt from the asset's own origin. Keep VER equal to release.yml's. Recorded
+          # 2026-09-30 from three routes that agreed: checksums.txt, the releases API `digest` field,
+          # and sha256sum over the downloaded tarball. Bump VER and the digest in one commit.
+          VER=2.0.11
+          SBOMQS_SHA256=55777d63d76805bef8ff7f59c41ebf7741cd601de508b00437c593cd3bfa2ebb
+          asset="sbomqs_${VER}_Windows_x86_64.tar.gz"
+          base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
+          echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
+          # A relative archive name: Git Bash's tar reads a `D:\...` path as a remote host.
+          tar -xzf "${asset}" sbomqs.exe
+          ./sbomqs.exe score -b sbom-python-windows.cdx.json
+          ./sbomqs.exe compliance --ntia sbom-python-windows.cdx.json || true
       - name: Upload the Windows SBOM artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

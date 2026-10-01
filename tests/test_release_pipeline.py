@@ -240,7 +240,8 @@ def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one()
     - it holds ``contents: read`` ONLY, so nothing it runs sits beside the signing identity;
     - it runs exactly when ``release`` does: the same job ``if:``, and ``release`` needs it, so a
       release cannot proceed without the file or ship one from a skipped job;
-    - its upload refuses a missing file, rather than failing two jobs later at the download;
+    - its upload refuses a missing file, rather than failing two jobs later at the download, and is
+      kept one day, since the signed copy on the release is the record;
     - the ``release`` job downloads it, and it is signed, SLSA-attested, attached to the GitHub
       release and uploaded as a workflow artifact. Both engine SBOMs are held to those four sinks, so
       neither can drop out of one while the other still reaches it.
@@ -264,6 +265,8 @@ def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one()
     ]
     assert len(uploads) == 1, f"sbom-windows has {len(uploads)} artifact uploads"
     assert uploads[0]["with"].get("if-no-files-found") == "error", uploads[0]["with"]
+    # A hand-off between two jobs of one run; the signed copy on the release is the record (#2521).
+    assert uploads[0]["with"].get("retention-days") == 1, uploads[0]["with"]
     artifact = uploads[0]["with"]["name"]
     assert uploads[0]["with"]["path"] == _WINDOWS_SBOM
 
@@ -2953,6 +2956,109 @@ def test_the_sbomqs_split_refuses_each_way_back_to_a_green_pin_failure(
     mutate(job)
     offences = _sbomqs_split_offences(job)
     assert any(needle in o for o in offences), f"expected {needle!r} among {offences}"
+
+
+def _security_jobs() -> dict:
+    import yaml
+
+    path = _REPO / ".github" / "workflows" / "security.yml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]
+
+
+#: A stand-in for sbomqs: it logs each call to ``calls.log`` and fails a `score` of the file named by
+#: ``FAIL_SCORE``, so a score step's control flow runs exactly as written with no binary to download.
+_SBOMQS_STUB = (
+    '#!/bin/sh\necho "$*" >> calls.log\n'
+    'if [ "$1" = score ] && [ "$3" = "${FAIL_SCORE:-}" ]; then exit 1; fi\nexit 0\n'
+)
+
+
+def _run_score_step(tmp_path: Path, body: str, fail: str) -> tuple[int, list[str]]:
+    """Run a score step's scoring lines, from ``rc=0`` on, under the runner's ``bash -e`` with the
+    stub; return (exit code, the sbomqs calls it made). The lines above ``rc=0`` install the binary."""
+    assert "rc=0" in body, "the score step no longer starts its scores at `rc=0`"
+    tail = re.sub(
+        r"(?m)^(\s*)(?:/usr/local/bin/)?sbomqs ", r"\1./sbomqs ", body[body.index("rc=0") :]
+    )
+    (tmp_path / "sbomqs").write_bytes(_SBOMQS_STUB.encode("utf-8"))
+    (tmp_path / "sbomqs").chmod(0o755)
+    script = tmp_path / "score.sh"
+    # Bytes, never write_text: on Windows a translated \r\n breaks every line of the script.
+    script.write_bytes(tail.encode("utf-8"))
+    env = {**_posix_tool_env(), "FAIL_SCORE": fail}
+    rc, _ = _run_leak_gate(require_bash(tmp_path, env), tmp_path, script, env)
+    assert rc not in (126, 127), explain_returncode(rc, "the score step")
+    log = tmp_path / "calls.log"
+    return rc, log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+
+
+#: Each workflow's two-SBOM score step: how to find it, the binary it must call, then the SBOM scored
+#: first and second. The release calls the binary its BLOCKING install verified, by absolute path, so
+#: no other `sbomqs` earlier on PATH can stand in for it.
+_SCORE_STEPS = {
+    "release": (
+        lambda: _release_step(_jobs()["release"], "sbomqs score"),
+        "/usr/local/bin/sbomqs",
+        "messagefoundry-sbom.cdx.json",
+        "messagefoundry-sbom-windows.cdx.json",
+    ),
+    "security": (
+        lambda: _release_step(_security_jobs()["sbom"], "sbomqs score"),
+        "sbomqs",
+        "sbom-python.cdx.json",
+        "sbom-ide.cdx.json",
+    ),
+}
+
+
+@pytest.mark.parametrize("workflow", sorted(_SCORE_STEPS))
+@pytest.mark.parametrize(
+    ("fail", "pre_fix", "step_fails", "second_scored"),
+    [
+        ("first", False, True, True),
+        ("second", False, True, True),
+        ("", False, False, True),
+        # The pre-fix body: the one arm where the hypothesis is false, so the test can fail.
+        ("first", True, True, False),
+    ],
+    ids=["first-fails", "second-fails", "none-fail", "pre-fix-body-skips-the-second"],
+)
+def test_a_failing_sbomqs_score_does_not_skip_the_other_sbom(
+    tmp_path: Path, workflow: str, fail: str, pre_fix: bool, step_fails: bool, second_scored: bool
+) -> None:
+    """BACKLOG #2521 finding 3. Under the runner's ``bash -e``, a failing first score used to end the
+    step before the second SBOM was scored, and ``continue-on-error`` hid it. Each step must score
+    both whatever either does, and still end non-zero when one failed, so the run shows it.
+    """
+    find, binary, first, second = _SCORE_STEPS[workflow]
+    body = str(find()["run"])
+    for sbom in (first, second):
+        assert re.search(rf"(?m)^\s*{re.escape(binary)} score -b {re.escape(sbom)}\b", body), sbom
+    if pre_fix:
+        assert " || rc=1" in body, "the pre-fix mutation's anchor is gone from the live step"
+        body = body.replace(" || rc=1", "")
+    rc, calls = _run_score_step(tmp_path, body, {"first": first, "second": second}.get(fail, ""))
+    assert (rc != 0) is step_fails, (rc, calls)
+    assert f"score -b {first}" in calls, calls
+    assert (f"score -b {second}" in calls) is second_scored, calls
+
+
+def test_the_windows_sbom_dry_run_scores_it_with_the_released_sbomqs_version() -> None:
+    """BACKLOG #2521 finding 4. security.yml's `sbom-windows` job is the pre-tag dry-run for this
+    workflow's Windows SBOM, and it once never ran sbomqs on it, so sbomqs first read that file at a
+    tag. Its score step must read the file the job builds, at the version the release pins."""
+    step = _release_step(_security_jobs()["sbom-windows"], "sbomqs.exe score")
+    body = _executed_shell(str(step["run"]))
+    assert "score -b sbom-python-windows.cdx.json" in body
+    assert "sha256sum -c" in body, "the Windows sbomqs download is not verified"
+
+    def version(text: str) -> str:
+        found = re.findall(r"^\s*VER=(\S+)$", text, re.MULTILINE)
+        assert len(set(found)) == 1, found
+        return found[0]
+
+    install = _release_step(_jobs()["release"], "sha256sum -c")
+    assert version(body) == version(_executed_shell(str(install["run"])))
 
 
 def test_the_harness_smoke_runs_the_install_resolution_check() -> None:
