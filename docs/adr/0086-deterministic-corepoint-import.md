@@ -252,20 +252,30 @@ validated against an export, so this rule was written from the HL7 shapes alone.
 - An inlined `ActionListCall` runs in its own scope, because nothing ties the handle names inside a
   called list to the caller's. The called list starts knowing no handle, so its writes and sends of
   any handle it did not bind there decline or raise. An `input-handle` span inside the called list
-  still counts toward the caller's input, because nothing establishes that a call passing nothing
-  does not hand the caller's input over. A second name there makes the caller's input ambiguous.
+  can make the caller's input ambiguous, because nothing establishes that a call passing nothing
+  does not hand the caller's input over. A second name there leaves the caller with no input. Such a
+  span never supplies the caller's input, though: with no `input-handle` of the caller's own, the
+  caller has none.
 - After an inlined call, every handle the caller has bound is unknown, whatever its name. No handle
-  name is matched. Every rule that matched names missed a spelling the export may carry: a `-`,
-  a `.`, a non-ASCII letter, or a handle with no `%`. The one exception is the input while it is
-  still `msg`, because generated code never rebinds `msg`. The input is unknown too when the called
-  list may overwrite any tree whole, under any name, since the called list may name the input by its
-  own handle. A call whose list is not inlined renders a TODO marker, counts unmapped, and leaves
-  every handle unknown, the input included.
+  name is matched. Every rule that matched names missed some spelling the export may carry,
+  including at least a `-`, a `.`, a non-ASCII letter, and a handle with no `%`.
+- The input, while it is still `msg`, survives a call only when the called list does nothing but
+  read: every live statement in it is `MsgSend` or `MsgLog`, and it holds at least one. That is
+  judged by verb alone. The called list names what it was passed by its own handle, so a write under
+  any spelling may replace the input, and no reading of operands can rule that out. An edit it makes
+  in place is a TODO in the inlined body, so sending `msg` would drop it. So a field write, a clone,
+  a `MsgCreate`, an unread verb, an unmodelled element, an exit, a nested call, or a step with no
+  statement all make the input unknown. A call whose list is not inlined renders a TODO marker,
+  counts unmapped, and leaves every handle unknown, the input included. A `<Call>` with no `@Data`
+  is never dissolved as a branch-group wrapper, so its list keeps its own scope.
 - **The cost of that rule (Manager decision, #313 step 2 re-cut).** Any send of a clone or a
   `MsgCreate` message made before a call raises at that send, even when the called list never
-  touches it. So does a send of the input after a call whose list builds or copies any message.
-  A human finishes each one. That is the importer's fail-closed contract: a raise costs a hand
-  edit, while a stale local would deliver the wrong message.
+  touches it. So does a send of the input after almost any call. A human finishes each one. That
+  is the importer's fail-closed contract: a raise costs a hand edit, while a stale local would
+  deliver the wrong message.
+- **Known gap, outside the call rule.** The whole-tree write rule above reads the handles a
+  statement names. It cannot see at least a handle spelled with no `%` in a markup-free statement,
+  so a `MsgCreate ADT ...` there leaves a bound `ADT` bound. Closing that is open work.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
   its whole-tree writes. Nothing it binds is trusted after it.
 

@@ -9,6 +9,7 @@ the ``messagefoundry check`` structural gate on emitted modules, and the untrust
 from __future__ import annotations
 
 import ast
+import html
 import json
 import re
 from dataclasses import replace
@@ -2100,8 +2101,8 @@ def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
     assert 'Send("OB_OUT"' not in body
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
 
-    # The input is msg, which generated code never rebinds, so a called list that overwrites no tree
-    # whole leaves it bound. Its write there declines rather than land on msg (see the scope test).
+    # The input handed to an inlined list is unknown after it too: an edit the list makes in place
+    # is a TODO in its body (it never lands on msg), so sending msg would drop it. A raise instead.
     call = (
         '<Call Data="ActionListCall &quot;Sub&quot; pass %ADT"><Actions>'
         '<Line Data="ItemClear %ADT/PID-19"/></Actions></Call>'
@@ -2109,11 +2110,10 @@ def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
     passed = _handler_body(
         _handler_source(_WRITE_INPUT + call + _role_send("input-handle", "%ADT", "OB_IN"))
     )
-    assert '    sends.append(Send("OB_IN", msg))' in passed
+    assert 'Send("OB_IN"' not in passed
     assert 'set_field(msg, "PID-19"' not in passed
 
-    # A called list that overwrites ANY tree whole may be replacing the input under its own name,
-    # so the input is unknown after it and its send raises.
+    # A called list that builds any message may be replacing the input under its own name.
     rebuilt = _handler_body(
         _handler_source(
             _WRITE_INPUT
@@ -2124,15 +2124,15 @@ def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
     assert 'Send("OB_IN"' not in rebuilt
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in rebuilt
 
-    # The control arm: a call that passes no handle, to a list that names none, leaves the input bound.
-    plain = (
-        '<Call Data="ActionListCall &quot;Log&quot;"><Actions>'
-        '<Line Data="EnvLogText &quot;called&quot;"/></Actions></Call>'
-    )
+    # The control arm: a call whose list only reads (MsgLog) leaves the input bound.
+    plain = _inlined_call(_MSGLOG_P, passing="")
     kept = _handler_body(
         _handler_source(_WRITE_INPUT + plain + _role_send("input-handle", "%ADT", "OB_IN"))
     )
     assert '    sends.append(Send("OB_IN", msg))' in kept
+
+
+_MSGLOG_P = _role_line(_span("keyword", "MsgLog") + " " + _span("other-handle", "%P"))
 
 
 def _inlined_call(*statements: str, passing: str = " pass %OUT") -> str:
@@ -2182,17 +2182,11 @@ def test_an_inlined_call_runs_in_its_own_scope(call: str) -> None:
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
 
 
-def _attr_text(text: str) -> str:
-    """``text`` escaped for an XML attribute, as the export writes a call line."""
-    return (
-        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-    )
-
-
 def _call_of(passing: str, *statements: str) -> str:
-    """An inlined ``ActionListCall "Sub"<passing>``; ``passing`` is raw text, escaped here."""
+    """An inlined ``ActionListCall "Sub"<passing>``. ``passing`` is raw text, escaped here, where
+    :func:`_inlined_call` takes it already escaped."""
     return (
-        f'<Call Data="ActionListCall &quot;Sub&quot;{_attr_text(passing)}"><Actions>'
+        f'<Call Data="ActionListCall &quot;Sub&quot;{html.escape(passing)}"><Actions>'
         + "".join(statements)
         + "</Actions></Call>"
     )
@@ -2299,20 +2293,101 @@ def test_no_handle_spelling_sends_a_clone_made_before_a_call(handle: str) -> Non
         assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in after
 
 
-def test_a_call_that_overwrites_no_tree_leaves_the_input_bound() -> None:
-    """The control for the input: a call whose list overwrites no tree whole leaves the input as
-    msg, whatever it passes, while a clone made before the same call is unknown after it."""
-    log = '<Line Data="EnvLogText &quot;x&quot;"/>'
+def test_a_call_that_only_reads_leaves_the_input_bound() -> None:
+    """The control for the input: a call whose list only reads leaves the input as msg, whatever
+    it passes, while a clone made before the same call is unknown after it."""
     body = _handler_body(
         _handler_source(
             _CLONE_OUT
-            + _call_of(" pass %ADT", log)
+            + _call_of(" pass %ADT", _MSGLOG_P)
             + _role_send("input-handle", "%ADT", "OB_IN")
             + _SEND_OUT
         )
     )
     assert '    sends.append(Send("OB_IN", msg))' in body
     assert 'Send("OB_OUT"' not in body
+
+
+_A04 = "as &quot;ADT^A04&quot; version &quot;2.5.1&quot;"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            _call_of(" pass ADT", f'<Line Data="MsgCreate ADT {_A04}"/>'),
+            id="markup-free-msgcreate-without-percent",
+        ),
+        pytest.param(
+            _call_of(" pass ADT", '<Line Data="MsgTreeCopy NEW/ to ADT/"/>'),
+            id="markup-free-copy-without-percent",
+        ),
+        pytest.param(
+            _call_of(
+                " pass ADT",
+                f"<Line Data=\"&lt;span class='handle'&gt;MsgCreate&lt;/span&gt; "
+                f"&lt;span class='handle'&gt;ADT&lt;/span&gt; {_A04}\"/>",
+            ),
+            id="unlisted-span-class",
+        ),
+        pytest.param(
+            _call_of(" pass ADT", f'<Switch Data="MsgCreate ADT {_A04}"/>'),
+            id="unknown-tag",
+        ),
+        pytest.param(
+            '<Call Data="ActionListCall &quot;Sub&quot; pass ADT"><Param Name="x"/></Call>',
+            id="param-only",
+        ),
+        pytest.param(_call_of(" pass ADT", "<Line/>"), id="empty-line-only"),
+        pytest.param(_call_of(" pass ADT", '<Line Comment="see Sub"/>'), id="comment-only"),
+        pytest.param(_call_of(" pass ADT", '<Line Data="Returns %P"/>'), id="returns"),
+        pytest.param(
+            _call_of(" pass ADT returning ADT", '<Line Data="EnvLogText &quot;x&quot;"/>'),
+            id="unread-verb-and-a-result-clause",
+        ),
+        pytest.param(_call_of(" pass ADT", _write("other-handle", "%P", "SUB")), id="field-write"),
+        pytest.param(
+            _call_of(" pass ADT", _call_of("", _MSGLOG_P)), id="nested-call-that-only-reads"
+        ),
+    ],
+)
+def test_a_call_that_may_do_more_than_read_unbinds_the_input(call: str) -> None:
+    """The input survives a call only when the called list does nothing but read, judged by verb.
+    Each of these could replace the input whole under a spelling no operand reading sees, or edit
+    it in place in a TODO, so the send of the input after it raises. The control (no call) sends."""
+    write = _write("input-handle", "ADT", "X")
+    send = _role_send("input-handle", "ADT", "OB_IN")
+    control = _handler_body(_handler_source(write + send))
+    assert '    sends.append(Send("OB_IN", msg))' in control
+    body = _handler_body(_handler_source(write + call + send))
+    assert 'Send("OB_IN"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+
+
+def test_a_called_lists_input_name_never_becomes_the_callers_input() -> None:
+    """Code review of the re-cut: with no input-handle of the caller's own, the called list's input
+    name must not decide the caller's input, or a caller scratch handle with that name is read as
+    msg. The control (no call) refuses the same send."""
+    write = _write("other-handle", "%OUT", "BUILT")
+    send = _role_send("other-handle", "%OUT", "OB_OUT")
+    call = _call_of(" pass %OUT", _write("input-handle", "%OUT", "STAMP"))
+    for export in (write + send, write + call + send):
+        body = _handler_body(_handler_source(export))
+        assert "set_field(msg" not in body
+        assert 'Send("OB_OUT"' not in body
+
+
+def test_a_call_with_no_data_wrapping_a_nested_call_keeps_its_own_scope() -> None:
+    """A ``<Call>`` with no ``@Data`` is never dissolved as a branch-group wrapper, so its list
+    runs in its own scope even when it holds a nested call, and a handle it rebuilds is unknown."""
+    call = (
+        '<Call Name="Sub"><Actions><Line Data="ActionListCall &quot;Inner&quot;"/>'
+        + _create("%OUT", _ADT_A04)
+        + "</Actions></Call>"
+    )
+    body = _handler_body(_handler_source(_CLONE_OUT + call + _SEND_OUT))
+    assert 'Send("OB_OUT"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
 
 
 def test_a_called_lists_input_is_not_the_callers_msg() -> None:

@@ -189,7 +189,9 @@ class _Deferred:
     in_control: bool = False
     flat: Action | UnmappedAction | None = None
     # Every handle the statement names as a whole tree, in EITHER reading of its markup, so a span
-    # class the role layer does not list cannot hide a handle from the fail-closed write rule.
+    # class the role layer does not list does not hide a ``%`` handle from the fail-closed write
+    # rule. It is still blind to at least a handle spelled with no ``%`` in a markup-free or
+    # unlisted-class statement, which is why a call is never judged from it (see _Flow._call_keys).
     named: frozenset[str] = frozenset()
     # Every word of the statement that is neither an operand nor the verb, styled or not (see
     # :func:`_statement_words`). Field writes, clones and ``MsgCreate`` are all judged on these.
@@ -835,16 +837,28 @@ def _input_handle(action_list: Element) -> tuple[str, bool]:
     The second value says whether any live element carries role markup at all. Only a list with none
     keeps the superseded model's reading, in which a markup-free field write lands on ``msg``."""
     inputs: set[str] = set()
+    # Input names inside an inlined ``<Call>`` body. They may make the caller's input ambiguous,
+    # because nothing establishes that a call passing nothing does not hand the caller's input to
+    # the called list's input handle. They never decide it: the called list's input is whatever
+    # it was passed, so with no input of the caller's own, a scratch handle that shares the called
+    # list's input name would otherwise be read as msg. Both ways fail closed.
+    called_inputs: set[str] = set()
+    called = {
+        id(inner)
+        for elem in _live_elements(action_list)
+        if _local(elem.tag).lower() == "call"
+        for inner in elem.iter()
+        if inner is not elem
+    }
     marked = False
-    # An inlined ``<Call>`` body votes too. Nothing establishes that a call which passes nothing
-    # does not hand the caller's input to the called list's input handle, so a second name there
-    # makes the caller's input ambiguous: fail closed.
     for elem in _live_elements(action_list):
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
         marked = marked or bool(tokens)
-        inputs.update(t.text for t in tokens if t.source_class == "input-handle")
-    return (next(iter(inputs)) if len(inputs) == 1 else ""), marked
+        names = {t.text for t in tokens if t.source_class == "input-handle"}
+        (called_inputs if id(elem) in called else inputs).update(names)
+    one = next(iter(inputs)) if len(inputs) == 1 and called_inputs <= inputs else ""
+    return one, marked
 
 
 def _live_elements(action_list: Element) -> list[Element]:
@@ -1525,7 +1539,9 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
         )
         return [Control("unknown", tag, statement or note, body=tuple(body), deferred=deferred)]
 
-    if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
+    # Never a ``<Call>``: dissolving one would run the called list's statements in the caller's
+    # scope, so a handle the called list rebuilt would keep the caller's stale local.
+    if not data and kind != "call" and any(isinstance(s, Control) and s.kind == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
         # at all, holding one child per branch (``<Line Data="If (…)">``, ``<Line Data="Else">``,
         # ``<Line Data="Catch">``) that each carry their OWN condition and their OWN body. Emitting a
@@ -1848,7 +1864,7 @@ class _Env(Mapping[str, str]):
 
 
 #: In a set of handle keys: the statement may reach ANY handle, the input included (a call whose list
-#: is not inlined, or whose list may overwrite some tree whole).
+#: is not inlined, or whose list may do more than read).
 _EVERY_HANDLE = "\x00every"
 #: In a set of handle keys: the statement may reach every handle except the input while it is still
 #: ``msg`` (an inlined call, see :meth:`_Flow._call`).
@@ -1903,6 +1919,7 @@ class _Flow:
         # Keyed by the id of a body tuple of the unsettled tree. The tuple rides in the value, so it
         # stays alive and its id cannot be reused for another body while this walk runs.
         self._written_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
+        self._reads_memo: dict[int, tuple[tuple[Step, ...], int]] = {}
 
     def handler(self, steps: tuple[Step, ...]) -> tuple[Step, ...]:
         env = _Env({self._input: "msg"} if self._input else {})
@@ -2067,16 +2084,51 @@ class _Flow:
         return replace(step, body=tuple(body))
 
     def _call_keys(self, step: Control) -> frozenset[str]:
-        """What a call leaves unknown: every handle but the input while it is still ``msg``.
+        """What a call leaves unknown: every handle, and the input too unless the call spares it.
 
-        The input is spared because generated code never rebinds ``msg``, so the input can change
-        only in place. Corepoint can still replace it whole: the called list names what it was
-        passed by its own handle, so a whole-tree write under ANY name may be the input. So the
-        input is unknown too when the called list may overwrite any tree whole, judged by
-        :meth:`_written` with no name compared. A call whose list is not inlined may do anything."""
-        if not step.body or self._written(step.body) - {_EVERY_LOCAL}:
-            return frozenset({_EVERY_HANDLE})
-        return frozenset({_EVERY_LOCAL})
+        Generated code never rebinds ``msg``. But Corepoint can replace the input whole through a
+        call, because the called list names what it was passed by its own handle, under any
+        spelling, so no reading of its operands can rule that out. And an edit it makes in place
+        is a TODO in the inlined body, so ``msg`` would go out without it. So the input survives
+        only a call whose inlined list does nothing but read (see :meth:`_reads_only`), judged by
+        verb and never by a handle's name. A call whose list is not inlined may do anything."""
+        if self._reads_only(step.body) > 0:
+            return frozenset({_EVERY_LOCAL})
+        return frozenset({_EVERY_HANDLE})
+
+    def _reads_only(self, steps: tuple[Step, ...]) -> int:
+        """How many live statements ``steps`` holds when every one is a read-only verb (see
+        :data:`_READ_ONLY_VERBS`), nested constructs included; ``-1`` when any one may be more.
+
+        Deliberately narrow, as that set is: a field write, a clone, a ``MsgCreate``, an unread
+        verb, an element this module does not model, an exit and a nested call all count as more,
+        and so does a step with no statement at all. Memoized like :meth:`_written`."""
+        cached = self._reads_memo.get(id(steps))
+        if cached is not None:
+            return cached[1]
+        count = 0
+        for step in steps:
+            if not isinstance(step, Control):
+                count = -1
+            elif step.kind == "disabled":
+                continue
+            elif step.kind in ("pending", "send"):
+                read_only = step.deferred is not None and step.deferred.verb.lower() in (
+                    _READ_ONLY_VERBS
+                )
+                count = count + 1 if read_only else -1
+            elif step.kind in ("block", "break", *_NESTING_KINDS):
+                for nested in (step.body, *(branch.body for branch in step.branches)):
+                    inner = self._reads_only(nested)
+                    count = -1 if inner < 0 else count + inner
+                    if count < 0:
+                        break
+            else:
+                count = -1
+            if count < 0:
+                break
+        self._reads_memo[id(steps)] = (steps, count)
+        return count
 
     def _strays(self, ctrl: Control, env: _Env) -> Control:
         """Settle the branches the render inlines AFTER ``ctrl`` (see :func:`_stray_branches`)."""
