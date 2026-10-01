@@ -68,12 +68,17 @@ _ORDINARY = "ORDINARY_OPERATOR_VARIABLE"
 _ALLOWED = "PYTHONHASHSEED"
 _ALLOWED_VALUE = "4242"
 
+#: The secrets a library reads when the engine's own setting is unset. Typed here, not read from
+#: ``childenv``: a list checked against itself checks nothing.
+_LIBRARY_FALLBACK_SECRETS = frozenset({"VAULT_TOKEN", "PGPASSWORD"})
+
 #: Every environment name the engine calls a secret: the registry's fixed names, one ``env()``
-#: connection secret (the prefix is fixed, the suffix is the operator's), and the one name outside
+#: connection secret (the prefix is fixed, the suffix is the operator's), and the names outside
 #: the engine's namespace that it may still rely on.
 _SECRET_NAMES = frozenset(
     {name for name in CRITICAL_SECRETS if name.startswith(childenv.ENGINE_ENV_PREFIX)}
-    | {VALUE_ENV_PREFIX + "PARTNER_PASSWORD", "VAULT_TOKEN"}
+    | {VALUE_ENV_PREFIX + "PARTNER_PASSWORD"}
+    | _LIBRARY_FALLBACK_SECRETS
 )
 
 _PACKAGE_ROOT = str(Path(messagefoundry.__file__).resolve().parent.parent)
@@ -267,10 +272,29 @@ def test_the_worker_environment_is_an_allowlist() -> None:
     assert kept == {"PATH": "/usr/bin", "TZ": "UTC", _ALLOWED: _ALLOWED_VALUE}
 
 
+def test_a_variable_that_only_looks_like_the_interpreters_or_the_locales_does_not_cross() -> None:
+    """The allowlist is names, not prefixes: an operator's own variable can start with the same
+    letters as an interpreter or a locale variable."""
+    parent = {"PYTHON_APP_SECRET": _MARKER, "PYTHONSTARTUP": "x", "LC_MY_TOKEN": _MARKER}
+    assert childenv.worker_environment({**parent, "PYTHONUTF8": "1"}).get("PYTHONUTF8") == "1"
+    assert set(childenv.worker_environment(parent)) & set(parent) == set()
+
+
 def test_a_named_engine_switch_crosses_and_nothing_else_in_the_namespace_does() -> None:
     switch = settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV
     env = childenv.worker_environment(_parent_environment(), engine_switches=(switch,))
     assert {n for n in env if n.startswith(childenv.ENGINE_ENV_PREFIX)} == {switch}
+    with pytest.raises(TypeError):
+        childenv.worker_environment(_parent_environment(), engine_switches=switch)
+
+
+def test_the_operator_page_names_each_library_secret_the_hook_loses() -> None:
+    """The ``[dr]`` rows state the rule in words an operator reads. Hold them to the code's list."""
+    repository = Path(__file__).resolve().parents[1]
+    page = (repository / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+    row = next(line for line in page.splitlines() if line.startswith("| `takeover_hook` |"))
+    assert childenv._ENGINE_SECRETS_OUTSIDE_THE_PREFIX == _LIBRARY_FALLBACK_SECRETS
+    assert [name for name in sorted(_LIBRARY_FALLBACK_SECRETS) if f"`{name}`" not in row] == []
 
 
 def test_the_hook_environment_drops_the_engine_namespace_and_nothing_else() -> None:
@@ -278,7 +302,9 @@ def test_the_hook_environment_drops_the_engine_namespace_and_nothing_else() -> N
     env = childenv.hook_environment(parent)
     dropped = set(parent) - set(env)
     assert dropped == {
-        n for n in parent if n.startswith(childenv.ENGINE_ENV_PREFIX) or n == "VAULT_TOKEN"
+        n
+        for n in parent
+        if n.startswith(childenv.ENGINE_ENV_PREFIX) or n in _LIBRARY_FALLBACK_SECRETS
     }
     assert dropped >= _SECRET_NAMES
     assert env[_ORDINARY] == _MARKER
@@ -329,16 +355,21 @@ def test_the_python_children_are_told_where_the_parents_package_is(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``-P`` takes the working directory off the child's import path. An engine run from a source
-    checkout found its own package there, so the child is told the location instead."""
+    checkout found its own package there, so the child is told the location instead, and told it
+    first, so that another copy further down the path cannot answer in the child."""
     monkeypatch.setattr(site, "getsitepackages", lambda: [])
     monkeypatch.setattr(site, "getusersitepackages", lambda: "")
-    monkeypatch.setattr(childenv, "_searches_the_working_directory", lambda: True)
     for build in _BUILDERS_OF_A_PYTHON_CHILD:
-        env = build({"PYTHONPATH": _OPERATOR_PATH})
-        assert env["PYTHONPATH"].split(os.pathsep) == [_PACKAGE_ROOT, _OPERATOR_PATH]
         assert build({})["PYTHONPATH"] == _PACKAGE_ROOT
-        # A child of a child: the location is already there, so it is not stacked again.
-        assert build(env)["PYTHONPATH"] == env["PYTHONPATH"]
+        for inherited in (
+            _OPERATOR_PATH,
+            os.pathsep.join((_OPERATOR_PATH, _PACKAGE_ROOT)),
+            os.pathsep.join((".", _OPERATOR_PATH)),
+        ):
+            env = build({"PYTHONPATH": inherited})
+            assert env["PYTHONPATH"].split(os.pathsep) == [_PACKAGE_ROOT, _OPERATOR_PATH]
+            # A child of a child: the location is already first, so it is not stacked again.
+            assert build(env)["PYTHONPATH"] == env["PYTHONPATH"]
 
 
 @pytest.mark.parametrize(
@@ -357,23 +388,15 @@ def test_an_entry_that_names_the_working_directory_does_not_reach_the_child(
         assert [entry for entry in crossed.split(os.pathsep) if entry] == expected
 
 
-def test_a_child_that_finds_the_package_by_itself_is_told_nothing(
+def test_an_installed_package_adds_nothing_to_the_childs_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two cases. The package is in site-packages, which every child searches; naming it on
-    ``PYTHONPATH`` would move it ahead of the standard library. Or this process was itself started
-    with ``-P``, so it found the package without the working directory and its child does too."""
-    for in_site_packages, searches_cwd in ((True, True), (False, False)):
-        monkeypatch.setattr(
-            site, "getsitepackages", lambda found=in_site_packages: [_PACKAGE_ROOT] if found else []
-        )
-        monkeypatch.setattr(site, "getusersitepackages", lambda: "")
-        monkeypatch.setattr(
-            childenv, "_searches_the_working_directory", lambda answer=searches_cwd: answer
-        )
-        for build in _BUILDERS_OF_A_PYTHON_CHILD:
-            assert "PYTHONPATH" not in build({})
-            assert build({"PYTHONPATH": _OPERATOR_PATH})["PYTHONPATH"] == _OPERATOR_PATH
+    """Installed in site-packages, the child finds the package by itself. Naming site-packages on
+    ``PYTHONPATH`` would move it ahead of the standard library."""
+    monkeypatch.setattr(site, "getsitepackages", lambda: [_PACKAGE_ROOT])
+    for build in _BUILDERS_OF_A_PYTHON_CHILD:
+        assert "PYTHONPATH" not in build({})
+        assert build({"PYTHONPATH": _OPERATOR_PATH})["PYTHONPATH"] == _OPERATOR_PATH
 
 
 # --- the static guard ---------------------------------------------------------------------------
@@ -385,9 +408,10 @@ def test_a_child_that_finds_the_package_by_itself_is_told_nothing(
 # from. The walk over calls is this file's own.
 #
 # Its limits, so nobody reads a green run as more than it is. It reads at least the starts the
-# inventory's tables name. It takes ``env=<name>`` on trust when that name is assigned straight from
-# a builder in the same function, and does not follow a later reassignment. It cannot see a start
-# made by a third-party library, or one reached through ``getattr`` with a computed name.
+# inventory's tables name. It takes ``env=<name>`` on trust when that name is bound once, in the
+# same function body, straight from a builder; it does not see the dict being changed afterwards
+# (``env.update(...)``). It cannot see a start made by a third-party library, or one reached
+# through ``getattr`` with a computed name.
 
 #: The only environments that count as chosen: a call to one of these.
 _BUILDERS = frozenset(
@@ -412,8 +436,8 @@ _AS_A_VALUE = " (as a value)"
 
 #: Starts that hand the child the caller's whole environment on purpose, as ``(module, enclosing
 #: function, start)``, each with its reason. A start named ``... (as a value)`` is a reference to
-#: the function that is not itself a call. An entry for a call covers ONE call: a second start added
-#: to a listed function fails the guard.
+#: the function that is not itself a call. An entry covers ONE start unless :data:`_MORE_THAN_ONE`
+#: says otherwise: a second start added to a listed function fails the guard.
 _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
     ("auth/trust_anchors.py", "dacl_is_owner_only", "subprocess.run"): _PINNED_TOOL,
     ("store/store.py", "_secure_file", "subprocess.run"): _PINNED_TOOL,
@@ -440,6 +464,12 @@ _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
         "the tray starting itself again under its branded launcher: the same program, as the same "
         "desktop user, so it needs the environment it already has"
     ),
+}
+
+#: Listed sites that hold more than one start, with the number.
+_MORE_THAN_ONE: dict[tuple[str, str, str], int] = {
+    # The prototype is set in two statements: ``argtypes`` and ``restype``.
+    ("service.py", "_runas_wait", "ShellExecuteExW" + _AS_A_VALUE): 2,
 }
 
 #: The sites this change is about. They are also the positive control: a walker that could not see
@@ -475,14 +505,33 @@ def _is_builder_call(node: ast.AST, aliases: Mapping[str, str]) -> bool:
     return isinstance(node, ast.Call) and _dotted(node.func, aliases) in _BUILDERS
 
 
+def _own_nodes(scope: ast.AST) -> list[ast.AST]:
+    """The nodes of one function or module body, without the bodies of the functions, lambdas and
+    classes nested in it: a name bound in an inner scope says nothing about the outer one."""
+    found: list[ast.AST] = []
+    pending = list(ast.iter_child_nodes(scope))
+    while pending:
+        node = pending.pop()
+        found.append(node)
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
+            pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
 def _built_names(scope: ast.AST, aliases: Mapping[str, str]) -> frozenset[str]:
-    """The local names ``scope`` assigns straight from a builder call."""
+    """The local names ``scope`` binds exactly once, and binds straight from a builder call. A
+    parameter, or a name bound a second time, is not one of them."""
+    nodes = _own_nodes(scope)
+    bound = Counter(
+        node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    )
+    bound.update(node.arg for node in nodes if isinstance(node, ast.arg))
     return frozenset(
         target.id
-        for node in ast.walk(scope)
+        for node in nodes
         if isinstance(node, ast.Assign) and _is_builder_call(node.value, aliases)
         for target in node.targets
-        if isinstance(target, ast.Name)
+        if isinstance(target, ast.Name) and bound[target.id] == 1
     )
 
 
@@ -504,8 +553,8 @@ def _spawn_sites(sources: Mapping[str, str]) -> tuple[Counter[_Site], Counter[_S
     """Every process start in ``sources``, counted per site: ``(starts whose environment a builder
     chose, starts that hand over the caller's)``. A site is ``(module, enclosing function, start)``,
     and the function is qualified by its classes, so two methods of one name stay apart. A start
-    function that is named without being called can only be the second kind, and is recorded once
-    per site under ``<start> (as a value)``."""
+    function that is named without being called can only be the second kind, and is counted under
+    ``<start> (as a value)``."""
     chosen: Counter[_Site] = Counter()
     inherits: Counter[_Site] = Counter()
 
@@ -539,7 +588,7 @@ def _spawn_sites(sources: Mapping[str, str]) -> tuple[Counter[_Site], Counter[_S
             ):
                 start = _start_name(node, aliases)  # noqa: B023
                 if start is not None:
-                    inherits[(rel, where, start[0] + _AS_A_VALUE)] = 1  # noqa: B023
+                    inherits[(rel, where, start[0] + _AS_A_VALUE)] += 1  # noqa: B023
             for child in ast.iter_child_nodes(node):
                 visit(child, classes, function, built)
 
@@ -565,10 +614,11 @@ def test_every_process_the_engine_starts_is_given_an_environment() -> None:
     """One comparison, three failures it can report: a start nobody decided, a second start inside
     a listed function, and a listed site that has gone or now chooses its environment."""
     _chosen, inherits = _live_spawn_sites()
-    assert dict(inherits) == dict.fromkeys(_INHERITS_ON_PURPOSE, 1), (
+    listed = {site_key: _MORE_THAN_ONE.get(site_key, 1) for site_key in _INHERITS_ON_PURPOSE}
+    assert dict(inherits) == listed, (
         "the starts that hand a child the caller's whole environment are not the ones listed in "
-        "_INHERITS_ON_PURPOSE, one each. Pass env= from a messagefoundry.childenv builder, or list "
-        "the site with its reason."
+        "_INHERITS_ON_PURPOSE, in the numbers listed. Pass env= from a messagefoundry.childenv "
+        "builder, or list the site with its reason."
     )
 
 
@@ -677,18 +727,42 @@ def test_each_call_is_counted_and_a_method_is_keyed_by_its_class() -> None:
 
 def test_a_start_passed_as_a_value_is_a_site_of_its_own() -> None:
     """A module that already has a listed call must not hide a second start that is handed to
-    something else to call."""
+    something else to call, and each such reference is counted."""
     source = (
         "import asyncio, subprocess\n"
         "async def f():\n"
         "    subprocess.run(['listed'])\n"
         "    await asyncio.to_thread(subprocess.run, ['unjudged'])\n"
+        "    await asyncio.to_thread(subprocess.run, ['unjudged too'])\n"
     )
     _chosen, inherits = _spawn_sites({"m.py": source})
     assert dict(inherits) == {
         ("m.py", "f", "subprocess.run"): 1,
-        ("m.py", "f", "subprocess.run" + _AS_A_VALUE): 1,
+        ("m.py", "f", "subprocess.run" + _AS_A_VALUE): 2,
     }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Bound twice in the function.
+        "def f():\n    env = hook_environment()\n    env = os.environ\n"
+        "    subprocess.run(['x'], env=env)\n",
+        # The parameter, while an inner function binds the same name from a builder.
+        "def f(env):\n    def inner():\n        env = hook_environment()\n"
+        "    subprocess.run(['x'], env=env)\n",
+        # A module-level name, while a function binds the same name from a builder.
+        "env = os.environ\ndef g():\n    env = hook_environment()\n"
+        "def f():\n    subprocess.run(['x'], env=env)\n",
+        # A class body does not inherit what a method binds.
+        "class C:\n    def g(self):\n        env = hook_environment()\n"
+        "    subprocess.run(['x'], env=env)\n",
+    ],
+)
+def test_a_name_is_trusted_only_where_a_builder_bound_it_once(body: str) -> None:
+    source = _FROM_A_BUILDER + "import os, subprocess\n" + body
+    chosen, inherits = _spawn_sites({"m.py": source})
+    assert (sum(chosen.values()), sum(inherits.values())) == (0, 1)
 
 
 def test_a_call_that_starts_no_process_is_not_a_site() -> None:

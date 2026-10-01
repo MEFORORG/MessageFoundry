@@ -394,10 +394,12 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   child would have read them from its own environment. This ADR never mentioned the environment,
   so nobody decided that; it was inherited.
 
-  **What changed.** Each child the engine starts is now handed an environment that somebody chose.
-  The sandbox worker gets an allowlist, and no `MEFOR_*` variable except one switch its own
-  `load_config` reads. The worker and the engine shards also start with `-P`, so the engine's
-  working directory is not on their import path. `messagefoundry/childenv.py` is the source of
+  **What changed.** The sandbox worker, the DR hook and the engine shards are now each handed an
+  environment that somebody chose. The other processes the engine starts, which run fixed system
+  tools, still inherit; the guard below lists each with its reason. The sandbox worker gets an
+  allowlist, and no `MEFOR_*` variable except one switch its own `load_config` reads. The worker and
+  the engine shards also start with `-P`, which keeps the engine's working directory off their
+  import path unless that directory is the engine's own checkout. `messagefoundry/childenv.py` is the source of
   record for what each child gets and why; the `[sandbox]` and `[dr]` sections of
   [CONFIGURATION.md](../CONFIGURATION.md) say what an operator sees. A guard in
   `tests/test_child_process_environment.py` fails a process start whose environment does not come

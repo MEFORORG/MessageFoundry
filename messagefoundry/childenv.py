@@ -53,13 +53,47 @@ ENGINE_ENV_PREFIX: Final = "MEFOR_"
 
 #: The interpreter flag a ``python -m`` child is started with. Without it Python puts the working
 #: directory first on the child's import path, so a file there could stand in for a module the child
-#: imports. :func:`_with_import_path` hands the child the package location that flag takes away.
+#: imports. :func:`_with_import_path` hands the child the package location that flag takes away,
+#: and says when the flag's promise holds.
 SAFE_PATH_FLAG: Final = "-P"
 
-#: Interpreter variables cross as a namespace, not one by one. They are settings of the interpreter
-#: (encoding, hash seed, warnings, the import path), and a child started without one the parent has
-#: would run the same Handler differently from ``[sandbox].mode = "off"``.
-_INTERPRETER_PREFIX: Final = "PYTHON"
+#: The interpreter's own variables that cross, by name. Each one changes whether the interpreter
+#: starts, where it imports from, or how the same code behaves (encoding, hash seed, warnings), so
+#: a child started without one the parent has would run the same Handler differently from
+#: ``[sandbox].mode = "off"``. Named one by one, not by the ``PYTHON`` prefix: an operator's own
+#: variable can start with those letters. The ones that hand control to a console or a debugger
+#: (``PYTHONSTARTUP``, ``PYTHONINSPECT``, ``PYTHONBREAKPOINT``) are left out on purpose. A variable
+#: a later interpreter adds is not here until somebody adds it.
+_INTERPRETER_NAMES: Final = frozenset(
+    {
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONSAFEPATH",
+        "PYTHONPLATLIBDIR",
+        "PYTHONNOUSERSITE",
+        "PYTHONUSERBASE",
+        "PYTHONHASHSEED",
+        "PYTHONOPTIMIZE",
+        "PYTHONUTF8",
+        "PYTHONIOENCODING",
+        "PYTHONCOERCECLOCALE",
+        "PYTHONLEGACYWINDOWSFSENCODING",
+        "PYTHONLEGACYWINDOWSSTDIO",
+        "PYTHONINTMAXSTRDIGITS",
+        "PYTHONWARNINGS",
+        "PYTHONDEVMODE",
+        "PYTHONCASEOK",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONUNBUFFERED",
+        "PYTHONFAULTHANDLER",
+        "PYTHONMALLOC",
+        "PYTHON_GIL",
+        "PYTHON_JIT",
+        "PYTHON_CPU_COUNT",
+        "PYTHON_FROZEN_MODULES",
+    }
+)
 
 #: What a Windows process needs to start and to find its temp and profile directories, plus the
 #: machine facts ``platform`` reads. Upper case: Windows names are case-insensitive.
@@ -91,8 +125,9 @@ _WINDOWS_NAMES: Final = frozenset(
     }
 )
 
-#: The POSIX equivalent. ``LD_LIBRARY_PATH`` is here because an interpreter built against a shared
-#: library outside the default search path cannot start without it. Every ``LC_*`` name crosses too.
+#: The POSIX equivalent, with the locale categories. ``LD_LIBRARY_PATH`` is here because an
+#: interpreter built against a shared library outside the default search path cannot start
+#: without it.
 _POSIX_NAMES: Final = frozenset(
     {
         "PATH",
@@ -105,9 +140,21 @@ _POSIX_NAMES: Final = frozenset(
         "LANG",
         "LANGUAGE",
         "LD_LIBRARY_PATH",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "LC_ADDRESS",
+        "LC_IDENTIFICATION",
+        "LC_MEASUREMENT",
+        "LC_NAME",
+        "LC_PAPER",
+        "LC_TELEPHONE",
     }
 )
-_POSIX_LOCALE_PREFIX: Final = "LC_"
 
 #: Secrets the engine may rely on that are not named ``MEFOR_*``, because a library it uses reads
 #: them when the engine's own setting is unset. At least these two: hvac falls back to
@@ -120,11 +167,9 @@ _ENGINE_SECRETS_OUTSIDE_THE_PREFIX: Final = frozenset({"VAULT_TOKEN", "PGPASSWOR
 def _allowed_for_a_worker(name: str, engine_switches: Collection[str]) -> bool:
     # Windows names are case-insensitive; POSIX names are not.
     key = name.upper() if sys.platform == "win32" else name
-    if key in engine_switches or key.startswith(_INTERPRETER_PREFIX):
+    if key in engine_switches or key in _INTERPRETER_NAMES:
         return True
-    if sys.platform == "win32":
-        return key in _WINDOWS_NAMES
-    return key in _POSIX_NAMES or key.startswith(_POSIX_LOCALE_PREFIX)
+    return key in (_WINDOWS_NAMES if sys.platform == "win32" else _POSIX_NAMES)
 
 
 def _outside_the_engine_namespace(name: str) -> bool:
@@ -147,40 +192,29 @@ def _site_directories() -> set[str]:
     return {str(Path(entry).resolve()) for entry in found if entry}
 
 
-def _searches_the_working_directory() -> bool:
-    """Whether THIS process was started without :data:`SAFE_PATH_FLAG`, so that its own import of
-    this package may have come from the working directory or the script's directory."""
-    return not sys.flags.safe_path
-
-
 def _with_import_path(env: dict[str, str]) -> dict[str, str]:
     """Set the ``PYTHONPATH`` of a ``python -m`` child started with :data:`SAFE_PATH_FLAG`.
 
-    Two things, both so that the flag means what it says and the child still starts:
+    Two things, both so that the child still starts and imports the build its parent is running:
 
     * **Only absolute entries of the inherited ``PYTHONPATH`` cross.** An empty or relative entry
       names the working directory, which is what the flag takes off the child's import path.
-    * **This package's location goes first, when the child would not find it otherwise.** An engine
-      run from a source checkout that is not installed found its own package in the working
-      directory, so its child would fail to import it. That is the case when this process searches
-      the working directory and the package is outside site-packages. A process started with the
-      flag found the package without the working directory, so its child does too; and
-      site-packages is left off, because a ``PYTHONPATH`` entry is searched ahead of the standard
+    * **This package's location goes first, unless it is in site-packages.** An engine run from a
+      source checkout that is not installed found its own package in the working directory, so its
+      child would fail to import it. Putting it first also keeps another copy, further down the
+      path, from answering in the child when it did not in the parent. Site-packages is left off:
+      every child searches it already, and a ``PYTHONPATH`` entry is searched ahead of the standard
       library.
 
-    For an editable install the entry is redundant, and it puts the checkout ahead of the standard
-    library and site-packages in the child. The working directory already did that for a child of
-    an engine started from its checkout.
+    **So the flag keeps the working directory off the child's path only when that directory is not
+    the engine's own checkout.** For an engine run or installed from a checkout, the checkout is
+    named here, ahead of the standard library, as the working directory was before.
     """
     root = _package_root()
     inherited = env.pop("PYTHONPATH", "")
     entries = [entry for entry in inherited.split(os.pathsep) if os.path.isabs(entry)]
-    if (
-        _searches_the_working_directory()
-        and root not in entries
-        and root not in _site_directories()
-    ):
-        entries.insert(0, root)
+    if root not in _site_directories():
+        entries = [root, *(entry for entry in entries if str(Path(entry).resolve()) != root)]
     if entries:
         env["PYTHONPATH"] = os.pathsep.join(entries)
     return env
@@ -203,6 +237,10 @@ def worker_environment(
     its parent already made. It is for a switch, never for a secret: whatever is named here is in
     the environment of the code this builder exists to keep secrets from.
     """
+    if isinstance(engine_switches, str):
+        # A bare string is a collection of its characters, so no switch would cross and nothing
+        # would say why.
+        raise TypeError("engine_switches takes a collection of names, not one string")
     switches = frozenset(engine_switches)
     return _with_import_path(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, switches)}
