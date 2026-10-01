@@ -1929,7 +1929,7 @@ class MLLPSource(SourceConnector):
             )
         except OSError as exc:
             logger.debug(
-                "MLLP TLS handshake from %s did not complete: %s",
+                "TLS handshake on MLLP from %s did not complete: %s",
                 writer.get_extra_info("peername"),
                 safe_exc(exc),
             )
@@ -1940,7 +1940,7 @@ class MLLPSource(SourceConnector):
         if _lost_its_transport(writer):
             writer._transport = raw  # type: ignore[attr-defined]  # see the docstring
             logger.debug(
-                "MLLP TLS connection from %s closed during its handshake",
+                "TLS connection on MLLP from %s closed during its handshake",
                 raw.get_extra_info("peername"),
             )
             return False
