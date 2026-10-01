@@ -390,9 +390,9 @@ class _Clock:
 class _RecordingPool(LendsItself):
     """A lease pool that records the per-statement timeout and can advance either clock mid-flight.
 
-    Since BACKLOG #2523 the clamp bounds the statement and its release, and the borrow gets the
-    fence instead. :class:`LendsItself` records the release's timeout, which is the statement's,
-    and ``last_timeout`` reads it back.
+    Since BACKLOG #2523 the clamp reaches the borrow, the statement and the release, rather than an
+    asyncpg per-call keyword. :class:`LendsItself` records the release's timeout, which is the
+    statement's, and ``last_timeout`` reads it back.
 
     ``db_advance_before`` moves the DB clock to the instant the statement EXECUTES (which is where a
     real server stamps ``lease_expires_at``); ``mono_advance_after`` moves this node's monotonic clock

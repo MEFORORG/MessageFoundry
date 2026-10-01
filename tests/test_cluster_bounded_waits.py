@@ -78,8 +78,10 @@ class _Server:
         self.fail: set[str] = set()
         self.hung = asyncio.Event()  # set once a statement is hanging, so a test can act then
         self.answer = asyncio.Event()  # a partitioned server answers only if a test sets this
+        self.sent: list[str] = []  # every statement that reached the server
 
     async def run(self, sql: str, node: str) -> object:
+        self.sent.append(sql)
         if any(fragment in sql for fragment in self.hang):
             self.hung.set()
             await self.answer.wait()
@@ -100,8 +102,14 @@ class _Conn:
         self.in_flight = False
 
     async def _run(self, sql: str, node: str) -> object:
+        # in_flight stays set only when the statement is CANCELLED before it returns, which is the one
+        # case asyncpg's release waits on. An ordinary error clears it, as a real release does not wait.
         self.in_flight = True
-        result = await self._server.run(sql, node)
+        try:
+            result = await self._server.run(sql, node)
+        except Exception:
+            self.in_flight = False
+            raise
         self.in_flight = False
         return result
 
@@ -240,20 +248,20 @@ async def _timed[T](aw: Awaitable[T]) -> tuple[float, T]:
 # --- stop() -------------------------------------------------------------------------------------
 
 
-async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_borrow_bound(
+async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_release_bound(
     server: _Server,
 ) -> None:
     """stop() cancels the maintenance task while its heartbeat UPDATE is hung on the server. The
     task must FINISH, not merely be left behind by stop()'s own bound: its connection goes back to the
-    pool within the release's timeout, which for a statement other than a lease one is the fence.
+    pool within the release's timeout, which for a statement in the maintenance loop is the clamp.
 
     MUTATION ARM, measured: send the statement through the pool's own ``execute`` (as before #2523)
     and the task is still running after stop() returns, because the release waits for ever."""
-    # A fence long enough that stop()'s cancel lands well inside it on a loaded runner. If the
+    # A clamp long enough that stop()'s cancel lands well inside it on a loaded runner. If the
     # coordinator's own deadline fired first, the loop would move on to a claim before stop() ran.
-    fence = 1.0
+    renew = 1.0
     server.hang.add(_HEARTBEAT_SQL)
-    a, pool = _pg(server, fence=fence)
+    a, pool = _pg(server, renew=renew, fence=_GUARD)
     await a.start()
     await asyncio.wait_for(server.hung.wait(), _GUARD)
     heartbeat = a._heartbeat_task
@@ -264,14 +272,14 @@ async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_borrow_bound(
     assert elapsed < _STOP_BOUND + _SLACK
     # stop() did not wait for it (its own bound is shorter), but the task finishes within the
     # release's timeout.
-    await asyncio.wait({heartbeat}, timeout=fence + _SLACK)
+    await asyncio.wait({heartbeat}, timeout=renew + _SLACK)
     assert heartbeat.done(), "the cancelled heartbeat is still waiting on its connection's release"
     # And it finished CANCELLED. The stand-in's release raises TimeoutError over the cancel, as
     # asyncpg's does; without _call_within restoring the cancel, the loop logs that as a failed
     # heartbeat and goes on to send a claim after stop() had cancelled it.
     assert heartbeat.cancelled(), "the cancel was swallowed by the release's TimeoutError"
     assert server.row.owner is None, "the cancelled loop went on to claim the lease"
-    assert fence in pool.release_timeouts
+    assert renew in pool.release_timeouts
     assert None not in pool.acquire_timeouts, "a statement borrowed with no timeout"
     assert None not in pool.release_timeouts, "a statement released with no timeout"
 
@@ -281,13 +289,13 @@ async def test_a_cancel_survives_a_release_that_raises_over_it(server: _Server) 
     error over the cancel the borrower was unwinding with, and the maintenance loop catches
     ``Exception``. Here the connection dies under the cancel, so the release raises at once.
 
-    The fence is set long on purpose, so the coordinator's own deadline cannot fire first and turn
+    The clamp is set long on purpose, so the coordinator's own deadline cannot fire first and turn
     the hung heartbeat into an ordinary timeout before stop() cancels it.
 
     MUTATION ARM, measured: drop the restore in ``_call_within`` and the loop logs a failed heartbeat,
     then sends a claim and takes the lease after stop() had cancelled it."""
     server.hang.add(_HEARTBEAT_SQL)
-    a, pool = _pg(server, fence=_GUARD)
+    a, pool = _pg(server, renew=_GUARD, fence=_GUARD)
     pool.release_fails = True
     await a.start()
     await asyncio.wait_for(server.hung.wait(), _GUARD)
@@ -337,21 +345,43 @@ async def test_stop_is_bounded_when_a_background_task_never_unwinds(
 # --- the lease statements -----------------------------------------------------------------------
 
 
-async def test_a_busy_pool_does_not_fail_the_renew(server: _Server) -> None:
-    """Review finding on the first cut of #2523: the renew clamp also bounded the wait for a pool
-    connection. The coordinator shares the store's pool, so a leader whose pool was merely busy
-    failed every renew and self-fenced under load. The borrow now waits up to the fence, apart from
-    the clamp, which still bounds the statement.
+async def test_the_clamp_bounds_a_renew_from_issue_borrow_included(server: _Server) -> None:
+    """ADR 0157 Inc 0's premise: the clamp bounds how long a renew stays in flight after it is
+    ISSUED, and the fence baseline is stamped before the borrow. A round-1 review repair gave the
+    borrow its own wait up to the fence, and round 2 found the cost: a renew could commit after
+    this node had self-fenced and promote it again, and a tick could hold the leadership lock past
+    the fence. So a renew whose borrow outlasts the clamp fails, and the baseline does not move.
 
-    MUTATION ARM, measured: make the claim's borrow share the statement's deadline again and this
-    renew raises TimeoutError."""
+    The price, kept on purpose: on a pool too busy to lend a connection within the clamp, the
+    renew fails like any other slow renew, and the leader fences if that lasts past the fence.
+
+    MUTATION ARM, measured: give the borrow its own wait and this renew succeeds."""
     a, pool = _pg(server, renew=0.05, fence=_GUARD)
-    pool.borrow_delay = 0.3  # longer than the clamp, well inside the fence
+    await a._maintain_leadership()
+    baseline = a._last_renew_ok
+    pool.borrow_delay = 0.3  # longer than the clamp
 
-    await asyncio.wait_for(a._maintain_leadership(), _GUARD)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(a._maintain_leadership(), _GUARD)
 
-    assert a.is_leader() is True
-    assert pool.acquire_timeouts[-1] == _GUARD and pool.release_timeouts[-1] == 0.05
+    assert a._last_renew_ok == baseline, "a renew that missed the clamp moved the fence baseline"
+    assert pool.acquire_timeouts[-1] == 0.05
+
+
+async def test_a_borrow_that_used_the_deadline_sends_no_statement(server: _Server) -> None:
+    """Review round 2: an expired ``asyncio.timeout`` cancels only at the statement's first
+    suspension, and asyncpg may already have written a cached statement by then, so a write could
+    commit while its caller was told it timed out. A borrow that used the whole deadline therefore
+    raises before the statement is sent.
+
+    MUTATION ARM, measured: drop the check after the borrow and the claim reaches the server."""
+    a, pool = _pg(server, renew=0.05)
+    pool.borrow_delay = 0.05  # exactly the clamp: the borrow returns, with no time left
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(a._maintain_leadership(), _GUARD)
+
+    assert server.sent == [], "a statement went out after its deadline had passed"
 
 
 async def test_a_stepdown_whose_release_write_hangs_returns_within_the_bound(

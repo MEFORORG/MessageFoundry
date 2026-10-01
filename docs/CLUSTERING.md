@@ -505,6 +505,12 @@ seconds on SQL Server, where `[store].command_timeout` (30) is longer than the f
 4.5 second renew timeout on Postgres. A read that misses the limit fails, the node logs it and stays
 paused, and the stepdown gets the lock in time ([BACKLOG #2540](BACKLOG.md)).
 
+The limit is on the read, and cleaning up after a stalled read takes a little longer. On Postgres the
+driver may wait as long again to hand the connection back, so the read can hold the lock for up to
+9 seconds at the shipped settings. On SQL Server the cleanup is normally instant, but it can take up
+to 5 more seconds. **So keep `leader_fence_timeout_seconds` above 20 on SQL Server** if a retried
+stepdown must never see `503 lock-timeout` while the store is slow.
+
 We chose that limit over two other designs. Moving the read into the claim statement would break
 the retry of an unconfirmed release, which relies on a claim that finds no row to clear the owed
 write ([BACKLOG #1508](BACKLOG.md)). Moving the read outside the lock would let it race a stepdown
