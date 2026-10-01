@@ -1234,7 +1234,10 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `safe_name`.
   - **SFTP:** atomic where the server honours the SFTP `RENAME`, which refuses an existing name.
     OpenSSH's server does, on a filesystem with hard links. `_SftpClient.publish` in
-    `transports/remotefile.py` states where it does not hold.
+    `transports/remotefile.py` states where it does not hold, and two costs: on OpenSSH the final
+    name appears by a hard link, so a partner watching for a move event does not see it, and a
+    server that refuses `RENAME` outright fails every delivery. Either site sets
+    `overwrite = true` with a per-message `filename`.
   - **FTP and FTPS: not atomic.** A partner file written in the few round trips between the
     publish's own listing and `RNTO` is still replaced on a server whose `RNTO` replaces.
     `_FtpClient.publish` states why. The check costs one more directory listing per delivery.

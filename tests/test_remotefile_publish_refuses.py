@@ -413,9 +413,16 @@ class _ScriptedFtp:
     leaves that to the server. ``appear_after_listing`` lands partner files after the first listing,
     which is between the client's check and its rename."""
 
-    def __init__(self, files: dict[str, bytes], *, replaces: bool = False) -> None:
+    def __init__(
+        self, files: dict[str, bytes], *, replaces: bool = False, case_blind: bool = False
+    ) -> None:
         self.files = dict(files)
         self.replaces = replaces
+        #: A case-insensitive server: ``RNTO`` onto a case variant of a held name is refused.
+        self.case_blind = case_blind
+        #: With ``list_reply`` set, this many listings answer before the refusals start.
+        self.listings_before_failure = 0
+        self.listings = 0
         self.appear_after_listing: dict[str, bytes] = {}
         self.rnto_reply: str | None = None
         #: When set, MLSD and NLST both refuse with this 5xx reply.
@@ -430,7 +437,8 @@ class _ScriptedFtp:
 
     def mlsd(self, path: str = "", facts: Any = ()) -> Iterator[tuple[str, dict[str, str]]]:
         self.calls.append(f"MLSD {path}")
-        if self.list_reply is not None:
+        self.listings += 1
+        if self.list_reply is not None and self.listings > self.listings_before_failure:
             raise ftplib.error_perm(self.list_reply)
         listing = [
             (posixpath.basename(p), {"type": "file"})
@@ -444,6 +452,11 @@ class _ScriptedFtp:
     def nlst(self, path: str = "") -> list[str]:
         assert self.list_reply is not None, "MLSD answers unless list_reply is set"
         raise ftplib.error_perm(self.list_reply)
+
+    def _held(self, toname: str) -> bool:
+        if self.case_blind:
+            return toname.casefold() in {p.casefold() for p in self.files}
+        return toname in self.files
 
     def sendcmd(self, cmd: str) -> str:
         verb, _, arg = cmd.partition(" ")
@@ -459,7 +472,7 @@ class _ScriptedFtp:
         self.calls.append(f"RNTO {toname}")
         if self.rnto_reply is not None:
             raise ftplib.error_perm(self.rnto_reply)
-        if toname in self.files and not self.replaces:
+        if self._held(toname) and not self.replaces:
             raise ftplib.error_perm("550 Rename failed: file exists")
         self.files[toname] = self.files.pop(self._rnfr)
         return "250 Rename successful"
@@ -548,13 +561,42 @@ def test_ftp_publish_refused_for_another_reason_keeps_its_class(
     assert "553" in str(caught.value)
 
 
-def test_ftp_publish_skips_a_case_variant_of_a_taken_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A case-insensitive server holds ``MSG.HL7`` against ``msg.hl7`` and would refuse the
-    ``RNTO``, so the check compares case-blind and moves straight on."""
-    ftp = _ScriptedFtp({"/in/.t.part": b"new", "/in/MSG.HL7": _PARTNER})
+def test_ftp_publish_moves_past_a_case_variant_a_case_blind_server_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A case-insensitive server holds ``MSG.HL7`` against ``msg.hl7`` and refuses the ``RNTO``.
+    The fresh listing after the refusal compares case-blind, so it is a collision, not a fault."""
+    ftp = _ScriptedFtp({"/in/.t.part": b"new", "/in/MSG.HL7": _PARTNER}, case_blind=True)
     client = _ftp_client(ftp, monkeypatch)
     assert client.publish("/in/.t.part", ["/in/msg.hl7", "/in/msg-1.hl7"]) == "/in/msg-1.hl7"
     assert ftp.files == {"/in/MSG.HL7": _PARTNER, "/in/msg-1.hl7": b"new"}
+    assert ftp.calls == ["MLSD /in", "RNTO /in/msg.hl7", "MLSD /in", "RNTO /in/msg-1.hl7"]
+
+
+def test_ftp_publish_keeps_the_name_beside_a_case_variant_on_a_case_sensitive_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CONTROL: where the server tells ``msg.hl7`` from ``MSG.HL7``, the rendered name is kept."""
+    ftp = _ScriptedFtp({"/in/.t.part": b"new", "/in/MSG.HL7": _PARTNER})
+    client = _ftp_client(ftp, monkeypatch)
+    assert client.publish("/in/.t.part", ["/in/msg.hl7", "/in/msg-1.hl7"]) == "/in/msg.hl7"
+    assert ftp.files == {"/in/MSG.HL7": _PARTNER, "/in/msg.hl7": b"new"}
+
+
+def test_ftp_refusal_stays_permanent_when_the_confirming_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``RNTO`` answers ``553`` and the listing meant to confirm a collision then fails. That
+    confirms nothing, so the ``553`` keeps its permanent class rather than becoming a retry."""
+    ftp = _ScriptedFtp({"/in/.t.part": b"new"})
+    ftp.rnto_reply = "553 Requested action not taken"
+    ftp.list_reply = "550 No files found"
+    ftp.listings_before_failure = 1
+    with pytest.raises(_RemoteError) as caught:
+        _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7"])
+    assert caught.value.permanent is True
+    assert "553" in str(caught.value)
+    assert ftp.listings == 2  # the confirming listing ran, and failed
 
 
 def test_ftp_publish_with_the_temp_gone_is_not_a_collision(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -581,17 +623,6 @@ def test_ftp_publish_listing_failure_is_transient(monkeypatch: pytest.MonkeyPatc
     assert ftp.files == {"/in/.t.part": b"new"}
 
 
-async def test_the_listing_is_case_blind(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The first guess compares case-blind too: ``MSG.HL7`` listed means ``msg.hl7`` is not
-    offered, so the upload lands under ``msg-1.hl7`` without a refusal."""
-    client = _RacingClient({"/in/MSG.HL7": _PARTNER})
-    dest = _dest(monkeypatch, client, filename="msg.hl7", overwrite=False)
-    await dest.send("new")
-    assert client.files["/in/MSG.HL7"] == _PARTNER
-    assert client.files["/in/msg-1.hl7"] == b"new"
-    assert [dst for op, dst in client.ops if op == "publish"] == ["/in/msg-1.hl7"]
-
-
 # === an SFTP rename whose outcome is unknown is never a collision ==============
 
 
@@ -600,23 +631,32 @@ class _StubSftp:
     carries out the move when ``moves`` is set, then raises ``fail_with``, as a reply lost or late
     would."""
 
-    def __init__(self, files: dict[str, bytes], fail_with: Exception, *, moves: bool) -> None:
+    def __init__(
+        self,
+        files: dict[str, bytes],
+        fail_with: Exception | None,
+        *,
+        moves: bool,
+        missing: Exception | None = None,
+    ) -> None:
         self.files = dict(files)
         self.calls: list[str] = []
         self._fail_with = fail_with
         self._moves = moves
+        self._missing = missing or FileNotFoundError("no such file")
 
     def lstat(self, path: str) -> object:
         self.calls.append(f"lstat {path}")
         if path not in self.files:
-            raise FileNotFoundError(path)
+            raise self._missing
         return object()
 
     def rename(self, oldpath: str, newpath: str) -> None:
         self.calls.append(f"rename {newpath}")
         if self._moves:
             self.files[newpath] = self.files.pop(oldpath)
-        raise self._fail_with
+        if self._fail_with is not None:
+            raise self._fail_with
 
 
 def _stub_sftp_client(sftp: _StubSftp, monkeypatch: pytest.MonkeyPatch) -> _SftpClient:
@@ -644,3 +684,13 @@ def test_sftp_rename_timeout_is_not_a_collision(monkeypatch: pytest.MonkeyPatch)
     with pytest.raises(TimeoutError):
         _stub_sftp_client(sftp, monkeypatch).publish("/in/.t.part", ["/in/a.hl7", "/in/b.hl7"])
     assert sftp.calls == ["lstat /in/a.hl7", "rename /in/a.hl7"]
+
+
+def test_sftp_publish_goes_ahead_when_the_server_will_not_stat_a_missing_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Some servers answer ``lstat`` of a missing path with a permission failure. The check then
+    says nothing, and the ``RENAME``'s own refusal decides, so the upload is not blocked."""
+    sftp = _StubSftp({"/in/.t.part": b"new"}, None, moves=True, missing=PermissionError("denied"))
+    assert _stub_sftp_client(sftp, monkeypatch).publish("/in/.t.part", ["/in/a.hl7"]) == "/in/a.hl7"
+    assert sftp.files == {"/in/a.hl7": b"new"}
