@@ -16,6 +16,7 @@ from the evidence by an edit to either side alone.
 from __future__ import annotations
 
 import csv
+import functools
 from collections import defaultdict
 from pathlib import Path
 
@@ -34,18 +35,22 @@ from harness.load.connscale.runner import (
     current_leg,
     herd_floor_armed,
 )
+from scripts import connscale_harvest as ch
 from tests.test_connscale_empty_claims_per_msg import _rec
-from tests.test_connscale_smoke import _HERD_FLOOR_LEGS
+from tests.test_connscale_smoke import _HERD_FLOOR_LEGS, _SMOKE_COUNTS, _smoke_profile
 
 _ARMED = "ubuntu-latest-py3.14"
 _HARVEST = (
     Path(__file__).resolve().parents[1]
     / "docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/readings.csv"
 )
-#: The smoke profile's offered aggregate rate per lane at the base count N=12: aggregate_rate 24.0,
-#: and per_conn_rate 1.0 times 12 connections.
-_RATE = {"fixed_aggregate": 24.0, "fixed_per_conn": 12.0}
-_BASE = 12
+#: Read off the profile CI runs, so a change to its base count or rates cannot leave this module
+#: grading the old numbers while the armed legs drift from the evidence.
+_SMOKE: ConnScaleProfile = _smoke_profile(20000)  # type: ignore[assignment]
+_BASE = min(_SMOKE_COUNTS)
+_RATE = {
+    lane: _SMOKE.aggregate_rate_for(lane, _BASE) for lane in ("fixed_aggregate", "fixed_per_conn")
+}
 #: #1415 clause (a): min(passing base readings) / F must reach this.
 _MARGIN = 1.25
 #: #1415 clause (c), as the owner set it on 2026-10-01: run 36797223259, job 110163384729,
@@ -59,11 +64,8 @@ _KNOWN_RUN, _KNOWN_JOB, _KNOWN_LEG, _KNOWN_LANE, _KNOWN_VALUE = (
 )
 
 
-def _profile(
-    *legs: str, claim_modes: str = '["per_lane"]', base_reading: str = "true"
-) -> ConnScaleProfile:
-    return load_connscale_profile_text(
-        f"""
+def _profile_text_with(slo_lines: str, claim_modes: str = '["per_lane"]') -> str:
+    return f"""
 [connscale]
 name = "unit"
 counts = [12, 24]
@@ -83,12 +85,15 @@ store_backend = "sqlite"
 corpus_count_per_trigger = 5
 
 [connscale.slo]
-zero_loss = true
-empty_claims_base_reading = {base_reading}
-empty_claims_herd_floor_legs = {list(legs)}
-""",
-        where="<unit-test profile>",
-    )
+{slo_lines}
+"""
+
+
+def _profile(
+    *legs: str, claim_modes: str = '["per_lane"]', base_reading: str = "true"
+) -> ConnScaleProfile:
+    slo = f"empty_claims_base_reading = {base_reading}\nempty_claims_herd_floor_legs = {list(legs)}"
+    return load_connscale_profile_text(_profile_text_with(slo, claim_modes), where="<unit>")
 
 
 def _herd_gone() -> list[ConnScaleRecord]:
@@ -158,13 +163,13 @@ def test_the_leg_comes_from_the_ci_variable_and_nothing_else(
 ) -> None:
     profile = _profile(_ARMED)
     monkeypatch.delenv(CONNSCALE_LEG_ENV, raising=False)
-    assert current_leg() is None and not herd_floor_armed(profile)
+    assert current_leg() is None and not herd_floor_armed(profile, current_leg())
     monkeypatch.setenv(CONNSCALE_LEG_ENV, "  ")
     assert current_leg() is None
     monkeypatch.setenv(CONNSCALE_LEG_ENV, _ARMED)
-    assert herd_floor_armed(profile)
+    assert herd_floor_armed(profile, current_leg())
     monkeypatch.setenv(CONNSCALE_LEG_ENV, "windows-2022-py3.14")
-    assert not herd_floor_armed(profile)
+    assert not herd_floor_armed(profile, current_leg())
 
 
 # --- the profile seam ----------------------------------------------------------------------------
@@ -187,82 +192,81 @@ def test_a_pooled_only_profile_cannot_arm_a_floor_that_grades_nothing() -> None:
         _profile(_ARMED, claim_modes='["pooled"]', base_reading="false")
 
 
-def _profile_text_with(slo_line: str) -> str:
-    return f"""
-[connscale]
-name = "unit"
-counts = [12, 24]
-sweep_mode = "both"
-aggregate_rate = 24.0
-per_conn_rate = 1.0
-hold_seconds = 1.5
-connect_batch = 8
-connect_batch_pause_s = 0.0
-poll_interval_s = 0.25
-drain_timeout_s = 30.0
-base_port = 20000
-transform = "cheap"
-reload_probe = false
-store_backend = "sqlite"
-corpus_count_per_trigger = 5
-
-[connscale.slo]
-{slo_line}
-"""
-
-
 # --- the decision, recomputed from the committed harvest -----------------------------------------
 
 
-def _cells() -> dict[tuple[str, str], list[dict[str, str]]]:
-    cells: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+@functools.cache
+def _readings() -> tuple[ch.BaseReading, ...]:
+    """The committed readings, typed as the harvest script types them."""
+
     with _HARVEST.open(encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            if row["population"] == "post_2024" and row["count"] == str(_BASE):
-                cells[(row["leg"], row["lane"])].append(row)
-    return cells
+        return tuple(
+            ch.BaseReading(
+                population=row["population"],
+                leg=row["leg"],
+                lane=row["lane"],
+                count=int(row["count"]) if row["count"] else None,
+                value=float(row["value"]) if row["value"] else None,
+                job_conclusion=row["job_conclusion"],
+                run_id=int(row["run_id"]),
+                run_attempt=int(row["run_attempt"]),
+                job_id=int(row["job_id"]),
+                head_sha=row["head_sha"],
+                artifact_created_at=row["artifact_created_at"],
+            )
+            for row in csv.DictReader(handle)
+        )
 
 
-def _passes_rule(leg: str, lane: str, rows: list[dict[str, str]]) -> bool:
+def _cells() -> dict[tuple[str, str], ch.CellSummary]:
+    """The fitted population's cells at the base count, summarised by the harvest's own code."""
+    result = ch.Harvest("r", "w", None, "s", "u", readings=list(_readings()))
+    return {
+        (c.leg, c.lane): c
+        for c in ch.summarise(result)
+        if c.population == ch.POST_2024 and c.count == _BASE
+    }
+
+
+def _passes_rule(leg: str, lane: str, cell: ch.CellSummary) -> bool:
     """Clauses (a) to (c) for one cell, candidate F = the cell's predicted floor. (d) is above."""
     prediction = predict_herd_levels(_BASE, _RATE[lane])
-    assert prediction is not None
-    passing = sorted(float(r["value"]) for r in rows if r["job_conclusion"] == "success")
-    margin_ok = passing[0] / prediction.floor >= _MARGIN  # (a)
+    assert prediction is not None and cell.min is not None
+    margin_ok = cell.min / prediction.floor >= _MARGIN  # (a)
     excludes_herd_gone = prediction.floor > prediction.idle  # (b)
-    known_ok = (leg, lane) != (_KNOWN_LEG, _KNOWN_LANE) or prediction.floor <= _KNOWN_VALUE
+    known_ok = (leg, lane) != (_KNOWN_LEG, _KNOWN_LANE) or prediction.floor <= _KNOWN_VALUE  # (c)
     return margin_ok and excludes_herd_gone and known_ok
 
 
 def test_the_committed_harvest_holds_every_cell_with_enough_readings() -> None:
     cells = _cells()
     assert len(cells) == 6, sorted(cells)  # three legs by two lanes, never pooled
-    for key, rows in cells.items():
-        passing = [r for r in rows if r["job_conclusion"] == "success"]
-        assert len(passing) >= 101, (key, len(passing))  # p1 needs n >= 101 to be a reading
+    for key, cell in cells.items():
+        assert cell.n_passing >= 101, (key, cell.n_passing)  # p1 needs n >= 101 to be a reading
 
 
 def test_the_known_answer_case_is_in_the_harvest_and_clears_its_cells_floor() -> None:
     (row,) = [
         r
-        for r in _cells()[(_KNOWN_LEG, _KNOWN_LANE)]
-        if r["run_id"] == _KNOWN_RUN and r["job_id"] == _KNOWN_JOB
+        for r in _readings()
+        if (r.run_id, r.job_id, r.lane) == (int(_KNOWN_RUN), int(_KNOWN_JOB), _KNOWN_LANE)
     ]
     floor = predict_herd_levels(_BASE, _RATE[_KNOWN_LANE])
-    assert floor is not None
-    value = float(row["value"])
+    assert floor is not None and row.value is not None
+    verdict = "not below" if row.value >= floor.floor else "BELOW"
     print(
         f"#1415 clause (c): run {_KNOWN_RUN} job {_KNOWN_JOB} {_KNOWN_LEG} {_KNOWN_LANE} "
-        f"base reading {value} vs F {floor.floor:.4f}: {'not below' if value >= floor.floor else 'BELOW'}"
+        f"base reading {row.value} vs F {floor.floor:.4f}: {verdict}"
     )
-    assert value == _KNOWN_VALUE and row["job_conclusion"] == "success"
-    assert value >= floor.floor
+    assert (row.leg, row.population, row.job_conclusion) == (_KNOWN_LEG, ch.POST_2024, "success")
+    assert row.value == _KNOWN_VALUE
+    assert row.value >= floor.floor
 
 
 def test_the_armed_legs_are_exactly_the_legs_whose_every_cell_clears_the_rule() -> None:
     by_leg: dict[str, list[bool]] = defaultdict(list)
-    for (leg, lane), rows in _cells().items():
-        by_leg[leg.replace(" ", "-")].append(_passes_rule(leg, lane, rows))
+    for (leg, lane), cell in _cells().items():
+        by_leg[leg.replace(" ", "-")].append(_passes_rule(leg, lane, cell))
     cleared = {leg for leg, verdicts in by_leg.items() if all(verdicts)}
     assert cleared == set(_HERD_FLOOR_LEGS) == {_ARMED}, by_leg
     # And the two Windows legs fail on EVERY cell, so no lane-level arming is being left on the table.

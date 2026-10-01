@@ -56,6 +56,7 @@ from harness.load.connscale.report import (
     RATE_WINDOW,
     ConnScaleRecord,
     ConnScaleReport,
+    HerdFloorReading,
     NoLoss,
     SloCheck,
     herd_floor_readings,
@@ -2286,6 +2287,23 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
     return out
 
 
+def _base_readings(
+    profile: ConnScaleProfile, records: list[ConnScaleRecord]
+) -> tuple[list[HerdFloorReading], list[HerdFloorReading]]:
+    """Each lane's empty-claims base reading, and the graded subset, for the two checks that read it.
+
+    One definition, so the sign test and the armed floor cannot grade different lane sets.
+    """
+    readings = herd_floor_readings(
+        records, lambda r: r.empty_claims_per_msg, base_count=min(profile.counts)
+    )
+    return readings, [r for r in readings if r.ok is not None]
+
+
+def _not_graded_reasons(readings: list[HerdFloorReading]) -> str:
+    return "; ".join(f"{r.label}: {r.not_graded}" for r in readings) or "no lanes"
+
+
 #: The CI leg a run is on, as ``<matrix os>-py<python version>`` -- the same suffix the readings
 #: artifact carries, so a harvest cell and an armed leg are spelled one way. ci.yml's
 #: ``Tests (pytest)`` step exports it; nothing else does, so a local run, the py3.15 canary and the
@@ -2298,9 +2316,8 @@ def current_leg() -> str | None:
     return os.environ.get(CONNSCALE_LEG_ENV, "").strip() or None
 
 
-def herd_floor_armed(profile: ConnScaleProfile, leg: str | None = None) -> bool:
-    """True when ``profile`` arms the predicted herd floor on ``leg`` (default: this process's)."""
-    leg = current_leg() if leg is None else leg
+def herd_floor_armed(profile: ConnScaleProfile, leg: str | None) -> bool:
+    """True when ``profile`` arms the predicted herd floor on ``leg``; ``None`` is no leg."""
     return leg is not None and leg in profile.slo.empty_claims_herd_floor_legs
 
 
@@ -2324,19 +2341,16 @@ def _empty_claims_herd_floor_slo(
     the smoke test carries the run-level bound that some lane was graded.
     """
     expectation = "each per_lane base reading at or above its predicted herd floor"
-    armed = profile.slo.empty_claims_herd_floor_legs
-    if leg is None or leg not in armed:
+    if not herd_floor_armed(profile, leg):
         return SloCheck(
             "empty_claims_herd_floor",
             expectation,
             f"NOT GRADED -- recorded only: this run's leg is {leg or 'unset (not a CI test leg)'}, "
-            f"and the floor is armed only on {list(armed)} (BACKLOG #1415)",
+            f"and the floor is armed only on {list(profile.slo.empty_claims_herd_floor_legs)} "
+            f"(BACKLOG #1415)",
             True,
         )
-    readings = herd_floor_readings(
-        records, lambda r: r.empty_claims_per_msg, base_count=min(profile.counts)
-    )
-    graded = [r for r in readings if r.ok is not None]
+    readings, graded = _base_readings(profile, records)
     below = [r for r in graded if r.ok is False]
     if below:
         observed = "; ".join(
@@ -2347,12 +2361,11 @@ def _empty_claims_herd_floor_slo(
         )
         return SloCheck("empty_claims_herd_floor", expectation, observed, False)
     if not graded:
-        reasons = "; ".join(f"{r.label}: {r.not_graded}" for r in readings) or "no lanes"
         return SloCheck(
             "empty_claims_herd_floor",
             expectation,
             f"NOT GRADED -- 0 of {len(readings)} lane(s) produced a base reading on armed leg "
-            f"{leg} ({reasons})",
+            f"{leg} ({_not_graded_reasons(readings)})",
             True,
         )
     return SloCheck(
@@ -2396,10 +2409,7 @@ def _empty_claims_base_reading_slo(
     few lines above. The run-level bound -- that SOME lane was graded -- belongs in the smoke test,
     where the metric genuinely runs; that is exactly where wall #4 already puts its equivalent.
     """
-    readings = herd_floor_readings(
-        records, lambda r: r.empty_claims_per_msg, base_count=min(profile.counts)
-    )
-    graded = [r for r in readings if r.ok is not None]
+    readings, graded = _base_readings(profile, records)
     dead = [r for r in graded if r.value is not None and r.value <= 0.0]
     expectation = "a positive empty-claims-per-message reading at the base connection count"
     if dead:
@@ -2409,12 +2419,12 @@ def _empty_claims_base_reading_slo(
         )
         return SloCheck("empty_claims_base_reading", expectation, observed, False)
     if not graded:
-        reasons = "; ".join(f"{r.label}: {r.not_graded}" for r in readings) or "no lanes"
         return SloCheck(
             "empty_claims_base_reading",
             expectation,
             f"NOT GRADED -- 0 of {len(readings)} lane(s) produced a base reading at "
-            f"N={min(profile.counts)} ({reasons}), so this says nothing about wall #3",
+            f"N={min(profile.counts)} ({_not_graded_reasons(readings)}), so this says nothing "
+            f"about wall #3",
             True,
         )
     return SloCheck(

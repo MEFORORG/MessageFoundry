@@ -505,7 +505,10 @@ async def smoke_report() -> ConnScaleReport:
         install_executor_shim=True,
     )
     # In the FIXTURE, so the readings are recorded before any assertion can fail the module.
-    _record_ratio_readings(report, enforced=herd_floor_armed(profile))  # type: ignore[arg-type]
+    _record_ratio_readings(
+        report,
+        enforced=herd_floor_armed(profile, current_leg()),  # type: ignore[arg-type]
+    )
     _record_diagnostics(report)
     return report
 

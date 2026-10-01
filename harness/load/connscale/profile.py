@@ -402,22 +402,19 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
     # Those two rules compose into a gate that CANNOT FAIL: a pooled-only profile that armed this check
     # would report a green wall #3 on every run while measuring nothing, and nothing downstream would
     # report a problem. Reject it at PARSE time instead. This is structural, decided from the profile
-    # alone before any engine is spawned, so it cannot flake on a runner.
-    if profile.slo.empty_claims_base_reading and PER_LANE not in profile.claim_modes:
-        raise ConnScaleProfileError(
-            f"{where}: slo.empty_claims_base_reading = true needs {PER_LANE!r} in claim_modes -- the "
-            f"check grades only per_lane lanes, so with claim_modes={list(profile.claim_modes)} it "
-            f"would grade zero lanes and pass on every run; add {PER_LANE!r} to claim_modes, or set "
-            f"empty_claims_base_reading = false"
-        )
-    # The armed herd floor reads the same per_lane base readings, so the same gate-that-cannot-fail
-    # argument applies to it (BACKLOG #1415).
-    if profile.slo.empty_claims_herd_floor_legs and PER_LANE not in profile.claim_modes:
-        raise ConnScaleProfileError(
-            f"{where}: slo.empty_claims_herd_floor_legs needs {PER_LANE!r} in claim_modes -- the "
-            f"floor grades only per_lane lanes, so with claim_modes={list(profile.claim_modes)} it "
-            f"would grade zero lanes and pass on every run"
-        )
+    # alone before any engine is spawned, so it cannot flake on a runner. The armed herd floor reads
+    # the same per_lane base readings, so the same argument applies to it (BACKLOG #1415).
+    per_lane_only = {
+        "empty_claims_base_reading": profile.slo.empty_claims_base_reading,
+        "empty_claims_herd_floor_legs": bool(profile.slo.empty_claims_herd_floor_legs),
+    }
+    for key, armed in per_lane_only.items():
+        if armed and PER_LANE not in profile.claim_modes:
+            raise ConnScaleProfileError(
+                f"{where}: slo.{key} needs {PER_LANE!r} in claim_modes -- the check grades only "
+                f"per_lane lanes, so with claim_modes={list(profile.claim_modes)} it would grade "
+                f"zero lanes and pass on every run; add {PER_LANE!r} to claim_modes, or unset {key}"
+            )
 
 
 def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
