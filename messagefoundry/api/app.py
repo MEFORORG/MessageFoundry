@@ -5924,7 +5924,6 @@ def create_app(
                     escalate_tiers=len(r.escalate),  # #81 — occurrence-driven escalation tier count
                     schedule_configured=r.schedule
                     is not None,  # #81 — schedule-gated (present-or-not)
-                    content_label=r.content_label,  # #81 — content_match label this rule routes by
                 )
                 for r in alerts.rules
             ],

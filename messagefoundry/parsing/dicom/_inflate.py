@@ -59,9 +59,10 @@ DEFLATED_EXPLICIT_VR_LE = "1.2.840.10008.1.2.1.99"
 
 #: Default max **uncompressed** size the deflate stream may reach before it is rejected as a bomb —
 #: matches :data:`messagefoundry.parsing.peek.DEFAULT_MAX_MESSAGE_BYTES` (16 MiB, the MLLP/file ingress
-#: cap). A module constant; the guard functions take a ``max_bytes`` override (the DIMSE SCP/SCU pass
-#: their own ``max_object_bytes`` so the inflate bound matches the object-size policy they already
-#: enforce).
+#: cap). A module constant; the guard functions take a ``max_bytes`` override. The DIMSE SCU passes its
+#: own ``max_object_bytes``. The SCP passes the lesser of its ``max_object_bytes`` and this constant,
+#: because ``DicomPeek``/``DicomDataset`` refuse anything past this constant once it is committed
+#: (BACKLOG #2104).
 DEFAULT_MAX_INFLATED_BYTES = 16 * 1024 * 1024
 
 
@@ -84,8 +85,8 @@ def bounded_inflate_or_error(compressed: bytes | memoryview, *, max_bytes: int) 
       output is discarded, so this costs no memory. It keeps the verdict on a corrupt stream that
       breaks inside the window that crosses the cap: zlib raises first, and the object is left to
       ``dcmread``. Asking for one byte past the cap would call that object a bomb instead, and the
-      SCP answers a bomb with Out of Resources, a status a sender may treat as transient and retry.
-      A corrupt object gets Cannot Understand from the decode path, which it does not retry."""
+      SCP would log it as over its inflate cap rather than as the corrupt object it is. Both are
+      final refusals since BACKLOG #2103, but the log would name the wrong cause."""
     if not compressed:
         return
     try:

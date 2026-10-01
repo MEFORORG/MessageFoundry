@@ -271,7 +271,7 @@ Aggregate capacity is the sum of the interfaces; the shared message store on a s
 headroom for the combined load, so you scale out by adding interfaces rather than trying to make one pipe
 infinitely fast.
 
-> ⚠️ **CORRECTION (2026-07-14) — do NOT size on "aggregate = the sum of the interfaces". That composition rule
+> **CORRECTION (2026-07-14) — do NOT size on "aggregate = the sum of the interfaces". That composition rule
 > is MEASURED-FALSE on the shipped default shape, and it over-reports.** Interfaces are not independent: they
 > contend on a shared upstream (store-side) wall, so per-interface ceilings do **not** add.
 > [`benchmarks/THROUGHPUT-STATUS-2026-07-10.md`](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §4 measured

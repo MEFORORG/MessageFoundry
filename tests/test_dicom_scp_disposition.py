@@ -42,8 +42,10 @@ _NAME = "IB_DICOM"
 _MIB = 1024 * 1024
 
 _SUCCESS = 0x0000
-_OUT_OF_RESOURCES = 0xA700
 _CANNOT_UNDERSTAND = 0xC000
+#: BACKLOG #2103: a deterministic over-cap refusal, in the Cannot Understand class so no sender reads
+#: it as transient and re-sends an object that would be refused again.
+_REFUSED_OVER_CAP = 0xC010
 
 
 @pytest.fixture
@@ -127,7 +129,7 @@ async def test_an_object_in_the_16_to_128_mib_band_is_refused_to_the_sender(
 
     status = await _send_through_runner(store, data)
 
-    assert status == _OUT_OF_RESOURCES
+    assert status == _REFUSED_OVER_CAP
     assert await _rows(store) == [], "a refused object must not also be recorded as received"
 
 
@@ -162,6 +164,66 @@ async def test_a_committed_object_still_answers_success(store: MessageStore) -> 
     assert rows[0]["status"] != MessageStatus.ERROR.value
 
 
+def _deflated_big_sr(payload_bytes: int) -> bytes:
+    """:func:`_big_sr` saved as Deflated Explicit VR LE. The zero filler compresses to almost nothing,
+    so the object is small on the wire and large once inflated."""
+    from pydicom import dcmread
+    from pydicom.uid import DeflatedExplicitVRLittleEndian
+
+    ds = dcmread(BytesIO(_big_sr(payload_bytes)))
+    ds.file_meta.TransferSyntaxUID = DeflatedExplicitVRLittleEndian
+    out = BytesIO()
+    ds.save_as(out, enforce_file_format=True)
+    return out.getvalue()
+
+
+async def test_a_small_deflated_object_that_inflates_past_the_parse_ceiling_is_refused(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #2104: the SCP bounded a deflated object's inflate by ``max_object_bytes`` (128 MiB at
+    the shipped default), while the codec that parses it after commit bounds the same inflate at a
+    fixed 16 MiB. An object between the two passed the SCP, was answered Success, and could then only
+    be recorded ERROR. The SCP now bounds the inflate at the lesser of the two, so the sender hears a
+    refusal and nothing is recorded as received."""
+    data = _deflated_big_sr(DEFAULT_MAX_INFLATED_BYTES + _MIB)
+    assert len(data) < _MIB, "the object must be small on the wire; only its inflate is large"
+
+    status = await _send_through_runner(store, data)
+
+    assert status != _SUCCESS
+    assert status == _REFUSED_OVER_CAP
+    assert await _rows(store) == [], "a refused object must not also be recorded as received"
+
+
+async def test_the_scp_inflate_bound_reads_the_codec_ceiling_when_it_runs(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2104: the codec reads its inflate ceiling each time it parses. The SCP must read the
+    same value then too, not a copy taken when its module was imported or the connection was built,
+    or the two drift apart and the SCP answers Success for an object the router's parse refuses.
+    Lowering the ceiling after import is that drift: a 2 MiB inflate is now over it."""
+    from messagefoundry.parsing.dicom import _inflate
+
+    monkeypatch.setattr(_inflate, "DEFAULT_MAX_INFLATED_BYTES", _MIB)
+    data = _deflated_big_sr(2 * _MIB)
+
+    status = await _send_through_runner(store, data)
+
+    assert status == _REFUSED_OVER_CAP
+    assert await _rows(store) == [], "a refused object must not also be recorded as received"
+
+
+@pytest.mark.parametrize("configured", [128 * _MIB, 64 * _MIB, None, 0])
+def test_the_scp_inflate_bound_never_exceeds_the_parse_ceiling(configured: int | None) -> None:
+    """BACKLOG #2104: whatever ``max_object_bytes`` says, the SCP never lets a deflated object through
+    whose inflate the codec would then refuse."""
+    assert _scp(configured)._max_inflated_bytes == DEFAULT_MAX_INFLATED_BYTES
+
+
+def test_an_inflate_bound_below_the_parse_ceiling_is_kept() -> None:
+    assert _scp(_MIB)._max_inflated_bytes == _MIB
+
+
 def _scp(max_object_bytes: int | None, name: str | None = None) -> DicomScpSource:
     settings: dict[str, object] = {
         "ae_title": _SCP_AE,
@@ -179,6 +241,25 @@ def test_the_scp_cap_never_exceeds_the_engine_ingress_ceiling(configured: int | 
     assert _scp(configured)._max_object_bytes == ingress_guards.INGRESS_MAX_BYTES
 
 
+@pytest.mark.parametrize("bad", [-1, "-1"])
+def test_a_negative_cap_is_refused_with_the_scps_own_text(bad: object) -> None:
+    """BACKLOG #2103: the shared ``positive_cap`` refusal says "use None or 0 to disable it". On the SCP
+    neither value disables the cap; both resolve to the engine's ingress ceiling. So the SCP's refusal
+    must say that, and must not send an operator looking for an off switch that does not exist."""
+    with pytest.raises(ValueError) as caught:
+        _scp(bad)  # type: ignore[arg-type]
+    message = str(caught.value)
+    assert "DICOM-SCP source max_object_bytes=" in message
+    assert "disable" not in message.replace("does not disable", "")
+    assert "does not disable" in message
+    assert str(ingress_guards.INGRESS_MAX_BYTES) in message
+
+
+def test_an_unparseable_cap_is_refused_naming_the_setting() -> None:
+    with pytest.raises(ValueError, match="DICOM-SCP source max_object_bytes='lots'"):
+        _scp("lots")  # type: ignore[arg-type]
+
+
 def test_a_cap_below_the_ceiling_is_kept() -> None:
     assert _scp(_MIB)._max_object_bytes == _MIB
 
@@ -190,11 +271,12 @@ def _clamp_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]
 @pytest.mark.parametrize(
     ("configured", "shown", "inflate"),
     [
-        (64 * _MIB, str(64 * _MIB), 64 * _MIB),
+        # BACKLOG #2104: the inflate bound never exceeds the codec's inflate ceiling either.
+        (64 * _MIB, str(64 * _MIB), DEFAULT_MAX_INFLATED_BYTES),
         (
             ingress_guards.INGRESS_MAX_BYTES + 1,
             str(ingress_guards.INGRESS_MAX_BYTES + 1),
-            ingress_guards.INGRESS_MAX_BYTES + 1,
+            DEFAULT_MAX_INFLATED_BYTES,
         ),
         # An explicit uncapped setting is the widest clamp of all: "no limit" becomes 16 MiB, and
         # the inflate bound falls to the codec default.

@@ -570,8 +570,8 @@ Expected deltas, and **an edit that produces anything else is the tell**:
   green on the day. A gate nobody has made fail on purpose is an assertion, not evidence.
 
 **Safest habit:** never use `✅ ⛔ 🪦 🔢 🚧` anywhere in an item body — not as emphasis, not in a
-nested blockquote. Say the word (`WARNING`, `DO NOT`). `⚠️` and `⭐` are outside both alphabets and
-are safe.
+nested blockquote. Say the word (`WARNING`, `DO NOT`). The warning sign (`U+26A0`) and `⭐` are outside both
+alphabets, so the gate ignores them and they are safe for it.
 
 ## Limits
 

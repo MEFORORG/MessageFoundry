@@ -985,7 +985,7 @@ def test_conflict_markers_QUOTED_IN_PROSE_do_not_trip_the_refusal(repo: Path) ->
 # ----------------------------------------------------------------- encoding
 
 
-# The real docs/BACKLOG.md and docs/adr/README.md are full of em-dashes, ✅ and ⚠️. Every other test in
+# The real docs/BACKLOG.md and docs/adr/README.md were full of em-dashes, ✅ and U+26A0. Every other test in
 # this file writes pure ASCII, which is exactly why this shipped broken: `git(...)` used `text=True` with
 # NO `encoding=`, so it decoded git's output with the LOCALE default — cp1252 on Windows. The decode blew
 # up inside subprocess's reader thread, `proc.stdout` came back **None**, and the caller died on

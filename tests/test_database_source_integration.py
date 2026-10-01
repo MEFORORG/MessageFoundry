@@ -50,7 +50,12 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import DatabasePoll
 from messagefoundry.transports import build_source
-from messagefoundry.transports.database import DatabaseSource, _build_dsn, _make_pool
+from messagefoundry.transports.database import (
+    DatabaseSource,
+    _build_dsn,
+    _login_timeout,
+    _make_pool,
+)
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -89,7 +94,12 @@ async def pool() -> AsyncIterator[Any]:
     """The single autocommit aioodbc pool for the whole test — opened once, closed once. Both the raw
     DDL/assertions *and* the source's poll/mark run on it, so the test never opens a second pool or
     reopens one (the ODBC-18 / Python-3.14 driver instability described in the module docstring)."""
-    p = await _make_pool(_build_dsn(_conn()), 3, autocommit=True)
+    p = await _make_pool(
+        _build_dsn(_conn()),
+        3,
+        autocommit=True,
+        login_timeout=_login_timeout(_conn(), "test", dialect="sqlserver"),
+    )
     try:
         yield p
     finally:

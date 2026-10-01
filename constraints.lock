@@ -4,21 +4,19 @@ aioodbc==0.5.0
     # via messagefoundry
 aiosqlite==0.22.1
     # via messagefoundry
-annotated-doc==0.0.4
+annotated-doc==0.0.5
     # via fastapi
-annotated-types==0.7.0
-    # via
-    #   messagefoundry
-    #   pydantic
+annotated-types==0.8.0
+    # via pydantic
 antlr4-python3-runtime==4.13.2
     # via fhirpathpy
-anyio==4.14.2
+anyio==4.15.1
     # via
     #   httpx
     #   starlette
 argon2-cffi==25.1.0
     # via messagefoundry
-argon2-cffi-bindings==25.1.0
+argon2-cffi-bindings==26.1.0
     # via argon2-cffi
 ast-serialize==0.6.0
     # via mypy
@@ -30,13 +28,13 @@ bcrypt==5.0.0
     # via paramiko
 cbor2==6.1.2
     # via webauthn
-certifi==2026.6.17
+certifi==2026.7.22
     # via
     #   httpcore
     #   httpx
     #   requests
     #   signxml
-cffi==2.0.0
+cffi==2.1.1
     # via
     #   argon2-cffi-bindings
     #   cryptography
@@ -56,17 +54,17 @@ cryptography==50.0.1
     #   signxml
     #   webauthn
 defusedxml==0.7.1
-    # via
-    #   messagefoundry
-    #   pyx12
+    # via pyx12
 elementpath==5.1.3
     # via xmlschema
 execnet==2.1.2
     # via pytest-xdist
 fastapi==0.141.1
     # via messagefoundry
-fhir-core==1.1.9
-    # via fhir-resources
+fhir-core==1.1.11
+    # via
+    #   fhir-resources
+    #   messagefoundry
 fhir-resources==8.3.0
     # via messagefoundry
 fhirpathpy==2.2.4
@@ -93,7 +91,7 @@ httpx==0.28.1
     # via messagefoundry
 hvac==2.4.0
     # via messagefoundry
-idna==3.18
+idna==3.20
     # via
     #   anyio
     #   httpx
@@ -236,7 +234,7 @@ signxml==5.1.0
     # via messagefoundry
 six==1.17.0
     # via python-dateutil
-sspilib==0.5.0 ; sys_platform == 'win32'
+sspilib==0.6.0 ; sys_platform == 'win32'
     # via pyspnego
 starlette==1.7.0
     # via
@@ -246,8 +244,9 @@ tomlkit==0.15.1
     # via messagefoundry
 truststore==0.10.4
     # via messagefoundry
-typing-extensions==4.15.0
+typing-extensions==4.16.0
     # via
+    #   anyio
     #   fastapi
     #   grpcio
     #   mypy
@@ -259,7 +258,7 @@ typing-extensions==4.15.0
     #   pydantic
     #   pydantic-core
     #   typing-inspection
-typing-inspection==0.4.2
+typing-inspection==0.4.4
     # via
     #   fastapi
     #   pydantic
@@ -273,7 +272,7 @@ uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'c
     # via messagefoundry
 webauthn==3.0.0
     # via messagefoundry
-websockets==16.0
+websockets==17.1
     # via messagefoundry
 xmlschema==4.3.2
     # via messagefoundry

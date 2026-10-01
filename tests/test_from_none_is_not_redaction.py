@@ -157,6 +157,11 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "KeyError carries an operator-authored reference-set name, also in the message",
     ),
     _Allowed(
+        "messagefoundry/config/wiring.py::DatabaseRef::ValueError::WiringError",
+        _SAFE + "check_db_connect_timeout's fixed text withholds the value, raised with no chain; "
+        "the new message is that same text",
+    ),
+    _Allowed(
         "messagefoundry/framing.py::codec_for::KeyError::ValueError",
         _SAFE + "KeyError carries the framing preset name, which the new message also quotes",
     ),
