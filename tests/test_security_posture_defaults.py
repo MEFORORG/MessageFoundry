@@ -55,7 +55,7 @@ def _ad(**over: object) -> AuthSettings:
     return AuthSettings(**base)  # type: ignore[arg-type]
 
 
-def _names(
+def _pairs(
     sec: SecuritySettings | None = None,
     store: StoreSettings | None = None,
     auth: AuthSettings | None = None,
@@ -67,47 +67,34 @@ def _names(
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
-) -> list[str]:
-    """The loosening SWITCH NAMES for a settings combination (defaults where not overridden)."""
-    return [
-        name
-        for name, _ in security_loosenings(
-            sec or SecuritySettings(),
-            store or StoreSettings(),
-            auth or AuthSettings(),
-            alerts or AlertsSettings(),
-            rotation or SecretRotationSettings(),
-            cleartext_hops=cleartext_hops,
-            expiry_relaxed_hops=expiry_hops,
-            unverified_db_hops=db_hops,
-            attested_hops=attested_hops,
-            revocation_attested_hops=revocation_hops,
-            api=api or ApiSettings(),
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-        )
-    ]
+) -> list[tuple[str, str]]:
+    """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
+    overridden)."""
+    return security_loosenings(
+        sec or SecuritySettings(),
+        store or StoreSettings(),
+        auth or AuthSettings(),
+        alerts or AlertsSettings(),
+        rotation or SecretRotationSettings(),
+        cleartext_hops=cleartext_hops,
+        expiry_relaxed_hops=expiry_hops,
+        unverified_db_hops=db_hops,
+        attested_hops=attested_hops,
+        revocation_attested_hops=revocation_hops,
+        api=api or ApiSettings(),
+        store_privilege=None,
+        audit_chain_unkeyed=None,
+    )
+
+
+def _names(**kwargs: object) -> list[str]:
+    """The loosening SWITCH NAMES for a settings combination; arguments as :func:`_pairs`."""
+    return [name for name, _ in _pairs(**kwargs)]  # type: ignore[arg-type]
 
 
 def _risks(sec: SecuritySettings, auth: AuthSettings) -> dict[str, str]:
     """Switch name -> risk text, for a [security] and [auth] pair with every other input at default."""
-    return dict(
-        security_loosenings(
-            sec,
-            StoreSettings(),
-            auth,
-            AlertsSettings(),
-            SecretRotationSettings(),
-            cleartext_hops=(),
-            expiry_relaxed_hops=(),
-            unverified_db_hops=(),
-            attested_hops=(),
-            revocation_attested_hops=(),
-            api=ApiSettings(),
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-        )
-    )
+    return dict(_pairs(sec=sec, auth=auth))
 
 
 # --- the shipped defaults themselves ---------------------------------------------------------
@@ -1100,6 +1087,38 @@ def _load_plain_ldap(tmp_path: Path, enforcement: str) -> ServiceSettings:
 def test_plain_ldap_with_the_opt_in_is_refused_at_load_under_enforce(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="ad_allow_insecure_ldap is inert under"):
         _load_plain_ldap(tmp_path, "enforce")
+
+
+@pytest.mark.parametrize(
+    ("prefix", "server"),
+    [
+        # A loopback ldap:// (an on-box LDAPS proxy): the cleartext-hop gradient's loopback ALLOW was
+        # deliberately not extended to this hop.
+        ("", "ldap://127.0.0.1:389"),
+        # Sign-in off ([auth].enabled lives at [security].require_sign_in, ADR 0118): nothing dials the
+        # directory yet, but turning sign-in on would make the bind live with no second check.
+        ("[security]\nrequire_sign_in = false\n", "ldap://dc.test.invalid:389"),
+    ],
+    ids=["loopback", "sign_in_off"],
+)
+def test_the_enforce_refusal_has_no_loopback_or_sign_in_carve_out(
+    tmp_path: Path, prefix: str, server: str
+) -> None:
+    path = tmp_path / "messagefoundry.toml"
+    body = _PLAIN_LDAP_AUTH.replace("ldap://dc.test.invalid:389", server)
+    path.write_text(prefix + body, encoding="utf-8")
+    with pytest.raises(ValueError, match="ad_allow_insecure_ldap is inert under"):
+        load_settings(config_path=path, environ=_BIND_ENV)
+
+
+def test_surrounding_whitespace_does_not_hide_an_ldaps_address() -> None:
+    """ldap3 strips the address before it reads the scheme, so the engine must too: otherwise a
+    padded ldaps:// address reads as plain here and gets ldap3's unverified default TLS there."""
+    from messagefoundry.config.settings import is_ldaps_address
+
+    assert is_ldaps_address("  ldaps://dc.test.invalid ")
+    assert not is_ldaps_address(" ldap://dc.test.invalid")
+    assert not _ad(ad_server=" ldaps://dc.test.invalid:636").plain_ldap_bind
 
 
 def test_plain_ldap_with_the_opt_in_loads_under_warn_and_is_named(tmp_path: Path) -> None:

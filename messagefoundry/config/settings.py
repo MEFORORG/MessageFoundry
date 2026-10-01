@@ -2432,8 +2432,9 @@ def is_ldaps_address(server: str) -> bool:
     The scheme ``ldaps://`` and nothing looser. A bare host such as ``ldapsrv01.corp.example`` starts
     with ``ldaps`` too, but ldap3 dials it on 389 with no TLS, so a prefix test without ``://`` would
     take a cleartext bind for an encrypted one. ``AuthSettings`` and ``LdapAuthenticator`` both read
-    this, so the settings refusal and the TLS the authenticator builds agree on what is plain."""
-    return server.lower().startswith("ldaps://")
+    this, so the settings refusal and the TLS the authenticator builds agree on what is plain.
+    Surrounding whitespace is ignored, because ldap3 strips it before it reads the scheme."""
+    return server.strip().lower().startswith("ldaps://")
 
 
 def split_kerberos_spn(spn: str) -> tuple[str, str]:
@@ -6671,7 +6672,9 @@ def security_loosenings(
     ``ad_tls_verify``, ``oidc_require_mfa_claim``,
     ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
     enumerated in the floor test's exemption set so the gap is a written decision that a new switch
-    cannot silently join.
+    cannot silently join. That set also holds at least one switch this registry DOES report,
+    ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's lone
+    flip never builds; its own tests pin it.
 
     **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
@@ -6954,7 +6957,7 @@ def security_loosenings(
     # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
     # nothing and is not named. Sign-in is read off [security], as for the limiter entries below, so
     # `security set` turning it on shows this at once.
-    if sec.require_sign_in and auth.plain_ldap_bind and auth.ad_allow_insecure_ldap:
+    if sec.require_sign_in and auth.plain_ldap_bind:
         out.append(
             (
                 "ad_allow_insecure_ldap",

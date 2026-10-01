@@ -72,7 +72,7 @@ section reference.
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
-| | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only with `ad_enabled` and an `ldap://` `ad_server`, which loads only under `enforcement = warn`) |
+| | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
 | | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (*conditional* — a loosening only while auth is on; minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
@@ -542,7 +542,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > **Conditional**, and reachable only at `[security].enforcement = warn`. Under `enforce` the switch is
 > inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
 > #2354). A loopback `ldap://` address is refused too.
-> Beside an `ldaps://` address, or with `ad_enabled = false`, it changes nothing and is not reported.
+> It is reported only while a plain bind is live, which needs at least `ad_enabled`,
+> `[security].require_sign_in` and an `ad_server` that is not `ldaps://`.
 - **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
   binds, so the service-account password and the password of every user who signs in or steps up cross
   the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path

@@ -504,18 +504,18 @@ class LdapAuthenticator:
         # (the [security].enforcement dial, defaulting to enforce) or a known enforcing `posture`. It
         # runs before the bind secret is resolved, so a refused build never fetches the password.
         if not self._ldaps:
-            if enforcing or (posture is not None and posture.enforcing):
-                raise LdapError(
-                    "ad_server is not an ldaps:// address, and ad_allow_insecure_ldap is inert under "
-                    "[security].enforcement = enforce (the binds would send passwords in cleartext). "
-                    "Use an ldaps:// ad_server."
-                )
             if not settings.ad_allow_insecure_ldap:
                 # AuthSettings requires the opt-in only while ad_enabled; a direct construction can
                 # carry ad_enabled = false, so check it here too rather than assume it.
                 raise LdapError(
                     "ad_server is not an ldaps:// address; a plain bind needs "
                     "ad_allow_insecure_ldap = true under [security].enforcement = warn."
+                )
+            if enforcing or (posture is not None and posture.enforcing):
+                raise LdapError(
+                    "ad_server is not an ldaps:// address, and ad_allow_insecure_ldap is inert under "
+                    "[security].enforcement = enforce (the binds would send passwords in cleartext). "
+                    "Use an ldaps:// ad_server."
                 )
             logger.warning(
                 "AD binds over plain ldap:// (ad_allow_insecure_ldap=true, honoured because "
