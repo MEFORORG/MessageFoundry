@@ -1394,9 +1394,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   has: the approved TLS 1.2 suites, the approved TLS 1.3 suites and the SHA-224-free signature
   schemes where the interpreter allows them, the key-exchange pin and a TLS 1.2 floor. ldap3's own
   host name check still runs after the handshake. `ciphers=` is no longer passed to ldap3.
-  Python 3.14 is unchanged on the wire: its TLS 1.3 gap is recorded, not closed. The engine
-  refuses LDAP referrals, so no referred hop is opened; see `changelog.d/2530.security.md`.
-  (`BACKLOG #2494`, owner ruling R3 of
+  Python 3.14 is unchanged on the wire: its TLS 1.3 gap is recorded, not closed. A followed
+  referral still gets a plain ldap3 context. (`BACKLOG #2494`, owner ruling R3 of
   2026-09-27, ADR 0188 amendment of 2026-09-30)
 - **On Python 3.15 the engine stops offering SHA-224 TLS signature schemes.** Every context the
   engine narrows drops `rsa_pkcs1_sha224`, `ecdsa_sha224` and `dsa_sha224` through
