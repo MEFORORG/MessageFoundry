@@ -11,9 +11,13 @@ The views in this file each answer a different question. More diagrams live in o
 2. **System topology** — the engine's internal packages, process boundaries, and the one-way dependency rule.
 3. **Runtime message flow** — how a received message moves through the staged queue and earns a disposition.
 4. **Config wiring graph** — how Connections, Routers, and Handlers wire together by name (no "channel" object).
+5. **Receive to deliver**: the order of steps from receipt to delivery, when the sender gets its ACK, and what the main failures do.
+6. **Message disposition**: every status a message can hold, and what moves it from one to the next.
 
 **Legend.** Solid/thick arrows = *depends on / calls*. Dotted arrows = *talks to over the API or wire*
 (separate process). Cylinders = persisted stage/store. Hexagon = the single disposition authority.
+The arrow meanings apply to sections 1 and 2. Sections 3 and 4 label their own arrows, and
+sections 5 and 6 each carry their own legend.
 
 ---
 
@@ -28,6 +32,8 @@ the block, because a copy drifts from its source.
 | System topology | [architecture-diagram.md](architecture-diagram.md) (this file, section 2) |
 | Runtime message flow | [architecture-diagram.md](architecture-diagram.md) (this file, section 3) |
 | Config wiring graph | [architecture-diagram.md](architecture-diagram.md) (this file, section 4) |
+| Receive to deliver sequence, with its failure paths | [architecture-diagram.md](architecture-diagram.md) (this file, section 5) |
+| Message disposition state machine | [architecture-diagram.md](architecture-diagram.md) (this file, section 6) |
 | Trust boundaries and PHI data flow | [SECURITY.md](SECURITY.md) |
 | Sign-in and permission check flow | [SECURITY.md](SECURITY.md) |
 | Deployment topologies | [DEPLOYMENT.md](DEPLOYMENT.md) |
@@ -318,6 +324,234 @@ Connections/Routers/Handlers are authored against the `messagefoundry` surface
 (`inbound` / `outbound` / `@router` / `@handler` / `Send` / `MLLP` / `File` / `Message`), registered
 into a `Registry` by the loader ([config/wiring.py](../messagefoundry/config/wiring.py)) and run by the
 `RegistryRunner` ([pipeline/wiring_runner.py](../messagefoundry/pipeline/wiring_runner.py)).
+
+---
+
+## 5. Receive to deliver - the sequence
+
+This view is for an integrator. It shows when the sender gets its ACK, and what happens if a step
+fails after that. The listener commits the raw message to the `ingress` stage, and
+only then sends the ACK. Routing, transform and delivery run after the ACK. Each one is its own
+committed step.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant SND as Sender
+  participant LSN as Inbound listener
+  participant MST as Message store
+  participant RTW as Router worker
+  participant TRW as Transform worker
+  participant DLW as Delivery worker
+  participant OBC as Outbound Connection
+
+  SND->>LSN: HL7 message
+  LSN->>LSN: decode, parse, and strict validate<br/>when the inbound asks for it
+  LSN->>MST: commit the raw message to the ingress stage
+  MST-->>LSN: committed, the message is RECEIVED
+  LSN-->>SND: ACK with code AA
+  Note over SND,LSN: The sender has its answer.<br/>No later step sends it a NAK.
+
+  RTW->>MST: claim the ingress row
+  RTW->>RTW: run the Router
+  RTW->>MST: in one transaction, consume the ingress row<br/>and add one routed row per Handler
+  Note over MST: ROUTED, or UNROUTED when the Router picks no Handler
+
+  TRW->>MST: claim a routed row
+  TRW->>TRW: run the Handler
+  TRW->>MST: in one transaction, consume the routed row<br/>and add one outbound row per Send
+
+  DLW->>MST: claim an outbound row
+  DLW->>OBC: send
+  OBC-->>DLW: accepted
+  DLW->>MST: mark the outbound row done
+  Note over MST: The finalizer sets PROCESSED<br/>when no row is pending or in flight
+```
+
+**Legend.** In both diagrams of this section, a solid arrow is a call and a dashed arrow is a reply.
+In this first diagram, a note over the message store names the disposition the message holds at
+that point. Section 6 covers every disposition.
+
+The diagram shows an MLLP inbound that carries HL7 v2, in the original acknowledgement mode. In
+enhanced mode the three codes are `CA`, `CE` and `CR`. With acknowledgements turned off, the inbound
+sends no reply. A source that answers in its own protocol sends no HL7 ACK. The HTTP listener is
+one: its receipt is its own status code, sent after the ingress commit. A file inbound has no
+sender to answer. An inbound of another content type skips HL7 parsing.
+
+The diagram draws one Handler and one outbound Connection. At least four paths are not drawn:
+
+- A Send into a pass-through inbound makes a new message on that inbound.
+- A captured reply can enter again through a loopback inbound.
+- An inbound can opt in to an inline path. The router worker then also runs the Handler, and no
+  routed row is written.
+- An HTTP inbound with `reply_from` holds its answer until the outbound's reply comes back. A
+  failed delivery does reach that sender. [CONNECTIONS.md](CONNECTIONS.md) describes it.
+
+### When a step fails
+
+The second diagram shows four failures, one in each band of the frame. Only the first one reaches
+the sender, because only the first one happens before the ACK. The codes are again those of an MLLP
+inbound.
+
+```mermaid
+sequenceDiagram
+  participant SND as Sender
+  participant LSN as Inbound listener
+  participant MST as Message store
+  participant WRK as Router or transform worker
+  participant DLW as Delivery worker
+  participant OBC as Outbound Connection
+
+  alt The listener cannot accept the message
+    SND->>LSN: HL7 message
+    LSN->>MST: record the message as ERROR, with no ingress row
+    LSN-->>SND: NAK with AR for a decode or parse failure,<br/>AE for a strict validation failure
+  else A Router or a Handler raises, after the ACK
+    WRK->>MST: dead-letter the row at its own stage
+    MST->>MST: the finalizer sets ERROR<br/>when no other row is pending or in flight
+    Note over SND,LSN: No NAK. The sender already holds its AA.
+  else The engine stops before a handoff commits
+    WRK->>MST: claim a row, which marks it in flight
+    Note over MST,WRK: The engine stops. The handoff never commits,<br/>so the row stays in flight.
+    MST->>MST: on the next start, reset each in-flight row to pending
+    WRK->>MST: claim the row again and run the stage again
+  else A delivery fails
+    DLW->>OBC: send
+    OBC-->>DLW: a transport error, or a NAK with AE or CE
+    DLW->>MST: put the outbound row back to pending, with a backoff
+    Note over DLW,OBC: The worker tries again.<br/>A NAK with AR or CR skips the retries.
+    DLW->>MST: dead-letter the outbound row when the attempts run out
+    MST->>MST: the finalizer sets ERROR<br/>when no other row is pending or in flight
+  end
+```
+
+The table lists the main failures. It is not a full list.
+
+| Failure | What the sender sees | Where the message ends |
+|---|---|---|
+| The body cannot be decoded or parsed, or it holds a NUL character | NAK `AR` | `ERROR`, recorded with no ingress row |
+| Strict validation fails or times out | NAK `AE` | `ERROR`, recorded with no ingress row |
+| A streaming inbound cannot store a large document | NAK `AE` | `ERROR`, recorded with no ingress row |
+| The store cannot commit the message | NAK `AE` from the MLLP listener, then the connection closes | Nothing was ACKed, so the sender sends it again |
+| A Router or a Handler raises | The `AA` it already holds | `ERROR`, with the row dead-lettered at its own stage |
+| The engine stops before a handoff commits | The `AA` it already holds | The stage runs again after the restart |
+| A delivery fails | The `AA` it already holds | Retries, then `ERROR` with the outbound row dead-lettered |
+
+A stage can run again safely. A Router and a Handler are pure, so the second run derives the same
+rows. A committed handoff has already consumed its row, so it cannot run twice. A delivery that was
+in flight when the engine stopped may be sent a second time, which is why an outbound Connection
+must be idempotent.
+
+A single-node engine resets every in-flight row when it starts. An engine shard resets only the rows
+on its own lanes. A clustered node recovers them when it becomes the leader, and
+[CLUSTERING.md](CLUSTERING.md) holds that detail.
+
+Two settings in `[delivery]` shape the failure paths, and [CONFIGURATION.md](CONFIGURATION.md) lists
+both. `retry_max_attempts` caps the delivery attempts before the row is dead-lettered. The value
+`forever` turns the cap off, and a Connection's own `retry=` overrides the setting.
+`internal_error` decides what a worker does when a Router, a Handler or a send raises from a code
+error. The default, `continue`, dead-letters the row and moves on. The other value, `stop`,
+puts the row back in the queue, stops that lane and raises an alert.
+
+---
+
+## 6. Message disposition - the state machine
+
+This view is for an operator. It shows what a message's status means and what can change it. A
+message holds one disposition at a time, out of seven. The store's finalizer alone
+sets `PROCESSED`, `FILTERED`, `NOT_DEPLOYED` and an `ERROR` after ingress. It does so only when no
+queue row of the message is still pending or in flight.
+
+```mermaid
+stateDiagram-v2
+  direction TB
+  classDef moving fill:#fff3e0,stroke:#ef6c00,color:#3a1d00
+  classDef settled fill:#e8f5e9,stroke:#2e7d32,color:#10240f
+  classDef failed fill:#fce4ec,stroke:#c2185b,color:#3d0a1f
+
+  [*] --> RECEIVED: raw message committed to the ingress stage
+  [*] --> ERROR: refused before the ingress commit
+  [*] --> ROUTED: an edited body sent straight to an outbound Connection
+  RECEIVED --> ROUTED: the Router picked one or more Handlers
+  RECEIVED --> UNROUTED: the Router picked no Handler
+  RECEIVED --> ERROR: a row is dead
+  RECEIVED --> PROCESSED: after a replay of a routed row, every outbound row resolved
+  ROUTED --> PROCESSED: every outbound row resolved, none dead
+  ROUTED --> FILTERED: every Handler ran and sent nothing
+  ROUTED --> NOT_DEPLOYED: every Send was declined
+  ROUTED --> ERROR: a row is dead
+  ERROR --> RECEIVED: replay of a dead ingress or routed row
+  ERROR --> ROUTED: replay of outbound rows
+  PROCESSED --> ROUTED: replay or resend
+  PROCESSED --> [*]
+  FILTERED --> [*]
+  UNROUTED --> [*]
+  NOT_DEPLOYED --> [*]
+  ERROR --> [*]
+
+  class RECEIVED, ROUTED moving
+  class PROCESSED, FILTERED, UNROUTED, NOT_DEPLOYED settled
+  class ERROR failed
+```
+
+**Legend.** Orange states are in progress. Green states are settled with no failure. Pink is a
+failure. An arrow to the end mark means a message can rest in that state. The store holds each name
+in lower case, for example `not_deployed`.
+
+The diagram draws the main moves. The table says what causes each one, and the replay rule under it
+covers the moves that are not drawn.
+
+| From | To | What moves the message |
+|---|---|---|
+| start | `RECEIVED` | The listener commits the raw message to the ingress stage. |
+| start | `ERROR` | Decode, parse or strict validation fails. The listener records the message, and an MLLP inbound answers with a NAK. |
+| start | `ROUTED` | An operator edits a stored message and resends the edited body straight to an outbound Connection. The new message skips the Router and the Handlers. |
+| `RECEIVED` | `ROUTED` | The Router picks one or more Handlers. |
+| `RECEIVED` | `UNROUTED` | The Router picks no Handler. |
+| `RECEIVED` | `ERROR` | A row is dead, and no row is pending or in flight. Most often it is the ingress row: the Router raised, or the inbound Connection left the config. |
+| `RECEIVED` | `PROCESSED` | Only after a replay put a routed row back. The Handler runs again and its deliveries resolve. The message does not pass through `ROUTED` on this path. |
+| `ROUTED` | `PROCESSED` | No row is pending or in flight, none is dead, and at least one outbound row exists. Each one was delivered, or an operator purged it from the queue. |
+| `ROUTED` | `FILTERED` | Every Handler ran, and none of them sent anything. |
+| `ROUTED` | `NOT_DEPLOYED` | No delivery was queued, and at least one Send was declined because its target Connection is in the graph but not deployed. |
+| `ROUTED` | `ERROR` | A row is dead, and no row is pending or in flight. A row goes dead when a Handler raises, a partner rejects the message permanently, or the delivery attempts run out. It also goes dead when its Handler or its outbound Connection has left the config. |
+| `ERROR` | `RECEIVED` | A message replay puts a dead ingress or routed row back in the queue. |
+| `ERROR` | `ROUTED` | A message replay or a dead-letter replay puts dead outbound rows back in the queue. A resend also moves the message to `ROUTED`, because it adds a new outbound row. |
+| `PROCESSED` | `ROUTED` | A message replay sends the delivered rows again. A resend queues the stored body to another outbound Connection. |
+
+A new message also starts at `RECEIVED` in at least three other cases:
+
+- a Send into a pass-through inbound
+- a captured reply that enters again through a loopback inbound
+- an uploaded message that an operator resends
+
+**Dead-letter is a row state, not a disposition.** A queue row is pending, in flight, done, dead or
+cancelled. A dead row is a dead-letter. Its message shows `ERROR` once no other row of that message
+is pending or in flight. One dead row is enough: the message shows `ERROR` even when another
+Handler's delivery succeeded. While a delivery waits to retry, the message keeps the disposition it
+already has.
+
+**Replay works on queue rows.** A message replay first looks for dead or pending rows. If it finds
+any, it puts only those back and leaves the delivered rows alone. If it finds none, it sends the
+delivered rows again. The message then shows `RECEIVED` if an ingress or routed row is waiting, and
+`ROUTED` if only outbound rows are. An `ERROR` recorded before ingress has no queue row. Neither
+does an `UNROUTED`, `FILTERED` or `NOT_DEPLOYED` message. A replay of any of these changes nothing,
+and the API answers 409.
+
+**An edit and resubmit makes a new message.** By default the edited body enters as a new `RECEIVED`
+message and takes the whole path again. When the operator names a target outbound Connection, the
+new message starts at `ROUTED` with one outbound row. Either way the new message is linked to the
+original, and the original keeps its disposition.
+
+These are the main operator actions, each an API route. [SECURITY.md](SECURITY.md) lists the
+permission each route needs.
+
+| Action | Route |
+|---|---|
+| Replay one message | `POST /messages/{message_id}/replay` |
+| Replay dead-lettered deliveries | `POST /dead-letters/replay` |
+| Resend to another outbound Connection | `POST /messages/{message_id}/resend` |
+| Edit and resubmit | `POST /messages/{message_id}/edit-resend` |
+| Purge an outbound queue | `POST /connections/{name}/purge` |
 
 ---
 
