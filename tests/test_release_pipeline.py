@@ -300,7 +300,8 @@ def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one()
         ),
     }
     # Both walks below draw from this tuple: the Linux SBOM and the Windows one (PR 1849).
-    assert len(_ENGINE_SBOMS) >= 2, f"expected the Linux and Windows engine SBOMs: {_ENGINE_SBOMS}"
+    assert len(set(_ENGINE_SBOMS)) >= 2, f"expected two distinct engine SBOMs: {_ENGINE_SBOMS}"
+    assert _WINDOWS_SBOM in _ENGINE_SBOMS, f"the Windows SBOM left the walk: {_ENGINE_SBOMS}"
     missing = [(f, sink) for f in _ENGINE_SBOMS for sink, text in sinks.items() if f not in text]
     assert not missing, f"an engine SBOM does not reach these sinks: {missing}"
     # The Sigstore bundle must ride along wherever the file does, or an operator cannot verify it.
