@@ -178,9 +178,12 @@ replacement for it, and hooks get added.
 | forbidden-content | The leak guard found customer or PHI-shaped content. See below. |
 | push guard (`pre-push`) | You tried to push a protected branch directly. Branch and open a PR. |
 
-**mypy does not run at commit.** No pre-commit hook invokes it. mypy strict is a CI leg that reports
-after your process is gone, so run `mypy messagefoundry` and `mypy --explicit-package-bases tests`
-by hand before you commit.
+**mypy does not run at commit.** No pre-commit hook invokes it. mypy strict runs in CI and reports
+after your process is gone, so run the three legs `ci.yml` runs by hand before you commit:
+
+    mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
+    mypy --platform win32 messagefoundry messagefoundry_toolkit
+    mypy --explicit-package-bases tests
 
 Never use `--no-verify`, and never rename a file to slip past a gate. A gate you bypassed is a gate
 nobody will re-run.
