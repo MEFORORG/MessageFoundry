@@ -43,7 +43,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a provider module by name | Two provider seams | Off unless you name an external provider |
 | 4 | Starting processes | 11 modules | Varies, see below |
-| 5 | Calling native libraries | 16 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 17 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -224,7 +224,7 @@ reach one:
 
 ## 5. Native library calls
 
-16 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+17 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
@@ -233,6 +233,10 @@ pure-Python equivalent:
 - Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
   drive letter is a mapped network drive, so it can refuse one before opening the file
 - Process and job control: `pipeline/sandbox.py`
+- Drop-folder confinement: `transports/file.py`, which on Windows asks `kernel32`'s
+  `GetFinalPathNameByHandleW` where the file it opened really is, so the FILE source refuses a drop
+  reached through a link or junction out of its watch folder (BACKLOG #2507). POSIX needs no
+  `ctypes` for this; it opens each path part with `O_NOFOLLOW`
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`

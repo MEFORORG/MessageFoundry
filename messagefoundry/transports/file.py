@@ -1812,11 +1812,12 @@ def _open_confined(path: Path, directory: Path, root_real: Path) -> tuple[int, o
 
 
 def _listed_parts(path: Path, directory: Path) -> tuple[str, ...]:
-    """``path``'s components below the watch directory, refusing anything but plain names."""
+    """``path``'s components below the watch directory, refusing anything but plain names. The refusal
+    is raised outside the handler, so it carries no ``ValueError`` naming both paths."""
     try:
         parts = path.relative_to(directory).parts
     except ValueError:
-        raise _Unconfined("not under the watch directory") from None
+        parts = ()
     if not parts or any(part in (".", "..") for part in parts):
         raise _Unconfined("not a plain name under the watch directory")
     return parts
@@ -1864,13 +1865,16 @@ def _pin_confined(path: Path, directory: Path, root_real: Path) -> tuple[int | N
 
 def _open_no_link(name: str, flags: int, dir_fd: int) -> int:
     """``os.open`` relative to ``dir_fd`` with ``O_NOFOLLOW``. The error drops the component's name:
-    under ``recursive`` it can be a partner-made subdirectory, which ``safe_exc`` cannot swap out."""
+    under ``recursive`` it can be a partner-made subdirectory, which ``safe_exc`` cannot swap out. So
+    it is raised outside the handler, keeping only the errno and its text: ``from None`` would leave
+    the named error on ``__context__``."""
     try:
         return os.open(name, flags | _O_NOFOLLOW, dir_fd=dir_fd)
     except OSError as exc:
-        if exc.errno in _LINK_ERRNOS:
-            raise _Unconfined("a symbolic link") from None
-        raise OSError(exc.errno, exc.strerror) from None
+        code, text = exc.errno, exc.strerror
+    if code in _LINK_ERRNOS:
+        raise _Unconfined("a symbolic link")
+    raise OSError(code, text)
 
 
 def _final_path(fd: int) -> str:
