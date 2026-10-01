@@ -30,7 +30,8 @@ inbound(
 # A FHIR REST destination. ``url`` is the service BASE (e.g. https://host/fhir); ``interaction="create"``
 # POSTs each resource to {base}/{ResourceType}. A SMART/OAuth deployment adds
 # ``bearer_token=env("fhir_bearer_token")`` (a secret → MEFOR_VALUE_FHIR_BEARER_TOKEN). For idempotent
-# re-sends, set interaction="update" (PUT by id) or a conditional knob (if-none-exist / conditional-update
+# re-sends, set interaction="update" (an update by id, sent as a one-entry transaction Bundle so the id
+# stays out of the URL) or a conditional knob (if-none-exist / conditional-update
 # / if-match) — see docs/CONNECTIONS.md.
 outbound("OB_FHIR_SERVER", FHIR(url=env("fhir_base_url"), interaction="create"))
 
