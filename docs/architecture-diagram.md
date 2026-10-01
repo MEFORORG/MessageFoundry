@@ -12,6 +12,7 @@ The views in this file each answer a different question. More diagrams live in o
 3. **Runtime message flow** — how a received message moves through the staged queue and earns a disposition.
 4. **Config wiring graph** — how Connections, Routers, and Handlers wire together by name (no "channel" object).
 5. **Receive to deliver**: the order of steps from receipt to delivery, when the sender gets its ACK, and what each failure does.
+6. **Message disposition**: every status a message can hold, and what moves it from one to the next.
 
 **Legend.** Solid/thick arrows = *depends on / calls*. Dotted arrows = *talks to over the API or wire*
 (separate process). Cylinders = persisted stage/store. Hexagon = the single disposition authority.
@@ -30,6 +31,7 @@ the block, because a copy drifts from its source.
 | Runtime message flow | [architecture-diagram.md](architecture-diagram.md) (this file, section 3) |
 | Config wiring graph | [architecture-diagram.md](architecture-diagram.md) (this file, section 4) |
 | Receive to deliver sequence, with its failure paths | [architecture-diagram.md](architecture-diagram.md) (this file, section 5) |
+| Message disposition state machine | [architecture-diagram.md](architecture-diagram.md) (this file, section 6) |
 | Trust boundaries and PHI data flow | [SECURITY.md](SECURITY.md) |
 | Sign-in and permission check flow | [SECURITY.md](SECURITY.md) |
 | Deployment topologies | [DEPLOYMENT.md](DEPLOYMENT.md) |
@@ -432,6 +434,92 @@ both. `retry_max_attempts` is the number of delivery attempts before the row is 
 shipped. `internal_error` decides what a worker does when a Router, a Handler or a send raises from a
 code error. The default, `continue`, dead-letters the row and moves on. The other value, `stop`,
 keeps the row, stops that lane and raises an alert.
+
+---
+
+## 6. Message disposition - the state machine
+
+This view answers one question for an operator: what does a message's status mean, and what can
+change it. A message holds one disposition at a time, out of seven. The store's finalizer alone
+sets `PROCESSED`, `FILTERED`, `NOT_DEPLOYED` and an `ERROR` after ingress. It does so only when no
+queue row of the message is still pending or in flight.
+
+```mermaid
+stateDiagram-v2
+  direction TB
+  classDef moving fill:#fff3e0,stroke:#ef6c00,color:#3a1d00
+  classDef settled fill:#e8f5e9,stroke:#2e7d32,color:#10240f
+  classDef failed fill:#ede7f6,stroke:#5e35b1,color:#22103f
+
+  [*] --> RECEIVED: raw message committed to the ingress stage
+  [*] --> ERROR: refused before the ingress commit
+  [*] --> ROUTED: an edited body sent straight to an outbound Connection
+  RECEIVED --> ROUTED: the Router picked one or more Handlers
+  RECEIVED --> UNROUTED: the Router picked no Handler
+  RECEIVED --> ERROR: the ingress row was dead-lettered
+  ROUTED --> PROCESSED: every outbound row resolved, none dead
+  ROUTED --> FILTERED: every Handler ran and sent nothing
+  ROUTED --> NOT_DEPLOYED: every Send was declined
+  ROUTED --> ERROR: a row was dead-lettered at any stage
+  ERROR --> RECEIVED: replay of a dead ingress or routed row
+  ERROR --> ROUTED: replay of dead outbound rows
+  PROCESSED --> ROUTED: replay or resend
+  PROCESSED --> [*]
+  FILTERED --> [*]
+  UNROUTED --> [*]
+  NOT_DEPLOYED --> [*]
+  ERROR --> [*]
+
+  class RECEIVED, ROUTED moving
+  class PROCESSED, FILTERED, UNROUTED, NOT_DEPLOYED settled
+  class ERROR failed
+```
+
+**Legend.** Orange states are still moving: a worker has more to do. Green states are settled with
+no failure. Purple is a failure. An arrow to the end mark means a message can rest in that state.
+The store holds each name in lower case, for example `not_deployed`.
+
+| From | To | What moves the message |
+|---|---|---|
+| start | `RECEIVED` | The listener commits the raw message to the ingress stage. |
+| start | `ERROR` | Decode, parse or strict validation fails. The listener records the message, and an HL7 inbound sends a NAK. |
+| start | `ROUTED` | An operator edits a stored message and resends the edited body straight to an outbound Connection. The new message skips the Router and the Handlers. |
+| `RECEIVED` | `ROUTED` | The Router picks one or more Handlers. |
+| `RECEIVED` | `UNROUTED` | The Router picks no Handler. |
+| `RECEIVED` | `ERROR` | The ingress row is dead-lettered. For example, the Router raised, or the inbound Connection left the config. |
+| `ROUTED` | `PROCESSED` | No row is in flight, none is dead, and at least one outbound row exists. Each one was delivered, or an operator purged it from the queue. |
+| `ROUTED` | `FILTERED` | Every Handler ran, and none of them sent anything. |
+| `ROUTED` | `NOT_DEPLOYED` | No delivery was queued, and at least one Send was declined because its target Connection is in the graph but not deployed. |
+| `ROUTED` | `ERROR` | A row is dead-lettered at any stage. For example, a Handler raised, a partner rejected the message for good, the delivery attempts ran out, or a Handler or an outbound Connection left the config. |
+| `ERROR` | `RECEIVED` | A message replay puts a dead ingress or routed row back in the queue. |
+| `ERROR` | `ROUTED` | A message replay or a dead-letter replay puts dead outbound rows back in the queue. A resend also moves the message to `ROUTED`, because it adds a new outbound row. |
+| `PROCESSED` | `ROUTED` | A message replay sends the delivered rows again. A resend queues the stored body to another outbound Connection. |
+
+**Dead-letter is a row state, not a disposition.** A queue row is pending, in flight, done, dead or
+cancelled. A dead row is a dead-letter, and its message shows `ERROR`. One dead row is enough: the
+message shows `ERROR` even when another Handler's delivery succeeded. A message stays `ROUTED` while
+a delivery waits to retry.
+
+**Replay works on queue rows.** A message replay first looks for dead or waiting rows and puts only
+those back, so a row that was already delivered is not sent twice. If nothing is stuck, it sends the
+delivered rows again. An `ERROR` recorded before ingress has no queue row. Neither does an
+`UNROUTED`, `FILTERED` or `NOT_DEPLOYED` message. A replay of any of these changes nothing, and the
+API answers 409.
+
+**An edit and resubmit makes a new message.** By default the edited body enters as a new `RECEIVED`
+message and takes the whole path again. When the operator names a target outbound Connection, the
+new message starts at `ROUTED` with one outbound row. Either way the new message is linked to the
+original, and the original keeps its disposition.
+
+The operator actions are API routes, and each one checks a permission:
+
+| Action | Route |
+|---|---|
+| Replay one message | `POST /messages/{message_id}/replay` |
+| Replay dead-lettered deliveries | `POST /dead-letters/replay` |
+| Resend to another outbound Connection | `POST /messages/{message_id}/resend` |
+| Edit and resubmit | `POST /messages/{message_id}/edit-resend` |
+| Purge an outbound queue | `POST /connections/{name}/purge` |
 
 ---
 
