@@ -48,45 +48,61 @@ was dropped and its code deleted (#396).
 
 ## 2. Reference architecture
 
-```
-                        HL7 / MLLP senders
-                               |
-                    VIP / L4 load balancer (operator-built)
-          TCP-connect health check per MLLP port -- passes ONLY on the
-          engine that holds leadership (a standby binds no listeners)
-                               |
- ============= PRIMARY DC (hospital) =============       ======== DR DC (offsite) ========
- |                                               |       |                               |
- |  Host A          Host B                       |       |  Host E                       |
- |  +---------+     +---------+                  |       |  +---------+                  |
- |  |Engine VM|     |Engine VM|                  |       |  |DR Engine|                  |
- |  |#1 ACTIVE|     |#2 active|                  |       |  |VM       |                  |
- |  |(leader) |     |-eligible|                  |       |  |SERVICE  |                  |
- |  |         |     |STANDBY  |                  |       |  |STOPPED  |                  |
- |  |         |     |         |                  |       |  |(cold)   |                  |
- |  +----+----+     +----+----+                  |       |  +----+----+                  |
- |       |               |                       |       |       :                       |
- |       +-------+-------+                       |       |       :                       |
- |               | TDS/TLS to AG listener        |       |       :                       |
- |  Host C          Host D                       |       |  Host F                       |
- |  +---------+     +---------+                  |       |  +---------+                  |
- |  |SQL VM   |     |SQL VM   |                  |       |  |SQL VM   |                  |
- |  |AG R1    |     |AG R2    |                  |       |  |AG R3    |                  |
- |  |primary  |     |SYNC +   |                  |       |  |ASYNC    |                  |
- |  |SYNC +   |     |AUTO f/o |                  |       |  |forced   |                  |
- |  |AUTO f/o |     |         |                  |       |  |f/o only |                  |
- |  +---------+     +---------+                  |       |  +---------+                  |
- |  all engines point [store].server here        |       |                               |
- |                                               |       |                               |
- =================================================       =================================
+This diagram shows where each VM sits across the two data centers, and how the engines reach the
+availability group (AG). Senders connect through a VIP (virtual IP address) or a load balancer,
+which the operator builds.
+Every engine sets `[store].server` to the AG listener, and the listener leads to the replica that
+is primary at the time.
 
-   Async log send: primary R1/R2  ------ over the WAN ------>  R3  (forced failover only).
-   The DR-engine connector is dotted ( : ): its NSSM service is STOPPED in steady state and
-   started only per the section 6 DR runbook -- promoted with the database as a site unit.
+```mermaid
+flowchart TB
+  classDef io fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
 
- WSFC quorum: primary-DC nodes vote, DR node gets ZERO votes; witness = CLOUD WITNESS
- (or a file share witness at a THIRD site -- never inside either data center).
+  HL7_SENDERS(["HL7 and MLLP senders"]):::io
+  L4_LB["VIP or L4 load balancer (operator-built)<br/>TCP-connect health check per MLLP port<br/>passes ONLY on the engine that holds leadership"]:::ext
+
+  subgraph PRIMARY_DC["PRIMARY DC (hospital)"]
+    ENGINE_1["Host A: engine VM 1<br/>ACTIVE (leader)"]:::core
+    ENGINE_2["Host B: engine VM 2<br/>STANDBY, active-eligible<br/>binds no listeners"]:::core
+    AG_R1[("Host C: SQL VM, AG replica R1<br/>primary<br/>SYNC commit, AUTO failover")]:::store
+    AG_R2[("Host D: SQL VM, AG replica R2<br/>SYNC commit, AUTO failover")]:::store
+  end
+
+  AG_LISTENER["AG listener<br/>the store address every engine uses"]:::ext
+
+  subgraph DR_DC["DR DC (offsite)"]
+    ENGINE_DR["Host E: DR engine VM<br/>service STOPPED in steady state (cold)"]:::core
+    AG_R3[("Host F: SQL VM, AG replica R3<br/>ASYNC commit, forced failover only")]:::store
+  end
+
+  HL7_SENDERS ==> L4_LB
+  L4_LB ==>|"health check passes"| ENGINE_1
+  L4_LB -.->|"health check fails"| ENGINE_2
+  ENGINE_1 ==>|"TDS over TLS"| AG_LISTENER
+  ENGINE_2 -->|"heartbeat only, TDS over TLS"| AG_LISTENER
+  ENGINE_DR -.->|"only after the DR runbook starts it"| AG_LISTENER
+  AG_LISTENER ==>|"current primary replica"| AG_R1
+  AG_R1 ==>|"synchronous commit"| AG_R2
+  AG_R1 -->|"asynchronous log send over the WAN"| AG_R3
 ```
+
+**Legend.** Thick arrows are the steady-state message and commit path. Thin solid arrows are
+steady-state traffic outside that path. Dotted arrows are paths nothing uses in steady state.
+Cylinders are SQL Server replicas.
+
+Three notes go with the diagram:
+
+- **Asynchronous log send.** The current primary, R1 or R2, sends log to R3 over the WAN. R3 takes
+  a forced failover only.
+- **The DR engine connector is dotted.** Its NSSM service is STOPPED in steady state. The section 6
+  DR runbook starts it, and nothing else does. The DR engine is promoted with the database, as a
+  site unit.
+- **WSFC quorum.** WSFC is Windows Server Failover Clustering. The primary-DC nodes vote and the DR
+  node gets ZERO votes. The witness is a cloud witness, or a file share witness at a THIRD site. It
+  is never inside either data center.
 
 The commit topology reduces to one rule: **synchronous commit stays inside the hospital DC**
 (R1 + R2, with automatic failover), while **the DR replica is asynchronous** (forced failover
