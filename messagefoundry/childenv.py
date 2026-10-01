@@ -6,19 +6,19 @@ A process started with no ``env=`` gets a copy of its parent's whole environment
 environment holds its secrets by design: the store key, the store password and every ``env()``
 connection secret arrive as ``MEFOR_*`` variables. So each spawn site names what its child gets,
 through one of the three builders here, and ``tests/test_child_process_environment.py`` fails a
-spawn that passes no ``env=`` at all.
+process start whose environment does not come from one of them.
 
 * :func:`worker_environment` is an **allowlist**, for a child that runs code the engine does not
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
   and the engine switches its caller names. A variable nobody listed does not cross.
 * :func:`hook_environment` is **everything except the engine's own namespace**, for a command an
   operator configured (the DR hook). Such a command may need ordinary variables the engine cannot
-  list in advance, such as a cloud profile or a proxy. It has no use for the engine's settings, and
-  every secret the engine declares is named ``MEFOR_*``, so the whole prefix is dropped. Dropping a
-  prefix does not go stale the way a list of secret names would. One name outside the prefix is
-  dropped too (:data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX`). **A secret an operator keeps under any
-  other name still reaches the hook**: a ``[secrets].provider = "env"`` reference may name any
-  variable, and this module cannot know which.
+  list in advance, such as a cloud profile or a proxy. It has no use for the engine's settings, so
+  the whole ``MEFOR_*`` prefix is dropped. Dropping a prefix does not go stale the way a list of
+  secret names would. A few names outside the prefix are dropped too
+  (:data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX`). **A secret kept under any other name still reaches
+  the hook**: a ``[secrets].provider = "env"`` reference may name any variable, a library may read
+  one this module does not know, and neither can be listed here.
 * :func:`engine_environment` is the **whole** environment, for a child that is itself a full engine
   (an engine shard). It opens the store and builds connections, so it needs the secrets.
 
@@ -47,12 +47,13 @@ __all__ = [
     "worker_environment",
 ]
 
-#: Every environment variable the engine reads as a setting or a secret starts with this.
+#: The engine's own settings and secrets are named with this prefix. The libraries it uses read
+#: other names as well; :data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the secret ones known here.
 ENGINE_ENV_PREFIX: Final = "MEFOR_"
 
 #: The interpreter flag a ``python -m`` child is started with. Without it Python puts the working
 #: directory first on the child's import path, so a file there could stand in for a module the child
-#: imports. The builders below hand the child the package location that flag takes away.
+#: imports. :func:`_with_import_path` hands the child the package location that flag takes away.
 SAFE_PATH_FLAG: Final = "-P"
 
 #: Interpreter variables cross as a namespace, not one by one. They are settings of the interpreter
@@ -108,10 +109,12 @@ _POSIX_NAMES: Final = frozenset(
 )
 _POSIX_LOCALE_PREFIX: Final = "LC_"
 
-#: Secrets the engine may use that are not named ``MEFOR_*``. The Vault clients pass
-#: ``MEFOR_STORE_VAULT_TOKEN`` / ``MEFOR_SECRETS_VAULT_TOKEN`` to hvac, and when one is unset hvac
-#: falls back to its own ``VAULT_TOKEN``. So that name can be the engine's Vault credential.
-_ENGINE_SECRETS_OUTSIDE_THE_PREFIX: Final = frozenset({"VAULT_TOKEN"})
+#: Secrets the engine may rely on that are not named ``MEFOR_*``, because a library it uses reads
+#: them when the engine's own setting is unset. At least these two: hvac falls back to
+#: ``VAULT_TOKEN`` when ``MEFOR_STORE_VAULT_TOKEN`` or ``MEFOR_SECRETS_VAULT_TOKEN`` is unset, and
+#: asyncpg falls back to ``PGPASSWORD`` when ``[store].password`` is unset. A list of names, so it
+#: can be incomplete; the module docstring says what that leaves.
+_ENGINE_SECRETS_OUTSIDE_THE_PREFIX: Final = frozenset({"VAULT_TOKEN", "PGPASSWORD"})
 
 
 def _allowed_for_a_worker(name: str, engine_switches: Collection[str]) -> bool:
@@ -144,22 +147,42 @@ def _site_directories() -> set[str]:
     return {str(Path(entry).resolve()) for entry in found if entry}
 
 
-def _with_package_location(env: dict[str, str]) -> dict[str, str]:
-    """Put this package's location on the child's ``PYTHONPATH``, unless the child finds it anyway.
+def _searches_the_working_directory() -> bool:
+    """Whether THIS process was started without :data:`SAFE_PATH_FLAG`, so that its own import of
+    this package may have come from the working directory or the script's directory."""
+    return not sys.flags.safe_path
 
-    A ``python -m`` child started with :data:`SAFE_PATH_FLAG` no longer searches the working
-    directory. An engine run from a source checkout that is not installed found its own package
-    exactly there, so the child would fail to import it. Naming the location also holds the child to
-    the build its parent is running. An installed package sits in site-packages, which the child
-    searches already; that directory is left off ``PYTHONPATH`` because an entry there is searched
-    ahead of the standard library.
+
+def _with_import_path(env: dict[str, str]) -> dict[str, str]:
+    """Set the ``PYTHONPATH`` of a ``python -m`` child started with :data:`SAFE_PATH_FLAG`.
+
+    Two things, both so that the flag means what it says and the child still starts:
+
+    * **Only absolute entries of the inherited ``PYTHONPATH`` cross.** An empty or relative entry
+      names the working directory, which is what the flag takes off the child's import path.
+    * **This package's location goes first, when the child would not find it otherwise.** An engine
+      run from a source checkout that is not installed found its own package in the working
+      directory, so its child would fail to import it. That is the case when this process searches
+      the working directory and the package is outside site-packages. A process started with the
+      flag found the package without the working directory, so its child does too; and
+      site-packages is left off, because a ``PYTHONPATH`` entry is searched ahead of the standard
+      library.
+
+    For an editable install the entry is redundant, and it puts the checkout ahead of the standard
+    library and site-packages in the child. The working directory already did that for a child of
+    an engine started from its checkout.
     """
     root = _package_root()
-    inherited = env.get("PYTHONPATH", "")
-    # Already first when this process is itself such a child: do not stack a copy per generation.
-    if root in _site_directories() or inherited.split(os.pathsep)[0] == root:
-        return env
-    env["PYTHONPATH"] = os.pathsep.join((root, inherited)) if inherited else root
+    inherited = env.pop("PYTHONPATH", "")
+    entries = [entry for entry in inherited.split(os.pathsep) if os.path.isabs(entry)]
+    if (
+        _searches_the_working_directory()
+        and root not in entries
+        and root not in _site_directories()
+    ):
+        entries.insert(0, root)
+    if entries:
+        env["PYTHONPATH"] = os.pathsep.join(entries)
     return env
 
 
@@ -174,25 +197,27 @@ def worker_environment(
 
     An allowlist over ``environ`` (default :data:`os.environ`): the platform's start-up names, the
     interpreter's own variables, and ``engine_switches``. Code in the child that reads any other
-    variable sees it unset, which is a difference from running in the engine process; ``env()`` is
-    the supported way to hand a Router or a Handler a value.
+    variable finds it unset, which is a difference from running in the engine process.
 
     ``engine_switches`` names the ``MEFOR_*`` variables the child's own code reads to make a decision
     its parent already made. It is for a switch, never for a secret: whatever is named here is in
     the environment of the code this builder exists to keep secrets from.
     """
     switches = frozenset(engine_switches)
-    return _with_package_location(
+    return _with_import_path(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, switches)}
     )
 
 
 def hook_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for a command an operator configured: everything outside the engine's own
-    ``MEFOR_*`` namespace, less :data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX`."""
+    ``MEFOR_*`` namespace, less :data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
+
+    ``PYTHONPATH`` crosses as this process has it. In an engine shard started from a checkout that
+    includes the engine's package location, which :func:`engine_environment` put there."""
     return {n: v for n, v in _source(environ).items() if _outside_the_engine_namespace(n)}
 
 
 def engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for a ``python -m`` child that is itself a full engine: all of it."""
-    return _with_package_location(dict(_source(environ)))
+    return _with_import_path(dict(_source(environ)))

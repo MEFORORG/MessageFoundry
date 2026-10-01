@@ -394,18 +394,14 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   child would have read them from its own environment. This ADR never mentioned the environment,
   so nobody decided that; it was inherited.
 
-  **What changed.** The worker is now started with an environment built from an allowlist
-  (`messagefoundry/childenv.py`, `worker_environment`): the names the platform and the interpreter
-  need to start, the interpreter's own `PYTHON*` variables, and one engine switch,
-  `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`, which the child's own `load_config` reads. No other
-  `MEFOR_*` variable crosses. The worker is also started with `-P`, so the engine's working
-  directory is no longer on the child's import path, and the builder names the engine package's
-  location for the child instead. The DR hook (`pipeline/dr.py`) is an operator's own command and may
-  need ordinary variables, so it gets everything except the `MEFOR_*` namespace and `VAULT_TOKEN`;
-  a secret kept under any other name still reaches it. An engine shard is a whole engine and keeps
-  the whole environment, by name.
-  A guard in `tests/test_child_process_environment.py` fails a process start that passes no `env=`
-  unless it is listed there with its reason.
+  **What changed.** Each child the engine starts is now handed an environment that somebody chose.
+  The sandbox worker gets an allowlist, and no `MEFOR_*` variable except one switch its own
+  `load_config` reads. The worker and the engine shards also start with `-P`, so the engine's
+  working directory is not on their import path. `messagefoundry/childenv.py` is the source of
+  record for what each child gets and why; the `[sandbox]` and `[dr]` sections of
+  [CONFIGURATION.md](../CONFIGURATION.md) say what an operator sees. A guard in
+  `tests/test_child_process_environment.py` fails a process start whose environment does not come
+  from that module, unless the start is listed there with its reason.
 
   **What this does NOT claim.** An explicit environment is not an isolation boundary by itself. The
   child still runs as the engine's operating-system account, so it can still read the engine
@@ -413,10 +409,13 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   removes the direct read from the child's own environment and nothing more. Running the child as
   a different account is separate, later work (ADR 0147).
 
-  **One new difference between the modes.** A Router or Handler that reads an environment variable
-  directly sees it under `mode=off` and, unless it is on the allowlist, does not see it under
-  `mode=subprocess`. `env()` is the supported way to hand a Router or Handler a value, and it is
-  unaffected.
+  **One new difference between the modes, and it can be silent.** The worker loads the config
+  directory again, in its own process, under the allowlisted environment. Config code that reads an
+  environment variable directly, at the top of a module or inside a Router or Handler, sees it under
+  `mode=off` and, unless it is on the allowlist, does not see it under `mode=subprocess`. Where the
+  code supplies a default, nothing fails: the worker builds a different graph, or a Handler takes a
+  different branch, from the one the engine loaded. Nothing compares the two today. A comparison of
+  the worker's graph with the engine's at worker start would close that, and is not built.
 - **The boundary confines the address space, not the machine.** `os`/`subprocess`/`ctypes`/`sqlite3`/
   `http.client` are importable inside the sandbox, so a Handler can still read and write files, open
   network connections, and spawn processes **as the service account**. The forbidden-import guard

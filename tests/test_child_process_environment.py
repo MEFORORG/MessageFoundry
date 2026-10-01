@@ -23,7 +23,6 @@ import ast
 import asyncio
 import functools
 import os
-import re
 import site
 import subprocess
 import sys
@@ -43,13 +42,18 @@ from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline import dr, supervisor
 from messagefoundry.pipeline.dryrun import transform_one
 from tests.test_dangerous_functionality_doc import (
+    _ARGV,
     _ATTRIBUTE_STARTS,
+    _CONSOLE,
     _OS_EXEC_RE,
+    _SHELL,
     _START_FORMS,
     _SUBPROCESS_FUNCS,
     _aliases,
+    _annotation_nodes,
     _dotted,
     _package_sources,
+    _python_under,
     _start_sites,
 )
 from tests.test_sandbox import RAW, _session
@@ -315,6 +319,12 @@ async def test_the_supervisor_starts_a_shard_with_that_environment(
     assert captured["env"] == childenv.engine_environment()
 
 
+#: An absolute directory that is not the package root, for an operator's own ``PYTHONPATH`` entry.
+_OPERATOR_PATH = str(Path(_PACKAGE_ROOT).parent / "operator-libraries")
+
+_BUILDERS_OF_A_PYTHON_CHILD = (childenv.worker_environment, childenv.engine_environment)
+
+
 def test_the_python_children_are_told_where_the_parents_package_is(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -322,36 +332,68 @@ def test_the_python_children_are_told_where_the_parents_package_is(
     checkout found its own package there, so the child is told the location instead."""
     monkeypatch.setattr(site, "getsitepackages", lambda: [])
     monkeypatch.setattr(site, "getusersitepackages", lambda: "")
-    for build in (childenv.worker_environment, childenv.engine_environment):
-        env = build({"PYTHONPATH": "operator-path"})
-        assert env["PYTHONPATH"].split(os.pathsep) == [_PACKAGE_ROOT, "operator-path"]
+    monkeypatch.setattr(childenv, "_searches_the_working_directory", lambda: True)
+    for build in _BUILDERS_OF_A_PYTHON_CHILD:
+        env = build({"PYTHONPATH": _OPERATOR_PATH})
+        assert env["PYTHONPATH"].split(os.pathsep) == [_PACKAGE_ROOT, _OPERATOR_PATH]
         assert build({})["PYTHONPATH"] == _PACKAGE_ROOT
-        # A child of a child: the location is already first, so it is not stacked again.
+        # A child of a child: the location is already there, so it is not stacked again.
         assert build(env)["PYTHONPATH"] == env["PYTHONPATH"]
 
 
-def test_an_installed_package_adds_nothing_to_the_childs_path(
+@pytest.mark.parametrize(
+    "inherited",
+    ["", ".", os.pathsep + _OPERATOR_PATH, _OPERATOR_PATH + os.pathsep, "relative-directory"],
+)
+def test_an_entry_that_names_the_working_directory_does_not_reach_the_child(
+    monkeypatch: pytest.MonkeyPatch, inherited: str
+) -> None:
+    """An empty or relative ``PYTHONPATH`` entry is the working directory by another name, so
+    carrying it across would undo ``-P``."""
+    monkeypatch.setattr(site, "getsitepackages", lambda: [_PACKAGE_ROOT])
+    expected = [_OPERATOR_PATH] if _OPERATOR_PATH in inherited else []
+    for build in _BUILDERS_OF_A_PYTHON_CHILD:
+        crossed = build({"PYTHONPATH": inherited}).get("PYTHONPATH", "")
+        assert [entry for entry in crossed.split(os.pathsep) if entry] == expected
+
+
+def test_a_child_that_finds_the_package_by_itself_is_told_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Installed in site-packages, the child finds the package by itself. Naming site-packages on
-    ``PYTHONPATH`` would move it ahead of the standard library."""
-    monkeypatch.setattr(site, "getsitepackages", lambda: [_PACKAGE_ROOT])
-    for build in (childenv.worker_environment, childenv.engine_environment):
-        assert "PYTHONPATH" not in build({})
-        assert build({"PYTHONPATH": "operator-path"})["PYTHONPATH"] == "operator-path"
+    """Two cases. The package is in site-packages, which every child searches; naming it on
+    ``PYTHONPATH`` would move it ahead of the standard library. Or this process was itself started
+    with ``-P``, so it found the package without the working directory and its child does too."""
+    for in_site_packages, searches_cwd in ((True, True), (False, False)):
+        monkeypatch.setattr(
+            site, "getsitepackages", lambda found=in_site_packages: [_PACKAGE_ROOT] if found else []
+        )
+        monkeypatch.setattr(site, "getusersitepackages", lambda: "")
+        monkeypatch.setattr(
+            childenv, "_searches_the_working_directory", lambda answer=searches_cwd: answer
+        )
+        for build in _BUILDERS_OF_A_PYTHON_CHILD:
+            assert "PYTHONPATH" not in build({})
+            assert build({"PYTHONPATH": _OPERATOR_PATH})["PYTHONPATH"] == _OPERATOR_PATH
 
 
 # --- the static guard ---------------------------------------------------------------------------
 #
-# The names that start a process, the alias resolution and the scanned tree are the process-start
+# The names that start a process, the alias resolution and the engine tree are the process-start
 # inventory's own (tests/test_dangerous_functionality_doc.py), imported so the two cannot disagree
-# about which names start a process or which files are read. That inventory asks which MODULES start
-# a process and in what form. This guard asks a different question, call by call: does each one name
-# the child's environment. The walk over calls is this file's own.
+# about which names start a process. That inventory asks which MODULES start a process and in what
+# form. This guard asks a different question of each start: where does the child's environment come
+# from. The walk over calls is this file's own.
+#
+# Its limits, so nobody reads a green run as more than it is. It reads at least the starts the
+# inventory's tables name. It takes ``env=<name>`` on trust when that name is assigned straight from
+# a builder in the same function, and does not follow a later reassignment. It cannot see a start
+# made by a third-party library, or one reached through ``getattr`` with a computed name.
 
-#: Starts that accept ``env=``: the ``subprocess`` functions, and the asyncio spellings whether
-#: written on the module or on an event loop. Every other start has no ``env=`` to pass.
-_ASYNCIO_START_RE = re.compile(r"^(?:create_)?subprocess_(?:shell|exec)$")
+#: The only environments that count as chosen: a call to one of these.
+_BUILDERS = frozenset(
+    f"messagefoundry.childenv.{name}"
+    for name in ("worker_environment", "hook_environment", "engine_environment")
+)
 
 _PINNED_TOOL = (
     "runs one fixed Windows system tool by its absolute System32 path, with an argument list and no "
@@ -366,10 +408,12 @@ _SERVICE_CONTROL = (
     "tray or the CLI; ShellExecute takes no environment argument, and the command line is built "
     "from validated names only"
 )
+_AS_A_VALUE = " (as a value)"
 
-#: Calls that hand the child the caller's environment on purpose, as ``(module, enclosing function,
-#: start)``, each with its reason. None of them runs code an operator or a config author supplied.
-#: An entry covers ONE call: a second start added to a listed function fails the guard.
+#: Starts that hand the child the caller's whole environment on purpose, as ``(module, enclosing
+#: function, start)``, each with its reason. A start named ``... (as a value)`` is a reference to
+#: the function that is not itself a call. An entry for a call covers ONE call: a second start added
+#: to a listed function fails the guard.
 _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
     ("auth/trust_anchors.py", "dacl_is_owner_only", "subprocess.run"): _PINNED_TOOL,
     ("store/store.py", "_secure_file", "subprocess.run"): _PINNED_TOOL,
@@ -377,11 +421,20 @@ _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
     ("service.py", "service_state", "subprocess.run"): _PINNED_TOOL,
     ("service.py", "control_service", "ShellExecuteW"): _SERVICE_CONTROL,
     ("service.py", "_runas_wait", "ShellExecuteExW"): _SERVICE_CONTROL,
+    ("service.py", "_runas_wait", "ShellExecuteExW" + _AS_A_VALUE): (
+        "sets the ctypes prototype of the call listed on the line above; it starts nothing"
+    ),
     ("service.py", "install_service", "ShellExecuteW"): _SERVICE_CONTROL,
     ("service_status.py", "_query", "subprocess.run"): _PINNED_TOOL,
+    ("checks.py", "_run_tool", "subprocess.run"): (
+        "the developer's own `messagefoundry check` command, run by hand or in CI and never by the "
+        "service; ruff and mypy read their settings from the developer's environment, so it passes "
+        "all of it plus one variable"
+    ),
     ("tray/actions.py", "_run_detached", "subprocess.Popen"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "_open_path", "os.startfile"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "_open_path", "webbrowser.open"): _TRAY_OPENS_FOR_ITS_USER,
+    ("tray/actions.py", "open_console", "webbrowser.open" + _AS_A_VALUE): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/app.py", "TrayApp._edit_settings", "os.startfile"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/branding.py", "relaunch_branded", "subprocess.Popen"): (
         "the tray starting itself again under its branded launcher: the same program, as the same "
@@ -390,8 +443,8 @@ _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
 }
 
 #: The sites this change is about. They are also the positive control: a walker that could not see
-#: a call would report a clean tree, so these three must be seen, and seen passing ``env=``.
-_MUST_PASS_ENV = frozenset(
+#: a call would report a clean tree, so these three must be seen, and seen with a chosen environment.
+_MUST_CHOOSE = frozenset(
     {
         ("pipeline/sandbox.py", "SandboxSession._spawn", "subprocess.Popen"),
         ("pipeline/dr.py", "_run_command", "create_subprocess_shell"),
@@ -402,129 +455,211 @@ _MUST_PASS_ENV = frozenset(
 _Site = tuple[str, str, str]
 
 
-def _start(call: ast.Call, aliases: Mapping[str, str]) -> tuple[str, bool] | None:
-    """``(the start a call makes, whether that start accepts env=)``, or ``None`` for any other call."""
-    func = call.func
-    dotted = _dotted(func, aliases)
+def _start_name(expr: ast.expr, aliases: Mapping[str, str]) -> tuple[str, bool] | None:
+    """``(the process start an expression names, whether that start accepts env=)``, or ``None``."""
+    dotted = _dotted(expr, aliases)
     if dotted in _SUBPROCESS_FUNCS:
         return dotted, True
-    last = func.attr if isinstance(func, ast.Attribute) else (dotted or "").rpartition(".")[2]
-    if last and any(pattern.match(last) for pattern, _form in _ATTRIBUTE_STARTS):
-        return last, _ASYNCIO_START_RE.match(last) is not None
+    last = expr.attr if isinstance(expr, ast.Attribute) else (dotted or "").rpartition(".")[2]
+    for pattern, form in _ATTRIBUTE_STARTS:
+        if last and pattern.match(last):
+            # Among the starts matched by name alone, the asyncio ones are the shell and
+            # argument-list forms, and they take env=. ShellExecute and CreateProcess do not.
+            return last, form in (_SHELL, _ARGV)
     if dotted is not None and (dotted in _START_FORMS or _OS_EXEC_RE.match(dotted)):
         return dotted, False
     return None
 
 
-def _names_an_environment(call: ast.Call) -> bool:
-    """Whether the call passes ``env=``. ``env=None`` means inherit, so it does not count; neither
-    does ``**kwargs``, which may or may not carry one."""
+def _is_builder_call(node: ast.AST, aliases: Mapping[str, str]) -> bool:
+    return isinstance(node, ast.Call) and _dotted(node.func, aliases) in _BUILDERS
+
+
+def _built_names(scope: ast.AST, aliases: Mapping[str, str]) -> frozenset[str]:
+    """The local names ``scope`` assigns straight from a builder call."""
+    return frozenset(
+        target.id
+        for node in ast.walk(scope)
+        if isinstance(node, ast.Assign) and _is_builder_call(node.value, aliases)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    )
+
+
+def _chooses_an_environment(
+    call: ast.Call, aliases: Mapping[str, str], built: frozenset[str]
+) -> bool:
+    """Whether ``env=`` is a builder's result. Anything else is the caller's environment or might
+    be: no ``env=``, ``env=None``, ``os.environ`` or a copy of it, a dict built by hand, ``**kwargs``."""
     for keyword in call.keywords:
         if keyword.arg == "env":
-            return not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None)
+            value = keyword.value
+            return _is_builder_call(value, aliases) or (
+                isinstance(value, ast.Name) and value.id in built
+            )
     return False
 
 
 def _spawn_sites(sources: Mapping[str, str]) -> tuple[Counter[_Site], Counter[_Site]]:
-    """Every process-starting call in ``sources``, counted per site: ``(calls that name the child's
-    environment, calls that do not)``. A site is ``(module, enclosing function, start)``, and the
-    function is qualified by its classes, so two methods of one name stay apart."""
-    named: Counter[_Site] = Counter()
+    """Every process start in ``sources``, counted per site: ``(starts whose environment a builder
+    chose, starts that hand over the caller's)``. A site is ``(module, enclosing function, start)``,
+    and the function is qualified by its classes, so two methods of one name stay apart. A start
+    function that is named without being called can only be the second kind, and is recorded once
+    per site under ``<start> (as a value)``."""
+    chosen: Counter[_Site] = Counter()
     inherits: Counter[_Site] = Counter()
-
-    def visit(
-        node: ast.AST, rel: str, aliases: Mapping[str, str], classes: tuple[str, ...], function: str
-    ) -> None:
-        if isinstance(node, ast.ClassDef):
-            classes = (*classes, node.name)
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            function = node.name  # the innermost function names the site
-        if isinstance(node, ast.Call):
-            start = _start(node, aliases)
-            if start is not None:
-                name, takes_env = start
-                site_key = (rel, ".".join((*classes, function)), name)
-                (named if takes_env and _names_an_environment(node) else inherits)[site_key] += 1
-        for child in ast.iter_child_nodes(node):
-            visit(child, rel, aliases, classes, function)
 
     for rel, source in sources.items():
         tree = ast.parse(source)
-        visit(tree, rel, _aliases(tree), (), "<module>")
-    return named, inherits
+        aliases = _aliases(tree)
+        annotations = _annotation_nodes(tree)
+        called: set[int] = set()
+
+        def visit(
+            node: ast.AST, classes: tuple[str, ...], function: str, built: frozenset[str]
+        ) -> None:
+            if isinstance(node, ast.ClassDef):
+                classes = (*classes, node.name)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                function = node.name  # the innermost function names the site
+                built = _built_names(node, aliases)  # noqa: B023
+            where = ".".join((*classes, function))
+            if isinstance(node, ast.Call):
+                called.add(id(node.func))  # noqa: B023
+                start = _start_name(node.func, aliases)  # noqa: B023
+                if start is not None:
+                    name, takes_env = start
+                    judged = takes_env and _chooses_an_environment(node, aliases, built)  # noqa: B023
+                    (chosen if judged else inherits)[(rel, where, name)] += 1  # noqa: B023
+            elif (
+                isinstance(node, ast.Name | ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and id(node) not in called  # noqa: B023
+                and id(node) not in annotations  # noqa: B023
+            ):
+                start = _start_name(node, aliases)  # noqa: B023
+                if start is not None:
+                    inherits[(rel, where, start[0] + _AS_A_VALUE)] = 1  # noqa: B023
+            for child in ast.iter_child_nodes(node):
+                visit(child, classes, function, built)
+
+        visit(tree, (), "<module>", _built_names(tree, aliases))
+    return chosen, inherits
+
+
+@functools.cache
+def _scanned_sources() -> Mapping[str, str]:
+    """The engine and the toolkit, as the inventory keys them, plus the web console, which the
+    engine mounts in its own process and the inventory does not read."""
+    console = {f"{_CONSOLE.name}/{rel}": text for rel, text in _python_under(_CONSOLE).items()}
+    return {**_package_sources(), **console}
 
 
 @functools.cache
 def _live_spawn_sites() -> tuple[Counter[_Site], Counter[_Site]]:
     """The shipped tree, parsed once for every test below. No test changes the result."""
-    return _spawn_sites(_package_sources())
+    return _spawn_sites(_scanned_sources())
 
 
 def test_every_process_the_engine_starts_is_given_an_environment() -> None:
     """One comparison, three failures it can report: a start nobody decided, a second start inside
-    a listed function, and a listed site that has gone or now names its environment."""
-    _named, inherits = _live_spawn_sites()
+    a listed function, and a listed site that has gone or now chooses its environment."""
+    _chosen, inherits = _live_spawn_sites()
     assert dict(inherits) == dict.fromkeys(_INHERITS_ON_PURPOSE, 1), (
-        "the calls that start a process with the caller's whole environment are not the ones listed "
-        "in _INHERITS_ON_PURPOSE, one call each. Pass env= from messagefoundry.childenv, or list the "
-        "site with its reason."
+        "the starts that hand a child the caller's whole environment are not the ones listed in "
+        "_INHERITS_ON_PURPOSE, one each. Pass env= from a messagefoundry.childenv builder, or list "
+        "the site with its reason."
     )
 
 
 def test_the_guard_sees_the_calls_it_is_about() -> None:
-    named, inherits = _live_spawn_sites()
-    assert sorted(_MUST_PASS_ENV - set(named)) == []
-    assert sorted(_MUST_PASS_ENV & set(inherits)) == []
+    chosen, inherits = _live_spawn_sites()
+    assert sorted(_MUST_CHOOSE - set(chosen)) == []
+    assert sorted(_MUST_CHOOSE & set(inherits)) == []
+    # Only those three choose one today. A fourth is fine; it has to be a deliberate edit here.
+    assert set(chosen) == _MUST_CHOOSE
 
 
 def test_the_guard_reads_every_module_the_process_start_inventory_names() -> None:
-    """Coverage, beside the finding. The inventory finds a start wherever its name is read; this
-    guard reads calls. A module the inventory names and this guard has no site in would hold a
-    start the guard cannot judge, such as a start function passed as a value and called elsewhere."""
-    named, inherits = _live_spawn_sites()
-    seen = {rel for rel, _function, _name in (*named, *inherits)}
-    assert seen == set(_start_sites(_package_sources()))
+    """Coverage, beside the finding: the inventory is a second reader of the same tree, and a module
+    it says starts a process must be one this guard has a site in."""
+    chosen, inherits = _live_spawn_sites()
+    seen = {rel for rel, _function, _name in (*chosen, *inherits)}
+    assert seen == set(_start_sites(_scanned_sources()))
     assert len(seen) >= 9
+    assert any(rel.startswith(_CONSOLE.name + "/") for rel in _scanned_sources())
+
+
+_FROM_A_BUILDER = "from messagefoundry.childenv import hook_environment\n"
 
 
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
         ("import subprocess\ndef f():\n    subprocess.run(['x'])\n", False),
-        ("import subprocess\ndef f():\n    subprocess.run(['x'], env={})\n", True),
         ("import subprocess\ndef f():\n    subprocess.run(['x'], env=None)\n", False),
+        ("import subprocess\ndef f():\n    subprocess.run(['x'], env={})\n", False),
+        ("import os, subprocess\ndef f():\n    subprocess.run(['x'], env=os.environ)\n", False),
+        (
+            "import os, subprocess\ndef f():\n    subprocess.run(['x'], env=os.environ.copy())\n",
+            False,
+        ),
+        (
+            "import os, subprocess\ndef f():\n"
+            "    subprocess.run(['x'], env={**os.environ, 'A': '1'})\n",
+            False,
+        ),
         ("import subprocess\ndef f(**kw):\n    subprocess.run(['x'], **kw)\n", False),
+        ("import subprocess\ndef f(env):\n    subprocess.run(['x'], env=env)\n", False),
         ("import subprocess as sp\ndef f():\n    sp.Popen(['x'])\n", False),
         ("from subprocess import Popen\ndef f():\n    Popen(['x'])\n", False),
-        ("from subprocess import check_output as co\ndef f():\n    co(['x'], env={})\n", True),
         ("import asyncio\nasync def f():\n    await asyncio.create_subprocess_shell('x')\n", False),
-        (
-            "import asyncio\nasync def f():\n    await asyncio.create_subprocess_exec('x', env={})\n",
-            True,
-        ),
         (
             "from asyncio import create_subprocess_shell as css\nasync def f():\n    await css('x')\n",
             False,
         ),
         ("async def f(loop):\n    await loop.subprocess_exec(None, 'x')\n", False),
-        ("async def f(loop):\n    await loop.subprocess_exec(None, 'x', env={})\n", True),
+        (
+            _FROM_A_BUILDER + "import subprocess\ndef f():\n"
+            "    subprocess.run(['x'], env=hook_environment())\n",
+            True,
+        ),
+        (
+            "from messagefoundry import childenv\nfrom subprocess import check_output as co\n"
+            "def f():\n    co(['x'], env=childenv.worker_environment())\n",
+            True,
+        ),
+        (
+            _FROM_A_BUILDER + "import asyncio\nasync def f():\n    env = hook_environment()\n"
+            "    await asyncio.create_subprocess_exec('x', env=env)\n",
+            True,
+        ),
+        (
+            _FROM_A_BUILDER + "async def f(loop):\n"
+            "    await loop.subprocess_exec(None, 'x', env=hook_environment())\n",
+            True,
+        ),
         # A start with no env= to pass can only ever be listed.
         ("import os\ndef f():\n    os.system('x')\n", False),
-        ("import os\ndef f():\n    os.startfile('x', env={})\n", False),
+        (
+            _FROM_A_BUILDER
+            + "import os\ndef f():\n    os.startfile('x', env=hook_environment())\n",
+            False,
+        ),
         ("import os\ndef f():\n    os.execve('x', ['x'], {})\n", False),
     ],
 )
 def test_the_guard_reads_each_spelling_of_a_start(source: str, expected: bool) -> None:
-    named, inherits = _spawn_sites({"m.py": source})
-    assert (sum(named.values()), sum(inherits.values())) == ((1, 0) if expected else (0, 1))
+    chosen, inherits = _spawn_sites({"m.py": source})
+    assert (sum(chosen.values()), sum(inherits.values())) == ((1, 0) if expected else (0, 1))
 
 
 def test_each_call_is_counted_and_a_method_is_keyed_by_its_class() -> None:
     source = (
-        "import subprocess\n"
+        _FROM_A_BUILDER + "import subprocess\n"
         "class A:\n"
         "    def f(self):\n"
-        "        subprocess.run(['x'], env={})\n"
+        "        subprocess.run(['x'], env=hook_environment())\n"
         "        subprocess.run(['y'])\n"
         "        subprocess.run(['z'])\n"
         "class B:\n"
@@ -532,11 +667,27 @@ def test_each_call_is_counted_and_a_method_is_keyed_by_its_class() -> None:
         "        def inner():\n"
         "            subprocess.run(['w'])\n"
     )
-    named, inherits = _spawn_sites({"m.py": source})
-    assert dict(named) == {("m.py", "A.f", "subprocess.run"): 1}
+    chosen, inherits = _spawn_sites({"m.py": source})
+    assert dict(chosen) == {("m.py", "A.f", "subprocess.run"): 1}
     assert dict(inherits) == {
         ("m.py", "A.f", "subprocess.run"): 2,
         ("m.py", "B.inner", "subprocess.run"): 1,
+    }
+
+
+def test_a_start_passed_as_a_value_is_a_site_of_its_own() -> None:
+    """A module that already has a listed call must not hide a second start that is handed to
+    something else to call."""
+    source = (
+        "import asyncio, subprocess\n"
+        "async def f():\n"
+        "    subprocess.run(['listed'])\n"
+        "    await asyncio.to_thread(subprocess.run, ['unjudged'])\n"
+    )
+    _chosen, inherits = _spawn_sites({"m.py": source})
+    assert dict(inherits) == {
+        ("m.py", "f", "subprocess.run"): 1,
+        ("m.py", "f", "subprocess.run" + _AS_A_VALUE): 1,
     }
 
 
@@ -544,6 +695,7 @@ def test_a_call_that_starts_no_process_is_not_a_site() -> None:
     source = (
         "import os, subprocess\n"
         "def f(x, proc: subprocess.Popen):\n"
+        "    held: subprocess.Popen | None = None\n"
         "    x.run()\n"
         "    os.path.join('a')\n"
         "    subprocess.list2cmdline(['a'])\n"
