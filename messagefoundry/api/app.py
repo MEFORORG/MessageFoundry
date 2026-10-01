@@ -41,7 +41,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 from uuid import uuid4
 
 from fastapi import (
@@ -206,6 +206,7 @@ from messagefoundry.api.security import (
     deadline_utc,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
+    get_auth,
     optional_identity,
     pending_credential_deadline,
     require,
@@ -461,6 +462,9 @@ _NO_STORE_ROUTE_PATHS = frozenset(
     }
 )
 _log = logging.getLogger(__name__)
+
+#: The two monitoring rows whose ``reason`` is masked until a per-item reveal (BACKLOG #2443).
+_ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 
 
 def _matched_route_path(request: Request) -> str | None:
@@ -3126,6 +3130,76 @@ def create_app(
             reason=e.reason,
         )
 
+    async def _admit_reveal(request: Request, identity: Identity, reveal: int | None) -> None:
+        """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
+
+        Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
+        A reveal hands out one reason whole, which is ``messages:view_summary`` data (BACKLOG
+        #2443), so a caller without it is refused, and the refusal is audited as
+        ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
+        also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web
+        console's reveal routes already charged both through ``require_ui(..., phi=True)`` before
+        calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
+        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
+        if reveal is None:
+            return
+        if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
+            auth = get_auth(request)
+            if auth is not None and auth.enabled:
+                await auth.audit_permission_denied(
+                    identity,
+                    Permission.MESSAGES_VIEW_SUMMARY,
+                    request.url.path,
+                    client=client_ip(request),
+                )
+            raise HTTPException(403, "revealing a reason needs messages:view_summary")
+        if not (_matched_route_path(request) or "").startswith("/ui/"):
+            enforce_phi_read_hop(request)
+            enforce_phi_read_pacing(request, identity)
+
+    async def _redact_reasons(
+        infos: list[_ReasonInfo],
+        *,
+        engine: Engine,
+        identity: Identity,
+        request: Request,
+        reveal: int | None,
+        audit_action: str,
+    ) -> list[_ReasonInfo]:
+        """Gate and mask each row's ``reason``, lifting the mask on the ONE row ``reveal`` names.
+
+        A caller without ``messages:view_summary`` gets ``reason`` null; a holder gets it as the
+        fixed mask (BACKLOG #2443, ASVS 14.2.6, owner ruling R12). ``reveal`` is the per-item act:
+        a request argument with nowhere to live between calls, so the next bare load is masked
+        again. Every reveal request writes one audit row naming the item and whether its text was
+        actually returned, so a reveal of an empty reason is not recorded as a disclosure. The
+        caller has already passed :func:`_admit_reveal`."""
+        out = [
+            redact_unauthorized(
+                i,
+                identity,
+                revealed=revealable(type(i), summary=False, error_text=i.id == reveal),
+            )
+            for i in infos
+        ]
+        if reveal is not None:
+            shown = next((i for i in out if i.id == reveal), None)
+            await engine.store.record_audit(
+                audit_action,
+                actor=identity.username,
+                # The connection, so the row sits beside that channel's message_view rows.
+                channel_id=shown.connection if shown is not None else None,
+                detail=json.dumps(
+                    {
+                        "id": reveal,
+                        "connection": shown.connection if shown is not None else None,
+                        "revealed": ["reason"] if shown is not None and shown.reason else [],
+                    }
+                ),
+                client=client_ip(request),
+            )
+        return out
+
     @app.get("/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events(
         request: Request,
@@ -3135,13 +3209,21 @@ def create_app(
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
+        # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
+        # calls this handler in-process, and a call that leaves it out must get None.
+        reveal: Annotated[int | None, Query(ge=1)] = None,
     ) -> list[ConnectionEventInfo]:
         """The Corepoint-style connection/transport event log (#46), newest first. Optionally filtered
         by ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp.
 
         Not PHI-free: ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives it a
-        protection level. It is gated by ``monitoring:read`` rather than a PHI permission, and the
-        response is served ``no-store`` (``_NO_STORE_ROUTE_PATHS``)."""
+        protection level. The route is gated by ``monitoring:read``, so ``reason`` is gated
+        separately on ``messages:view_summary``: null without it, the fixed mask with it (BACKLOG
+        #2443). ``reveal`` names ONE event whose reason this response returns whole; it needs
+        ``messages:view_summary``, charges the PHI-read budget, and is audited as
+        ``connection_event_reveal``. The response is served ``no-store``
+        (``_NO_STORE_ROUTE_PATHS``)."""
+        await _admit_reveal(request, identity, reveal)
         # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
         # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
         if connection is not None and not identity.can_access_channel(connection):
@@ -3154,7 +3236,14 @@ def create_app(
             limit=limit,
             allowed_channels=_scope(identity),
         )
-        return [_conn_event_info(r) for r in rows]
+        return await _redact_reasons(
+            [_conn_event_info(r) for r in rows],
+            engine=engine,
+            identity=identity,
+            request=request,
+            reveal=reveal,
+            audit_action="connection_event_reveal",
+        )
 
     @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events_for(
@@ -3165,8 +3254,11 @@ def create_app(
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
+        reveal: Annotated[int | None, Query(ge=1)] = None,
     ) -> list[ConnectionEventInfo]:
-        """The connection/transport event log scoped to one connection (#46), newest first."""
+        """The connection/transport event log scoped to one connection (#46), newest first.
+        ``reason`` and ``reveal`` behave as on ``GET /events`` (BACKLOG #2443)."""
+        await _admit_reveal(request, identity, reveal)
         # Per-channel RBAC: 403 + audit an out-of-scope name (an outbound name isn't a channel a scoped
         # user can access, so this also denies shared-outbound topology); the store scope is defense-in-
         # depth on top of the guard.
@@ -3178,11 +3270,23 @@ def create_app(
             limit=limit,
             allowed_channels=_scope(identity),
         )
-        return [_conn_event_info(r) for r in rows]
+        return await _redact_reasons(
+            [_conn_event_info(r) for r in rows],
+            engine=engine,
+            identity=identity,
+            request=request,
+            reveal=reveal,
+            audit_action="connection_event_reveal",
+        )
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
 
-    def _alert_instance_info(a: Any) -> AlertInstanceInfo:
+    def _alert_instance_info(a: Any, identity: Identity) -> AlertInstanceInfo:
+        """One alert instance, ``reason`` gated and masked (BACKLOG #2443). The mutation echoes use
+        this and reveal nothing: acknowledging an alert is not the act of reading its reason."""
+        return redact_unauthorized(_alert_instance_row(a), identity)
+
+    def _alert_instance_row(a: Any) -> AlertInstanceInfo:
         return AlertInstanceInfo(
             id=a.id,
             event_type=a.event_type,
@@ -3201,24 +3305,36 @@ def create_app(
 
     @app.get("/alerts/active", response_model=AlertInstanceList)
     async def list_active_alerts(
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
         limit: int = Query(200, ge=1, le=1000),
+        reveal: Annotated[int | None, Query(ge=1)] = None,
     ) -> AlertInstanceList:
         """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen``
         first. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the ack/resolve tier),
         with the same per-channel RBAC scope as ``GET /events``. Not PHI-free: ``reason`` is scrubbed
         free text, ``docs/PHI.md`` section 2 gives it a protection level, and the response is served
-        ``no-store`` (``_NO_STORE_ROUTE_PATHS``).
+        ``no-store`` (``_NO_STORE_ROUTE_PATHS``). ``reason`` is gated and masked, and ``reveal``
+        names one alert to return whole, as on ``GET /events``; that act is audited as
+        ``alert_reveal`` (BACKLOG #2443).
 
         ``total``/``worst_severity`` aggregate EVERY active instance in that scope, not this page of
         them. One ``allowed_channels`` value feeds both reads, so the aggregate is scoped identically
         to the rows and can never report an alert the caller may not read."""
+        await _admit_reveal(request, identity, reveal)
         scope = _scope(identity)
         rows = await engine.store.list_active_alert_instances(limit=limit, allowed_channels=scope)
         summary = await engine.store.summarize_active_alert_instances(allowed_channels=scope)
         return AlertInstanceList(
-            alerts=[_alert_instance_info(r) for r in rows],
+            alerts=await _redact_reasons(
+                [_alert_instance_row(r) for r in rows],
+                engine=engine,
+                identity=identity,
+                request=request,
+                reveal=reveal,
+                audit_action="alert_reveal",
+            ),
             total=summary.total,
             worst_severity=summary.worst_severity,
         )
@@ -3309,7 +3425,7 @@ def create_app(
             detail=json.dumps({"alert_id": alert_id, "minutes": body.minutes}),
             client=client_ip(request),
         )
-        return _alert_instance_info(info)
+        return _alert_instance_info(info, identity)
 
     @app.post("/alerts/{alert_id}/resume", response_model=AlertInstanceInfo)
     async def resume_alert(
@@ -3331,7 +3447,7 @@ def create_app(
             detail=json.dumps({"alert_id": alert_id}),
             client=client_ip(request),
         )
-        return _alert_instance_info(info)
+        return _alert_instance_info(info, identity)
 
     @app.post("/alerts/test-email", response_model=AlertTestEmailResult)
     async def test_alert_email(
@@ -3488,7 +3604,7 @@ def create_app(
         a = await engine.store.get_alert_instance(alert_id, allowed_channels=_scope(identity))
         if a is None:  # vanished (e.g. concurrent retention purge of a just-resolved row)
             raise HTTPException(404, "alert instance not found")
-        return _alert_instance_info(a)
+        return _alert_instance_info(a, identity)
 
     @app.get("/dead-letters", response_model=DeadLetterList)
     async def list_dead_letters(

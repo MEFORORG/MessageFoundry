@@ -261,8 +261,11 @@ async def test_event_info_carries_no_phi_field(engine: Engine) -> None:
             "reason",
         }
         closed = next(e for e in events if e["kind"] == "closed")
-        # reason is the safe_text-scrubbed value, never a message body.
-        assert closed["reason"] == "eof"
+        # BACKLOG #2443: a bare load masks the reason whole for a view_summary holder; the
+        # per-event reveal returns the stored, safe_text-scrubbed value, never a message body.
+        assert closed["reason"] == "****"
+        revealed = (await c.get("/events", params={"reveal": closed["id"]}, headers=h)).json()
+        assert next(e for e in revealed if e["id"] == closed["id"])["reason"] == "eof"
 
 
 async def test_all_channels_operator_sees_full_estate(engine: Engine) -> None:
