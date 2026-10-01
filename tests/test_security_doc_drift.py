@@ -281,6 +281,52 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
             "suspended_until",
         }
     ),
+    # BACKLOG #2443 step 4: only ``error`` is gated. The rest is the dashboard an operator with
+    # monitoring:read alone must still read, including THAT a connection failed (``status``) and
+    # how many messages errored on it (``errored``, a count, never text).
+    "ConnectionRow": frozenset(
+        {
+            "alerts_active",
+            "backlog_seconds",
+            "channel_id",
+            "channel_name",
+            "delivered_age_seconds",
+            "destination",
+            "direction",
+            "errored",
+            "flagged",
+            "idle_seconds",
+            "method",
+            "name",
+            "owner_shard",
+            "paused",
+            "peer",
+            "port",
+            "queue_depth",
+            "read",
+            "role",
+            "simulated",
+            "status",
+            "toml_managed",
+            "waiting_for_reply",
+            "written",
+        }
+    ),
+    # The same ``error`` for one connection, on its metadata route. ``metadata`` is the operator's
+    # own label table and ``settings`` is credential-scrubbed for every role; neither is message data.
+    "ConnectionMetadata": frozenset(
+        {
+            "direction",
+            "fault",
+            "metadata",
+            "method",
+            "name",
+            "router",
+            "running",
+            "settings",
+            "simulated",
+        }
+    ),
 }
 
 #: Response models reachable on a message-family route that carry no PHI property, each reviewed once.
@@ -2295,7 +2341,7 @@ def test_field_level_table_equals_phi_fields_in_both_directions() -> None:
         f"code but undocumented: {sorted(derived - documented)}; documented but not gated: "
         f"{sorted(documented - derived)}"
     )
-    assert len(documented) == 13, f"{len(documented)} (object, property) rows, expected 13"
+    assert len(documented) == 15, f"{len(documented)} (object, property) rows, expected 15"
 
 
 def test_field_level_table_parser_detects_a_planted_omission() -> None:
@@ -2307,7 +2353,7 @@ def test_field_level_table_parser_detects_a_planted_omission() -> None:
     mutilated = "\n".join(line for line in text.splitlines() if not line.startswith(dropped))
     remaining = _doc_field_triples(mutilated)
     assert ("MessageSummary", "metadata", Permission.MESSAGES_VIEW_SUMMARY.value) not in remaining
-    assert len(remaining) == 12, (
+    assert len(remaining) == 14, (
         "the parser did not notice a deleted row — it is not actually parsing"
     )
 

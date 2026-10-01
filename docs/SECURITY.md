@@ -747,8 +747,8 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|
 | `GET` | `/security/posture` | `monitoring:read` | `require` |
 | `GET` | `/channels` | `monitoring:read` | `require` |
-| `GET` | `/connections` | `monitoring:read` | `require` |
-| `GET` | `/connections/{name}/metadata` | `monitoring:read` | `require` — per-channel for inbound; a shared outbound is barred to scoped users; credentials scrubbed unconditionally |
+| `GET` | `/connections` | `monitoring:read` | `require` — `error` gated on `messages:view_summary` and masked; the `reveal=<connection name>` act also needs `messages:view_summary` (BACKLOG #2443) |
+| `GET` | `/connections/{name}/metadata` | `monitoring:read` | `require` — per-channel for inbound; a shared outbound is barred to scoped users; credentials scrubbed unconditionally; `error` gated on `messages:view_summary` and masked; the `reveal=true` act also needs `messages:view_summary` (BACKLOG #2443) |
 | `GET` | `/events` | `monitoring:read` | `require` |
 | `GET` | `/connections/{name}/events` | `monitoring:read` | `require` |
 | `GET` | `/stats` | `monitoring:read` | `require` |
@@ -900,13 +900,20 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 115 route objects a default `create_app()` serves, **sixteen** can put
-PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
+**PHI-egress route set.** Of the 115 route objects a default `create_app()` serves, **at least twenty-one**
+can put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/messages/{id}/raw`, `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
-`GET /uploads/{file_id}/messages`, `POST /uploads/{file_id}/resend` and `GET /logs/tail`. Twelve of
-them carry an explicit PHI-read hop refusal + per-actor budget; the other four (`/search/presets` × 3
-and `POST /uploads/{id}/resend`) return no body content of their own.
+`GET /uploads/{file_id}/messages`, `POST /uploads/{file_id}/resend` and `GET /logs/tail`, plus five
+monitoring reads whose free-text field can carry a fragment the scrubber missed: `GET /events`,
+`GET /connections/{name}/events`, `GET /alerts/active`, `GET /connections` and
+`GET /connections/{name}/metadata` (BACKLOG #2443). Twelve of the first sixteen carry an explicit
+PHI-read hop refusal + per-actor budget; the other four (`/search/presets` × 3 and
+`POST /uploads/{id}/resend`) return no body content of their own. The five monitoring reads return
+that field masked, and take the hop refusal and the budget only on their audited `reveal` act,
+the one request that returns it whole.
+*Corrected 2026-10-01:* this read **sixteen** and named none of the five, although PR 1856 had
+already given the first three a `reveal` act.
 
 **With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **at least thirteen more** emit PHI. **CAUTION: this is deliberately not a closed enumeration**, per CLAUDE.md §11: a fixed count is a liability that the next PHI-emitting route silently falsifies, and this one already was — it read "nine more" and omitted `POST /ui/messages/{id}/edit-resend`, whose `_reject` arm re-renders both the pristine body (from `core.get_message_body`, BACKLOG #2345) and the operator's edited `raw_value`. **The authority is the code, not this list:** a `/ui` route emits PHI if it renders a message body, and the ones that charge the per-actor read budget are those passing `phi=True` to `require_ui` / `require_ui_step_up` (`messagefoundry_webconsole/_auth.py`) **or** that reach `enforce_phi_read_pacing` some other way — a reused engine handler that paces in its own body (`search_messages` / `layered_search` / `browse_uploaded_file`), or a console route that charges it inline on a short-circuit render (BACKLOG #1025). Known today:
 `GET /ui/messages`, `/ui/messages/{id}`, `/ui/messages/{id}/summary`, `/ui/messages/{id}/body`,
@@ -1871,7 +1878,7 @@ one place — [`api/field_authz.py`](../messagefoundry/api/field_authz.py) — a
 `redact_unauthorized()` helper applied to every returned row, rather than re-implemented inline per
 endpoint (where a new endpoint or field could silently leak PHI — the BOPLA risk, ASVS 8.1.2 / 8.2.3).
 
-**The default for a mapped model denies.** Each of the eight response models below is a `PhiGatedModel`
+**The default for a mapped model denies.** Each of the ten response models below is a `PhiGatedModel`
 ([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)) that withholds every gated property from JSON
 until an authorization decision is recorded on the instance; `redact_unauthorized()` is what records
 one, releasing exactly the properties the caller's permissions unlock. A route that never calls it
@@ -1880,8 +1887,8 @@ clear. The gate is on JSON serialization, which is every path by which one of th
 client; a python-mode `model_dump()` stays ungated by design, because the engine composes
 `MessageDetail` from a `MessageSummary` dump before any authorization decision exists.
 
-**Read rules — one row per (response object, property).** This table is 1:1 with `PHI_FIELDS`: thirteen
-entries over eight response models. Keying on the *object* (not just the property name) is what makes it
+**Read rules — one row per (response object, property).** This table is 1:1 with `PHI_FIELDS`: fifteen
+entries over ten response models. Keying on the *object* (not just the property name) is what makes it
 mechanically comparable to the map — a CI guard asserts set equality in **both** directions, so the
 table can neither omit a row nor invent one.
 
@@ -1900,6 +1907,8 @@ table can neither omit a row nor invent one.
 | `CapturedResponseInfo` | `detail` | captured-reply disposition text | `messages:view_summary` |
 | `ConnectionEventInfo` | `reason` | scrubbed transport error text, the same `safe_exc` text as `last_error` on a `connection_lost` event | `messages:view_summary` |
 | `AlertInstanceInfo` | `reason` | scrubbed alert detail, the same text on a `connection_error` alert | `messages:view_summary` |
+| `ConnectionRow` | `error` | why a connection failed to start or was DR-parked; the start failure is `safe_exc` text | `messages:view_summary` |
+| `ConnectionMetadata` | `error` | as above, for the one connection the route names | `messages:view_summary` |
 
 `DeadLetterRow` has no `metadata` field, so its absence from the map is correct, not an omission.
 
@@ -1934,19 +1943,23 @@ calls `redact_unauthorized`. It is safe because its line emits only
 `id`/`channel_id`/`received_at`/`message_type`/`control_id`/`status`/`raw` — **no map-gated property may
 ever be added to that line** without a `PHI_FIELDS`-equivalent gate.
 
-**Where redaction actually runs.** Nine read surfaces construct a mapped model, and all nine redact:
+**Where redaction actually runs.** At least eleven read surfaces construct a mapped model, and all of
+these redact:
 `GET /dead-letters`, `GET /messages`, `GET /messages/search`, `GET /messages/{id}` (the wrapper **and**
 each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys on the exact type),
 `GET /messages/{id}/responses` (#120), `GET /search/layered`, and the three monitoring reads
-`GET /events`, `GET /connections/{name}/events` and `GET /alerts/active` (BACKLOG #2443). The four
+`GET /events`, `GET /connections/{name}/events` and `GET /alerts/active`, the connections
+dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Four of those nine additionally feed the **coalesced per-actor/hour PHI-summary exposure
+**Audit.** Four of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`), so a scripted bulk read
-cannot harvest the patient census unaudited. The other five do **not** call the coalescer — they write
+cannot harvest the patient census unaudited. The rest do **not** call the coalescer — they write
 their own dedicated audit rows instead (`response.read` for `GET /messages/{id}/responses`,
-`preset.layered_search` for `GET /search/layered`, and a `connection_event_reveal` or `alert_reveal`
-row for each per-item reveal on the three monitoring reads, which write nothing on a masked load). The four census surfaces are audited **only when a
+`preset.layered_search` for `GET /search/layered`, a `connection_event_reveal` or `alert_reveal`
+row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
+each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
+five write nothing on a masked load). The four census surfaces are audited **only when a
 gated property is actually returned** — `count_exposed()` is computed *post*-redaction and the
 coalescer is called under `if exposed:` — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
@@ -1958,18 +1971,18 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
-(Administrator and Operator hold both; Viewer holds neither, so a Viewer sees the **seven** rows it can
+(Administrator and Operator hold both; Viewer holds neither, so a Viewer sees the **nine** rows it can
 reach — `MessageSummary` × 3, `DeadLetterRow` × 2, `CapturedResponseInfo.detail`,
-`ConnectionEventInfo.reason` — as `null`, and is
+`ConnectionEventInfo.reason`, `ConnectionRow.error`, `ConnectionMetadata.error` — as `null`, and is
 refused `GET /messages/{id}` outright, since that route gates on `messages:view_raw`, which a Viewer
 does not hold. The other five rows (`MessageDetail` × 3, `OutboxInfo.last_error`, `EventInfo.detail`)
 are reached only by a role holding `view_raw` — including a custom role granted `view_raw` **without**
-`view_summary`, which is precisely why those rows sit on the `view_summary` tier. The thirteenth row,
+`view_summary`, which is precisely why those rows sit on the `view_summary` tier. The fifteenth row,
 `AlertInstanceInfo.reason`, is reached only by a role holding `monitoring:diagnose`: of the built-in
 roles only Operator and Administrator hold it, and both also hold `view_summary`, so the row is
 withheld only from a custom role granted `monitoring:diagnose` without `view_summary`. Deployment,
-Coding and Auditor hold neither `view_raw` nor `view_summary`, and reach the `ConnectionEventInfo.reason`
-row through `monitoring:read`) — but that is a
+Coding and Auditor hold neither `view_raw` nor `view_summary`, and reach the `ConnectionEventInfo.reason`,
+`ConnectionRow.error` and `ConnectionMetadata.error` rows through `monitoring:read`) — but that is a
 **role-policy** convention, not a permission-model guarantee, and the split is **reachable**: a custom
 role may be granted `view_raw` without `view_summary` (only `users:manage`, `approvals:approve` and
 `dr:operate` are non-assignable). The disposition fields therefore sit on the `view_summary` tier
@@ -1995,6 +2008,30 @@ cipher-encrypted (PHI.md §2/§7); the scrubber is not de-identification, which 
 Every other field of the two models stays readable under the route's monitoring permission, and CI
 asserts each is on a reviewed non-PHI list.
 
+`ConnectionRow.error` (`GET /connections`) joined the map on the same tier, for the same reason
+(BACKLOG #2443, step 4). It says why a connection failed to start or why the DR run-profile parked
+it, and the start failure is `safe_exc()` text. A holder of `messages:view_summary` gets `****`
+until the `reveal=<connection name>` act, which lifts the error on every row of that name. A name
+can be both an inbound and an outbound, so that act can lift two rows. It needs
+`messages:view_summary`, charges the PHI-read budget, and writes a `connection_error_reveal` audit
+row. A channel-scoped caller that names a connection outside its scope gets 403 and an
+`auth.channel_denied` row, as on `GET /connections/{name}/events`, before any PHI-read budget is
+spent. The `status` word and the `errored` count stay readable, so an operator can still tell that a
+connection failed.
+
+`ConnectionMetadata.error` (`GET /connections/{name}/metadata`) is the same string for the one
+connection the path names, gated and masked the same way. Its reveal is `reveal=true`, a flag,
+because the path already names the item, as `reveal_errors` does on `GET /messages/{id}`. The scope
+check runs first, then the reveal is admitted, charged and audited as `connection_error_reveal`.
+Its ungated `fault` field (`failed` or `filtered`) still tells a role without
+`messages:view_summary` that the connection is down, as `status` does on the dashboard.
+*Corrected 2026-10-01 (BACKLOG #2443 step 4):* this paragraph called that field a known gap. It
+said any `monitoring:read` holder got the text whole. The cause was the gate's one shared field
+serializer, which typed every field named `metadata` as a string. This model's `metadata` is a
+dict. Each model now gets a serializer over its own gated properties only
+([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)). So the dict is untouched and the gap is
+closed. The published schema of every other gated model is unchanged.
+
 **Caveat.** With `[security].require_sign_in = false` every route resolves to the built-in system
 identity, which holds every role and therefore every permission, so the per-property gate withholds
 nothing. The gate survives as code only; that posture is out of scope for a PHI deployment.
@@ -2003,7 +2040,7 @@ nothing. The gate survives as code only; that posture is out of scope for a PHI 
 this gate can be forgotten (the previous claim here was overstated: the old pinning tests iterate the
 *map*, so a new model and a new field on a mapped model both passed them silently):
 
-- **The policy is documented** — `tests/test_security_doc_drift.py` asserts the thirteen-row table above
+- **The policy is documented** — `tests/test_security_doc_drift.py` asserts the fifteen-row table above
   equals `PHI_FIELDS` exactly, in **both** directions, permission literal included, plus a
   planted-omission self-test so a reformatted table cannot make the parser silently no-op.
 - **The policy is complete** — the same module asserts every response model reachable on a
@@ -2014,7 +2051,7 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
   `monitoring:diagnose` without it for the alert list) and asserts every gated property
-  comes back `null`, with a companion assertion that an administrator sees all thirteen — matched **per
+  comes back `null`, with a companion assertion that an administrator sees all fifteen — matched **per
   model, not per property name** — so the negative cannot pass vacuously. That distinction is
   load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
   `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
@@ -2023,8 +2060,12 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
-  against each model's own `phi_gated_properties` in both directions, and proves class creation
-  refuses a gated name the serializer does not cover. The enumeration of call sites above keeps the
+  against each model's own `phi_gated_properties` in both directions. Class creation refuses a
+  gated name outside the reviewed vocabulary, a name that is not a field, a gated field that is
+  not `str | None`, and a subclass that ungates a parent's property. It also reads back the
+  serializers pydantic collected and refuses a gated name none of them covers. *Corrected
+  2026-10-01 (BACKLOG #2443 step 4):* this said class creation refuses a gated name the ONE
+  shared serializer does not cover; that serializer is now per model. The enumeration of call sites above keeps the
   *shipped* surfaces honest; this is what makes the route nobody has written yet safe.
 
 **Write side (engine → store).** Exception/disposition text is also scrubbed *before* it is stored: a
@@ -3277,7 +3318,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes (`POST /ui/login`, `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`), plus `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) | logged, **not** audited. **429 + `Retry-After: 30` on `POST /ui/login`** — the only *sign-in-window* route that sends the header (three **ceremony** routes, `POST /ui/reauth`, `POST /ui/reauth/webauthn` and `POST /ui/mfa`, send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on the other console entry routes — `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when it charges at all — because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 5 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/reauth/oidc`, `POST /ui/account/mfa/verify`; the fourth is registered only with federation on), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; `Retry-After: 30` on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/reauth/oidc` (its 429 re-renders the step-up page), `POST /ui/account/mfa/verify` or `POST /ui/account/password`; logged |
 | Account lockout | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` | 5 / 15 min / 24 h | — | **yes** | no | no | **store-backed**, on **two counters** per account (ADR 0197). While the credential in force is engine-generated (an administrator's account creation and both resets set it), a sign-in failure is still counted and audited but arms no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); the second-step lock arms as usual. The **sign-in** counter takes the local password leg, a combined sign-in (password and TOTP code in one request) with both factors wrong, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only). The **second-step** counter takes the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and a combined sign-in with exactly one factor right. Each attempt is counted by one atomic `increment_login_failure` (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — on the password leg the uniform `auth.login_failed` (`bad_credentials`) row and then `auth.login_locked`, which only `users:manage` reads (the sign-in lock does **not** refuse a combined sign-in on a local account with TOTP enrolled; the second-step lock does), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs (the second-step lock only; the sign-in lock refuses neither), `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by either lock, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
-| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 11 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
+| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 11 `/ui` views via `require_ui(phi=True)`, 1 further `/ui` GET that inherits the charge by delegating into the handler body, and the `reveal` act on the monitoring JSON routes that carry one (at least `GET /events`, `GET /connections/{name}/events`, `GET /alerts/active`, `GET /connections` and `GET /connections/{name}/metadata`), charged at admission (BACKLOG #2443) | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | on / 12 / 15 s / 0.15 s gap | 15 s | **yes** (12, and a 0.15 s minimum gap) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + `Retry-After: 1`, logged. `/ui`: 429 + `Retry-After: 10`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login and every completed second factor | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked; see the *Concurrent session count* signal row for sign-ins that still owe a second factor |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |

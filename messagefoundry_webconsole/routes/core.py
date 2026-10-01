@@ -551,10 +551,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui", response_class=HTMLResponse)
     async def ui_dashboard(
+        request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
     ) -> HTMLResponse:
-        rows = await core.list_connections(engine=engine, identity=identity)
+        rows = await core.list_connections(request=request, engine=engine, identity=identity)
         # BACKLOG #1152: the landing page is where a fresh operator forms the impression that RBAC
         # is broken, so it is where the unprovisioned state gets a sentence. Read off the identity,
         # never off `not rows` — an estate with no connections configured yet is a different empty.
@@ -562,12 +563,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui/connections", response_class=HTMLResponse)
     async def ui_connections(
+        request: Request,
         engine: Any = Depends(deps.get_engine),
         # activity=False (ASVS 14.3.1): the dashboard's 5s live-table refresh is timer-driven, not
         # user activity — it must not keep an abandoned tab's session alive.
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ, activity=False)),
     ) -> HTMLResponse:
-        rows = await core.list_connections(engine=engine, identity=identity)
+        rows = await core.list_connections(request=request, engine=engine, identity=identity)
         return HTMLResponse(pages.connections_fragment(rows))
 
     @app.get("/ui/connection/{name}", response_class=HTMLResponse)
@@ -602,7 +604,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Compose the detail view from existing monitoring handlers (no new PHI surface): find the row in
         # the (already channel-scoped) connection list, then its recent events. A singular /ui/connection/
         # path avoids colliding with the /ui/connections/{purge-confirm,...} action routes.
-        rows = await core.list_connections(engine=engine, identity=identity)
+        rows = await core.list_connections(request=request, engine=engine, identity=identity)
         row = next((r for r in rows if r.name == name), None)
         if row is None:
             raise HTTPException(404, "connection not found")
