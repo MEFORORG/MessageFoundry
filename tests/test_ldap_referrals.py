@@ -349,21 +349,40 @@ def test_the_refusal_names_hosts_and_nothing_else_the_directory_sent() -> None:
         assert leaked not in message
 
 
+def test_the_refusal_names_a_few_hosts_and_counts_the_rest() -> None:
+    """A directory decides how many referrals it sends, so the log line and audit row stay short."""
+    referrals = [f"ldap://dc{i}.other.example/" for i in range(5)] + ["ldap://dc_9.corp.example/"]
+    with pytest.raises(LdapError) as refused:
+        ldap_module._refuse_referral(
+            SimpleNamespace(result={"result": RESULT_REFERRAL, "referrals": referrals}), "user bind"
+        )
+    message = str(refused.value)
+    assert "dc0.other.example, dc1.other.example, dc2.other.example and 3 more;" in message
+    assert "dc3" not in message
+
+
 # --- static: no construction site may bring ldap3's referral defaults back --------------------------
 
 
 def test_every_search_in_the_ldap_module_goes_through_the_refusing_wrapper() -> None:
     """A search called directly would read a referral as "no entries" again. ``_search`` is the one
-    place a ``.search(...)`` call may appear in ``auth/ldap.py``."""
+    place a ``.search(...)`` call may appear in ``auth/ldap.py``, at any depth, async or not. A
+    regular expression's ``.search`` is not an LDAP search and is let through."""
     tree = ast.parse(Path(ldap_module.__file__).read_text(encoding="utf-8"))
+    regexes = {"re", "_PRINTABLE_HOST"}
+    owner = {
+        id(node): scope.name
+        for scope in ast.walk(tree)
+        if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef)
+        for node in ast.walk(scope)
+    }  # the innermost scope wins: ast.walk visits outer functions first, and later keys overwrite
     callers = [
-        func.name
-        for func in ast.walk(tree)
-        if isinstance(func, ast.FunctionDef)
-        for node in ast.walk(func)
+        owner.get(id(node), "<module>")
+        for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "search"
+        and not (isinstance(node.func.value, ast.Name) and node.func.value.id in regexes)
     ]
     assert callers == ["_search"], callers
 

@@ -138,6 +138,8 @@ def _install_fakes(
 
         def search(self, **kwargs: Any) -> bool:
             base = str(kwargs.get("search_base", ""))
+            # Every operation sets result afresh, as ldap3 does.
+            self.result = {"result": 0}
             if base.startswith("OU=Groups") and refer == "group":
                 self.result = REFERRAL_RESULT
                 self.entries = []
@@ -169,6 +171,7 @@ def _install_fakes(
             if refer == "bind":
                 self.result = REFERRAL_RESULT
                 return False
+            self.result = {"result": 0 if bind_ok else 49}  # 49: invalidCredentials
             return bind_ok
 
         def unbind(self) -> None:

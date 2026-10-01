@@ -332,9 +332,13 @@ service-account password to whatever host one referral named.
 
 `messagefoundry/auth/ldap.py` now builds every `Connection` with `auto_referrals=False` and every
 `Server` with `allowed_referral_hosts=[]`. Each alone stops the follow, and
-`tests/test_ldap_referrals.py` measures both arms against loopback servers. A referral answer is now
-an `LdapError` that names the referred host and nothing else from the URL. Sign-in audits it as
-`auth.login_error`, and the session reconciler reads it as unavailable, so it never revokes.
+`tests/test_ldap_referrals.py` measures both arms against loopback servers. A referral result
+(resultCode 10) to a search or to the user bind is now an `LdapError` that names the referred hosts
+and nothing else from the URL. Sign-in audits it as `auth.login_error`, and the session reconciler
+reads it as unavailable, so it never revokes. A search continuation reference is not a referral
+result: ldap3 never follows one, and it still reads as no entry from that subtree.
 
 A site whose users or groups live in more than one domain of a forest would need a global catalog,
-or a search base in the bound controller's own domain, instead of referrals.
+or a search base in the bound controller's own domain, instead of referrals. A global catalog
+carries the membership of universal groups only, so roles mapped to another domain's domain-local
+or global groups would not resolve through it.

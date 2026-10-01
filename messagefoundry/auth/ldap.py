@@ -384,7 +384,10 @@ def _cn_of(dn: str) -> str | None:
 
 #: A referred host the refusal may name. Anything else is replaced, because the text comes from the
 #: directory and is written to the log and the audit row.
-_PRINTABLE_HOST = re.compile(r"[A-Za-z0-9.:\[\]-]{1,253}")
+_PRINTABLE_HOST = re.compile(r"[A-Za-z0-9._:\[\]-]{1,253}")
+
+#: How many referred hosts the refusal names before it only counts the rest.
+_HOSTS_NAMED = 3
 
 
 def _referred_hosts(referrals: Iterable[object]) -> str:
@@ -400,7 +403,9 @@ def _referred_hosts(referrals: Iterable[object]) -> str:
         except ValueError:
             host = None
         hosts.add(host if host and _PRINTABLE_HOST.fullmatch(host) else "<unreadable host>")
-    return ", ".join(sorted(hosts)) or "<no host given>"
+    named = sorted(hosts)[:_HOSTS_NAMED]
+    more = len(hosts) - len(named)
+    return ", ".join(named) + (f" and {more} more" if more else "") or "<no host given>"
 
 
 def _refuse_referral(conn: Any, operation: str) -> None:
@@ -419,7 +424,12 @@ def _refuse_referral(conn: Any, operation: str) -> None:
     reads as a rejected password, which the step-up re-bind would count toward the engine lockout.
     An :class:`LdapError` is audited as ``auth.login_error`` at sign-in, and read as unavailable by
     the reconciler, which never revokes. A referral usually means a search base in another domain of
-    the forest, which a global catalog or a per-domain setting answers.
+    the forest.
+
+    **Only a referral RESULT (resultCode 10).** A search continuation reference (``searchResRef``)
+    arrives with resultCode 0, beside the entries. ldap3 never follows one, with or without this
+    item, so it leaks nothing, and it still reads as no entry from that subtree. AD adds such
+    references to every search based at a domain root, so refusing them would refuse every search.
     """
     from ldap3.core.results import RESULT_REFERRAL  # lazy, like every ldap3 import here
 
@@ -430,16 +440,16 @@ def _refuse_referral(conn: Any, operation: str) -> None:
     message = (
         f"AD answered the {operation} with a referral to {hosts}; the engine does not follow "
         "referrals, because ldap3 would re-send the bind credentials there without the pinned CA "
-        "(BACKLOG #2530). Point the search base at this domain controller's own domain, or at a "
-        "global catalog."
+        "(BACKLOG #2530). This usually means a configured search base lies in another domain of "
+        "the forest; use a base in this domain controller's own domain, or a global catalog."
     )
     _warn_once(f"referral: {operation}", "%s Reported once per operation.", message)
     raise LdapError(message)
 
 
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
-    """``conn.search(**kwargs)``, refusing a referral answer. Every search in this module goes
-    through here, so none can read a referral as "no entries"; a test pins that."""
+    """``conn.search(**kwargs)``, refusing a referral result. Every search in this module goes
+    through here, so none can read one as "no entries"; a test pins that."""
     conn.search(**kwargs)
     _refuse_referral(conn, operation)
 
