@@ -1542,7 +1542,8 @@ def assert_hvac_tls_suites(
     **Since BACKLOG #300 the engine supplies the context instead** (owner ruling 2026-09-27: narrow
     the library-built contexts too). The returned factory builds it with urllib3's **own public
     constructor**, ``urllib3.util.ssl_.create_urllib3_context``, the very function
-    ``urllib3.connection`` calls, so every default urllib3 sets is kept. It then narrows the context
+    ``urllib3.connection`` calls, so every default urllib3 sets is kept. It then pins the approved
+    key-exchange groups (:func:`harden_kex_groups`), narrows the context
     with :func:`narrow_to_approved_suites`, asserts it with :func:`harden_cipher_suites`, and holds it
     to the approved list itself: at least one TLS 1.2 suite, and every suite in
     :data:`_APPROVED_TLS_SUITES`. This function runs the factory once before returning, so a narrowing
@@ -1636,6 +1637,10 @@ def assert_hvac_tls_suites(
 
     def narrowed_context() -> ssl.SSLContext:
         ctx = create_urllib3_context()
+        # ASVS 11.6.2, as every other engine-built context does. Safe for hvac/requests: the context
+        # is a plain client SSLContext the adapter hands to urllib3, which sets no groups of its own,
+        # and harden_kex_groups pins nothing until Python 3.15 grows set_groups (see its docstring).
+        harden_kex_groups(ctx)
         _narrow_library_context(ctx, connector=connector, hop="the Vault TLS context")
         harden_cipher_suites(ctx, connector=connector)
         _hold_to_approved_list(ctx, connector=connector, hop="the Vault TLS context")
