@@ -4787,8 +4787,14 @@ def create_app(
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
     ) -> MessageResponses:
         """The captured request/response replies for a message (ADR 0013). ``outcome``/``detail`` need
-        the message-read permission; the PHI ``body`` is included only for a caller that also holds the
-        raw-body permission (``MESSAGES_VIEW_RAW``). Every access is audited (``response.read``)."""
+        the message-read permission; the PHI ``body`` is included only for a caller that also holds
+        BOTH ``MESSAGES_VIEW_RAW`` and ``MESSAGES_VIEW_SUMMARY``. Every access is audited
+        (``response.read``).
+
+        Why both (ASVS 14.2.6, vault BACKLOG #1187): owner ruling R18 makes this one-message JSON
+        request the reveal act only for a ``view_summary`` holder. An ADR 0045 custom role may hold
+        ``view_raw`` alone, and no built-in role does; such a caller gets a null ``body``, the same
+        answer as a caller without ``view_raw``."""
         row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
@@ -4797,7 +4803,9 @@ def create_app(
                 await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         captured = await engine.store.correlate_response(message_id)
-        include_body = identity.has(Permission.MESSAGES_VIEW_RAW)
+        include_body = identity.has(Permission.MESSAGES_VIEW_RAW) and identity.has(
+            Permission.MESSAGES_VIEW_SUMMARY
+        )
         # Reading captured replies is PHI access — audit it. If bodies are exposed, also record the
         # per-message PHI view timeline (record_view), exactly like opening a raw body.
         await engine.store.record_audit(
@@ -4813,7 +4821,8 @@ def create_app(
             await engine.store.record_view(message_id, actor=identity.username)
         # `detail` can embed a reply fragment (e.g. an unparseable-ACK note), so it gates on
         # messages:view_summary like every other disposition text (#120) — a bare messages:read caller
-        # (Viewer) reaches this endpoint but gets `detail` nulled. The PHI `body` stays on view_raw above.
+        # (Viewer) reaches this endpoint but gets `detail` nulled. The PHI `body` stays on the
+        # view_raw + view_summary pair above.
         return MessageResponses(
             message_id=message_id,
             responses=[
@@ -4837,11 +4846,16 @@ def create_app(
         message_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+        identity: Identity = Depends(
+            require_phi_read(Permission.MESSAGES_VIEW_RAW, Permission.MESSAGES_VIEW_SUMMARY)
+        ),
     ) -> OutboundPayloads:
         """The **transformed outbound payloads** MEFOR routed for a message — one entry per
         destination (#14 parity tool). The PHI bodies are returned in full, so the route requires
-        ``MESSAGES_VIEW_RAW`` outright (unlike ``/responses``, where the body is conditional). Works on
+        ``MESSAGES_VIEW_RAW`` and ``MESSAGES_VIEW_SUMMARY`` outright (unlike ``/responses``, where the
+        body is conditional). The second is there because owner ruling R18 makes this one-message
+        request the reveal act only for a ``view_summary`` holder (ASVS 14.2.6, vault BACKLOG #1187);
+        an ADR 0045 custom role holding ``view_raw`` alone gets the ordinary 403. Works on
         both simulate/shadow and live runs — the transformed payload is retained on the done outbound
         row in either mode. Every access is audited (``outbound.read`` + a per-message ``viewed``
         event when bodies are returned)."""

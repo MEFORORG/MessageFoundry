@@ -481,6 +481,104 @@ async def test_outbound_payloads_require_view_raw(engine: Engine) -> None:
         ).status_code == 403  # no view_raw
 
 
+async def _add_custom(service: AuthService, username: str, permissions: list[str]) -> None:
+    """A user holding ONE ADR 0045 custom role made of exactly ``permissions``."""
+    role = await service.create_custom_role(
+        display_name=f"role-{username}", description=None, permissions=permissions, actor="test"
+    )
+    user_id = await create_local_user_chosen(
+        service,
+        username=username,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[role.id],
+        actor="test",
+    )
+    await _clear_must_change(service, user_id)
+
+
+async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(engine: Engine) -> None:
+    """ASVS 14.2.6, vault BACKLOG #1187, ground (b2): owner ruling R18 makes a one-message JSON
+    request the reveal act only for a ``messages:view_summary`` holder. A custom role holding
+    ``view_raw`` without it gets neither body: ``/outbound`` answers 403 with an
+    ``auth.permission_denied`` row naming the missing permission, and ``/responses`` returns a null
+    ``body``, the answer a caller without ``view_raw`` gets.
+
+    The ``both`` custom role is the control arm: it differs from ``rawonly`` by ``view_summary``
+    alone, and it reads both bodies, so the refusals are that permission and not a broken route."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    await _add(service, "vw", Role.VIEWER)
+    await _add_custom(service, "rawonly", ["messages:read", "messages:view_raw"])
+    await _add_custom(
+        service, "both", ["messages:read", "messages:view_raw", "messages:view_summary"]
+    )
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("OB_Q", "MSH|transformed")]
+    )
+    items = await engine.store.claim_ready(destination_name="OB_Q")
+    await engine.store.complete_with_response(
+        items[0].id, body="MSA|AA", outcome="accepted", detail="MSA-1=AA"
+    )
+    async with _client(engine, service) as c:
+        h = {u: _auth((await _login(c, u)).json()["token"]) for u in ("op", "adm", "vw")}
+        h |= {u: _auth((await _login(c, u)).json()["token"]) for u in ("rawonly", "both")}
+
+        # Built-in roles behave as before: the two that hold view_raw read both bodies.
+        for user in ("op", "adm", "both"):
+            out = await c.get(f"/messages/{mid}/outbound", headers=h[user])
+            assert out.status_code == 200, user
+            assert out.json()["payloads"][0]["payload"] == "MSH|transformed"
+            reply = (await c.get(f"/messages/{mid}/responses", headers=h[user])).json()
+            assert reply["responses"][0]["body"] == "MSA|AA", user
+        assert (await c.get(f"/messages/{mid}/outbound", headers=h["vw"])).status_code == 403
+        vw_reply = (await c.get(f"/messages/{mid}/responses", headers=h["vw"])).json()
+        assert vw_reply["responses"][0]["body"] is None
+
+        # The view_raw-only custom role: the same answers as a caller missing a permission.
+        refused = await c.get(f"/messages/{mid}/outbound", headers=h["rawonly"])
+        assert refused.status_code == 403
+        assert refused.json()["detail"] == "missing permission: messages:view_summary"
+        reply = await c.get(f"/messages/{mid}/responses", headers=h["rawonly"])
+        assert reply.status_code == 200
+        got = reply.json()["responses"][0]
+        assert got["outcome"] == "accepted" and got["body"] is None and got["detail"] is None
+
+    denied = [dict(r) for r in await engine.store.list_audit(action="auth.permission_denied")]
+    assert any(
+        r["actor"] == "rawonly"
+        and '"messages:view_summary"' in r["detail"]
+        and "/outbound" in r["detail"]
+        for r in denied
+    ), denied
+    # The response.read row records that no body went out to the view_raw-only caller.
+    reads = [dict(r) for r in await engine.store.list_audit(action="response.read")]
+    assert any(r["actor"] == "rawonly" and '"body": false' in r["detail"] for r in reads), reads
+
+
+def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:
+    """The reply and outbound bodies now need both permissions (vault BACKLOG #1187). Every built-in
+    role that held ``view_raw`` must therefore hold ``view_summary`` too, or this change would take
+    a body away from a built-in role. The control is that at least one built-in role holds
+    ``view_raw`` at all, so an empty comprehension cannot pass."""
+    from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, Permission
+
+    raw_holders = [
+        role
+        for role, perms in BUILTIN_ROLE_PERMISSIONS.items()
+        if Permission.MESSAGES_VIEW_RAW in perms
+    ]
+    assert {Role.ADMINISTRATOR, Role.OPERATOR} <= set(raw_holders)
+    lacking = [
+        role
+        for role in raw_holders
+        if Permission.MESSAGES_VIEW_SUMMARY not in BUILTIN_ROLE_PERMISSIONS[role]
+    ]
+    assert lacking == []
+
+
 async def test_the_body_fetch_requires_view_raw_and_channel_scope(engine: Engine) -> None:
     """BACKLOG #2345: ``GET /messages/{id}/raw`` rides the same ``messages:view_raw`` gate and
     per-channel 404 as the open. The OPERATOR arm is the control: it proves the route serves the body,
