@@ -555,6 +555,8 @@ async def test_update_and_if_match_url_carries_no_message_id(
     [entry] = bundle["entry"]
     assert entry["request"] == {"method": "PUT", "url": f"Patient/{ID_1965}", **extra}
     assert entry["resource"] == json.loads(UPDATE_1965)
+    # A PUT entry's fullUrl SHALL have a value; it carries the id in the body, never the URL.
+    assert entry["fullUrl"] == f"{BASE}/Patient/{ID_1965}"
 
 
 def test_read_site_still_carries_the_id_in_the_path() -> None:
@@ -610,6 +612,8 @@ async def test_failed_entry_in_a_2xx_reply_is_not_delivered(
     with pytest.raises(DeliveryError) as ei:
         await dest.send(UPDATE_1965)
     assert isinstance(ei.value, NegativeAckError) is permanent
+    # The status came from the entry, not the HTTP reply, and the message says so.
+    assert "transaction entry status" in str(ei.value) and "HTTP" not in str(ei.value)
 
 
 async def test_successful_entry_is_delivered() -> None:
@@ -639,10 +643,14 @@ async def test_entry_etag_and_location_are_captured_as_headers() -> None:
     assert resp.headers == {"ETag": 'W/"8"', "Location": "from-the-real-header"}
 
 
-async def test_overlong_entry_etag_is_not_captured() -> None:
+async def test_overlong_entry_etag_is_not_captured_and_hides_the_bundle_etag() -> None:
+    # The entry named an ETag, so the reply's own ETag, which describes the Bundle, must not stand
+    # in for it when the entry's value is dropped.
+    reply_headers = email.message.Message()
+    reply_headers["ETag"] = 'W/"bundle-level"'
     dest = _dest(interaction="update", capture_response=True, capture_response_headers=["ETag"])
     dest._opener = _FakeOpener(  # type: ignore[assignment]
-        body=_transaction_response("200 OK", etag="x" * 9000)
+        body=_transaction_response("200 OK", etag="x" * 9000), headers=reply_headers
     )
     resp = await dest.send(UPDATE_1965)
     assert resp is not None and resp.headers == {}
@@ -673,24 +681,37 @@ async def test_capture_outcome_comes_from_the_entry(
     ["HTTP/1.1 404 Not Found", "\N{SUPERSCRIPT TWO}" * 3, True, None],
     ids=["prefixed", "non-ascii-digits", "bool", "missing"],
 )
-async def test_unreadable_entry_status_retries(status: object) -> None:
-    # An entry with no status that reads as an HTTP code is not taken as success, and a non-ASCII
-    # digit cannot reach int() and escape as an unclassified ValueError.
+async def test_unreadable_entry_status_is_delivered_with_a_warning(
+    status: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The server answered 2xx, so the write most likely applied; a retry of an applied if-match
+    # update would 412 and dead-letter a message that landed. A non-ASCII digit must not reach
+    # int() and escape as an unclassified ValueError.
     entry = {"response": {} if status is None else {"status": status}}
     body = {"resourceType": "Bundle", "type": "transaction-response", "entry": [entry]}
-    dest = _dest(interaction="update")
+    dest = _dest(conditional="if-match")
     dest._opener = _FakeOpener(body=json.dumps(body).encode())  # type: ignore[assignment]
-    with pytest.raises(DeliveryError) as ei:
-        await dest.send(UPDATE_1965)
-    assert not isinstance(ei.value, NegativeAckError)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.fhir"):
+        assert await dest.send(UPDATE_1965) is None
+    assert "no readable status" in caplog.text
 
 
-async def test_integer_entry_status_is_read() -> None:
+@pytest.mark.parametrize("status", [404, 404.0], ids=["int", "float"])
+async def test_numeric_entry_status_is_read(status: float) -> None:
     dest = _dest(interaction="update")
-    body = {"resourceType": "Bundle", "entry": [{"response": {"status": 404}}]}
+    body = {"resourceType": "Bundle", "entry": [{"response": {"status": status}}]}
     dest._opener = _FakeOpener(body=json.dumps(body).encode())  # type: ignore[assignment]
     with pytest.raises(NegativeAckError):
         await dest.send(UPDATE_1965)
+
+
+async def test_too_deep_2xx_reply_captures_as_unparseable() -> None:
+    # A capture of a too-deep reply must classify, not escape as RecursionError.
+    for over in ({"interaction": "update"}, {"interaction": "create"}):
+        dest = _dest(capture_response=True, **over)
+        dest._opener = _FakeOpener(body=b"[" * 200_000)  # type: ignore[assignment]
+        resp = await dest.send(UPDATE_1965)
+        assert resp is not None and resp.outcome == "unparseable"
 
 
 async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
@@ -726,6 +747,36 @@ async def test_static_if_match_moves_into_the_entry_and_a_dynamic_one_overrides_
 def test_static_if_match_stays_a_header_on_create() -> None:
     # Control arm: only a connection whose writes are wrapped moves its static If-Match.
     assert _dest(interaction="create", headers={"If-Match": "x"})._headers["If-Match"] == "x"
+
+
+async def test_connector_if_match_wins_over_every_other_case_spelling() -> None:
+    # The version check is the connector's. A static If-Match and a Handler-stamped if-match in
+    # another letter case must not displace it.
+    dest = _dest(conditional="if-match", headers={"If-Match": 'W/"static"'}, dynamic_headers=True)
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965, metadata={"http.header.if-match": 'W/"attacker"'})
+    assert _sent_bundle(opener.requests[0])["entry"][0]["request"]["ifMatch"] == 'W/"7"'
+
+
+@pytest.mark.parametrize(
+    ("header", "field"),
+    [
+        ("If-None-Match", "ifNoneMatch"),
+        ("If-Modified-Since", "ifModifiedSince"),
+        ("If-None-Exist", "ifNoneExist"),
+    ],
+)
+async def test_other_conditional_headers_move_into_the_entry(header: str, field: str) -> None:
+    # Each would have qualified the PUT; Bundle.entry.request has a field of the same meaning.
+    for static in (True, False):
+        dest = _dest(interaction="update", headers={header: "v"} if static else None)
+        opener = _FakeOpener()
+        dest._opener = opener  # type: ignore[assignment]
+        await dest.send(UPDATE_1965, metadata=None if static else {f"http.header.{header}": "v"})
+        req = opener.requests[0]
+        assert not req.has_header(header.capitalize())
+        assert _sent_bundle(req)["entry"][0]["request"][field] == "v"
 
 
 @pytest.mark.parametrize("dots", [".", "..", "..."])

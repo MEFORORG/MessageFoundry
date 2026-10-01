@@ -182,6 +182,11 @@ def _operation_outcome(body: str) -> dict[str, Any] | None:
         obj = json.loads(body)
     except (ValueError, RecursionError):  # a deeply nested body must classify, not escape
         return None
+    return _as_operation_outcome(obj)
+
+
+def _as_operation_outcome(obj: Any) -> dict[str, Any] | None:
+    """``obj`` when it is a parsed FHIR ``OperationOutcome``, else None."""
     if isinstance(obj, dict) and obj.get("resourceType") == "OperationOutcome":
         return obj
     return None
@@ -208,20 +213,23 @@ def _classify_fhir(status: int, body: str) -> DeliveryError | None:
     return _classify_status(status, _operation_outcome(body) if reads_outcome else None)
 
 
-def _classify_status(status: int, outcome: dict[str, Any] | None) -> DeliveryError | None:
+def _classify_status(
+    status: int, outcome: dict[str, Any] | None, where: str = "HTTP"
+) -> DeliveryError | None:
     """:func:`_classify_fhir` over an ``OperationOutcome`` that is already parsed, or ``None``.
-    A transaction-response entry carries its outcome parsed, so it is classified here directly."""
+    A transaction-response entry carries its outcome parsed, so it is classified here directly;
+    ``where`` names the layer the status came from, so an entry status is not read as the HTTP one."""
     if 200 <= status < 300:
         return None
     if 500 <= status < 600:
-        return DeliveryError(f"FHIR server returned HTTP {status}")  # 5xx always transient
+        return DeliveryError(f"FHIR server returned {where} {status}")  # 5xx always transient
     transient_issue = outcome is not None and any(
         code in _TRANSIENT_ISSUE_CODES for code in _issue_field(outcome, "code")
     )
     if status in _RETRYABLE_4XX or transient_issue:
-        return DeliveryError(f"FHIR server returned HTTP {status} (transient)")
+        return DeliveryError(f"FHIR server returned {where} {status} (transient)")
     return NegativeAckError(
-        f"FHIR server rejected with HTTP {status}", code=str(status), permanent=True
+        f"FHIR server rejected with {where} {status}", code=str(status), permanent=True
     )
 
 
@@ -231,7 +239,7 @@ def _capture_outcome(body: str) -> str:
     OperationOutcome) → ``accepted``; a received-but-unparseable body → ``unparseable``."""
     try:
         obj = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):  # a too-deep reply is unparseable, not an internal error
         return "unparseable"
     return _capture_outcome_of(obj)
 
@@ -310,13 +318,20 @@ class _FhirRequest(NamedTuple):
     transaction: bool = False
 
 
-#: The one conditional request header FHIR defines for an update, and the ``Bundle.entry.request``
-#: field that carries it in a transaction
-#: (https://hl7.org/fhir/R4B/bundle-definitions.html#Bundle.entry.request.ifMatch).
-_IF_MATCH = "if-match"
+#: The FHIR conditional request headers and their ``Bundle.entry.request`` fields
+#: (https://hl7.org/fhir/R4B/bundle-definitions.html#Bundle.entry.request). On a wrapped update each
+#: one goes to the entry, which the server judges as it judged the PUT; on the outer POST it would
+#: qualify the Bundle instead.
+_ENTRY_CONDITIONAL_FIELDS = {
+    "if-match": "ifMatch",
+    "if-none-match": "ifNoneMatch",
+    "if-modified-since": "ifModifiedSince",
+    "if-none-exist": "ifNoneExist",
+}
 
 #: The reply headers a single PUT would have carried, and the ``Bundle.entry.response`` fields a
-#: transaction-response carries them in instead.
+#: transaction-response carries them in instead. The values keep the entry's own formats: a
+#: ``lastModified`` is a FHIR instant, not an HTTP-date, and a ``location`` is usually relative.
 _ENTRY_RESPONSE_HEADERS = {"ETag": "etag", "Location": "location", "Last-Modified": "lastModified"}
 
 #: ``Bundle.entry.response.status`` starts with a 3-digit HTTP code. ``[0-9]``, never ``\d``: ``\d``
@@ -327,31 +342,38 @@ _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 
 
 def _as_transaction(
-    entry: _FhirRequest, headers: Mapping[str, str], payload: str
+    base: str, entry: _FhirRequest, headers: Mapping[str, str], payload: str
 ) -> tuple[dict[str, str], str]:
     """Wrap one resource as the single entry of a ``transaction`` Bundle (vault BACKLOG #1965).
 
-    Returns the headers left for the outer POST and the Bundle text. An ``If-Match`` in ``headers``
-    moves into the entry's ``request.ifMatch``: on the outer POST it would qualify the Bundle, not
-    the update. ``headers`` lists the per-message headers before the connector's own, so the
-    connector's value is assigned last and wins, as it did on the PUT.
+    Returns the headers left for the outer POST and the Bundle text. Each conditional header in
+    ``headers`` moves into the entry's ``request``, the later one winning, so pass them in rising
+    precedence. The connector's own (``entry.headers``) is applied last and always wins, whatever
+    the letter case of a competing name.
+
+    ``fullUrl`` is written because the definition of ``Bundle.entry.fullUrl`` says it SHALL have a
+    value except on a POST (https://hl7.org/fhir/R4B/bundle-definitions.html#Bundle.entry.fullUrl).
+    It repeats the id, in the body only.
 
     The resource text is spliced in VERBATIM rather than re-serialized. A JSON round-trip would
     rewrite a FHIR ``decimal`` such as ``1.50`` to ``1.5``, and FHIR requires a decimal's precision
     to be preserved (https://hl7.org/fhir/R4B/datatypes.html#decimal). ``payload`` has already
     passed :class:`FhirPeek`, so it is exactly one JSON object; only the BOM ``FhirPeek`` tolerates
-    is removed, because a BOM inside a JSON document is not valid JSON. No ``fullUrl`` is written:
-    it is optional for a transaction ``PUT`` entry, and it would be one more copy of the id."""
+    is removed, because a BOM inside a JSON document is not valid JSON."""
     request = {"method": entry.method, "url": entry.url}
     outer: dict[str, str] = {}
-    for name, value in headers.items():
-        if name.lower() == _IF_MATCH:
-            request["ifMatch"] = value
-        else:
-            outer[name] = value
+    for source in (headers, entry.headers):
+        for name, value in source.items():
+            field = _ENTRY_CONDITIONAL_FIELDS.get(name.lower())
+            if field is not None:
+                request[field] = value
+            elif source is headers:
+                outer[name] = value
     bundle = "".join(
         (
-            '{"resourceType":"Bundle","type":"transaction","entry":[{"resource":',
+            '{"resourceType":"Bundle","type":"transaction","entry":[{"fullUrl":',
+            json.dumps(f"{base}/{entry.url}"),
+            ',"resource":',
             payload.lstrip(_BOM),
             ',"request":',
             json.dumps(request, separators=(",", ":")),
@@ -363,53 +385,63 @@ def _as_transaction(
 
 def _unwrap_transaction_reply(
     body: str, headers: dict[str, str], allowlist: frozenset[str]
-) -> tuple[dict[str, str], str | None]:
-    """Read a 2xx reply to a wrapped update. Returns the captured headers and the capture outcome
-    of the entry, or ``None`` for the outcome when the reply is not a transaction-response with an
-    entry; such a reply is left alone, as any 2xx was before.
+) -> tuple[dict[str, str], str]:
+    """Read a 2xx reply to a wrapped update. Returns the captured headers and the capture outcome.
 
-    Raises the classified failure when the entry's ``response.status`` failed, and a retryable
-    :class:`DeliveryError` when it has none that reads as an HTTP code. A conformant server fails a
-    whole transaction with an error HTTP status, which ``_post`` already classifies; this covers a
-    server that answers 2xx while the entry itself failed, which would otherwise record a rejected
-    update as delivered. The status is an HTTP code by specification
-    (https://hl7.org/fhir/R4B/bundle-definitions.html#Bundle.entry.response.status). PHI-safe: only
-    the code is named, never the entry's ``status`` text or ``outcome``.
+    A reply that is not a transaction-response with an entry is judged as any 2xx was before: it
+    is delivered, and its outcome is that of the whole body.
 
-    The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so they win
-    over a reply header of the same name, which describes the Bundle. Each is offered to the #154
-    allow-list as the header a PUT reply would have carried. A value carrying a control character,
-    or longer than a header value may be, is dropped: it came from a JSON body, which, unlike an
-    HTTP header line, bounds neither."""
+    Raises the classified failure when the entry's ``response.status`` failed. A conformant server
+    fails a whole transaction with an error HTTP status, which ``_post`` already classifies; this
+    covers a server that answers 2xx while the entry itself failed, which would otherwise record a
+    rejected update as delivered. The status is an HTTP code by specification
+    (https://hl7.org/fhir/R4B/bundle-definitions.html#Bundle.entry.response.status). An entry status
+    that does not read as one is logged and the reply is taken as delivered: the server answered
+    2xx, so the write most likely applied, and a retry of an if-match update that did apply would
+    end in a 412 and a false dead-letter. PHI-safe: only the code is named, never the entry's
+    ``status`` text or ``outcome``.
+
+    The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
+    entry carries suppresses the reply header of the same name, which describes the Bundle, even
+    when the entry's value is then dropped. A value carrying a control character, or longer than a
+    header value may be, is dropped: it came from a JSON body, which, unlike an HTTP header line,
+    bounds neither. The rest are offered to the #154 allow-list."""
     try:
         peek = FhirPeek.parse(body)
     except FhirPeekError:
-        return headers, None
+        return headers, "unparseable"
     entries = peek.obj.get("entry") if peek.resource_type == "Bundle" else None
     first = entries[0] if isinstance(entries, list) and entries else None
     response = first.get("response") if isinstance(first, dict) else None
     if not isinstance(response, dict):
-        return headers, None
+        return headers, _capture_outcome_of(peek.obj)
+    outcome = _as_operation_outcome(response.get("outcome"))
     status = response.get("status")
-    m = _ENTRY_STATUS_RE.match(str(status)) if isinstance(status, (str, int)) else None
+    m = _ENTRY_STATUS_RE.match(str(status)) if isinstance(status, (str, int, float)) else None
     if m is None:
-        raise DeliveryError("FHIR transaction-response entry carries no readable status")
-    outcome = response.get("outcome")
-    if not (isinstance(outcome, dict) and outcome.get("resourceType") == "OperationOutcome"):
-        outcome = None
-    failure = _classify_status(int(m.group(1)), outcome)
-    if failure is not None:
-        raise failure
-    from_entry = {
-        name: value
+        logger.warning(
+            "FHIR transaction-response entry carries no readable status; taking the 2xx reply "
+            "as delivered"
+        )
+    else:
+        failure = _classify_status(int(m.group(1)), outcome, where="transaction entry status")
+        if failure is not None:
+            raise failure
+    present = {
+        name: response[field]
         for name, field in _ENTRY_RESPONSE_HEADERS.items()
-        if isinstance(value := response.get(field), str)
+        if response.get(field) is not None
+    }
+    usable = {
+        name: value
+        for name, value in present.items()
+        if isinstance(value, str)
         and not has_control_char(value)
         and len(value) <= MAX_OUTBOUND_HEADER_VALUE_LEN
     }
-    taken = {name.lower() for name in from_entry}
+    taken = {name.lower() for name in present}
     kept = {name: value for name, value in headers.items() if name.lower() not in taken}
-    captured = {**kept, **capture_response_headers(from_entry, allowlist)}
+    captured = {**kept, **capture_response_headers(usable, allowlist)}
     return captured, _capture_outcome_of(outcome) if outcome is not None else "accepted"
 
 
@@ -509,16 +541,17 @@ class FhirDestination(DestinationConnector):
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)
-        # vault BACKLOG #1965: an update travels as a transaction entry, so a static If-Match, which
-        # qualified every PUT, moves into the entry with the rest; on the outer POST it would qualify
-        # the Bundle. Mirrors _resolve_request's dispatch: conditional first, then interaction.
-        wraps_update = self.conditional == "if-match" or (
+        # vault BACKLOG #1965: whether this connection's writes are updates, sent as a transaction
+        # entry. Decided once here, conditional first as _resolve_request reads it, which branches
+        # on this flag. A static conditional header, which qualified every PUT, moves into the entry
+        # with the rest; on the outer POST it would qualify the Bundle.
+        self._wraps_update = self.conditional == "if-match" or (
             self.conditional is None and self.interaction == "update"
         )
-        self._static_if_match = {
+        self._static_conditionals = {
             name: self._headers.pop(name)
             for name in list(self._headers)
-            if wraps_update and name.lower() == _IF_MATCH
+            if self._wraps_update and name.lower() in _ENTRY_CONDITIONAL_FIELDS
         }
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
@@ -705,26 +738,25 @@ class FhirDestination(DestinationConnector):
                 f"{base}/{type_seg}",
                 {"If-None-Exist": self.conditional_query or ""},
             )
-        if self.conditional == "if-match":
-            version_id = self._version_id(peek)
-            if not version_id:
-                raise NegativeAckError(
-                    "FHIR if-match requires the resource's meta.versionId",
-                    code="no-version-id",
-                    permanent=True,
-                )
-            _reject_control_chars(version_id, "meta.versionId")  # it flows into the entry's ifMatch
-            # versionId is an id-typed FHIR value: gate it to the id grammar so it can't break out of
-            # the W/"..." ETag (an ETag is not a place to encode, so reject rather than encode).
-            _validate_path_token(version_id, _FHIR_ID_RE, "meta.versionId")
+        if self._wraps_update:  # update, or if-match; decided once in __init__
+            interaction_headers: dict[str, str] = {}
+            if self.conditional == "if-match":
+                version_id = self._version_id(peek)
+                if not version_id:
+                    raise NegativeAckError(
+                        "FHIR if-match requires the resource's meta.versionId",
+                        code="no-version-id",
+                        permanent=True,
+                    )
+                _reject_control_chars(version_id, "meta.versionId")  # it flows into the ifMatch
+                # versionId is an id-typed FHIR value: gate it to the id grammar so it can't break
+                # out of the W/"..." ETag (an ETag is not a place to encode, so reject).
+                _validate_path_token(version_id, _FHIR_ID_RE, "meta.versionId")
+                interaction_headers["If-Match"] = f'W/"{version_id}"'
             id_seg = urllib.parse.quote(self._require_id(peek), safe="")
             return _FhirRequest(
-                "PUT", f"{type_seg}/{id_seg}", {"If-Match": f'W/"{version_id}"'}, transaction=True
+                "PUT", f"{type_seg}/{id_seg}", interaction_headers, transaction=True
             )
-
-        if self.interaction == "update":
-            id_seg = urllib.parse.quote(self._require_id(peek), safe="")
-            return _FhirRequest("PUT", f"{type_seg}/{id_seg}", {}, transaction=True)
         return _FhirRequest("POST", f"{base}/{type_seg}", {})  # create (default)
 
     @staticmethod
@@ -786,16 +818,17 @@ class FhirDestination(DestinationConnector):
     def _exchange(
         self, payload: str, request: _FhirRequest, extra_headers: dict[str, str]
     ) -> tuple[str, int, dict[str, str], str | None]:
-        """Send one resolved request; the last element is the capture outcome a transaction entry
-        reported, or ``None``. An update goes out as a one-entry ``transaction`` (vault BACKLOG #1965)
+        """Send one resolved request; the last element is the capture outcome of a wrapped update's
+        reply, or ``None``. An update goes out as a one-entry ``transaction`` (vault BACKLOG #1965)
         and its reply is unwrapped; everything else goes to ``_post`` as resolved."""
         if not request.transaction:
             return (*self._post(payload, request.method, request.url, extra_headers), None)
-        # Static, then per-message, then the connector's own: the merge order a PUT had.
+        base = self.base_url.rstrip("/")
+        # Static, then per-message, then the connector's own: the precedence a PUT had.
         outer, bundle = _as_transaction(
-            request, {**self._static_if_match, **extra_headers}, payload
+            base, request, {**self._static_conditionals, **extra_headers}, payload
         )
-        body, status, headers = self._post(bundle, "POST", self.base_url.rstrip("/"), outer)
+        body, status, headers = self._post(bundle, "POST", base, outer)
         captured, outcome = _unwrap_transaction_reply(body, headers, self.capture_response_headers)
         return body, status, captured, outcome
 
