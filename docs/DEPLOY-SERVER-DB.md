@@ -4,9 +4,7 @@
 are filled in as the Gate #3 staging runs confirm them.** How to run the engine on a **production
 server database** (PostgreSQL or SQL Server) instead of the single-node SQLite default. For the network
 exposure / TLS posture of every channel, see [`DEPLOYMENT.md`](DEPLOYMENT.md); for the full settings
-reference, [`CONFIGURATION.md`](CONFIGURATION.md); for clustering, [`CLUSTERING.md`](CLUSTERING.md).
-For a picture of this topology, see
-[`DEPLOYMENT.md`](DEPLOYMENT.md#topology-2-message-store-on-a-remote-server-database).
+reference, [`CONFIGURATION.md`](CONFIGURATION.md); for clustering, [`CLUSTERING.md`](CLUSTERING.md). For a picture of this topology, see [`DEPLOYMENT.md`](DEPLOYMENT.md#message-store-on-a-remote-server-database).
 
 ---
 

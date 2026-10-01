@@ -13,8 +13,7 @@
 
 The engine reaches its clients **only** over its localhost-or-network HTTP/WebSocket API
 ([`api/app.py`](../messagefoundry/api/app.py)) — a client never imports the engine or touches the store
-directly. So the operator UI can run on a different machine from the engine. For a picture of this
-topology, see [`DEPLOYMENT.md`](DEPLOYMENT.md#topology-4-web-console-from-another-machine).
+directly. So the operator UI can run on a different machine from the engine. For a picture of this topology, see [`DEPLOYMENT.md`](DEPLOYMENT.md#web-console-from-another-machine).
 
 Remote access is **supported but off by default**: out of the box the engine is bound to `127.0.0.1`
 (loopback only), so nothing is exposed until an admin deliberately (1) binds the engine to a routable
