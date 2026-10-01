@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.generators import _core, orm  # noqa: F401  (importing orm registers ORM)
+from messagefoundry.generators import _core, all_types  # noqa: F401  (registers ORM and OML)
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.validate import _SEQUENCES_LABELLED_CHOICE
 
