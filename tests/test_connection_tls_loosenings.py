@@ -266,6 +266,10 @@ def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Pa
         "no connection declares tls_check_hostname=false"
         in _result(report, "tls-check-hostname").detail
     )
+    assert (
+        "no outbound url carries a credential-like query parameter"
+        in _result(report, "url-query-credential").detail
+    )
 
 
 def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_path: Path) -> None:
@@ -284,6 +288,7 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
         "tls-revocation-attested",
         "fhir-update-path-form",
         "tls-check-hostname",
+        "url-query-credential",
     ):
         r = _result(report, name)
         assert r.skipped and r.ok and "config did not load" in r.detail
@@ -368,7 +373,7 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
             "OB_ATTESTED",
             ConnectionSpec(
                 type=ConnectorType.REST,
-                settings={"url": "https://partner.example.invalid/ingest"},
+                settings={"url": "https://partner.example.invalid/ingest?subscription-key=SYNTH"},
             ),
             tls_revocation_attested=True,
             tls_revocation_attested_reason="partner PKI runs OCSP at the edge",
@@ -410,6 +415,8 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
     assert "OB_BRIDGE" in switches["tls_allow_expired"]
     assert "OB_NAMELESS" in switches["tls_check_hostname"]
     assert "OB_BRIDGE" not in switches["tls_check_hostname"]
+    assert "OB_ATTESTED" in switches["url_query_credential"]
+    assert "SYNTH" not in switches["url_query_credential"]
     assert "OB_PG_RESULTS" in switches["generic_odbc_tls_unenforced"]
     assert "OB_ATTESTED" in switches["tls_revocation_attested"]
     assert "inbound:IB_MTLS" in switches["tls_revocation_attested"]
@@ -429,6 +436,7 @@ async def test_posture_route_scope_names_every_connection_deviation(engine: Engi
     assert "tls_revocation_attested" in scope
     assert "tls_hop_attested" in scope
     assert "tls_check_hostname" in scope
+    assert "url_query_credential" in scope
 
 
 def _loosenings(body: dict[str, object]) -> list[dict[str, str]]:

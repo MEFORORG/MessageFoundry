@@ -87,7 +87,7 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.secretscrub import credential_query_params, scrub_credentials
 
 __all__ = [
     "ConnectionSpec",
@@ -153,6 +153,7 @@ __all__ = [
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
+    "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
     "overbroad_smart_scopes",
@@ -5108,6 +5109,30 @@ def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
         for ic in registry.inbound.values()
         if _declares_hostname_check_off(ic.spec.settings)
     )
+    return sorted(out)
+
+
+def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every OUTBOUND whose endpoint ``url`` carries a credential-like query parameter, as
+    ``(name, parameter names)`` (ASVS 14.2.1).
+
+    The single reader, on the contract of :func:`expiry_relaxed_hops`, so ``messagefoundry check``,
+    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree. Sorted by name. The
+    second element is the parameter NAMES only, comma-joined, from
+    :func:`~messagefoundry.secretscrub.credential_query_params`; a value never leaves this function.
+
+    A credential in the query rides the request line, so the partner's and every proxy's access log
+    holds it. ``refuse_url_credentials`` refuses a credential in the userinfo, because that shape
+    never authenticated anything; a query credential does authenticate, and some partner APIs take
+    it nowhere else, so it is reported rather than refused.
+
+    It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
+    construction WARNING in ``pipeline.wiring_runner`` reads the resolved one. Pure."""
+    out: list[tuple[str, str]] = []
+    for oc in registry.outbound.values():
+        url = oc.spec.settings.get("url")
+        if isinstance(url, str) and (names := credential_query_params(url)):
+            out.append((oc.name, ", ".join(names)))
     return sorted(out)
 
 

@@ -91,6 +91,7 @@ section reference.
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening) |
+| | `url_query_credential` | no credential-like parameter in an outbound `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
@@ -965,6 +966,31 @@ This section is kept rather than deleted, because the claim it used to make is t
   it. The construction WARNING and the `check` line are its only records today; adding it to the
   registry is owed work.
 
+### `url_query_credential` — a credential in an outbound `url`'s query string
+> **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
+> outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) whose query string has a parameter named like a
+> credential: `key`, `sig`, `signature`, a name ending in `token`, `secret`, `password` or
+> `credential`, and the rest of the engine's credential vocabulary. ASVS 14.2.1.
+- **What you lose:** the credential rides the request line. The partner's access log holds it, and so
+  does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire.
+- **Why it is reported and not refused:** a credential in the URL's user part, `user:password@`, is
+  refused at construction, because that shape never authenticated anything and its error text carried
+  the password. A query credential does authenticate, and some partner APIs take it nowhere else, such
+  as a shared-access `sig` or an API `key`. The detection is also a guess from the parameter name, and
+  a wrong refusal would have no override.
+- **When acceptable:** the partner accepts the credential only in the query. If it takes a header, use
+  `bearer_token`, basic auth, or a `headers` table supplied whole by `env()`.
+- **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
+  file, and treat the partner's and the proxy's access logs as holding a secret.
+- **It is never silent:** a WARNING at each construction naming the connection and the parameter
+  names, never a value; a `url-query-credential` line in `messagefoundry check`; and a
+  `url_query_credential` entry in `security_loosenings()`, and so in `GET /security/posture` on a
+  running engine. The construction WARNING reads the resolved URL. The `check` line and the registry
+  read a literal `url` only, so a URL supplied by `env()` is in the WARNING alone.
+- **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
+  know, and it will name a parameter that only looks like one, such as `page_token`. OIDC's
+  `response_mode=query` is a different matter and stays a recorded delta.
+
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the flag entries above it is not a flag anyone sets — it is the *absence* of a
 > verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
@@ -1146,6 +1172,7 @@ chapter was not part of the verification above.
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
+| `url_query_credential` (per-connection credential in an endpoint URL's query) | V14 Data Protection (14.2.1) | **SC-8** Transmission Confidentiality and Integrity · **IA-5(7)** No Embedded Unencrypted Static Authenticators | §164.312(d) Person or Entity Authentication · §164.312(e)(1) Transmission Security |
 | `tls_check_hostname` (per-connection host-name match off) | V12 Secure Communication (12.3.2) | **SC-8(1)** Cryptographic Protection · **IA-3** Device Identification and Authentication | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
 | `tls_hop_attested` (per-connection hop attested secure) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |

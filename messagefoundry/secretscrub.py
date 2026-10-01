@@ -106,7 +106,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["CREDENTIAL_PLACEHOLDER", "scrub_credentials"]
+__all__ = ["CREDENTIAL_PLACEHOLDER", "credential_query_params", "scrub_credentials"]
 
 #: What a scrubbed credential VALUE is replaced with. Matches
 #: :class:`logging_setup.CredentialQueryScrubFilter`, so one log line cannot carry two spellings of
@@ -496,6 +496,64 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     if not _admits(folded, _ANY_HINT):
         return text
     return _run(text, placeholder, folded)
+
+
+#: Query-parameter NAMES that carry a credential in a URL and in nothing else here. Each is too
+#: ordinary for :data:`_CREDENTIAL_WORDS` -- ``key=`` is a cache key in log text, which is why that
+#: list leaves it out -- but a query parameter is a narrower place, and these three are how the
+#: common partner APIs spell a credential there: an API ``key=`` or ``subscription-key=``, a shared
+#: access ``sig=``, and a signed URL's ``X-Amz-Signature=``.
+_QUERY_CREDENTIAL_WORDS = ("key", "sig", "signature")
+
+#: The words a credential parameter NAME may end in, casefolded. Matched as a whole name or as the
+#: last segment after a ``.``, ``_`` or ``-`` (:func:`_is_credential_param`), so ``monkey`` and
+#: ``keyword`` are not ``key`` and ``bypass`` is not ``pass``. Plain string tests rather than a regex
+#: composed from these tuples: a composed pattern is one more blind spot for the ReDoS scanner in
+#: ``tests/test_security_static.py``, and this needs none of what a regex buys.
+_QUERY_CREDENTIAL_TAILS = tuple(
+    word.casefold() for word in _CREDENTIAL_WORDS + _TOKEN_WORDS + _QUERY_CREDENTIAL_WORDS
+)
+
+#: Key-material names, matched only as the whole name, for the reason :data:`_KEY_MATERIAL_WORDS`
+#: gives: a tail rule over them would reach ``private_key_file`` and other non-secrets.
+_QUERY_KEY_MATERIAL = frozenset(word.casefold() for word in _KEY_MATERIAL_WORDS)
+
+
+def _is_credential_param(name: str) -> bool:
+    folded = name.casefold()
+    if folded in _QUERY_KEY_MATERIAL:
+        return True
+    return any(
+        folded == word or folded.endswith((f"_{word}", f"-{word}", f".{word}"))
+        for word in _QUERY_CREDENTIAL_TAILS
+    )
+
+
+def credential_query_params(url: str) -> list[str]:
+    """The query-parameter NAMES in ``url`` that look like a credential, sorted and unique.
+
+    For the ASVS 14.2.1 check on an endpoint URL: a credential in a query string rides the request
+    line, so it lands in the server's and every proxy's access log. Returns names only, never a
+    value, so a caller can log what it returns. Total: an unparseable URL returns ``[]`` rather than
+    raising, because a parser error would quote the URL.
+
+    A heuristic over names, from this module's own vocabulary plus :data:`_QUERY_CREDENTIAL_WORDS`.
+    It misses a credential under a name it does not know, and it will name a parameter that only
+    looks like one (``page_token``). Its callers WARN rather than refuse for that reason.
+
+    Not :class:`logging_setup.CredentialQueryScrubFilter`'s list. That one scrubs VALUES out of log
+    text and carries ``code`` and ``state`` for the OIDC callback; neither is a credential name on a
+    partner endpoint, and naming them here would flag ordinary query strings."""
+    # Imported here, not at module scope: this leaf is imported by every log handler at startup on
+    # ``re`` alone, and only configuration checks call this.
+    import urllib.parse  # noqa: PLC0415
+
+    try:
+        query = urllib.parse.urlsplit(url).query
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    except ValueError:
+        return []
+    return sorted({name for name, _ in pairs if _is_credential_param(name)})
 
 
 def _run(text: str, placeholder: str, folded: str | None) -> str:

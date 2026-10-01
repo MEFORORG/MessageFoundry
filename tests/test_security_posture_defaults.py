@@ -64,6 +64,7 @@ def _pairs(
     cleartext_hops: tuple[str, ...] = (),
     expiry_hops: tuple[str, ...] = (),
     hostname_hops: tuple[str, ...] = (),
+    query_hops: tuple[str, ...] = (),
     db_hops: tuple[str, ...] = (),
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
@@ -80,6 +81,7 @@ def _pairs(
         cleartext_hops=cleartext_hops,
         expiry_relaxed_hops=expiry_hops,
         hostname_unchecked_hops=hostname_hops,
+        query_credential_hops=query_hops,
         unverified_db_hops=db_hops,
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
@@ -129,6 +131,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -158,6 +161,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -184,6 +188,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -231,6 +236,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -377,6 +383,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -947,6 +954,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -975,6 +983,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1035,6 +1044,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1572,6 +1582,34 @@ def test_the_hostname_check_flag_is_actually_wired() -> None:
     assert "tls_check_hostname" not in _names()  # control: nothing declared, nothing named
 
 
+def test_the_url_query_credential_is_actually_wired() -> None:
+    """ASVS 14.2.1: driven through its reader AND through `security_loosenings`, with a benign query
+    beside it as the control that must not appear."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        query_credential_hops,
+    )
+
+    reg = Registry()
+    for name, url in (
+        ("OB_SIGNED", "https://h.example.invalid/x?sig=SYNTHETIC"),
+        ("OB_BENIGN", "https://h.example.invalid/x?fmt=json"),
+    ):
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.REST, settings={"url": url})
+            )
+        )
+    hops = tuple(n for n, _ in query_credential_hops(reg))
+    assert hops == ("OB_SIGNED",)
+    risk = dict(_pairs(query_hops=hops))["url_query_credential"]
+    assert "OB_SIGNED" in risk and "OB_BENIGN" not in risk and "SYNTHETIC" not in risk
+    assert "url_query_credential" not in _names()  # control: nothing declared, nothing named
+
+
 def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> None:
     """CORRECTED (ASVS 12.3.2 re-read): the entry said the hostname match is "still fully verified"
     for every listed hop. It now conditions that on the hop leaving the name check on."""
@@ -1677,6 +1715,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             cleartext_hops=("OB_LEGACY", "OB_LAB"),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1718,6 +1757,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=("OB_PARTNER_ADT", "OB_LAB_ORU"),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1750,6 +1790,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1779,6 +1820,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             cleartext_hops=(),
             expiry_relaxed_hops=(),
             hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),

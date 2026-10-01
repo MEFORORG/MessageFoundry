@@ -172,6 +172,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
 )
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
+from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.store import (
     MessageStatus,
     OutboxItem,
@@ -9820,6 +9821,39 @@ def warn_unbudgeted_streaming_inbound(ic: InboundConnection, *, budget: int) -> 
     return True
 
 
+def warn_url_query_credentials(dest: Destination) -> None:
+    """Log a WARNING when an outbound's resolved ``url`` carries a credential-like query parameter
+    (ASVS 14.2.1). Names the connection and the parameter NAMES, never a value or the URL.
+
+    WARN, not refuse, and the reason is the difference from the userinfo precedent.
+    ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
+    authenticated anything: urllib reads it as part of the host, and the error text carried the
+    password into ``queue.last_error``. A query credential does authenticate, and some partner APIs
+    take it nowhere else (a shared-access ``sig``, an API ``key``), so a refusal would remove the
+    hop with no header to move it to. The detection is also a heuristic over names, and a false
+    refusal has no override. What the warning records is the cost: the request line, query and all,
+    lands in the partner's and every proxy's access log. The engine's own log lines already drop the
+    query (``_peer_label``, ``rest._redact_url``).
+
+    Called from :func:`check_egress_allowed` because that is the one function every outbound build
+    path runs (check, start, operator start, test), and it runs on the env-resolved destination, so
+    it sees a URL that ``env()`` supplied. ``config.wiring.query_credential_hops`` is the graph-side
+    reader for ``check`` and the posture registry."""
+    url = dest.settings.get("url")
+    if not isinstance(url, str):
+        return
+    names = credential_query_params(url)
+    if names:
+        log.warning(
+            "outbound %r: the endpoint url carries a credential in its query string (parameter(s) "
+            "%s). It rides the request line, so the partner's and any proxy's access log will hold "
+            "it. Move it to a header if the partner accepts one (bearer_token, basic auth, or a "
+            "headers table supplied whole by env()); see docs/SECURITY-LOOSENING.md (ASVS 14.2.1).",
+            dest.name,
+            ", ".join(names),
+        )
+
+
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
@@ -9835,6 +9869,7 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     # nothing about whether the proxy is permitted (BACKLOG #1659).
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
+    warn_url_query_credentials(dest)  # ASVS 14.2.1: a recorded loosening, never a silent one
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
         # to files, so this log line is a forensic surface an operator reads -- and "under

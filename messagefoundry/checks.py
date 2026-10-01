@@ -262,6 +262,9 @@ def run_checks(
         # ASVS 12.3.2: tls_check_hostname=false, the third per-connection TLS relaxation, which no
         # surface listed at all until 2026-10-01. Advisory, as tls_allow_expired is -- see the check.
         _check_hostname_unchecked(config_dir),
+        # ASVS 14.2.1: an endpoint url carrying a credential in its query string. Advisory, and a
+        # refusal was weighed and declined -- see the check and wiring_runner's warning.
+        _check_url_query_credentials(config_dir),
         _check_generic_db_tls(config_dir),
         # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
         _check_hop_attested(config_dir),
@@ -2106,6 +2109,44 @@ def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
             f"{len(unchecked)} connection(s) do not match the server certificate to the host they "
             f"dial — {listed} (the chain is still verified; any certificate chaining to the trust "
             "anchor is accepted whatever host it names)"
+        ),
+    )
+
+
+def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
+    """Name every outbound whose endpoint ``url`` carries a credential-like query parameter (ASVS
+    14.2.1), with the parameter NAMES and never a value.
+
+    Advisory (``required=False``): a query credential authenticates, unlike the userinfo shape
+    ``refuse_url_credentials`` refuses, and some partner APIs take it nowhere else. The detection is
+    a heuristic over names. It reads a literal ``url`` only; an ``env()`` URL is read, resolved, by
+    the construction WARNING. SKIPs when the graph will not load, like its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, query_credential_hops
+
+    name = "url-query-credential"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    found = query_credential_hops(registry)
+    if not found:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            detail="no outbound url carries a credential-like query parameter",
+        )
+    listed = "; ".join(f"{conn} ({params})" for conn, params in found)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(found)} outbound connection(s) carry a credential in the endpoint url's query "
+            f"string — {listed}. It rides the request line, so the partner's and any proxy's access "
+            "log holds it (ASVS 14.2.1)"
         ),
     )
 
