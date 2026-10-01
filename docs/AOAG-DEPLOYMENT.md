@@ -61,13 +61,13 @@ flowchart TB
   classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
   classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
 
-  HL7_SENDERS(["HL7 and MLLP senders"]):::io
+  HL7_SENDERS(["HL7 senders over MLLP"]):::io
   L4_LB["VIP or L4 load balancer (operator-built)<br/>TCP-connect health check per MLLP port<br/>passes ONLY on the engine that holds leadership"]:::ext
 
   subgraph PRIMARY_DC["PRIMARY DC (hospital)"]
     ENGINE_1["Host A: engine VM 1<br/>ACTIVE (leader)"]:::core
     ENGINE_2["Host B: engine VM 2<br/>STANDBY, active-eligible<br/>binds no listeners"]:::core
-    AG_LISTENER["AG listener<br/>the store address every engine uses"]:::ext
+    AG_LISTENER["AG listener<br/>the store address every engine uses<br/>follows the primary replica"]:::ext
     AG_R1[("Host C: SQL VM, AG replica R1<br/>primary<br/>SYNC commit, AUTO failover")]:::store
     AG_R2[("Host D: SQL VM, AG replica R2<br/>SYNC commit, AUTO failover")]:::store
   end
@@ -81,11 +81,11 @@ flowchart TB
   L4_LB ==>|"health check passes"| ENGINE_1
   L4_LB -.->|"health check fails"| ENGINE_2
   ENGINE_1 ==>|"TDS over TLS"| AG_LISTENER
-  ENGINE_2 -->|"heartbeat only, TDS over TLS"| AG_LISTENER
+  ENGINE_2 -->|"TDS over TLS"| AG_LISTENER
+  ENGINE_DR -.->|"no connection while the service is stopped"| AG_LISTENER
   AG_LISTENER ==>|"current primary replica"| AG_R1
   AG_R1 ==>|"synchronous commit"| AG_R2
   AG_R1 -->|"asynchronous log send over the WAN"| AG_R3
-  ENGINE_DR -.->|"no connection while the service is stopped"| AG_R3
 ```
 
 **Legend.** Thick arrows are the steady-state message and commit path. Thin arrows are traffic
@@ -99,7 +99,7 @@ Three notes go with the diagram:
   failover only.
 - The DR engine connector is dotted because its NSSM service is kept STOPPED in steady state.
   Start it only per the section 6 DR runbook. The DR engine is promoted with the database, as a
-  site unit, and it then reaches R3 through the AG listener.
+  site unit. The AG listener moves to R3 in that failover, and the DR engine reaches R3 through it.
 - For the WSFC (Windows Server Failover Clustering) quorum, the primary-DC nodes vote and the DR
   node gets ZERO votes. The witness is a cloud witness, or a file share witness at a THIRD site.
   It is never inside either data center.

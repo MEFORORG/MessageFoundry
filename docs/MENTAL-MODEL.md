@@ -516,16 +516,18 @@ flowchart TB
 
 **Legend.** Thick arrows carry messages. Dotted arrows are process control. The cylinder is the
 message store. API ports follow the sorted order of the engine shard ids. A message can arrive on
-one engine shard and leave from another, because the queued row waits in the shared store for the
-engine shard that owns its outbound Connection.
+one engine shard and leave from another. The queued row waits in the shared store for the engine
+shard that owns its outbound Connection.
 
 This is **engine sharding**. [ADR 0037](adr/0037-multi-process-sharding-l3.md) defines it,
 [ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md) requires the one shared store, and
 [ADR 0073](adr/0073-ownership-scoped-recovery-single-consumer-lanes.md) gives each outbound
 Connection one delivering engine shard. **Database sharding** is a different idea: it would split
 the message store across several databases. [ADR 0039](adr/0039-database-tier-sharding-l5.md)
-proposed it, and its status is declined. The paragraph above this heading says what is measured
-about engine shards on one server database, and what is not.
+proposed it, and its status is declined.
+
+Before sizing a deployment from this picture, read the paragraph on what is measured, above this
+heading. It names the store that the measured run used and the support status of this topology.
 
 ## 16. Dependencies & supply chain
 

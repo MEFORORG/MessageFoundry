@@ -308,10 +308,13 @@ flowchart TB
     MSG_STORE[("Message store<br/>the durable staged queue")]:::store
   end
 
+  RECEIVERS(["Downstream receivers<br/>reached through outbound Connections"]):::io
+
   PARTNERS ==> VIP
   VIP ==>|"port bound, check passes"| NODE_A
   VIP -.->|"port NOT bound, check fails"| NODE_B
-  NODE_A ==>|"claims, processes and delivers"| MSG_STORE
+  NODE_A ==>|"reads and writes the queue"| MSG_STORE
+  NODE_A ==>|"delivers"| RECEIVERS
   NODE_A -->|"renews every heartbeat"| LEASE_ROW
   NODE_B -->|"acquires only after the lease expires"| LEASE_ROW
   NODE_A -->|"heartbeat"| NODES_TABLE
