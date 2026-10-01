@@ -14,9 +14,11 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import importlib.util
-import re
+import json
 import tomllib
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -39,9 +41,22 @@ HEADER = (
     b"upstream's, unchanged.\n"
 )
 
-#: A README row: the file name in backticks, the change, then a 64-hex digest in backticks.
-_ROW = re.compile(r"^\| `([^`]+)` \| [^|]+ \| `([0-9a-f]{64})` \|$", re.MULTILINE)
-RECORDED = dict(_ROW.findall((VENDOR / "README.md").read_text(encoding="utf-8")))
+
+def _load_sbom_finalize() -> ModuleType:
+    """The SBOM helper, loaded by path because it is a script. Its README grammar is the RULE this
+    file reads the table with, so the release and these tests cannot parse the table differently."""
+    spec = importlib.util.spec_from_file_location(
+        "sbom_finalize", REPO / "scripts" / "security" / "sbom_finalize.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+sbom_finalize = _load_sbom_finalize()
+#: The README's file rows: name to upstream SHA-256.
+RECORDED = dict(sbom_finalize._FILE_ROW.findall((VENDOR / "README.md").read_text(encoding="utf-8")))
 
 
 def _upstream_bytes(name: str) -> bytes:
@@ -106,3 +121,74 @@ def test_the_engine_no_longer_declares_the_package() -> None:
     # The vendored licence travels with every wheel and sdist, as PSF-2.0 requires.
     assert "messagefoundry/_vendor/defusedxml/LICENSE" in project["license-files"]
     assert "PSF-2.0" in project["license"]
+
+
+# --- the SBOM lists the copy (BACKLOG #2498) -------------------------------------------------------
+# These sit here, on the engine legs, and not in tests/test_sbom_finalize.py, which is tooling-tier and
+# path-gated to scripts/ and .github/. A pull request that vendors something trips this file's gate.
+
+
+def _finalized_sbom(tmp_path: Path) -> dict[str, Any]:
+    """A minimal BOM finalized with ``--vendored-from`` over the real vendor directory."""
+    bom = tmp_path / "bom.cdx.json"
+    seed = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "metadata": {"component": {"bom-ref": "root", "name": "messagefoundry"}},
+        "components": [],
+    }
+    bom.write_text(json.dumps(seed), encoding="utf-8")
+    assert sbom_finalize.main([str(bom), "--vendored-from", str(VENDOR.parent)]) == 0
+    doc: dict[str, Any] = json.loads(bom.read_text(encoding="utf-8"))
+    return doc
+
+
+def test_every_vendored_package_is_in_the_finalized_sbom(tmp_path: Path) -> None:
+    """A copy under messagefoundry/_vendor that the SBOM omits fails here.
+
+    The tree is enumerated by NAME, not by the helper's own package test, so a single vendored module
+    the helper cannot see as a package cannot pass both.
+    """
+    vendored = sorted(Path(p.name).stem for p in VENDOR.parent.iterdir() if p.name[:2] != "__")
+    assert "defusedxml" in vendored, f"the enumeration found {vendored}; it has gone blind"
+    listed = {
+        prop["value"]
+        for c in _finalized_sbom(tmp_path)["components"]
+        for prop in c.get("properties", [])
+        if prop["name"] == sbom_finalize.VENDORED_PROPERTY
+    }
+    missing = [n for n in vendored if f"messagefoundry._vendor.{n}" not in listed]
+    assert not missing, f"vendored packages missing from the finalized SBOM: {missing}"
+
+
+def _locked_sdist_sha256() -> str:
+    """The digest uv.lock records for the vendored version's sdist."""
+    lock = tomllib.loads((REPO / "uv.lock").read_text(encoding="utf-8"))
+    [entry] = [
+        p for p in lock["package"] if p["name"] == "defusedxml" and p["version"] == VENDORED_VERSION
+    ]
+    algorithm, _, digest = entry["sdist"]["hash"].partition(":")
+    assert algorithm == "sha256", entry["sdist"]["hash"]
+    return str(digest)
+
+
+def test_the_sbom_component_carries_the_upstream_record(tmp_path: Path) -> None:
+    """Name, version, licence and purl are what a scanner matches an advisory on. Upstream's digests
+    sit in the pedigree, checked here against the files and the lock rather than against the README
+    the helper read them from, and never on the component, whose shipped bytes differ."""
+    [c] = [
+        c
+        for c in _finalized_sbom(tmp_path)["components"]
+        if str(c.get("bom-ref")).startswith(sbom_finalize.VENDORED_REF_PREFIX)
+    ]
+    assert (c["name"], c["version"]) == ("defusedxml", VENDORED_VERSION)
+    assert c["purl"] == f"pkg:pypi/defusedxml@{VENDORED_VERSION}"
+    assert c["licenses"] == [{"license": {"id": "PSF-2.0"}}]
+    assert "hashes" not in c and "components" not in c
+    [upstream] = c["pedigree"]["ancestors"]
+    assert upstream["purl"] == c["purl"]
+    [dist] = upstream["externalReferences"]
+    assert dist["url"].endswith(f"/defusedxml-{VENDORED_VERSION}.tar.gz")
+    assert dist["hashes"] == [{"alg": "SHA-256", "content": _locked_sdist_sha256()}]
+    files = {f["name"]: f["hashes"][0]["content"] for f in upstream["components"]}
+    assert files == {n: hashlib.sha256(_upstream_bytes(n)).hexdigest() for n in UPSTREAM_FILES}

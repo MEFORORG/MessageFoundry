@@ -126,9 +126,10 @@ The SBOM (CycloneDX 1.6) is a machine-readable inventory carrying at least a nam
 **license** for every component. It does **not** carry per-component file hashes — the generator we run does
 not emit them (see [How the SBOMs are generated](#how-the-sboms-are-generated-for-auditors)) — so use it as an
 inventory, not as an integrity check on the components it lists. The one exception is a vendored package
-(see [The one vendored Python source](#the-one-vendored-python-source-which-does-ship)): its component
-carries the SHA-256 of upstream's sdist and of each upstream file. Those digests describe upstream's
-bytes, not the vendored copy, which adds a header to each module. "Hash-locked" elsewhere on this page refers
+(see [The one vendored Python source](#the-one-vendored-python-source-which-does-ship)): its component's
+`pedigree` records the SHA-256 of upstream's sdist and of each upstream file. Those digests describe
+upstream's bytes, not the vendored copy, which adds a header to each module, so they sit in the
+pedigree and not on the component. "Hash-locked" elsewhere on this page refers
 to the lock file the inventory is built from, not to a field inside the SBOM. Feed it to your own tooling:
 
 ```bash
@@ -253,11 +254,12 @@ The same two statements apply, scoped to this copy:
 2. **What is listed, and what is not.** The SBOM generator reads installed distributions, so it
    cannot see this copy. `sbom_finalize.py --vendored-from messagefoundry/_vendor` adds it to both
    engine SBOMs from the README's record, as `pkg:pypi/defusedxml@0.7.1`, so a scanner reading an
-   SBOM can match an advisory against it. `tests/test_sbom_finalize.py` fails when a package under
-   `_vendor/` is missing from the finalized SBOM. pip-audit still reads only the locks and never
-   sees the copy. The `x12` extra still installs upstream defusedxml for `pyx12`, so the all-extras
-   lock and its audit do carry the upstream package, but that says nothing about the copy the
-   engine runs.
+   SBOM can match an advisory against it. `tests/test_vendored_defusedxml.py` fails when anything
+   under `_vendor/` is missing from the finalized SBOM. Nothing in this repository scans the SBOM
+   for advisories, and pip-audit reads only the locks, so an advisory against this copy still needs
+   someone here to check it by hand. The `x12` extra still installs upstream defusedxml for `pyx12`,
+   so the all-extras lock and its audit do carry the upstream package, but that says nothing about
+   the copy the engine runs.
 
 ## Related
 
