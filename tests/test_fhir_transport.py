@@ -390,7 +390,7 @@ def test_resolve_encodes_segments() -> None:
     # proving the grammar gate + quote round-trips a valid id.
     body = json.dumps({"resourceType": "Patient", "id": "abc.123-DEF"})
     r = _dest(interaction="update")._resolve_request(body)
-    assert r.url == "Patient/abc.123-DEF"
+    assert r == ("PUT", "Patient/abc.123-DEF", {}, True)
     # An id that was previously accepted (control-char-free) but carries a path separator is now rejected,
     # confirming the grammar gate closed the redirection vector.
     redir = json.dumps({"resourceType": "Patient", "id": "p/../$op"})
@@ -620,8 +620,10 @@ async def test_successful_entry_is_delivered() -> None:
 
 async def test_entry_etag_and_location_are_captured_as_headers() -> None:
     # #154 capture keeps working for an update: the values a PUT reply carried as headers now come
-    # back in the entry, and a real reply header still wins over the entry's value.
+    # back in the entry. The entry describes the updated resource, so it wins over a reply header,
+    # which describes the Bundle. A reply header the entry lacks is kept; an unsafe value is dropped.
     reply_headers = email.message.Message()
+    reply_headers["Etag"] = 'W/"bundle-level"'
     reply_headers["Location"] = "from-the-real-header"
     dest = _dest(
         interaction="update",
@@ -629,9 +631,7 @@ async def test_entry_etag_and_location_are_captured_as_headers() -> None:
         capture_response_headers=["ETag", "Location", "Last-Modified"],
     )
     dest._opener = _FakeOpener(  # type: ignore[assignment]
-        body=_transaction_response(
-            "200 OK", etag='W/"8"', location=f"Patient/{ID_1965}/_history/8", lastModified="x\r\ny"
-        ),
+        body=_transaction_response("200 OK", etag='W/"8"', lastModified="x\r\ny"),
         headers=reply_headers,
     )
     resp = await dest.send(UPDATE_1965)
@@ -639,27 +639,114 @@ async def test_entry_etag_and_location_are_captured_as_headers() -> None:
     assert resp.headers == {"ETag": 'W/"8"', "Location": "from-the-real-header"}
 
 
+async def test_overlong_entry_etag_is_not_captured() -> None:
+    dest = _dest(interaction="update", capture_response=True, capture_response_headers=["ETag"])
+    dest._opener = _FakeOpener(  # type: ignore[assignment]
+        body=_transaction_response("200 OK", etag="x" * 9000)
+    )
+    resp = await dest.send(UPDATE_1965)
+    assert resp is not None and resp.headers == {}
+
+
 @pytest.mark.parametrize(
-    ("header", "field"),
+    ("outcome", "expected"),
     [
-        ("If-Match", "ifMatch"),
-        ("if-none-match", "ifNoneMatch"),
-        ("If-Modified-Since", "ifModifiedSince"),
-        ("If-None-Exist", "ifNoneExist"),
+        ({"resourceType": "OperationOutcome", "issue": [{"severity": "error"}]}, "rejected"),
+        ({"resourceType": "OperationOutcome", "issue": [{"severity": "warning"}]}, "accepted"),
+        (None, "accepted"),
     ],
 )
-async def test_dynamic_conditional_header_on_plain_update_moves_into_the_entry(
-    header: str, field: str
+async def test_capture_outcome_comes_from_the_entry(
+    outcome: dict[str, object] | None, expected: str
 ) -> None:
-    # Before the wrap, a Handler-stamped conditional header qualified the PUT. On the outer POST it
-    # would not, so it moves into the entry instead of being lost or misapplied.
+    # A 2xx PUT whose body was an error OperationOutcome was captured as rejected. In a
+    # transaction-response that outcome sits in the entry, so it is read there.
+    extra = {"outcome": outcome} if outcome is not None else {}
+    dest = _dest(interaction="update", capture_response=True)
+    dest._opener = _FakeOpener(body=_transaction_response("200 OK", **extra))  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    assert resp is not None and resp.outcome == expected
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["HTTP/1.1 404 Not Found", "\N{SUPERSCRIPT TWO}" * 3, True, None],
+    ids=["prefixed", "non-ascii-digits", "bool", "missing"],
+)
+async def test_unreadable_entry_status_retries(status: object) -> None:
+    # An entry with no status that reads as an HTTP code is not taken as success, and a non-ASCII
+    # digit cannot reach int() and escape as an unclassified ValueError.
+    entry = {"response": {} if status is None else {"status": status}}
+    body = {"resourceType": "Bundle", "type": "transaction-response", "entry": [entry]}
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=json.dumps(body).encode())  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send(UPDATE_1965)
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+async def test_integer_entry_status_is_read() -> None:
+    dest = _dest(interaction="update")
+    body = {"resourceType": "Bundle", "entry": [{"response": {"status": 404}}]}
+    dest._opener = _FakeOpener(body=json.dumps(body).encode())  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError):
+        await dest.send(UPDATE_1965)
+
+
+async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
+    # Control arm for the entry checks: a 2xx with no entry is delivered, as any 2xx was before.
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=b"")  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None
+
+
+async def test_dynamic_if_match_on_plain_update_moves_into_the_entry() -> None:
+    # Before the wrap, a Handler-stamped If-Match qualified the PUT. On the outer POST it would
+    # qualify the Bundle, so it moves into the entry instead.
     dest = _dest(interaction="update", dynamic_headers=True)
     opener = _FakeOpener()
     dest._opener = opener  # type: ignore[assignment]
-    await dest.send(UPDATE_1965, metadata={f"http.header.{header}": "v-5"})
+    await dest.send(UPDATE_1965, metadata={"http.header.if-match": 'W/"5"'})
     req = opener.requests[0]
-    assert not req.has_header(header.capitalize())
-    assert _sent_bundle(req)["entry"][0]["request"][field] == "v-5"
+    assert not req.has_header("If-match")
+    assert _sent_bundle(req)["entry"][0]["request"]["ifMatch"] == 'W/"5"'
+
+
+async def test_static_if_match_moves_into_the_entry_and_a_dynamic_one_overrides_it() -> None:
+    dest = _dest(interaction="update", headers={"If-Match": 'W/"static"'})
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965)
+    await dest.send(UPDATE_1965, metadata={"http.header.If-Match": 'W/"dynamic"'})
+    for req, expected in zip(opener.requests, ('W/"static"', 'W/"dynamic"'), strict=True):
+        assert not req.has_header("If-match")
+        assert _sent_bundle(req)["entry"][0]["request"]["ifMatch"] == expected
+
+
+def test_static_if_match_stays_a_header_on_create() -> None:
+    # Control arm: only a connection whose writes are wrapped moves its static If-Match.
+    assert _dest(interaction="create", headers={"If-Match": "x"})._headers["If-Match"] == "x"
+
+
+@pytest.mark.parametrize("dots", [".", "..", "..."])
+def test_resolve_rejects_a_dot_only_id(dots: str) -> None:
+    # The id grammar admits these, and a path resolver reads them as this level or the parent.
+    body = json.dumps({"resourceType": "Patient", "id": dots})
+    with pytest.raises(NegativeAckError) as ei:
+        _dest(interaction="update")._resolve_request(body)
+    assert ei.value.permanent is True
+
+
+async def test_deeply_nested_error_body_still_classifies() -> None:
+    # A 5xx is transient without reading its body, and a 4xx body too deep to parse classifies on
+    # the status rather than escaping as RecursionError.
+    nested = b"[" * 200_000
+    for code, permanent in ((503, False), (404, True)):
+        dest = _dest(interaction="create")
+        dest._opener = _FakeOpener(_http_error(code, nested))  # type: ignore[assignment]
+        with pytest.raises(DeliveryError) as ei:
+            await dest.send(PATIENT)
+        assert isinstance(ei.value, NegativeAckError) is permanent
 
 
 async def test_dynamic_if_match_on_create_stays_a_header() -> None:
