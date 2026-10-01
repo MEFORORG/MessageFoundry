@@ -2100,7 +2100,8 @@ def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
     assert 'Send("OB_OUT"' not in body
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
 
-    # The input handed to an inlined list is unknown after it too: fail closed, a raise at the send.
+    # The input is msg, which generated code never rebinds, so a called list that overwrites no tree
+    # whole leaves it bound. Its write there declines rather than land on msg (see the scope test).
     call = (
         '<Call Data="ActionListCall &quot;Sub&quot; pass %ADT"><Actions>'
         '<Line Data="ItemClear %ADT/PID-19"/></Actions></Call>'
@@ -2108,7 +2109,20 @@ def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
     passed = _handler_body(
         _handler_source(_WRITE_INPUT + call + _role_send("input-handle", "%ADT", "OB_IN"))
     )
-    assert 'Send("OB_IN"' not in passed
+    assert '    sends.append(Send("OB_IN", msg))' in passed
+    assert 'set_field(msg, "PID-19"' not in passed
+
+    # A called list that overwrites ANY tree whole may be replacing the input under its own name,
+    # so the input is unknown after it and its send raises.
+    rebuilt = _handler_body(
+        _handler_source(
+            _WRITE_INPUT
+            + _inlined_call(_create("%P", _ADT_A04), passing=" pass %ADT")
+            + _role_send("input-handle", "%ADT", "OB_IN")
+        )
+    )
+    assert 'Send("OB_IN"' not in rebuilt
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in rebuilt
 
     # The control arm: a call that passes no handle, to a list that names none, leaves the input bound.
     plain = (
@@ -2168,6 +2182,139 @@ def test_an_inlined_call_runs_in_its_own_scope(call: str) -> None:
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
 
 
+def _attr_text(text: str) -> str:
+    """``text`` escaped for an XML attribute, as the export writes a call line."""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def _call_of(passing: str, *statements: str) -> str:
+    """An inlined ``ActionListCall "Sub"<passing>``; ``passing`` is raw text, escaped here."""
+    return (
+        f'<Call Data="ActionListCall &quot;Sub&quot;{_attr_text(passing)}"><Actions>'
+        + "".join(statements)
+        + "</Actions></Call>"
+    )
+
+
+def _lander_case(handle: str, call: str, *, loop: bool = False) -> str:
+    """Clone the input into ``handle``, run ``call``, then send ``handle``. With ``loop``, the send
+    and the call sit in a ForEach, so a later pass would send what an earlier call rebuilt."""
+    send = _role_send("other-handle", handle, "OB_OUT")
+    clone = _root_copy("input-handle", "%ADT", "other-handle", handle)
+    if loop:
+        return clone + "<Foreach>" + send + call + "</Foreach>"
+    return clone + call + send
+
+
+@pytest.mark.parametrize(
+    "export",
+    [
+        pytest.param(
+            _lander_case("%OUT-A", _call_of(" pass %OUT-A", _create("%P", _ADT_A04))),
+            id="hyphen-passed",
+        ),
+        pytest.param(
+            _lander_case("%OUT-A", _call_of("", _create("%OUT-A", _ADT_A04))),
+            id="hyphen-rebuilt-without-a-pass",
+        ),
+        pytest.param(
+            _lander_case("%OUT.A", _call_of(" pass %OUT.A", _create("%P", _ADT_A04))),
+            id="dot",
+        ),
+        pytest.param(
+            _lander_case("%AUSGANGÄ", _call_of("", _create("%AUSGANGÄ", _ADT_A04))),
+            id="non-ascii",
+        ),
+        pytest.param(
+            _root_copy("input-handle", "ADT", "other-handle", "OUT")
+            + _call_of("", _create("OUT", _ADT_A04))
+            + _role_send("other-handle", "OUT", "OB_OUT"),
+            id="no-percent-anywhere",
+        ),
+        pytest.param(
+            _lander_case("%OUT-A", _call_of(" pass %OUT-A", _create("%P", _ADT_A04)), loop=True),
+            id="hyphen-in-a-foreach",
+        ),
+    ],
+)
+def test_the_landers_stale_local_repros_all_raise(export: str) -> None:
+    """The Lander's QA of d401cdb5b on PR 1900: name matching missed ``-``, ``.``, non-ASCII and
+    ``%``-free handles, so each of these sent the clone a called list had rebuilt. A call now leaves
+    every caller handle but the input unknown, whatever its name."""
+    body = _handler_body(_handler_source(export))
+    assert 'Send("OB_OUT"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
+
+
+# Handle spellings an export may carry, each one the clone below binds to its own local (the control
+# in the test proves that). A rule that matched handles by name missed at least the first four.
+_HOSTILE_HANDLES = (
+    "%OUT-A",
+    "%OUT.A",
+    "%AUSGANGÄ",
+    "OUT",
+    "%out",
+    "%OUT A",
+    "%OUT-",
+    "%Ω",
+    "%ÄÖ-ß.x",
+    "%OUT$1",
+    "%OUT(1)",
+    "%OUT;A",
+    '%O"UT',
+    "%OUT/X",
+    "%_",
+    "%1OUT",
+    "%ADT2",
+)
+
+
+def _call_shapes(handle: str) -> list[str]:
+    """Calls that may rebuild ``handle`` or leave it alone, passing it or not."""
+    log = '<Line Data="EnvLogText &quot;x&quot;"/>'
+    return [
+        _call_of(f" pass {handle}", _create("%P", _ADT_A04)),
+        _call_of("", _create(handle, _ADT_A04)),
+        _call_of(f" pass {handle}", log),
+        _call_of("", log),
+        _call_of(f" ({handle})", _write("other-handle", handle, "SUB")),
+        '<Line Data="ActionListCall &quot;Sub&quot;"/>',
+    ]
+
+
+@pytest.mark.parametrize("handle", _HOSTILE_HANDLES)
+def test_no_handle_spelling_sends_a_clone_made_before_a_call(handle: str) -> None:
+    """Property: for every spelling and every call shape, clone, then call, then send never renders
+    a Send of the clone. The control arm, the same clone sent BEFORE the call, does send it, so the
+    spelling really binds and the refusal is the call's doing."""
+    clone = _root_copy("input-handle", "%ADT", "other-handle", handle)
+    send = _role_send("other-handle", handle, "OB_OUT")
+    for call in _call_shapes(handle):
+        before = _handler_body(_handler_source(clone + send + call))
+        assert re.search(r'sends\.append\(Send\("OB_OUT", \w+_msg(_\d+)?\)\)', before), handle
+        after = _handler_body(_handler_source(clone + call + send))
+        assert 'Send("OB_OUT"' not in after, (handle, call)
+        assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in after
+
+
+def test_a_call_that_overwrites_no_tree_leaves_the_input_bound() -> None:
+    """The control for the input: a call whose list overwrites no tree whole leaves the input as
+    msg, whatever it passes, while a clone made before the same call is unknown after it."""
+    log = '<Line Data="EnvLogText &quot;x&quot;"/>'
+    body = _handler_body(
+        _handler_source(
+            _CLONE_OUT
+            + _call_of(" pass %ADT", log)
+            + _role_send("input-handle", "%ADT", "OB_IN")
+            + _SEND_OUT
+        )
+    )
+    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert 'Send("OB_OUT"' not in body
+
+
 def test_a_called_lists_input_is_not_the_callers_msg() -> None:
     """Inside the called list, its input handle is whatever was passed, not the caller's msg. A
     write there must not land on msg, and a handle the list binds is not the caller's to send."""
@@ -2188,17 +2335,29 @@ def test_a_called_lists_input_is_not_the_callers_msg() -> None:
     assert 'Send("OB_P"' not in body and 'Send("OB_IN"' not in body
 
 
-def test_a_called_lists_input_handle_does_not_erase_the_callers() -> None:
-    """The caller's input is decided by the caller's own statements: a called list that marks its
-    own input-handle does not make the caller's input ambiguous."""
+@pytest.mark.parametrize(
+    "rebuild",
+    [
+        pytest.param(_create("%P", _ADT_A04), id="lander-repro"),
+        pytest.param("", id="input-handle-only"),
+    ],
+)
+def test_a_called_lists_input_handle_makes_the_callers_input_ambiguous(rebuild: str) -> None:
+    """The Lander's LOW 2 on PR 1900. Nothing establishes that a call passing nothing does not hand
+    the caller's input to the called list's input handle, so a second input-handle name inside an
+    inlined list makes the caller's input ambiguous: no handle is msg, and the send raises. The
+    ``input-handle-only`` arm overwrites no tree, so only this rule refuses it."""
     inner = _inlined_call(
-        _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%P")), passing=""
+        _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%P")),
+        rebuild,
+        passing="",
     )
     body = _handler_body(
         _handler_source(_WRITE_INPUT + inner + _role_send("input-handle", "%ADT", "OB_IN"))
     )
-    assert '    set_field(msg, "MSH-6", "X")' in body
-    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert 'set_field(msg, "MSH-6", "X")' not in body
+    assert 'Send("OB_IN"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
 
 
 def test_a_markup_free_write_in_a_branch_of_a_marked_list_declines() -> None:

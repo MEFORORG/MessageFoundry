@@ -251,14 +251,21 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   purpose: a missing verb costs a raise, while a wrongly listed one would deliver the wrong message.
 - An inlined `ActionListCall` runs in its own scope, because nothing ties the handle names inside a
   called list to the caller's. The called list starts knowing no handle, so its writes and sends of
-  any handle it did not bind there decline or raise. Its own `input-handle` does not decide the
-  caller's input. After the call, the caller can vouch for no handle the call might reach, judged by
-  name on the raw text and case-insensitively, so no pass syntax or span class can hide one: any
-  word of the call line, and any `%` handle anywhere in the called list. A call whose list is not
-  inlined renders a TODO marker, counts unmapped, and leaves every handle unknown. So a list that
-  hands its input to a sub-list, or calls one that names it, and then sends it raises at that send.
-  That includes a sub-list that only reads or forwards the input, which is the cost of failing
-  closed.
+  any handle it did not bind there decline or raise. An `input-handle` span inside the called list
+  still counts toward the caller's input, because nothing establishes that a call passing nothing
+  does not hand the caller's input over. A second name there makes the caller's input ambiguous.
+- After an inlined call, every handle the caller has bound is unknown, whatever its name. No handle
+  name is matched. Every rule that matched names missed a spelling the export may carry: a `-`,
+  a `.`, a non-ASCII letter, or a handle with no `%`. The one exception is the input while it is
+  still `msg`, because generated code never rebinds `msg`. The input is unknown too when the called
+  list may overwrite any tree whole, under any name, since the called list may name the input by its
+  own handle. A call whose list is not inlined renders a TODO marker, counts unmapped, and leaves
+  every handle unknown, the input included.
+- **The cost of that rule (Manager decision, #313 step 2 re-cut).** Any send of a clone or a
+  `MsgCreate` message made before a call raises at that send, even when the called list never
+  touches it. So does a send of the input after a call whose list builds or copies any message.
+  A human finishes each one. That is the importer's fail-closed contract: a raise costs a hand
+  edit, while a stale local would deliver the wrong message.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
   its whole-tree writes. Nothing it binds is trusted after it.
 

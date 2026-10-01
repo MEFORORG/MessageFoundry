@@ -836,18 +836,10 @@ def _input_handle(action_list: Element) -> tuple[str, bool]:
     keeps the superseded model's reading, in which a markup-free field write lands on ``msg``."""
     inputs: set[str] = set()
     marked = False
-    # A called list's own input handle is the message it was passed, not the caller's msg (see
-    # _Flow._call), so an inlined ``<Call>`` body does not vote on the caller's input.
-    called = {
-        id(inner)
-        for elem in _live_elements(action_list)
-        if _local(elem.tag).lower() == "call"
-        for inner in elem.iter()
-        if inner is not elem
-    }
+    # An inlined ``<Call>`` body votes too. Nothing establishes that a call which passes nothing
+    # does not hand the caller's input to the called list's input handle, so a second name there
+    # makes the caller's input ambiguous: fail closed.
     for elem in _live_elements(action_list):
-        if id(elem) in called:
-            continue
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
         marked = marked or bool(tokens)
@@ -1599,7 +1591,7 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
     if kind in ("block", "call"):
         # A ``<Block>`` is a section LABEL, not an action, and a ``<Call>``'s target list is inlined:
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
-        # What a call may reach is judged by :meth:`_Flow._call` from the call line's raw text.
+        # :meth:`_Flow._call` decides what a call leaves unknown, and never from what its line names.
         return [Control(kind, source, statement or note or tag, body=tuple(body))]
 
     inner, branches = _split_branches(body)
@@ -1855,20 +1847,25 @@ class _Env(Mapping[str, str]):
                     self.unbind(handle)
 
 
-#: In a set of handle keys: the statement may reach ANY handle (a call whose list is not inlined).
+#: In a set of handle keys: the statement may reach ANY handle, the input included (a call whose list
+#: is not inlined, or whose list may overwrite some tree whole).
 _EVERY_HANDLE = "\x00every"
-_NAME_WORD = re.compile(r"[A-Za-z0-9_]+")
-_HANDLE_WORD = re.compile(r"%([A-Za-z0-9_]+)")
+#: In a set of handle keys: the statement may reach every handle except the input while it is still
+#: ``msg`` (an inlined call, see :meth:`_Flow._call`).
+_EVERY_LOCAL = "\x00every-local"
 
 
 def _handle_key(handle: str) -> str:
-    """A handle's name for matching by name: no ``%``, case-folded."""
+    """A handle's name for matching a statement's own whole-tree writes: no ``%``, case-folded."""
     return handle.lstrip("%").lower()
 
 
-def _hit(keys: frozenset[str], handle: str) -> bool:
-    """Whether a set of handle keys (see :meth:`_Flow._written`) reaches ``handle``."""
-    return _EVERY_HANDLE in keys or _handle_key(handle) in keys
+def _hit(keys: frozenset[str], handle: str, local: str) -> bool:
+    """Whether a set of handle keys (see :meth:`_Flow._written`) reaches ``handle``, which holds
+    ``local``."""
+    if _EVERY_HANDLE in keys or (_EVERY_LOCAL in keys and local != "msg"):
+        return True
+    return _handle_key(handle) in keys
 
 
 def _forget(env: _Env, deferred: _Deferred) -> None:
@@ -1906,7 +1903,6 @@ class _Flow:
         # Keyed by the id of a body tuple of the unsettled tree. The tuple rides in the value, so it
         # stays alive and its id cannot be reused for another body while this walk runs.
         self._written_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
-        self._text_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
 
     def handler(self, steps: tuple[Step, ...]) -> tuple[Step, ...]:
         env = _Env({self._input: "msg"} if self._input else {})
@@ -1926,7 +1922,8 @@ class _Flow:
 
     def _written(self, steps: tuple[Step, ...]) -> frozenset[str]:
         """The keys (see :func:`_hit`) of every handle any live statement in ``steps`` may overwrite
-        whole, nested constructs included; :data:`_EVERY_HANDLE` when that may be any handle.
+        whole, nested constructs included; :data:`_EVERY_LOCAL` or :data:`_EVERY_HANDLE` when a call
+        may reach any handle (see :meth:`_call_keys`).
 
         Read on the UNSETTLED tree, so it is a syntactic answer: a clone this walk will bind counts as
         a write as surely as an overwrite it cannot model. A loop and a ``Try`` use it to say which
@@ -1993,7 +1990,7 @@ class _Flow:
             # overwrite is unknown throughout it, and after it (the body may run no times at all).
             written = self._written(step.body)
             for handle in list(env):
-                if _hit(written, handle):
+                if _hit(written, handle, env[handle]):
                     env.unbind(handle)
             body, _ = self._arm(step.body, env)
             settled = replace(step, body=tuple(body))
@@ -2038,7 +2035,7 @@ class _Flow:
         mark = env.mark()
         written = self._written(step.body)
         for handle in list(env):
-            if _hit(written, handle):
+            if _hit(written, handle, env[handle]):
                 env.unbind(handle)
         settled_catches: dict[int, Control] = {}
         for branch in catches:
@@ -2058,46 +2055,28 @@ class _Flow:
 
         Nothing ties the handle names inside a called list to the caller's: it may name the message
         it was passed by its own input handle, or reuse a caller's name for a different tree. So the
-        inlined body starts knowing no handle at all. Afterwards the caller can vouch for no handle
-        the call might reach, judged by NAME on the raw text, case-insensitively, so no pass syntax
-        or span class can hide one (see :meth:`_call_keys`). Fail closed: a later send of one of
-        those raises."""
+        inlined body starts knowing no handle at all, and afterwards the caller vouches for none of
+        its own handles, whatever their names (see :meth:`_call_keys`). No name is matched: a handle
+        is untrusted text, and every earlier rule that matched by name missed some spelling. Fail
+        closed: a later send of a clone or a built message raises."""
         keys = self._call_keys(step)
         body = self._run_in_line(step.body, _Env({}))
         for handle in list(env):
-            if _hit(keys, handle):
+            if _hit(keys, handle, env[handle]):
                 env.unbind(handle)
         return replace(step, body=tuple(body))
 
     def _call_keys(self, step: Control) -> frozenset[str]:
-        """The handle keys a call may reach: every word of its call line (a pass may be spelled any
-        way), and every ``%`` handle named anywhere in its inlined list. A call whose list is not
-        inlined may reach any handle at all."""
-        if not step.body:
+        """What a call leaves unknown: every handle but the input while it is still ``msg``.
+
+        The input is spared because generated code never rebinds ``msg``, so the input can change
+        only in place. Corepoint can still replace it whole: the called list names what it was
+        passed by its own handle, so a whole-tree write under ANY name may be the input. So the
+        input is unknown too when the called list may overwrite any tree whole, judged by
+        :meth:`_written` with no name compared. A call whose list is not inlined may do anything."""
+        if not step.body or self._written(step.body) - {_EVERY_LOCAL}:
             return frozenset({_EVERY_HANDLE})
-        return frozenset(w.lower() for w in _NAME_WORD.findall(step.detail)) | self._text_keys(
-            step.body
-        )
-
-    def _text_keys(self, steps: tuple[Step, ...]) -> frozenset[str]:
-        """Every ``%`` handle key named in the raw text of any live statement in ``steps``.
-
-        Read from the statement text rather than from parsed operands, so a span class the role
-        layer does not list, an unknown tag, or a path operand cannot hide a handle. Memoized."""
-        cached = self._text_memo.get(id(steps))
-        if cached is not None:
-            return cached[1]
-        found: set[str] = set()
-        for step in steps:
-            if not isinstance(step, Control) or step.kind == "disabled":
-                continue
-            found.update(w.lower() for w in _HANDLE_WORD.findall(step.detail))
-            found |= self._text_keys(step.body)
-            for branch in step.branches:
-                found |= self._text_keys(branch.body)
-        result = frozenset(found)
-        self._text_memo[id(steps)] = (steps, result)
-        return result
+        return frozenset({_EVERY_LOCAL})
 
     def _strays(self, ctrl: Control, env: _Env) -> Control:
         """Settle the branches the render inlines AFTER ``ctrl`` (see :func:`_stray_branches`)."""
