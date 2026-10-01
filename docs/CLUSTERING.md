@@ -299,30 +299,29 @@ flowchart TB
 
   subgraph NODES["Engine nodes: same config dir, same store settings"]
     NODE_A["Node A: PRIMARY<br/>holds the leadership lease<br/>binds every listener<br/>graph running: router, transform and delivery workers"]:::core
-    NODE_B["Node B: STANDBY (warm)<br/>binds no listeners, runs no workers<br/>contends for the leadership lease only"]:::core
+    NODE_B["Node B: STANDBY (warm)<br/>binds no listeners, runs no workers<br/>keeps a membership heartbeat<br/>contends for the leadership lease"]:::core
   end
 
   subgraph SHARED_DB["Shared server database: PostgreSQL or SQL Server"]
     LEASE_ROW[("leader_lease row<br/>one owner, expiry on the database clock")]:::store
     NODES_TABLE[("nodes table<br/>membership heartbeats")]:::store
     MSG_STORE[("Message store<br/>the durable staged queue")]:::store
-    DB_HA["Database-tier HA is the database's job:<br/>PostgreSQL streaming replication<br/>or SQL Server Always On"]:::ext
   end
 
   PARTNERS ==> VIP
   VIP ==>|"port bound, check passes"| NODE_A
   VIP -.->|"port NOT bound, check fails"| NODE_B
-  NODE_A ==>|"renews every heartbeat"| LEASE_ROW
-  NODE_B -.->|"acquires only after the lease expires"| LEASE_ROW
   NODE_A ==>|"claims, processes and delivers"| MSG_STORE
+  NODE_A -->|"renews every heartbeat"| LEASE_ROW
+  NODE_B -->|"acquires only after the lease expires"| LEASE_ROW
   NODE_A -->|"heartbeat"| NODES_TABLE
   NODE_B -->|"heartbeat"| NODES_TABLE
 ```
 
-**Legend.** Thick arrows are the working path: sender traffic, lease renewal and message work, all on
-the primary. Dotted arrows are the standby's paths, which carry no sender traffic and no message
-work. Thin solid arrows are the membership heartbeat, which every node sends. Cylinders are data
-held in the shared database.
+**Legend.** Thick arrows carry messages, and only the primary has them. Thin arrows are coordination
+traffic, which every node sends on each heartbeat. The dotted arrow is the health check that fails
+on the standby, so the VIP sends no sender traffic there. Cylinders are data held in the shared
+database.
 
 **One primary processes; the rest are warm standbys.** All nodes point at the **same** server DB and run
 the **same** config dir; the `leader_lease` row elects exactly one primary, which alone binds listeners

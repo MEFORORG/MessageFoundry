@@ -476,11 +476,11 @@ shared message store.
 ```mermaid
 flowchart TB
   classDef io fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
-  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef deploy fill:#eceff1,stroke:#546e7a,color:#1c2429;
   classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
   classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
 
-  SUPERVISE["messagefoundry supervise<br/>finds the engine shard ids in the config<br/>restarts a process that exits"]:::ext
+  SUPERVISE["messagefoundry supervise<br/>finds the engine shard ids in the config<br/>restarts a process that exits"]:::deploy
 
   subgraph ES_A["Engine shard a"]
     IN_A["Inbound Connections tagged a"]:::io
@@ -498,6 +498,7 @@ flowchart TB
   end
 
   UNIFIED_STORE[("ONE message store<br/>one PostgreSQL or SQL Server database")]:::store
+  OUTBOUND(["Outbound Connections, the same set in every engine process<br/>each has one owning engine shard, which delivers for it"]):::io
 
   SUPERVISE -.->|"starts"| PROC_A
   SUPERVISE -.->|"starts"| PROC_B
@@ -505,20 +506,26 @@ flowchart TB
   IN_A ==> PROC_A
   IN_B ==> PROC_B
   IN_DEFAULT ==> PROC_DEFAULT
-  PROC_A ==> UNIFIED_STORE
-  PROC_B ==> UNIFIED_STORE
-  PROC_DEFAULT ==> UNIFIED_STORE
+  PROC_A ==>|"reads and writes"| UNIFIED_STORE
+  PROC_B ==>|"reads and writes"| UNIFIED_STORE
+  PROC_DEFAULT ==>|"reads and writes"| UNIFIED_STORE
+  PROC_A ==>|"delivers what it owns"| OUTBOUND
+  PROC_B ==>|"delivers what it owns"| OUTBOUND
+  PROC_DEFAULT ==>|"delivers what it owns"| OUTBOUND
 ```
 
 **Legend.** Thick arrows carry messages. Dotted arrows are process control. The cylinder is the
-message store. API ports follow the sorted order of the engine shard ids.
+message store. API ports follow the sorted order of the engine shard ids. A message can arrive on
+one engine shard and leave from another, because the queued row waits in the shared store for the
+engine shard that owns its outbound Connection.
 
-This is **engine sharding**: [ADR 0037](adr/0037-multi-process-sharding-l3.md) defines it, and
-[ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md) requires the one shared store.
-Every engine process also loads the same Routers, Handlers and outbound Connections, and exactly
-one engine shard delivers for each outbound Connection. **Database sharding** is a different idea:
-it would split the message store across several databases.
-[ADR 0039](adr/0039-database-tier-sharding-l5.md) proposed it, and its status is declined.
+This is **engine sharding**. [ADR 0037](adr/0037-multi-process-sharding-l3.md) defines it,
+[ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md) requires the one shared store, and
+[ADR 0073](adr/0073-ownership-scoped-recovery-single-consumer-lanes.md) gives each outbound
+Connection one delivering engine shard. **Database sharding** is a different idea: it would split
+the message store across several databases. [ADR 0039](adr/0039-database-tier-sharding-l5.md)
+proposed it, and its status is declined. The paragraph above this heading says what is measured
+about engine shards on one server database, and what is not.
 
 ## 16. Dependencies & supply chain
 

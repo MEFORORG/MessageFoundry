@@ -67,11 +67,10 @@ flowchart TB
   subgraph PRIMARY_DC["PRIMARY DC (hospital)"]
     ENGINE_1["Host A: engine VM 1<br/>ACTIVE (leader)"]:::core
     ENGINE_2["Host B: engine VM 2<br/>STANDBY, active-eligible<br/>binds no listeners"]:::core
+    AG_LISTENER["AG listener<br/>the store address every engine uses"]:::ext
     AG_R1[("Host C: SQL VM, AG replica R1<br/>primary<br/>SYNC commit, AUTO failover")]:::store
     AG_R2[("Host D: SQL VM, AG replica R2<br/>SYNC commit, AUTO failover")]:::store
   end
-
-  AG_LISTENER["AG listener<br/>the store address every engine uses"]:::ext
 
   subgraph DR_DC["DR DC (offsite)"]
     ENGINE_DR["Host E: DR engine VM<br/>service STOPPED in steady state (cold)"]:::core
@@ -83,26 +82,27 @@ flowchart TB
   L4_LB -.->|"health check fails"| ENGINE_2
   ENGINE_1 ==>|"TDS over TLS"| AG_LISTENER
   ENGINE_2 -->|"heartbeat only, TDS over TLS"| AG_LISTENER
-  ENGINE_DR -.->|"only after the DR runbook starts it"| AG_LISTENER
   AG_LISTENER ==>|"current primary replica"| AG_R1
   AG_R1 ==>|"synchronous commit"| AG_R2
   AG_R1 -->|"asynchronous log send over the WAN"| AG_R3
+  ENGINE_DR -.->|"no connection while the service is stopped"| AG_R3
 ```
 
-**Legend.** Thick arrows are the steady-state message and commit path. Thin solid arrows are
-steady-state traffic outside that path. Dotted arrows are paths nothing uses in steady state.
-Cylinders are SQL Server replicas.
+**Legend.** Thick arrows are the steady-state message and commit path. Thin arrows are traffic
+outside that path that still runs all the time. Dotted arrows carry no messages in steady state:
+the health check that fails on the standby, and the stopped DR engine. Cylinders are SQL Server
+replicas.
 
 Three notes go with the diagram:
 
-- **Asynchronous log send.** The current primary, R1 or R2, sends log to R3 over the WAN. R3 takes
-  a forced failover only.
-- **The DR engine connector is dotted.** Its NSSM service is STOPPED in steady state. The section 6
-  DR runbook starts it, and nothing else does. The DR engine is promoted with the database, as a
-  site unit.
-- **WSFC quorum.** WSFC is Windows Server Failover Clustering. The primary-DC nodes vote and the DR
-  node gets ZERO votes. The witness is a cloud witness, or a file share witness at a THIRD site. It
-  is never inside either data center.
+- The current primary, R1 or R2, sends log to R3 asynchronously over the WAN. R3 takes a forced
+  failover only.
+- The DR engine connector is dotted because its NSSM service is kept STOPPED in steady state.
+  Start it only per the section 6 DR runbook. The DR engine is promoted with the database, as a
+  site unit, and it then reaches R3 through the AG listener.
+- For the WSFC (Windows Server Failover Clustering) quorum, the primary-DC nodes vote and the DR
+  node gets ZERO votes. The witness is a cloud witness, or a file share witness at a THIRD site.
+  It is never inside either data center.
 
 The commit topology reduces to one rule: **synchronous commit stays inside the hospital DC**
 (R1 + R2, with automatic failover), while **the DR replica is asynchronous** (forced failover
