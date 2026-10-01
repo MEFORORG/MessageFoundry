@@ -301,6 +301,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
     "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
+    # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
+    # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.
+    "messagefoundry/auth/ldap_tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ADR 0142 (OIDC relying party, BACKLOG #274): the federated-SSO layer.
     #   claims.py — hmac.compare_digest for the constant-time nonce comparison; cryptography only for
     #     catching InvalidSignature (the verification itself is transports/signing.py, inventoried).
@@ -918,8 +921,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.auth.trust_anchors",
-            "tls_context:via messagefoundry.config.tls_policy",
         }
+    ),
+    # BACKLOG #2494: the LDAPS context is built by tls_policy.assert_ldap3_tls_suites, and the socket
+    # is wrapped with it here, in place of ldap3's own wrap_socket.
+    "messagefoundry/auth/ldap_tls.py": frozenset(
+        {"tls_context:.wrap_socket()", "tls_context:via messagefoundry.config.tls_policy"}
     ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
