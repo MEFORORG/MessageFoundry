@@ -788,7 +788,7 @@ tuple: they act only on the caller's own account.
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up` |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up` |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
-| `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; a rebind revokes the account's sessions. **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C); 409 when another account holds the identity, and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound` |
+| `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; a rebind revokes the account's sessions. **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C); 409 when another account holds the identity, and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound`. **A bound account is refused Windows SSO from then on**, whether or not `oidc_enabled` is on (vault BACKLOG #2609; [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits) |
 | `DELETE` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Removes the binding and revokes the account's sessions (BACKLOG #1474's service method); its next federated login is refused until it is bound again. The body's required `expected_issuer`/`expected_subject` is the pair the caller saw: a stored pair that differs is refused 409 `federated_binding_changed` with nothing changed, compared under the clear's row lock (BACKLOG #2026) |
 | `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
@@ -1693,7 +1693,9 @@ gated. Four routes take the *password-only* variant (`require_reauth_only[_actio
 `POST /me/mfa/confirm`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`. The skip serves
 an account with no factor only: a pending session on an account that has one gets `403` +
 `X-MFA-Required` on all four (BACKLOG #1951; see the "Binding a NEW second factor, or ending
-sessions" row).
+sessions" row). One first enrolment gets the same answer on the two enrolment routes: an
+account that holds a federated binding, from a session the federated sign-in did not mint
+(vault BACKLOG #2609; see [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)).
 
 This re-proves a credential of the session's account (secondary verification): the local password,
 the directory password by a live re-bind, or for an `oidc` session a fresh IdP sign-in. With **WP-14 native TOTP MFA** built, the step-up
@@ -2407,7 +2409,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `reason=federated_sign_in_required`. The binding decides, not `oidc_enabled`: an account bound
   while federation is off, or under an issuer that is no longer configured, signs in by neither
   leg until an administrator unbinds it. A bound account has no Windows SSO fallback during an
-  IdP outage either, so keep a local administrator account. A first bind revokes no session, so
+  IdP outage either, so keep a local administrator account. It also gets no bearer token:
+  `POST /auth/negotiate` was a directory account's one way to a JSON session, and federated
+  sign-in is browser only. So a scripted client needs a local account, or a directory account
+  with no binding. A first bind revokes no session, so
   a session Windows SSO minted earlier lives out its lifetime. Until that session has proven an
   engine factor it cannot enrol one: its re-bind returns no grant (`grant_refused` on the
   `auth.reauth` row) and the enrolment routes answer `403` with `X-MFA-Required: 1`. The web

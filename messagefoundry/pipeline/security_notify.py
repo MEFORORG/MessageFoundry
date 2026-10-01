@@ -94,7 +94,7 @@ _DESCRIPTIONS = {
     EMAIL_CHANGED: "Your account's email address was changed.",
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
     USERNAME_CHANGED: "Your account's username was changed.",
-    FEDERATED_IDENTITY_BOUND: "An external identity provider sign-in was linked to your account. From now on that provider can sign you in.",
+    FEDERATED_IDENTITY_BOUND: "An external identity provider sign-in was linked to your account. From now on you sign in through that provider, and Windows single sign-on no longer signs you in.",
     FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
     # BACKLOG #2019. Names the command because the reader has no console action to trace it to: it
     # ran at the host, against the store, while the install had no enabled Administrator.

@@ -1239,6 +1239,35 @@ def _holds_federated_binding(user: UserRecord) -> bool:
     return user.oidc_issuer is not None or user.oidc_subject is not None
 
 
+def _binds_past_the_identity_provider(session: SessionRecord, user: UserRecord) -> bool:
+    """Whether binding a factor from ``session`` would go around ``user``'s identity provider
+    (vault BACKLOG #2609).
+
+    True when the account holds a federated binding, the session was not minted by the
+    federated login, and the session carries no factor the engine verified. Windows SSO refuses
+    a bound account, so this describes at least a session Windows SSO minted BEFORE an
+    administrator bound the account: a first bind revokes no session
+    (:meth:`AuthService.bind_federated_subject`). Its only proof is a directory ticket and, at
+    step-up, the directory password. Letting it bind the account's first engine factor would
+    give that proof a full session on an account the site put behind its identity provider.
+
+    The test is the negative one on purpose, so anything that is not an ``oidc`` session fails
+    closed: a row with no recorded mechanism, and a password session on a row that holds a
+    pair, which no engine writer produces because a bind refuses any account that is not a
+    directory one.
+
+    A session the federated login minted is never refused. With
+    ``[auth].oidc_require_mfa_claim`` off it is minted owing a factor, and it must be able to
+    enrol one. A session that has already proven an engine factor is not refused either: it is
+    adding a factor, not binding the first one.
+    """
+    return (
+        session.mfa_verified_at is None
+        and session.auth_mechanism != SessionMechanism.OIDC.value
+        and _holds_federated_binding(user)
+    )
+
+
 def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
     """Whether ``user`` carries a federated binding but no ``directory_object_id`` (BACKLOG #2027).
 
@@ -6436,8 +6465,10 @@ class AuthService:
                     # The session is gone: a good password on a session that vanished mid-ceremony,
                     # or (with session_revoked) one revoked by its re-proof budget.
                     "session_lost": elevation.session_lost,
-                    # A good password whose purpose grant was refused (a pending session on an
-                    # account with a factor). Without it the row reads as a granted re-proof.
+                    # A good password whose purpose grant was refused: a pending session on an
+                    # account with a factor, or a factor-binding action that would go around a
+                    # bound account's identity provider (vault BACKLOG #2609). Without it the row
+                    # reads as a granted re-proof.
                     "grant_refused": grant_refused,
                     # This failure spent the session's re-proof budget, so it is revoked
                     # (BACKLOG #1138). A session already gone reads session_lost alone.
@@ -6527,7 +6558,7 @@ class AuthService:
 
         **One first enrolment IS refused: a factor-binding action on an account that holds a
         federated binding, from a session the federated login did not mint** (vault BACKLOG #2609).
-        See :meth:`_binds_past_the_identity_provider`.
+        See :func:`_binds_past_the_identity_provider`.
         """
         if not token:
             # No session to act on, so a listed action fails closed.
@@ -6541,40 +6572,15 @@ class AuthService:
             return False
         if await self._owes_enrolled_factor_hash(token_hash):
             return True
-        return (
-            purpose in self._FACTOR_BINDING_ACTIONS
-            and await self._binds_past_the_identity_provider(token_hash)
-        )
-
-    async def _binds_past_the_identity_provider(self, token_hash: str) -> bool:
-        """Whether binding a factor from this session would go around the account's identity
-        provider (vault BACKLOG #2609).
-
-        True when the account holds a federated binding, the session was not minted by the
-        federated login, and the session carries no factor the engine verified. Windows SSO refuses
-        a bound account, so the one session this describes is one Windows SSO minted BEFORE an
-        administrator bound the account: a first bind revokes no session
-        (:meth:`bind_federated_subject`). Its only proof is a directory ticket and, at step-up, the
-        directory password. Letting it bind the account's first engine factor would give that
-        proof a full session on an account the site put behind its identity provider.
-
-        A session the federated login minted is never refused here. With
-        ``[auth].oidc_require_mfa_claim`` off it is minted owing a factor, and it must be able to
-        enrol one. A session that has already proven an engine factor is not refused either: it is
-        adding a factor, not binding the first one.
-
-        Fails closed (True) when the session or its user cannot be found.
-        """
-        session = await self._store.get_session(token_hash)
-        if session is None:
-            return True
-        if (
-            session.mfa_verified_at is not None
-            or session.auth_mechanism == SessionMechanism.OIDC.value
-        ):
+        if purpose not in self._FACTOR_BINDING_ACTIONS:
             return False
-        user = await self._store.get_user(session.user_id)
-        return user is None or _holds_federated_binding(user)
+        # The second rule, :func:`_binds_past_the_identity_provider`. Fails closed when the
+        # session or its user cannot be found, as the rule above does.
+        session = await self._store.get_session(token_hash)
+        user = None if session is None else await self._store.get_user(session.user_id)
+        if session is None or user is None:
+            return True
+        return _binds_past_the_identity_provider(session, user)
 
     async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
         """Whether the session is MFA-pending on an account that already HAS a second factor.
@@ -7831,6 +7837,15 @@ class AuthService:
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
+        # vault BACKLOG #2609. The route in front of this leg rides the session window and asks no
+        # action-bound gate, so a ceremony begun before an administrator bound the account could
+        # finish after it. Asked here, before the challenge is spent. A session that is gone is
+        # left to the rotation below, which reports it as lost.
+        session = await self._store.get_session(hash_token(token))
+        if session is not None and _binds_past_the_identity_provider(session, user):
+            raise ValueError(
+                "this account signs in through its identity provider; sign in there to add a passkey"
+            )
         label = label.strip()
         if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
@@ -8828,7 +8843,7 @@ class AuthService:
         first bind revokes no session. It adds the federated way in, and it withdraws Windows SSO for
         later sign-ins: ``_directory_login_refusal`` refuses a bound row there (vault BACKLOG #2609).
         A session Windows SSO minted before the bind therefore outlives it, and
-        :meth:`_binds_past_the_identity_provider` stops that session binding the account's first
+        :func:`_binds_past_the_identity_provider` stops that session binding the account's first
         factor. This sentence used to end "it adds a way in and withdraws none". On a rebind the
         account is unbound between the two writes, and a federated login in that gap is refused
         rather than admitted. If the bind is then refused because another account took the pair in

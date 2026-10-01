@@ -523,3 +523,31 @@ B.1 left the verification of what comes back to the build. These are its criteri
   leg's path: stamp `reauth_at` and the client address on the old hash, rotate the session (ASVS 7.2.4)
   carrying `mfa_verified_at` and `auth_mechanism` forward, and only then mint any single-use action
   grant against the new hash.
+
+## Amendment C (2026-10-01) — a bound account signs in through the IdP only (vault BACKLOG #2609)
+
+> **Status: PROPOSED.** It records what the build for vault BACKLOG #2609 did. That item came from
+> the architecture review the owner approved on 2026-10-01. The owner has not ruled on this text, and
+> this amendment does not change the status line at the top of this ADR.
+
+### C.1 What changed
+
+An account that holds a federated binding is refused Windows SSO. `_directory_login_refusal` refuses
+the row at both of its call sites, audited as `auth.login_failed` with
+`reason=federated_sign_in_required`. An account with no binding is unchanged.
+
+### C.2 What it narrows in this ADR
+
+- **"Degradation is isolated" and AC-8.** Both still read true as written: the IdP's state changes
+  no Kerberos outcome. What is new is that a bound account has no Kerberos sign-in to fall back on.
+  So during an IdP outage a bound account cannot sign in at all, and it never gets a bearer token,
+  because the federated leg is browser only. A site keeps a local administrator account for that.
+- **Amendment B, "the session, not the account".** "A hybrid account can also log in by AD password
+  or Kerberos" now holds only for a session Kerberos minted before the account was bound. A first
+  bind revokes no session, so that session outlives the bind and keeps the password re-bind, as
+  AC-13's last sentence says. It cannot bind the account's first engine factor.
+
+### C.3 Left open for the owner
+
+Whether a first bind should revoke the account's live sessions, as a rebind and an unbind do. Today
+it does not, which is why C.2 has a pre-bind session to describe.

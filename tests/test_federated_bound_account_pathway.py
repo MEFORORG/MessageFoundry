@@ -41,7 +41,7 @@ from messagefoundry.auth.service import (
     AuthService,
 )
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline import Engine, security_notify
 from messagefoundry.store.store import MessageStore
 from tests.test_auth_oidc_service import (
     DEFAULT_SUB,
@@ -399,6 +399,37 @@ async def test_the_enrolment_route_refuses_the_session_minted_before_the_bind(
         assert "X-Step-Up-Required" not in refused.headers
 
 
+async def test_a_passkey_ceremony_begun_before_the_bind_cannot_finish_after_it(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``finish_webauthn_registration`` stops asking the rule itself.
+
+    The route in front of the passkey finish rides the session window and asks no action-bound gate,
+    so the service is the only place the rule can stand for it. The control is the same call on the
+    unbound account: it gets as far as the ceremony lookup, which is a different refusal."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _sso_service(store, rsa_key)
+        _as(monkeypatch, "jdoe")
+        minted = await service.authenticate_kerberos(b"spnego-token")
+        assert minted.token is not None and minted.identity is not None
+        identity, token = minted.identity, minted.token
+
+        async def finish() -> None:
+            await service.finish_webauthn_registration(
+                identity, "{}", label="key", token=token, rp_id="t", origin="https://t"
+            )
+
+        with pytest.raises(ValueError, match="passkey ceremony expired"):
+            await finish()
+        await _bind(service, store, DEFAULT_SUB)
+        with pytest.raises(ValueError, match="signs in through its identity provider"):
+            await finish()
+        assert await store.list_webauthn_credentials(identity.user_id) == []
+    finally:
+        await store.close()
+
+
 # --- the operator document ---------------------------------------------------------------------
 
 
@@ -410,3 +441,14 @@ def test_the_security_doc_names_the_reason_the_audit_row_carries() -> None:
         encoding="utf-8"
     )
     assert f"`reason={FEDERATED_SIGN_IN_REQUIRED}`" in text
+
+
+def test_the_bind_notice_tells_the_holder_windows_sso_no_longer_signs_them_in() -> None:
+    """RED when: the notice goes back to saying only that the provider can sign the holder in. The
+    bind withdraws a sign-in, and the notice is the one place the holder hears of it."""
+    from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND
+
+    assert (
+        "Windows single sign-on no longer"
+        in security_notify._DESCRIPTIONS[FEDERATED_IDENTITY_BOUND]
+    )
