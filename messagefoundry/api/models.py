@@ -548,9 +548,9 @@ class ApprovalDecisionResult(BaseModel):
 
 class ReloadRequest(RequestModel):
     # Directory of code-first config modules to load + apply. Optional: omitted/None reloads the
-    # server's startup --config dir. Any value must resolve within an allowed reload root (the
+    # server's startup --config dir. Any value must lie within an allowed reload root (the
     # startup dir or [api].config_reload_roots) — the loader executes Python from it. Length-bounded
-    # (ASVS 1.3.3); the allow-list confinement remains the real control.
+    # (ASVS 1.3.3); the allow-list confinement remains the real control (pipeline/path_confine.py).
     config_dir: FilesystemPath | None = None
     # dry_run: validate the graph against THIS environment (loads + build-checks connectors, which
     # resolves env() values for the target) and report the result WITHOUT swapping the live graph.
@@ -1258,7 +1258,8 @@ class DrActivateRequest(RequestModel):
     """Request body for ``POST /dr/activate`` (#61 / BACKLOG #102, ADR 0048). Both fields are optional so
     an empty body still reaches the fail-closed cold-seed step (a missing seed then aborts as before).
 
-    ``archive`` overrides ``[dr].seed_archive`` (the runbook may pass the chosen #60 backup).
+    ``archive`` overrides ``[dr].seed_archive`` (the runbook may pass the chosen #60 backup). It must
+    lie under ``[dr].seed_dir``, and is refused while that setting is empty (vault BACKLOG #2581).
     ``dba_attests_restored`` is the operator's explicit, per-activation attestation that a DBA has restored
     the server-DB ``mefor`` database for THIS failover — REQUIRED on a Postgres/SQL Server store (the
     config-only cold-seed archive cannot restore/verify a DBA-managed DB), IGNORED on SQLite (the archive

@@ -20,6 +20,14 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+### Security
+
+- **Activate DR and Release DR ask for a fresh sign-in proof.** `POST /ui/dr/activate` and
+  `POST /ui/dr/release` now sit behind `require_ui_step_up`, like the stepdown control. A session
+  whose step-up window has lapsed is sent to `/ui/reauth`, then back to the status page to press
+  the button again. The action is never re-sent for the operator. Both were reachable on the
+  session alone. (vault BACKLOG #2581)
+
 ## [0.4.0] — 2026-10-01 — Early Access
 
 **Requires engine 0.5.0. Supported engine UI seam: `32ad621e6081555e`**, the value engine 0.5.0

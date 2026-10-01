@@ -61,8 +61,10 @@ from messagefoundry.pipeline.cluster import (
     default_node_id,
     lease_release_unconfirmed,
     members_from_node_rows,
+    paused_read_budget_seconds,
     rows_affected,
     stepdown_pause_seconds,
+    stop_tasks_within,
 )
 from messagefoundry.redaction import safe_exc
 
@@ -132,6 +134,10 @@ class SqlServerCoordinator:
         # widening it is a multi-site enumeration — the exact defect class this avoids).
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
+        # BACKLOG #2540: the whole-call budget for the paused tick's owner read. The store's own
+        # [store].command_timeout still ends the statement first when it is the shorter of the two;
+        # paused_read_budget_seconds says why that matters here.
+        self._paused_read_budget = paused_read_budget_seconds(leader_fence_timeout_seconds)
         # Small relative to the fence timeout so a fence fires promptly (well before the lease TTL).
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
         # Leader-preference (ADR 0096): `acquire_delay` handicaps ONLY take-over of an EXPIRED lease (added
@@ -199,10 +205,9 @@ class SqlServerCoordinator:
         tasks = [t for t in (self._heartbeat_task, self._fence_task) if t is not None]
         self._heartbeat_task = None
         self._fence_task = None
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Bounded (BACKLOG #2523), as DbCoordinator.stop() is: the store quarantines a cancelled
+        # connection, but its pool release and a slow quarantine close are not bounded here.
+        await stop_tasks_within(tasks, self._stop_write_timeout, self.node_id)
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
         # expire the lease row at the DB clock's now, so a standby need not wait out the TTL and still
         # waits its own acquire_delay (BACKLOG #1986; DbCoordinator.stop() says why). Deliberately
@@ -473,9 +478,13 @@ class SqlServerCoordinator:
             # expired lease instead of this node renewing it straight back via the un-delayed t.owner = me
             # branch, and lift the pause once the row names another node (BACKLOG #1986). Mirrors
             # DbCoordinator._claim_or_renew_lease — read its comment there.
-            current = await self._store._fetchone(
-                "SELECT owner FROM leader_lease WHERE lease_key = ?", (self._lease_key,)
-            )
+            # BACKLOG #2540: bounded strictly under the fence, because this read holds the lock a
+            # retried stepdown waits on, and [store].command_timeout (30 s by default) is longer
+            # than the 20 s fence. See paused_read_budget_seconds.
+            async with asyncio.timeout(self._paused_read_budget):
+                current = await self._store._fetchone(
+                    "SELECT owner FROM leader_lease WHERE lease_key = ?", (self._lease_key,)
+                )
             if current is not None and current["owner"] != self.node_id:
                 self._no_claim_until = 0.0
             return False
@@ -541,7 +550,7 @@ class SqlServerCoordinator:
             self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         """Release leadership and stay up as a standby (ADR 0056 slice 1). Mirrors
         :meth:`~messagefoundry.pipeline.cluster.DbCoordinator.step_down_leadership` — read its

@@ -61,6 +61,7 @@ from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
+from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
@@ -76,6 +77,14 @@ _ACTION_SEED = "dr_seed"
 _ACTION_ACTIVATE = "dr.activate"
 _ACTION_RELEASE = "dr.release"
 _ACTION_ABORTED = "dr_activation_aborted"
+
+#: The one answer for every refused request archive, whichever check refused it. It names the
+#: setting and no part of the path, so the refusal says nothing about what exists on the DR box.
+_REQUEST_ARCHIVE_REFUSED = (
+    "the archive named in the request was refused: a request may name only an archive under "
+    "[dr].seed_dir, and with [dr].seed_dir unset it may name none. Set [dr].seed_dir, or name "
+    "the archive in [dr].seed_archive — refusing to activate (ADR 0048 fail-closed)"
+)
 
 
 class DrActivationError(RuntimeError):
@@ -173,7 +182,8 @@ class DrCoordinator:
         operator ``actor`` for the audit rows.
 
         ``archive`` overrides ``[dr].seed_archive`` (the runbook may pass the chosen #60 backup in the
-        request body). ``dba_attests_restored`` is the operator's explicit, per-activation attestation that
+        request body), and is confined to ``[dr].seed_dir`` before anything opens it
+        (:meth:`_confine_request_archive`). ``dba_attests_restored`` is the operator's explicit, per-activation attestation that
         a DBA has restored the server-DB ``mefor`` database for THIS failover — REQUIRED on a
         Postgres/SQL Server store (the config-only cold-seed archive cannot restore or verify a
         DBA-managed DB) and IGNORED on SQLite (BACKLOG #102). Raises :class:`DrActivationError` and records
@@ -196,6 +206,8 @@ class DrCoordinator:
                 )
             seed = archive or self._settings.seed_archive
             now = self._clock()
+            if archive:
+                seed = await self._confine_request_archive(archive, actor, now)
 
             # (1) Cold-seed restore-verify — FAIL-CLOSED, BEFORE any VIP step (AC-9/AC-14). A missing
             # seed path is itself an abort: a DR box must never promote onto an unverified store.
@@ -357,6 +369,49 @@ class DrCoordinator:
             )
 
     # --- internals -----------------------------------------------------------
+
+    async def _confine_request_archive(self, archive: str, actor: str, now: float) -> str:
+        """The resolved path of a request-named ``archive``, or an abort if it is not under
+        ``[dr].seed_dir`` (vault BACKLOG #2581). Deny by default: with ``seed_dir`` unset, a
+        request may name no archive.
+
+        :func:`~messagefoundry.pipeline.path_confine.confine` judges the text of ``archive`` first,
+        with no filesystem call on it, then resolves, off the event loop. The caller verifies the
+        RESOLVED path, so the file that was checked is the file that is opened. Every refusal
+        aborts with one message, and the audit row alone records the path that was asked for.
+
+        A ``seed_dir`` this box cannot resolve is a different answer: it is the operator's own
+        directory that failed, so the abort says so and names no part of the request."""
+        seed_dir = self._settings.seed_dir
+        resolved: Path | None = None
+        if seed_dir:
+            timeout = self._settings.takeover_timeout_seconds
+            try:
+                resolved = await asyncio.wait_for(
+                    asyncio.to_thread(_confined_archive, archive, seed_dir), timeout=timeout
+                )
+            except OSError as exc:
+                # An unreachable share, say, or one that does not answer in time (TimeoutError is
+                # an OSError). Still an abort with its audit row, never an unhandled error.
+                log.warning(
+                    "DR activation: could not resolve [dr].seed_dir for a request archive: %s",
+                    safe_exc(exc),
+                )
+                await self._record_aborted(
+                    "seed",
+                    f"[dr].seed_dir could not be resolved from this box within {timeout:g}s, so "
+                    "the archive named in the request was not checked — refusing to activate "
+                    "(ADR 0048 fail-closed). Check that the seed directory is reachable, or name "
+                    "the archive in [dr].seed_archive",
+                    actor,
+                    now,
+                    requested=archive,
+                )
+        if resolved is None:
+            await self._record_aborted(
+                "seed", _REQUEST_ARCHIVE_REFUSED, actor, now, requested=archive
+            )
+        return str(resolved)
 
     async def _verify_seed(self, archive: str, actor: str, now: float) -> VerifyResult:
         """Restore-verify the #60 cold-seed archive, FAIL-CLOSED. Reuses ADR 0049's owned primitive
@@ -744,15 +799,21 @@ class DrCoordinator:
                 )
         return True
 
-    async def _record_aborted(self, kind: str, message: str, actor: str, now: float) -> NoReturn:
+    async def _record_aborted(
+        self, kind: str, message: str, actor: str, now: float, *, requested: str | None = None
+    ) -> NoReturn:
         """Record a ``dr_activation_aborted`` audit row (PHI-free) + raise :class:`DrActivationError`. The
         single fail path for every refused activation, so an aborted promotion always leaves an audit
-        trail and the caller gets the failing phase. Never returns (always raises)."""
+        trail and the caller gets the failing phase. Never returns (always raises). ``requested`` is
+        a refused request path: it goes in the audit row and never in the raised message."""
+        detail = {"kind": kind, "reason": message}
+        if requested is not None:
+            detail["requested"] = requested
         try:
             await self._store.record_audit(
                 _ACTION_ABORTED,
                 actor=actor,
-                detail=json.dumps({"kind": kind, "reason": message}, sort_keys=True),
+                detail=json.dumps(detail, sort_keys=True),
                 now=now,
             )
         except Exception:
@@ -791,6 +852,19 @@ async def _run_command(command: str) -> bool:
     )
     await proc.wait()
     return proc.returncode == 0
+
+
+def _confined_archive(archive: str, seed_dir: str) -> Path | None:
+    """``archive`` resolved, if it lies under ``seed_dir``; ``None`` if not. Resolves ``seed_dir``
+    first, which is operator configuration, so run this off the event loop. ``archive`` may spell
+    the directory as configured or as it resolves."""
+    root = Path(seed_dir).resolve()
+    return confine(
+        archive,
+        lexical=lexical_roots([seed_dir, root]),
+        resolved=[root],
+        what="DR request archive",
+    )
 
 
 def _basename(path: str) -> str:

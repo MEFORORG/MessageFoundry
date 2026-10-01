@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,8 @@ from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.engine import ConfigReloadDenied
+from tests import _fs_spy
 from tests._admin_account import create_local_user_chosen
 
 
@@ -332,6 +335,107 @@ async def test_reload_allows_extra_configured_root(tmp_path: Path) -> None:
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             r = await c.post("/config/reload", json={"config_dir": str(staging)})
             assert r.status_code == 200, r.text  # staging is an allowed root
+    finally:
+        await eng.stop()
+
+
+# --- vault BACKLOG #2581: the allow-list is read from the TEXT before any filesystem call ----------
+
+_DENIED = "config directory is not an allowed reload root"
+
+
+async def test_a_refused_reload_path_is_never_touched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2581. A path outside the allowed roots is refused from its text alone.
+
+    Resolving a path opens it and each parent, so a refusal that resolves first has already touched
+    what the caller named. RED when ``Engine._resolve_reload_target`` resolves before it compares:
+    the spy then records calls naming the refused path.
+
+    The control is the last block: an allowed SUBDIRECTORY still reloads, and the spy records calls
+    naming it. So the empty lists mean the refused paths were not touched, and not that the spy saw
+    nothing. The IDE promote flow reloads a subdirectory of a root, which is why that path is kept.
+    """
+    allowed = tmp_path / "allowed"
+    _write_valid_config(allowed, tmp_path / "in", tmp_path / "out")
+    sub = allowed / "allowed-sub"
+    _write_valid_config(sub, tmp_path / "in-sub", tmp_path / "out-sub")
+    refused = [
+        str(tmp_path / "probe-outside"),
+        str(allowed) + "-probe-sibling",
+        str(allowed / "sub" / ".." / ".." / "probe-climb"),
+        *_fs_spy.NON_LOCAL_SHAPES,
+    ]
+    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=allowed)
+    try:
+        transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            calls = _fs_spy.install(monkeypatch)
+            for path in refused:
+                r = await c.post("/config/reload", json={"config_dir": path})
+                assert r.status_code == 403, (path, r.text)
+                # One generic answer for every refusal, so the route cannot probe the filesystem.
+                assert r.json()["detail"] == _DENIED
+            # The same refusal for a caller that reaches the engine without the route, as the
+            # dual-control release and the cluster convergence loop do.
+            with pytest.raises(ConfigReloadDenied):
+                await eng.reload(_fs_spy.SHARE)
+            assert _fs_spy.naming(calls, "probe") == []
+            assert eng.last_reload_dir is None  # a refused path never becomes the reload dir
+
+            denied = await eng.store.list_audit(action="config_reload_denied")
+            assert sorted(json.loads(a["detail"])["requested"] for a in denied) == sorted(refused)
+
+            r = await c.post("/config/reload", json={"config_dir": str(sub)})
+            assert r.status_code == 200, r.text
+            assert r.json()["inbound"] == 1
+            assert _fs_spy.naming(calls, "allowed-sub")
+    finally:
+        await eng.stop()
+
+
+async def test_the_engines_own_reload_of_its_startup_dir_is_never_refused(tmp_path: Path) -> None:
+    """The DR profile reload and the convergence loop hand the engine its own RESOLVED startup dir.
+    That path is a root by definition, so the text check must pass it however it is spelled.
+
+    The Windows arm starts the engine on a device-prefixed spelling of the directory, which the
+    resolve keeps. RED there when the text check refuses a device-prefixed path outright."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    spellings = [str(cfg)]
+    if os.name == "nt":
+        spellings.append("\\\\?\\" + str(cfg))
+    for spelling in spellings:
+        eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=spelling)
+        try:
+            assert eng.config_dir is not None
+            registry = await eng.reload(eng.config_dir, dry_run=True)
+            assert len(registry.inbound) == 1, spelling
+        finally:
+            await eng.stop()
+
+
+async def test_a_link_inside_a_root_that_leaves_it_is_still_refused(tmp_path: Path) -> None:
+    """The second line. The text check passes a path under a root; only the resolve can see that a
+    link there points outside. RED if the resolve-and-recheck is dropped in favour of the text
+    check alone."""
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    _write_valid_config(allowed, tmp_path / "in", tmp_path / "out")
+    _write_valid_config(outside, tmp_path / "in2", tmp_path / "out2")
+    link = allowed / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("this account cannot create a symbolic link")
+    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=allowed)
+    try:
+        transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post("/config/reload", json={"config_dir": str(link)})
+            assert r.status_code == 403, r.text
+            assert r.json()["detail"] == _DENIED
     finally:
         await eng.stop()
 

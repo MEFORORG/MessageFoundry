@@ -22,16 +22,19 @@ tell the fix from the defect.
 
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import replace
 from pathlib import Path
-from types import TracebackType
+from typing import Any
 
 import pytest
 
 from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
     ClusterMember,
     DbCoordinator,
+    NullCoordinator,
     StepdownOutcome,
     has_promotable_sibling,
     longest_promotable_sibling_delay,
@@ -54,23 +57,8 @@ BACKENDS = pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
 
 
 class _PgStopPool(_FakeLeasePool):
-    """The Postgres stand-in plus the two things ``stop()`` needs from a pool: ``acquire`` (its writes
-    go through :func:`~messagefoundry.pipeline.cluster._execute_within`) and a ``nodes`` tombstone.
-    The lease statement still goes through the parent, which asserts its SQL text."""
-
-    def acquire(self, *, timeout: float | None = None) -> _PgStopPool:
-        return self
-
-    async def __aenter__(self) -> _PgStopPool:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        return None
+    """The Postgres stand-in plus the ``nodes`` tombstone ``stop()`` sends after the release. The
+    lease statement still goes through the parent, which asserts its SQL text."""
 
     async def execute(self, sql: str, *args: object) -> str:
         if sql.startswith("UPDATE nodes"):
@@ -201,7 +189,7 @@ async def test_without_the_delay_term_the_drained_node_reclaims(backend: str) ->
     delayed = cluster.node("D", delay=60.0)
     await _lead(a)
 
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     cluster.advance(2 * _HEARTBEAT + 1.0)
     await delayed._maintain_leadership()
     await a._maintain_leadership()
@@ -339,12 +327,23 @@ async def test_stop_with_only_a_delayed_sibling_hands_over_after_the_delay(backe
 
 
 def test_the_pause_adds_the_sibling_delay_and_never_shortens() -> None:
-    assert stepdown_pause_seconds(10.0) == 20.0
+    assert stepdown_pause_seconds(10.0, 0.0) == 20.0
     assert stepdown_pause_seconds(10.0, 45.0) == 65.0
     assert stepdown_pause_seconds(10.0, -5.0) == 20.0
     # A non-finite delay would make the pause endless and the cluster leaderless until a restart.
     assert stepdown_pause_seconds(10.0, math.inf) == 20.0
     assert stepdown_pause_seconds(10.0, math.nan) == 20.0
+    # BACKLOG #2539: a delay above the config bound counts as the bound. The validator refuses one,
+    # but this value is read back from a nodes row, which something else may have written.
+    assert stepdown_pause_seconds(10.0, 3600.0) == 3620.0
+    assert stepdown_pause_seconds(10.0, 1e9) == 3620.0
+
+
+def test_the_pause_requires_the_sibling_delay_too() -> None:
+    # The same reason as the coordinators' signature: a forgotten delay must fail, not fall back to
+    # the bare two-heartbeat pause.
+    param = inspect.signature(stepdown_pause_seconds).parameters["sibling_acquire_delay_seconds"]
+    assert param.default is inspect.Parameter.empty
 
 
 def _with_delay(member: ClusterMember, delay: float) -> ClusterMember:
@@ -378,7 +377,7 @@ class _RecordingCoordinator(_StandinCoordinator):
         self.sibling_delays: list[float] = []
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         self.sibling_delays.append(sibling_acquire_delay_seconds)
         return await super().step_down_leadership(
@@ -402,3 +401,22 @@ async def test_the_endpoint_passes_the_longest_promotable_sibling_delay(tmp_path
         r = await c.post("/cluster/stepdown", headers=_auth(boss))
         assert r.status_code == 200, r.text
     assert coord.sibling_delays == [45.0]
+
+
+@pytest.mark.parametrize(
+    "cls", [ClusterCoordinator, NullCoordinator, DbCoordinator, SqlServerCoordinator]
+)
+def test_the_sibling_delay_is_a_required_argument(cls: type[Any]) -> None:
+    # BACKLOG #2539. With a 0.0 default, a caller that forgot the argument got the bare
+    # two-heartbeat pause with nothing failing, and that is the BACKLOG #1507 reclaim the argument
+    # exists to stop. Pinned on the Protocol and every coordinator, so a default added back to any
+    # one of them fails here.
+    param = inspect.signature(cls.step_down_leadership).parameters["sibling_acquire_delay_seconds"]
+    assert param.default is inspect.Parameter.empty, cls.__name__
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY, cls.__name__
+
+
+async def test_a_call_without_the_sibling_delay_is_refused() -> None:
+    # The behaviour the signature check above stands for, on the one coordinator that needs no DB.
+    with pytest.raises(TypeError, match="sibling_acquire_delay_seconds"):
+        await NullCoordinator().step_down_leadership()  # type: ignore[call-arg]

@@ -445,7 +445,8 @@ def test_the_page_takeover_rule_matches_the_engine_stepdown_check() -> None:
 def test_the_quoted_stepdown_pause_matches_the_engine_default() -> None:
     """The force confirm page quotes the stepdown pause at the shipped default. Pinned to the engine's
     own arithmetic and default, so retuning either fails here instead of leaving the page wrong."""
-    seconds = stepdown_pause_seconds(ClusterSettings().heartbeat_seconds)
+    # 0.0: the quoted figure is the no-delayed-sibling case the page describes.
+    seconds = stepdown_pause_seconds(ClusterSettings().heartbeat_seconds, 0.0)
     html = " ".join(str(pages.stepdown_confirm(_status(), _healthy(), force=True)).split())
     assert f"({seconds:g} seconds at the shipped default)" in html
 
@@ -513,7 +514,7 @@ class _Coordinator(NullCoordinator):
         return ("node-a", 1_700_000_030.0) if self._clustered else (self.node_id, None)
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         self.step_down_calls += 1
         if self._raises is not None:

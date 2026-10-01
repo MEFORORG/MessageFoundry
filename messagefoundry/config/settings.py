@@ -4421,6 +4421,13 @@ def _derived_renew_timeout_seconds(margin_seconds: float) -> float:
     )
 
 
+#: The largest ``[cluster].acquire_delay_seconds`` the config accepts (BACKLOG #2539). Picked, not
+#: derived; ``ClusterSettings._nonneg_acquire_delay`` says why. The stepdown pause also clamps a
+#: sibling delay to it (``pipeline.cluster.stepdown_pause_seconds``), because that delay is read
+#: back from a ``nodes`` row, which something other than this validator may have written.
+MAX_ACQUIRE_DELAY_SECONDS = 3600.0
+
+
 class ClusterSettings(_Section):
     """``[cluster]`` — active-passive HA coordination (Track B Steps 3-7).
 
@@ -4519,7 +4526,7 @@ class ClusterSettings(_Section):
     # LONGER than the un-handicapped expiry, so it can never open a two-leader window (the split-brain
     # guarantee is preserved). It governs take-over of an EXPIRED lease (the routine-transition path); the
     # very first election on an empty lease table is a plain race — use ``promotable`` / operator ordering
-    # to control cold bring-up. Must be >= 0.
+    # to control cold bring-up. Must be between 0 and 3600 (BACKLOG #2539).
     acquire_delay_seconds: float = 0.0
     # NON-PROMOTABLE standby flag (ADR 0096). True (default) = a normal HA node. False = this node may
     # NEVER become leader: it never inserts a fresh lease, never takes over an expired one, and does not
@@ -4561,9 +4568,16 @@ class ClusterSettings(_Section):
     def _nonneg_acquire_delay(cls, value: float) -> float:
         # 0.0 (the default) = no handicap; a negative delay would let a node claim BEFORE the lease
         # expires (a two-leader window), so it is rejected at config load.
-        if value < 0:
+        #
+        # BACKLOG #2539: bounded above too. A planned stepdown pauses the drained node for the
+        # longest promotable sibling's delay, so a typo of a few extra digits on any one sibling
+        # left that node unable to reclaim for hours, and an infinite or NaN delay could never be
+        # met at all. 3600 s is picked, not derived: the docs only ever describe delays of seconds
+        # to minutes, and an hour leaves ample room above that.
+        if not 0 <= value <= MAX_ACQUIRE_DELAY_SECONDS:
             raise ValueError(
-                "acquire_delay_seconds must be >= 0 (0 disables the leader-preference handicap)"
+                "acquire_delay_seconds must be between 0 and "
+                f"{MAX_ACQUIRE_DELAY_SECONDS:g} (0 disables the leader-preference handicap)"
             )
         return value
 
@@ -5253,9 +5267,15 @@ class DrSettings(_Section):
     # silent retry-forever — ADR 0048 AC-14). Must be > 0.
     takeover_timeout_seconds: float = 30.0
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
-    # supplies the archive path in the POST /dr/activate request body instead (the runbook path). A
-    # cloud URL is rejected (the seed is local/UNC only, like the backup destination — no new egress).
+    # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
+    # which needs seed_dir below. A cloud URL is rejected (the seed is local/UNC only, like the
+    # backup destination — no new egress).
     seed_archive: str = ""
+    # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
+    # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
+    # which is operator configuration and is not confined. Must be absolute. A cloud URL is
+    # rejected, like seed_archive.
+    seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
     # JSON token the DBA/operator places on the DR box recording the EXPECTED source-backup anchor of a
     # native (postgres/sqlserver) restore: {"expected_backup_archive": "<the most-recent engine dr_backup
@@ -5284,15 +5304,27 @@ class DrSettings(_Section):
             raise ValueError("[dr].takeover_timeout_seconds must be > 0")
         return value
 
-    @field_validator("seed_archive")
+    @field_validator("seed_archive", "seed_dir")
     @classmethod
-    def _no_cloud_seed(cls, value: str) -> str:
+    def _no_cloud_seed(cls, value: str, info: ValidationInfo) -> str:
         low = value.strip().lower()
         if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
             raise ValueError(
-                f"[dr].seed_archive must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
+        return value
+
+    @field_validator("seed_dir")
+    @classmethod
+    def _seed_dir_absolute(cls, value: str) -> str:
+        # "" switches request-named archives off. A blank-but-present or relative value would
+        # instead resolve against the service's working directory and quietly open that. So blank
+        # reads as "" and relative fails at load. "Absolute" is judged for THIS platform, the one
+        # that will resolve it: a rooted path with no drive is relative on Windows.
+        value = value.strip()
+        if value and not os.path.isabs(value):
+            raise ValueError(f"[dr].seed_dir must be an absolute path, or omitted ({value!r})")
         return value
 
     @field_validator("restore_token")

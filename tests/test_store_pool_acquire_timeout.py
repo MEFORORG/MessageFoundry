@@ -352,8 +352,14 @@ _REPO = Path(__file__).resolve().parents[1]
 # DOCSTRING mentions of `self._pool.acquire()` / `self._pool.fetch(...)` inside `_timed_acquire` and
 # reported 40 where there are 38. That is the instrument answering "does this text appear?" instead of
 # "is a connection borrowed here?" — adjacent questions with different answers.
+#
+# An `acquire(timeout=...)` is NOT counted: it is the bounded borrow, and asyncpg 0.31.0 also gives
+# that timeout to the shielded release by default (`pool.py:932`). `timeout=None` IS counted: it is
+# the unbounded borrow spelled out. The coordinator's start-up DDL borrows the bounded way since
+# BACKLOG #2523, and counting it would report a bounded site as unbounded.
 _UNBOUNDED_BORROW = re.compile(
-    r"(?:await|async with) self\._pool\.(fetch|fetchrow|fetchval|execute|executemany|acquire)\("
+    r"(?:await|async with) self\._pool\."
+    r"(?:(?:fetch|fetchrow|fetchval|execute|executemany)\(|acquire\((?!timeout=(?!None\b)))"
 )
 
 
@@ -406,9 +412,12 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # Cluster 9 -> 10 on 2026-09-30: the stepdown pause reads the lease row's owner each tick until a
     # successor holds it (BACKLOG #1986). It is a `fetchrow` carrying the same per-statement timeout
     # as the claim beside it, and like that claim it borrows inside asyncpg.
-    assert (len(store_sites), len(cluster_sites)) == (36, 10), (
+    # Cluster 10 -> 0 on 2026-10-01: every coordinator statement borrows through
+    # cluster._call_within's `pool.acquire(timeout=...)`, and the start-up DDL through its own bounded
+    # acquire (BACKLOG #2523). The store's 36 is the positive control: the scan still finds borrows.
+    assert (len(store_sites), len(cluster_sites)) == (36, 0), (
         "the measured population of pool borrows OUTSIDE the bounded helper moved from 36 (store)"
-        " + 10 (cluster), measured 2026-09-30. Re-read the CONNECTIONS.md scope note before changing"
+        " + 0 (cluster), measured 2026-10-01. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 

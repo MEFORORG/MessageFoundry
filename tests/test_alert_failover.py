@@ -28,6 +28,7 @@ from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
+from tests._pool_lend import LendsItself
 
 
 class _RecordingSink:
@@ -208,16 +209,13 @@ class _FakeLeaseDB:
         self.row: dict[str, Any] | None = None
 
 
-class _FakeLeasePool:
+class _FakeLeasePool(LendsItself):
     def __init__(self, db: _FakeLeaseDB) -> None:
         self._db = db
 
-    async def fetchrow(
-        self, sql: str, *args: object, timeout: float | None = None
-    ) -> dict[str, object] | None:
-        # `timeout` is ADR 0157 Inc 0's per-statement renew clamp, which the coordinator now passes
-        # asyncpg on every claim. Accepted and ignored here; tests/test_adr0157_inc0_margin.py pins
-        # the value that reaches the statement.
+    async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
+        # The renew clamp bounds the borrow (BACKLOG #2523), which LendsItself accepts;
+        # tests/test_adr0157_inc0_margin.py pins the value that reaches it.
         _lease_key, owner, ttl, delay = args
         now = self._db._db_clock()
         row = self._db.row

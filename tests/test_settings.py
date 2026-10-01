@@ -16,6 +16,7 @@ from messagefoundry.config.settings import (
     _DEFAULT_FILE,
     ApiSettings,
     AuthSettings,
+    ClusterSettings,
     DeliverySettings,
     DrSettings,
     ServiceSettings,
@@ -1327,6 +1328,27 @@ def test_cluster_acquire_delay_must_be_non_negative(tmp_path: Path) -> None:
         load_settings(config_path=cfg, environ={})
 
 
+@pytest.mark.parametrize("value", ["3600.5", "86400", "inf", "nan"])
+def test_cluster_acquire_delay_has_an_upper_bound(tmp_path: Path, value: str) -> None:
+    # BACKLOG #2539: a stepdown pauses the drained node for the longest sibling delay, so a typo of
+    # a few extra digits, or a delay that can never be met, would hold that node out for hours or for
+    # good. TOML spells the non-finite values `inf` and `nan`.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        f"[cluster]\nenabled = true\nacquire_delay_seconds = {value}\n",
+    )
+    with pytest.raises(ValidationError, match="between 0 and 3600"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_acquire_delay_accepts_the_bound_itself() -> None:
+    # The control for the test above: the bound is inclusive, so an hour is still a legal delay.
+    assert (
+        ClusterSettings(enabled=True, acquire_delay_seconds=3600.0).acquire_delay_seconds == 3600.0
+    )
+
+
 # --- [cluster.vip] engine-managed virtual IP (ADR 0056) ---------------------
 
 _VIP_PG = '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
@@ -1690,6 +1712,8 @@ def test_invalid_priority_and_dr_settings_rejected(tmp_path: Path) -> None:
         "[dr]\ntakeover_hook = '   '\n",  # blank-but-present hook
         "[dr]\ntakeover_timeout_seconds = 0\n",  # non-positive timeout
         "[dr]\nseed_archive = 's3://bucket/seed.mfbak'\n",  # cloud seed source
+        "[dr]\nseed_dir = 's3://bucket/seeds'\n",  # vault BACKLOG #2581: cloud seed directory
+        "[dr]\nseed_dir = 'seeds'\n",  # a relative directory would hang off the working directory
         "[dr]\nrestore_token = 'https://x/token.json'\n",  # BACKLOG #223: cloud restore-token source
     ]
     for i, body in enumerate(bad_configs):
@@ -1708,6 +1732,23 @@ def test_dr_restore_token_local_path_parses(tmp_path: Path) -> None:
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.dr.restore_token == "D:/dr/restore.token"
+
+
+def test_dr_seed_dir_parses_and_defaults_off(tmp_path: Path) -> None:
+    # Vault BACKLOG #2581: "" (the default) means a request may name no archive at all. A local
+    # path parses; a cloud URL is the only rejected form (covered above).
+    assert DrSettings().seed_dir == ""
+    seeds = (tmp_path / "seeds").as_posix()  # absolute on the platform running the test
+    cfg = _write(tmp_path / "dr_seed_dir.toml", f"[dr]\nenabled = true\nseed_dir = '{seeds}'\n")
+    assert load_settings(config_path=cfg, environ={}).dr.seed_dir == seeds
+    # Blank-but-present reads as off. It must never reach the engine as a path, where it would
+    # resolve to the working directory.
+    assert DrSettings(seed_dir="   ").seed_dir == ""
+    # "Absolute" is this platform's. A rooted path with no drive is relative on Windows, and a
+    # drive-letter path is a relative name anywhere else.
+    other_platform = "/srv/dr/seeds" if os.name == "nt" else "D:/dr/seeds"
+    with pytest.raises(ValidationError):
+        DrSettings(seed_dir=other_platform)
 
 
 def test_auth_mfa_secure_defaults_and_totp_skew_validation() -> None:
