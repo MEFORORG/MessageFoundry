@@ -62,9 +62,8 @@ updates:
     # resync then propagated 0.8.0/0.16.0 into constraints.lock, so ci.yml's `--constraint` pinned CI
     # *to* the broken versions. `python-deps` groups every minor and patch on `*`, and both of those
     # bumps are minors, so they red the WHOLE batch and hold every benign bump in it hostage. WHY
-    # each is capped lives beside the cap in pyproject.toml (ruff in [dev]; uvicorn in
-    # [project.dependencies]) — do not
-    # restate it here; lift a cap and delete its entry in the SAME PR.
+    # each is capped lives beside the cap in pyproject.toml, at the requirement the entry names. Do
+    # not restate it here; lift a cap and delete its entry in the SAME PR.
     # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
     # routine one (`update-types` is the version-only knob and cannot express a range). A ruff
     # 0.15.x or uvicorn 0.49.x advisory fix still flows. Detection is untouched — security.yml's
@@ -120,11 +119,12 @@ updates:
     # entry in the same PR that lifts the cap.
     #
     # `pynetdicom`, `pydicom` and `webauthn` are the same WIDENED-CAP case (BACKLOG #2505). Each entry
-    # below carries a one-line pointer to the reason beside its cap in pyproject.toml; read it there.
-    # pydicom's `<3.1` is a MINOR cap, so without its entry `python-deps` would widen it in the routine
-    # minor-and-patch batch. `hvac<3` is the one cap with NO entry, on purpose, and pyproject.toml says
-    # why beside it. tests/test_dependabot_cap_ignores.py holds every upper bound in pyproject.toml to
-    # an entry here or to a stated exemption, and every entry here to a cap that still exists.
+    # below carries a one-line pointer to pyproject.toml; read the comment there. pydicom's `<3.1` is
+    # a MINOR cap, so without its entry `python-deps` would widen it in the routine minor-and-patch
+    # batch. Some caps have NO entry on purpose: at least `hvac<3`, `hatchling`'s build-system pin and
+    # the exact group pins under "NOT IGNORED, deliberately" above. tests/test_dependabot_cap_ignores.py
+    # names every such exemption with its reason, holds every other upper bound in pyproject.toml to
+    # an entry here, and every entry here to a cap that still exists.
     ignore:
       - dependency-name: "ruff"
         versions: [">=0.16.0"]
@@ -134,7 +134,7 @@ updates:
         versions: [">=7.4.0"]
       - dependency-name: "uvicorn"
         versions: [">=0.50.0"]
-      # Why: the comment above the [dicom] extra in pyproject.toml.
+      # The comment above the [dicom] extra in pyproject.toml names the 3.x pairing with pydicom.
       - dependency-name: "pynetdicom"
         versions: [">=4.0.0"]
       # Why: the comment above the [dicom] extra in pyproject.toml.
