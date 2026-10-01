@@ -411,11 +411,40 @@ suite("LiveDebugController per-run reveal (ASVS 14.2.6, vault BACKLOG #1187)", (
     }
   });
 
-  test("a revealed run that fails shows nothing", async () => {
+  test("a revealed run that fails can still be hidden, error text and all", async () => {
+    // The --show-phi CLI's error text is unredacted, so a failed reveal counts as shown.
     const runner: TraceRunner = () => Promise.reject(new Error("boom"));
     const controller = new LiveDebugController(runner);
     try {
       await controller.runWith("/synthetic/adt.hl7", "/ws", true);
+      assert.strictEqual(controller.isShowingValues(), true);
+      assert.strictEqual(controller["entries"], null, "a failed run stores no trace");
+      await controller.hideValues();
+      assert.strictEqual(controller.isShowingValues(), false);
+      assert.strictEqual(controller["error"], null, "the revealed run's error text must go");
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a revealed run ends when the next run STARTS, not when it lands", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      if (!showPhi) {
+        await gate; // a slow masked run: the revealed values must not stay painted meanwhile
+      }
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner);
+    try {
+      await controller.runWith("/a.hl7", "/ws", true);
+      assert.strictEqual(controller.isShowingValues(), true);
+      const masked = controller.runWith("/a.hl7", "/ws");
+      assert.strictEqual(controller.isShowingValues(), false);
+      assert.strictEqual(controller["entries"], null, "the revealed trace must go as the run starts");
+      release();
+      await masked;
       assert.strictEqual(controller.isShowingValues(), false);
     } finally {
       controller.dispose();
@@ -462,8 +491,16 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
   // These drive the real triggers rather than runWith, so a trigger that re-arms a reveal fails here.
   // The integration host opens no folder, so the controller gets a fixed workspace path, and a real
   // synthetic sample file so no quick pick opens.
+  const tempDirs: string[] = [];
+  suiteTeardown(() => {
+    for (const dir of tempDirs) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   function syntheticSample(): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mf-live-"));
+    tempDirs.push(dir);
     const file = path.join(dir, "adt.hl7");
     fs.writeFileSync(file, "MSH|^~\\&|SYN|SYN|||20260101000000||ADT^A01|1|P|2.5\r");
     return file;
