@@ -81,9 +81,18 @@ def _artifact(art_id: int, os_name: str, created: str, *, expired: bool = False)
     }
 
 
-def _run(run_id: int, created: str, status: str = "completed") -> dict[str, Any]:
+def _run(
+    run_id: int,
+    created: str,
+    status: str = "completed",
+    *,
+    event: str = "push",
+    head_branch: str = "main",
+) -> dict[str, Any]:
     return {
         "id": run_id,
+        "event": event,
+        "head_branch": head_branch,
         "status": status,
         "conclusion": "success" if status == "completed" else None,
         "created_at": created,
@@ -118,7 +127,10 @@ class FakeApi:
         query = parse_qs(split.query)
         parts = split.path.split("/")
         if parts[-1] == "runs" and "workflows" in parts:
-            return {"workflow_runs": self._page(self.runs, query)}
+            # The listing's own branch filter matches a run's head branch and nothing else.
+            wanted = query.get("branch")
+            runs = [r for r in self.runs if wanted is None or r["head_branch"] in wanted]
+            return {"workflow_runs": self._page(runs, query)}
         run_id = int(parts[-2])
         if parts[-1] == "jobs":
             assert query["filter"] == ["all"], "every attempt must be listed, not only the latest"
@@ -144,7 +156,7 @@ def _harvest(api: FakeApi, **kw: Any) -> ch.Harvest:
         api,
         repo=_REPO,
         workflow="ci.yml",
-        branch="main",
+        branch=kw.pop("branch", None),
         since=kw.pop("since", _SINCE),
         until=kw.pop("until", _UNTIL),
         **kw,
@@ -570,7 +582,62 @@ def test_the_window_is_passed_to_the_api_as_given() -> None:
     _harvest(api, since=datetime(2026, 9, 3, tzinfo=UTC), until=datetime(2026, 9, 4, tzinfo=UTC))
     query = parse_qs(urlsplit(api.paths[0]).query)
     assert query["created"] == ["2026-09-03T00:00:00Z..2026-09-04T00:00:00Z"]
-    assert query["branch"] == ["main"]
+    assert "branch" not in query
+
+
+def _event_fixture() -> FakeApi:
+    """The rich fixture, plus a pull_request run and a merge_group run that each carry a reading."""
+    api = _fixture()
+    api.runs += [
+        _run(400, "2026-09-12T10:00:00Z", event="pull_request", head_branch="feature-x"),
+        _run(
+            500, "2026-09-12T11:00:00Z", event="merge_group", head_branch="gh-readonly-queue/main/x"
+        ),
+    ]
+    for run_id, art_id, start in ((400, 41, "2026-09-12T10"), (500, 51, "2026-09-12T11")):
+        api.jobs[run_id] = [
+            _job(run_id, "windows-2022", "success", f"{start}:01:00Z", f"{start}:30:00Z")
+        ]
+        api.artifacts[run_id] = [_artifact(art_id, "windows-2022", f"{start}:29:00Z")]
+        api.blobs[art_id] = _zip(_payload({"fixed_aggregate": 22.0}))
+    return api
+
+
+def test_the_default_harvest_reads_pull_request_and_merge_group_runs() -> None:
+    # BACKLOG #1415: a `branch=main` listing keeps only pushes, since neither of these two events
+    # carries `main` as its head branch. The default sends no branch filter, so both are scanned.
+    result = _harvest(_event_fixture())
+    assert {400, 500} <= set(result.runs_scanned)
+    harvested = {j.run_id for j in result.jobs if j.status == ch.HARVESTED}
+    assert {400, 500} <= harvested
+    assert "branch any" in ch.render_markdown(result)
+
+
+def test_an_explicit_branch_still_filters_and_says_so() -> None:
+    # The control arm: the same fixture with the old filter loses both runs, so the test above
+    # discriminates and is not passing on a fixture that never carried them.
+    api = _event_fixture()
+    result = _harvest(api, branch="main")
+    assert parse_qs(urlsplit(api.paths[0]).query)["branch"] == ["main"]
+    assert not {400, 500} & set(result.runs_scanned)
+    assert result.runs_scanned == [200, 100]
+    assert "branch main" in ch.render_markdown(result)
+
+
+def test_main_sends_no_branch_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    apis: list[FakeApi] = []
+
+    def make() -> FakeApi:
+        apis.append(_event_fixture())
+        return apis[-1]
+
+    monkeypatch.setattr(ch, "GhApi", make)
+    window = ["--since", "2026-09-01T00:00:00Z", "--until", "2026-09-30T00:00:00Z", "--quiet"]
+    ch.main(window)
+    ch.main([*window, "--branch", "main"])
+    first, second = (parse_qs(urlsplit(a.paths[0]).query) for a in apis)
+    assert "branch" not in first
+    assert second["branch"] == ["main"]
 
 
 def test_max_runs_caps_completed_runs_and_never_selects_on_artifacts() -> None:

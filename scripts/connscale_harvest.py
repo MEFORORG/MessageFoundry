@@ -36,6 +36,12 @@ THE THREE RULES THAT MAKE IT A HARVEST RATHER THAN A SAMPLE.
    landed, so a payload that lost the field fails closed rather than joining the with-tail cells.
    Anything else is excluded and counted by reason.
 
+WHICH RUNS. Every run of the workflow in the window, of every event and branch, unless ``--branch``
+or ``--event`` narrows it. The runs listing's ``branch`` filter matches a run's head branch, so
+``main`` keeps only pushes: a pull_request run carries the PR's branch and a merge_group run a
+``gh-readonly-queue/main/...`` branch, and both run the same sweep. A run from a fork is listed and
+never scanned.
+
 THE JOIN. An artifact names its leg but not its attempt, and a re-run attempt is a separate engine
 run. Since BACKLOG #2013 the payload's ``context`` names its own run, run attempt and workflow job
 key. Where it does, the artifact joins the one same-leg job of that attempt, and a payload naming
@@ -87,7 +93,11 @@ from urllib.parse import urlencode
 
 DEFAULT_REPO = "MEFORORG/MessageFoundry"
 DEFAULT_WORKFLOW = "ci.yml"
-DEFAULT_BRANCH = "main"
+#: No branch filter by default. The runs listing matches ``branch=`` against a run's head branch,
+#: so ``branch=main`` keeps only push runs: a pull_request run carries the PR's branch and a
+#: merge_group run a ``gh-readonly-queue/main/...`` branch, and both run the same connscale sweep
+#: (BACKLOG #1415). A fork's run is still left out, by its head repository.
+DEFAULT_BRANCH: str | None = None
 ARTIFACT_PREFIX = "connscale-readings-"
 READINGS_FILE = "empty_claims.json"
 #: The ci.yml step that runs the suite, connscale sweep included. Skipped means no sweep ran.
@@ -359,7 +369,8 @@ class JobOutcome:
 class Harvest:
     repo: str
     workflow: str
-    branch: str
+    #: ``None`` means every branch, which is the default.
+    branch: str | None
     since: str
     until: str
     #: The selection, recorded so the output alone is enough to re-run it.
@@ -374,8 +385,8 @@ class Harvest:
     #: Completed runs that carried no ``test (...)`` job at all, so no leg could have produced a
     #: reading. Listed rather than dropped, so a reader can see the runs the job table cannot.
     runs_without_test_jobs: list[int] = field(default_factory=list)
-    #: Runs whose head repository is not ``repo``: a fork's pull request from its own ``main``
-    #: matches ``branch=main`` but is not this repository's code. Listed, never scanned.
+    #: Runs whose head repository is not ``repo``: a fork's pull request is not this repository's
+    #: code, and one from the fork's own ``main`` matches ``branch=main`` too. Listed, never scanned.
     runs_from_other_repos: list[int] = field(default_factory=list)
     #: Job rows a "re-run failed jobs" attempt listed again for a leg it did not re-run: same leg,
     #: same start and end, new id. Each is one engine run, so it is counted once, here.
@@ -658,7 +669,7 @@ def harvest(
     *,
     repo: str,
     workflow: str,
-    branch: str,
+    branch: str | None,
     since: datetime,
     until: datetime,
     max_runs: int | None = None,
@@ -666,7 +677,10 @@ def harvest(
     with_tail_until: datetime | None = None,
     progress: bool = False,
 ) -> Harvest:
-    """Scan the workflow's runs on ``branch`` created in ``[since, until]``, newest first.
+    """Scan the workflow's runs created in ``[since, until]``, newest first.
+
+    ``branch=None`` lists runs of every branch and so every event: a pull_request or merge_group
+    run never carries ``main`` as its head branch, so a ``main`` filter keeps only pushes.
 
     ``max_runs`` caps the COMPLETED runs scanned. It never selects on whether a run carries
     artifacts: a pool chosen by that outcome could not report the missingness it exists to count.
@@ -681,7 +695,9 @@ def harvest(
         max_runs=max_runs,
         with_tail_until=None if with_tail_until is None else _iso(with_tail_until),
     )
-    query = {"branch": branch, "created": f"{_iso(since)}..{_iso(until)}"}
+    query = {"created": f"{_iso(since)}..{_iso(until)}"}
+    if branch:
+        query["branch"] = branch
     if event:
         query["event"] = event
     path = f"repos/{repo}/actions/workflows/{workflow}/runs"
@@ -833,7 +849,7 @@ def render_markdown(result: Harvest) -> str:
     lines = [
         "# connscale base-reading harvest (BACKLOG #1415, build 1: no gate)",
         "",
-        f"repo {result.repo}, workflow {result.workflow}, branch {result.branch}, "
+        f"repo {result.repo}, workflow {result.workflow}, branch {result.branch or 'any'}, "
         f"event {result.event or 'any'}",
         f"window {result.since} .. {result.until} (run creation time); "
         f"with-tail ceiling {result.with_tail_until or 'none'}",
@@ -924,7 +940,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--until", type=parse_time, help="window end, ISO 8601; default now")
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--workflow", default=DEFAULT_WORKFLOW)
-    parser.add_argument("--branch", default=DEFAULT_BRANCH)
+    parser.add_argument(
+        "--branch",
+        default=DEFAULT_BRANCH,
+        help="only runs whose head branch is this; default every branch, so every event",
+    )
     parser.add_argument("--event", help="only runs of this trigger event, such as push")
     parser.add_argument(
         "--max-runs", type=_positive_int, help="cap on completed runs scanned, newest first"
