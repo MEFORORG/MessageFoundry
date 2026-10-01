@@ -53,9 +53,10 @@ flowchart TB
 
   MERGED(["The reviewed commit merges to main"]):::ext
 
+  PLACE["The site places the merged commit<br/>in that instance's config directory"]:::ext
+
   subgraph PROMOTE["Promote to one instance: the promote command in the VS Code extension"]
-    PLACE["Place the merged commit in that instance's config directory"]:::opstool
-    LOCAL["Stage<br/>validate the config locally"]:::opstool
+    LOCAL["Stage<br/>validate the workspace config"]:::opstool
     TARGET["Target<br/>pick the environment and its engine instance"]:::opstool
     PREFLIGHT["Pre-flight<br/>a dry-run reload resolves that environment's env() values"]:::opstool
     APPLY["Confirm and apply<br/>the engine swaps in the new graph in one step"]:::opstool
@@ -71,7 +72,7 @@ flowchart TB
 
   LOGIC --> VALIDATE
   CONNS --> VALIDATE
-  VALUES --> POSTURE
+  VALUES -->|"the active environment's file only"| POSTURE
   FIXTURES --> DRYRUN
   VALIDATE --> DRYRUN
   DRYRUN --> POSTURE
@@ -90,8 +91,9 @@ flowchart TB
   SECRETS -.-> PROD
 ```
 
-**Legend.** Each group's title says what its boxes are. The rounded box is an event. A dotted arrow
-is a value that never enters the repo. The check group shows at least the checks that matter to
+**Legend.** Each group's title says what its boxes are. The rounded box is an event. The site does
+the Place step by its own means. The promote command does not do it. A dotted arrow is a value
+that never enters the repo. The check group shows at least the checks that matter to
 promotion. `run_checks` in [`checks.py`](../messagefoundry/checks.py) holds the full set, and says
 which ones block.
 
@@ -100,19 +102,23 @@ What each stage would do for a site:
 1. **Author.** Routers and Handlers are Python. A Connection is Python too, or a `connections.toml`
    entry. Either form reads a per-environment value by key: `env("key")` in Python,
    `{ env = "key" }` in TOML. So one graph serves every environment.
-2. **Gate.** The pull request runs `messagefoundry check`. Sections 2 and 3 below describe the
-   workflow and the main checks.
+2. **Gate.** The pull request runs `messagefoundry check`. Section 2 below describes the
+   scaffolded workflow. `run_checks` in `checks.py` is the source of record for what runs and what
+   blocks.
 3. **Merge.** The site would protect `main`, so only a commit that passed the gate lands there.
 4. **Place the commit.** The promote command does not copy files to a remote engine. A remote
    instance reloads from its own `--config` directory, so the site first places the merged commit
    there. Skip this, and the engine reloads the config it already had. For an engine on the same
-   machine, the command sends the workspace's config path instead.
+   machine, the command sends the workspace's config path instead. The engine refuses a path
+   outside its allowed reload roots. So promote from a checkout of the merged commit.
 5. **Promote.** The VS Code extension's promote command then asks that engine to reload. Its
    command id is `messagefoundry.promote`. Type "Promote" in the Command Palette to find it. The
-   pre-flight is a dry run: the engine resolves its own environment's values and swaps nothing. A
-   value the target lacks fails here, before anything goes live. The gate resolves only the one
-   environment its own settings name, so the pre-flight is where each target's values are checked.
-6. **Apply.** The reload route needs the `config:deploy` permission and a recent step-up sign-in
+   Stage step validates the workspace copy, not the placed copy. The pre-flight is a dry run: the
+   engine resolves its own environment's values and swaps nothing. A value the target lacks fails
+   here, before anything goes live. The gate resolves only the one environment its own settings
+   name, so the pre-flight is where each target's values are checked.
+6. **Apply.** The pre-flight and the apply call the same reload route. Both need the
+   `config:deploy` permission and a recent step-up sign-in
    ([SECURITY.md](SECURITY.md#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
    The engine audits every reload and every dry run. Where the site turns on dual control for
    reloads, the engine holds the swap until a second user approves.

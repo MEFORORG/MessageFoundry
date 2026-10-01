@@ -23,7 +23,7 @@ flowchart TB
   classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
   classDef opstool fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
   classDef devtool fill:#e0f2f1,stroke:#00796b,color:#06302b;
-  classDef cfg fill:#f1f8e9,stroke:#9e9d24,color:#1f2400;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
 
   CONSOLE["messagefoundry-webconsole<br/>the operator web console, served at /ui<br/>its own version line"]:::opstool
   TOOLKIT["messagefoundry-toolkit<br/>authoring commands, moving out of the engine in stages<br/>the engine's version"]:::devtool
@@ -32,11 +32,11 @@ flowchart TB
   ENGINE["messagefoundry<br/>the engine, its API and the messagefoundry command<br/>the Windows tray, messagefoundry-tray<br/>the authoring commands not yet moved"]:::core
 
   subgraph EXTRAS["Optional extras of the messagefoundry distribution"]
-    XSTORE["Store backends<br/>sqlserver, postgres"]:::cfg
-    XFORMAT["Message formats<br/>fhir, dicom, x12, xml"]:::cfg
-    XCONN["Connectors, keys and sign-in<br/>sftp, vault, webauthn"]:::cfg
-    XMETRIC["Metrics export<br/>otel"]:::cfg
-    XTEST["Test and development<br/>harness, dev, fuzz"]:::cfg
+    XSTORE["Store backends<br/>sqlserver, postgres"]:::ext
+    XFORMAT["Message formats<br/>fhir, dicom, x12, xml"]:::ext
+    XCONN["Connectors, keys and sign-in<br/>sftp, vault, webauthn"]:::ext
+    XMETRIC["Metrics export<br/>otel"]:::ext
+    XTEST["Test and development<br/>harness, dev, fuzz"]:::ext
   end
 
   CONSOLE -->|"declares the engine, and needs a matching release"| ENGINE
