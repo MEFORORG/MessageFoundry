@@ -98,7 +98,7 @@ export type TraceRunner = (
 
 /**
  * Assemble the `dryrun --trace json` argv. `--show-phi` is appended IFF `showPhi` — the single point
- * where the reveal-values gate turns into a real-value request. Pure (no vscode) so it is unit-testable.
+ * where one run's reveal request turns into a real-value request. Pure (no vscode) so it is unit-testable.
  */
 export function buildTraceArgs(cfgDir: string, samplePath: string, showPhi: boolean): string[] {
   const args = ["dryrun", "--config", cfgDir, "--messages", samplePath, "--trace", "json"];
@@ -391,6 +391,11 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
   // #1187). It describes ONE stored run, not a session preference: each run sets it from its own
   // `showPhi`, so the next run (a save, a re-toggle) stores false and renders masked again.
   private shownRunRevealed = false;
+  // A reveal run has started and not yet landed or been superseded. Lets Hide cancel it, and the status
+  // item say so, before any value is shown.
+  private revealPending = false;
+  // The in-progress sample pick, shared so a double-click cannot open a second pick (BACKLOG #1187 QA).
+  private enabling: Promise<boolean> | undefined;
   private rows: LiveDryRunRow[] | null = null;
   private entries: LiveTraceEntry[] | null = null; // last traced run (drives the inline decorations)
   private error: string | null = null;
@@ -403,14 +408,21 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
   private valueDecoration: vscode.TextEditorDecorationType | undefined;
   private warnDecoration: vscode.TextEditorDecorationType | undefined;
 
-  constructor(private readonly runner: TraceRunner = cliTraceRunner) {}
+  /**
+   * `workspace` defaults to the open folder; a test passes a fixed path, since the integration host
+   * opens no folder and every trigger path stops at "no workspace" without one.
+   */
+  constructor(
+    private readonly runner: TraceRunner = cliTraceRunner,
+    private readonly workspace: () => string | undefined = workspaceDir,
+  ) {}
 
   setStatusBar(item: vscode.StatusBarItem): void {
     this.statusBar = item;
     this.updateStatus();
   }
 
-  /** Wire the SEPARATE reveal-values status item (its own command/toggle — never the Live toggle). */
+  /** Wire the SEPARATE per-run reveal status item (its own commands — never the Live toggle). */
   setRevealStatusBar(item: vscode.StatusBarItem): void {
     this.revealStatusBar = item;
     this.updateRevealStatus();
@@ -460,14 +472,24 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
 
   /**
    * Reflect the shown run in its OWN status item (distinct icon/label from "MEFOR Live"). Hidden, a click
-   * reveals ONE run; shown, a click hides it now. Either way the next run is masked.
+   * reveals ONE run; revealing or shown, a click hides. Either way the next run is masked. The item shows
+   * only while Live is on, so a click meant for "MEFOR Live: Off" beside it cannot start a reveal.
    */
   private updateRevealStatus(): void {
     const sb = this.revealStatusBar;
     if (!sb) {
       return;
     }
-    if (this.shownRunRevealed) {
+    if (this.enabled) {
+      sb.show();
+    } else {
+      sb.hide();
+    }
+    if (this.revealPending) {
+      sb.text = "$(sync~spin) Values: Revealing…";
+      sb.command = "messagefoundry.hideValues";
+      sb.tooltip = "A run with real values is in progress. Click to cancel it and keep values hidden.";
+    } else if (this.shownRunRevealed) {
       sb.text = "$(eye) Values: This Run";
       sb.command = "messagefoundry.hideValues";
       sb.tooltip =
@@ -484,19 +506,13 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
 
   /** Flip on/off. Turning on picks a synthetic sample (if none) and does a first run; off clears lenses. */
   async toggle(): Promise<void> {
+    if (this.enabling) {
+      return; // a sample pick is already open; let it finish
+    }
     if (this.enabled) {
       this.enabled = false;
-      // Orphan any run still in flight, so a reveal that lands after Live is off stores nothing.
-      this.runToken += 1;
-      this.running = false;
-      this.rows = null;
-      this.entries = null;
-      this.shownRunRevealed = false;
       this.error = null;
-      this.updateStatus();
-      this.updateRevealStatus();
-      this.changed.fire();
-      this.refreshActiveDecorations();
+      this.clearRun();
       return;
     }
     if (await this.enable()) {
@@ -504,15 +520,40 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     }
   }
 
-  /** Turn Live on, picking a synthetic sample if none is chosen. False (and Live left off) if none is. */
-  private async enable(): Promise<boolean> {
-    this.enabled = true;
-    const ok = await this.ensureSample();
-    if (!ok) {
-      this.enabled = false;
-    }
+  /**
+   * Drop the stored run and orphan any run in flight, so a reveal that lands afterwards stores nothing.
+   * `rows` go too: on a revealed run their per-message error text is unredacted.
+   */
+  private clearRun(): void {
+    this.runToken += 1;
+    this.running = false;
+    this.revealPending = false;
+    this.rows = null;
+    this.entries = null;
+    this.shownRunRevealed = false;
     this.updateStatus();
-    return ok;
+    this.updateRevealStatus();
+    this.changed.fire();
+    this.refreshActiveDecorations();
+  }
+
+  /** Turn Live on, picking a synthetic sample if none is chosen. False (and Live left off) if none is. */
+  private enable(): Promise<boolean> {
+    this.enabling ??= (async (): Promise<boolean> => {
+      try {
+        this.enabled = true;
+        const ok = await this.ensureSample();
+        if (!ok) {
+          this.enabled = false;
+        }
+        this.updateStatus();
+        this.updateRevealStatus();
+        return ok;
+      } finally {
+        this.enabling = undefined;
+      }
+    })();
+    return this.enabling;
   }
 
   /**
@@ -521,24 +562,28 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * a re-toggle) is masked again. Turns Live on first if it is off, since decorations render only then.
    */
   async revealOnce(): Promise<void> {
-    if (!this.enabled && !(await this.enable())) {
+    if ((this.enabling || !this.enabled) && !(await this.enable())) {
       return;
+    }
+    // A save just before the click would otherwise fire a masked run that silently drops this reveal.
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = undefined;
     }
     await this.run(true);
   }
 
   /**
-   * Hide the shown run's values now. Drops the in-memory trace (it holds real values) and, when Live is
-   * on, re-runs masked so the decorations come back as placeholders.
+   * Hide real values now, or cancel a reveal still running. Drops the stored run (it holds real values)
+   * and, when Live is on, re-runs masked so the decorations come back as placeholders. The re-run, not an
+   * in-memory mask, is what restores the CLI's own redaction of the per-message error text.
    */
   async hideValues(): Promise<void> {
-    if (!this.shownRunRevealed) {
+    if (!this.shownRunRevealed && !this.revealPending) {
+      void vscode.window.showInformationMessage("MEFOR Live: no values are shown, so there is nothing to hide.");
       return;
     }
-    this.entries = null; // never keep real values around once hidden
-    this.shownRunRevealed = false;
-    this.updateRevealStatus();
-    this.refreshActiveDecorations();
+    this.clearRun();
     if (this.enabled && this.samplePath) {
       await this.run(false);
     }
@@ -549,7 +594,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (!this.enabled || isExecGated() || doc.languageId !== "python") {
       return;
     }
-    if (!isConfigFile(doc.uri.fsPath, workspaceDir(), configDir())) {
+    if (!isConfigFile(doc.uri.fsPath, this.workspace(), configDir())) {
       return;
     }
     this.scheduleRun();
@@ -576,7 +621,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (this.samplePath && fs.existsSync(this.samplePath)) {
       return true;
     }
-    const ws = workspaceDir();
+    const ws = this.workspace();
     if (!ws) {
       void vscode.window.showInformationMessage("MEFOR Live: open a workspace folder first.");
       return false;
@@ -612,7 +657,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (!this.enabled) {
       return;
     }
-    const ws = workspaceDir();
+    const ws = this.workspace();
     if (!ws) {
       return;
     }
@@ -623,14 +668,8 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       }
     }
     if (isExecGated()) {
-      this.rows = null;
-      this.entries = null;
-      this.shownRunRevealed = false;
-      this.updateRevealStatus();
       this.error = "workspace not trusted — live-debug disabled until you trust this workspace";
-      this.updateStatus();
-      this.changed.fire();
-      this.refreshActiveDecorations();
+      this.clearRun();
       return;
     }
     // this.samplePath is set by ensureSample above.
@@ -647,23 +686,29 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
   async runWith(samplePath: string, cwd: string, showPhi = false): Promise<void> {
     const token = ++this.runToken;
     this.running = true;
+    this.revealPending = showPhi; // a newer masked run clears a pending reveal it supersedes
     this.updateStatus();
+    this.updateRevealStatus();
     let entries: LiveTraceEntry[] | null = null;
+    let rows: LiveDryRunRow[] | null = null;
     let err: string | null = null;
     try {
       entries = await this.runner(samplePath, cwd, showPhi);
+      rows = rowsFromTrace(entries); // inside the try: a skewed trace shape is this run's error
     } catch (e) {
+      entries = null;
       err = e instanceof Error ? e.message : String(e);
     }
     if (token !== this.runToken) {
       return; // superseded by a newer run — drop this stale result
     }
     this.running = false;
+    this.revealPending = false;
     this.samplePath = samplePath;
     this.sampleLabel = path.basename(samplePath);
     this.entries = entries;
     this.shownRunRevealed = showPhi && entries !== null;
-    this.rows = entries ? rowsFromTrace(entries) : null;
+    this.rows = rows;
     this.error = err;
     this.updateStatus();
     this.updateRevealStatus();
@@ -673,9 +718,14 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
 
   // --- inline decorations ----------------------------------------------------------------------
 
-  /** Re-apply inline decorations to the active editor (called after a run, a toggle, or an editor swap). */
+  /**
+   * Re-apply inline decorations to every visible editor (called after a run, a toggle, or an editor
+   * swap). Every one, not only the active one, so a hide or a masked run reaches a split editor too.
+   */
   refreshActiveDecorations(): void {
-    this.applyDecorations(vscode.window.activeTextEditor);
+    for (const editor of vscode.window.visibleTextEditors) {
+      this.applyDecorations(editor);
+    }
   }
 
   /**
@@ -695,7 +745,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       clear();
       return;
     }
-    if (!isConfigFile(editor.document.uri.fsPath, workspaceDir(), configDir())) {
+    if (!isConfigFile(editor.document.uri.fsPath, this.workspace(), configDir())) {
       clear();
       return;
     }
@@ -741,7 +791,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (!this.enabled) {
       return [];
     }
-    if (!isConfigFile(document.uri.fsPath, workspaceDir(), configDir())) {
+    if (!isConfigFile(document.uri.fsPath, this.workspace(), configDir())) {
       return [];
     }
     return this.lensesForText(document.getText()).map(
@@ -778,10 +828,10 @@ export function registerLiveDebug(context: vscode.ExtensionContext): LiveDebugCo
   statusBar.show();
 
   // The per-run reveal is its OWN status item, independent of "MEFOR Live". Its command flips between
-  // revealValuesOnce and hideValues with the shown run (set in updateRevealStatus).
+  // revealValuesOnce and hideValues with the shown run, and it shows only while Live is on (both set in
+  // updateRevealStatus).
   const revealBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49);
   controller.setRevealStatusBar(revealBar);
-  revealBar.show();
 
   // Inline `after`-text decorations: dimmed for values, amber for the live-lookup warning. contentText
   // is set per-decoration (it varies per line); color/style live on the shared type.

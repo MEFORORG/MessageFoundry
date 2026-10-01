@@ -2,6 +2,7 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 
 import {
@@ -449,6 +450,108 @@ suite("LiveDebugController per-run reveal (ASVS 14.2.6, vault BACKLOG #1187)", (
       assert.strictEqual(controller.isShowingValues(), true);
       await controller.hideValues(); // Live is off here, so this only hides; no run follows
       assert.strictEqual(controller.isShowingValues(), false);
+      assert.strictEqual(controller["entries"], null, "the revealed trace must not stay in memory");
+      assert.strictEqual(controller["rows"], null, "a revealed run's error text must not stay either");
+    } finally {
+      controller.dispose();
+    }
+  });
+});
+
+suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)", () => {
+  // These drive the real triggers rather than runWith, so a trigger that re-arms a reveal fails here.
+  // The integration host opens no folder, so the controller gets a fixed workspace path, and a real
+  // synthetic sample file so no quick pick opens.
+  function syntheticSample(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mf-live-"));
+    const file = path.join(dir, "adt.hl7");
+    fs.writeFileSync(file, "MSH|^~\\&|SYN|SYN|||20260101000000||ADT^A01|1|P|2.5\r");
+    return file;
+  }
+
+  async function waitFor(cond: () => boolean, ms: number): Promise<void> {
+    const end = Date.now() + ms;
+    while (!cond() && Date.now() < end) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  test("revealOnce reveals one run; Live off then on, and a save, are masked", async () => {
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws");
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // choose the sample, masked
+      await controller.revealOnce(); // Live is off: this turns it on and reveals that one run
+      assert.strictEqual(controller.isEnabled(), true);
+      assert.deepStrictEqual(calls, [false, true]);
+      assert.strictEqual(controller.isShowingValues(), true);
+
+      controller["scheduleRun"](); // exactly what a save of a config module does
+      await waitFor(() => calls.length === 3, 5000);
+      assert.deepStrictEqual(calls, [false, true, false], "a save after a reveal must be masked");
+      assert.strictEqual(controller.isShowingValues(), false);
+
+      await controller.revealOnce();
+      await controller.toggle(); // Live off clears the shown run
+      assert.strictEqual(controller.isShowingValues(), false);
+      assert.strictEqual(controller["entries"], null);
+      await controller.toggle(); // Live on again runs masked
+      assert.deepStrictEqual(calls, [false, true, false, true, false]);
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("hideValues cancels a reveal still running", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      if (showPhi) {
+        await gate;
+      }
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws");
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.toggle(); // Live on, masked
+      const reveal = controller.revealOnce(); // starts a --show-phi run that has not landed
+      await controller.hideValues();
+      release();
+      await reveal;
+      assert.deepStrictEqual(calls, [false, false, true, false]);
+      assert.strictEqual(controller.isShowingValues(), false, "a cancelled reveal must not land");
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("turning Live off orphans a reveal still running", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      if (showPhi) {
+        await gate;
+      }
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws");
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.toggle(); // Live on, masked
+      const reveal = controller.revealOnce();
+      await controller.toggle(); // Live off; no masked re-run follows to supersede the reveal
+      release();
+      await reveal;
+      assert.strictEqual(controller.isShowingValues(), false, "a reveal landing after Live off must store nothing");
+      assert.strictEqual(controller["entries"], null);
     } finally {
       controller.dispose();
     }
