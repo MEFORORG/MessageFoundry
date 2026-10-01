@@ -76,6 +76,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
         # doc-drift guard, but the doc half is not the reason it stays.
         "test_adaptive_attributes_doc_drift.py",
+        # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of
+        # docs/architecture-diagram.md (`pipeline/`, `store/`, ...) to a folder that exists. What
+        # breaks that arm is an engine package being renamed or removed, which arrives as an ENGINE
+        # diff and does not trip the tooling job's path gate (scripts/**, .github/**, the ledger).
+        # Its other arms read docs/*.md, which makes it a doc-drift guard, but those are not the
+        # reason it stays.
+        "test_architecture_diagrams.py",
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
         # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
