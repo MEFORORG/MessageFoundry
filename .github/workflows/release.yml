@@ -878,14 +878,18 @@ jobs:
       # builder workflow identity, transparency-logged via the OIDC identity above. This is the
       # GitHub-native artifact attestation for the GitHub release assets, COMPLEMENTING the PyPI-side
       # PEP 740 attestations emitted by the publish step below (dist-pub/ is a byte-identical copy, so
-      # the digests match either source). Verify a downloaded artifact with:
-      #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry
+      # the digests match either source). Verify a downloaded artifact with (BACKLOG #2534):
+      #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry \
+      #     --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml \
+      #     --source-ref refs/tags/v<version>
+      # Keep the last two flags, and write <version> in the tag's spelling (v0.5.0-rc1, not 0.5.0rc1).
       #
       # THE GUARD HAS TWO PARTS, AND EACH ANSWERS A DIFFERENT QUESTION.
       #
       # 1. The event-and-ref pair, the same one every publish step below carries (BACKLOG #1805). The
-      #    verify command above does NOT check the ref or the workflow: it accepts an attestation
-      #    signed by any workflow in this repository, from any ref. So an attestation a dispatch wrote
+      #    verify command with `--repo` alone does NOT check the ref or the workflow: it accepts an
+      #    attestation signed by any workflow in this repository, from any ref, and a verifier may
+      #    drop the two flags above. So an attestation a dispatch wrote
       #    for an unreviewed branch would verify exactly like a release's. This step used to run on
       #    the dispatch dry-run too, to validate the attestation path before a tag. The pair gives
       #    that up on purpose; a tag push is now the only run that reaches this step. At least one

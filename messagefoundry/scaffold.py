@@ -170,7 +170,25 @@ jobs:
       - name: Verify SLSA build provenance before install
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify dist-verify/messagefoundry-*.whl --repo MEFORORG/MessageFoundry
+        run: |
+          # --signer-workflow and --source-ref accept only the engine's release workflow, run on the
+          # tag for this exact version. With --repo alone, an attestation from any workflow or ref in
+          # that repository would pass. The tag follows the pin in requirements.txt, so a bump needs
+          # no edit here.
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist-verify/messagefoundry-*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected one engine wheel in dist-verify/, found ${#wheels[@]}"; exit 1
+          fi
+          # The wheel spells a pre-release as PEP 440 does (0.5.0rc1); its tag is v0.5.0-rc1.
+          version=$(basename "${wheels[0]}" | cut -d- -f2)
+          if [[ "$version" =~ ^([0-9]+[.][0-9]+[.][0-9]+)((a|b|rc)[0-9]+)$ ]]; then
+            tag="v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+          else
+            tag="v$version"
+          fi
+          gh attestation verify "${wheels[0]}" --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref "refs/tags/$tag"
 
   check:
     needs: verify-engine

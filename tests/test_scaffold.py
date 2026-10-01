@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
+from _bash_resolver import explain_returncode, probe_env, require_bash
 
 from messagefoundry import __version__
 from messagefoundry.__main__ import main
@@ -80,10 +84,11 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # WP-BL3-07: a fail-closed engine-provenance verify gate runs before the check job, skippable via a
     # repo variable for indexes that strip attestations; the check job gates on it (never on verify failure)
     assert "verify-engine:" in ci
-    assert (
-        "gh attestation verify dist-verify/messagefoundry-*.whl --repo MEFORORG/MessageFoundry"
-        in ci
-    )
+    # BACKLOG #2534: --repo alone accepts any workflow on any ref, so the gate pins both. The step's
+    # behaviour is executed by test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag.
+    assert "gh attestation verify" in ci and "--repo MEFORORG/MessageFoundry" in ci
+    assert "--signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml" in ci
+    assert '--source-ref "refs/tags/$tag"' in ci
     # The scaffolded gate must name the repo that BUILDS the release — attestations are minted by the
     # public repo's release workflow, so a private-vault slug here verifies against something no
     # adopter can read. Pin the negative too: the retired slug must never creep back in.
@@ -107,6 +112,82 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     assert "--index-url" in readme and "PIP_CONSTRAINT" in readme
     assert "--require-hashes" in readme
     assert "--generate-hashes" in readme or "uv export" in readme
+
+
+_VERIFY_STEP = "Verify SLSA build provenance before install"
+_RELEASE_WORKFLOW = "MEFORORG/MessageFoundry/.github/workflows/release.yml"
+
+
+@pytest.mark.parametrize(
+    ("wheels", "source_ref"),
+    [
+        (["messagefoundry-0.4.0-py3-none-any.whl"], "refs/tags/v0.4.0"),
+        # The wheel says 0.5.0rc1; the release tag says v0.5.0-rc1, and only the tag is a real ref.
+        (["messagefoundry-0.5.0rc1-py3-none-any.whl"], "refs/tags/v0.5.0-rc1"),
+        ([], None),
+        (["messagefoundry-0.4.0-py3-none-any.whl", "messagefoundry-0.4.1-py3-none-any.whl"], None),
+    ],
+    ids=["final", "pre-release", "no-wheel", "two-wheels"],
+)
+def test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag(
+    tmp_path: Path, wheels: list[str], source_ref: str | None
+) -> None:
+    """BACKLOG #2534: run the generated step under bash with a recording ``gh`` on PATH.
+
+    The two pass rows are each other's control: one tag rule that ignored the version, or got the
+    pre-release spelling wrong, fails one of them. The refusal rows require that ``gh`` never ran,
+    so a step that verified some file other than the one engine wheel cannot pass.
+    """
+    repo = tmp_path / "repo"
+    scaffold(repo)
+    ci = yaml.safe_load((repo / ".github" / "workflows" / "check.yml").read_text(encoding="utf-8"))
+    [step] = [s for s in ci["jobs"]["verify-engine"]["steps"] if s.get("name") == _VERIFY_STEP]
+    script = tmp_path / "verify.sh"
+    # Bytes, so Windows does not turn each newline into CRLF, which bash would read as part of a line.
+    script.write_bytes(str(step["run"]).encode("utf-8"))
+
+    work = tmp_path / "work"
+    (work / "dist-verify").mkdir(parents=True)
+    for wheel in wheels:
+        (work / "dist-verify" / wheel).write_bytes(b"not a real wheel")
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    stub.write_bytes(b'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$GH_LOG"\n')
+    stub.chmod(0o755)
+    log = tmp_path / "gh.log"
+
+    bash = require_bash(tmp_path)
+    env = probe_env(Path(bash), dict(os.environ))
+    env["PATH"] = f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    env["GH_LOG"] = log.as_posix()
+    proc = subprocess.run(
+        [bash, "-e", script.as_posix()],
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    output = proc.stdout + proc.stderr
+
+    if source_ref is None:
+        assert proc.returncode == 1, f"{explain_returncode(proc.returncode)}\n{output}"
+        assert "expected one engine wheel" in output, output
+        assert not log.exists(), f"gh ran although the step should have refused: {log.read_text()}"
+        return
+    assert proc.returncode == 0, f"{explain_returncode(proc.returncode)}\n{output}"
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "attestation",
+        "verify",
+        f"dist-verify/{wheels[0]}",
+        "--repo",
+        "MEFORORG/MessageFoundry",
+        "--signer-workflow",
+        _RELEASE_WORKFLOW,
+        "--source-ref",
+        source_ref,
+    ]
 
 
 def test_scaffold_refuses_nonempty_without_force(tmp_path: Path) -> None:

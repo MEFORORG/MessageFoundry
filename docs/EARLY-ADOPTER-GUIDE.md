@@ -179,7 +179,9 @@ gh release download "v$V" --repo MEFORORG/MessageFoundry `
 if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit $LASTEXITCODE)" }
 
 # Verify SLSA build provenance:  artifact -> source commit -> builder workflow
-gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry
+gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry `
+  --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml `
+  --source-ref "refs/tags/v$V"
 if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # (defense in depth) Verify the Sigstore signature pins the release workflow identity
@@ -206,8 +208,10 @@ attestation verify` that one file, then `pip install` that same resolved file pa
 silently pick a different file than the one you verified. See
 [INSTALL-GUIDE.md §3](INSTALL-GUIDE.md#verify-the-release-before-you-install-supply-chain-integrity)
 for the exact script, exit-code checks included. A registry/mirror substitution or a relabelled file
-**fails** the check. (The `--cert-identity` ref must match the tag you install — e.g.
-`refs/tags/v0.1.0-rc1` for a pre-release.)
+**fails** the check. Keep `--signer-workflow` and `--source-ref`: with `--repo` alone, the check
+accepts an attestation from any workflow in the repository, on any ref. The `--source-ref` and
+`--cert-identity` refs must match the tag you install. A pre-release tag is `v0.5.0-rc1`, while its
+wheel says `0.5.0rc1`, so write `refs/tags/v0.5.0-rc1` there for a pre-release.
 
 For a **reproducible pinned** deploy, generate a hash-locked requirements file scoped to the extras you
 actually run and install it with `--require-hashes`. The scaffolded config repo (`messagefoundry init`,

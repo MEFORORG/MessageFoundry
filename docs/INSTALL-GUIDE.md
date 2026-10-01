@@ -93,7 +93,9 @@ gh release download "v$V" --repo MEFORORG/MessageFoundry `
 if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit $LASTEXITCODE)" }
 
 # Verify SLSA build provenance:  artifact -> source commit -> builder workflow
-gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry
+gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry `
+  --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml `
+  --source-ref "refs/tags/v$V"
 if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # (defense in depth) Verify the Sigstore signature pins the release workflow identity
@@ -112,6 +114,13 @@ if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 > this section checks `$LASTEXITCODE` after each verification step and `throw`s before `pip install`
 > ever runs, so a failed check actually stops the install. Do not drop those checks when you copy this
 > into your own script.
+
+> **Keep `--signer-workflow` and `--source-ref`.** With `--repo` alone, `gh attestation verify`
+> accepts an attestation from any workflow in the repository, on any ref
+> ([SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) says more). Both blocks fit a final release, where the tag and
+> the wheel spell the version the same way. A pre-release tag is `v0.5.0-rc1`, while its wheel says
+> `0.5.0rc1`. For a pre-release, write the tag's spelling in `gh release download`, `--source-ref`
+> and `--cert-identity`, and the wheel's spelling in the file names.
 
 The same attestation also covers the **public PyPI** copy of the wheel (it is byte-identical to the
 GitHub-built artifact, so the digest matches), so you can download-verify-then-install from the index.
@@ -135,7 +144,9 @@ if ($wheels.Count -gt 1) {
 }
 $wheel = $wheels[0].FullName
 
-gh attestation verify $wheel --repo MEFORORG/MessageFoundry
+gh attestation verify $wheel --repo MEFORORG/MessageFoundry `
+  --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml `
+  --source-ref "refs/tags/v$V"
 if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # Install the EXACT file you just verified, not a re-resolution of the package name via --find-links
