@@ -2633,6 +2633,163 @@ def test_handle_case_is_ignored_for_every_unbind(export: str, dest: str) -> None
     assert f'raise NotImplementedError("Corepoint import: MsgSend to {dest}:' in body
 
 
+_SEND_INPUT = _role_send("input-handle", "%ADT", "OB_IN")
+_REPLACE_ADT = _root_copy("other-handle", "%NEW", "other-handle", "%ADT")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(
+            _role_line(
+                "MsgCreate "
+                + _span("keyword", "Returns")
+                + " "
+                + _span("other-handle", "%ADT")
+                + _ADT_A04
+            ),
+            id="exit-verb-misread-from-a-later-span",
+        ),
+        pytest.param(
+            _role_line(
+                "MsgLoad " + _span("keyword", "LoopExit") + " " + _span("other-handle", "%ADT")
+            ),
+            id="break-verb-misread-from-a-later-span",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgCreate")
+                + " "
+                + _span("literal", "ADT")
+                + " as "
+                + _span("literal", '"ADT^A04"')
+                + " version "
+                + _span("literal", '"2.5.1"')
+            ),
+            id="handle-in-a-bare-literal-span",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgTreeCopy")
+                + " "
+                + _span("other-handle", "%NEW")
+                + _span("path", "/")
+                + " to "
+                + _span("variable", "ADT")
+            ),
+            id="handle-in-a-variable-span",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgTreeCopy")
+                + " "
+                + _span("other-handle", "%NEW")
+                + _span("path", "/")
+                + " to "
+                + _span("other-handle", "%OUT")
+                + _span("path", "/")
+                + " "
+                + _span("action-list-call-pass", "%ADT")
+            ),
+            id="handle-in-a-pass-span",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgTreeCopy")
+                + " "
+                + _span("other-handle", "%NEW")
+                + _span("path", "/*")
+                + " to "
+                + _span("input-handle", "%ADT")
+                + _span("path", "/*")
+            ),
+            id="whole-tree-path-not-spelled-slash",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgLog")
+                + " "
+                + _span("other-handle", "%NEW")
+                + " "
+                + _span("other-handle", "%ADT")
+            ),
+            id="msglog-with-two-handles",
+        ),
+        pytest.param(
+            _REPLACE_ADT.replace("<Line ", '<Line Disabled="N" ', 1), id="disabled-spelled-N"
+        ),
+        pytest.param("<Line>MsgTreeCopy %NEW/ to %ADT/</Line>", id="statement-in-element-text"),
+        pytest.param('<MsgCreate Handle="%ADT" Type="ADT^A04"/>', id="unmodelled-element-no-data"),
+    ],
+)
+def test_round_three_shapes_unbind_the_input(statement: str) -> None:
+    """Code review of the unread-statement rule: each of these could replace the input in a way no
+    rule saw, and the send of the input after it rendered ``Send("OB_IN", msg)``. Now it raises."""
+    body = _handler_body(_handler_source(_WRITE_INPUT + statement + _SEND_INPUT))
+    assert 'Send("OB_IN"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+
+
+def test_a_call_carrying_a_control_verb_keeps_its_construct() -> None:
+    """A ``<Call>`` whose verb is ``If`` still renders under the dead placeholder, so nothing in it
+    runs unconditionally, and markers around it leave every handle unknown."""
+    call = (
+        '<Call Data="If %ADT/PID-3 = &quot;x&quot;"><Actions>'
+        + _create("%OUT", _ADT_A04)
+        + _SEND_OUT
+        + "</Actions></Call>"
+    )
+    body = _handler_body(_handler_source(_WRITE_INPUT + call + _SEND_INPUT))
+    assert "    if False:" in body
+    assert '\n    sends.append(Send("OB_OUT"' not in body  # never at the handler's own level
+    assert 'Send("OB_IN"' not in body
+
+
+def test_a_call_carrying_msgsend_raises_rather_than_filter() -> None:
+    """A ``<Call>`` whose verb is ``MsgSend`` keeps its send and its declared destination, and the
+    marker before it makes that send raise: never a silent filter."""
+    src = _handler_source(
+        _WRITE_INPUT + '<Call Data="MsgSend %ADT to connection &quot;OB_IN&quot;"><Actions/></Call>'
+    )
+    body = _handler_body(src)
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+    assert "return None" not in body
+    assert 'outbound("OB_IN"' in src
+
+
+def test_an_input_handle_spelled_with_a_trailing_slash_is_still_overwritten() -> None:
+    """The key drops a trailing ``/``, so a handle span written ``%ADT/`` and a write to ``%ADT``
+    are one handle."""
+    write = _write("input-handle", "%ADT/", "X")
+    send = _role_send("input-handle", "%ADT/", "OB_IN")
+    control = _handler_body(_handler_source(write + send))
+    assert '    sends.append(Send("OB_IN", msg))' in control
+    body = _handler_body(_handler_source(write + _REPLACE_ADT + send))
+    assert 'Send("OB_IN"' not in body
+
+
+@pytest.mark.parametrize(
+    ("input_handle", "written"),
+    [
+        pytest.param("%ADI", "%adı", id="dotless-i"),
+        pytest.param("%CAFÉ", "%café", id="decomposed-accent"),
+    ],
+)
+def test_handle_case_folding_covers_unicode(input_handle: str, written: str) -> None:
+    """The key upper-cases before it folds and normalises compatibility forms, so neither a dotless
+    ``i`` nor a decomposed accent keeps a write from reaching the input."""
+    write = _write("input-handle", input_handle, "X")
+    send = _role_send("input-handle", input_handle, "OB_IN")
+    body = _handler_body(_handler_source(write + _create(written, _ADT_A04) + send))
+    assert 'Send("OB_IN"' not in body
+
+
+def test_two_data_attributes_that_differ_only_in_case_are_refused() -> None:
+    """One reader would take ``data`` and another ``Data``, so the import refuses the export."""
+    with pytest.raises(CorepointImportError, match="more than one Data attribute"):
+        _handler_source('<Line data="MsgLog %P" Data="MsgTreeCopy %NEW/ to %ADT/"/>')
+
+
 def test_a_called_lists_input_is_not_the_callers_msg() -> None:
     """Inside the called list, its input handle is whatever was passed, not the caller's msg. A
     write there must not land on msg, and a handle the list binds is not the caller's to send."""

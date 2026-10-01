@@ -246,21 +246,31 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   is unstyled still declines, as it did before step 2.
 - The flow reads a statement only when its verb is one it models (`ItemCopy`, `ItemClear`,
   `ItemAppend`, `MsgTreeCopy`, `MsgCreate`, `MsgLog`; `MsgSend` is a send), that verb is the
-  statement's first word, and every other word is one that verb may carry. A markup-free statement
+  statement's first word, every other word is one that verb may carry, no span falls out of both
+  readings (`block`, `pass`, `custom`), and its operands take the verb's one read shape: a plain
+  clone, a `MsgCreate` whose first operand is the whole tree it builds, a `MsgLog` of one whole
+  tree, or a field write into a path of a named handle or a `$variable`. A markup-free statement
   must also spell every handle with a `%`, because a bare word may be a handle no operand reading
   sees (`MsgCreate ADT as ...`). **Any other statement leaves every handle unknown, the input
   included (Manager decision, #313 step 2).** That covers at least an unread verb (`MsgLoad`,
-  `EnvLogText`), an `ActionListCall` under another verb spelling, a `<Call>` whose `@Data` verb is
-  not `ActionListCall` (read as an unmodelled element, never spliced in as another construct), a
-  verb misread from a later span, and a span class the role layer does not list. An element this
-  module does not model leaves every handle unknown too when it carries a statement.
+  `EnvLogText`), an `ActionListCall` under another verb spelling, a verb misread from a later span,
+  a span class the role layer does not list, a handle in a literal or variable span, and a
+  whole-tree path not spelled `/` (`%ADT/*`).
+- Markers that leave every handle unknown bracket, before and after, at least: a `<Call>` whose
+  `@Data` verb is not `ActionListCall` (it keeps its own construct, so an `If` stays under its
+  placeholder and a `MsgSend` still raises, never filters), a control or send whose verb is not its
+  first word, a step whose `@Disabled` value is not `1`, `true` or `yes`, and a `<Line>` whose
+  statement is not in `@Data`. Every element this module does not model leaves every handle
+  unknown. An element carrying two attributes that fold to one name with different values is
+  refused outright.
 - A statement the flow does read may still overwrite every handle it names as a whole tree, in
   either reading of its markup, such as a `MsgCreate` whose handle is not its first operand. Each
   such handle is unknown afterwards. Only `MsgSend` and `MsgLog` are read-only. That read-only list
   is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would deliver
   the wrong message.
 - **Handle case.** Whether Corepoint handle names are case-sensitive is unverified, so the import
-  assumes the worst. Every unbind ignores case: a write to `%adt` makes `%ADT` unknown, and a clone
+  assumes the worst. Every unbind ignores case, compatibility forms, a trailing `/`, and letters
+  that fold only after upper-casing (a dotless `i`): a write to `%adt` makes `%ADT` unknown, and a clone
   or `MsgCreate` into a handle whose name case-folds to the input's is a whole write of the input.
   Every ambiguity test keeps case: two `input-handle` spellings that differ only in case leave the
   list with no input. How a local is named is unchanged.
@@ -301,8 +311,10 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   another verb spelling, and a `<Call>` carrying another verb as an open gap. The rule above closes
   all three.
 - A statement in a branch its construct cannot continue still counts its whole-tree writes, and an
-  unmodelled element carrying a statement leaves every handle unknown. Nothing either binds is
-  trusted after it.
+  unmodelled element leaves every handle unknown. Nothing either binds is trusted after it.
+- **Still open.** A `<Block>`, `<Foreach>`, `<If>`, `<Loop>`, `<Try>` or `<Case>` whose `@Data` is
+  itself a writing statement (`<Block Data="MsgTreeCopy ...">`) is read as a label or a condition,
+  so nothing is unbound. Telling a statement from a label's prose is open work.
 
 **Markup-free `MsgSend` (gap 2).** A send with no role markup is judged by the handle its first
 operand names (`%NAME` or `%NAME/`). If that handle holds a known message, the send delivers it.

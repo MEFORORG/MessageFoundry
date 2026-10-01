@@ -84,6 +84,7 @@ import html
 import json
 import keyword
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from math import isfinite
@@ -100,7 +101,7 @@ from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.message import Message
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Callable, Iterator
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
         Element,
     )
@@ -200,6 +201,9 @@ class _Deferred:
     # Whether the verb was styled as a keyword span. Only a field write reads this (see _Flow), and
     # the default is the fail-closed one: an unstyled verb declines.
     styled: bool = False
+    # Whether a span fell out of both readings (a ``block``, ``pass`` or ``custom`` span). A handle
+    # inside one is invisible to every rule, so the flow reads the statement as unread.
+    dropped: bool = False
 
 
 @dataclass(frozen=True)
@@ -961,12 +965,17 @@ def _local(tag: str) -> str:
 
 
 def _attr(elem: Element, name: str) -> str:
-    """Case-insensitively read attribute ``name``, or ``""``. Untrusted input: never assume casing."""
+    """Case-insensitively read attribute ``name``, or ``""``. Untrusted input: never assume casing.
+
+    Two attributes that fold to the same name with different values are refused: this module would
+    read one and a case-sensitive reader the other, and nothing says which Corepoint runs."""
     lowered = name.lower()
-    for key, value in elem.attrib.items():
-        if _local(key).lower() == lowered:
-            return value
-    return ""
+    found = {value for key, value in elem.attrib.items() if _local(key).lower() == lowered}
+    if len(found) > 1:
+        raise CorepointImportError(
+            f"an element carries more than one {name} attribute with different values — refusing"
+        )
+    return next(iter(found), "")
 
 
 def _disabled_scope(elem: Element, parents: dict[Element, Element]) -> tuple[str, str] | None:
@@ -1487,7 +1496,50 @@ def _container_steps(elem: Element, in_control: bool, depth: int = 0) -> list[St
     return _parse_list(elem, in_control, depth + 1)
 
 
+# The @Disabled values this import reads as disabled with confidence. Any other value that
+# :func:`_is_disabled` still reads as disabled may mean enabled to Corepoint.
+_DISABLED_SURE = frozenset({"1", "true", "yes"})
+# Attributes a ``<Line>`` with no ``@Data`` may carry and still hold no statement.
+_INERT_LINE_ATTRIBUTES = frozenset({"comment", "disabled"})
+
+
+def _unreadable(elem: Element, kind: str | None, verb: str, statement: str) -> str:
+    """Why the flow cannot trust what ``elem`` may write, or ``""``.
+
+    Each of these may write a handle the flow never sees, so the parse brackets the element's steps
+    with markers that leave every handle unknown, before and after (see :func:`_parse_statement`)."""
+    tag = _local(elem.tag).lower()
+    if _is_disabled(elem):
+        if _attr(elem, "Disabled").strip().lower() in _DISABLED_SURE:
+            return ""
+        return "its @Disabled value may mean enabled, so it may have run"
+    if tag == "call" and kind != "call":
+        return f"a <Call> carrying {_comment_text(verb, 40) or 'no verb'}, not ActionListCall"
+    if kind not in (None, "block", "call") and verb:
+        first = statement.split()[:1]
+        if [w.lower() for w in first] != [verb.lower()]:
+            return "its verb is not its first word"
+    if tag == "line" and not _attr(elem, "Data"):
+        extra = any(_local(k).lower() not in _INERT_LINE_ATTRIBUTES for k in elem.attrib)
+        if extra or (elem.text or "").strip():
+            return "its statement is not in @Data"
+    return ""
+
+
 def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
+    """Parse one statement element, bracketed by markers when the flow cannot trust it."""
+    steps = _parse_one(elem, in_control, depth)
+    data = _attr(elem, "Data")
+    statement = strip_markup(data)
+    verb = _statement_verb(parse_roles(data), _split_verb(statement)[0])
+    why = _unreadable(elem, _statement_kind(_local(elem.tag), verb), verb, statement)
+    if not why:
+        return steps
+    marker = Control("unknown", _local(elem.tag), why, deferred=_Deferred(verb, ()))
+    return [marker, *steps, marker]
+
+
+def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
     """Parse one statement element into zero or more steps (a list, so a leaf can carry a body).
 
     A statement whose rendering depends on what a message handle holds at that point comes back as a
@@ -1523,6 +1575,7 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
     handle_operands = role_operands or flat_operands
     named = frozenset(h for h in map(_whole_tree, (*role_operands, *flat_operands)) if h)
     words = _statement_words(roles, verb)
+    dropped = any(t.role in ("block", "pass", "custom") for t in roles)
 
     if _is_disabled(elem):
         # Preserved in full as commented-out pseudo-source — the subtree is parsed (so it is visible and
@@ -1530,20 +1583,14 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
         label = statement or note or tag
         return [Control("disabled", source, label, body=tuple(body))]
 
-    # A ``<Call>`` whose verb is not ``ActionListCall`` (``ActionListExit``) is read as unmodelled
-    # too: splicing its body in as some other construct would run a called list in the caller's
-    # scope, and the flow vouches for no handle after it.
-    if tag.lower() not in _STATEMENT_TAGS or (tag.lower() == "call" and kind != "call"):
+    if tag.lower() not in _STATEMENT_TAGS:
         # An element in a statement position whose tag this layer does not model. Reported and counted,
         # with its parsed subtree inlined beneath the marker — never dropped (count-and-log). The marker
         # says the element's SCOPE was lost, because an unmodelled construct may well have been
         # conditional: inlining its body is the honest, visible degradation, guessing the scope is not.
-        # The element still ran in Corepoint, so its own whole-tree writes are carried for the flow.
-        deferred = (
-            _Deferred(verb, handle_operands, qualified=qualified, named=named, words=words)
-            if statement
-            else None
-        )
+        # The element still ran in Corepoint and may have written any handle, so the flow vouches
+        # for none after it.
+        deferred = _Deferred(verb, handle_operands, qualified=qualified, named=named, words=words)
         return [Control("unknown", tag, statement or note, body=tuple(body), deferred=deferred)]
 
     # Never a ``<Call>``: dissolving one would run the called list's statements in the caller's
@@ -1578,6 +1625,7 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
                     named=named,
                     words=words,
                     styled=bool(_role_verb(roles)),
+                    dropped=dropped,
                 ),
             )
         elif statement:
@@ -1819,11 +1867,15 @@ class _Env(Mapping[str, str]):
     A construct's arms each start from the same state. Copying the whole map for every arm costs the
     number of bound handles per construct, which an untrusted export can make quadratic. Instead each
     arm runs in place, reports the handles it touched, and is undone, so the cost of an arm is the
-    number of handles it actually changes."""
+    number of handles it actually changes. An index by :func:`_handle_key` keeps an unbind by key
+    from scanning every bound handle."""
 
     def __init__(self, initial: dict[str, str]) -> None:
-        self._live = dict(initial)
+        self._live: dict[str, str] = {}
+        self._by_key: dict[str, set[str]] = {}
         self._journal: list[tuple[str, str | None]] = []
+        for handle, local in initial.items():
+            self._set(handle, local)
 
     def __getitem__(self, handle: str) -> str:
         return self._live[handle]
@@ -1834,13 +1886,32 @@ class _Env(Mapping[str, str]):
     def __len__(self) -> int:
         return len(self._live)
 
+    def _set(self, handle: str, local: str | None) -> None:
+        key = _handle_key(handle)
+        if local is None:
+            self._live.pop(handle, None)
+            spellings = self._by_key.get(key)
+            if spellings is not None:
+                spellings.discard(handle)
+                if not spellings:
+                    del self._by_key[key]
+        else:
+            self._live[handle] = local
+            self._by_key.setdefault(key, set()).add(handle)
+
     def bind(self, handle: str, local: str) -> None:
         self._journal.append((handle, self._live.get(handle)))
-        self._live[handle] = local
+        self._set(handle, local)
 
     def unbind(self, handle: str) -> None:
         if handle in self._live:
-            self._journal.append((handle, self._live.pop(handle)))
+            self._journal.append((handle, self._live[handle]))
+            self._set(handle, None)
+
+    def unbind_key(self, handle: str) -> None:
+        """Unbind every bound spelling of ``handle`` (see :func:`_handle_key`)."""
+        for bound in sorted(self._by_key.get(_handle_key(handle), ())):
+            self.unbind(bound)
 
     def mark(self) -> int:
         return len(self._journal)
@@ -1852,10 +1923,7 @@ class _Env(Mapping[str, str]):
     def undo(self, mark: int) -> None:
         while len(self._journal) > mark:
             handle, previous = self._journal.pop()
-            if previous is None:
-                self._live.pop(handle, None)
-            else:
-                self._live[handle] = previous
+            self._set(handle, previous)
 
     def narrow(self, outcomes: list[dict[str, str | None]]) -> None:
         """Unbind every handle some path left on a different local than it holds here.
@@ -1879,12 +1947,15 @@ _EVERY_LOCAL = "\x00every-local"
 
 
 def _handle_key(handle: str) -> str:
-    """A handle's name for matching a statement's own whole-tree writes: no ``%``, case-folded.
+    """A handle's name for matching whole-tree writes: no ``%`` or trailing ``/``, and folded.
 
     Whether Corepoint handle names are case-sensitive is unverified, so the import assumes the
-    worst: a write to ``%adt`` may be a write to ``%ADT``. Only unbinding reads this key; how a
-    local is NAMED does not."""
-    return handle.lstrip("%").casefold()
+    worst: a write to ``%adt`` may be a write to ``%ADT``. The fold is broad on purpose: Unicode
+    compatibility forms are normalised, and upper-casing first also joins letters such as a dotless
+    ``i`` that a case fold alone keeps apart. Only unbinding reads this key; how a local is NAMED
+    does not."""
+    name = unicodedata.normalize("NFKC", handle.strip().lstrip("%").rstrip("/"))
+    return unicodedata.normalize("NFKC", name.upper().casefold())
 
 
 def _hit(keys: frozenset[str], handle: str, local: str) -> bool:
@@ -1895,18 +1966,11 @@ def _hit(keys: frozenset[str], handle: str, local: str) -> bool:
     return _handle_key(handle) in keys
 
 
-def _unbind_key(env: _Env, handles: Iterable[str]) -> None:
-    """Unbind every bound handle whose key (see :func:`_handle_key`) matches one of ``handles``."""
-    keys = {_handle_key(h) for h in handles}
-    for bound in list(env):
-        if _handle_key(bound) in keys:
-            env.unbind(bound)
-
-
 def _forget(env: _Env, deferred: _Deferred) -> None:
     """Unbind every handle the statement may overwrite whole (see :func:`_whole_written`), in any
     spelling of its case."""
-    _unbind_key(env, _whole_written(deferred))
+    for handle in _whole_written(deferred):
+        env.unbind_key(handle)
 
 
 def _forget_all(env: _Env) -> None:
@@ -1928,13 +1992,12 @@ def _unread(step: Control) -> bool:
     """Whether the flow cannot read everything ``step`` (a ``"pending"`` statement) may write.
 
     It reads a statement only when its verb is one it models (:data:`_READ_VERB_WORDS`), that verb
-    is the statement's first word (so a verb is never misread from a later span), and every other
-    word is one that verb may carry. A markup-free statement must also spell every handle with a
-    ``%``: a bare word may be a handle (``MsgCreate ADT as ...``), which no operand reading sees.
-    Anything else may overwrite any handle, the input included, so nothing is vouched for after it.
-    That is judged by verb and shape, never by a handle's name."""
+    is the statement's first word (so a verb is never misread from a later span), every other word
+    is one that verb may carry, no span fell out of both readings, and its operands fit the verb's
+    grammar (see :func:`_fits`). Anything else may overwrite any handle, the input included, so
+    nothing is vouched for after it. That is judged by verb and shape, never by a handle's name."""
     deferred = step.deferred
-    if deferred is None:
+    if deferred is None or deferred.dropped:
         return True
     verb = deferred.verb.lower()
     allowed = _READ_VERB_WORDS.get(verb)
@@ -1942,13 +2005,34 @@ def _unread(step: Control) -> bool:
         return True
     if not {w.lower() for w in deferred.words} <= allowed:
         return True
-    if deferred.flat is None:
+    operands = deferred.operands
+    if deferred.flat is not None:
+        # Markup-free: a connective is a bare token here, and every other bare token may be a
+        # handle spelled without ``%`` (``MsgCreate ADT as ...``), which no reading sees.
+        operands = tuple(o for o in operands if not (o.kind == "literal" and o.text in allowed))
+        if any(o.kind == "literal" and _string_literal(o.text) is None for o in operands):
+            return True
+    return not _fits(verb, operands, deferred)
+
+
+def _fits(verb: str, operands: tuple[Operand, ...], deferred: _Deferred) -> bool:
+    """Whether ``operands`` take the one shape the flow reads for ``verb``: a plain clone, a
+    ``MsgCreate`` whose first operand is the whole tree it builds, a ``MsgLog`` of one whole tree,
+    or a field write whose destination is a path into a named handle or a ``$variable``, which is
+    not a message handle. Any other shape, a whole-tree
+    path the flow does not read as one (``%ADT/*``) included, may overwrite a tree it cannot see."""
+    if verb == "msgtreecopy":
+        return bool(_clone_target(deferred))
+    if verb == "msgcreate":
+        return bool(operands) and bool(_whole_tree(operands[0]))
+    if verb == "msglog":
+        return len(operands) == 1 and bool(_whole_tree(operands[0]))
+    arity = 1 if verb == "itemclear" else 2
+    if len(operands) != arity:
         return False
-    return any(
-        o.kind == "literal"
-        and not (len(o.text) >= 2 and o.text[0] == o.text[-1] == '"')
-        and o.text.lower() not in allowed
-        for o in deferred.operands
+    destination = operands[-1]
+    return destination.kind == "variable" or (
+        destination.kind == "path" and bool(destination.handle)
     )
 
 
@@ -2347,11 +2431,10 @@ class _Flow:
     def _tree_copy(self, step: Control, operands: tuple[Operand, ...], env: _Env) -> Step:
         source, dest = _whole_tree(operands[0]), _whole_tree(operands[1])
         verb = step.source_verb
-        _unbind_key(env, [dest])  # every spelling of its case, the input's included
+        env.unbind_key(dest)  # every spelling of its case, the input's included
         if _handle_key(dest) == _handle_key(self._input):
             # Rebinding msg would leave every later write and send of the input addressing a
             # different object than the one that arrived. Unknown from here on instead.
-            env.unbind(dest)
             return UnmappedAction(
                 verb,
                 "overwrites the input handle; msg stays the message that arrived, so the input is "
@@ -2364,7 +2447,6 @@ class _Flow:
             if env[source] in self._created:
                 self._created.add(local)  # a copy of a skeleton is still only a skeleton
             return Control("clone", verb, step.detail, args=(local, expression))
-        env.unbind(dest)
         what = (
             f"{_comment_text(source, 60)}, which holds no message this import can identify here"
             if source
