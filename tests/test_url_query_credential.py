@@ -80,6 +80,21 @@ def test_detector_leaves_benign_parameters_alone(url: str) -> None:
         ("https://p.example.invalid/x?turkey=a&MONKEY=b&hotkeys=c", []),
         # Control: pagination cursors, sort keys and public keys end in a credential word only.
         ("https://p.example.invalid/x?pageToken=a&next_page_token=b&sortKey=c&publicKey=d", []),
+        # Lander QA: one-word compounds, bare auth and jwt, digits, brackets and a "+" separator.
+        (
+            "https://p.example.invalid/x?accesstoken=a&authkey=b&auth=c&jwt=d&sessionid=e",
+            ["accesstoken", "auth", "authkey", "jwt", "sessionid"],
+        ),
+        (
+            "https://p.example.invalid/x?key1=a&api_key2=b&apiKey2=c&token[]=d&api+key=e",
+            ["'api key'", "'token[]'", "apiKey2", "api_key2", "key1"],
+        ),
+        # Control: ids and keys that are not secrets.
+        (
+            "https://p.example.invalid/x?idempotency_key=a&partition_key=b&routingKey=c"
+            "&primaryKey=d&NextPartitionKey=e&NextRowKey=f",
+            [],
+        ),
     ],
 )
 def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
@@ -118,11 +133,38 @@ def test_userinfo_mask_ignores_an_at_sign_in_the_query() -> None:
     the end of a userinfo and the view showed the wrong host."""
     from messagefoundry.config.wiring import redacted_settings
 
-    url = "https://h.example.invalid:8443/x?email=a@b.example.invalid&key=SYNTHETIC-9"
+    url = "https://h.example.invalid/x?email=a@b.example.invalid&key=SYNTHETIC-9"
     assert (
         redacted_settings({"url": url})["url"]
-        == "https://h.example.invalid:8443/x?email=a@b.example.invalid&key=***"
+        == "https://h.example.invalid/x?email=a@b.example.invalid&key=***"
     )
+
+
+@pytest.mark.parametrize("password", ["p?ss", "p#ss", "pa/ss"])
+def test_userinfo_mask_fails_toward_masking_a_password_holding_a_delimiter(password: str) -> None:
+    """Lander QA on 4e1c148c5e: ending the authority at the first ``/``, ``?`` or ``#`` let these
+    passwords through verbatim, and urllib's proxy parser accepts them."""
+    from messagefoundry.config.wiring import redacted_settings
+
+    shown = redacted_settings({"proxy_url": f"http://user:{password}@proxy.example.invalid:3128"})
+    assert shown["proxy_url"] == "http://user:***@proxy.example.invalid:3128"
+
+
+def test_userinfo_mask_leaves_a_url_with_no_userinfo_alone() -> None:
+    from messagefoundry.config.wiring import redacted_settings
+
+    url = "http://proxy.example.invalid:3128/path?x=1#f"
+    assert redacted_settings({"proxy_url": url})["proxy_url"] == url
+
+
+def test_mask_fails_toward_masking_when_urlsplit_strips_a_control_character() -> None:
+    """Lander QA: urlsplit strips tab, CR and LF, so its query is not a substring of the URL as
+    written. The detector still named the key; the mask must not show its value."""
+    from messagefoundry.secretscrub import mask_credential_query
+
+    url = "https://h.example.invalid/p?key=SE\tCRET&fmt=json"
+    assert credential_query_params(url) == ["key"]
+    assert mask_credential_query(url) == "https://h.example.invalid/p?key=***&fmt=json"
 
 
 def test_mask_and_detector_agree_on_where_the_query_is() -> None:

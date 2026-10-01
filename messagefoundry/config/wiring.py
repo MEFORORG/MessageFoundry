@@ -1424,13 +1424,20 @@ def _mask_url_userinfo(value: object) -> object:
     if not isinstance(value, str) or "@" not in value or "//" not in value:
         return value
     scheme, _, rest = value.partition("//")
-    # The authority ends at the first "/", "?" or "#". Splitting the whole rest at its last "@" read
-    # an "@" in a query (``?email=a@b.com``) as the userinfo end and rendered the wrong host.
+    # The clean case first: an "@" inside the authority, which ends at the first "/", "?" or "#".
+    # That keeps an "@" in a query (``/x?email=a@b.com``) from being read as the end of a userinfo.
     end = min(
         (i for i in (rest.find("/"), rest.find("?"), rest.find("#")) if i >= 0), default=len(rest)
     )
     authority, tail = rest[:end], rest[end:]
     userinfo, at, hostpart = authority.rpartition("@")
+    if not at:
+        # A password may itself hold "/", "?" or "#", which ends that authority early, and urllib's
+        # proxy parser accepts it (``http://user:p?ss@proxy:3128``). So fail toward masking: split
+        # at the LAST "@" in the whole rest, as this did before. The cost is a wrong host in the
+        # view when a query "@" follows a host with a port; a password is never shown.
+        userinfo, at, hostpart = rest.rpartition("@")
+        tail = ""
     if not at or ":" not in userinfo:
         return value  # no userinfo, or a user with no password -- nothing secret to remove
     user, _, _pw = userinfo.partition(":")
