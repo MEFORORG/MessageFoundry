@@ -74,6 +74,7 @@ __all__ = [
     "MAX_FRAME",
     "SandboxError",
     "SandboxCodecError",
+    "GraphShape",
     "Request",
     "Response",
     "build_payload",
@@ -1037,8 +1038,39 @@ def decode_boot(body: bytes) -> Boot:
     )
 
 
-def encode_ready() -> bytes:
-    return encode_frame(_envelope({}, "ready"), ())
+@dataclass(frozen=True)
+class GraphShape:
+    """The names one loaded graph declares, and how its inbounds are bound (vault BACKLOG #2587).
+
+    The worker loads the config directory again, in its own process and under an allowlisted
+    environment, so its graph can differ from the engine's. It reports this in its ``ready`` frame
+    and the engine compares (:func:`messagefoundry.pipeline.sandbox.graph_differences`).
+
+    ``bindings`` maps an inbound to its Router, for the inbounds the process holds. An engine shard
+    holds only its own, so ``inbound`` carries every inbound NAME in the deployment beside it.
+    ``accepts`` is the Handlers that declare an ``accepts=`` predicate. **Names only:** two graphs
+    with one shape can still differ in what a function of the same name does."""
+
+    bindings: Mapping[str, str]
+    inbound: frozenset[str]
+    routers: frozenset[str]
+    handlers: frozenset[str]
+    accepts: frozenset[str]
+    outbound: frozenset[str]
+
+
+#: The name sets of a :class:`GraphShape`, as its fields and its wire keys.
+_SHAPE_SETS: Final = ("inbound", "routers", "handlers", "accepts", "outbound")
+
+
+def _dec_names(node: Any, what: str) -> frozenset[str]:
+    return frozenset(_req_str(name, what) for name in _req_list(node, what))
+
+
+def encode_ready(shape: GraphShape) -> bytes:
+    graph: dict[str, Any] = {key: sorted(getattr(shape, key)) for key in _SHAPE_SETS}
+    graph["bindings"] = sorted([name, router] for name, router in shape.bindings.items())
+    return encode_frame(_envelope({"graph": graph}, "ready"), ())
 
 
 def encode_bootfail(error: str) -> bytes:
@@ -1047,16 +1079,27 @@ def encode_bootfail(error: str) -> bytes:
     return encode_frame(header, blobs.items)
 
 
-def decode_boot_reply(body: bytes) -> tuple[bool, str]:
-    """``(ready, error)`` — ``error`` is type-checked to ``str`` BEFORE the parent interpolates it, so a
-    child-supplied object's ``__format__``/``__repr__`` is never invoked in the engine."""
+def decode_boot_reply(body: bytes) -> tuple[bool, str, GraphShape | None]:
+    """``(ready, error, graph)``. ``error`` is type-checked to ``str`` BEFORE the parent interpolates
+    it, so a child-supplied object's ``__format__``/``__repr__`` is never invoked in the engine. The
+    graph is rebuilt from strings only, for the same reason; it is ``None`` on a ``bootfail``."""
     header, reader, kind = _open(body, ("ready", "bootfail"))
     if kind == "ready":
+        graph = _req_obj(header.get("graph"), "graph")
+        bindings: dict[str, str] = {}
+        for pair in _req_list(graph.get("bindings"), "graph bindings"):
+            if len(_req_list(pair, "graph binding")) != 2:
+                raise SandboxCodecError("sandbox graph binding must be a pair")
+            bindings[_req_str(pair[0], "graph binding")] = _req_str(pair[1], "graph binding")
+        shape = GraphShape(
+            bindings=bindings,
+            **{key: _dec_names(graph.get(key), f"graph {key}") for key in _SHAPE_SETS},
+        )
         reader.finish()
-        return True, ""
+        return True, "", shape
     error = reader.text(header.get("error"))
     reader.finish()
-    return False, error
+    return False, error, None
 
 
 def encode_request(

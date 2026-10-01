@@ -23,7 +23,6 @@ import ast
 import asyncio
 import functools
 import os
-import site
 import subprocess
 import sys
 from collections import Counter
@@ -40,6 +39,7 @@ from messagefoundry.config.environments import VALUE_ENV_PREFIX
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline import dr, supervisor
+from messagefoundry.pipeline import sandbox as sandbox_mod
 from messagefoundry.pipeline.dryrun import transform_one
 from tests.test_dangerous_functionality_doc import (
     _ARGV,
@@ -80,8 +80,6 @@ _SECRET_NAMES = frozenset(
     | {VALUE_ENV_PREFIX + "PARTNER_PASSWORD"}
     | _LIBRARY_FALLBACK_SECRETS
 )
-
-_PACKAGE_ROOT = str(Path(messagefoundry.__file__).resolve().parent.parent)
 
 
 def test_the_secret_names_are_a_real_list() -> None:
@@ -125,9 +123,19 @@ def h_path(msg):
         marker = "IMPORTED"
     except ImportError:
         marker = "NOT-IMPORTABLE"
+    import sysconfig
+
+    def where(directory):
+        wanted = os.path.normcase(os.path.abspath(directory))
+        found = [i for i, e in enumerate(sys.path) if e and os.path.normcase(os.path.abspath(e)) == wanted]
+        return found[0] if found else -1
+
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(messagefoundry.__file__)))
     return Send(
         "OB_ENV",
-        "SAFE=" + str(sys.flags.safe_path) + ";MARKER=" + marker + ";MF=" + messagefoundry.__file__,
+        "SAFE=" + str(sys.flags.safe_path) + ";MARKER=" + marker + ";MF=" + messagefoundry.__file__
+        + ";STDLIB=" + str(where(sysconfig.get_path("stdlib"))) + ";ROOT=" + str(where(package_root))
+        + ";REMOTE_DEBUG=" + str(sys.is_remote_debug_enabled()),
     )
 """
 
@@ -186,6 +194,9 @@ def test_the_worker_does_not_search_the_working_directory_and_loads_the_parents_
     assert seen["SAFE"] == "True"
     assert seen["MARKER"] == "NOT-IMPORTABLE"
     assert Path(seen["MF"]).resolve() == Path(messagefoundry.__file__).resolve()
+    # The package's directory is on the worker's path, and the standard library is searched first.
+    assert 0 <= int(seen["STDLIB"]) < int(seen["ROOT"])
+    assert seen["REMOTE_DEBUG"] == "False"
 
 
 def test_the_sandbox_hands_its_worker_one_engine_switch_and_no_other_engine_variable(
@@ -215,7 +226,7 @@ def test_the_sandbox_hands_its_worker_one_engine_switch_and_no_other_engine_vari
 
     engine_names = {n for n in captured["env"] if n.startswith(childenv.ENGINE_ENV_PREFIX)}
     assert engine_names == {settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV}
-    assert captured["argv"][1:3] == [childenv.SAFE_PATH_FLAG, "-m"]
+    assert captured["argv"] == childenv.python_child_argv(sandbox_mod.WORKER_MODULE)
 
 
 # --- the DR hook, through the real spawn --------------------------------------------------------
@@ -280,12 +291,12 @@ def test_a_variable_that_only_looks_like_the_interpreters_or_the_locales_does_no
     assert set(childenv.worker_environment(parent)) & set(parent) == set()
 
 
-def test_a_named_engine_switch_crosses_and_nothing_else_in_the_namespace_does() -> None:
+def test_an_extra_name_crosses_and_nothing_else_in_the_engine_namespace_does() -> None:
     switch = settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV
-    env = childenv.worker_environment(_parent_environment(), engine_switches=(switch,))
+    env = childenv.worker_environment(_parent_environment(), extra_names=(switch,))
     assert {n for n in env if n.startswith(childenv.ENGINE_ENV_PREFIX)} == {switch}
     with pytest.raises(TypeError):
-        childenv.worker_environment(_parent_environment(), engine_switches=switch)
+        childenv.worker_environment(_parent_environment(), extra_names=switch)
 
 
 def test_the_operator_page_names_each_library_secret_the_hook_loses() -> None:
@@ -293,7 +304,7 @@ def test_the_operator_page_names_each_library_secret_the_hook_loses() -> None:
     repository = Path(__file__).resolve().parents[1]
     page = (repository / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
     row = next(line for line in page.splitlines() if line.startswith("| `takeover_hook` |"))
-    assert childenv._ENGINE_SECRETS_OUTSIDE_THE_PREFIX == _LIBRARY_FALLBACK_SECRETS
+    assert childenv.ENGINE_SECRETS_OUTSIDE_THE_PREFIX == _LIBRARY_FALLBACK_SECRETS
     assert [name for name in sorted(_LIBRARY_FALLBACK_SECRETS) if f"`{name}`" not in row] == []
 
 
@@ -345,58 +356,72 @@ async def test_the_supervisor_starts_a_shard_with_that_environment(
     assert captured["env"] == childenv.engine_environment()
 
 
-#: An absolute directory that is not the package root, for an operator's own ``PYTHONPATH`` entry.
-_OPERATOR_PATH = str(Path(_PACKAGE_ROOT).parent / "operator-libraries")
+#: An absolute directory, for an operator's own ``PYTHONPATH`` entry.
+_OPERATOR_PATH = str(Path(__file__).resolve().parent / "operator-libraries")
 
 _BUILDERS_OF_A_PYTHON_CHILD = (childenv.worker_environment, childenv.engine_environment)
-
-
-def test_the_python_children_are_told_where_the_parents_package_is(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``-P`` takes the working directory off the child's import path. An engine run from a source
-    checkout found its own package there, so the child is told the location instead, and told it
-    first, so that another copy further down the path cannot answer in the child."""
-    monkeypatch.setattr(site, "getsitepackages", lambda: [])
-    monkeypatch.setattr(site, "getusersitepackages", lambda: "")
-    for build in _BUILDERS_OF_A_PYTHON_CHILD:
-        assert build({})["PYTHONPATH"] == _PACKAGE_ROOT
-        for inherited in (
-            _OPERATOR_PATH,
-            os.pathsep.join((_OPERATOR_PATH, _PACKAGE_ROOT)),
-            os.pathsep.join((".", _OPERATOR_PATH)),
-        ):
-            env = build({"PYTHONPATH": inherited})
-            assert env["PYTHONPATH"].split(os.pathsep) == [_PACKAGE_ROOT, _OPERATOR_PATH]
-            # A child of a child: the location is already first, so it is not stacked again.
-            assert build(env)["PYTHONPATH"] == env["PYTHONPATH"]
 
 
 @pytest.mark.parametrize(
     "inherited",
     ["", ".", os.pathsep + _OPERATOR_PATH, _OPERATOR_PATH + os.pathsep, "relative-directory"],
 )
-def test_an_entry_that_names_the_working_directory_does_not_reach_the_child(
-    monkeypatch: pytest.MonkeyPatch, inherited: str
-) -> None:
+def test_an_entry_that_names_the_working_directory_does_not_reach_the_child(inherited: str) -> None:
     """An empty or relative ``PYTHONPATH`` entry is the working directory by another name, so
-    carrying it across would undo ``-P``."""
-    monkeypatch.setattr(site, "getsitepackages", lambda: [_PACKAGE_ROOT])
+    carrying it across would undo ``-P``. An absolute entry crosses, and nothing is added: the
+    child is told where the package is by its bootstrap, never through ``PYTHONPATH``."""
     expected = [_OPERATOR_PATH] if _OPERATOR_PATH in inherited else []
     for build in _BUILDERS_OF_A_PYTHON_CHILD:
         crossed = build({"PYTHONPATH": inherited}).get("PYTHONPATH", "")
         assert [entry for entry in crossed.split(os.pathsep) if entry] == expected
-
-
-def test_an_installed_package_adds_nothing_to_the_childs_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Installed in site-packages, the child finds the package by itself. Naming site-packages on
-    ``PYTHONPATH`` would move it ahead of the standard library."""
-    monkeypatch.setattr(site, "getsitepackages", lambda: [_PACKAGE_ROOT])
-    for build in _BUILDERS_OF_A_PYTHON_CHILD:
         assert "PYTHONPATH" not in build({})
-        assert build({"PYTHONPATH": _OPERATOR_PATH})["PYTHONPATH"] == _OPERATOR_PATH
+
+
+def test_a_python_child_starts_with_the_interpreters_remote_debugging_disabled() -> None:
+    """Read off real interpreters. The control is a child started without the flags: it must report
+    remote debugging ENABLED, or "disabled" below would not show that the flags did it. That also
+    catches a spelling the interpreter accepts and ignores."""
+    probe = "import sys; print(sys.flags.safe_path, sys.is_remote_debug_enabled())"
+
+    def answer(flags: tuple[str, ...]) -> str:
+        done = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
+            [sys.executable, *flags, "-c", probe],
+            env=childenv.worker_environment(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        return done.stdout.strip()
+
+    if answer(()) != "False True":
+        pytest.skip("this interpreter starts with remote debugging already off")
+    flags = childenv.CHILD_INTERPRETER_FLAGS
+    assert answer(flags) == "True False"
+    assert childenv.python_child_argv("a.module")[1 : 1 + len(flags)] == list(flags)
+
+
+def test_the_bootstrap_runs_a_module_with_its_arguments_and_without_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    """Through a real interpreter, the way an engine shard starts: the module runs as ``__main__``,
+    its argument arrives, and a decoy package of the same name in the working directory does not
+    answer in place of this build."""
+    decoy = tmp_path / "messagefoundry"
+    decoy.mkdir()
+    (decoy / "__init__.py").write_text("raise SystemExit('the decoy answered')\n", encoding="utf-8")
+    (decoy / "__main__.py").write_text("raise SystemExit('the decoy answered')\n", encoding="utf-8")
+    done = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
+        [*childenv.python_child_argv("messagefoundry"), "--version"],
+        cwd=tmp_path,
+        env=childenv.engine_environment(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert f"package: {Path(messagefoundry.__file__).resolve().parent}" in done.stdout
 
 
 # --- the static guard ---------------------------------------------------------------------------
@@ -473,12 +498,13 @@ _MORE_THAN_ONE: dict[tuple[str, str, str], int] = {
 }
 
 #: The sites this change is about. They are also the positive control: a walker that could not see
-#: a call would report a clean tree, so these three must be seen, and seen with a chosen environment.
+#: a call would report a clean tree, so each of these must be seen, and seen with a chosen environment.
 _MUST_CHOOSE = frozenset(
     {
         ("pipeline/sandbox.py", "SandboxSession._spawn", "subprocess.Popen"),
         ("pipeline/dr.py", "_run_command", "create_subprocess_shell"),
         ("pipeline/supervisor.py", "_default_spawn", "create_subprocess_exec"),
+        ("pipeline/supervisor.py", "preflight_shard_config", "create_subprocess_exec"),
     }
 )
 
@@ -626,8 +652,27 @@ def test_the_guard_sees_the_calls_it_is_about() -> None:
     chosen, inherits = _live_spawn_sites()
     assert sorted(_MUST_CHOOSE - set(chosen)) == []
     assert sorted(_MUST_CHOOSE & set(inherits)) == []
-    # Only those three choose one today. A fourth is fine; it has to be a deliberate edit here.
+    # Only these choose one today. Another is fine; it has to be a deliberate edit here.
     assert set(chosen) == _MUST_CHOOSE
+
+
+def test_one_function_builds_the_command_line_of_a_python_child() -> None:
+    """``python_child_argv`` is where the interpreter flags are added, so a Python child started any
+    other way would start without them. Outside the tray, which is the desktop user's own process,
+    it is the only code in the shipped packages that names this interpreter's executable."""
+    names_the_interpreter = {
+        rel
+        for rel, source in _scanned_sources().items()
+        if not rel.startswith("tray/")
+        and any(
+            isinstance(node, ast.Attribute)
+            and node.attr == "executable"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+            for node in ast.walk(ast.parse(source))
+        )
+    }
+    assert names_the_interpreter == {"childenv.py"}
 
 
 def test_the_guard_reads_every_module_the_process_start_inventory_names() -> None:

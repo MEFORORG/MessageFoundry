@@ -10,13 +10,13 @@ process start whose environment does not come from one of them.
 
 * :func:`worker_environment` is an **allowlist**, for a child that runs code the engine does not
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
-  and the engine switches its caller names. A variable nobody listed does not cross.
+  and the extra names its caller adds. A variable nobody listed does not cross.
 * :func:`hook_environment` is **everything except the engine's own namespace**, for a command an
   operator configured (the DR hook). Such a command may need ordinary variables the engine cannot
   list in advance, such as a cloud profile or a proxy. It has no use for the engine's settings, so
   the whole ``MEFOR_*`` prefix is dropped. Dropping a prefix does not go stale the way a list of
   secret names would. A few names outside the prefix are dropped too
-  (:data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX`). **A secret kept under any other name still reaches
+  (:data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`). **A secret kept under any other name still reaches
   the hook**: a ``[secrets].provider = "env"`` reference may name any variable, a library may read
   one this module does not know, and neither can be listed here.
 * :func:`engine_environment` is the **whole** environment, for a child that is itself a full engine
@@ -33,29 +33,36 @@ Stdlib only, so any package may import it.
 from __future__ import annotations
 
 import os
-import site
 import sys
 from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Final
 
 __all__ = [
+    "CHILD_INTERPRETER_FLAGS",
     "ENGINE_ENV_PREFIX",
-    "SAFE_PATH_FLAG",
+    "ENGINE_SECRETS_OUTSIDE_THE_PREFIX",
     "engine_environment",
     "hook_environment",
+    "outside_engine_namespace",
+    "python_child_argv",
     "worker_environment",
 ]
 
 #: The engine's own settings and secrets are named with this prefix. The libraries it uses read
-#: other names as well; :data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the secret ones known here.
+#: other names as well; :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the secret ones known here.
 ENGINE_ENV_PREFIX: Final = "MEFOR_"
 
-#: The interpreter flag a ``python -m`` child is started with. Without it Python puts the working
-#: directory first on the child's import path, so a file there could stand in for a module the child
-#: imports. :func:`_with_import_path` hands the child the package location that flag takes away,
-#: and says when the flag's promise holds.
-SAFE_PATH_FLAG: Final = "-P"
+#: The interpreter options every Python child is started with. ``-P`` keeps the working directory
+#: off the child's import path, so a file there cannot stand in for a module the child imports.
+#: ``-X disable-remote-debug`` starts the child with the interpreter's remote debugging disabled.
+#: The option is spelled with hyphens; the interpreter accepts and ignores other spellings, which is
+#: why ``tests/test_child_process_environment.py`` reads the result off a real child.
+CHILD_INTERPRETER_FLAGS: Final = ("-P", "-X", "disable-remote-debug")
+
+#: The script a Python child is started through. Its docstring says where it puts this package on
+#: the child's import path, and why.
+_BOOTSTRAP: Final = str(Path(__file__).resolve().parent / "_child_bootstrap.py")
 
 #: The interpreter's own variables that cross, by name. Each one changes whether the interpreter
 #: starts, where it imports from, or how the same code behaves (encoding, hash seed, warnings), so
@@ -161,60 +168,50 @@ _POSIX_NAMES: Final = frozenset(
 #: ``VAULT_TOKEN`` when ``MEFOR_STORE_VAULT_TOKEN`` or ``MEFOR_SECRETS_VAULT_TOKEN`` is unset, and
 #: asyncpg falls back to ``PGPASSWORD`` when ``[store].password`` is unset. A list of names, so it
 #: can be incomplete; the module docstring says what that leaves.
-_ENGINE_SECRETS_OUTSIDE_THE_PREFIX: Final = frozenset({"VAULT_TOKEN", "PGPASSWORD"})
+ENGINE_SECRETS_OUTSIDE_THE_PREFIX: Final = frozenset({"VAULT_TOKEN", "PGPASSWORD"})
 
 
-def _allowed_for_a_worker(name: str, engine_switches: Collection[str]) -> bool:
-    # Windows names are case-insensitive; POSIX names are not.
-    key = name.upper() if sys.platform == "win32" else name
-    if key in engine_switches or key in _INTERPRETER_NAMES:
+def _key(name: str) -> str:
+    """A variable name as the platform compares it: Windows names are case-insensitive."""
+    return name.upper() if sys.platform == "win32" else name
+
+
+def _allowed_for_a_worker(name: str, extra_names: Collection[str]) -> bool:
+    key = _key(name)
+    if key in extra_names or key in _INTERPRETER_NAMES:
         return True
     return key in (_WINDOWS_NAMES if sys.platform == "win32" else _POSIX_NAMES)
 
 
-def _outside_the_engine_namespace(name: str) -> bool:
-    # Upper-cased on every platform. Windows reads `mefor_x` and `MEFOR_X` as one variable, and on
-    # POSIX dropping the lower-case spelling costs a hook nothing.
+def outside_engine_namespace(name: str) -> bool:
+    """Whether ``name`` is neither one of the engine's own ``MEFOR_*`` variables nor a secret a
+    library reads on its behalf. Upper-cased on every platform: Windows reads ``mefor_x`` and
+    ``MEFOR_X`` as one variable, and on POSIX refusing the lower-case spelling costs nothing."""
     upper = name.upper()
     return (
-        not upper.startswith(ENGINE_ENV_PREFIX) and upper not in _ENGINE_SECRETS_OUTSIDE_THE_PREFIX
+        not upper.startswith(ENGINE_ENV_PREFIX) and upper not in ENGINE_SECRETS_OUTSIDE_THE_PREFIX
     )
 
 
-def _package_root() -> str:
-    """The directory that holds this ``messagefoundry`` package."""
-    return str(Path(__file__).resolve().parent.parent)
+def python_child_argv(module: str, *, executable: str | None = None) -> list[str]:
+    """The command line that runs ``module`` in a child interpreter, as ``python -m`` would.
 
-
-def _site_directories() -> set[str]:
-    """The site-packages directories every interpreter started from this one searches by itself."""
-    found = [*site.getsitepackages(), site.getusersitepackages()]
-    return {str(Path(entry).resolve()) for entry in found if entry}
-
-
-def _with_import_path(env: dict[str, str]) -> dict[str, str]:
-    """Set the ``PYTHONPATH`` of a ``python -m`` child started with :data:`SAFE_PATH_FLAG`.
-
-    Two things, both so that the child still starts and imports the build its parent is running:
-
-    * **Only absolute entries of the inherited ``PYTHONPATH`` cross.** An empty or relative entry
-      names the working directory, which is what the flag takes off the child's import path.
-    * **This package's location goes first, unless it is in site-packages.** An engine run from a
-      source checkout that is not installed found its own package in the working directory, so its
-      child would fail to import it. Putting it first also keeps another copy, further down the
-      path, from answering in the child when it did not in the parent. Site-packages is left off:
-      every child searches it already, and a ``PYTHONPATH`` entry is searched ahead of the standard
-      library.
-
-    **So the flag keeps the working directory off the child's path only when that directory is not
-    the engine's own checkout.** For an engine run or installed from a checkout, the checkout is
-    named here, ahead of the standard library, as the working directory was before.
+    Two differences from ``python -m``. The child starts with :data:`CHILD_INTERPRETER_FLAGS`.
+    And it starts through :data:`_BOOTSTRAP`, which hands it the package location that ``-P``
+    takes away. Pass the result of :func:`worker_environment` or :func:`engine_environment` as its
+    ``env``: they keep a ``PYTHONPATH`` entry from putting the working directory back.
     """
-    root = _package_root()
+    return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, _BOOTSTRAP, module]
+
+
+def _without_working_directory_entries(env: dict[str, str]) -> dict[str, str]:
+    """Keep only the absolute entries of an inherited ``PYTHONPATH``.
+
+    An empty or relative entry names the working directory, which is what ``-P`` takes off the
+    child's import path.
+    """
     inherited = env.pop("PYTHONPATH", "")
     entries = [entry for entry in inherited.split(os.pathsep) if os.path.isabs(entry)]
-    if root not in _site_directories():
-        entries = [root, *(entry for entry in entries if str(Path(entry).resolve()) != root)]
     if entries:
         env["PYTHONPATH"] = os.pathsep.join(entries)
     return env
@@ -225,37 +222,37 @@ def _source(environ: Mapping[str, str] | None) -> Mapping[str, str]:
 
 
 def worker_environment(
-    environ: Mapping[str, str] | None = None, *, engine_switches: Collection[str] = ()
+    environ: Mapping[str, str] | None = None, *, extra_names: Collection[str] = ()
 ) -> dict[str, str]:
-    """The environment for a ``python -m`` child that runs code the engine does not fully trust.
+    """The environment for a Python child that runs code the engine does not fully trust.
 
     An allowlist over ``environ`` (default :data:`os.environ`): the platform's start-up names, the
-    interpreter's own variables, and ``engine_switches``. Code in the child that reads any other
+    interpreter's own variables, and ``extra_names``. Code in the child that reads any other
     variable finds it unset, which is a difference from running in the engine process.
 
-    ``engine_switches`` names the ``MEFOR_*`` variables the child's own code reads to make a decision
-    its parent already made. It is for a switch, never for a secret: whatever is named here is in
-    the environment of the code this builder exists to keep secrets from.
+    ``extra_names`` is what the caller adds: an engine switch the child's own code reads to make a
+    decision its parent already made, and the names an operator listed in
+    ``[sandbox].pass_environment``. Never a secret: whatever is named here is in the environment of
+    the code this builder exists to keep secrets from. Settings load refuses the engine's own.
     """
-    if isinstance(engine_switches, str):
-        # A bare string is a collection of its characters, so no switch would cross and nothing
+    if isinstance(extra_names, str):
+        # A bare string is a collection of its characters, so no name would cross and nothing
         # would say why.
-        raise TypeError("engine_switches takes a collection of names, not one string")
-    switches = frozenset(engine_switches)
-    return _with_import_path(
-        {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, switches)}
+        raise TypeError("extra_names takes a collection of names, not one string")
+    extras = frozenset(_key(name) for name in extra_names)
+    return _without_working_directory_entries(
+        {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, extras)}
     )
 
 
 def hook_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for a command an operator configured: everything outside the engine's own
-    ``MEFOR_*`` namespace, less :data:`_ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
+    ``MEFOR_*`` namespace, less :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
 
-    ``PYTHONPATH`` crosses as this process has it. In an engine shard started from a checkout that
-    includes the engine's package location, which :func:`engine_environment` put there."""
-    return {n: v for n, v in _source(environ).items() if _outside_the_engine_namespace(n)}
+    ``PYTHONPATH`` crosses as this process has it."""
+    return {n: v for n, v in _source(environ).items() if outside_engine_namespace(n)}
 
 
 def engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for a ``python -m`` child that is itself a full engine: all of it."""
-    return _with_import_path(dict(_source(environ)))
+    """The environment for a Python child that is itself a full engine: all of it."""
+    return _without_working_directory_entries(dict(_source(environ)))

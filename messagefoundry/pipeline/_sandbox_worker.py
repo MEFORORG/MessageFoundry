@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The sandbox worker child process (ADR 0087, BACKLOG #197).
 
-Launched by :class:`messagefoundry.pipeline.sandbox.SandboxSession` as ``python -m
-messagefoundry.pipeline._sandbox_worker``. It speaks the length-prefixed **MFW2** codec
+Launched by :class:`messagefoundry.pipeline.sandbox.SandboxSession` through
+:func:`messagefoundry.childenv.python_child_argv`, which runs this module the way ``python -m``
+would. It speaks the length-prefixed **MFW2** codec
 (:mod:`messagefoundry.pipeline._sandbox_codec`) on stdin/stdout — a closed-tag JSON+segment wire whose
 decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
 direction, in either process.
@@ -243,7 +244,7 @@ def _respond(registry: Any, req: Any, code_sets: Any) -> bytes:
 def main() -> int:
     from messagefoundry.pipeline import _sandbox_codec as codec
     from messagefoundry.pipeline._sandbox_codec import SandboxError
-    from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame
+    from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame, graph_shape
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
@@ -276,7 +277,9 @@ def main() -> int:
             pass
         return 1
     try:
-        _write_frame(stdout, codec.encode_ready())
+        # The graph this process loaded goes back with ``ready``. The engine compares it with its
+        # own and refuses a worker whose graph differs (vault BACKLOG #2587).
+        _write_frame(stdout, codec.encode_ready(graph_shape(registry)))
     except (OSError, SandboxError):
         return 1
 

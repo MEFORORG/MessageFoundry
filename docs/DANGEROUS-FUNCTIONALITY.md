@@ -150,7 +150,7 @@ de-identification leak check only, and is not on the message path.
 | Module | What it runs | When | Form |
 |---|---|---|---|
 | `pipeline/sandbox.py` | The sandbox worker | Only when `[sandbox].mode = "subprocess"` | argument list |
-| `pipeline/supervisor.py` | Engine-shard children | Only under `messagefoundry supervise` | argument list |
+| `pipeline/supervisor.py` | Engine-shard children, and one child that loads the config before any shard starts | Only under `messagefoundry supervise` | argument list |
 | `pipeline/dr.py` | The operator's disaster-recovery hook | A DR takeover or fail-back, when `[dr].takeover_hook` or `[dr].release_hook` is set | shell string |
 | `service.py` | `sc.exe`, and elevated `cmd.exe` and `powershell.exe` | Service status, start, stop, restart and install | argument list, ShellExecute |
 | `service_status.py` | `sc.exe query` | Reading the service's state | argument list |

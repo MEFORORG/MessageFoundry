@@ -58,6 +58,7 @@ from pydantic import (
 )
 
 from messagefoundry.api_tls_source import api_tls_source
+from messagefoundry.childenv import outside_engine_namespace
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -1787,6 +1788,22 @@ class PipelineSettings(_Section):
     snapshot_on_send: bool = Field(default=True)
 
 
+def _pass_environment_refusal(name: str) -> str | None:
+    """Why ``name`` may not be handed to a sandbox worker, or ``None`` if it may.
+
+    The worker runs the code ``[sandbox]`` exists to keep the engine's secrets from, so nothing of
+    the engine's own may be named: no ``MEFOR_*`` variable at all, and no secret a library reads on
+    the engine's behalf. That is the rule the DR hook's environment follows
+    (:func:`messagefoundry.childenv.outside_engine_namespace`), reused so the two cannot drift.
+    Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
+    added. The text never echoes a value, only the name the operator typed."""
+    if not (name.isascii() and name.isidentifier()):
+        return f"{name!r} is not an environment variable name"
+    if not outside_engine_namespace(name):
+        return f"{name} is one of the engine's own variables; it may not be passed to a worker"
+    return None
+
+
 class SandboxSettings(_Section):
     """``[sandbox]`` — opt-in subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
 
@@ -1849,6 +1866,29 @@ class SandboxSettings(_Section):
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
+    # Extra environment variable NAMES the worker is given, beyond its allowlist
+    # (messagefoundry/childenv.py). The worker loads the config again under that allowlist, so a
+    # config that reads another variable needs it named here, or its worker is refused when the
+    # graph it builds differs from the engine's. Names only, and never a MEFOR_* name or another
+    # of the engine's own: see _pass_environment_refusal.
+    pass_environment: tuple[str, ...] = ()
+
+    @field_validator("pass_environment", mode="before")
+    @classmethod
+    def _split_pass_environment(cls, v: object) -> object:
+        # The env layer delivers MEFOR_SANDBOX_PASS_ENVIRONMENT as one string; split on commas.
+        if isinstance(v, str):
+            return [name.strip() for name in v.split(",") if name.strip()]
+        return v
+
+    @field_validator("pass_environment")
+    @classmethod
+    def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        for name in v:
+            refusal = _pass_environment_refusal(name)
+            if refusal is not None:
+                raise ValueError(f"sandbox.pass_environment: {refusal}")
+        return v
 
 
 class DiagnosticsSettings(_Section):

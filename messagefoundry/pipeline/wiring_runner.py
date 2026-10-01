@@ -162,7 +162,13 @@ from messagefoundry.pipeline.phase_timing import (
 )
 from messagefoundry.pipeline.reference_sync import database_source_dsn, reference_connection_name
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
-from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
+from messagefoundry.pipeline.sandbox import (
+    GraphShape,
+    SandboxMode,
+    SandboxPolicy,
+    SandboxSession,
+    graph_shape,
+)
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
@@ -1008,6 +1014,7 @@ class RegistryRunner:
         self._sandbox_policy = sandbox_policy
         self._sandbox_config_source = sandbox_config_source
         self._sandbox_sessions: dict[str, SandboxSession] = {}
+        self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
         # origin. Coarse by design (bounds total work, not topology). From [pipeline] max_correlation_depth.
@@ -3988,6 +3995,17 @@ class RegistryRunner:
                 if _pool_warn is not None:
                     log.warning(_pool_warn)
 
+    def _engine_graph_shape(self) -> GraphShape:
+        """The shape of the graph now being served, which each sandbox worker's must match.
+
+        One object per registry, shared by every inbound's session: a shape holds every name in the
+        graph, so one per session would cost the square of the connection count. A reload swaps
+        ``self.registry`` and drops the sessions, so the next session takes the new graph's shape."""
+        cached = self._sandbox_graph_shape
+        if cached is None or cached[0] is not self.registry:
+            cached = self._sandbox_graph_shape = (self.registry, graph_shape(self.registry))
+        return cached[1]
+
     def _sandbox_for(self, name: str) -> SandboxSession | None:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
 
@@ -4016,6 +4034,7 @@ class RegistryRunner:
                 inbound=name,  # attributes the child's relayed stderr to this feed (ADR 0176)
                 config_dir=cfg_dir,
                 env=env,
+                graph=self._engine_graph_shape(),
                 code_sets=self.registry.code_sets,
             )
             self._sandbox_sessions[name] = session

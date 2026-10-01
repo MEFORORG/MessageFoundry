@@ -19,12 +19,25 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.childenv import python_child_argv
+from messagefoundry.config.settings import StoreBackend
+from messagefoundry.pipeline import supervisor as supervisor_mod
 from messagefoundry.pipeline.supervisor import (
     ShardSpec,
     Supervisor,
     _default_spawn,
     build_shard_specs,
+    discover_shard_specs,
+    preflight_shard_config,
+    supervise,
 )
+
+#: The arguments discovery and ``supervise`` share in the pre-flight tests.
+_DISCOVERY: dict[str, Any] = {
+    "store_backend": StoreBackend.SQLITE,
+    "db_base": "preflight.db",
+    "base_port": 18790,
+}
 
 # --- shard-spec derivation (pure) --------------------------------------------
 
@@ -62,8 +75,10 @@ def test_spec_argv_includes_env_and_service_config_when_given() -> None:
     argv = specs[0].argv
     assert "--env" in argv and "prod" in argv
     assert "--service-config" in argv and "svc.toml" in argv
-    # -P keeps the working directory off the shard's import path (vault BACKLOG #2587).
-    assert argv[:5] == (specs[0].argv[0], "-P", "-m", "messagefoundry", "serve")
+    # The shard starts through childenv's command line, which keeps the working directory off its
+    # import path (vault BACKLOG #2587).
+    head = python_child_argv("messagefoundry")
+    assert argv[: len(head) + 1] == (*head, "serve")
 
 
 def test_spec_argv_includes_project_root_when_given() -> None:
@@ -454,3 +469,70 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
     with pytest.raises(asyncio.CancelledError):
         await run
     assert proc.terminated and proc.killed  # escalated to kill after the grace elapsed
+
+
+# --- the pre-flight: a config must load the way a shard will load it (vault BACKLOG #2587) -------
+
+_SHARD_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+from __HELPER__ import NAME
+
+inbound(NAME, MLLP(port=19471), router="r")
+outbound("OB_PREFLIGHT", MLLP(host="127.0.0.1", port=19472))
+
+
+@router("r")
+def r(msg):
+    return "h"
+
+
+@handler("h")
+def h(msg):
+    return Send("OB_PREFLIGHT", str(msg))
+"""
+
+_CWD_HELPER = "mf_b2587_cwd_only_helper"
+
+
+def _shard_config(tmp_path: Path, helper: str) -> Path:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "graph.py").write_text(_SHARD_GRAPH.replace("__HELPER__", helper), encoding="utf-8")
+    return config
+
+
+@pytest.mark.asyncio
+async def test_a_config_that_needs_the_working_directory_is_refused_before_any_shard_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The config imports a helper that is importable only from the working directory. The
+    supervisor's own load finds it; a shard would not, and would be restarted for ever. So the
+    refusal has to come once, here, before a shard exists."""
+    config = _shard_config(tmp_path, _CWD_HELPER)
+    (tmp_path / f"{_CWD_HELPER}.py").write_text('NAME = "IB_PREFLIGHT"\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # What `python -m messagefoundry supervise` gives the supervisor: the working directory first.
+    monkeypatch.syspath_prepend(str(tmp_path))
+    built: list[object] = []
+    monkeypatch.setattr(supervisor_mod, "Supervisor", lambda specs: built.append(specs))
+    try:
+        # Control: the supervisor's own load passes, so discovery alone would have started shards.
+        assert len(discover_shard_specs(str(config), **_DISCOVERY)) == 1
+        with caplog.at_level(logging.ERROR, logger=supervisor_mod.__name__):
+            code = await supervise(str(config), install_signal_handlers=False, **_DISCOVERY)
+    finally:
+        sys.modules.pop(_CWD_HELPER, None)
+
+    assert code == 2
+    assert built == []
+    assert "`_`-prefixed" in caplog.text
+    assert _CWD_HELPER in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_config_whose_helper_sits_beside_it_passes_the_preflight(tmp_path: Path) -> None:
+    """The control, and the documented layout: the same graph with its helper as a ``_``-prefixed
+    file in the config directory."""
+    config = _shard_config(tmp_path, "_helper")
+    (config / "_helper.py").write_text('NAME = "IB_PREFLIGHT"\n', encoding="utf-8")
+    assert await preflight_shard_config(str(config)) is None

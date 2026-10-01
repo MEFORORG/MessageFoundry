@@ -399,7 +399,8 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   tools, still inherit; the guard below lists each with its reason. The sandbox worker gets an
   allowlist, and no `MEFOR_*` variable except one switch its own `load_config` reads. The worker and
   the engine shards also start with `-P`, which keeps the engine's working directory off their
-  import path unless that directory is the engine's own checkout. `messagefoundry/childenv.py` is the source of
+  import path, and with the interpreter's remote debugging disabled.
+  `messagefoundry/childenv.py` is the source of
   record for what each child gets and why; the `[sandbox]` and `[dr]` sections of
   [CONFIGURATION.md](../CONFIGURATION.md) say what an operator sees. A guard in
   `tests/test_child_process_environment.py` fails a process start whose environment does not come
@@ -411,13 +412,19 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   removes the direct read from the child's own environment and nothing more. Running the child as
   a different account is separate, later work (ADR 0147).
 
-  **One new difference between the modes, and it can be silent.** The worker loads the config
-  directory again, in its own process, under the allowlisted environment. Config code that reads an
-  environment variable directly, at the top of a module or inside a Router or Handler, sees it under
-  `mode=off` and, unless it is on the allowlist, does not see it under `mode=subprocess`. Where the
-  code supplies a default, nothing fails: the worker builds a different graph, or a Handler takes a
-  different branch, from the one the engine loaded. Nothing compares the two today. A comparison of
-  the worker's graph with the engine's at worker start would close that, and is not built.
+  **One new difference between the modes.** The worker loads the config directory again, in its
+  own process, under the allowlisted environment. Config code that reads an environment variable
+  directly, at the top of a module or inside a Router or Handler, sees it under `mode=off` and,
+  unless it is on the allowlist, does not see it under `mode=subprocess`. Where the code supplies a
+  default, the worker can build a different graph from the one the engine loaded.
+
+  **Added 2026-10-01, the same change.** The worker now reports the shape of the graph it
+  loaded, and the engine refuses a worker whose graph differs from its own, so the difference
+  fails closed and says why. `[sandbox].pass_environment` names the extra variables a config
+  needs. The `[sandbox]` section of [CONFIGURATION.md](../CONFIGURATION.md) says what is compared
+  and what the setting refuses. **The comparison is of names.** Two graphs with one shape can
+  still differ in what a function of the same name does, and a variable read inside a Router or
+  Handler body is never compared.
 - **The boundary confines the address space, not the machine.** `os`/`subprocess`/`ctypes`/`sqlite3`/
   `http.client` are importable inside the sandbox, so a Handler can still read and write files, open
   network connections, and spawn processes **as the service account**. The forbidden-import guard
