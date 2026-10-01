@@ -15,6 +15,101 @@ with secure defaults, and AD-group→role mapping is automatic.
 
 ---
 
+## Trust boundaries and PHI data flow at a glance
+
+This diagram answers one question: where does PHI enter, rest and leave, and which control sits on
+each boundary. Each outer box is a trust zone. Each arrow names its protocol and says whether the
+hop is encrypted. The diagram shows the default posture, `[security].enforcement = "enforce"`, on
+the MLLP path, which is the HL7 v2 default. The sections below and [PHI.md](PHI.md) hold the detail
+behind each label.
+
+```mermaid
+flowchart TB
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef client fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+
+  subgraph Z_PARTNERS["Partner systems on the organization's private network"]
+    SRC["Sending system"]:::ext
+    DST["Receiving system"]:::ext
+    LKP["Lookup source<br/>(database or FHIR server)"]:::ext
+  end
+
+  subgraph Z_OPERATORS["Operator workstation"]
+    BROWSER["Operator's browser"]:::client
+    TOOLS["API clients<br/>(VS Code extension, test harness)"]:::client
+  end
+
+  subgraph Z_ENGINE["Engine host: the engine process"]
+    INB["Inbound Connection<br/>(listener)"]:::engine
+    WORK["Router and Handler workers"]:::engine
+    OUTB["Outbound Connection<br/>(delivery worker)"]:::engine
+    GATE["API and web console at /ui, one origin<br/>bound to 127.0.0.1 by default<br/>sign-in, session check,<br/>per-route permission, deny by default"]:::api
+    LOGF["Log handler filters<br/>HL7-shaped text redacted,<br/>credentials scrubbed"]:::engine
+    HOSTLOG["Service log on the engine host"]:::engine
+  end
+
+  subgraph Z_STORE["Message store: a SQLite file, or SQL Server or PostgreSQL"]
+    QUEUE["Messages and staged queue<br/>PHI columns sealed with AES-256-GCM"]:::store
+    AUDIT["Audit trail<br/>hash-chained rows"]:::store
+  end
+
+  subgraph Z_OFFBOX["Off-box services the default posture requires"]
+    SIEM["Log collector"]:::ext
+    MAIL["Mail relay"]:::ext
+  end
+
+  SRC -->|"MLLP. Encrypted with TLS when the Connection sets tls=true.<br/>A listener off loopback without TLS<br/>is refused by default"| INB
+  INB -->|"raw message committed before the ACK.<br/>Local file, or TLS to a server database"| QUEUE
+  QUEUE -->|"staged rows"| WORK
+  WORK -->|"routed and outbound rows"| QUEUE
+  QUEUE -->|"outbound rows"| OUTB
+  OUTB -->|"MLLP. Encrypted with TLS when the Connection sets tls=true.<br/>The destination must be on the egress allow-list.<br/>A cleartext hop off the host is refused by default"| DST
+  WORK -->|"Handler lookup, read statements only.<br/>The server must be on the egress allow-list"| LKP
+  BROWSER -->|"HTTPS, TLS 1.2 or later.<br/>Session cookie: HttpOnly, SameSite Strict, Secure"| GATE
+  TOOLS -->|"HTTPS, TLS 1.2 or later.<br/>Bearer session token"| GATE
+  GATE -->|"PHI reads, each gated by a permission"| QUEUE
+  GATE -->|"audit rows that name the acting user"| AUDIT
+  WORK -->|"log records"| LOGF
+  GATE -->|"log records"| LOGF
+  LOGF -->|"redacted text"| HOSTLOG
+  LOGF -->|"syslog over TLS,<br/>collector certificate verified"| SIEM
+  GATE -->|"SMTP with STARTTLS,<br/>server certificate verified by default.<br/>Account-security notices, no message content"| MAIL
+```
+
+Reading the diagram:
+
+- **PHI enters** at an inbound Connection. The listener commits the raw message to the message
+  store before it sends the ACK. The engine refuses, by default, a listener that would take
+  messages off the loopback address without TLS.
+- **PHI rests** in the message store. A store key seals the PHI columns with AES-256-GCM, and each
+  sealed value is bound to its own table, column and row. By default `serve` refuses to start
+  without a store key. The engine reaches a SQL Server or PostgreSQL store over TLS and verifies the
+  server certificate by default. It sets owner-only permissions on a SQLite store file.
+  [PHI.md section 2](PHI.md#2-where-phi-lives--data-at-rest-inventory) lists each at-rest location.
+- **PHI leaves** through an outbound Connection, or through an operator reading a message. `serve`
+  turns on `[security].block_unlisted_outbound` unless the operator sets it, so a destination or
+  lookup server that no `[egress].allowed_*` list names is refused when the config loads. A Handler
+  lookup accepts read statements only: `db_lookup` uses `[egress].allowed_db` and `fhir_lookup`
+  uses `[egress].allowed_http`.
+- **Operators** reach the engine over HTTPS. The engine serves TLS with the operator's
+  certificate, or with a self-signed pair it creates on first run. One topology differs: a declared
+  reverse proxy that terminates TLS in front of the engine.
+  [Enforcement model](#enforcement-model) states its rules.
+- **The audit trail** lives in the message store. Each row's hash covers the row before it, so an
+  edited or reordered row fails verification. Sign-ins, permission decisions and PHI reads write rows
+  that name the acting user. See [Audit](#audit).
+- **Logs** follow one rule: full message bodies go to the message store and never to the general
+  log. A filter on each log handler backs that rule. It redacts HL7-shaped text before a record is
+  written or forwarded. Under the default posture `serve` requires an off-box log collector over
+  verified TLS, and a mail relay for account-security notices.
+  [PHI.md section 7](PHI.md#7-logging--phi-redaction) covers redaction and how to treat the log
+  files.
+
+---
+
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
