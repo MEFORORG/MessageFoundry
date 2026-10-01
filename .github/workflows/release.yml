@@ -181,6 +181,15 @@ jobs:
         with:
           python-version: "3.14"
 
+      # BACKLOG #2534. The trigger above accepts any `vX.Y.Z-*` tag, and the version gate compares
+      # PEP 440 versions, so `v0.5.0-rc.1` would release a wheel saying 0.5.0rc1. A verifier holds
+      # only that wheel and must name the tag in `gh attestation verify --source-ref`, and the
+      # scaffolded CI gate rebuilds it from the wheel's version. That needs one spelling per
+      # version, so this refuses every other spelling first, before anything is built or signed.
+      - name: The tag is spelled vX.Y.Z or vX.Y.Z-(a|b|rc)N
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: python scripts/release/tag_spelling.py "$GITHUB_REF_NAME"
+
       # BACKLOG #2080. Unreleased changelog entries live as fragments under changelog.d/ until the
       # release pull request runs `changelog_fragments.py assemble`. The release notes below are read
       # from CHANGELOG.md alone, so a fragment still in the tree at the tag would be missing from them.

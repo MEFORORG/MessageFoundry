@@ -181,13 +181,13 @@ jobs:
           if [ "${#wheels[@]}" -ne 1 ]; then
             echo "::error::expected one engine wheel in dist-verify/, found ${#wheels[@]}"; exit 1
           fi
-          # The wheel spells a pre-release as PEP 440 does (0.5.0rc1); its tag is v0.5.0-rc1.
+          # The wheel spells a pre-release as PEP 440 does (0.5.0rc1); its tag is v0.5.0-rc1. The
+          # engine release refuses any other tag spelling, so this rebuild is exact.
           version=$(basename "${wheels[0]}" | cut -d- -f2)
-          if [[ "$version" =~ ^([0-9]+[.][0-9]+[.][0-9]+)((a|b|rc)[0-9]+)$ ]]; then
-            tag="v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
-          else
-            tag="v$version"
+          if [[ ! "$version" =~ ^([0-9]+[.][0-9]+[.][0-9]+)((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::engine wheel version $version has no release tag spelling"; exit 1
           fi
+          tag="v${BASH_REMATCH[1]}${BASH_REMATCH[2]:+-${BASH_REMATCH[2]}}"
           gh attestation verify "${wheels[0]}" --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref "refs/tags/$tag"
 
   check:

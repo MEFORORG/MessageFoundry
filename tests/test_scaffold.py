@@ -12,11 +12,13 @@ from pathlib import Path
 import pytest
 import yaml
 from _bash_resolver import explain_returncode, probe_env, require_bash
+from packaging.version import Version
 
 from messagefoundry import __version__
 from messagefoundry.__main__ import main
 from messagefoundry.api.tls import _generated_pair
 from messagefoundry.scaffold import scaffold
+from scripts.release.tag_spelling import allowed
 
 _EXPECTED = {
     "README.md",
@@ -115,34 +117,25 @@ _VERIFY_STEP = "Verify SLSA build provenance before install"
 _RELEASE_WORKFLOW = "MEFORORG/MessageFoundry/.github/workflows/release.yml"
 
 
-@pytest.mark.parametrize(
-    ("wheels", "source_ref"),
-    [
-        (["messagefoundry-0.4.0-py3-none-any.whl"], "refs/tags/v0.4.0"),
-        # The wheel says 0.5.0rc1; the release tag says v0.5.0-rc1, and only the tag is a real ref.
-        (["messagefoundry-0.5.0rc1-py3-none-any.whl"], "refs/tags/v0.5.0-rc1"),
-        ([], None),
-        (["messagefoundry-0.4.0-py3-none-any.whl", "messagefoundry-0.4.1-py3-none-any.whl"], None),
-    ],
-    ids=["final", "pre-release", "no-wheel", "two-wheels"],
-)
-def test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag(
-    tmp_path: Path, wheels: list[str], source_ref: str | None
-) -> None:
-    """BACKLOG #2534: run the generated step under bash with a recording ``gh`` on PATH.
-
-    The two pass rows are each other's control: one tag rule that ignored the version, or got the
-    pre-release spelling wrong, fails one of them. The refusal rows require that ``gh`` never ran,
-    so a step that verified some file other than the one engine wheel cannot pass.
-    """
-    repo = tmp_path / "repo"
+@pytest.fixture(scope="module")
+def verify_step(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
+    """The generated verify step written to disk, and a bash that can run it, found once per module."""
+    root = tmp_path_factory.mktemp("verify-step")
+    repo = root / "repo"
     scaffold(repo)
     ci = yaml.safe_load((repo / ".github" / "workflows" / "check.yml").read_text(encoding="utf-8"))
     [step] = [s for s in ci["jobs"]["verify-engine"]["steps"] if s.get("name") == _VERIFY_STEP]
-    script = tmp_path / "verify.sh"
+    script = root / "verify.sh"
     # Bytes, so Windows does not turn each newline into CRLF, which bash would read as part of a line.
     script.write_bytes(str(step["run"]).encode("utf-8"))
+    return require_bash(root), script
 
+
+def _run_verify_step(
+    verify_step: tuple[str, Path], tmp_path: Path, wheels: list[str]
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run the step with ``wheels`` in dist-verify/ and a ``gh`` on PATH that records its argv."""
+    bash, script = verify_step
     work = tmp_path / "work"
     (work / "dist-verify").mkdir(parents=True)
     for wheel in wheels:
@@ -153,8 +146,6 @@ def test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag(
     stub.write_bytes(b'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$GH_LOG"\n')
     stub.chmod(0o755)
     log = tmp_path / "gh.log"
-
-    bash = require_bash(tmp_path)
     env = probe_env(Path(bash), dict(os.environ))
     env["PATH"] = f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}"
     env["GH_LOG"] = log.as_posix()
@@ -166,25 +157,62 @@ def test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag(
         text=True,
         timeout=60,
     )
-    output = proc.stdout + proc.stderr
+    return proc, log
 
-    if source_ref is None:
-        assert proc.returncode == 1, f"{explain_returncode(proc.returncode)}\n{output}"
-        assert "expected one engine wheel" in output, output
-        assert not log.exists(), f"gh ran although the step should have refused: {log.read_text()}"
-        return
+
+@pytest.mark.parametrize(
+    "tag", ["v0.4.0", "v1.10.0", "v0.5.0-a1", "v0.5.0-b2", "v0.5.0-rc1", "v2.0.0-rc10"]
+)
+def test_the_scaffolded_verify_step_rebuilds_the_release_tag(
+    verify_step: tuple[str, Path], tmp_path: Path, tag: str
+) -> None:
+    """BACKLOG #2534: the gate names the release workflow and the exact tag the wheel came from.
+
+    Each tag here is one the release accepts (scripts/release/tag_spelling.py), and its wheel says
+    the version as PEP 440 normalises it, which is what the release's own version gate requires.
+    So the step must turn that wheel back into this tag: a final, an alpha, a beta and two rcs.
+    """
+    assert allowed(tag), f"{tag} is not a tag the release accepts, so this row tests nothing real"
+    wheel = f"messagefoundry-{Version(tag[1:])}-py3-none-any.whl"
+    proc, log = _run_verify_step(verify_step, tmp_path, [wheel])
+    output = proc.stdout + proc.stderr
     assert proc.returncode == 0, f"{explain_returncode(proc.returncode)}\n{output}"
     assert log.read_text(encoding="utf-8").splitlines() == [
         "attestation",
         "verify",
-        f"dist-verify/{wheels[0]}",
+        f"dist-verify/{wheel}",
         "--repo",
         "MEFORORG/MessageFoundry",
         "--signer-workflow",
         _RELEASE_WORKFLOW,
         "--source-ref",
-        source_ref,
+        f"refs/tags/{tag}",
     ]
+
+
+@pytest.mark.parametrize(
+    ("wheels", "message"),
+    [
+        ([], "expected one engine wheel"),
+        (
+            ["messagefoundry-0.4.0-py3-none-any.whl", "messagefoundry-0.4.1-py3-none-any.whl"],
+            "expected one engine wheel",
+        ),
+        # No release tag spells these, so the step refuses rather than guess one.
+        (["messagefoundry-0.4.0.post1-py3-none-any.whl"], "has no release tag spelling"),
+        (["messagefoundry-0.5.0.dev1-py3-none-any.whl"], "has no release tag spelling"),
+    ],
+    ids=["no-wheel", "two-wheels", "post-release", "dev-release"],
+)
+def test_the_scaffolded_verify_step_refuses_what_it_cannot_verify(
+    verify_step: tuple[str, Path], tmp_path: Path, wheels: list[str], message: str
+) -> None:
+    """The refusals require that ``gh`` never ran, so no other file can be verified instead."""
+    proc, log = _run_verify_step(verify_step, tmp_path, wheels)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, f"{explain_returncode(proc.returncode)}\n{output}"
+    assert message in output, output
+    assert not log.exists(), f"gh ran although the step should have refused: {log.read_text()}"
 
 
 def test_scaffold_refuses_nonempty_without_force(tmp_path: Path) -> None:
