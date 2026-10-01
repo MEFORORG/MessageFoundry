@@ -202,7 +202,7 @@ The PySide6 **desktop console was retired** and `messagefoundry/console/` delete
 | Home authoring page (webview launchpad) | ✅ | Wizards / test & data / operate / setup actions in one panel |
 | Wizards — Route, Connection, Router, Handler, Alert | ✅ | Route = IB→Router→Handler→OB in one flow; Connection also has a keyboard-only variant; Alert edits the service TOML's `[[alerts.rules]]` (ADR 0014) |
 | Test Bench (dry-run + before/after diff + debug step-through) | ✅ | |
-| Live Debug — annotate the code on save from a synthetic dry-run | ✅ | Disposition summary + per-line values; message-derived values **redacted by default** behind a separate *Reveal Values* toggle, synthetic samples only, never a real engine; debounced (`liveDebug.debounceMs`) |
+| Live Debug — annotate the code on save from a synthetic dry-run | ✅ | Disposition summary + per-line values; message-derived values **redacted by default**; *Reveal Values for One Run* shows real values for that one run and the next run is masked again, synthetic samples only, never a real engine; debounced (`liveDebug.debounceMs`) |
 | Steps view over a Handler `.py` | ✅ | ADR 0076 — a custom editor over the *real* Python via `messagefoundry lens parse` / `lens rewrite`; plain `.py` stays the only artifact and the only execution path |
 | Wiring Map (read-only graph panel) | ✅ | Open from the Components title bar or *Show in Wiring Map*; no drag-drop and no editing of any kind |
 | Insert Element + scaffold snippets + Cookbook | ✅ | `Ctrl+Alt+I` / `Cmd+Alt+I`, the bundled Python snippet set, and a searchable gallery of solved problems — each drops real, editable Python |
