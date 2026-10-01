@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-import os
 import random
 import re
 import time
@@ -353,24 +352,53 @@ def test_a_ref_outside_the_repository_is_reported_and_never_probed(
     assert "0012 links a path outside the repository" in capsys.readouterr().out
 
 
-@pytest.mark.skipif(os.name != "nt", reason="device names are a Windows path rule")
-def test_a_windows_device_ref_is_outside_the_repository(tmp_path: Path) -> None:
-    # ``tests/NUL`` opens the NUL device from any directory, so it "exists" without being a file
-    # in the repository. Before the fix it counted as covered.
+#: A component whose stem is a DOS device name. Windows opens the device for each of these on some
+#: release -- ``tests/NUL`` from any directory, ``nul.py`` on windows-2022 but not on newer ones --
+#: so the rule refuses all of them on every host rather than ask the one it runs on.
+_DEVICE_REFS = [
+    "tests/NUL",
+    "tests/nul.py",
+    "fixtures/con.hl7",
+    "tests/Aux.tar.gz",
+    "tests/com1.txt",
+    "tests/LPT9",
+    "tests/prn./x.py",
+    "harness/nul/x.py",
+]
+#: Names that only contain a device name, or extend one. Ordinary paths, on every host.
+_LOOKALIKE_REFS = ["tests/null.py", "tests/console.py", "tests/com10.py", "tests/my_nul.py"]
+
+
+def test_a_dos_device_ref_is_outside_the_repository_on_every_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     adr, root = _repo(tmp_path)
+    refs = [*_DEVICE_REFS, "tests/test_real.py", *_LOOKALIKE_REFS]
     _write(
         adr,
         "0014-dev.md",
         "# 0014 - Dev\n\n- **Status:** Accepted\n\n## Acceptance Criteria\n\n"
-        "- **AC-1** - THE SYSTEM SHALL do it. -> `tests/NUL`\n"
-        "- **AC-2** - THE SYSTEM SHALL do it. -> `tests/test_real.py`\n"
-        "- **AC-3** - THE SYSTEM SHALL do it. -> `tests/nul.py`\n",
+        + "".join(f"- **AC-{i}** - THE SYSTEM SHALL do it. -> `{r}`\n" for i, r in enumerate(refs)),
     )
-    device, real, lookalike = analyze_adrs(adr, repo_root=root).reports[0].criteria
-    assert real.covered  # control: an ordinary ref beside it is unaffected
-    assert device.outside_refs == ["tests/NUL"] and not device.covered
-    # A name that only starts like a device is an ordinary path in the repository: probed, missing.
-    assert lookalike.outside_refs == [] and lookalike.missing_refs == ["tests/nul.py"]
+    probed: list[str] = []
+    real_exists = Path.exists
+
+    def recording_exists(self: Path, *, follow_symlinks: bool = True) -> bool:
+        probed.append(self.as_posix())
+        return real_exists(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "exists", recording_exists)
+    criteria = analyze_adrs(adr, repo_root=root).reports[0].criteria
+    by_ref = {c.test_refs[0]: c for c in criteria}
+    assert len(by_ref) == len(refs)  # one criterion per ref, each parsed
+    assert by_ref["tests/test_real.py"].covered  # control: an ordinary ref is unaffected
+    for ref in _DEVICE_REFS:
+        assert by_ref[ref].outside_refs == [ref] and not by_ref[ref].covered, ref
+    for ref in _LOOKALIKE_REFS:
+        assert by_ref[ref].outside_refs == [] and by_ref[ref].missing_refs == [ref], ref
+    # The lookalikes were probed, and no device ref ever was.
+    assert sum(any(p.endswith(ref) for p in probed) for ref in _LOOKALIKE_REFS) == 4
+    assert not [ref for ref in _DEVICE_REFS if any(p.endswith(ref) for p in probed)]
 
 
 def test_control_characters_in_record_text_are_escaped_on_the_terminal(

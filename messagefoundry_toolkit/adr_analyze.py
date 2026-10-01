@@ -8,8 +8,8 @@ Architecture Decision Records and report, **advisory-only** (never blocks a comm
 * **Acceptance-criteria coverage** — for each ADR carrying an ``## Acceptance Criteria`` block (EARS,
   per the ADR ``TEMPLATE.md`` / R1), the test/fixture each criterion links to (``→ tests/…``), and
   whether that file exists on disk. A *coverage gap* is a criterion whose linked test is missing.
-  A link whose path climbs out of the repository root with ``..``, or names a Windows device, is
-  reported as outside the repository and never probed.
+  A link whose path climbs out of the repository root with ``..``, or names a DOS device such as
+  ``NUL`` or ``nul.py``, is reported as outside the repository on every platform, never probed.
 * **Missing criteria** — an ``Accepted`` ADR with no acceptance-criteria block (recommended to add).
 * **Open clarifications** — unchecked ``- [ ]`` task items (the "clarify" step): questions that
   should be resolved before an ADR flips to ``Accepted``.
@@ -200,19 +200,36 @@ def _title(text: str, fallback: str) -> str:
     return fallback
 
 
-def _inside(ref_path: str, repo_root: Path) -> str | None:
+#: The DOS device names. Windows opens the device for one of these wherever it sits in a path.
+#: ``_REF_RE`` admits ASCII only, so the superscript-digit ``COM`` and ``LPT`` forms and the ``$``
+#: names such as ``CONIN$`` cannot reach :func:`_inside`, and are not listed.
+_DOS_DEVICES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"{name}{n}" for name in ("COM", "LPT") for n in range(1, 10)}
+)
+
+
+def _inside(ref_path: str) -> str | None:
     """A ref's path normalised, or None when it leaves the repository root.
 
-    Decided without touching the filesystem, so a ref that escapes is never probed. ``abspath`` is
-    string work, and on Windows it is the OS's own path rule, so it sees both ways out: ``..``, and
-    a device name such as ``tests/NUL``, which opens the device wherever it sits. A name that only
-    starts like one, ``tests/nul.py``, stays inside. The normalised form is what gets probed, so
-    ``tests/sub/../x`` means the same on every OS. A symbolic link inside the root is still
-    followed; this reads the text, not the tree.
+    Decided on the text alone, the same way on every host, so a ref that escapes is never probed.
+    ``_REF_RE`` admits only ``/`` as a separator and no drive, colon or leading slash, which leaves
+    two ways out. One is ``..``. The other is a component whose stem, the part before its first
+    dot with trailing dots and spaces dropped, is a DOS device name in any case: ``tests/NUL``,
+    ``tests/nul.py`` and ``fixtures/con.hl7`` are all outside. Windows itself disagrees by version
+    on a name with an extension -- windows-2022 opens the device for ``nul.py`` and newer releases
+    do not -- so the rule takes the older, wider reading rather than asking the host. A name that
+    only CONTAINS one stays inside: ``tests/null.py``, ``tests/console.py``, ``tests/com10.py``,
+    ``tests/my_nul.py``. The normalised form is what gets probed, so ``tests/sub/../x`` means the
+    same on every OS. A symbolic link inside the root is still followed; this reads the text, not
+    the tree.
     """
     norm = posixpath.normpath(ref_path)
-    root = Path(os.path.abspath(repo_root))
-    return norm if Path(os.path.abspath(root / norm)).is_relative_to(root) else None
+    if norm == ".." or norm.startswith("../"):
+        return None
+    for part in norm.split("/"):
+        if part.split(".", 1)[0].rstrip(". ").upper() in _DOS_DEVICES:
+            return None
+    return norm
 
 
 def _criteria(lines: list[str], repo_root: Path) -> list[AcceptanceCriterion]:
@@ -240,7 +257,7 @@ def _criteria(lines: list[str], repo_root: Path) -> list[AcceptanceCriterion]:
         outside: list[str] = []
         missing: list[str] = []
         for ref in refs:
-            ref_path = _inside(ref.split("::", 1)[0], repo_root)
+            ref_path = _inside(ref.split("::", 1)[0])
             if ref_path is None:
                 outside.append(ref)
             elif not (repo_root / ref_path).exists():
