@@ -38,11 +38,16 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, *, admin_write_rate_limit: bool = True) -> AuthService:
     # Channel-scope RBAC test, not an MFA test: pin require_mfa=False so the admin's step-up scope
     # endpoint isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
     service = AuthService(
-        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            admin_write_rate_limit_enabled=admin_write_rate_limit,
+            require_mfa=False,
+        ),
     )
     await service.initialize()
     return service
@@ -179,8 +184,9 @@ async def test_scoped_user_connection_control_and_purge(engine: Engine) -> None:
 
 
 async def test_scoped_user_cannot_test_or_read_shared_outbound(engine: Engine) -> None:
-    # A graph so the outbound exists (an unscoped caller gets 404 for a missing name; a scoped one
-    # gets 403, BACKLOG #2551). A channel-scoped operator may probe/read their OWN inbound, but a shared outbound — which
+    # A graph so the outbound exists. A scoped caller gets the same 403 for a missing name since
+    # BACKLOG #2551, so these 403s alone no longer prove OB_X exists; the parity test below pins
+    # the outbound branch with a control. A channel-scoped operator may probe/read their OWN inbound, but a shared outbound — which
     # spans channels — is off-limits, mirroring the purge boundary.
     reg = Registry()
     reg.add_inbound(
@@ -336,9 +342,11 @@ async def _probe(
     c: httpx.AsyncClient, engine: Engine, h: dict[str, str], method: str, path: str
 ) -> tuple[int, object, list[tuple[str, str | None]]]:
     """One request's status, JSON body, and the audit rows it wrote as (action, channel_id)."""
-    seen = {r["id"] for r in await engine.store.list_audit(limit=10_000)}
+    latest = await engine.store.list_audit(limit=1)  # newest first
+    last_id = latest[0]["id"] if latest else 0
     r = await c.request(method, path, headers=h)
-    rows = [r2 for r2 in await engine.store.list_audit(limit=10_000) if r2["id"] not in seen]
+    # One request writes a few rows at most, so the newest 50 hold all of them.
+    rows = [r2 for r2 in await engine.store.list_audit(limit=50) if r2["id"] > last_id]
     return r.status_code, r.json(), [(row["action"], row["channel_id"]) for row in rows]
 
 
@@ -361,17 +369,9 @@ async def test_scoped_caller_cannot_tell_which_connection_names_exist(engine: En
     )
     reg.add_router("r", lambda m: [])
     engine.add_registry(reg)
-    # As _service, with the per-actor admin-write ceiling off: this test sends about thirty paced
-    # writes from one actor, and a 429 would hide the answer under test.
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            admin_write_min_interval_seconds=0,
-            admin_write_rate_limit_enabled=False,
-            require_mfa=False,
-        ),
-    )
-    await service.initialize()
+    # The per-actor admin-write ceiling is off: this test sends about thirty paced writes from one
+    # actor, and a 429 would hide the answer under test.
+    service = await _service(engine, admin_write_rate_limit=False)
     scoped_uid = await _add(service, "op", Role.OPERATOR)
     # IB_GONE is in the scope and exists nowhere: the in-scope control below.
     await service.set_channel_scope(scoped_uid, ["IB_A", "IB_GONE"], actor="admin")

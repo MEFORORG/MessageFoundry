@@ -1308,13 +1308,6 @@ the same permission set on the same method reds CI until it is listed here.
 > rather than relabelled — its dashboard row, its graph node and its live status all disappear, because
 > an outbound spans channels and its state can reflect another channel's downstream.
 > `GET /connections/{name}/events` and `GET /connections/{name}/metadata` answer 403 outside the scope.
-> At least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`, `/test-credential`,
-> `/start`, `/stop` and `/restart` give a scoped caller one 403, one body and one
-> `auth.channel_denied` row for an inbound outside the scope, a shared outbound, and a name that
-> exists nowhere, so their answers do not say which names exist (BACKLOG #2551). An unknown name
-> inside the caller's own scope still answers 404. This does not hide names everywhere: the
-> Prometheus exposition, below, carries every connection name, and `POST /connections/{name}/flag`
-> has no per-channel check.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
@@ -1324,6 +1317,16 @@ the same permission set on the same method reds CI until it is listed here.
 > This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
 > route above against a scoped caller with an all-channels caller as the control, and reds if the
 > prose and the app disagree.
+
+> **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
+> This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
+> `/test-credential`, `/start`, `/stop` and `/restart`. Each checks the scope before it looks the
+> name up. A scoped caller gets one 403, one body and one `auth.channel_denied` row in three cases:
+> an inbound outside its scope, a shared outbound, and a name that exists nowhere. A name in the
+> caller's own scope that exists nowhere still answers 404, as any unknown name does for an
+> unscoped caller. Names still show elsewhere. At least the Prometheus exposition above and
+> `GET /alerts/rules` list them, and `POST /connections/{name}/flag` has no per-channel check.
+> `tests/test_channel_rbac.py` pins the six routes, not that list.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
