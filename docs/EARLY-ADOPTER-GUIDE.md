@@ -151,10 +151,10 @@ version**, the same way you pin any other production dependency. Create a venv a
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install "messagefoundry==0.5.0"        # pin the exact engine version (core runtime only)
+pip install "messagefoundry==0.5.1"        # pin the exact engine version (core runtime only)
 ```
 
-`messagefoundry==0.5.0` pulls only the **core runtime** — what a headless engine needs. Add extras
+`messagefoundry==0.5.1` pulls only the **core runtime** — what a headless engine needs. Add extras
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
 as its own `messagefoundry-webconsole` wheel.
 
@@ -172,7 +172,7 @@ is required, and 2.102.0 or later is recommended, because older `gh` gives a wea
 optionally `sigstore` (`pip install sigstore`). Install **only** the file that passes:
 
 ```powershell
-$V = "0.5.0"   # the exact version you intend to install, as its wheel spells it
+$V = "0.5.1"   # the exact version you intend to install, as its wheel spells it
 # Its tag's spelling. A pre-release wheel says 0.5.0rc1, while its tag is v0.5.0-rc1.
 $TagVersion = $V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2'
 
