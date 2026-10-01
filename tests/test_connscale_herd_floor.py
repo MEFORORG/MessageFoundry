@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import functools
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -373,3 +374,51 @@ def test_an_armed_leg_says_enforced_in_both_emitters() -> None:
         and "ENFORCED on this leg" not in unarmed
     )
     assert payload_enforced(True) is True and payload_enforced(False) is False
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "a" * 200_000 + "-py",  # no version after the separator
+        "a" * 200_000 + "-py" + "1." * 100_000 + "x",  # a long version that fails at the very end
+        "-py" * 100_000,  # separators all the way down
+        "a-" * 100_000 + "py3.14x",  # a letter in the version, at the very end
+    ],
+    ids=["no-version", "long-version-bad-tail", "separators-only", "letter-in-version"],
+)
+def test_a_hostile_long_leg_is_refused_in_linear_time(hostile: str) -> None:
+    # The parser is plain string handling, so a value built to make a regex backtrack costs one pass.
+    started = time.perf_counter()
+    with pytest.raises(ConnScaleProfileError, match="empty_claims_herd_floor_legs"):
+        load_connscale_profile_text(
+            _profile_text_with(f"empty_claims_herd_floor_legs = ['{hostile}']"), where="<unit>"
+        )
+    assert time.perf_counter() - started < 2.0
+
+
+@pytest.mark.parametrize(
+    ("leg", "ok"),
+    [
+        ("ubuntu-latest-py3.14", True),
+        ("windows-2022-py3.14", True),
+        ("a-py3-py3.14", True),  # an os part may itself contain -py; the last one separates
+        ("ubuntu-latest-py3", True),
+        ("ubuntu-latest py3.14", False),
+        ("ubuntu-latest-py", False),
+        ("ubuntu-latest-py3..14", False),
+        ("ubuntu-latest-py3.14.", False),
+        ("-ubuntu-py3.14", False),
+        ("_ubuntu-py3.14", False),
+        ("ubu ntu-py3.14", False),
+        ("-py3.14", False),
+    ],
+)
+def test_the_leg_parser_accepts_exactly_the_old_patterns_language(leg: str, ok: bool) -> None:
+    # The cases the replaced regex [A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)* decided, decided the
+    # same way by the string parser that replaced it.
+    text = _profile_text_with(f"empty_claims_herd_floor_legs = ['{leg}']")
+    if ok:
+        assert load_connscale_profile_text(text, where="<unit>").slo.empty_claims_herd_floor_legs
+    else:
+        with pytest.raises(ConnScaleProfileError):
+            load_connscale_profile_text(text, where="<unit>")

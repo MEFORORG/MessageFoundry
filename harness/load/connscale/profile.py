@@ -19,7 +19,6 @@ so a broken profile is rejected before any engine is spawned. All numbers are ge
 
 from __future__ import annotations
 
-import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -436,7 +435,7 @@ def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
         # The shape is checked, not just non-emptiness: the harvest report prints a leg with a SPACE
         # ("ubuntu-latest py3.14"), and a leg copied from it would parse, never match, and disarm the
         # floor with nothing reporting it.
-        if not isinstance(item, str) or not _LEG.fullmatch(item.strip()):
+        if not isinstance(item, str) or not _is_leg(item.strip()):
             raise ConnScaleProfileError(
                 f"{where}: every 'empty_claims_herd_floor_legs' entry must name a CI leg as "
                 f"'<os>-py<version>' with no spaces, e.g. 'ubuntu-latest-py3.14'; got {item!r}"
@@ -446,8 +445,25 @@ def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-#: A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``.
-_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)*")
+_LEG_OS_HEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+_LEG_OS_TAIL = _LEG_OS_HEAD | frozenset("._-")
+
+
+def _is_leg(text: str) -> bool:
+    """A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``.
+
+    Plain string parsing, linear in the input, so a hostile profile value cannot make it backtrack.
+    The version holds only digits and dots, so the separator is always the LAST ``-py``. The os part
+    starts with an ASCII letter or digit and then allows ``.``, ``_`` and ``-``; the version is one
+    or more groups of decimal digits joined by single dots.
+    """
+    os_name, sep, version = text.rpartition("-py")
+    if not sep or not os_name or os_name[0] not in _LEG_OS_HEAD:
+        return False
+    if not set(os_name) <= _LEG_OS_TAIL:
+        return False
+    # isdecimal is exactly what the regex's \d accepted (Unicode category Nd), kept identical.
+    return all(part.isdecimal() for part in version.split("."))
 
 
 def _claim_modes_from(raw: Any, where: str) -> tuple[str, ...]:

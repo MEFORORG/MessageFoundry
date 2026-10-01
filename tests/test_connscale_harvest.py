@@ -1049,10 +1049,10 @@ def test_the_json_is_written_before_a_csv_directory_that_cannot_be(
 
 def test_payload_text_cannot_run_as_a_spreadsheet_formula(tmp_path: Path) -> None:
     result = _result_with([_reading(ch.POST_2024, "ubuntu-latest py3.14", -1.5, "success")])
-    result.readings[0] = dataclasses.replace(result.readings[0], lane="=HYPERLINK(1)")
+    result.readings[0] = dataclasses.replace(result.readings[0], lane="   =HYPERLINK(1)")
     ch.write_csvs(result, tmp_path)
     (row,) = csv.DictReader((tmp_path / "readings.csv").open(encoding="utf-8"))
-    assert row["lane"] == "'=HYPERLINK(1)"
+    assert row["lane"] == "'   =HYPERLINK(1)"  # a trigger behind spaces too: the canonical rule
     assert row["value"] == "-1.5", "a number is never quoted, so a negative reading stays one"
 
 
@@ -1067,3 +1067,11 @@ def test_a_saved_row_off_the_csv_header_is_a_clean_error(
     path.write_text(json.dumps(saved), encoding="utf-8")
     assert ch.main(["--from-json", str(path), "--csv-dir", str(tmp_path / "csv")]) == 2
     assert "cannot write CSVs" in capsys.readouterr().err
+
+
+def test_the_csv_writer_uses_the_canonical_rule_not_a_copy() -> None:
+    # ASVS 1.2.10: tests/test_csv_formula_consistency.py records this writer as routing every cell
+    # through the engine's rule. Identity, so a local copy swapped back in reds here.
+    # Checked by name, not by import: this test is in the tooling tier, which imports no engine code.
+    fn = ch.spreadsheet_safe
+    assert (fn.__module__, fn.__qualname__) == ("messagefoundry.spreadsheet", "spreadsheet_safe")

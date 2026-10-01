@@ -97,6 +97,14 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
+# Anchor on the script, not on whatever sys.path offers (the same insert as kerberos_epa_spike.py),
+# so the canonical spreadsheet rule below is this checkout's own.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# ASVS 1.2.10: the --csv-dir writer is a recorded spreadsheet writer, and its cells go through the
+# one canonical formula-injection rule (tests/test_csv_formula_consistency.py), never a local copy.
+from messagefoundry.spreadsheet import spreadsheet_safe as spreadsheet_safe  # noqa: E402
+
 DEFAULT_REPO = "MEFORORG/MessageFoundry"
 DEFAULT_WORKFLOW = "ci.yml"
 #: No branch filter by default. The runs listing matches ``branch=`` against a run's head branch,
@@ -977,22 +985,15 @@ def from_json_dict(data: dict[str, Any]) -> Harvest:
     return result
 
 
-def _csv_safe(value: object) -> object:
-    """Payload-derived TEXT that a spreadsheet would run as a formula gets a leading quote.
-
-    Numbers pass untouched, so a negative reading stays a number. Text such as a lane name comes from
-    a CI artifact, and the CSVs are committed for a reader to open.
-    """
-    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
-        return "'" + value
-    return value
-
-
 def write_csvs(result: Harvest, out_dir: Path) -> list[Path]:
     """Every reading, every job and every unjoined artifact as CSV, one row each.
 
     CSV because it is the form a reader checks a number in, and it is a fraction of the JSON's size
     when committed beside a decision that rests on it (BACKLOG #1415 criterion 1.3).
+
+    EVERY CELL goes through the canonical ``spreadsheet_safe`` (ASVS 1.2.10). Text such as a lane
+    name or a reason comes from a CI artifact; numbers and ``None`` pass through it untouched, so a
+    negative reading stays a number.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     tables: list[tuple[str, list[str], list[dict[str, Any]]]] = [
@@ -1010,7 +1011,7 @@ def write_csvs(result: Harvest, out_dir: Path) -> list[Path]:
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=header, lineterminator="\n")
             writer.writeheader()
-            writer.writerows({k: _csv_safe(v) for k, v in row.items()} for row in rows)
+            writer.writerows({k: spreadsheet_safe(v) for k, v in row.items()} for row in rows)
         written.append(path)
     return written
 

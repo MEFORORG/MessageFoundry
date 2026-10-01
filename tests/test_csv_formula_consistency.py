@@ -179,6 +179,11 @@ _RECORDED_SPREADSHEET_WRITERS = {
     ),
     "harness/load/report.py": "escapes profile/phase/kind; other columns are numeric",
     "harness/load/connscale/report.py": "escapes profile/claim_mode/sweep_mode; others numeric",
+    "scripts/connscale_harvest.py": (
+        "--csv-dir: every cell of readings/jobs/unjoined goes through the engine's canonical "
+        "messagefoundry.spreadsheet.spreadsheet_safe (lane, reason and name come from CI artifacts); "
+        "numbers and None pass through it untouched (BACKLOG #1415)"
+    ),
     "scripts/security/vuln_metrics.py": (
         "no free-text cell: every value is an ISO date, a formatted number, a count, or an 'n/a: …' "
         "string, so no cell can begin with '=', '+', '@', TAB/CR/LF or NUL. A formatted median CAN "
