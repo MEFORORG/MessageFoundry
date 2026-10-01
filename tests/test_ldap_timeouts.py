@@ -49,7 +49,9 @@ from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, _ldap3_rece
 from messagefoundry.config.settings import AuthSettings
 
 _CONNECT_TIMEOUT = 7.5  # deliberately not the default, so a hardcoded literal cannot pass
-_RECEIVE_TIMEOUT = 9.25  # fractional on purpose: ldap3 needs an int on POSIX (see below)
+# Deliberately not the default, AFTER rounding: its ceiling is 12, not the default's 10, so a
+# hardcoded 10 cannot pass. Fractional on purpose: ldap3 needs an int on POSIX (see below).
+_RECEIVE_TIMEOUT = 11.25
 
 
 def _ad_settings(**over: Any) -> AuthSettings:
@@ -215,7 +217,6 @@ def _assert_all_finite(rec: _Recorder) -> None:
             f"ldap3.Connection #{i} receive_timeout {value!r} is not [auth].ad_receive_timeout "
             "rounded up to whole seconds"
         )
-        struct.pack("LL", value, 0)  # ldap3's own POSIX call; raises struct.error on a float
 
 
 # --- runtime guard ------------------------------------------------------------------------------
@@ -507,6 +508,43 @@ def test_every_ldap3_construction_site_passes_a_timeout() -> None:
         "ldap3 construction site(s) passing an explicitly UNBOUNDED timeout — the keyword is present "
         f"but means 'wait forever' (ASVS 13.1.3): {unbounded}"
     )
+    # A Connection's receive_timeout must go through _ldap3_receive_timeout. A raw settings float
+    # passes every check above and still raises struct.error on every non-Windows host, and the
+    # runtime fakes see only the sites a test happens to drive.
+    unconverted = [
+        f"Connection at {module}:{line} passes receive_timeout={ast.unparse(value)}"
+        for attr, module, line, kwargs in sites
+        if attr == "Connection"
+        and (value := kwargs.get("receive_timeout")) is not None
+        and not _is_receive_timeout_call(value)
+    ]
+    assert not unconverted, (
+        "ldap3.Connection site(s) passing receive_timeout without _ldap3_receive_timeout(); ldap3 "
+        f"struct.pack()s it on POSIX, so a float breaks every AD connection on Linux: {unconverted}"
+    )
+
+
+def _is_receive_timeout_call(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = (
+        func.id
+        if isinstance(func, ast.Name)
+        else func.attr
+        if isinstance(func, ast.Attribute)
+        else None
+    )
+    return name == "_ldap3_receive_timeout"
+
+
+def test_the_receive_timeout_guard_discriminates() -> None:
+    """Control for the guard above: it must refuse the raw settings attribute the engine used to
+    pass, and accept the wrapped form, or its green on the real tree measures nothing."""
+    raw = ast.parse("self._s.ad_receive_timeout", mode="eval").body
+    wrapped = ast.parse("_ldap3_receive_timeout(self._s.ad_receive_timeout)", mode="eval").body
+    assert not _is_receive_timeout_call(raw)
+    assert _is_receive_timeout_call(wrapped)
 
 
 def test_static_walker_sees_the_bare_import_call_form() -> None:
@@ -576,6 +614,17 @@ def test_ad_timeout_rejects_an_unbounded_value(bad: float) -> None:
         _ad_settings(ad_connect_timeout=bad)
     with pytest.raises(ValueError, match="finite number of seconds"):
         _ad_settings(ad_receive_timeout=bad)
+
+
+@pytest.mark.parametrize("field", ["ad_connect_timeout", "ad_receive_timeout"])
+def test_ad_timeout_rejects_a_value_that_overflows_the_socket(field: str) -> None:
+    """A huge finite value raises OverflowError in socket.settimeout, which no LdapError handler
+    catches. The bound itself is accepted, so the refusal is the cap and not something else."""
+    assert getattr(_ad_settings(**{field: 3600.0}), field) == 3600.0
+    with pytest.raises(ValueError, match="at most 3600 seconds"):
+        _ad_settings(**{field: 3600.5})
+    with pytest.raises(ValueError, match="at most 3600 seconds"):
+        _ad_settings(**{field: 1e300})
 
 
 # --- resource release: the failed-bind path is the common adversarial case ----------------------

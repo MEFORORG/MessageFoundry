@@ -143,9 +143,11 @@ def _ldap3_receive_timeout(seconds: float) -> int:
     byte reached the domain controller: AD sign-in could not work there at all. Windows hides it,
     because ldap3 converts with ``int(1000 * t)`` on that branch.
 
-    Rounds UP, never to nearest: the result is never shorter than the operator configured and never
-    zero, which ldap3 reads as "wait forever" (ASVS 13.1.3). The POSIX branch drops sub-second
-    precision anyway (``tv_usec`` is always 0), so ``ceil`` loses nothing that branch could keep.
+    Rounds UP, never to nearest, so the result is never shorter than the operator configured. The
+    cost is a timeout up to one second longer on every OS: ldap3 first calls
+    ``socket.settimeout(receive_timeout)``, which would have kept sub-second precision. Rounding up
+    also never yields 0. The settings validator already refuses values <= 0, and 0 would make
+    ``settimeout`` turn the socket non-blocking, so every read would fail at once.
     """
     return math.ceil(seconds)
 
