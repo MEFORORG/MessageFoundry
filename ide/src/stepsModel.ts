@@ -177,8 +177,16 @@ export function looksLikeUnknownArgument(text: string): boolean {
   return UNKNOWN_ARG_RE.test(text);
 }
 
-/** {@link looksLikeUnknownArgument} over a thrown value (the `runJson*` failure path). */
+/**
+ * {@link looksLikeUnknownArgument} over a thrown value (the `runJson*` failure path). A cliJson
+ * `CliOutputError` no longer quotes the CLI's output, so its verdict travels as `argumentRejected`,
+ * decided where the output was read. Checked by shape, because cliJson imports this module.
+ */
 export function isUnknownArgumentError(err: unknown): boolean {
+  const rejected = err instanceof Error ? (err as { argumentRejected?: unknown }).argumentRejected : undefined;
+  if (typeof rejected === "boolean") {
+    return rejected;
+  }
   return looksLikeUnknownArgument(err instanceof Error ? err.message : String(err));
 }
 

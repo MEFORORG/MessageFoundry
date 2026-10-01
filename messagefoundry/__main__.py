@@ -27,6 +27,7 @@ from __future__ import annotations
 __lazy_modules__ = ["sqlite3", "tomllib"]
 
 import argparse
+import contextlib
 import functools
 import json
 import logging
@@ -4586,6 +4587,16 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
         return PipelineSettings().snapshot_on_send
 
 
+def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
+    """Send a print() in the author's own code to stderr for the duration of one call.
+
+    ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
+    one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
+    the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
+    ``_print_json`` still write to the real stdout (vault BACKLOG #1187)."""
+    return contextlib.redirect_stdout(sys.stderr)
+
+
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
@@ -4596,7 +4607,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return resolved
     config_dir, service_config = resolved
     try:
-        reg = load_config(config_dir)
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
@@ -4624,13 +4636,14 @@ def _dryrun(args: argparse.Namespace) -> int:
         traced: list[dict[str, Any]] = []
         try:
             for source, path, raw in messages:
-                entry = trace_dry_run(
-                    reg,
-                    raw,
-                    inbound=args.inbound,
-                    show_phi=show_phi,
-                    snapshot_on_send=snapshot_on_send,
-                )
+                with _author_prints_to_stderr():
+                    entry = trace_dry_run(
+                        reg,
+                        raw,
+                        inbound=args.inbound,
+                        show_phi=show_phi,
+                        snapshot_on_send=snapshot_on_send,
+                    )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
             return _emit_error(str(exc), as_json=args.json)
@@ -4640,7 +4653,8 @@ def _dryrun(args: argparse.Namespace) -> int:
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            with _author_prints_to_stderr():
+                result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
             out.append(
                 {
                     "source": source,
