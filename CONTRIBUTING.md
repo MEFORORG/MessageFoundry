@@ -173,15 +173,16 @@ These are the routes, and this section is where they are recorded:
 
 - **A fix or a feature:** open a pull request. A bug fix carries a test that reproduces the bug.
 - **A bug you cannot fix yourself:** post it in the
-  [Bugs category of GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions/categories/bugs).
-  The maintainers watch that category. Reproduce it on the latest release first, because that is
-  the only supported version ([docs/SUPPORT-POLICY.md](docs/SUPPORT-POLICY.md)).
+  [Bugs category of GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions/categories/bugs),
+  unless it is a security vulnerability (see the last route below). The maintainers watch that
+  category. Say which version or commit you ran. The supported version is the latest engine
+  release, the `messagefoundry` package ([docs/SUPPORT-POLICY.md](docs/SUPPORT-POLICY.md)).
 - **A question or design discussion:** use
   [GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions).
 - **Anything larger or architectural:** discuss it first, in a Discussion or a draft pull request.
   The "discuss first" list is in [GOVERNANCE.md](GOVERNANCE.md).
-- **A security vulnerability:** use the [private advisory](.github/SECURITY.md), never a public
-  post.
+- **A security vulnerability:** use the [private advisory](.github/SECURITY.md). Never put its
+  details in a public post.
 
 Never paste real PHI or customer data anywhere public. Use synthetic HL7 from
 `messagefoundry generate`, and redact hostnames, IP addresses and partner names.

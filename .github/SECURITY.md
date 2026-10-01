@@ -5,9 +5,10 @@ reports seriously and appreciate responsible disclosure.
 
 ## Supported versions
 
-The project is pre-1.0 and evolving rapidly; only the latest release is supported, as
-[`docs/SUPPORT-POLICY.md`](../docs/SUPPORT-POLICY.md) states. Please verify a report against the
-latest release before filing.
+The project is pre-1.0 and evolving rapidly. Only the latest engine release, the `messagefoundry`
+package, is supported, as [`docs/SUPPORT-POLICY.md`](../docs/SUPPORT-POLICY.md) states. Please
+verify a report against that release before filing. A vulnerability you find only on current
+`main` is still worth reporting.
 
 ## Reporting a vulnerability
 
@@ -22,11 +23,12 @@ latest release before filing.
   Please do **not** use the website contact form for vulnerability details — it is routed through a
   third-party form service.
 
-If you cannot reach a maintainer privately within a few business days, you may request a contact via a
-**non-detail** public post in the
+If you cannot reach a maintainer privately within a few business days, you may ask for a contact
+in a public post. Post it in the
 [Bugs category of GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions/categories/bugs),
-which the maintainers watch (title only, e.g. "requesting a private security contact") — **never** put vulnerability details,
-reproduction steps, or any message content in a public post.
+which the maintainers watch. The post must be **non-detail**: a title only, e.g. "requesting a
+private security contact". **Never** put vulnerability details, reproduction steps, or any message
+content in a public post.
 
 Please include: affected component (e.g. MLLP/file transport, store, API/auth, console),
 a description and impact, and reproduction steps or a proof of concept. Do **not** include
