@@ -38,7 +38,7 @@ from harness.load.connscale.intake_audit import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from harness.load.connscale.compare import (
         ClaimModeComparison,
@@ -53,10 +53,49 @@ SCHEMA_VERSION = 1
 
 #: Which rate window the readings payload's rates were computed over (BACKLOG #1420). The window is
 #: defined once, in `harness.load.connscale.runner._empty_claim_rates`. This value names the one that
-#: EXCLUDES the post-drain final. A payload without the field was computed over the old window, which
-#: ran to that final, and its readings are not comparable with these. A harvest filters on this exact
-#: name and value, so do not rename either.
-RATE_WINDOW = "in_hold_excl_drain"
+#: EXCLUDES the post-drain final AND the reload probe's time past the hold's end (BACKLOG #2024).
+#:
+#: Three populations exist, and none compares with another. No field: the window ran to the
+#: post-drain final. ``"in_hold_excl_drain"``: #1420 took that final out, but a slow reload's
+#: reconnect wait and extra hold were still inside. This value: #2024 took those out too.
+#: `scripts/connscale_harvest.py` filters on the exact name and each value, so a new window gets a
+#: new value and the harvest a new population; never reuse or rename one.
+RATE_WINDOW = "in_hold_excl_drain_reload_tail"
+
+#: The rate window of the two-box path (BACKLOG #2012). ``connscale-remote`` reads the engine once
+#: as the hold starts and once as it ends, and divides by the hold's length; the batch driver takes
+#: its rates from those reports. That window was never moved by #1420 or #2024, so it carries its
+#: own value rather than borrowing `RATE_WINDOW`, and the two never compare.
+HOLD_BRACKET_RATE_WINDOW = "hold_bracket"
+
+
+def records_rate_window(records: Iterable[ConnScaleRecord]) -> str | None:
+    """The one rate window a set of records was computed over, for an output built from several.
+
+    ``None`` when no record says. Two different windows, or a said and an unsaid one, come back
+    joined with ``|``, so a reader sees the mix rather than whichever record came first.
+    """
+    windows = sorted({r.rate_window or "unrecorded" for r in records})
+    if not windows or windows == ["unrecorded"]:
+        return None
+    return "|".join(windows)
+
+
+def per_lane_wake_pin(records: Iterable[ConnScaleRecord]) -> str:
+    """The run's effective ``per_lane_wake``, for a payload context, as text (BACKLOG #2013).
+
+    A step that recorded ``True`` decides first, so a run that ran a different engine anywhere is
+    never read as unproven: ``"mixed"`` beside a ``False`` step, else ``"true"``. Otherwise ``"-"``
+    when any record did not record one, or there are none, since a pin is proven only where every
+    step says so. ``"false"`` is left, and only when every step recorded it.
+    """
+    values = {r.per_lane_wake for r in records}
+    if True in values:
+        return "mixed" if False in values else "true"
+    if not values or None in values:
+        return "-"
+    return "false"
+
 
 # The shared rule (harness/_spreadsheet.py) — this module used to carry its own copy, and was the one
 # writer with no formula-injection test at all, which is how the copies drifted unnoticed.
@@ -247,15 +286,41 @@ class ConnScaleRecord:
     # reload probe ran, and `post_reload_reply_s` is also None when no reply came inside the wait.
     post_reload_reply_s: float | None = None
     post_reload_drops: int | None = None
+    # The reload window's own terms, saved so a reader can check why a send was or was not excused
+    # (BACKLOG #2024). `reload_aged` counts the sends the close stranded that were written BEFORE the
+    # window opened; the budget judged those. `reload_lookback_s` is how far before the request the
+    # window opened, and `reload_reconnect_timeout_s` is the reconnect wait the step allowed.
+    # `reload_not_applied` is True when dual control held the reload or the engine refused it, so no
+    # new graph ran. All four are None when no reload probe ran.
+    reload_aged: int | None = None
+    reload_lookback_s: float | None = None
+    reload_reconnect_timeout_s: float | None = None
+    reload_not_applied: bool | None = None
+    # Which window this record's rates were computed over (BACKLOG #2012): `RATE_WINDOW` for a sweep
+    # step, `HOLD_BRACKET_RATE_WINDOW` for a two-box cell. The window moved at #1420 and again at
+    # #2024, so two records compare only where this matches. None means not recorded: a record
+    # built by hand, or read from an older artifact.
+    rate_window: str | None = None
+    # The `per_lane_wake` value this step's engine ran with, as the engine's own settings parser
+    # reads the environment the harness gave it (BACKLOG #2013). It moves both terms of the
+    # predicted herd floor, so #1415 needs it pinned across every counted run. None means not
+    # recorded: a two-box cell, a record built by hand, or an older artifact.
+    per_lane_wake: bool | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
             "claim_mode": self.claim_mode,
             "fuse_thread_hops": self.fuse_thread_hops,
             "batch_handoff_statements": self.batch_handoff_statements,
+            "per_lane_wake": self.per_lane_wake,
             "sweep_mode": self.sweep_mode,
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),
+            # The window the `achieved` and `wall3_empty_claims` rates read (BACKLOG #2012). The
+            # engine-sample peaks (`in_pipeline_peak`, wall #1 and #2) read the same readings plus
+            # the post-drain final, so they moved with it at #2024 too. The `cpu` fields come from
+            # the OS probe's own readings and are not in it.
+            "rate_window": self.rate_window,
             "achieved": {
                 "read_per_s": round(self.achieved_read_per_s, 2),
                 "written_per_s": round(self.achieved_written_per_s, 2),
@@ -352,6 +417,10 @@ class ConnScaleRecord:
                 "extra_hold_s": _round_or_none(self.post_reload_extra_hold_s, 3),
                 "reply_s": _round_or_none(self.post_reload_reply_s, 3),
                 "drops_after": self.post_reload_drops,
+                "aged": self.reload_aged,
+                "lookback_s": _round_or_none(self.reload_lookback_s, 3),
+                "reconnect_timeout_s": _round_or_none(self.reload_reconnect_timeout_s, 3),
+                "not_applied": self.reload_not_applied,
             },
             "wall6_ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),
@@ -982,8 +1051,9 @@ class ConnScaleReport:
             "context": dict(context or {}),
             # ADDITIVE, so `schema_version` stays 2: every row below keeps its shape. What changed is
             # the window each value was computed over, and this field is how a harvest tells the
-            # two populations apart (BACKLOG #1420; see `RATE_WINDOW`).
-            "rate_window": RATE_WINDOW,
+            # populations apart (BACKLOG #1420 and #2024; see `RATE_WINDOW`). Read off the records,
+            # so a report whose records do not all say the sweep's window is not labelled as one.
+            "rate_window": records_rate_window(self.records),
             "readings": readings,
         }
         if base_count is not None:

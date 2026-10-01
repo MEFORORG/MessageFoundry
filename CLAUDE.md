@@ -4,7 +4,7 @@ An **open-source, Python** healthcare integration engine — an alternative to *
 and **Corepoint**. Handles **HL7 v2.x by default** (payload-agnostic for other formats — JSON,
 XML/SOAP, X12, DB records) with routing/handling **written in Python** (vs Mirth's Rhino JS;
 Corepoint is low/no-code), and connections that can be code *or* data (`connections.toml`/GUI).
-Stack: **python-hl7** (tolerant parsing) + **hl7apy** (strict validation), **FastAPI/uvicorn**
+Stack: a **built-in tolerant HL7 parser** (ADR 0054) + **hl7apy** (strict validation), **FastAPI/uvicorn**
 (localhost engine API), **SQLite/aiosqlite** (message store), a **browser web console** (`/ui`,
 `messagefoundry_webconsole`) as the operator UI, and **PySide6** (the standalone test harness GUI).
 
@@ -190,7 +190,7 @@ messagefoundry/
   config/          # connector models (models.py) + code-first wiring (wiring.py) + service settings (settings.py)
   pipeline/        # engine.py (Engine), wiring_runner.py (RegistryRunner), dryrun.py
   transports/      # base.py (connector registry), mllp.py, file.py, dicom.py (C-STORE SCP + SCU/C-ECHO), dicomweb.py (STOW-RS, ADR 0025), smart.py (SMART Backend Services token provider, ADR 0024)   ← "connectors"
-  parsing/         # peek.py (python-hl7, hot path), tree.py, validate.py (hl7apy, strict); x12/ (X12 EDI codec, ADR 0012), dicom/ (DICOM codec, ADR 0025), binary.py (base64 carriage, ADR 0028)
+  parsing/         # peek.py + _builtin_hl7.py (tolerant, hot path), tree.py, validate.py (hl7apy, strict); x12/ (X12 EDI codec, ADR 0012), dicom/ (DICOM codec, ADR 0025), binary.py (base64 carriage, ADR 0028)
   anon/            # de-identification framework (ADR 0030; vendored to tee/anon/)
   store/           # base.py (Store protocol + open_store factory), store.py (SQLite WAL inbox/outbox), sqlserver.py, postgres.py
   auth/            # authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, service.py
@@ -881,8 +881,10 @@ gates a merge**, and no seat has to clear one.
 
 ### A Builder runs the checks before it commits, because nobody downstream can ask it to
 
-- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict,
-  over `messagefoundry` and, with `--explicit-package-bases`, `tests`), `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
+  in the three legs `ci.yml` runs: `mypy --platform linux messagefoundry messagefoundry_webconsole
+  messagefoundry_toolkit --exclude 'messagefoundry/tray/'`, `mypy --platform win32 messagefoundry
+  messagefoundry_toolkit` and `mypy --explicit-package-bases tests`. Then `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
 - **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
   Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
   points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
@@ -952,7 +954,7 @@ QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM=
 # format / lint / types
 ruff format .
 ruff check .
-mypy messagefoundry
+mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit   # the packages ci.yml checks
 mypy --explicit-package-bases tests   # BACKLOG #1799; the profile and its exemptions: pyproject.toml
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
@@ -1146,7 +1148,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 ## 12. Do / Don't Quick Reference
 
 **Do**
-- Parse with python-hl7 on the hot path; use hl7apy for opt-in strict validation.
+- Parse with the built-in tolerant parser (`Peek`/`Message`) on the hot path; use hl7apy for opt-in
+  strict validation.
 - Keep the engine free of GUI imports; reach it from the web console / harness via the HTTP API.
 - Preserve the raw message; **log every received message with its disposition** (route bad
   messages to the error/dead-letter path — never accept-and-drop).

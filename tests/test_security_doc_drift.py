@@ -88,9 +88,12 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # GET /ui/messages/{message_id}/errors, the detail page with the error text revealed.
 # BACKLOG #1982 added three /ui routes and no JSON route: GET /ui/approvals and the approve and
 # reject POSTs under /ui/approvals/{approval_id}/, the console's side of dual control.
+# BACKLOG #2443 (ASVS 14.2.6, owner ruling R12) added three /ui routes and no JSON route: the
+# per-item reason reveals GET /ui/events/{event_id}/reason, /ui/alerts/{alert_id}/reason and
+# /ui/connection/{name}/events/{event_id}/reason. The JSON reveal is a query parameter.
 _ROUTES_DEFAULT = 115
 _ROUTES_WITH_DOCS = 119
-_ROUTES_WITH_UI = 236
+_ROUTES_WITH_UI = 239
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -129,6 +132,11 @@ _MULTI_PERMISSION_ROUTES = frozenset(
         # monitoring:read handlers before it offers the cluster:control POST.
         ("GET", "/ui/cluster/stepdown-confirm"),
         ("GET", "/ui/cluster/force-stepdown-confirm"),
+        # BACKLOG #2443: each per-item reason reveal needs its page's monitoring permission(s) to
+        # render the list and messages:view_summary to unlock the one reason it returns whole.
+        ("GET", "/ui/alerts/{alert_id}/reason"),
+        ("GET", "/ui/events/{event_id}/reason"),
+        ("GET", "/ui/connection/{name}/events/{event_id}/reason"),
     }
 )
 
@@ -252,21 +260,83 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
             "response_seq",
         }
     ),
+    # BACKLOG #2443: only ``reason`` is gated. The rest is what an operator with monitoring:read
+    # alone must still see: THAT a connection went down, and what kind of event it was.
+    "ConnectionEventInfo": frozenset(
+        {"connection", "direction", "id", "kind", "message_id", "peer_host", "transport", "ts"}
+    ),
+    "AlertInstanceInfo": frozenset(
+        {
+            "acked_at",
+            "acked_by",
+            "connection",
+            "count",
+            "event_type",
+            "first_seen",
+            "id",
+            "last_seen",
+            "resolved_at",
+            "severity",
+            "status",
+            "suspended_until",
+        }
+    ),
+    # BACKLOG #2443 step 4: only ``error`` is gated. The rest is the dashboard an operator with
+    # monitoring:read alone must still read, including THAT a connection failed (``status``) and
+    # how many messages errored on it (``errored``, a count, never text).
+    "ConnectionRow": frozenset(
+        {
+            "alerts_active",
+            "backlog_seconds",
+            "channel_id",
+            "channel_name",
+            "delivered_age_seconds",
+            "destination",
+            "direction",
+            "errored",
+            "flagged",
+            "idle_seconds",
+            "method",
+            "name",
+            "owner_shard",
+            "paused",
+            "peer",
+            "port",
+            "queue_depth",
+            "read",
+            "role",
+            "simulated",
+            "status",
+            "toml_managed",
+            "waiting_for_reply",
+            "written",
+        }
+    ),
+    # The same ``error`` for one connection, on its metadata route. ``metadata`` is the operator's
+    # own label table and ``settings`` is credential-scrubbed for every role; neither is message data.
+    "ConnectionMetadata": frozenset(
+        {
+            "direction",
+            "fault",
+            "metadata",
+            "method",
+            "name",
+            "router",
+            "running",
+            "settings",
+            "simulated",
+        }
+    ),
 }
 
 #: Response models reachable on a message-family route that carry no PHI property, each reviewed once.
 #: A NEW model on those routes must be either mapped in PHI_FIELDS or added here with a justification —
 #: which is the review the fail-open default (an unmapped model is returned in full) makes mandatory.
 _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
-    "AlertInstanceInfo": (
-        "reason is free text PHI.md §2 classifies as POSSIBLY PHI-bearing; deliberately outside the "
-        "per-property map — route-gated on monitoring:diagnose (not a PHI permission), scrubbed by "
-        "safe_exc() at the emit site and safe_text(reason)[:200] at the store, cipher-encrypted at "
-        "rest. A NEW free-text field here must be scrubbed the same way or moved into PHI_FIELDS"
-    ),
     "AlertInstanceList": (
-        "envelope: alerts + total + worst_severity — a count and a severity NAME "
-        "('info'/'warning'/'critical'), both aggregated from alert metadata, no message data"
+        "envelope: AlertInstanceInfo rows (mapped; reason gated, BACKLOG #2443) + total + "
+        "worst_severity — a count and a severity NAME ('info'/'warning'/'critical'), both "
+        "aggregated from alert metadata; the envelope's own fields carry no message data"
     ),
     "AlertRuleInfo": "operator-authored rule name/type/threshold — configuration, not message data",
     "AlertTestEmailResult": (
@@ -277,11 +347,6 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     ),
     "AlertsConfig": "sink configuration; credentials never returned",
     "AttachmentInfo": "content_type/id/total_bytes — attachment metadata, never bytes",
-    "ConnectionEventInfo": (
-        "reason is free text PHI.md §2 classifies as POSSIBLY PHI-bearing; same posture as "
-        "AlertInstanceInfo.reason — route-gated on monitoring:read, scrubbed at both ends, "
-        "cipher-encrypted at rest"
-    ),
     "DeadLetterList": (
         "envelope: limit/offset/total + DeadLetterRow rows (mapped) + DeadLetterTarget replay "
         "targets + the replayable_in_scope flag"
@@ -1323,6 +1388,13 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "absence of eight retired SECURITY.md and CONFIGURATION.md sentences (BACKLOG #1133); the "
         "code they describe is pinned by calling it in the ninth-sweep probe test"
     ),
+    (
+        "test_docs_security_pathways.py",
+        "test_the_tenth_sweep_states_the_mfa_scope_reach_for_both_account_kinds",
+    ): (
+        "absence of a retired MFA-scope sentence in EARLY-ADOPTER-GUIDE.md (BACKLOG #1133); the "
+        "code it describes is pinned by calling it in the tenth-sweep probe test"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
     ),
@@ -2269,7 +2341,7 @@ def test_field_level_table_equals_phi_fields_in_both_directions() -> None:
         f"code but undocumented: {sorted(derived - documented)}; documented but not gated: "
         f"{sorted(documented - derived)}"
     )
-    assert len(documented) == 11, f"{len(documented)} (object, property) rows, expected 11"
+    assert len(documented) == 15, f"{len(documented)} (object, property) rows, expected 15"
 
 
 def test_field_level_table_parser_detects_a_planted_omission() -> None:
@@ -2281,7 +2353,7 @@ def test_field_level_table_parser_detects_a_planted_omission() -> None:
     mutilated = "\n".join(line for line in text.splitlines() if not line.startswith(dropped))
     remaining = _doc_field_triples(mutilated)
     assert ("MessageSummary", "metadata", Permission.MESSAGES_VIEW_SUMMARY.value) not in remaining
-    assert len(remaining) == 10, (
+    assert len(remaining) == 14, (
         "the parser did not notice a deleted row — it is not actually parsing"
     )
 
@@ -2313,9 +2385,8 @@ def test_message_family_response_models_are_mapped_or_reviewed_as_phi_free() -> 
     import typing
 
     # /events and /alerts are in scope because ConnectionEventInfo.reason and AlertInstanceInfo.reason
-    # are free-text diagnostic fragments PHI.md §2 classifies as *possibly* PHI-bearing. They stay
-    # outside PHI_FIELDS (route-gated on monitoring:* + scrubbed at both ends), but a NEW un-scrubbed
-    # field on either model must red CI rather than be invisible.
+    # are free-text diagnostic fragments PHI.md §2 classifies as *possibly* PHI-bearing. Both models
+    # are in PHI_FIELDS since BACKLOG #2443, so a NEW field on either reds the reviewed-field test.
     families = ("/messages", "/dead-letters", "/search", "/uploads", "/events", "/alerts")
     seen: set[type[BaseModel]] = set()
 
@@ -2347,6 +2418,10 @@ def test_message_family_response_models_are_mapped_or_reviewed_as_phi_free() -> 
         "unmapped model is returned in FULL and is invisible to the PHI-exposure census — declare it "
         "or justify it here."
     )
+    # A model cannot be both mapped and "reviewed as PHI-free": the allow-list entry would then carry
+    # a justification the map contradicts, which is how the pre-#2443 entries outlived their premise.
+    both = {cls.__name__ for cls in PHI_FIELDS} & set(_NO_PHI_RESPONSE_MODELS)
+    assert not both, f"{sorted(both)} are mapped in PHI_FIELDS and also allow-listed as PHI-free"
     stale = set(_NO_PHI_RESPONSE_MODELS) - {cls.__name__ for cls in seen}
     assert not stale, f"the reviewed no-PHI allow-list has stale entries: {sorted(stale)}"
 

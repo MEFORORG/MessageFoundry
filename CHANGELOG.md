@@ -437,8 +437,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   Vault hop's anchor and the proxy's host name. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
   proxy is refused when the client is built, and again before each send. requests does not verify
   that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
-  nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.
+  nobody. Use an `https://` Vault address. A direct `http://` Vault address was not refused by
+  this change; the next entry refuses it.
   (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
+- **BREAKING: the Vault clients refuse a Vault address that is not `https://`.** At least the KV
+  secret provider, the store key provider and the Transit cipher took an `http://` address with no
+  scheme check, so on a first deployment with one the `X-Vault-Token` would have crossed the
+  network in cleartext, directly or through an `http://` proxy. Each now refuses such an address
+  when its client is built, and again before each send in case a proxy appeared since. That
+  includes an address from hvac's own `VAULT_ADDR` fallback, and an address that does not read as
+  one well-formed URL. The one `http://` address allowed is a loopback Vault reached with no
+  proxy, the shared cleartext-hop rule's on-box case, as `docs/CONFIGURATION.md` section
+  `[secrets]` states it; hvac's built-in default, `http://localhost:8200`, is one. At build, each client raises its provider's own fail-closed error (`SecretProviderError` or
+  `KeyProviderError`), caused by an `InsecureHopRefused` whose fixed text names no part of the
+  address. The `https://`-proxy refusal above now reaches callers the same way at build; it was a
+  bare `ValueError`. Before a send, the refusal is the `InsecureHopRefused` itself.
+  `provision-admin` prints the refusal's own text, not its canned line about the secret reference.
+  `[security].enforcement` does not relax it, since this hop has no posture in scope and no way to
+  declare an accepted risk. An `https://` Vault behind an `http://` proxy is unchanged: the token
+  rides inside the TLS tunnel. (`BACKLOG #2317`, ASVS 12.3.1)
 - **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
   `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
   site proxy would have taken the loopback probe off the host and read a running engine as down.
@@ -707,6 +724,27 @@ All notable changes to MessageFoundry are documented here. The format follows
   gets a warning, not a failure. The release workflow refuses to publish a tag while a fragment is
   left unassembled. `changelog.d/README.md` has the naming rules. (`BACKLOG #2080`)
 ### Fixed
+- **`provision-admin` now refuses before it prompts on a fresh install, and resolves directory
+  secrets the way `serve` does.** It builds its auth service once, before the password prompt and
+  before any store is created, with the `[secrets]` provider and hop posture `serve` passes, and
+  opens the store with that posture too. A trust-anchor refusal at `enforce` on a fresh install no
+  longer comes after the prompt and leaves an empty store. A store key that cannot be resolved,
+  such as `vault` with no Vault environment in the shell or a DPAPI key the shell cannot read, is
+  refused before the prompt with exit 2. An AD bind password or OIDC client secret held by a
+  `[secrets]` provider now resolves here. A secret provider, directory or missing-file failure is
+  refused in fixed words, with no text from the failure, instead of reaching the generic error
+  report. An unusable bundled breach corpus is refused before the prompt. At `warn` an anchor
+  warning now prints once, not twice. Two refusals `serve` already gives now apply here too, at
+  `enforce`: an off-box OIDC identity provider with no `[auth].oidc_tls_crl_file` (exit 1), and a
+  server store hop that `serve` would refuse, such as one with no revocation check (exit 2). The
+  first applies here even with `[auth].enabled = false`, where `serve` builds no auth service.
+  (`BACKLOG #2081`)
+- **`audit-anchor --json` now reports a bad service settings file as JSON on stdout.** A missing,
+  unparseable or invalid `--service-config` printed plain text to stderr whatever `--json` said, so
+  a caller piping to `jq` got an empty stdout. It now prints `{"error": ...}` on stdout, as the
+  command's other refusals do, and exits 2. A settings section that fails validation is now
+  reported without echoing the section's values, and a directory named as the settings file now
+  exits 2 rather than 1, which this command spends on a broken chain. (`BACKLOG #2094`)
 - **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
   the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
   model defines both. The web console builds its bulk-replay buttons from them, so a channel whose
@@ -1406,6 +1444,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **LDAPS to Active Directory would no longer fail closed on Python 3.15, and it narrows TLS 1.3.**
+  On an interpreter with `SSLContext.set_ciphersuites`, the approved list drops
+  `TLS_AES_128_GCM_SHA256`. ldap3 builds its own TLS context and could not narrow TLS 1.3, so the
+  engine refused to build the AD authenticator there. The engine now builds the LDAPS context
+  itself: a new `ldap3.Tls` subclass, `messagefoundry.auth.ldap_tls.NarrowedTls`, wraps each
+  connection with a context from `tls_policy.assert_ldap3_tls_suites`, which now returns a factory.
+  That context loads the CA as ldap3 did and carries the posture every engine-built client hop
+  has: the approved TLS 1.2 suites, the approved TLS 1.3 suites and the SHA-224-free signature
+  schemes where the interpreter allows them, the key-exchange pin and a TLS 1.2 floor. ldap3's own
+  host name check still runs after the handshake. `ciphers=` is no longer passed to ldap3.
+  Python 3.14 is unchanged on the wire: its TLS 1.3 gap is recorded, not closed. A followed
+  referral still gets a plain ldap3 context. (`BACKLOG #2494`, owner ruling R3 of
+  2026-09-27, ADR 0188 amendment of 2026-09-30)
 - **On Python 3.15 the engine stops offering SHA-224 TLS signature schemes.** Every context the
   engine narrows drops `rsa_pkcs1_sha224`, `ecdsa_sha224` and `dsa_sha224` through
   `SSLContext.set_server_sigalgs`. Read from the OpenSSL source, not yet measured on 3.15, that one
@@ -1416,8 +1467,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   three SHA-224 schemes; `rsa_pss_rsae_*` now comes before `rsa_pss_pss_*`. A build that refuses
   the ML-DSA names still drops SHA-224, without ML-DSA, and logs a warning once. Python 3.14 is
   unchanged. A 3.15
-  on an OpenSSL older than 3.4 pins nothing and logs a warning once. The LDAPS hop is not reached.
-  (`BACKLOG #1171`, ASVS 11.4.1, owner ruling 2026-09-29)
+  on an OpenSSL older than 3.4 pins nothing and logs a warning once. The LDAPS hop was not
+  reached; since BACKLOG #2494, above, it is. (`BACKLOG #1171`, ASVS 11.4.1, owner ruling 2026-09-29)
 - **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
   reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
   account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was

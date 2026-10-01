@@ -62,12 +62,14 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.redaction import json_loads_or_refusal
-from tests.test_threat_model_doc_drift import _ALLOWED_SUBPROCESS_SITES
+from tests.test_threat_model_doc_drift import (
+    _ALLOWED_SUBPROCESS_SITES,
+    _TOOLKIT_PREFIX,
+    _scanned_py_files,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PKG = _ROOT / "messagefoundry"
-_TOOLKIT = _ROOT / "messagefoundry_toolkit"
-_TOOLKIT_PREFIX = "messagefoundry_toolkit/"
 _DOC = _ROOT / "docs" / "DANGEROUS-FUNCTIONALITY.md"
 
 _ARGV = "argument list"
@@ -136,17 +138,11 @@ _REVIEWED_COMPUTED_LOADS: dict[str, tuple[str, ...]] = {
 # --- reading the tree ----------------------------------------------------------------------------
 
 
-def _python_under(root: Path, prefix: str = "") -> dict[str, str]:
+def _python_under(root: Path) -> dict[str, str]:
     return {
-        f"{prefix}{path.relative_to(root).as_posix()}": path.read_text(encoding="utf-8")
+        path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
         for path in sorted(root.rglob("*.py"))
     }
-
-
-@functools.cache
-def _engine_sources() -> dict[str, str]:
-    """The engine's modules alone, for the threat-model register, which reads only the engine."""
-    return _python_under(_PKG)
 
 
 @functools.cache
@@ -156,8 +152,9 @@ def _package_sources() -> dict[str, str]:
     ADR 0201 moved the authoring commands out of ``messagefoundry/`` into ``messagefoundry_toolkit/``,
     which ships as its own distribution. A module that moves must not leave the scans, so every
     inventory here reads both roots (BACKLOG #1190). Engine keys carry no prefix, so the toolkit's
-    ``__main__.py`` cannot collide with the engine's."""
-    return {**_engine_sources(), **_python_under(_TOOLKIT, _TOOLKIT_PREFIX)}
+    ``__main__.py`` cannot collide with the engine's. The walk and the keying are the threat-model
+    register's own, so the two registers cannot scan different trees (BACKLOG #2517)."""
+    return {key: path.read_text(encoding="utf-8") for key, path in _scanned_py_files().items()}
 
 
 def _parse(source: str) -> ast.Module:
@@ -467,8 +464,9 @@ def _register_gap(live: Mapping[str, object], register: Mapping[str, object]) ->
 
 def test_the_two_process_start_inventories_agree() -> None:
     """``tests/test_threat_model_doc_drift.py`` keeps its own register of process-start modules for
-    the vault threat model. Two registers of one fact drift apart unless something compares them."""
-    gap = _register_gap(_start_sites(_engine_sources()), _ALLOWED_SUBPROCESS_SITES)
+    the vault threat model. Two registers of one fact drift apart unless something compares them.
+    Both read the engine and the toolkit since BACKLOG #2517, so the comparison does too."""
+    gap = _register_gap(_start_sites(_package_sources()), _ALLOWED_SUBPROCESS_SITES)
     assert not gap, f"the two process-start inventories disagree on {sorted(gap)}"
 
 
@@ -575,7 +573,7 @@ def test_the_computed_load_naming_check_fires() -> None:
 
 
 def test_the_register_comparison_fires() -> None:
-    live = _start_sites(_engine_sources())
+    live = _start_sites(_package_sources())
     short = {rel: why for rel, why in _ALLOWED_SUBPROCESS_SITES.items() if rel != "tray/app.py"}
     assert _register_gap(live, short) == {"tray/app.py"}
 
@@ -1292,11 +1290,12 @@ def test_the_page_states_the_patterns_the_detector_uses() -> None:
 def test_the_parse_site_scan_reaches_the_sites_it_must() -> None:
     # The multipart parser is the site that first showed the page's list was not derived. It is
     # hand-written, so only pattern 4 reaches it. The HTTP listener is reached only by pattern 5,
-    # and the HL7 fast path is the product's main parser.
+    # and the HL7 message surface is the product's main parser API. (The HL7 fast path, parsing/peek.py,
+    # stood here until python-hl7 retired: the built-in parser imports no library, so it is hand-read.)
     must = {
         "api/multipart.py",
         "transports/http_listener.py",
-        "parsing/peek.py",
+        "parsing/message.py",
         "parsing/fhir/",
         f"{_CONSOLE_PREFIX}routes/core.py",
     }
@@ -1392,9 +1391,7 @@ def test_parser_table_drift_is_reported() -> None:
     )
     # One site in both tables.
     assert _parser_drift(
-        _replace_once(
-            text, "`phi_log_silencer.py` |", "`phi_log_silencer.py`, `api/multipart.py` |"
-        ),
+        _replace_once(text, "`hl7structures.py` |", "`hl7structures.py`, `api/multipart.py` |"),
         live,
     )
     # A planted parser the page does not name.

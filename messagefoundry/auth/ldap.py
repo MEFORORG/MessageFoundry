@@ -14,16 +14,22 @@ so the only bound on an unresponsive domain controller is the pair of finite ``l
 ``[auth].ad_receive_timeout`` (each LDAP response read), both defaulting to 10 s (ASVS 13.1.3). ldap3's
 own defaults are ``None`` on both, i.e. wait forever. ``ldap3``/``spnego`` are imported lazily so a
 local-only deployment never touches them.
+
+**No referral is followed, and one is refused** (BACKLOG #2530); :func:`_refuse_referral` says why.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import re
 import ssl
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import urlsplit
 
 from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
@@ -33,11 +39,10 @@ from messagefoundry.config.settings import (
     split_kerberos_spn,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import (
-    APPROVED_TLS12_SUITES,
-    HopPosture,
-    assert_ldap3_tls_suites,
-)
+from messagefoundry.config.tls_policy import HopPosture
+
+if TYPE_CHECKING:
+    from messagefoundry.auth.ldap_tls import NarrowedTls
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,24 @@ class _Lookup(NamedTuple):
 
     answer: DirectoryAnswer
     info: dict[str, Any] | None = None
+
+
+def _ldap3_receive_timeout(seconds: float) -> int:
+    """``[auth].ad_receive_timeout`` as the whole seconds ldap3 can actually apply on every OS.
+
+    ldap3 sets ``SO_RCVTIMEO`` with ``struct.pack('LL', receive_timeout, 0)`` on every non-Windows
+    host, and ``struct.pack`` refuses a float. The setting is a float (default ``10.0``), so passing
+    it straight through made EVERY ldap3 socket open raise ``struct.error`` on Linux after the TCP
+    connect and before the bind was sent: AD sign-in could not work there at all. Windows hides it,
+    because ldap3 converts with ``int(1000 * t)`` on that branch.
+
+    Rounds UP, never to nearest, so the result is never shorter than the operator configured. The
+    cost is a timeout up to one second longer on every OS: ldap3 first calls
+    ``socket.settimeout(receive_timeout)``, which would have kept sub-second precision. Rounding up
+    also never yields 0. The settings validator already refuses values <= 0, and 0 would make
+    ``settimeout`` turn the socket non-blocking, so every read would fail at once.
+    """
+    return math.ceil(seconds)
 
 
 def _escape_filter(value: str) -> str:
@@ -378,6 +401,85 @@ def _cn_of(dn: str) -> str | None:
     return head[3:] if head[:3].upper() == "CN=" else None
 
 
+#: A referred host the refusal may name. Anything else is replaced, because the text comes from the
+#: directory and is written to the log and the audit row.
+_PRINTABLE_HOST = re.compile(r"[A-Za-z0-9._:\[\]-]{1,253}")
+
+#: How many referred hosts the refusal names before it only counts the rest.
+_HOSTS_NAMED = 3
+
+
+def _referred_hosts(referrals: Iterable[object]) -> str:
+    """The hosts ``referrals`` point at, for the refusal. Never the whole URL.
+
+    An LDAP URL can carry a DN, a filter and extensions (RFC 4516), and a bindname extension would
+    name an account. Only the host part says where the directory tried to send the engine.
+    """
+    hosts: set[str] = set()
+    unreadable = False
+    for uri in referrals:
+        try:
+            host = urlsplit(str(uri)).hostname
+        except ValueError:
+            host = None
+        if host and _PRINTABLE_HOST.fullmatch(host):
+            hosts.add(host)
+        else:
+            unreadable = True
+    # Readable hosts take the named slots; an unreadable one is only ever listed last.
+    shown = sorted(hosts) + (["<unreadable host>"] if unreadable else [])
+    named = shown[:_HOSTS_NAMED]
+    more = len(shown) - len(named)
+    return ", ".join(named) + (f" and {more} more" if more else "") or "<no host given>"
+
+
+def _refuse_referral(conn: Any, operation: str) -> None:
+    """Raise :class:`LdapError` when the directory answered ``conn``'s last operation with a referral.
+
+    BACKLOG #2530. With ``auto_referrals`` on, which is ldap3's default, ldap3 2.9.1 opens a new
+    connection to the referred host and, on a bound connection, binds there with this connection's
+    user and password (``strategy/base.py``, ``create_referral_connection``). It builds a plain
+    ``ldap3.Tls`` for that hop: no pinned CA bytes, no narrowed suites, and none at all for an
+    ``ldap://`` referral. So one referral would carry the service-account password off the anchored
+    hop. Every ``Connection`` here is built with ``auto_referrals=False``, so ldap3 hands the
+    referral back instead, and this turns it into a refusal.
+
+    **A refusal, not a "no match" or a wrong password.** Left alone, a referred search reads as no
+    entries, which the session reconciler would count toward revoking the account. A referred bind
+    reads as a rejected password, which the step-up re-bind would count toward the engine lockout.
+    An :class:`LdapError` is audited as ``auth.login_error`` at sign-in, and read as unavailable by
+    the reconciler, which never revokes. A referral usually means a search base in another domain of
+    the forest.
+
+    **Only a referral RESULT (resultCode 10).** A search continuation reference (``searchResRef``)
+    arrives with resultCode 0, beside the entries. ldap3 never follows one, with or without this
+    item, so it leaks nothing, and it still reads as no entry from that subtree. AD adds such
+    references to every search based at a domain root, so refusing them would refuse every search.
+    """
+    from ldap3.core.results import RESULT_REFERRAL  # lazy, like every ldap3 import here
+
+    result = conn.result
+    if not isinstance(result, dict) or result.get("result") != RESULT_REFERRAL:
+        return
+    hosts = _referred_hosts(result.get("referrals") or ())
+    message = (
+        f"AD answered the {operation} with a referral to {hosts}; the engine does not follow "
+        "referrals, because ldap3 would re-send the bind credentials there without the pinned CA "
+        "(BACKLOG #2530). This usually means a configured search base lies in another domain of "
+        "the forest; use a base in this domain controller's own domain, or a global catalog, "
+        "which carries universal-group membership only (ADR 0180 Amendment F)."
+    )
+    _warn_once(f"referral: {operation}", "%s Reported once per operation.", message)
+    raise LdapError(message)
+
+
+def _search(conn: Any, operation: str, **kwargs: Any) -> None:
+    """``conn.search(**kwargs)``, refusing a referral result. Every search in this module goes
+    through here, so none can read one as "no entries"; a test pins that."""
+    conn.search(**kwargs)
+    _refuse_referral(conn, operation)
+
+
 class LdapAuthenticator:
     """Binds against Active Directory over LDAPS and resolves a user's (nested) group membership."""
 
@@ -447,55 +549,40 @@ class LdapAuthenticator:
                 "production.",
                 INSECURE_TLS_ESCAPE_ENV,
             )
-        # BACKLOG #1317. Assert the suite list this hop will negotiate (ASVS 12.1.2). Verification-off
-        # is refused/warned above; this is the separate question of whether the traffic is ENCRYPTED and
-        # the peer AUTHENTICATED at all, which was inherited from the interpreter default and unchecked.
-        # Measured: the inherited list is clean today, so this raises on no supported configuration --
-        # it converts an inherited property into a checked one, the same move harden_cipher_suites
-        # documents. Done ONCE here rather than in _server() because the answer is fixed by config and
-        # _server() runs up to three times per login; AuthService builds this eagerly, so a bad suite
-        # list fails app startup rather than the first bind.
+        # BACKLOG #1317, #2494. The engine builds this hop's TLS context (ASVS 12.1.2): narrowed to the
+        # approved suites at TLS 1.2 and, where the interpreter allows it, TLS 1.3, then asserted.
+        # Verification-off is refused/warned above; this is the separate question of whether the
+        # traffic is ENCRYPTED and the peer AUTHENTICATED at all. NarrowedTls builds and asserts that
+        # context once here, so a bad one fails app startup (AuthService builds this eagerly), and
+        # again for every connection. One Tls serves every Server: ldap3.Tls holds only settings.
+        # The CA goes in as the bytes checked above, never a path (BACKLOG #2034); None loads the OS
+        # trust store, as ldap3 did. The accepted risk of owner ruling 2026-09-27 stands: an older
+        # domain controller that offers none of the approved suites fails to bind.
+        self._tls: NarrowedTls | None = None
         if self._ldaps:
-            assert_ldap3_tls_suites(self._tls_kwargs(), connector=_LDAPS_CONNECTOR)
+            from messagefoundry.auth.ldap_tls import NarrowedTls  # lazy: it imports ldap3
 
-    def _tls_kwargs(self) -> dict[str, Any]:
-        """The ``ldap3.Tls`` arguments for this bind — the SINGLE definition, read by both consumers.
-
-        ``__init__`` asserts the suite list these resolve to and ``_server()`` builds the real ``Tls``
-        from them, so the two cannot drift onto different shapes. Keep it that way: the assertion runs
-        against a REBUILT context (``ldap3.Tls`` holds no ``SSLContext`` to check directly), and a
-        rebuilt context is only evidence about this hop while it is built from the hop's own arguments.
-
-        The CA goes in as ``ca_certs_data``, the bytes ``__init__`` checked, and never as
-        ``ca_certs_file`` (BACKLOG #2034). ``None`` means no CA is configured, and ldap3 then loads
-        the OS trust store, as it did before.
-
-        ``ciphers`` narrows the TLS 1.2 suites to the approved AEAD list (BACKLOG #300, owner ruling
-        2026-09-27), the same list every engine-built context offers. The assertion refuses any other
-        value, because ldap3 silently swallows a string OpenSSL rejects. The accepted risk, named in
-        the ruling: an older domain controller that offers none of these suites fails to bind.
-        """
-        return {
-            "validate": ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE,
-            "ca_certs_data": self._ca_certs_data,
-            "ciphers": ":".join(APPROVED_TLS12_SUITES),
-        }
+            self._tls = NarrowedTls(
+                validate=ssl.CERT_REQUIRED if settings.ad_tls_verify else ssl.CERT_NONE,
+                ca_certs_data=self._ca_certs_data,
+                connector=_LDAPS_CONNECTOR,
+            )
 
     def _server(self) -> Any:
         import ldap3
 
-        tls = None
-        if self._ldaps:
-            tls = ldap3.Tls(**self._tls_kwargs())
         # ASVS 13.1.3: ldap3's Server.connect_timeout defaults to None (wait forever) and the engine
         # never sets a process-wide socket default, so this is the ONLY bound on the TCP connect to the
         # domain controller. Every Server in this module is built here, so threading it here covers the
         # service-account bind AND the user bind.
         return ldap3.Server(
             self._s.ad_server,
-            tls=tls,
+            tls=self._tls,
             get_info=ldap3.NONE,
             connect_timeout=self._s.ad_connect_timeout,
+            # BACKLOG #2530, see _refuse_referral. ldap3's default, None, admits every host; empty
+            # admits none, so this holds even for a Connection that omits auto_referrals=False.
+            allowed_referral_hosts=[],
         )
 
     def _service_conn(self) -> Any:
@@ -510,7 +597,8 @@ class LdapAuthenticator:
             password=self._bind_password,  # resolved once in __init__ (env or [secrets].provider)
             authentication=ldap3.SIMPLE,
             auto_bind=True,
-            receive_timeout=self._s.ad_receive_timeout,
+            receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
+            auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
         )
 
     def _equalizing_bind(self, password: str) -> None:
@@ -542,7 +630,8 @@ class LdapAuthenticator:
                 user=f"CN=mf-nonexistent-timing-equalizer,{self._s.ad_user_search_base}",
                 password=password,
                 authentication=ldap3.SIMPLE,
-                receive_timeout=self._s.ad_receive_timeout,
+                receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
+                auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
             )
             try:
                 conn.bind()  # result deliberately ignored — this branch always fails the login
@@ -578,7 +667,9 @@ class LdapAuthenticator:
         """
         import ldap3
 
-        conn.search(
+        _search(
+            conn,
+            "user search",
             search_base=self._s.ad_user_search_base,
             search_filter=search_filter,
             search_scope=ldap3.SUBTREE,
@@ -689,7 +780,9 @@ class LdapAuthenticator:
             if cn:
                 groups.add(cn.lower())
         if self._s.ad_use_nested_groups and self._s.ad_group_search_base:
-            conn.search(
+            _search(
+                conn,
+                "group search",
                 search_base=self._s.ad_group_search_base,
                 search_filter=f"(member:{_MATCHING_RULE_IN_CHAIN}:={_escape_filter(user_dn)})",
                 search_scope=ldap3.SUBTREE,
@@ -746,13 +839,15 @@ class LdapAuthenticator:
                     user=user_dn,
                     password=password,
                     authentication=ldap3.SIMPLE,
-                    receive_timeout=self._s.ad_receive_timeout,
+                    receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
+                    auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
                 )
                 # Released on BOTH paths. A rejected password is the common adversarial case, so
                 # returning early without unbinding would leave the connection to GC under exactly
                 # the load that matters (ASVS 13.1.3 — resource release).
                 try:
                     if not user_conn.bind():
+                        _refuse_referral(user_conn, "user bind")
                         return None
                 finally:
                     user_conn.unbind()

@@ -187,6 +187,7 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, directory: _Directory) -
     class FakeConnection:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self.entries: list[_Entry] = []
+            self.result: dict[str, Any] | None = None  # no referral
 
         def __enter__(self) -> FakeConnection:
             return self

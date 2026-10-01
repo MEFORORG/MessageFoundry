@@ -86,7 +86,7 @@ use the table below alongside them when planning.
 | Validation & load tooling (`generate`, `check`, `dryrun`, the test harness, the load harness) | ✅ Built — see §8/§9 and [LOAD-TESTING.md](LOAD-TESTING.md) |
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
-| **Native MFA** (TOTP, local accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; a directory account is in scope like any other (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
+| **Native MFA** (TOTP and passkeys, local and directory accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; while it is on, a directory session that proved no factor owes one under either `require_mfa_scope` value (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
 | **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
@@ -862,7 +862,8 @@ mode, an F5, a cloud **L4 / network** LB, …).
 Failover is **not instantaneous** — quantify *your* window from these drills; don't assume zero-downtime.
 
 - [ ] **Clean switchover** (planned): gracefully stop the primary's service. It **expires its lease**, so
-      a standby promotes on its next heartbeat (**≈ one `heartbeat_seconds`**). Watch `leader_node_id`
+      a standby promotes on its next heartbeat (**≈ one `heartbeat_seconds`**), or after its
+      `acquire_delay_seconds` if every standby has one. Watch `leader_node_id`
       move on `/cluster/nodes`, watch the VIP repoint, and keep synthetic traffic flowing throughout.
 - [ ] **Crash** (unplanned): hard-kill / power off the primary. Its lease **ages out**, so a standby
       promotes after **up to `leader_lease_ttl_seconds`** (~30 s default); a partitioned old primary

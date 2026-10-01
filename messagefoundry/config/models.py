@@ -70,6 +70,39 @@ class ConnectorType(str, Enum):  # noqa: UP042
     # An inbound DICOMweb (STOW-RS) receiver is destination-only here — it awaits the HTTP listener (ADR 0023).
 
 
+# Seconds. The default `connect_timeout` of every DATABASE-backed declaration (Database/DatabasePoll,
+# DatabaseLookup, DatabaseRef) and the value the connector falls back to when a mapping omits it.
+# Defined once so the declared default and the applied default cannot drift (BACKLOG #2089).
+DEFAULT_DB_CONNECT_TIMEOUT = 15
+
+
+def check_db_connect_timeout(value: object, label: str) -> int:
+    """Return a DATABASE ``connect_timeout`` as whole seconds, at least 1, or raise ``ValueError``
+    (BACKLOG #2089). There is no upper cap.
+
+    Parsed as ``_lookup_max_rows`` in ``transports/database.py`` parses ``max_rows``: an int, or a
+    string an env() ref resolved to, is accepted; a bool (an int to Python) and a fractional number
+    (which ``int()`` would quietly truncate) are refused. ``label`` names the declaration. The message
+    names the setting and never the value, because a resolved env() value stays out of errors
+    (BACKLOG #1183)."""
+    refusal = (
+        f"{label} connect_timeout must be a whole number of seconds, at least 1 (value withheld)"
+    )
+    if isinstance(value, bool):
+        raise ValueError(refusal)
+    # Raised after the handler ends: int()'s ValueError quotes the value (BACKLOG #1796).
+    seconds: int | None
+    try:
+        seconds = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError, OverflowError):
+        seconds = None
+    if seconds is None or seconds < 1:
+        raise ValueError(refusal)
+    if not isinstance(value, str) and seconds != value:  # 2.5, not truncated to 2
+        raise ValueError(refusal)
+    return seconds
+
+
 class AckAfter(str, Enum):  # noqa: UP042
     """**When** an inbound connection sends its ACK, in the staged pipeline (ADR 0001).
 

@@ -157,6 +157,11 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "KeyError carries an operator-authored reference-set name, also in the message",
     ),
     _Allowed(
+        "messagefoundry/config/wiring.py::DatabaseRef::ValueError::WiringError",
+        _SAFE + "check_db_connect_timeout's fixed text withholds the value, raised with no chain; "
+        "the new message is that same text",
+    ),
+    _Allowed(
         "messagefoundry/framing.py::codec_for::KeyError::ValueError",
         _SAFE + "KeyError carries the framing preset name, which the new message also quotes",
     ),
@@ -675,7 +680,7 @@ _BODY_HOLDING = frozenset(
         "JSONDecodeError",  # .doc is the whole input
         "IncompleteReadError",  # .partial is every byte read before the stream ended
         "ValidationError",  # pydantic quotes each failing input value in its errors
-        "HL7PeekError",  # carried python-hl7's text about the body until #2085
+        "HL7PeekError",  # carried python-hl7's text about the body until #2085; python-hl7 is retired
         "TOMLDecodeError",  # .doc is the whole document on Python 3.14 (measured)
     }
 )

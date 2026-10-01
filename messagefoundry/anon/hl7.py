@@ -13,7 +13,7 @@ adversarial parity tests pin them):
 * a message with **no parseable MSH / encoding characters** is **refused** — :class:`AnonError`, a
   body-free error — never emitted un-anonymized (ADR 0030 §3 / CLAUDE.md §8: parse defensively, fail
   closed); and
-* any malformed-structure error from python-hl7 is caught and re-raised as a body-free
+* any malformed-structure error from the parser is caught and re-raised as a body-free
   :class:`AnonError` rather than crashing the caller or leaking the body in a traceback; and
 * OBX-5 is preserved only against an **allowlist** of value types (``preserve_obx5_value``) — an
   unrecognized, absent or empty OBX-2 means the value is redacted, never passed through.
@@ -23,8 +23,6 @@ site-code pass splits only on the message's actual separators.
 """
 
 from __future__ import annotations
-
-from hl7.exceptions import HL7Exception
 
 from messagefoundry.parsing.message import Message
 
@@ -69,9 +67,10 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
         encoded = msg.encode()
     except AnonError:
         raise  # already a body-free refusal with its own reason; do not relabel it "malformed"
-    except (HL7Exception, ValueError, KeyError, IndexError, TypeError) as exc:
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
         # Convert any malformed-structure error into a body-free refusal — never crash the caller or
-        # let a traceback carry the message.
+        # let a traceback carry the message. ValueError includes HL7PeekError, which Message.parse
+        # raises for a body with no leading MSH and for a parser fault.
         raise AnonError("could not anonymize HL7 message (malformed structure)") from exc
     return scrub_message_site_codes(encoded, keyer)
 

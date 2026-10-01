@@ -109,6 +109,9 @@ async def test_clean_stop_releases_lease_for_immediate_takeover(store) -> None:
 
     b = _coord(store, "nodeB:2:bbbb")
     await b._register()
+    # The release stamps the DB clock's now at millisecond resolution and the take-over predicate is
+    # strict (BACKLOG #1986), so B's claim must land in a later millisecond than the release.
+    await asyncio.sleep(0.01)
     assert await b._claim_or_renew_lease() is True  # no TTL wait — A released
     assert (await b.leadership_lease())[0] == "nodeB:2:bbbb"
 

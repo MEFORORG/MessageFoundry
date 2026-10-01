@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import unicodedata
 from collections.abc import Callable
 from importlib import metadata
 
@@ -111,7 +112,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     adr_analyze.add_argument(
         "--repo-root",
         default=None,
-        help="root for resolving test/fixture refs (default: adr-dir/../..)",
+        help="root for resolving test/fixture refs (default: adr-dir/../..; required when adr-dir "
+        "sits directly under a drive or filesystem root)",
     )
     adr_analyze.add_argument(
         "--strict",
@@ -128,7 +130,9 @@ def _adr_analyze(args: argparse.Namespace) -> int:
     criteria→test link coverage, Accepted ADRs missing criteria, and open ``- [ ]`` clarifications.
 
     Two exit codes, and which one a condition gets is the point of the split. A *finding* is
-    advisory: a missing linked test/fixture exits 0, or 1 under ``--strict``. An *absent corpus* —
+    advisory: a missing linked test/fixture, or one outside the repository root, exits 0, or 1
+    under ``--strict``. An *absent corpus*, or an ADR directory with no grandparent to default
+    the repository root to —
     :attr:`~messagefoundry_toolkit.adr_analyze.AnalysisResult.error`, defined at
     :func:`~messagefoundry_toolkit.adr_analyze.analyze_adrs` — exits **2 with or without
     ``--strict``**, because the analyzer never ran. 2 and not 1 keeps "could not start" apart from
@@ -156,17 +160,51 @@ def _adr_analyze(args: argparse.Namespace) -> int:
         return 2
     if not args.json:
         with_criteria = sum(1 for r in result.reports if r.has_criteria)
-        _safe_print(
+        _print_record_line(
             f"ADRs analyzed: {len(result.reports)} ({with_criteria} with acceptance criteria)"
         )
         for adr in result.accepted_without_criteria:
-            _safe_print(f"  recommend: {adr} is Accepted with no acceptance-criteria block")
+            _print_record_line(f"  recommend: {adr} is Accepted with no acceptance-criteria block")
         for adr, ref in result.coverage_gaps:
-            _safe_print(f"  COVERAGE GAP: {adr} links a missing test/fixture: {ref}")
+            _print_record_line(f"  COVERAGE GAP: {adr} links a missing test/fixture: {ref}")
+        for adr, ref in result.outside_refs:
+            _print_record_line(
+                f"  OUTSIDE REPO: {adr} links a path outside the repository root, "
+                f"not checked: {ref}"
+            )
         for adr, item in result.open_clarifications:
-            _safe_print(f"  clarify: {adr} - open item: {item}")
-        _safe_print("ok" if result.ok else "coverage gaps found (advisory)")
+            _print_record_line(f"  clarify: {adr} - open item: {item}")
+        _print_record_line(
+            "ok" if result.ok else "coverage gaps or links outside the repository found (advisory)"
+        )
     return 1 if args.strict and not result.ok else 0
+
+
+#: Unicode categories escaped before record text reaches a terminal: C0 and C1 controls (an ANSI
+#: escape, a bell, a NUL), format characters (a bidirectional override that reorders the line) and
+#: the line and paragraph separators. An ADR is read as data, and a terminal acts on these.
+#: ``messagefoundry.controlchars.scrub_control_chars`` is not reused: its alphabet is C0 and DEL
+#: only, pinned that way for byte-oriented sinks, and so it passes C1 and the bidi overrides.
+_ESCAPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _print_record_line(line: str) -> None:
+    """``_safe_print`` a line that carries record text, with each character a terminal would act
+    on written as its Python escape (BACKLOG #2516). Every human line goes through here, so a new
+    one cannot forget the escape.
+
+    Local to the toolkit on purpose. ``_safe_print`` serves every engine command too, and its job
+    is the console codec, not what the line says. The JSON output needs nothing: ``json.dumps``
+    already escapes every control and non-ASCII character.
+
+    A backslash is doubled as well, so a record that spells ``\\x1b`` out in text cannot pass for
+    one that holds the escape character itself."""
+    _safe_print(
+        "".join(
+            ascii(ch)[1:-1] if ch == "\\" or unicodedata.category(ch) in _ESCAPED_CATEGORIES else ch
+            for ch in line
+        )
+    )
 
 
 _DISPATCH: dict[str, Callable[[argparse.Namespace], int]] = {

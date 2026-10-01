@@ -705,7 +705,7 @@ CASES: list[tuple[str, str, bool, str]] = [
         "unvetted-import",
         False,
         """
-        import hl7
+        import tomlkit
 
         @handler("h")
         def h(msg):
@@ -999,11 +999,11 @@ def test_sibling_config_module_import_is_vetted(tmp_path: Path) -> None:
 
 def test_shipped_dependency_roots_are_install_independent() -> None:
     # Guards the importlib.metadata mapping AND install-independence: a declared installed core dep
-    # (hl7) maps to its real import name, and a declared-but-uninstalled optional-extra dep (pydicom,
+    # (tomlkit) maps to its real import name, and a declared-but-uninstalled optional-extra dep (pydicom,
     # under [dicom]) is vetted via a dist-name guess — so a lazy `import pydicom` is not a false
     # positive regardless of which extras are installed on the box running `check`.
     roots = _shipped_dep_import_roots()
-    assert "hl7" in roots
+    assert "tomlkit" in roots
     assert "pydicom" in roots
 
 

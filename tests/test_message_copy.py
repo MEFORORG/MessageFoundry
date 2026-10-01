@@ -2,17 +2,16 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``Message.copy()`` / ``RawMessage.copy()`` — the ADR 0104 structural-clone primitive.
 
-Verifies AC-2 (dual-backend ``copy().encode() == source.encode()`` over an escaping / repetition /
-custom-separator / trailing-whitespace / Z-segment corpus, including a python-hl7 fallback-produced
-source) and AC-3 (structural clone preserves the source backend and is **not** ``parse(encode())``).
+Verifies AC-2 (``copy().encode() == source.encode()`` over an escaping / repetition /
+custom-separator / trailing-whitespace / Z-segment corpus, including a tree that holds a blank
+segment) and AC-3 (the structural clone is **not** ``parse(encode())``).
 """
 
 from __future__ import annotations
 
-import hl7
 import pytest
 
-from messagefoundry.parsing._backend import backend
+import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 
 _STD = (
@@ -69,38 +68,22 @@ _CORPUS = {
 }
 
 
-@pytest.mark.parametrize("builtin", [True, False], ids=["builtin", "python_hl7"])
 @pytest.mark.parametrize("name", list(_CORPUS))
-def test_structural_clone_encode_parity_both_backends(name: str, builtin: bool) -> None:
-    """AC-2: the clone encodes byte-identically to the source on both backends, and mutating the clone
+def test_structural_clone_encode_parity(name: str) -> None:
+    """AC-2: the clone encodes byte-identically to the source, and mutating the clone
     leaves the source's bytes unchanged (true independence)."""
-    with backend(builtin=builtin):
-        src = _CORPUS[name]()
-        clone = src.copy()
-        assert clone.encode() == src.encode(), f"{name}: clone lost bytes"
-        before = src.encode()
-        clone.set("MSH-3", "MUTATED")
-        assert src.encode() == before, f"{name}: mutating the clone changed the source"
-        assert clone.field("MSH-3") == "MUTATED"
-
-
-@pytest.mark.parametrize("builtin", [True, False], ids=["builtin", "python_hl7"])
-def test_clone_preserves_backend(builtin: bool) -> None:
-    """AC-3: the clone keeps the source's own backend (built-ins ``dict`` vs ``hl7.Message``)."""
-    with backend(builtin=builtin):
-        src = _std()
-        clone = src.copy()
-        assert clone._builtin is src._builtin
-        if builtin:
-            assert isinstance(clone._m, dict)
-        else:
-            assert isinstance(clone._m, hl7.Message)
+    src = _CORPUS[name]()
+    clone = src.copy()
+    assert clone.encode() == src.encode(), f"{name}: clone lost bytes"
+    before = src.encode()
+    clone.set("MSH-3", "MUTATED")
+    assert src.encode() == before, f"{name}: mutating the clone changed the source"
+    assert clone.field("MSH-3") == "MUTATED"
 
 
 def test_copy_is_not_parse_encode(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC-3: ``copy()`` is a structural clone, not ``Message.parse(self.encode())`` — it must succeed
-    even if ``Message.parse`` would raise (which is also why a fallback-parsed source keeps its backend
-    rather than being re-parsed under the default one)."""
+    even if ``Message.parse`` would raise."""
     src = _std()
 
     def _boom(cls, raw):
@@ -111,16 +94,17 @@ def test_copy_is_not_parse_encode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert clone.encode() == src.encode()
 
 
-def test_fallback_source_clone_parity() -> None:
-    """AC-2/AC-3: a source produced by the python-hl7 fallback clones and encodes identically while the
-    default backend is active (the exact mid-handler backend-switch case ``parse(encode())`` would hit)."""
-    with backend(builtin=False):
-        fallback_src = _std()
-        assert fallback_src._builtin is False
-    # Default (built-ins) backend is now active again; the clone must still use the source's backend.
-    clone = fallback_src.copy()
-    assert clone._builtin is False
-    assert clone.encode() == fallback_src.encode()
+def test_tree_held_blank_segment_clones_faithfully() -> None:
+    """AC-2/AC-3: a tree built without :meth:`Message.parse` keeps a blank segment line, which
+    ``parse(encode())`` would drop. The structural clone keeps it.
+
+    This replaced a test of a python-hl7 fallback-parsed source, the other case ``parse(encode())``
+    got wrong; the fallback retired with python-hl7 (ADR 0054 amendment)."""
+    src = Message(_builtin_hl7.parse(_STD.replace("\rOBX", "\r\rOBX")))
+    clone = src.copy()
+    assert "\r\r" in src.encode()
+    assert clone.encode() == src.encode()
+    assert "\r\r" not in Message.parse(src.encode()).encode()
 
 
 def test_rawmessage_copy_recaptures() -> None:

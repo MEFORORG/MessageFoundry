@@ -1267,7 +1267,7 @@ async def test_connections_standalone_row_reads_stopped_when_the_graph_is_down(
     below is one this fix would have INTRODUCED had the ``rr.running`` gate been left out.
 
     The discriminating assertion is the last one: it reads BOTH halves of a single payload, so a
-    regression cannot pass by agreeing with itself. Drop the gate in ``list_connections`` and the
+    regression cannot pass by agreeing with itself. Drop the gate in ``_connection_rows`` and the
     source row still reads "stopped" while the destination row flips to "running"."""
     await _started_outbound_engine(engine, tmp_path)
     rr = engine.registry_runner

@@ -1114,8 +1114,12 @@ class EngineClient:
         """Inbound connections (id = connection name) — used by the Log Search filter."""
         return _decode_list(self._get("/channels"), ChannelInfo)
 
-    def connections(self) -> list[ConnectionRow]:
-        return _decode_list(self._get("/connections"), ConnectionRow)
+    def connections(self, *, reveal: str | None = None) -> list[ConnectionRow]:
+        """The per-endpoint connections dashboard. It needs only ``monitoring:read``, but it is not
+        PHI-free: each ``error`` is null without ``messages:view_summary`` and a fixed mask with it,
+        and ``reveal`` names ONE connection whose error comes back whole, an audited PHI read
+        (BACKLOG #2443)."""
+        return _decode_list(self._get("/connections", reveal=reveal), ConnectionRow)
 
     # --- code-first connection operations ------------------------------------
 
@@ -1286,11 +1290,16 @@ class EngineClient:
         connection: str | None = None,
         kind: str | None = None,
         limit: int = 200,
+        reveal: int | None = None,
     ) -> list[ConnectionEventInfo]:
         """The Corepoint-style connection/transport event log (#46), newest first. It needs only
         ``monitoring:read``, but it is not PHI-free: ``reason`` is scrubbed free text that
-        ``docs/PHI.md`` section 2 gives a protection level."""
-        response = self._get("/events", connection=connection, kind=kind, limit=limit)
+        ``docs/PHI.md`` section 2 gives a protection level. So ``reason`` is null without
+        ``messages:view_summary`` and a fixed mask with it, and ``reveal`` names ONE event whose
+        reason comes back whole, an audited PHI read (BACKLOG #2443)."""
+        response = self._get(
+            "/events", connection=connection, kind=kind, limit=limit, reveal=reveal
+        )
         return [ConnectionEventInfo.model_validate(e) for e in response.json()]
 
     def replay_dead_letters(
@@ -1364,10 +1373,12 @@ class EngineClient:
         No secrets/recipients are returned. Gated by ``monitoring:read`` like :meth:`stats`."""
         return _decode(self._get("/alerts/rules"), AlertsConfig)
 
-    def active_alerts(self) -> AlertInstanceList:
-        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest first — metadata
-        only. Gated by ``monitoring:diagnose``."""
-        return _decode(self._get("/alerts/active"), AlertInstanceList)
+    def active_alerts(self, *, reveal: int | None = None) -> AlertInstanceList:
+        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest first. Gated by
+        ``monitoring:diagnose``. Not PHI-free: each ``reason`` is null without
+        ``messages:view_summary`` and a fixed mask with it, and ``reveal`` names ONE alert whose
+        reason comes back whole, an audited PHI read (BACKLOG #2443)."""
+        return _decode(self._get("/alerts/active", reveal=reveal), AlertInstanceList)
 
     def ack_alert(self, alert_id: int) -> AlertInstanceInfo:
         """Acknowledge an open alert instance (ADR 0044). Gated by ``monitoring:diagnose``."""

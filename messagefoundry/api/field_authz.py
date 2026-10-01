@@ -33,7 +33,11 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from messagefoundry.api.models import (
+    AlertInstanceInfo,
     CapturedResponseInfo,
+    ConnectionEventInfo,
+    ConnectionMetadata,
+    ConnectionRow,
     DeadLetterRow,
     EventInfo,
     MessageDetail,
@@ -83,6 +87,29 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     CapturedResponseInfo: {
         "detail": Permission.MESSAGES_VIEW_SUMMARY,
     },
+    # The connection event log and the alert list (BACKLOG #2443). The event routes need only
+    # ``monitoring:read``, which the built-in Viewer, Deployment, Coding and Auditor roles hold
+    # without any PHI permission. The alert route needs ``monitoring:diagnose``, which only the
+    # built-in Operator and Administrator hold, and both also hold ``messages:view_summary``; a
+    # custom role may hold ``monitoring:diagnose`` without it. So the reason is gated here on the
+    # same tier as ``messages.error``: the same ``safe_exc`` text reaches ``connection_event.reason``
+    # and ``alert_instance.reason``.
+    ConnectionEventInfo: {
+        "reason": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    AlertInstanceInfo: {
+        "reason": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    # The connections dashboard row (BACKLOG #2443, step 4). ``GET /connections`` needs only
+    # ``monitoring:read``, and ``error`` is why a connection failed to start: the same ``safe_exc``
+    # text whose stored copy is an alert reason. ``ConnectionMetadata.error`` on
+    # ``GET /connections/{name}/metadata`` is the same string for one connection.
+    ConnectionRow: {
+        "error": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    ConnectionMetadata: {
+        "error": Permission.MESSAGES_VIEW_SUMMARY,
+    },
 }
 
 #: Properties whose *authorized* value is still display-masked until a reveal act (ASVS 14.2.6).
@@ -127,6 +154,16 @@ ERROR_TEXT_MASKED_UNTIL_REVEALED: Mapping[type[BaseModel], frozenset[str]] = Map
         OutboxInfo: frozenset({"last_error"}),
         EventInfo: frozenset({"detail"}),
         DeadLetterRow: frozenset({"last_error"}),
+        # BACKLOG #2443: the same delivery-error text, copied into a ``connection_lost`` event and
+        # its ``connection_error`` alert. Each is revealed by its own per-item act, the ``reveal``
+        # id on its list route, one audited request per event or alert.
+        ConnectionEventInfo: frozenset({"reason"}),
+        AlertInstanceInfo: frozenset({"reason"}),
+        # BACKLOG #2443 step 4: why a connection failed to start or was DR-parked. Revealed by the
+        # ``reveal=<connection name>`` act on ``GET /connections``, one audited request per name.
+        ConnectionRow: frozenset({"error"}),
+        # The same string for one connection, revealed by ``reveal=true`` on its metadata route.
+        ConnectionMetadata: frozenset({"error"}),
     }
 )
 

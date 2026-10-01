@@ -568,7 +568,8 @@ jobs:
             --output-format JSON --output-file sbom-python.cdx.json
           # Declare the SBOM lifecycle (CISA "Build" type) + backfill the hatchling-dynamic root version.
           python scripts/security/sbom_finalize.py sbom-python.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
       - name: Generate the VS Code extension SBOM (npm, install-free)
         # if: always() so a Python-SBOM failure above doesn't skip this independent generator.
         if: always()
@@ -585,6 +586,9 @@ jobs:
         # continue-on-error: sbomqs is advisory HERE, so a download/checksum/parse hiccup must never skip
         # the SBOM-artifact upload below (the actual deliverable). This no longer matches release.yml:
         # there the install and pin check BLOCK and only the score is advisory (BACKLOG #1698).
+        # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
+        # unscored (BACKLOG #2521).
+        if: always()
         continue-on-error: true
         run: |
           # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA
@@ -598,9 +602,12 @@ jobs:
           grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
-          sbomqs score -b sbom-python.cdx.json
-          sbomqs score -b sbom-ide.cdx.json
+          # Each score runs whatever the other did; the step still fails if either did (BACKLOG #2521).
+          rc=0
+          sbomqs score -b sbom-python.cdx.json || rc=1
+          sbomqs score -b sbom-ide.cdx.json || rc=1
           sbomqs compliance --ntia sbom-python.cdx.json || true
+          exit "$rc"
       - name: Upload the SBOM artifacts
         # if: always() + if-no-files-found: ignore so whichever SBOM(s) generated are retained even if a
         # sibling generator failed. SHA-pinned for supply-chain integrity, matching ci.yml's upload pin.
@@ -611,6 +618,70 @@ jobs:
           path: |
             sbom-python.cdx.json
             sbom-ide.cdx.json
+          if-no-files-found: ignore
+
+  sbom-windows:
+    name: SBOM (CycloneDX, engine resolved on Windows)
+    runs-on: windows-latest
+    # Two hash-locked installs and one SBOM render.
+    # Advisory and schedule-only, so a cap that fires here costs a nightly, not a merge.
+    timeout-minutes: 20
+    # The Windows twin of the engine SBOM above, and the pre-tag dry-run for release.yml's
+    # `sbom-windows` job, exactly as `sbom` is for the Linux step. Why the engine ships a second,
+    # Windows-resolved SBOM is ADR 0149's 2026-09-30 amendment. A separate job rather than a matrix
+    # leg of `sbom`, because that job's npm and sbomqs steps are Linux-only and would each need a
+    # platform guard.
+    continue-on-error: true
+    # Same gate as `sbom`, for the same reason: the SBOM derives from a committed lockfile.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Generate the Windows-resolved engine SBOM (license-complete, hash-locked core runtime)
+        shell: bash
+        run: |
+          # HASH-PINNED and BYTE-IDENTICAL to release.yml's sbom-windows install, enforced by
+          # tests/test_ci_venv_pinning.py. That job's step says why the venv has no pip and why every
+          # path is absolute; read it there rather than here, so the reasons cannot drift apart.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m venv --without-pip "$RUNNER_TEMP/sbomenv"
+          python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install --require-hashes -r docker/locks/requirements-core.lock
+          python -m cyclonedx_py environment "$RUNNER_TEMP/sbomenv/Scripts/python.exe" \
+            --pyproject pyproject.toml --mc-type application \
+            --output-format JSON --output-file sbom-python-windows.cdx.json
+          python scripts/security/sbom_finalize.py sbom-python-windows.cdx.json \
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
+      - name: Score the Windows SBOM's quality (sbomqs -- advisory)
+        # The pre-tag dry-run of release.yml's score of this file (BACKLOG #2521). It rehearses the FILE:
+        # the release uses sbomqs's Linux build, this runner its Windows build. Advisory, like `sbom`'s.
+        continue-on-error: true
+        shell: bash
+        run: |
+          # PINNED IN-REPO, as release.yml's sbomqs step is, rather than verified against a
+          # checksums.txt from the asset's own origin. Keep VER equal to release.yml's. Recorded
+          # 2026-09-30 from three routes that agreed: checksums.txt, the releases API `digest` field,
+          # and sha256sum over the downloaded tarball. Bump VER and the digest in one commit.
+          VER=2.0.11
+          SBOMQS_SHA256=55777d63d76805bef8ff7f59c41ebf7741cd601de508b00437c593cd3bfa2ebb
+          asset="sbomqs_${VER}_Windows_x86_64.tar.gz"
+          base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
+          echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
+          # A relative archive name: Git Bash's tar reads a `D:\...` path as a remote host.
+          tar -xzf "${asset}" sbomqs.exe
+          ./sbomqs.exe score -b sbom-python-windows.cdx.json
+          ./sbomqs.exe compliance --ntia sbom-python-windows.cdx.json || true
+      - name: Upload the Windows SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-cyclonedx-windows
+          path: sbom-python-windows.cdx.json
           if-no-files-found: ignore
 
   trivy:
@@ -1021,7 +1092,25 @@ jobs:
           # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
           # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
           # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
-          python -m pip install --upgrade pip "semgrep==1.172.0"
+          #
+          # RETRIED, because semgrep's transitive set resolves live from PyPI and one index read can
+          # come back empty. Merge-group run 36832387843 (2026-10-01) failed at this install, in the
+          # semgrep job, with ResolutionImpossible: pip saw "no matching distributions" for
+          # pydantic-core at ANY version. The same pin resolved pydantic-core 2.46.5 on the same runner
+          # image six minutes later, so it was a transient index read, not a new release. Still
+          # fail-closed: three failures exit 1, and nothing here touches the scan below. The `until`
+          # condition is exempt from `bash -e`. tests/test_semgrep_install_retry.py pins all of this.
+          attempt=1
+          until python -m pip install --upgrade pip "semgrep==1.172.0"
+          do
+            if [ "${attempt}" -ge 3 ]; then
+              echo "::error::semgrep did not install after 3 attempts. Failing closed: no scan ran."
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt}: semgrep install failed; retrying"
+            sleep "$((attempt * 15))"
+            attempt=$((attempt + 1))
+          done
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           #
           # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this
@@ -1319,7 +1408,25 @@ jobs:
           # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
           # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
           # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
-          python -m pip install --upgrade pip "semgrep==1.172.0"
+          #
+          # RETRIED, because semgrep's transitive set resolves live from PyPI and one index read can
+          # come back empty. Merge-group run 36832387843 (2026-10-01) failed at this install, in the
+          # semgrep job, with ResolutionImpossible: pip saw "no matching distributions" for
+          # pydantic-core at ANY version. The same pin resolved pydantic-core 2.46.5 on the same runner
+          # image six minutes later, so it was a transient index read, not a new release. Still
+          # fail-closed: three failures exit 1, and nothing here touches the scan below. The `until`
+          # condition is exempt from `bash -e`. tests/test_semgrep_install_retry.py pins all of this.
+          attempt=1
+          until python -m pip install --upgrade pip "semgrep==1.172.0"
+          do
+            if [ "${attempt}" -ge 3 ]; then
+              echo "::error::semgrep did not install after 3 attempts. Failing closed: no scan ran."
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt}: semgrep install failed; retrying"
+            sleep "$((attempt * 15))"
+            attempt=$((attempt + 1))
+          done
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           #
           # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this

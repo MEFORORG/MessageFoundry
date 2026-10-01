@@ -21,7 +21,7 @@ lies converts "I should check" into "I already know":
 Driven as real subprocesses against fixtures, because these are PowerShell scripts and a Python
 re-implementation of their rules would only assert that the re-implementation agrees with itself.
 
-THE ``pwsh`` LAUNCHES HERE GO THROUGH ``run_single`` (BACKLOG #1304), at 21 call sites. A launch out
+THE DIRECT ``pwsh`` LAUNCHES HERE GO THROUGH ``run_single`` (BACKLOG #1304). A launch out
 of this file starved past its 60-second ceiling on the ``windows-2025`` harness leg while
 ``test_session_mail.py`` held 16 concurrent ``pwsh`` on a 4-vCPU runner; the evidence, and the rule
 for what may take the lock, live in ``tests/_spawn_lock.py``. Read that module before adding a launch
@@ -29,14 +29,15 @@ here.
 
 AT LEAST ONE ``pwsh`` LAUNCH IN THIS FILE IS STILL UNLOCKED, and it is named rather than counted
 because an enumeration here would be the liability CLAUDE.md section 11 warns about (SDS-3.6). The
-two ``bash`` sites are excluded by ``_LOCKED_INTERPRETERS``, which matches on the binary being
-launched -- and one of them, ``test_bash_runs_the_wired_command_end_to_end_and_it_publishes``, runs
-the wired statusLine command, whose whole job is to invoke ``pwsh``. So that is a real ``pwsh``
-launch on a 60-second ceiling sitting outside the lock. It is left alone: wrapping it means calling
-``single_spawn`` directly around a ``bash`` invocation, which is a behaviour change to a test that
-has produced no #1304 evidence, and the module's rule is not to wrap on a hunch.
+``bash`` sites are excluded by ``_LOCKED_INTERPRETERS``, which matches on the binary being launched
+-- and at least two of them, ``test_bash_runs_the_wired_command_end_to_end_and_it_publishes`` and
+the #1459 helper ``_run_under_bash``, run the wired statusLine command, whose whole job is to invoke
+``pwsh``. So those are real ``pwsh`` launches on a 60-second ceiling sitting outside the lock. They
+are left alone: wrapping them means calling ``single_spawn`` directly around a ``bash`` invocation,
+which is a behaviour change with no #1304 evidence behind it, and the module's rule is not to wrap
+on a hunch.
 
-``tests/test_spawn_lock.py`` gates the 21 direct sites against a 22nd being added unwrapped. That
+``tests/test_spawn_lock.py`` gates the direct sites against one being added unwrapped. That
 gate exists because this paragraph is a convention, and ``run_single``'s own docstring says a
 convention in a docstring does not hold a line.
 """
@@ -2567,3 +2568,211 @@ def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path
     code, doc = read(state)
     assert code == UNAVAILABLE, doc
     assert doc["marker_state"] == "MALFORMED"
+
+
+# ------------------------------------------ BACKLOG #1459: roots that never publish, and why
+#
+# Measured 2026-09-30 across six live config roots. The account roots that DID publish carry a
+# single-quoted command the readers misfiled as legacy. One that never published carries the
+# PowerShell-source command the old installer emitted: bash rejects it, and the reader still called it
+# WIRED_HERE and told the operator to start a session and wait. The tests below start from those two
+# shapes, not from a root the current installer prepared, because that root was never the problem.
+
+HOOK = ROOT / "scripts" / "hooks" / "usage-headroom-inject.ps1"
+WIRED_POWERSHELL_SOURCE = "WIRED_POWERSHELL_SOURCE"
+
+
+def _powershell_source_command(collector: Path, state: Path) -> str:
+    """The shape the pre-shell-agnostic installer wrote, rebuilt with this fixture's paths. Its
+    `$d` names the root's OWN publish path, which is what made the reader call it WIRED_HERE."""
+    return (
+        "# mefor-usage\n"
+        f"$s = '{collector}'; $d = '{state}'; "
+        "if (Test-Path -LiteralPath $s) { & pwsh -NoProfile -File $s -StateDir $d } "
+        "else { Write-Output 'mefor-usage: collector missing' }"
+    )
+
+
+def _hook(pin: Path, home: Path) -> str:
+    """The spawn hook as a session pinned to ``pin`` runs it: no -StateDir, so the root comes from
+    the pin alone. USERPROFILE points the reader's survey at the fixture home, never the real one."""
+    env = _env(pin)
+    env["USERPROFILE"] = str(home)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
+        input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_input": {}}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    ctx: str = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    return ctx
+
+
+def _run_under_bash(
+    bash: str, tmp_path: Path, command: str, pin: Path, payload: dict[str, Any]
+) -> subprocess.CompletedProcess[str]:
+    """Run a wired statusLine string the way Claude Code does: as a bash script, payload on stdin."""
+    script = tmp_path / f"statusline-{time.monotonic_ns()}.sh"
+    script.write_bytes(command.encode("utf-8"))
+    return subprocess.run(
+        [bash, script.as_posix()],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=probe_env(Path(bash), _env(pin)),
+    )
+
+
+def test_the_single_quoted_shape_the_publishing_roots_carry_reads_as_wired_here(
+    bash: str, fake_home: Path, tmp_path: Path
+) -> None:
+    """THE ROOTS THAT WORKED WERE MISFILED. Their command names its publish path in single quotes,
+    which both shells run, and the readers matched only double quotes or a `$d = '...'` assignment.
+    So every publishing root read as WIRED_LEGACY -- "carries no -StateDir" -- beside a -StateDir."""
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    command = f"# mefor-usage\npwsh -NoProfile -File '{COLLECT}' -StateDir '{state}'"
+    (pin / "settings.json").write_text(
+        json.dumps({"statusLine": {"type": "command", "command": command}}), encoding="utf-8"
+    )
+    rc, err = bash_parse(bash, tmp_path, command, "single-quoted.sh")
+    assert rc == 0, f"the shape under test is not one bash runs, so this proves nothing: {err!r}"
+
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == WIRED_HERE, doc
+    assert doc["wired_state_dir"].lower() == str(state).lower(), doc
+
+    status = install("-Status", pin=pin, home=fake_home, collector=None).stdout
+    assert "legacy command, no -StateDir" not in status, status
+    assert f"collector     : {COLLECT}" in status, status
+
+
+def test_a_root_the_old_installer_wired_publishes_after_one_reinstall_and_the_hook_reads_it(
+    bash: str, fake_home: Path, tmp_path: Path
+) -> None:
+    """THE CHECK THE ROW ASKS FOR: a real headroom figure at the spawn point, on a root that was NOT
+    prepared by the current installer. It starts where a live root was on 2026-09-30 and goes
+    through the real installer, the real bash, the real collector and the real hook, which resolves
+    the root from the pin alone.
+
+    STEP 1 IS THE CONTROL. Without the defect reproduced first, the green at step 5 could be a
+    fixture that was never broken.
+    """
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {
+                "statusLine": {
+                    "type": "command",
+                    "command": _powershell_source_command(COLLECT, state),
+                    "refreshInterval": 10000,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {
+        "session_id": "e2e-1459",
+        "rate_limits": {"five_hour": window(64.0, 3600), "seven_day": window(31.0, 280000)},
+    }
+
+    # 1. The defect: bash rejects the old command, pwsh never starts, nothing publishes.
+    before = _run_under_bash(bash, tmp_path, wired(pin / "settings.json"), pin, payload)
+    assert before.returncode != 0 and "syntax error" in before.stderr, before
+    assert not (state / "latest.json").exists()
+
+    # 2. The reader names the cause and the fix, and the hook passes both on. It used to say
+    # WIRED_HERE and "start a NEW session", which waiting can never satisfy.
+    code, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert code == UNKNOWN, doc
+    assert doc["statusline_state"] == WIRED_POWERSHELL_SOURCE, doc
+    assert any(str(pin) in line for line in doc["statusline_remedy"]), doc
+    ctx = _hook(pin, fake_home)
+    assert "verdict: UNKNOWN" in ctx and WIRED_POWERSHELL_SOURCE in ctx, ctx
+    assert str(pin) in ctx, f"the remedy must name the root: {ctx}"
+    # The remedy writes a config root outside git, and this text reaches every spawning session.
+    assert "OWNER action" in ctx, f"the remedy must not read as a task for the session: {ctx}"
+    status = install("-Status", pin=pin, home=fake_home, collector=None).stdout
+    assert "publishes NOTHING" in status, status
+
+    # 3. One installer run, which says what it replaced -- not "some other way".
+    proc = install("-ConfigDir", str(pin), pin=None, home=fake_home)
+    assert proc.returncode == 0, proc.stdout
+    assert "REWIRED" in proc.stdout and "that was PowerShell source" in proc.stdout, proc.stdout
+    assert "some other way" not in proc.stdout, proc.stdout
+
+    # 4. bash runs the new command and the collector publishes under this root.
+    after = _run_under_bash(bash, tmp_path, wired(pin / "settings.json"), pin, payload)
+    assert after.returncode == 0, after.stderr
+    assert (state / "latest.json").exists(), "bash ran the rewired command and nothing published"
+
+    # 5. The spawn hook prints a real figure, not UNKNOWN.
+    ctx = _hook(pin, fake_home)
+    assert "verdict: OK" in ctx, ctx
+    assert re.search(r"5h\s+64\.0% used", ctx), ctx
+    assert WIRED_POWERSHELL_SOURCE not in ctx, ctx
+
+
+def test_a_powershell_source_root_with_a_stale_reading_still_warns_in_the_text_output(
+    fake_home: Path,
+) -> None:
+    """A REGRESSION THE #1459 CHANGE ITSELF OPENED, caught by its own second review round.
+
+    WIRED_POWERSHELL_SOURCE is deliberately not in $dxUntrusted, and the "wired correctly yet nothing
+    fresh" arm fires only for WIRED_HERE. So a root carrying the old command beside an old
+    latest.json fell through both arms: the operator saw a bare "reading is N min old" and neither
+    the cause nor the fix. Before #1459 that root read WIRED_HERE and at least got a warning.
+    """
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    state.mkdir(parents=True)
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {
+                "statusLine": {
+                    "type": "command",
+                    "command": _powershell_source_command(COLLECT, state),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    old = (datetime.now(UTC) - timedelta(minutes=48)).isoformat()
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": old,
+                "five_hour": {
+                    "used_percentage": 64.0,
+                    "resets_at_epoch": int(time.time()) + 780,
+                    "captured_at": old,
+                },
+                "seven_day": {
+                    "used_percentage": 31.0,
+                    "resets_at_epoch": int(time.time()) + 280000,
+                    "captured_at": old,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code, parsed, _ = reader("-Json", pin=pin, home=fake_home)
+    assert code == UNKNOWN, parsed
+    assert parsed["statusline_state"] == WIRED_POWERSHELL_SOURCE, parsed
+
+    _, _, human = reader(pin=pin, home=fake_home)
+    assert "WARNING" in human, f"a PowerShell-source root with a stale reading was silent:\n{human}"
+    assert "PowerShell source" in human, human
+    assert "install-usage-statusline.ps1" in human and str(pin) in human, (
+        f"the warning must carry the fix and name the root:\n{human}"
+    )
+    assert "Start a NEW session" not in human, human

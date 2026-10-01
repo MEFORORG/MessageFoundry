@@ -256,6 +256,17 @@ from typing import Any
 #: BACKLOG #2436 (ASVS 14.2.6, owner ruling R12): ``get_message`` gained a second keyword,
 #: ``reveal_errors``, on the same terms and with the same blind spot. The digest did not move.
 #:
+#: BACKLOG #2443 (ASVS 14.2.6, owner ruling R12): ``list_connection_events`` and
+#: ``list_active_alerts`` gained the keyword ``reveal``, and ``list_active_alerts`` now takes
+#: ``request``; the console passes both. ``ConnectionEventInfo`` and ``AlertInstanceInfo`` now
+#: subclass ``PhiGatedModel``, with the same fields. Same blind spot again: the digest did not move.
+#:
+#: BACKLOG #2443 step 4 (ASVS 14.2.6, owner ruling R12): ``list_connections`` now takes ``request``
+#: and the keyword ``reveal``; the console passes ``request`` and no ``reveal``. ``ConnectionRow``
+#: now subclasses ``PhiGatedModel``, with the same fields. Same blind spot: the digest did not move.
+#: A console without this change calls ``list_connections`` with no ``request`` and gets a
+#: TypeError on the dashboard, which the handshake does not catch.
+#:
 #: BACKLOG #2015: discovery now reads every name the console imports from ``auth.service``, not
 #: only ``AuthService``. Those include step-up action constants, an exception, and result
 #: dataclasses whose fields the console reads; ``tests/test_seam_discovery.py`` pins the set.

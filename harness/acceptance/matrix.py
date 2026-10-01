@@ -327,7 +327,7 @@ MATRIX: tuple[MatrixRow, ...] = (
     # ---- E. HL7 / payload handling ----------------------------------------------------------------
     _row(
         "E1",
-        "Tolerant peek (python-hl7) routing",
+        "Tolerant peek (built-in parser) routing",
         ONCE,
         Coverage.PYTEST,
         ("tests/test_parsing.py",),

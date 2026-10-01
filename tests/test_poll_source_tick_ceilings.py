@@ -233,14 +233,14 @@ async def test_file_stuck_files_do_not_charge_the_ceiling(
     (inbox / "a_locked2.hl7").write_text(_ADT.format(n=2), encoding="utf-8")
     (inbox / "b_good1.hl7").write_text(_ADT.format(n=3), encoding="utf-8")
     (inbox / "b_good2.hl7").write_text(_ADT.format(n=4), encoding="utf-8")
-    real_read = Path.read_bytes
+    real_read = file_mod._read_confined
 
-    def read_bytes(self: Path) -> bytes:
-        if self.name.startswith("a_locked"):
+    def read_bytes(path: Path, *rest: Any) -> bytes:
+        if path.name.startswith("a_locked"):
             raise OSError("locked by another process")
-        return real_read(self)
+        return real_read(path, *rest)
 
-    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(file_mod, "_read_confined", read_bytes)
     src = _file_source(inbox)
     handler = _RecordingHandler()
     src._handler = handler

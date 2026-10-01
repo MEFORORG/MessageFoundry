@@ -30,6 +30,11 @@ as ``engine_cacert`` for :mod:`messagefoundry.tray.probe` to pin.
 
 from __future__ import annotations
 
+# PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). The tray's first
+# process only calls default_config_dir() before it re-execs as the branded child, so it need not
+# load service_status (asyncio, subprocess, ctypes) or tomllib.
+__lazy_modules__ = ["messagefoundry.service_status", "tomllib"]
+
 import re
 import sys
 import tomllib

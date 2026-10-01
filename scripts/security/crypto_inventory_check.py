@@ -301,6 +301,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
     "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
+    # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
+    # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.
+    "messagefoundry/auth/ldap_tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ADR 0142 (OIDC relying party, BACKLOG #274): the federated-SSO layer.
     #   claims.py — hmac.compare_digest for the constant-time nonce comparison; cryptography only for
     #     catching InvalidSignature (the verification itself is transports/signing.py, inventoried).
@@ -579,7 +582,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
     # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
-    "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
+    # BACKLOG #2317 adds the tls_policy import: the cleartext-hop authority (is_loopback_hop_host,
+    # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
+    # is a posture decision on the scheme, and it calls no cipher or context.
+    "messagefoundry/transports/strict_requests.py": frozenset(
+        {"messagefoundry.config.tls_policy", "ssl"}
+    ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
     # engine's cert, it pins trust to exactly that PEM (ssl.create_default_context with cafile=);
@@ -918,8 +926,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.auth.trust_anchors",
-            "tls_context:via messagefoundry.config.tls_policy",
         }
+    ),
+    # BACKLOG #2494: the LDAPS context is built by tls_policy.assert_ldap3_tls_suites, and the socket
+    # is wrapped with it here, in place of ldap3's own wrap_socket.
+    "messagefoundry/auth/ldap_tls.py": frozenset(
+        {"tls_context:.wrap_socket()", "tls_context:via messagefoundry.config.tls_policy"}
     ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}

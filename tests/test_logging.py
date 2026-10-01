@@ -102,48 +102,37 @@ def test_routes_uvicorn_loggers_to_root() -> None:
 # --- serve --log-level -------------------------------------------------------
 
 
-# --- C-1: python-hl7 PHI-to-log suppression ----------------------------------
+# --- C-1: the parser writes no field value to the log ----------------------------------------------
 
 
-def test_silences_hl7_value_loggers_phi_leak() -> None:
-    import hl7
-    import hl7.containers  # noqa: F401  (so hl7.containers.__file__ resolves)
-    import hl7.util  # noqa: F401
+def test_an_unmapped_escape_logs_no_field_value() -> None:
+    """Review finding C-1: python-hl7 logged the WHOLE field at ERROR on an unmapped escape, so the
+    engine silenced its loggers. python-hl7 is retired and that silencer went with it. This pins the
+    reason it is no longer needed: reading a field with an unmapped escape through the built-in parser
+    emits no record carrying the value."""
+    from messagefoundry.parsing import Message, Peek
 
-    from messagefoundry.logging_setup import silence_phi_prone_dependency_loggers
-
-    util_logger = logging.getLogger(hl7.util.__file__)
-    containers_logger = logging.getLogger(hl7.containers.__file__)
-    # Reset to permissive so this proves the silencer, not parsing-import's side effect.
-    util_logger.setLevel(logging.NOTSET)
-    containers_logger.setLevel(logging.NOTSET)
-
-    silence_phi_prone_dependency_loggers()
-    assert util_logger.level == logging.CRITICAL
-    assert containers_logger.level == logging.CRITICAL
-
-    # Behavior: an unmapped escape makes python-hl7's unescape() log the WHOLE field at ERROR; with
-    # the loggers silenced, no such record (and no PHI) reaches a handler.
     captured: list[logging.LogRecord] = []
 
     class _Capture(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
             captured.append(record)
 
+    body = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5.1\rPID|1||MRN123||DOE\\Z9\\JANE\r"
     root = logging.getLogger()
     handler = _Capture(logging.DEBUG)
+    prior = root.level
     root.addHandler(handler)
     root.setLevel(logging.DEBUG)
     try:
-        msg = hl7.parse(
-            "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5.1\rPID|1||MRN123||DOE\\Z9\\JANE\r"
-        )
-        msg.unescape("DOE\\Z9\\JANE")  # → "Error decoding value [Z9], field [DOE\\Z9\\JANE]…"
+        assert Peek.parse(body).field("PID-5.1") == "DOEJANE"  # the unmapped \Z9\ is dropped
+        assert Message.parse(body).field("PID-5.1") == "DOEJANE"
     finally:
         root.removeHandler(handler)
+        root.setLevel(prior)
 
     leaked = [r for r in captured if "DOE" in r.getMessage() or "JANE" in r.getMessage()]
-    assert leaked == [], f"python-hl7 leaked PHI to logs: {[r.getMessage() for r in leaked]}"
+    assert leaked == [], f"a parser logged a field value: {[r.getMessage() for r in leaked]}"
 
 
 # --- serve --log-level -------------------------------------------------------

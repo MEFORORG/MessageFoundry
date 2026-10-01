@@ -24,8 +24,9 @@ Two complementary guards, because either alone has a hole:
   module other than ``auth/ldap.py`` (a reconciler path, a future SPNEGO/LDAP helper, a new
   federation module), which a single-file walk would have missed entirely while advertising full
   coverage. The static half also rejects an explicitly unbounded literal (``receive_timeout=None``
-  or ``=0``), which a keyword-presence check alone would accept; a non-literal value (a settings
-  attribute) is covered by the runtime half's finiteness assertions.
+  or ``=0``), which a keyword-presence check alone would accept. It also requires every
+  ``Connection``'s ``receive_timeout`` to be a ``_ldap3_receive_timeout(...)`` call, so a raw
+  settings float is refused statically too.
 
   *Disclosed limit:* an aliased module import (``import ldap3 as l3``) or a factory that returns a
   ``Connection`` from elsewhere is not resolved. Those forms do not exist at HEAD and the runtime
@@ -37,16 +38,21 @@ PHI-free: synthetic directory names only, no real principal or network address.
 from __future__ import annotations
 
 import ast
+import functools
+import math
+import struct
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator
+from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, _ldap3_receive_timeout
 from messagefoundry.config.settings import AuthSettings
 
 _CONNECT_TIMEOUT = 7.5  # deliberately not the default, so a hardcoded literal cannot pass
-_RECEIVE_TIMEOUT = 9.25
+# Deliberately not the default, AFTER rounding: its ceiling is 12, not the default's 10, so a
+# hardcoded 10 cannot pass. Fractional on purpose: ldap3 needs an int on POSIX (see below).
+_RECEIVE_TIMEOUT = 11.25
 
 
 def _ad_settings(**over: Any) -> AuthSettings:
@@ -99,10 +105,21 @@ class _Recorder:
         self.unbinds: list[str | None] = []
 
 
-def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> _Recorder:
+#: What ``_install_fakes(refer=...)`` answers a referred operation with (BACKLOG #2530).
+REFERRAL_RESULT: dict[str, Any] = {
+    "result": 10,  # RFC 4511 resultCode referral
+    "referrals": ["ldaps://dc9.other.example:636/DC=other"],
+}
+
+
+def _install_fakes(
+    monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True, refer: str = ""
+) -> _Recorder:
     """Install recording ``ldap3`` doubles. ``bind_ok=False`` makes every EXPLICIT bind fail, which
     is how the valid-user-wrong-password branch is driven (the service-account connection is built
-    with ``auto_bind=True``, which these doubles do not honour, so it is never an explicit bind)."""
+    with ``auto_bind=True``, which these doubles do not honour, so it is never an explicit bind).
+    ``refer`` names the operation, ``"bind"`` (explicit binds) or ``"group"`` (the group search),
+    that the directory answers with a referral instead."""
     import ldap3
 
     rec = _Recorder()
@@ -116,6 +133,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> 
             rec.connections.append({"server": server, **kwargs})
             self.entries: list[_FakeEntry] = []
             self._bind_dn: str | None = kwargs.get("user")
+            self.result: dict[str, Any] | None = None  # no referral
 
         def __enter__(self) -> FakeConnection:
             return self
@@ -125,6 +143,12 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> 
 
         def search(self, **kwargs: Any) -> bool:
             base = str(kwargs.get("search_base", ""))
+            # Every operation sets result afresh, as ldap3 does.
+            self.result = {"result": 0}
+            if base.startswith("OU=Groups") and refer == "group":
+                self.result = REFERRAL_RESULT
+                self.entries = []
+                return False
             if base.startswith("OU=Groups"):
                 self.entries = [
                     _FakeEntry(
@@ -149,6 +173,10 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> 
 
         def bind(self) -> bool:
             rec.binds.append(self._bind_dn)
+            if refer == "bind":
+                self.result = REFERRAL_RESULT
+                return False
+            self.result = {"result": 0 if bind_ok else 49}  # 49: invalidCredentials
             return bind_ok
 
         def unbind(self) -> None:
@@ -178,12 +206,33 @@ def _assert_all_finite(rec: _Recorder) -> None:
         assert isinstance(value, int | float) and 0 < float(value) < float("inf"), (
             f"ldap3.Connection #{i} receive_timeout is not a finite positive number: {value!r}"
         )
-        assert float(value) == _RECEIVE_TIMEOUT, (
-            f"ldap3.Connection #{i} receive_timeout {value!r} is not [auth].ad_receive_timeout"
+        # An INT, not merely a number; _ldap3_receive_timeout's docstring says why. These fakes never
+        # open a socket, so only this assertion sees the type in this file; the real-socket arm is
+        # tests/test_ldap_referrals.py, which went red on Linux CI over it.
+        assert type(value) is int, (
+            f"ldap3.Connection #{i} receive_timeout {value!r} is not an int; ldap3's POSIX branch "
+            "struct.pack()s it, so a float breaks every AD connection on Linux"
+        )
+        assert value == math.ceil(_RECEIVE_TIMEOUT), (
+            f"ldap3.Connection #{i} receive_timeout {value!r} is not [auth].ad_receive_timeout "
+            "rounded up to whole seconds"
         )
 
 
 # --- runtime guard ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("seconds", "expected"), [(10.0, 10), (9.25, 10), (0.001, 1), (3, 3)])
+def test_receive_timeout_is_whole_seconds_rounded_up(seconds: float, expected: int) -> None:
+    """Never shorter than configured, never 0 (ldap3's "wait forever"), and always an int that
+    ldap3's POSIX ``struct.pack('LL', ...)`` accepts. The float arm is the control: it is what the
+    engine used to pass, and it must raise, or this test is not measuring the Linux failure."""
+    value = _ldap3_receive_timeout(seconds)
+    assert type(value) is int and value == expected
+    struct.pack("LL", value, 0)
+    if isinstance(seconds, float):
+        with pytest.raises(struct.error):
+            struct.pack("LL", seconds, 0)
 
 
 def test_authenticate_builds_only_finitely_timed_ldap_objects(
@@ -372,6 +421,7 @@ def test_the_equalizing_bind_is_never_aimed_at_a_principal_the_caller_named() ->
 _REQUIRED_KWARG = {"Server": "connect_timeout", "Connection": "receive_timeout"}
 
 
+@functools.cache  # one package parse per session; tests/test_ldap_referrals.py walks it too
 def _ldap3_construction_sites() -> list[tuple[str, str, int, dict[str, ast.expr]]]:
     """``(ldap3 attribute, module, line number, {keyword: value node})`` for every ldap3 ``Server`` /
     ``Connection`` construction anywhere in the ``messagefoundry`` package.
@@ -430,7 +480,7 @@ def test_every_ldap3_construction_site_passes_a_timeout() -> None:
     # Sanity: the package walk must still find the three known auth/ldap.py sites, or it has gone
     # vacuously green (a moved file, a renamed package, a broken walker).
     kinds = [attr for attr, _module, _line, _kw in sites]
-    assert kinds.count("Server") >= 1 and kinds.count("Connection") >= 2, (
+    assert kinds.count("Server") >= 1 and kinds.count("Connection") >= 3, (
         f"AST walk found an unexpected ldap3 construction set: {sites}"
     )
     assert any(module.endswith("auth/ldap.py") for _a, module, _l, _k in sites), (
@@ -446,8 +496,8 @@ def test_every_ldap3_construction_site_passes_a_timeout() -> None:
         f"controller would block the login thread forever (ASVS 13.1.3): {untimed}"
     )
     # Keyword PRESENCE is not enough: `receive_timeout=None` (or `=0`) satisfies a presence check and
-    # restores the unbounded wait. Reject a literal None/0 statically; a non-literal (a settings
-    # attribute) is covered by the finiteness assertions in the runtime fakes above.
+    # restores the unbounded wait. Reject a literal None/0 statically; the next check refuses a raw
+    # settings attribute on a Connection.
     unbounded = [
         f"{attr} at {module}:{line} passes {_REQUIRED_KWARG[attr]}={ast.unparse(kwargs[_REQUIRED_KWARG[attr]])}"
         for attr, module, line, kwargs in sites
@@ -458,6 +508,57 @@ def test_every_ldap3_construction_site_passes_a_timeout() -> None:
         "ldap3 construction site(s) passing an explicitly UNBOUNDED timeout — the keyword is present "
         f"but means 'wait forever' (ASVS 13.1.3): {unbounded}"
     )
+    # A Connection's receive_timeout must go through _ldap3_receive_timeout. A raw settings float
+    # passes every check above and still raises struct.error on every non-Windows host, and the
+    # runtime fakes see only the sites a test happens to drive.
+    unconverted = _unconverted_receive_timeouts(sites)
+    assert not unconverted, (
+        "ldap3.Connection site(s) passing receive_timeout without _ldap3_receive_timeout(); ldap3 "
+        f"struct.pack()s it on POSIX, so a float breaks every AD connection on Linux: {unconverted}"
+    )
+
+
+def _unconverted_receive_timeouts(
+    sites: list[tuple[str, str, int, dict[str, ast.expr]]],
+) -> list[str]:
+    return [
+        f"Connection at {module}:{line} passes receive_timeout={ast.unparse(value)}"
+        for attr, module, line, kwargs in sites
+        if attr == "Connection"
+        and (value := kwargs.get("receive_timeout")) is not None
+        and not _is_receive_timeout_call(value)
+    ]
+
+
+def _is_receive_timeout_call(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = (
+        func.id
+        if isinstance(func, ast.Name)
+        else func.attr
+        if isinstance(func, ast.Attribute)
+        else None
+    )
+    return name == "_ldap3_receive_timeout"
+
+
+def test_the_receive_timeout_guard_discriminates() -> None:
+    """Control for the guard above: it must refuse the raw settings attribute the engine used to
+    pass, and accept the wrapped form, or its green on the real tree measures nothing."""
+
+    def site(arg: str) -> tuple[str, str, int, dict[str, ast.expr]]:
+        call = ast.parse(f"ldap3.Connection(s, receive_timeout={arg})", mode="eval").body
+        assert isinstance(call, ast.Call)
+        return ("Connection", "snippet.py", 1, {kw.arg: kw.value for kw in call.keywords if kw.arg})
+
+    raw = site("self._s.ad_receive_timeout")
+    wrapped = site("_ldap3_receive_timeout(self._s.ad_receive_timeout)")
+    assert _unconverted_receive_timeouts([raw]) == [
+        "Connection at snippet.py:1 passes receive_timeout=self._s.ad_receive_timeout"
+    ]
+    assert _unconverted_receive_timeouts([wrapped]) == []
 
 
 def test_static_walker_sees_the_bare_import_call_form() -> None:
@@ -527,6 +628,17 @@ def test_ad_timeout_rejects_an_unbounded_value(bad: float) -> None:
         _ad_settings(ad_connect_timeout=bad)
     with pytest.raises(ValueError, match="finite number of seconds"):
         _ad_settings(ad_receive_timeout=bad)
+
+
+@pytest.mark.parametrize("field", ["ad_connect_timeout", "ad_receive_timeout"])
+def test_ad_timeout_rejects_a_value_that_overflows_the_socket(field: str) -> None:
+    """A huge finite value raises OverflowError in socket.settimeout, which no LdapError handler
+    catches. The bound itself is accepted, so the refusal is the cap and not something else."""
+    assert getattr(_ad_settings(**{field: 3600.0}), field) == 3600.0
+    with pytest.raises(ValueError, match="at most 3600 seconds"):
+        _ad_settings(**{field: 3600.5})
+    with pytest.raises(ValueError, match="at most 3600 seconds"):
+        _ad_settings(**{field: 1e300})
 
 
 # --- resource release: the failed-bind path is the common adversarial case ----------------------

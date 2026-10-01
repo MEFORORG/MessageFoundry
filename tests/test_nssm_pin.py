@@ -752,11 +752,11 @@ def test_the_engine_installer_points_the_registration_before_configuring(
 @pytest.mark.parametrize("script", _WITH_BLOCK)
 def test_no_installer_sets_the_account_through_nssm(report: dict[str, Any], script: str) -> None:
     commands = _script(report, script)["commands"]
-    through_nssm = [
-        c
-        for c in commands
-        if c.get("name") in ("Invoke-Nssm", "Invoke-HelperNssm") and "ObjectName" in str(c["text"])
-    ]
+    nssm_calls = [c for c in commands if c.get("name") in ("Invoke-Nssm", "Invoke-HelperNssm")]
+    assert len(nssm_calls) >= 1, (
+        f"CONTROL FAILED: {script} runs no nssm wrapper, so none is checked"
+    )
+    through_nssm = [c for c in nssm_calls if "ObjectName" in str(c["text"])]
     assert not through_nssm, f"{script} still runs `nssm set ObjectName`: {through_nssm}"
     assert _at(commands, _named("Set-ServiceAccount")), f"CONTROL FAILED: {script} sets no account"
 
@@ -943,6 +943,7 @@ def test_no_workflow_names_an_unchecked_nssm() -> None:
         for job_id, job in _jobs(path.name).items()
         for script in _run_scripts(job)
     ]
+    assert runs, f"CONTROL FAILED: no workflow run: step was read under {WORKFLOWS}"
     assert any(job_id == _SMOKE_JOB for _, job_id, _ in runs), (
         f"CONTROL FAILED: the {_SMOKE_JOB} job was not read under {WORKFLOWS}"
     )
