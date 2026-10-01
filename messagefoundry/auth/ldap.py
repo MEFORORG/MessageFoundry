@@ -397,14 +397,20 @@ def _referred_hosts(referrals: Iterable[object]) -> str:
     name an account. Only the host part says where the directory tried to send the engine.
     """
     hosts: set[str] = set()
+    unreadable = False
     for uri in referrals:
         try:
             host = urlsplit(str(uri)).hostname
         except ValueError:
             host = None
-        hosts.add(host if host and _PRINTABLE_HOST.fullmatch(host) else "<unreadable host>")
-    named = sorted(hosts)[:_HOSTS_NAMED]
-    more = len(hosts) - len(named)
+        if host and _PRINTABLE_HOST.fullmatch(host):
+            hosts.add(host)
+        else:
+            unreadable = True
+    # Readable hosts take the named slots; an unreadable one is only ever listed last.
+    shown = sorted(hosts) + (["<unreadable host>"] if unreadable else [])
+    named = shown[:_HOSTS_NAMED]
+    more = len(shown) - len(named)
     return ", ".join(named) + (f" and {more} more" if more else "") or "<no host given>"
 
 
@@ -441,7 +447,8 @@ def _refuse_referral(conn: Any, operation: str) -> None:
         f"AD answered the {operation} with a referral to {hosts}; the engine does not follow "
         "referrals, because ldap3 would re-send the bind credentials there without the pinned CA "
         "(BACKLOG #2530). This usually means a configured search base lies in another domain of "
-        "the forest; use a base in this domain controller's own domain, or a global catalog."
+        "the forest; use a base in this domain controller's own domain, or a global catalog, "
+        "which carries universal-group membership only (ADR 0180 Amendment F)."
     )
     _warn_once(f"referral: {operation}", "%s Reported once per operation.", message)
     raise LdapError(message)

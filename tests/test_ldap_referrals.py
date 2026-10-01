@@ -344,7 +344,7 @@ def test_the_refusal_names_hosts_and_nothing_else_the_directory_sent() -> None:
             "user search",
         )
     message = str(refused.value)
-    assert "referral to <unreadable host>, dc2.other.example;" in message
+    assert "referral to dc2.other.example, <unreadable host>;" in message
     for leaked in ("DC=other", "bindname", "cn=x", "\x1b", "evil"):
         assert leaked not in message
 
@@ -359,6 +359,13 @@ def test_the_refusal_names_a_few_hosts_and_counts_the_rest() -> None:
     message = str(refused.value)
     assert "dc0.other.example, dc1.other.example, dc2.other.example and 3 more;" in message
     assert "dc3" not in message
+    # An underscore is legal in an AD host name, and the bad-URL placeholder never takes a slot
+    # ahead of a readable host.
+    assert ldap_module._referred_hosts(["ldap://dc_9.corp.example/"]) == "dc_9.corp.example"
+    assert ldap_module._referred_hosts(["not a url"] * 2 + referrals[:3]) == (
+        "dc0.other.example, dc1.other.example, dc2.other.example and 1 more"
+    )
+    assert ldap_module._referred_hosts([]) == "<no host given>"
 
 
 # --- static: no construction site may bring ldap3's referral defaults back --------------------------
@@ -367,14 +374,14 @@ def test_the_refusal_names_a_few_hosts_and_counts_the_rest() -> None:
 def test_every_search_in_the_ldap_module_goes_through_the_refusing_wrapper() -> None:
     """A search called directly would read a referral as "no entries" again. ``_search`` is the one
     place a ``.search(...)`` call may appear in ``auth/ldap.py``, at any depth, async or not. A
-    regular expression's ``.search`` is not an LDAP search and is let through."""
+    regular expression's ``.search`` would go red here too; name it in this test if one is added."""
     tree = ast.parse(Path(ldap_module.__file__).read_text(encoding="utf-8"))
-    regexes = {"re", "_PRINTABLE_HOST"}
     owner = {
         id(node): scope.name
         for scope in ast.walk(tree)
         if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef)
-        for node in ast.walk(scope)
+        for statement in scope.body  # the body only: defaults and decorators run outside it
+        for node in ast.walk(statement)
     }  # the innermost scope wins: ast.walk visits outer functions first, and later keys overwrite
     callers = [
         owner.get(id(node), "<module>")
@@ -382,7 +389,6 @@ def test_every_search_in_the_ldap_module_goes_through_the_refusing_wrapper() -> 
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "search"
-        and not (isinstance(node.func.value, ast.Name) and node.func.value.id in regexes)
     ]
     assert callers == ["_search"], callers
 
