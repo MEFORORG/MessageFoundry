@@ -37,7 +37,7 @@ import contextlib
 import json
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -802,11 +802,6 @@ async def run_batch_driver(
             cell_coord.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id, "error": str(exc)})
 
     batch_comparison = build_batch_comparison(records, profile.batch_modes)
-    if profile.slo.empty_claims_herd_floor_legs:
-        # A folded record sums the offered rate across processes, so a herd floor predicted from it
-        # is a number about something else (report.predict_herd_levels). Never grade it here.
-        notes.append("empty_claims_herd_floor_legs ignored: batch-box records are folded")
-        profile = replace(profile, slo=replace(profile.slo, empty_claims_herd_floor_legs=()))
     slos = _evaluate_slos(profile, records)
     result_ok = (
         bool(records)

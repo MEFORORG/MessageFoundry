@@ -15,6 +15,7 @@ mix.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
 import json
 import subprocess
@@ -1016,7 +1017,13 @@ def test_main_reports_an_unreadable_saved_harvest(
 
 
 @pytest.mark.parametrize(
-    "flag", [["--branch", "main"], ["--since", "2026-09-01T00:00:00Z"], ["--max-runs", "3"]]
+    "flag",
+    [
+        ["--branch", "main"],
+        ["--since", "2026-09-01T00:00:00Z"],
+        ["--max-runs", "3"],
+        ["--repo", "o/r"],
+    ],
 )
 def test_a_selection_flag_cannot_narrow_a_re_render(tmp_path: Path, flag: list[str]) -> None:
     saved = tmp_path / "h.json"
@@ -1038,3 +1045,25 @@ def test_the_json_is_written_before_a_csv_directory_that_cannot_be(
     assert rc == 2
     assert "cannot write CSVs" in capsys.readouterr().err
     assert json.loads(out.read_text(encoding="utf-8"))["jobs"], "the scan must survive"
+
+
+def test_payload_text_cannot_run_as_a_spreadsheet_formula(tmp_path: Path) -> None:
+    result = _result_with([_reading(ch.POST_2024, "ubuntu-latest py3.14", -1.5, "success")])
+    result.readings[0] = dataclasses.replace(result.readings[0], lane="=HYPERLINK(1)")
+    ch.write_csvs(result, tmp_path)
+    (row,) = csv.DictReader((tmp_path / "readings.csv").open(encoding="utf-8"))
+    assert row["lane"] == "'=HYPERLINK(1)"
+    assert row["value"] == "-1.5", "a number is never quoted, so a negative reading stays one"
+
+
+def test_a_saved_row_off_the_csv_header_is_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    saved = ch.to_json_dict(_harvest(_fixture()))
+    saved["unjoined_artifacts"] = [
+        {"run_id": 1, "artifact_id": 2, "name": "n", "reason": "r", "x": 1}
+    ]
+    path = tmp_path / "h.json"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    assert ch.main(["--from-json", str(path), "--csv-dir", str(tmp_path / "csv")]) == 2
+    assert "cannot write CSVs" in capsys.readouterr().err

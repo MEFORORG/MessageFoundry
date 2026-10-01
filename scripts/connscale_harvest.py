@@ -872,7 +872,7 @@ def is_complete(result: Harvest) -> bool:
 def render_markdown(result: Harvest) -> str:
     cap = "none" if result.max_runs is None else str(result.max_runs)
     lines = [
-        "# connscale base-reading harvest (BACKLOG #1415, build 1: no gate)",
+        "# connscale base-reading harvest (BACKLOG #1415 instrument: a scan, it arms nothing)",
         "",
         f"repo {result.repo}, workflow {result.workflow}, branch {result.branch or 'any'}, "
         f"event {result.event or 'any'}",
@@ -977,6 +977,17 @@ def from_json_dict(data: dict[str, Any]) -> Harvest:
     return result
 
 
+def _csv_safe(value: object) -> object:
+    """Payload-derived TEXT that a spreadsheet would run as a formula gets a leading quote.
+
+    Numbers pass untouched, so a negative reading stays a number. Text such as a lane name comes from
+    a CI artifact, and the CSVs are committed for a reader to open.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def write_csvs(result: Harvest, out_dir: Path) -> list[Path]:
     """Every reading, every job and every unjoined artifact as CSV, one row each.
 
@@ -999,7 +1010,7 @@ def write_csvs(result: Harvest, out_dir: Path) -> list[Path]:
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=header, lineterminator="\n")
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows({k: _csv_safe(v) for k, v in row.items()} for row in rows)
         written.append(path)
     return written
 
@@ -1050,6 +1061,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ("--event", args.event),
                 ("--max-runs", args.max_runs),
                 ("--with-tail-until", args.with_tail_until),
+                ("--repo", None if args.repo == DEFAULT_REPO else args.repo),
+                ("--workflow", None if args.workflow == DEFAULT_WORKFLOW else args.workflow),
             )
             if value is not None
         ]
@@ -1092,7 +1105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.csv_dir:
         try:
             write_csvs(result, args.csv_dir)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:  # ValueError: a saved row with a key off the header
             print(f"cannot write CSVs to {args.csv_dir}: {exc}", file=sys.stderr)
             return 2
     text = render_markdown(result) + "\n"

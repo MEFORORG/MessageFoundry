@@ -1,4 +1,4 @@
-# connscale base-reading harvest (BACKLOG #1415, build 1: no gate)
+# connscale base-reading harvest (BACKLOG #1415 instrument: a scan, it arms nothing)
 
 repo MEFORORG/MessageFoundry, workflow ci.yml, branch any, event any
 window 2026-09-30T12:00:00Z .. 2026-10-01T20:10:00Z (run creation time); with-tail ceiling none

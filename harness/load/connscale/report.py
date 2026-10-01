@@ -917,9 +917,11 @@ class ConnScaleReport:
             f"OUTSIDE BAND row here fails nothing. The width is left untouched, but the VALUES "
             f"changed window at BACKLOG #1420: readings harvested before that change are not "
             f"comparable with these (the JSON copy carries `rate_window`)."
+            # Only when the floor table below will actually render: a sentence about a table the
+            # early return drops would tell the reader the opposite of what was graded.
             + (
                 ""
-                if base_count is None
+                if base_count is None or not rows
                 else " The predicted herd floor below IS ENFORCED on this leg (BACKLOG #1415)."
                 if enforced
                 else " The predicted herd floor below is recorded and not enforced on this leg."

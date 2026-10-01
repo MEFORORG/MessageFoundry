@@ -114,6 +114,31 @@ def test_the_ci_profile_still_runs_at_the_harvested_point() -> None:
     assert min(_SMOKE_COUNTS) == _BASE, "the base count moved: re-harvest before arming any leg"
     offered = {lane: smoke.aggregate_rate_for(lane, _BASE) for lane in _RATE}
     assert offered == _RATE, "the offered rates moved: re-harvest before arming any leg"
+    # Everything else that shapes the rate window or the reading, at the values the harvest ran.
+    shape = {
+        "sweep_mode": smoke.sweep_mode,
+        "hold_seconds": smoke.hold_seconds,
+        "connect_batch": smoke.connect_batch,
+        "connect_batch_pause_s": smoke.connect_batch_pause_s,
+        "poll_interval_s": smoke.poll_interval_s,
+        "transform": smoke.transform,
+        "reload_probe": smoke.reload_probe,
+        "store_backend": smoke.store_backend,
+        "claim_modes": smoke.claim_modes,
+        "trials": smoke.trials,
+    }
+    assert shape == {
+        "sweep_mode": "both",
+        "hold_seconds": 1.5,
+        "connect_batch": 8,
+        "connect_batch_pause_s": 0.0,
+        "poll_interval_s": 0.25,
+        "transform": "cheap",
+        "reload_probe": True,
+        "store_backend": None,  # store_backend = "sqlite" parses to the default, None
+        "claim_modes": ("per_lane",),
+        "trials": 1,
+    }, "the CI profile moved off the harvested point: re-harvest before arming any leg"
 
 
 def test_ci_exports_the_leg_in_the_form_the_profile_names_it() -> None:
@@ -125,10 +150,12 @@ def test_ci_exports_the_leg_in_the_form_the_profile_names_it() -> None:
     step = step[: step.index("\n      - name:", 1)]
     expected = f"{CONNSCALE_LEG_ENV}: ${{{{ matrix.os }}}}-py${{{{ matrix.python-version }}}}"
     assert expected in step, step[:400]
+    # Each armed leg must be a `test` matrix entry, read from the matrix JSON the `changes` job
+    # builds, not from the words appearing anywhere else in ci.yml.
     for leg in _HERD_FLOOR_LEGS:
         os_name, _, version = leg.rpartition("-py")
-        assert f"'{os_name}'" in ci or f'"{os_name}"' in ci or f" {os_name}" in ci, os_name
-        assert version in ci, version
+        entry = f'{{"os":"{os_name}","python-version":"{version}",'
+        assert entry in ci, f"no test matrix entry starts {entry}: leg {leg} would never be graded"
 
 
 # --- clause (d): the deliberate negative control -------------------------------------------------
@@ -156,11 +183,14 @@ def test_a_reading_just_under_the_floor_trips_it_and_one_at_it_does_not() -> Non
 
 
 def test_the_harvested_minima_on_the_armed_leg_clear_the_floor() -> None:
-    # The lowest passing post_2024 readings of the armed leg's two cells (readings.csv).
-    records = [
-        _rec("fixed_aggregate", 12, per_msg=26.727272727272727),
-        _rec("fixed_per_conn", 12, per_msg=31.6875, rate=_RATE["fixed_per_conn"]),
-    ]
+    # The lowest passing post_2024 reading of each of the armed leg's cells, read from readings.csv.
+    cells = _cells()
+    leg = _ARMED.replace("-py", " py")
+    records = []
+    for lane, rate in _RATE.items():
+        low = cells[(leg, lane)].min
+        assert low is not None
+        records.append(_rec(lane, _BASE, per_msg=low, rate=rate))
     check = _empty_claims_herd_floor_slo(_profile(_ARMED), records, _ARMED)
     assert check.ok and check.observed == f"above the floor on 2 of 2 lane(s), leg {_ARMED}"
 
@@ -208,6 +238,15 @@ def test_the_floor_is_off_unless_a_leg_is_named() -> None:
 def test_a_malformed_leg_list_is_refused(bad: str) -> None:
     text = _profile_text_with(f"empty_claims_herd_floor_legs = {bad}")
     with pytest.raises(ConnScaleProfileError, match="empty_claims_herd_floor_legs"):
+        load_connscale_profile_text(text, where="<unit>")
+
+
+def test_a_floor_cannot_be_armed_over_repeat_trials() -> None:
+    # The floor grades the first base record per lane, so trials 2..N would go ungraded.
+    text = _profile_text_with(f"empty_claims_herd_floor_legs = ['{_ARMED}']").replace(
+        "corpus_count_per_trigger = 5", "corpus_count_per_trigger = 5\ntrials = 3"
+    )
+    with pytest.raises(ConnScaleProfileError, match="trials = 3"):
         load_connscale_profile_text(text, where="<unit>")
 
 

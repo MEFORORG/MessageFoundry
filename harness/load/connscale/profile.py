@@ -409,6 +409,13 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
         "empty_claims_base_reading": profile.slo.empty_claims_base_reading,
         "empty_claims_herd_floor_legs": bool(profile.slo.empty_claims_herd_floor_legs),
     }
+    # The floor grades the FIRST record at the base count in each lane (`herd_floor_readings`), so a
+    # repeat trial would be recorded and never graded: refuse the pairing rather than grade one of N.
+    if profile.slo.empty_claims_herd_floor_legs and profile.trials > 1:
+        raise ConnScaleProfileError(
+            f"{where}: slo.empty_claims_herd_floor_legs grades one base reading per lane, so it "
+            f"cannot be armed with trials = {profile.trials}"
+        )
     for key, armed in per_lane_only.items():
         if armed and PER_LANE not in profile.claim_modes:
             raise ConnScaleProfileError(

@@ -74,7 +74,7 @@ Where it lives:
   runs. It is not armed in `connscale-smoke.toml`: that file's base count is N=50, nothing runs it,
   and no harvest exists at that point.
 
-### The harvest
+### The harvest covers every event and gives each cell 137 to 144 passing readings
 
 The scan covered every `ci.yml` run of any event created from 2026-09-30T12:00:00Z to
 2026-10-01T20:10:00Z. The first payload of the fitted population (`rate_window =
@@ -107,7 +107,7 @@ same window. The branch fix is what made the counts reachable. Over this window 
 returns 412 runs with no branch filter, the 408 scanned plus the 4 still running, and 63 with
 `branch=main`, which is the filter the script used to send.
 
-### Per cell, passing jobs only, fitted population, N=12
+### Only the two ubuntu cells clear the margin
 
 `F` is the predicted floor, the geometric mean of the herd-present and herd-gone levels. `idle` is
 the herd-gone level. Neither was chosen against a reading.
@@ -124,17 +124,17 @@ the herd-gone level. Neither was chosen against a reading.
 The median is the lower median, and every percentile is nearest-rank, so each figure is a recorded
 reading.
 
-### The four clauses, per cell
+### Ubuntu passes all four clauses, and Windows fails the margin
 
-1. **(a) Margin.** `min / F` must reach 1.25. Both ubuntu cells pass. All four Windows cells fail,
+1. (a) Margin. `min / F` must reach 1.25. Both ubuntu cells pass. All four Windows cells fail,
    and on two of them `F` sits above a passing reading: 2 passing jobs on each Windows
    fixed_aggregate cell read below 15.30.
-2. **(b) It grades more than the sign test.** `F` must sit above the herd-gone level, not merely
+2. (b) It grades more than the sign test. `F` must sit above the herd-gone level, not merely
    above zero. Every cell passes: 15.30 is above 6, and 23.24 is above 12.
-3. **(c) The known-answer case.** Run 36797223259, job 110163384729, `test (windows-2022, py3.14)`,
+3. (c) The known-answer case. Run 36797223259, job 110163384729, `test (windows-2022, py3.14)`,
    lane `fixed_aggregate`, read 22.36. Against that cell's `F` of 15.30 it is not below, so (c)
    holds. The cell is still not armed, because (a) fails.
-4. **(d) A true positive or a negative control.** `tests/test_connscale_herd_floor.py` feeds both
+4. (d) A true positive or a negative control. `tests/test_connscale_herd_floor.py` feeds both
    lanes their herd-gone level on an armed leg. The floor trips, and the sign test passes the same
    readings.
 
@@ -142,7 +142,7 @@ reading.
 example anything up to 11.49 on windows-2022 fixed_aggregate. Picking it after reading the numbers
 is the fitted-threshold defect BACKLOG #1211 measured, and #1415's rule forbids it.
 
-### What this does not establish
+### The decision leaves these questions open
 
 - 137 passing readings with none below `F` bound the false-alarm rate per lane per run at about
   2.2 percent, by the rule of three. The observed margin of 1.36 or more suggests far lower, but it
@@ -157,9 +157,11 @@ is the fitted-threshold defect BACKLOG #1211 measured, and #1415's rule forbids 
   fails because of it, and leaves the passing cells. Read that leg's non-passing readings for floor
   breaches before re-applying the rule, or the gate's own fires will not show.
 - The floor is armed at the point measured: N=12, offering 24 msg/s (fixed_aggregate) and 12 msg/s
-  (fixed_per_conn). `tests/test_connscale_herd_floor.py` reds if the CI profile moves off it.
+  (fixed_per_conn), with the inline profile's hold, batching, poll and reload settings.
+  `tests/test_connscale_herd_floor.py` reds if the CI profile moves off any of them, or if the `test`
+  matrix stops carrying an armed leg.
 
-### Re-checking any number here
+### Every number here can be re-checked from committed files
 
 The readings are committed under
 [../../../docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/](../../../docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/):
