@@ -252,9 +252,7 @@ def test_each_engine_sbom_is_built_unprivileged_and_handed_to_release(
     - it runs exactly when ``release`` does: the same job ``if:``, and ``release`` needs it, so a
       release cannot proceed without the file or ship one from a skipped job;
     - its upload refuses a missing file, rather than failing a job later at the download;
-    - the ``release`` job downloads it exactly once, and builds no SBOM itself. The last arm is what
-      the 2026-09-30 move exists for: a `cyclonedx_py` step back inside ``release`` puts package
-      installs beside the key again while every sink check below stays green.
+    - the ``release`` job downloads it exactly once. That it builds none itself is the next test.
     """
     jobs = _jobs()
     build, rel = jobs.get(job_name), jobs.get("release")
@@ -292,7 +290,23 @@ def test_each_engine_sbom_is_built_unprivileged_and_handed_to_release(
     assert len(downloads) == 1, (
         f"release downloads the {artifact!r} artifact {len(downloads)} times"
     )
-    in_release = [st.get("name") for st in steps if "cyclonedx_py" in _run_shell(st)]
+
+
+def test_the_release_job_builds_no_sbom_itself() -> None:
+    """The signing job only downloads the engine SBOMs; it never generates one.
+
+    This is what the 2026-09-30 move exists for (ADR 0149's amendment): an SBOM build back inside
+    ``release`` puts package installs beside its signing identity again, while every sink check still
+    passes. Both step kinds are read: a ``run:`` calling ``cyclonedx_py``, and a ``uses:`` CycloneDX
+    action, which has no ``run:`` for the first test to see.
+    """
+    steps = _jobs()["release"].get("steps") or []
+    assert steps, "release.yml's `release` job has no steps, so this check would prove nothing"
+    in_release = [
+        st.get("name") or st.get("uses")
+        for st in steps
+        if "cyclonedx" in _run_shell(st).lower() or "cyclonedx" in str(st.get("uses", "")).lower()
+    ]
     assert not in_release, (
         f"release builds an SBOM itself again, beside its signing identity: {in_release}. Build it "
         f"in an unprivileged job and download it (ADR 0149's 2026-09-30 amendment)."
