@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from harness.load.connscale.driver import ConnScaleDriver
-from harness.load.connscale.report import NoLoss
+from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, NoLoss
 from harness.load.connscale.runner import ConnScaleError, _reconcile
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
@@ -112,6 +112,8 @@ class ConnScaleRemoteReport:
                 "drain_complete": self.drain_complete_iso,
             },
             "throughput": {
+                # Engine reads at the hold's start and end, over its length (BACKLOG #2012).
+                "rate_window": HOLD_BRACKET_RATE_WINDOW,
                 "achieved_aggregate_rate": round(self.achieved_aggregate_rate, 2),
                 "delivered_aggregate_rate": round(self.delivered_aggregate_rate, 2),
                 "in_pipeline_peak": self.in_pipeline_peak,

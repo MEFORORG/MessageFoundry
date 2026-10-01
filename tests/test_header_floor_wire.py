@@ -63,7 +63,7 @@ from messagefoundry.pipeline import Engine
 #: The uvicorn this suite was measured against. See the module docstring before moving it.
 _MEASURED_UVICORN = "0.49.0"
 #: The websockets library writes the legacy protocol's own handshake rejections, so it is pinned too.
-_MEASURED_WEBSOCKETS = "16.0"
+_MEASURED_WEBSOCKETS = "17.1"
 
 _HANDSHAKE = (
     "GET {path} HTTP/1.1\r\n"
@@ -453,8 +453,8 @@ def test_a_hooked_cycle_is_still_freed_by_refcount(cycle_module: str) -> None:
 def test_a_changed_handshake_writer_signature_reaches_the_server_unchanged(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Degrade on a signature change: a writer called with one argument, where 16.0 passes
-    (status, headers, body), must still write, not raise inside the override."""
+    """Degrade on a signature change: a writer called with one argument, where 16.0 and 17.1
+    pass (status, headers, body), must still write, not raise inside the override."""
     written: list[tuple[Any, ...]] = []
 
     class _Stub(asyncio.Protocol):

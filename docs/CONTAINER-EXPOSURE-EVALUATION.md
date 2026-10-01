@@ -222,7 +222,7 @@ Posture-B refusal never fires. It does declare a terminator, so the engine warns
 That runbook is maintainer-internal — [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what
 is withheld and what you can request.
 
-> **⚠ Keep `trusted_proxies` to the proxy's exact address(es).** Every host inside a `trusted_proxies`
+> **WARNING: Keep `trusted_proxies` to the proxy's exact address(es).** Every host inside a `trusted_proxies`
 > entry may set `X-Forwarded-For` to any value, and the engine hands that value on as the client
 > address — so a broad range like `10.0.0.0/8` on a LAN numbered out of 10/8 lets *any* workstation
 > forge its own source IP, poisoning the audit trail, the per-IP login limiter, and the new-client-IP

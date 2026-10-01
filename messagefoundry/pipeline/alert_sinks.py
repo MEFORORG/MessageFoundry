@@ -38,6 +38,7 @@ from typing import Any, Generic, Protocol, TypeVar
 
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
+    _ALERT_CONTROL_EVENT_TYPES,
     INSECURE_TLS_ESCAPE_ENV,
     AlertRule,
     AlertSeverity,
@@ -727,9 +728,6 @@ class AlertRuleSet:
         # event time (or, with invert, only outside its windows). No schedule = always applies.
         if rule.schedule is not None and not rule.schedule.is_active(now_dt):
             return False
-        # #81: content-label filter — route a content_match event by its (non-PHI operator) label.
-        if rule.content_label is not None and str(event.get("label", "")) != rule.content_label:
-            return False
         # Depth applies only to queue_buildup (you can't be "over depth" on a stopped connection); the
         # age threshold applies to BOTH age-carrying events — queue_buildup and message_stall (#50) —
         # since both fire on the same oldest-undelivered age (delivered_age). A rule setting a threshold
@@ -862,19 +860,6 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
-    def content_match(self, connection: str, *, label: str, rule_id: str | None = None) -> None:
-        # #81 (ADR 0133): a code-first Handler ("Action Point") inspected a message and decided to alert.
-        # PHI-FREE BY CONTRACT: there is NO value parameter — the event carries ONLY the connection, an
-        # operator `label` (e.g. "STAT order"), and an optional operator rule id — NEVER the matched field
-        # value. Rides the SAME (type, connection) throttle + ADR 0044 dedup as every other event, so a
-        # transform RE-RUN's re-emit folds into the one instance (idempotent) and is throttled to one
-        # notification per cooldown — the purity / at-least-once reconciliation (ADR 0133 D3). A rule can
-        # route it by `label` via AlertRule.content_label.
-        event: dict[str, Any] = {"type": "content_match", "connection": connection, "label": label}
-        if rule_id is not None:
-            event["rule_id"] = rule_id  # non-PHI operator id (payload key; not the matched value)
-        self._emit(event)
-
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         # The DB path stands in for "connection" so the realert throttle + subject keying work
         # uniformly; the event carries no message content (no PHI), only sizes.
@@ -967,11 +952,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is unclaimed and near its
         # deadline. `user:<username>` stands in for "connection", so the throttle and the alert
         # instance key per account. Rules still match it: AlertRule.connection defaults to "*". So
-        # when a catch-all rule is the first match, its mute or transports=[] silences this reminder,
-        # and its control_action is dispatched at `user:<username>`, or, with control_target set, at
-        # that real connection, which it restarts. Scope such rules to real connection names or to
-        # one event_type. `reason` carries the deadline into the durable alert row. The payload is
-        # the ISO deadline and whole hours remaining only: never the password, no PHI.
+        # when a catch-all rule is the first match, its mute or transports=[] silences this reminder.
+        # No control_action fires on it: AlertRule refuses one on a non-connection event type, and
+        # _emit skips it (BACKLOG #1898). `reason` carries the deadline into the durable alert row.
+        # The payload is the ISO deadline and whole hours remaining only: never the password, no PHI.
         self._emit(
             {
                 "type": "initial_credential_expiring",
@@ -1288,8 +1272,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # BEFORE the transport-suppression return, so a rule may auto-remediate QUIETLY (transports=[]) or
         # alongside a page. Dispatched off-worker + never-raise (see _dispatch_control).
         if decision.control_action is not None:
-            target = decision.control_target or str(event["connection"])
-            self._dispatch_control(decision.control_action, target)
+            if event["type"] in _ALERT_CONTROL_EVENT_TYPES:
+                target = decision.control_target or str(event["connection"])
+                self._dispatch_control(decision.control_action, target)
+            else:
+                # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never reaches
+                # here. This covers only a rule built past that validator (model_construct). It checks
+                # the event TYPE and cannot see a stand-in raised under an allowed type (see the
+                # KNOWN GAPS on _ALERT_CONTROL_EVENT_TYPES).
+                log.warning(
+                    "alert control_action %s skipped: event type %r is not connection-scoped",
+                    decision.control_action,
+                    event["type"],
+                )
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
         # was already recorded above (AC-3: a suspended alert stays open/counted/visible), and any #144
         # control action already dispatched; a still-active suspend window only mutes the transport enqueue.
@@ -1341,10 +1336,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             self._occurrences.pop(f"{inverse_of}:{connection}", None)
             coro = store.resolve_alert_instances_for(event_type=inverse_of, connection=connection)
         else:
-            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason);
-            # a content_match event carries only its non-PHI operator `label` (#81, ADR 0133) — NEVER the
-            # matched field value — so fall back to it so the instance shows what the content alert is about.
-            raw_reason = event.get("detail") or event.get("reason") or event.get("label")
+            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
+            raw_reason = event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
             coro = store.upsert_alert_instance(
                 event_type=etype,

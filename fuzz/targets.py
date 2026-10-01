@@ -306,7 +306,7 @@ class FuzzTarget:
 TARGETS: tuple[FuzzTarget, ...] = (
     FuzzTarget(
         name="hl7_peek",
-        summary="tolerant HL7 v2 peek (python-hl7 / built-ins) plus the pre-ACK routing accessors",
+        summary="tolerant HL7 v2 peek (the built-in parser) plus the pre-ACK routing accessors",
         run=_hl7_peek,
         seeds=_sample("adt_a01.hl7") + _sample("adt_batch.hl7") + (_MINIMAL_HL7, BLANK_SEGMENT_HL7),
     ),

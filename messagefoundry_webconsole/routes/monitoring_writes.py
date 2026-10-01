@@ -78,7 +78,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         holds ``monitoring:diagnose`` only, so the rules are fetched only for a caller that also holds
         read. A refusal must not widen what an actor can see."""
         instances = await core.list_active_alerts(
-            engine=engine, identity=identity, limit=ACTIVE_ALERTS_LIMIT
+            request=request, engine=engine, identity=identity, limit=ACTIVE_ALERTS_LIMIT
         )
         config = (
             await core.alerts_rules(request, _user=identity)

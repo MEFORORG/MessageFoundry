@@ -18,12 +18,14 @@ import json
 import sys
 import time
 import types
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.auth.ldap import LdapError
 from messagefoundry.auth.notifications import FIRST_ADMINISTRATOR_TAKEOVER, SecurityEvent
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
@@ -34,6 +36,7 @@ from messagefoundry.auth.service import (
     AuthService,
     FirstAdministratorRefused,
 )
+from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.settings import AlertsSettings, AuthSettings
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
@@ -732,14 +735,18 @@ def _anchored_service_config(
     else:
         monkeypatch.setenv("MEFOR_AUTH_OIDC_CLIENT_SECRET", "not-a-real-secret")
         security = 'web_console_public_address = "https://ops.example"\n'
+        # The IdP is on this host. Since BACKLOG #2081 the command passes the hop posture `serve`
+        # passes, so an off-box IdP with no [auth].oidc_tls_crl_file is refused at enforce by the
+        # revocation guard (#1887), as `serve` refuses it. On-box, the guard allows, and the anchor
+        # verdict is the only thing these tests vary.
         auth += (
             "oidc_enabled = true\n"
-            'oidc_issuer = "https://idp.example"\n'
+            'oidc_issuer = "https://127.0.0.1"\n'
             'oidc_client_id = "mefor-console"\n'
-            'oidc_authorization_endpoint = "https://idp.example/authorize"\n'
-            'oidc_token_endpoint = "https://idp.example/token"\n'
-            'oidc_jwks_uri = "https://idp.example/jwks"\n'
-            'oidc_allowed_endpoints = ["idp.example"]\n'
+            'oidc_authorization_endpoint = "https://127.0.0.1/authorize"\n'
+            'oidc_token_endpoint = "https://127.0.0.1/token"\n'
+            'oidc_jwks_uri = "https://127.0.0.1/jwks"\n'
+            'oidc_allowed_endpoints = ["127.0.0.1"]\n'
             f"oidc_tls_ca_cert_file = '{anchor.as_posix()}'\n"
         )
     cfg = tmp_path / "service.toml"
@@ -815,7 +822,10 @@ def test_the_command_provisions_where_serve_would_start(
     if owner_only:
         assert warned == []
     else:
-        assert warned and all("enforcement=warn, starting anyway" in m for m in warned)
+        # ONE warning, on both stores (BACKLOG #2081). The command builds AuthService once; an
+        # existing store used to build it twice, and so printed the same warning twice.
+        assert len(warned) == 1, warned
+        assert "enforcement=warn, starting anyway" in warned[0]
 
 
 @pytest.mark.parametrize("hop", _HOPS)
@@ -827,11 +837,12 @@ def test_a_weak_anchor_is_refused_cleanly_at_enforce(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """At ``enforce`` the command refuses, in words and with exit 1, never as a traceback.
+    """At ``enforce`` the command refuses, in words and with exit 1, never as a traceback, and
+    before the prompt on both stores (ADR 0183 AC-15).
 
-    Both arms that build ``AuthService`` are covered. On an existing store the early "is there an
-    Administrator" answer builds it, before the prompt. On a fresh one nothing is built until the
-    write, after the prompt.
+    On a fresh store the service used to be built only for the write, after the prompt and after
+    ``open_store(create=True)``, so the refusal left an empty store behind (BACKLOG #2081). It is
+    now built once, before the prompt, whichever store there is.
     """
     monkeypatch.chdir(tmp_path)
     key = _key_in_this_shell(monkeypatch)
@@ -840,9 +851,7 @@ def test_a_weak_anchor_is_refused_cleanly_at_enforce(
     db = tmp_path / "p.db"
     if store == "existing":
         _existing_empty_store(db, key)
-        _no_prompt(monkeypatch)
-    else:
-        _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    _no_prompt(monkeypatch)
     argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
     assert main([*argv, "--db", str(db), "--json"]) == 1
     captured = capsys.readouterr()
@@ -851,6 +860,270 @@ def test_a_weak_anchor_is_refused_cleanly_at_enforce(
     assert "writable by a non-owner" in error and "enforcement=enforce refuses" in error
     assert "provisioned nothing" in error
     assert "Traceback" not in captured.out + captured.err
+    assert db.exists() is (store == "existing"), "a refused fresh provision left a store behind"
+
+
+# --- BACKLOG #2081: every refusal before the prompt, and AuthService built the way serve builds it --
+
+#: A value planted where a secret would be, which must reach neither stream.
+_CANARY = "CANARY2081notarealsecret"
+
+#: The environment the ``vault`` key provider reads, cleared so a developer's own Vault wiring
+#: cannot turn the refusal into a live unwrap.
+_VAULT_ENV = (
+    "MEFOR_STORE_VAULT_ADDR",
+    "MEFOR_STORE_VAULT_TOKEN",
+    "MEFOR_STORE_VAULT_TRANSIT_KEY",
+    "MEFOR_STORE_VAULT_WRAPPED_DEK",
+    "MEFOR_STORE_VAULT_CA_FILE",
+)
+
+
+@pytest.mark.parametrize("store", _STORES)
+def test_a_key_provider_that_cannot_resolve_is_refused_before_the_prompt(
+    store: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``key_provider = "vault"`` with no Vault environment in this shell. ``open_store`` refuses an
+    absent store before it resolves the key, so on a fresh install the command used to prompt for a
+    password and only then fail at the write. The existing store is the control: its open resolves
+    the key, and it was refused before the prompt already, but as an escaped exception."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "p.db"
+    if store == "existing":
+        _existing_empty_store(db, _key_in_this_shell(monkeypatch))
+        monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY")
+    for name in _VAULT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "vault")
+    _no_prompt(monkeypatch)
+    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert rc == 2, error
+    # The Vault refusal itself, with this command's line after it, not the dispatch floor's report.
+    assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in error, error
+    assert error.endswith("Refusing to provision; nothing was written"), error
+    assert db.exists() is (store == "existing"), "a refused fresh provision left a store behind"
+
+
+def _secret_ad_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, ref: str) -> Path:
+    """AD enabled with its bind password held by the ``env`` secret provider under ``ref``, and no
+    literal bind password anywhere. No CA is named, so no anchor is checked."""
+    monkeypatch.delenv("MEFOR_AUTH_AD_BIND_PASSWORD", raising=False)
+    cfg = tmp_path / "service.toml"
+    cfg.write_text(
+        '[secrets]\nprovider = "env"\n'
+        "[auth]\n"
+        "ad_enabled = true\n"
+        'ad_server = "ldaps://dc1.example.test:636"\n'
+        'ad_user_search_base = "DC=example,DC=test"\n'
+        'ad_bind_dn = "CN=svc,DC=example,DC=test"\n'
+        'ad_domain = "example.test"\n'
+        f'ad_bind_password_secret = "{ref}"\n',
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_an_ad_bind_password_held_by_a_secret_provider_provisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` hands AuthService the ``[secrets]`` provider; this command did not, so an AD bind
+    password held by a provider could not resolve here and the command failed where ``serve``
+    starts. The directory is never contacted: the password is resolved when the service is built."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    monkeypatch.setenv("MEFOR_TEST_AD_BIND_2081", _CANARY)
+    cfg = _secret_ad_config(tmp_path, monkeypatch, ref="MEFOR_TEST_AD_BIND_2081")
+    db = tmp_path / "p.db"
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    assert main([*argv, "--db", str(db), "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["username"] == "site-admin"
+    assert _CANARY not in captured.out + captured.err
+
+
+def test_a_secret_the_provider_cannot_resolve_is_refused_before_the_prompt_in_fixed_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control on the test above: the reference names a variable that is unset. The refusal
+    is this command's fixed text, before the prompt, and the store is not created. The provider's
+    own message names the reference, which this text does not repeat."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    monkeypatch.delenv("MEFOR_TEST_AD_BIND_2081", raising=False)
+    cfg = _secret_ad_config(tmp_path, monkeypatch, ref="MEFOR_TEST_AD_BIND_2081")
+    db = tmp_path / "p.db"
+    _no_prompt(monkeypatch)
+    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    assert main([*argv, "--db", str(db), "--json"]) == 1
+    captured = capsys.readouterr()
+    error = json.loads(captured.out)["error"]
+    assert error.startswith("a secret the [auth] settings reference"), error
+    assert "MEFOR_TEST_AD_BIND_2081" not in captured.out + captured.err
+    assert not db.exists(), "a refused provision left a store behind"
+
+
+def _refusing_service(exc: BaseException) -> type:
+    """An ``AuthService`` stand-in whose construction raises ``exc``."""
+
+    class _Refusing:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            raise exc
+
+    return _Refusing
+
+
+@pytest.mark.parametrize("store", _STORES)
+@pytest.mark.parametrize(
+    ("make_exc", "lead"),
+    [
+        pytest.param(
+            lambda: SecretProviderError(_CANARY),
+            "a secret the [auth] settings reference",
+            id="secret-provider",
+        ),
+        pytest.param(lambda: LdapError(_CANARY), "the [auth] Active Directory settings", id="ldap"),
+        pytest.param(
+            lambda: FileNotFoundError(2, "No such file", _CANARY),
+            "a file the [auth] settings name does not exist",
+            id="missing-file",
+        ),
+    ],
+)
+def test_each_named_build_failure_is_refused_in_fixed_words_before_the_prompt(
+    store: str,
+    make_exc: Callable[[], BaseException],
+    lead: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The three failures a build can give that used to reach the dispatch floor. Each gets a fixed
+    text that carries nothing from the exception, which here is a canary standing in for whatever a
+    secret backend or a directory library put in its message."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    if store == "existing":
+        _existing_empty_store(db, key)
+    monkeypatch.setattr("messagefoundry.auth.service.AuthService", _refusing_service(make_exc()))
+    _no_prompt(monkeypatch)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    captured = capsys.readouterr()
+    error = json.loads(captured.out)["error"]
+    assert error.startswith(lead), error
+    assert error.endswith("Refusing to provision; nothing was written"), error
+    assert _CANARY not in captured.out + captured.err
+    assert db.exists() is (store == "existing"), "a refused fresh provision left a store behind"
+
+
+@pytest.mark.parametrize("store", _STORES)
+def test_the_command_builds_its_auth_service_once(
+    store: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One build per run, on both stores: the build is where the anchors are checked and the
+    directory secrets resolved, so a second one repeats each check and each warning."""
+    import messagefoundry.auth.service as auth_service
+
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    if store == "existing":
+        _existing_empty_store(db, key)
+    real = auth_service.AuthService
+    built: list[object] = []
+
+    def counting(*a: object, **k: object) -> object:
+        service = real(*a, **k)  # type: ignore[arg-type]
+        built.append(service)
+        return service
+
+    monkeypatch.setattr(auth_service, "AuthService", counting)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    assert len(built) == 1
+
+
+@pytest.mark.parametrize("enforcement", ["enforce", "warn"])
+def test_an_off_box_idp_with_no_revocation_check_is_refused_at_enforce_as_serve_refuses_it(
+    enforcement: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The hop posture ``serve`` passes reaches this command now, and with it the OIDC revocation
+    guard (#1887): an off-box IdP with no ``[auth].oidc_tls_crl_file`` is refused at ``enforce``,
+    in the guard's own words, before the prompt. ``warn`` is the control: it provisions, and the
+    guard warns, which it does only when the posture arrived. Text mode there, because ``--json``
+    replaces the root handler caplog reads."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _pin_verdict(monkeypatch, owner_only=True)
+    cfg = _anchored_service_config(tmp_path, monkeypatch, "oidc", enforcement)
+    text = cfg.read_text(encoding="utf-8").replace("127.0.0.1", "idp.example")
+    cfg.write_text(text, encoding="utf-8")
+    db = tmp_path / "p.db"
+    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    if enforcement == "warn":
+        _tty(monkeypatch, _PASSWORD, _PASSWORD)
+        assert main([*argv, "--db", str(db)]) == 0
+        warned = [r.getMessage() for r in caplog.records if "idp.example" in r.getMessage()]
+        assert any("revocation" in m for m in warned), warned
+        return
+    _no_prompt(monkeypatch)
+    assert main([*argv, "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "idp.example" in error and "oidc_tls_crl_file" in error, error
+    assert error.endswith("Refusing to provision; nothing was written"), error
+    assert not db.exists(), "a refused provision left a store behind"
+
+
+def test_a_secret_provider_that_cannot_load_is_refused_in_its_own_fixed_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Loading the ``[secrets]`` provider is not resolving an ``[auth]`` reference, so its refusal
+    must not send the operator looking for one. No auth setting references a secret here."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+
+    def cannot_load(*_a: object, **_k: object) -> None:
+        raise SecretProviderError(_CANARY)
+
+    monkeypatch.setattr("messagefoundry.config.secretprovider.resolve_secret_provider", cannot_load)
+    db = tmp_path / "p.db"
+    _no_prompt(monkeypatch)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    captured = capsys.readouterr()
+    error = json.loads(captured.out)["error"]
+    assert error.startswith("the [secrets].provider could not be loaded"), error
+    assert _CANARY not in captured.out + captured.err
+    assert not db.exists(), "a refused provision left a store behind"
+
+
+def test_a_dpapi_key_that_cannot_be_read_is_refused_before_the_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A DPAPI key the shell cannot unprotect is the same "could not start" as a Vault key, and
+    ``rotate-key`` already refuses the two alike. It used to escape to the dispatch floor."""
+    from messagefoundry.secrets_dpapi import DpapiError
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+
+    def cannot_unprotect(*_a: object, **_k: object) -> None:
+        raise DpapiError("the key file could not be unprotected")
+
+    monkeypatch.setattr("messagefoundry.store.base.build_store_cipher", cannot_unprotect)
+    db = tmp_path / "p.db"
+    _no_prompt(monkeypatch)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error == (
+        "the key file could not be unprotected. Refusing to provision; nothing was written"
+    ), error
+    assert not db.exists(), "a refused provision left a store behind"
 
 
 # --- BACKLOG #2019: the repair branch tells the earlier holder of an account it takes over ---------

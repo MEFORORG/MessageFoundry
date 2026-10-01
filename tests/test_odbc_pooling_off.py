@@ -146,5 +146,5 @@ async def test_the_database_connector_pool_is_created_with_pooling_off(
     from messagefoundry.transports import database
 
     seen = _fake_aioodbc(monkeypatch, fake_pyodbc)
-    await database._make_pool("DSN=test", 2, autocommit=False)
+    await database._make_pool("DSN=test", 2, autocommit=False, login_timeout=15)
     assert seen == [False], "the DATABASE connector connected with driver-manager pooling on"

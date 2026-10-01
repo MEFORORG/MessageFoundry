@@ -53,6 +53,7 @@ from harness.load.connscale.profile import ConnScaleProfile
 from harness.load.connscale.report import (
     EXIT_OK,
     EXIT_SLO_VIOLATION,
+    RATE_WINDOW,
     ConnScaleRecord,
     ConnScaleReport,
     NoLoss,
@@ -139,10 +140,13 @@ _POST_RELOAD_HOLD_FRACTION = 0.25
 #: the first answer room, and `_ReloadAccount.reply_s` records when it came, so a slow engine is
 #: visible in the record rather than read as a dead one.
 #:
-#: It is spent in full only when no reply comes, which fails the step. 10 s keeps the smoke's four
-#: steps inside its 120 s module timeout even if every one of them waits in full: the fixture's
-#: setup took 40.8 s on that runner, and 4 x 10 s more is 80.8 s. That margin does NOT cover a step
-#: that also spends its reconnect wait, so the wait is skipped where a connection never came back.
+#: It is spent in full only when no reply comes inside it. That does not always fail the step: a
+#: reply can still come inside the stop grace that follows. 10 s keeps the smoke's four steps inside
+#: its 120 s module timeout even if every one of them waits in full AND then spends its full stop
+#: grace: the fixture's setup took 40.8 s on that runner, and 4 x (10 s + 5 s) more is 100.8 s.
+#: CORRECTED 2026-09-30 (BACKLOG #2024): this read "4 x 10 s more is 80.8 s", which left out the stop
+#: grace. That margin does NOT cover a step that also spends its reconnect wait, so the wait is
+#: skipped where a connection never came back.
 _POST_RELOAD_REPLY_WAIT_S = 10.0
 _HEALTH_TIMEOUT = 30.0
 # One spelling, because both audit moments report it and they must not drift into disagreeing about
@@ -448,6 +452,8 @@ async def _run_one_step(
     # probe task keeps walking the process table for the whole REST of the sweep, and `run_connscale`
     # lets a failed step fall through to the next one rather than ending the run.
     sampler_tasks: list[asyncio.Task[Any]] = []
+    hold_task: asyncio.Task[None] | None = None
+    reload_task: asyncio.Task[_ReloadAccount] | None = None
     try:
         await sink.start()
         # SERVER backend: empty the shared store so THIS step starts clean — the analog of the SQLite
@@ -491,10 +497,14 @@ async def _run_one_step(
         await driver.open(
             connect_batch=profile.connect_batch, batch_pause_s=profile.connect_batch_pause_s
         )
+        # TWO stop events. `sampler_stop` ends the ENGINE sampler, whose readings are the rate window,
+        # and it fires when the hold ends. `probe_stop` ends the OS probe where it always ended, after
+        # the reload probe returns, so the graded FD window is unchanged (BACKLOG #2024).
         sampler_stop = asyncio.Event()
-        # TWO tasks off one stop event, not one task doing both (BACKLOG #1430). The engine poll is
-        # cheap; the OS probe is a process-table walk. Welded to a single tick, the probe's cost set
-        # the step's ENGINE sample count, and at the CI cell's 1.5 s hold that count was one.
+        probe_stop = asyncio.Event()
+        # TWO tasks, not one task doing both (BACKLOG #1430). The engine poll is cheap; the OS probe
+        # is a process-table walk. Welded to a single tick, the probe's cost set the step's ENGINE
+        # sample count, and at the CI cell's 1.5 s hold that count was one.
         sample_task = asyncio.create_task(
             _sample_loop(poller, profile.poll_interval_s, sampler_stop, samples)
         )
@@ -503,7 +513,7 @@ async def _run_one_step(
             sampler_tasks.append(
                 asyncio.create_task(
                     _probe_loop(
-                        fd_sampler, profile.poll_interval_s, sampler_stop, proc_readings, origin
+                        fd_sampler, profile.poll_interval_s, probe_stop, proc_readings, origin
                     )
                 )
             )
@@ -523,31 +533,42 @@ async def _run_one_step(
             # reload (the connections.toml path) is a separate operator experiment; the in-place reload
             # of the N-inbound graph already costs O(connections) to quiesce-and-swap. That reload
             # CLOSES EVERY INBOUND CONNECTION, so `_reload_mid_hold` also accounts for the sends the
-            # close strands and keeps traffic flowing after it (BACKLOG #1292).
-            reload_account = await _reload_mid_hold(
-                driver=driver,
-                counters=metrics.counters,
-                reload=lambda: _time_reload(poller),
-                run_hold=lambda seconds: driver.run_hold(
-                    corpus=corpus, mix=_MIX, aggregate_rate=aggregate_rate, hold_seconds=seconds
-                ),
-                hold_task=hold_task,
-                hold_seconds=profile.hold_seconds,
-                hold_started=hold_started,
+            # close strands and keeps traffic flowing after it (BACKLOG #1292). It runs BESIDE the
+            # hold, so the hold's end, not the probe's, decides when the engine sampler stops.
+            reload_task = asyncio.create_task(
+                _reload_mid_hold(
+                    driver=driver,
+                    counters=metrics.counters,
+                    reload=lambda: _time_reload(poller),
+                    run_hold=lambda seconds: driver.run_hold(
+                        corpus=corpus, mix=_MIX, aggregate_rate=aggregate_rate, hold_seconds=seconds
+                    ),
+                    hold_task=hold_task,
+                    hold_seconds=profile.hold_seconds,
+                    hold_started=hold_started,
+                )
             )
-            reload_seconds = reload_account.seconds
-        await hold_task
+        await _await_hold(hold_task, reload_task)
 
-        # Stop offering; drain the pipeline; final sample.
+        # The hold is over: stop the ENGINE sampler now. The reload probe may still be waiting for
+        # connections to come back, or offering its extra hold; neither is in the rate window, so a
+        # rate does not move with how slow the reload was (BACKLOG #2024).
         sampler_stop.set()
-        for task in sampler_tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        with contextlib.suppress(asyncio.CancelledError):
+            await sample_task
         # The in-hold count, taken BEFORE the post-drain final is appended, so it is the number of
         # readings the hold itself produced rather than that number plus one. Its provenance travels
         # with it: how many of those readings the FLOOR had to supply past the hold's end.
         in_hold_samples = len(samples)
         in_hold_floor_ticks = sample_task.result()
+        if reload_task is not None:
+            reload_account = await reload_task
+            reload_seconds = reload_account.seconds
+        # Stop offering; drain the pipeline; final sample.
+        probe_stop.set()
+        for task in sampler_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         if reload_account is not None:
             # After the samplers, so the wait is not in the rate window; before the stop, so a slow
             # first reply after the reload is waited for rather than read as none (BACKLOG #1292).
@@ -674,10 +695,21 @@ async def _run_one_step(
             audit_live=audit_live,
             audit_final=audit_final,
             reload_account=reload_account,
+            per_lane_wake=_effective_per_lane_wake(node_env),
         )
     finally:
         for task in sampler_tasks:
             task.cancel()
+        if hold_task is not None:
+            # Directly, not through the probe: a step cancelled inside `_await_hold` would otherwise
+            # leave the token bucket emitting until the probe task handled its own cancellation.
+            hold_task.cancel()
+        if reload_task is not None:
+            reload_task.cancel()
+            if reload_task.done() and not reload_task.cancelled():
+                # Read, so a probe error that a different error overtook is not logged again as
+                # never retrieved. The error that ended the step is already propagating.
+                reload_task.exception()
         with contextlib.suppress(Exception):
             await driver.stop(_STOP_GRACE)
         with contextlib.suppress(Exception):
@@ -686,6 +718,29 @@ async def _run_one_step(
             await poller.close()
         with contextlib.suppress(Exception):
             await node.stop()
+
+
+def _effective_per_lane_wake(node_env: Mapping[str, str]) -> bool | None:
+    """The ``per_lane_wake`` value the step's engine runs with, as the engine's own parser reads it.
+
+    Recorded so a harvest can check the pin rather than trust it (BACKLOG #2013). `_node_env` writes
+    the pin, but "effective" means what the engine resolves from that environment, so the engine's
+    parser reads it here. Only the ``MEFOR_PIPELINE_*`` keys go in: they alone decide this value, and
+    an unrelated section that fails to validate must not fail the step at this point. None, logged,
+    when even those keys do not parse; the engine would refuse to start on them too.
+
+    WHAT IT CANNOT SEE: this is the parse of the environment the engine is given, in this process.
+    It is not read back from the running engine, which reports no such value over its API. A ``serve``
+    CLI flag, which outranks the environment, would not show here; `EngineNode` passes none today.
+    """
+    from messagefoundry.config.settings import load_settings
+
+    pipeline_env = {k: v for k, v in node_env.items() if k.startswith("MEFOR_PIPELINE_")}
+    try:
+        return load_settings(environ=pipeline_env).pipeline.per_lane_wake
+    except (ValueError, OSError) as exc:
+        log.warning("connscale: could not read the effective per_lane_wake: %s", exc)
+        return None
 
 
 def _build_corpus(profile: ConnScaleProfile, ids: ControlIds) -> Corpus:
@@ -1100,7 +1155,8 @@ async def _sample_loop(
     of this loop produced two readings 0.06 s apart against a 0.25 s interval.
 
     The overshoot is bounded and cheap: at most ``min_samples`` further ticks after ``stop``, under one
-    interval each, by which point the driver has stopped offering. ATTEMPTS are counted rather than
+    interval each. The hold has ended by then, but the reload probe may still be offering its extra
+    hold, since the step stops this loop at the hold's end (BACKLOG #2024). ATTEMPTS are counted rather than
     readings, so a poll that keeps answering ``None`` cannot spin here.
     """
     past_stop = 0
@@ -1209,9 +1265,11 @@ class _ReloadAccount:
     # Filled in by `_await_post_reload_reply`, which runs once the samplers have stopped. All three
     # stay None on an account it did not see, so nobody reads an unmeasured 0 as a reading.
     # `reply_s`: seconds from every connection being back to the first reply (ACK or NAK) the
-    # driver read after that, on any connection. Every socket then is one opened after the reload,
-    # so it is the engine answering after the reload, which is what `replies_after` asks too. None
-    # when none came inside the wait; the stop grace can still bring one after it.
+    # driver read after that, on any connection. After an applied reload every socket then is one
+    # opened after the reload, so it is the engine answering after the reload, which is what
+    # `replies_after` asks too. After a reload that was NOT applied the old sockets can still be up,
+    # so the reply may come on one of them. None when none came inside the wait; the stop grace can
+    # still bring one after it.
     reply_s: float | None = None
     reply_wait_s: float | None = None  # how long the probe allowed for that first reply
     # Sockets the engine closed or reset from every connection being back to the end of the wait.
@@ -1247,8 +1305,11 @@ async def _reload_mid_hold(
        point. Without this a slow reload leaves the step with no send it did not strand, and
        nothing to judge intake by. `run_hold` emits its first send at once, so any extra offers one.
 
-    The caller then stops its samplers and hands the account to `_await_post_reload_reply`, which
-    waits for that first reply. Waiting here instead would put the wait inside the rate window.
+    The caller runs this as a task beside the hold, and stops its engine sampler when the hold ends,
+    not when this returns. So the reconnect wait past the hold's end and any extra hold are outside
+    the rate window (BACKLOG #2024). The caller then hands the account to
+    `_await_post_reload_reply`, which waits for that first reply. Waiting here instead would hold the
+    step's OS probe open for that wait too.
 
     The wait runs whenever the reload may have swapped, which includes a reload that returned no
     reading: the client gives up after 5 s while the engine is still restarting its listeners, and
@@ -1314,6 +1375,23 @@ async def _reload_mid_hold(
         reconnect_timeout_s=timeout,
         drops_at_back=drops_at_back,
     )
+
+
+async def _await_hold(
+    hold_task: asyncio.Task[None], reload_task: asyncio.Task[_ReloadAccount] | None
+) -> None:
+    """Wait for the step's hold to end, with the reload probe running beside it or not.
+
+    A probe that fails cancels the hold (see `_reload_mid_hold`). Awaiting the hold alone would then
+    raise the hold's cancellation, which reads as the step being cancelled. So when the probe
+    finishes first, its own error is raised instead. A probe that returns has already awaited the
+    hold, so the hold is done too.
+    """
+    if reload_task is not None:
+        await asyncio.wait((hold_task, reload_task), return_when=asyncio.FIRST_COMPLETED)
+        if reload_task.done():
+            await reload_task
+    await hold_task
 
 
 async def _await_post_reload_reply(
@@ -1403,6 +1481,7 @@ def _build_record(
     audit_final: IntakeAudit | None = None,
     reload_account: _ReloadAccount | None = None,
     fd_probe_root_pid: int | None = None,
+    per_lane_wake: bool | None = None,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1526,6 +1605,12 @@ def _build_record(
         post_reload_extra_hold_s=None if ra is None else ra.extra_hold_s,
         post_reload_reply_s=None if ra is None else ra.reply_s,
         post_reload_drops=None if ra is None else ra.drops_after,
+        reload_aged=None if ra is None else ra.aged,
+        reload_lookback_s=None if ra is None else ra.lookback_s,
+        reload_reconnect_timeout_s=None if ra is None else ra.reconnect_timeout_s,
+        reload_not_applied=None if ra is None else ra.not_applied,
+        rate_window=RATE_WINDOW,
+        per_lane_wake=per_lane_wake,
     )
 
 
@@ -1827,6 +1912,13 @@ def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float
     * up to ``_MIN_IN_HOLD_SAMPLES`` make-up floor ticks the loop took AFTER that stop, when the hold
       alone did not reach the floor (BACKLOG #1430; ``in_hold_floor_ticks`` counts them).
 
+    ``sampler_stop.set()`` fires when the step's HOLD ends, not when the reload probe returns
+    (BACKLOG #2024). The probe runs beside the hold. Where a slow reload keeps it waiting for
+    connections past the hold's end, or makes it offer an extra hold after it, those seconds are
+    OUTSIDE the window, with one exception: a make-up floor tick is taken after that stop, so on a
+    hold too short for the floor it can land in them. ``in_hold_floor_ticks`` says when that could
+    have happened. The reload itself fires mid-hold by design and stays inside.
+
     It EXCLUDES the post-drain final. ``_run_one_step`` counts ``in_hold_samples`` first, then appends
     that final after ``driver.stop(_STOP_GRACE)``, after ``poller.await_drain(...)`` and after
     ``asyncio.sleep(_SETTLE)``. **The window is still not "the hold"**, because a make-up tick can
@@ -1840,8 +1932,10 @@ def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float
     **READINGS FROM BEFORE THIS CHANGE ARE NOT COMPARABLE WITH READINGS AFTER IT.** Until fix (a),
     the window ran to the post-drain final, so the tail was inside every rate this module derives
     from it: the three returned here, ``empty_claims_per_msg``, and both achieved-throughput rates.
-    The readings payload carries ``rate_window`` so a harvest can tell the two populations apart; a
-    payload without that field was computed over the old window.
+    The readings payload carries ``rate_window`` so a harvest can tell the populations apart; a
+    payload without that field was computed over the old window. BACKLOG #2024 moved the window
+    again, taking out the reload probe's time past the hold, so it changed the value of
+    ``rate_window`` too: see ``report.RATE_WINDOW`` for the value each window carries.
 
     **THE HISTORY, kept because seats still quote it.** Five sites once called this window "first to
     last in-hold samples" while it ended at the post-drain final. Fix (b) corrected the words and
@@ -2267,7 +2361,7 @@ def _empty_claims_base_reading_slo(
 #: / `readings_payload`), but nothing grades against it there -- the rows are recorded, and the width is
 #: held fixed so the band stays the one the payloads harvested for #1211 were rendered under. Changing
 #: it would break that silently, on top of retuning the FD gate. The VALUES are a separate matter: they
-#: changed window at BACKLOG #1420, which `report.RATE_WINDOW` marks in the payload.
+#: changed window at BACKLOG #1420 and again at #2024, which `report.RATE_WINDOW` marks in the payload.
 _MONOTONIC_TOLERANCE = 0.25
 
 

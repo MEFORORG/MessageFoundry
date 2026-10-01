@@ -391,13 +391,17 @@ class DeadLetterList(BaseModel):
     replayable_in_scope: bool
 
 
-class ConnectionEventInfo(BaseModel):
+class ConnectionEventInfo(PhiGatedModel):
     """One connection/transport event (Corepoint-style log, #46): the connection name, transport,
     direction, event kind, peer IP, and a scrubbed reason. Read via the ``monitoring:read``-gated
     ``GET /events`` / ``GET /connections/{name}/events`` routes.
 
     Not PHI-free. ``reason`` is free text, scrubbed at the source and again at the store, and
-    ``docs/PHI.md`` section 2 gives its column a protection level. Read the level there."""
+    ``docs/PHI.md`` section 2 gives its column a protection level. Read the level there. So
+    ``reason`` is gated on ``messages:view_summary`` and masked until a per-event reveal (BACKLOG
+    #2443); every other field stays readable under ``monitoring:read``."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"reason"})
 
     id: int
     ts: float
@@ -410,14 +414,18 @@ class ConnectionEventInfo(BaseModel):
     reason: str | None = None
 
 
-class AlertInstanceInfo(BaseModel):
+class AlertInstanceInfo(PhiGatedModel):
     """One resolvable operator-alert instance (ADR 0044, #56): the alert type, connection label,
     severity, lifecycle status (open/acknowledged/resolved), the first/last-seen window + occurrence
     count, a scrubbed reason, and the ack/resolve audit fields. Read via the
     ``monitoring:diagnose``-gated ``GET /alerts/active`` route.
 
     Not PHI-free. ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives its column a
-    protection level. Read the level there."""
+    protection level. Read the level there. So ``reason`` is gated on ``messages:view_summary`` and
+    masked until a per-alert reveal (BACKLOG #2443); the alert's type, state and window stay
+    readable."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"reason"})
 
     id: int
     event_type: str
@@ -1517,7 +1525,6 @@ class AlertRuleInfo(BaseModel):
     mute: bool = False  # #143 — static per-rule NOTIFICATION mute (still records state)
     escalate_tiers: int = 0  # #81 — number of occurrence-driven escalation tiers (0 = none)
     schedule_configured: bool = False  # #81 — whether the rule is schedule-gated (present-or-not)
-    content_label: str | None = None  # #81 — content_match label this rule routes by (None = any)
 
 
 class AlertsConfig(BaseModel):

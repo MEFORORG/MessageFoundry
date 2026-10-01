@@ -42,7 +42,8 @@ __all__ = ["GATEABLE_PROPERTIES", "PhiGatedModel"]
 #: ungated — the one way this gate could go quietly inert. ``__pydantic_init_subclass__`` refuses
 #: such a declaration at class-creation time rather than leaving it to review.
 GATEABLE_PROPERTIES: frozenset[str] = frozenset(
-    {"summary", "error", "metadata", "last_error", "detail"}
+    # ``reason``: the connection-event and alert reasons (BACKLOG #2443).
+    {"summary", "error", "metadata", "last_error", "detail", "reason"}
 )
 
 

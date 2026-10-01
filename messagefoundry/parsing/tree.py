@@ -4,7 +4,7 @@
 
 Turns a raw message into a nested ``segment → field → repetition → component →
 subcomponent`` structure with HL7 paths and values, so the console can render an
-explorable tree without reaching into ``python-hl7`` internals. Pure and tolerant: it
+explorable tree without reaching into the parser's internals. Pure and tolerant: it
 builds whatever parses (the viewer must show non-conformant messages too).
 
 Splitting is done from the message's own MSH-1/MSH-2 separators rather than assumed
