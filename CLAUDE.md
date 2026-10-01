@@ -955,7 +955,7 @@ ruff check .
 # mypy: the three legs ci.yml runs. Name the platform, or a Windows box checks win32 only.
 mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
 mypy --platform win32 messagefoundry messagefoundry_toolkit
-mypy --explicit-package-bases tests   # BACKLOG #1799; the profile and its exemptions: pyproject.toml
+mypy --platform linux --explicit-package-bases tests   # CI runs it on linux. BACKLOG #1799; the profile and its exemptions: pyproject.toml
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
