@@ -8,6 +8,112 @@ decision record is [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality
 > MessageFoundry is **open-source integration middleware, not an FDA-regulated medical device**. This
 > program is driven by procurement and customer trust, not a device-SBOM mandate.
 
+## From a merged commit to a published package
+
+This diagram answers one question: how does a commit become the package you install? It follows a
+change through the merge checks, then through `release.yml`, which runs when a version tag is
+pushed. Each square-cornered box names a job or a step in `ci.yml`, `security.yml` or `release.yml`. The sections
+below say what a release publishes and how to verify it.
+
+```mermaid
+flowchart TB
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef build fill:#f3e5f5,stroke:#6a1b9a,color:#2a0a3d;
+
+  PR(["Pull request"]):::ext
+
+  subgraph CHECKS["Merge checks: ci.yml and security.yml"]
+    TESTS["test legs on Linux and Windows Server<br/>ruff, mypy strict, pytest"]:::build
+    LOCKS["Lock sync check<br/>uv lock --check, re-export each lock, git diff"]:::build
+    AUDIT["Install from the hashed lock<br/>pip-audit over the all-extras lock and the tool locks<br/>new-dependency check"]:::build
+    SAST["bandit, semgrep, gitleaks<br/>crypto inventory, forbidden-content scan"]:::build
+  end
+
+  MAIN[("main branch")]:::store
+  TAG(["Version tag vX.Y.Z pushed"]):::ext
+
+  subgraph SBOMS["release.yml: two SBOM jobs, each with a read-only token"]
+    SBL["sbom-linux<br/>CycloneDX SBOM from the hash-locked core runtime"]:::build
+    SBW["sbom-windows<br/>the same SBOM, as the engine installs on Windows"]:::build
+  end
+
+  subgraph RELJOB["release.yml: the release job"]
+    PRE["Tag spelling check<br/>changelog fragments check"]:::build
+    BUILD["Build the engine sdist and wheel<br/>build tools come from a hash-pinned lock"]:::build
+    GATE["Leak gate and member gate<br/>wheel smoke test, version equals tag"]:::build
+    TKIT["Build the toolkit wheel<br/>member gate, smoke test, lockstep pin"]:::build
+    STAGE["Stage the copy for PyPI<br/>byte-compare it with the gated files"]:::build
+    SBOMIN["Fetch both SBOMs, stage the OpenVEX file<br/>install sbomqs by pinned digest, report each SBOM's quality score"]:::build
+    SIGN["Sigstore keyless signing<br/>sdist, wheels, both SBOMs, VEX"]:::build
+    SLSA["SLSA build provenance attestation"]:::build
+    GHREL["Create the GitHub release<br/>artifacts with their Sigstore bundles"]:::build
+    PUBTK["Publish the toolkit wheel"]:::build
+    PUBENG["Publish the engine sdist and wheel"]:::build
+  end
+
+  HARN["release-harness job<br/>build wheel, member gate, smoke test"]:::build
+  TAGW(["Console tag webconsole-vX.Y.Z pushed"]):::ext
+  WEB["release-webconsole job<br/>build wheel, member gate, smoke test, engine floor gate"]:::build
+
+  GH(["GitHub release assets"]):::ext
+  PYPI(["PyPI<br/>Trusted Publishing by OIDC, PEP 740 attestations"]):::ext
+
+  PR --> TESTS
+  PR --> LOCKS
+  PR --> SAST
+  LOCKS --> AUDIT
+  TESTS --> MAIN
+  AUDIT --> MAIN
+  SAST --> MAIN
+  MAIN -->|"a maintainer tags the release commit"| TAG
+  TAG --> SBL
+  TAG --> SBW
+  SBL -->|"SBOM file"| PRE
+  SBW -->|"SBOM file"| PRE
+  PRE --> BUILD
+  BUILD --> GATE
+  GATE --> TKIT
+  TKIT --> STAGE
+  STAGE --> SBOMIN
+  SBOMIN --> SIGN
+  SIGN --> SLSA
+  SLSA --> GHREL
+  GHREL --> PUBTK
+  PUBTK --> PUBENG
+  GHREL --> GH
+  PUBTK --> PYPI
+  PUBENG --> PYPI
+  PUBENG -->|"then"| HARN
+  HARN -->|"attach wheel"| GH
+  HARN -.->|"publish"| PYPI
+  MAIN -->|"a maintainer tags a console release"| TAGW
+  TAGW --> WEB
+  WEB -->|"create release"| GH
+  WEB -.->|"publish"| PYPI
+```
+
+**Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
+group's title names the workflow its boxes belong to. The two job boxes outside a group are in
+`release.yml` too. The merge checks group shows at least the checks that bear on the package. A
+dotted arrow is a publish step that runs when its repository variable is set.
+
+Four facts the labels leave out:
+
+- **The locks.** `uv.lock` is the resolver's record of `pyproject.toml`. `requirements.lock` is its
+  hashed export with every extra. The lock sync check fails when `uv.lock` is out of step with
+  `pyproject.toml`, or when an exported lock is out of step with `uv.lock`.
+- **The merge queue.** `ci.yml` and `security.yml` also trigger on the merge-queue commit. Branch
+  protection reads the required checks there. The checked-in list of those checks is
+  [`.github/required-contexts.txt`](../.github/required-contexts.txt).
+- **One identity.** In the release job, signing, attestation and publishing all use that job's
+  GitHub OIDC identity. Every PyPI publish in `release.yml` is Trusted Publishing, with no API
+  token.
+- **The order.** A PyPI upload cannot be replaced, so the two publish steps come last in the
+  release job. A blocking step that fails before them stops the job. The SBOM quality score reports
+  and does not block. The toolkit uploads before the engine
+  ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
+
 ## What we publish, per release
 
 | Artifact | What it is | Where |
