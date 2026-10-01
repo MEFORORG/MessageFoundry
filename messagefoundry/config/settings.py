@@ -2463,6 +2463,10 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
 #: and ``tests/test_site_context_words.py`` holds the two equal.
 EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 
+#: Upper bound for ``[auth].ad_connect_timeout`` and ``ad_receive_timeout``. An hour is far past any
+#: real directory round trip and far below the point where a socket timeout overflows.
+_AD_TIMEOUT_MAX_SECONDS = 3600.0
+
 
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
@@ -3106,13 +3110,24 @@ class AuthSettings(_Section):
     @field_validator("ad_connect_timeout", "ad_receive_timeout")
     @classmethod
     def _check_ad_timeout(cls, value: float) -> float:
-        # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats 0/None as "wait forever", which is
-        # exactly the unbounded wait these settings exist to remove, and inf/NaN are the same hole by
-        # another spelling. Rejected at config load, not discovered at bind time against a wedged DC.
+        # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats a None, or a 0 connect_timeout, as
+        # "wait forever", which is exactly the unbounded wait these settings exist to remove, and
+        # inf/NaN are the same hole by another spelling. (A 0 receive_timeout instead makes the socket
+        # non-blocking, so every read fails at once.) Rejected at config load, not at bind time.
         if not value > 0 or value == float("inf"):
             raise ValueError(
                 "ad_connect_timeout / ad_receive_timeout must be a finite number of seconds > 0 "
-                "(0, a negative value, inf or NaN would restore an unbounded LDAP wait)"
+                "(inf, NaN or a None connect timeout would mean an unbounded LDAP wait; 0 or a "
+                "negative value would fail every LDAP read or connect)"
+            )
+        # A huge finite value overflows socket.settimeout / setsockopt (measured from about 3e6 s on
+        # Windows) with OverflowError or TypeError. Those are not ldap3 errors, so they would skip
+        # the LdapError mapping and the auth.login_error audit. The cap sits far below that point.
+        if value > _AD_TIMEOUT_MAX_SECONDS:
+            raise ValueError(
+                f"ad_connect_timeout / ad_receive_timeout must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
+                f"seconds (got {value:g}); the cap keeps the value far below where a socket "
+                "timeout overflows"
             )
         return value
 
