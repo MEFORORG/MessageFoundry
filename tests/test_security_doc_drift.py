@@ -1342,6 +1342,13 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "absence of eight retired SECURITY.md and CONFIGURATION.md sentences (BACKLOG #1133); the "
         "code they describe is pinned by calling it in the ninth-sweep probe test"
     ),
+    (
+        "test_docs_security_pathways.py",
+        "test_the_tenth_sweep_states_the_mfa_scope_reach_for_both_account_kinds",
+    ): (
+        "absence of a retired MFA-scope sentence in EARLY-ADOPTER-GUIDE.md (BACKLOG #1133); the "
+        "code it describes is pinned by calling it in the tenth-sweep probe test"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
     ),
