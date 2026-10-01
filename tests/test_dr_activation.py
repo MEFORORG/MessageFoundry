@@ -7,7 +7,10 @@ listener, stays passive, and records a dr_activation_aborted audit row (AC-6). A
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -18,10 +21,12 @@ from messagefoundry.config.settings import (
     DrSettings,
     StoreSettings,
 )
+from messagefoundry.pipeline import dr as dr_module
 from messagefoundry.pipeline.dr import DrActivationError, DrCoordinator
-from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.dr_backup import BackupRunner, VerifyResult, run_restore_verify
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
+from tests import _fs_spy
 
 # A trivially-succeeding / trivially-failing shell command that works on the runner's shell (Git Bash on
 # the dev box, /bin/sh on CI, cmd on a bare Windows box). `exit N` is portable across all of them.
@@ -204,3 +209,159 @@ async def test_activate_on_non_dr_box_refused(tmp_path: Path) -> None:
 
 async def _noop() -> None:
     return None
+
+
+# --- vault BACKLOG #2581: an archive named in the request is confined to [dr].seed_dir ----------
+
+
+async def test_a_request_archive_outside_seed_dir_is_refused_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request may name only an archive under ``[dr].seed_dir``, judged from the text of the path
+    before any filesystem call on it.
+
+    RED when ``activate`` hands a request path to the restore-verify unconfined: the spy records
+    calls naming the refused path. The control is the last block: the archive inside ``seed_dir``
+    still activates through the same argument, and the spy records calls naming it.
+
+    That block also pins WHICH path the restore-verify opens: the resolved one, so the file that
+    was checked is the file that is read, however the request spelled it.
+    """
+    store, archive, ss = await _seed(tmp_path)
+    seed_dir = Path(archive).parent
+    refused = [
+        str(tmp_path / "probe-outside" / "seed.mfbak"),
+        str(Path(str(seed_dir) + "-probe-sibling") / "seed.mfbak"),
+        str(seed_dir / ".." / "probe-climb.mfbak"),
+        *_fs_spy.NON_LOCAL_SHAPES,
+    ]
+    try:
+        coord, state = _coord(store, ss, seed_dir=str(seed_dir))
+        calls = _fs_spy.install(monkeypatch)
+        messages = set()
+        for path in refused:
+            with pytest.raises(DrActivationError) as exc:
+                await coord.activate(archive=path, actor="alice")
+            assert exc.value.kind == "seed", path
+            messages.add(str(exc.value))
+        # One generic answer, naming no part of any path, so the refusal cannot probe the filesystem.
+        assert len(messages) == 1
+        assert "probe" not in messages.pop()
+        assert _fs_spy.naming(calls, "probe") == []
+        assert not coord.active and not state["active"]
+        # The audit row alone carries what was asked for, so the refusals can be told apart later.
+        aborted = await store.list_audit(action="dr_activation_aborted")
+        assert sorted(json.loads(a["detail"])["requested"] for a in aborted) == sorted(refused)
+
+        verified: list[str] = []
+
+        async def recording_verify(path: str, *, store_settings: object) -> VerifyResult:
+            verified.append(path)
+            return await run_restore_verify(path, store_settings=store_settings)
+
+        monkeypatch.setattr(dr_module, "run_restore_verify", recording_verify)
+        name = Path(archive).name
+        roundabout = os.path.join(str(seed_dir), "..", seed_dir.name, name)
+        result = await coord.activate(archive=roundabout, actor="alice")
+        assert result.active and result.archive == name
+        assert verified == [str(Path(archive).resolve())]
+        assert _fs_spy.naming(calls, name)
+    finally:
+        await store.close()
+
+
+async def test_a_request_archive_is_refused_while_no_seed_dir_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deny by default: with no [dr].seed_dir there is nowhere a request may point, so even a good
+    # archive is refused untouched. The control is the same archive named in [dr].seed_archive,
+    # which is operator configuration and is not confined.
+    store, archive, ss = await _seed(tmp_path)
+    name = Path(archive).name
+    try:
+        coord, _state = _coord(store, ss)
+        calls = _fs_spy.install(monkeypatch)
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=archive, actor="alice")
+        assert exc.value.kind == "seed"
+        assert name not in str(exc.value)
+        assert _fs_spy.naming(calls, name) == []
+        assert not coord.active
+
+        configured, _state = _coord(store, ss, seed_archive=archive)
+        assert (await configured.activate(actor="alice")).active
+        assert _fs_spy.naming(calls, name)
+    finally:
+        await store.close()
+
+
+async def test_a_seed_dir_that_cannot_be_resolved_is_an_audited_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unreachable seed_dir (a share that is down during the failover, say) makes the resolve
+    # raise. That must leave through the one abort path, with its audit row, like any refusal.
+    store, archive, ss = await _seed(tmp_path)
+
+    def unreachable(_archive: str, _seed_dir: str) -> Path | None:
+        raise OSError("the network location cannot be reached")
+
+    try:
+        coord, _state = _coord(store, ss, seed_dir=str(Path(archive).parent))
+        monkeypatch.setattr(dr_module, "_confined_archive", unreachable)
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=archive, actor="alice")
+        assert exc.value.kind == "seed"
+        # Its own message: the operator's directory failed, so the remedy is not "set seed_dir".
+        assert "could not be resolved" in str(exc.value)
+        assert Path(archive).name not in str(exc.value)
+        assert not coord.active
+        assert (await _actions(store)).count("dr_activation_aborted") == 1
+    finally:
+        await store.close()
+
+
+async def test_a_seed_dir_that_does_not_answer_in_time_is_an_audited_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same abort when the resolve hangs past takeover_timeout_seconds. RED if the bound is
+    # dropped (the call then returns late and activation carries on) or if the timeout escapes.
+    store, archive, ss = await _seed(tmp_path)
+
+    def slow(_archive: str, _seed_dir: str) -> Path | None:
+        time.sleep(0.5)
+        return Path(archive)
+
+    try:
+        coord, _state = _coord(
+            store, ss, seed_dir=str(Path(archive).parent), takeover_timeout_seconds=0.05
+        )
+        monkeypatch.setattr(dr_module, "_confined_archive", slow)
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=archive, actor="alice")
+        assert exc.value.kind == "seed"
+        assert "could not be resolved" in str(exc.value)
+        assert not coord.active
+        assert (await _actions(store)).count("dr_activation_aborted") == 1
+    finally:
+        await store.close()
+
+
+async def test_a_link_inside_seed_dir_that_leaves_it_is_refused(tmp_path: Path) -> None:
+    # The second line: the text check passes a path under seed_dir, and only the resolve can see
+    # that a link there points outside it.
+    store, archive, ss = await _seed(tmp_path)
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    link = seed_dir / "linked.mfbak"
+    try:
+        try:
+            link.symlink_to(archive)
+        except OSError:
+            pytest.skip("this account cannot create a symbolic link")
+        coord, _state = _coord(store, ss, seed_dir=str(seed_dir))
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=str(link), actor="alice")
+        assert exc.value.kind == "seed"
+        assert not coord.active
+    finally:
+        await store.close()

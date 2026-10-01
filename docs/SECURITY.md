@@ -235,10 +235,11 @@ paragraph after this list describes:
   dead-letter and message replay/resend/edit-resend, `POST /config/reload`, **every** `users:manage`
   write — the `PATCH /users/{user_id}` exemption is gone, because BACKLOG #1148 made the action-bound
   `require_step_up_action` charge the same floor — the `/roles/custom` writes, the
-  `/uploads` writes, `POST /search/presets`.
+  `/uploads` writes, `POST /search/presets`, and since vault BACKLOG #2581
+  `POST /dr/activate|release`.
 - **`require_paced`** — state-changing routes that warrant pacing but **not** a step-up re-proof:
   connection start/stop/restart/flag/test/test-credential, `POST /statistics/reset`, the four
-  `/alerts/{id}/*` writes, approvals approve/reject, `POST /dr/activate|release`,
+  `/alerts/{id}/*` writes, approvals approve/reject,
   `POST /status/integrity-check`, and since BACKLOG #287 `PATCH /logging/level`,
   `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email`.
 
@@ -594,9 +595,9 @@ apply. What each **adds** over plain `require()`:
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
 | `require` | 41 | nothing — the ladder itself |
-| `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
+| `require_paced` | 17 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 30 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 32 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 6 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -855,8 +856,8 @@ tuple: they act only on the caller's own account.
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
-| `POST` | `/dr/activate` | `dr:operate` | `require_paced` |
-| `POST` | `/dr/release` | `dr:operate` | `require_paced` |
+| `POST` | `/dr/activate` | `dr:operate` | `require_step_up` |
+| `POST` | `/dr/release` | `dr:operate` | `require_step_up` |
 
 #### Messages (PHI)
 
@@ -1062,8 +1063,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/dead-letters/replay-all` | `messages:replay` | `require_ui_step_up` |
 | `POST` | `/ui/dead-letters/{channel_id}/replay` | `messages:replay` | `require_ui_step_up` |
 | `POST` | `/ui/dead-letters/{channel_id}/{destination_name}/replay` | `messages:replay` | `require_ui_step_up` |
-| `POST` | `/ui/dr/activate` | `dr:operate` | `require_ui` |
-| `POST` | `/ui/dr/release` | `dr:operate` | `require_ui` |
+| `POST` | `/ui/dr/activate` | `dr:operate` | `require_ui_step_up` |
+| `POST` | `/ui/dr/release` | `dr:operate` | `require_ui_step_up` |
 | `GET` | `/ui/events` | `monitoring:read` | `require_ui` |
 | `GET` | `/ui/events/{event_id}/reason` | `monitoring:read`**+**`messages:view_summary` | `require_ui` |
 | `GET` | `/ui/messages` | `messages:read` | `require_ui` |
@@ -1335,7 +1336,10 @@ the same permission set on the same method reds CI until it is listed here.
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
 > the server's startup `--config` dir or an entry in `[api].config_reload_roots` — otherwise it is
-> rejected (403). An omitted `config_dir` reloads the startup dir. Every reload (and every denial)
+> rejected (403). The engine reads the path as text first: one that is not under a root as written
+> is refused before any filesystem call on it. A path that passes is then resolved and compared
+> again, which catches a link inside a root that points out of it; that second refusal comes after
+> the resolve (vault BACKLOG #2581). An omitted `config_dir` reloads the startup dir. Every reload (and every denial)
 > is audited with the acting user; error responses are generic so a holder can't probe the
 > filesystem via reload errors. Lock down the config/staging directories' ACLs accordingly
 > (see [SERVICE.md](SERVICE.md#security-hardening-recommended)).
@@ -1656,7 +1660,7 @@ draws the same per-actor ceremony budget, and the callback draws the sign-in win
 that fills that window also refuses the IdP step-up (see the limiter split in the
 [protection set](#the-documented-protection-set-asvs-611)).
 
-**Gated operations — 36 route objects** (30 `require_step_up` + 6 action-bound `require_step_up_action`).
+**Gated operations — 38 route objects** (32 `require_step_up` + 6 action-bound `require_step_up_action`).
 The complete set, as enumerated in the [route map](#route--permission-map-engine-api) above:
 
 - **User / role administration** — `POST /users`, `POST /users/directory` (BACKLOG #2021),
@@ -1672,6 +1676,9 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   `POST /config/reload`, `POST /search/presets`.
 - **Uploaded files** — `POST /uploads`, `POST /uploads/{id}/resend`, `DELETE /uploads/{id}`.
 - **Cluster control** -- `POST /cluster/stepdown` (BACKLOG #1494).
+- **Disaster recovery** -- `POST /dr/activate` and `POST /dr/release` (vault BACKLOG #2581). A promotion
+  runs the operator's takeover hook and binds the priority listeners; a release runs the release
+  hook and unbinds every inbound. Each asks for the same fresh proof as the planned failover above.
 - **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
 - **Bulk-PHI reads** — `GET /messages/search`, `GET /messages/export`, `GET /search/layered`,

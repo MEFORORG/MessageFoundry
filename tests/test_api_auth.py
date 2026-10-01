@@ -1054,7 +1054,7 @@ def test_the_default_floor_admits_klm_pace_and_refuses_script_pace(
 
 # --- BACKLOG #193 pacing COVERAGE via require_paced (ASVS 2.4.2) --------------
 # require_paced extends the same #193 per-actor limiter to the mutating admin routes that warrant
-# pacing but not a full step-up re-proof (connection start/stop/restart, DR activate/release,
+# pacing but not a full step-up re-proof (connection start/stop/restart,
 # approvals approve/reject, alert ack/resolve, statistics reset). POST /statistics/reset is the
 # cleanest such route that 200s without a live connection/coordinator (empty targets → reset 0).
 _RESET_BODY = {"all": False, "targets": []}
@@ -1110,7 +1110,7 @@ async def test_require_paced_shares_one_bucket_with_step_up(engine: Engine) -> N
 async def test_require_paced_inherits_the_mfa_access_gate(engine: Engine) -> None:
     # INVERTED by ASVS 6.3.3, deliberately. require_paced builds on require(), so it now inherits the
     # MFA ACCESS gate: an unenrolled admin can no longer POST a paced route. That is the point of the
-    # cell — /statistics/reset and /dr/activate must not be reachable by an MFA-pending admin.
+    # cell — a paced route such as /statistics/reset must not be reachable by an MFA-pending admin.
     #
     # The distinction require_paced still draws against require_step_up is asserted on the far side of
     # the gate: once the second factor is satisfied, the paced route passes while the step-up route

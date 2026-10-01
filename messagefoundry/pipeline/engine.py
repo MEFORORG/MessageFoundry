@@ -67,6 +67,7 @@ from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
+from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
@@ -110,7 +111,7 @@ log = logging.getLogger(__name__)
 
 
 class ConfigReloadDenied(Exception):
-    """A /config/reload target resolved outside the allowed reload roots (RCE guard).
+    """A /config/reload target lies outside the allowed reload roots (RCE guard).
 
     The API maps this to 403. Because the loader executes Python from the target directory, a
     reload may only load from the server's startup ``--config`` dir or an explicitly configured
@@ -155,11 +156,6 @@ class ReloadOutcome:
     def degraded(self) -> bool:
         """True when the graph swapped but at least one follow-on step did not complete."""
         return self.applied and bool(self.failures)
-
-
-def _within(path: Path, root: Path) -> bool:
-    """True if ``path`` is ``root`` itself or nested under it (both already resolved)."""
-    return path == root or root in path.parents
 
 
 @runtime_checkable
@@ -536,6 +532,11 @@ class Engine:
             roots.append(self.config_dir)
         # Empty => unconstrained (embedding/tests). The served path always sets config_dir.
         self._reload_roots: tuple[Path, ...] = tuple(dict.fromkeys(roots))
+        # The same roots as text, for the first line of pipeline/path_confine.py. Each root is kept
+        # as configured AND as resolved, so a request may spell a root either way when they differ,
+        # and so the engine's own reloads, which pass the resolved startup dir, always pass.
+        configured = [*config_reload_roots, *([config_dir] if config_dir else [])]
+        self._reload_roots_lexical = lexical_roots([*configured, *self._reload_roots])
         # The directory the most recent reload loaded from (resolved) — for audit by the API.
         self.last_reload_dir: Path | None = None
         # ADR 0041 D1 (config provenance, item C): the content fingerprint + best-effort git commit of
@@ -1935,9 +1936,11 @@ class Engine:
             # First, so every reload route refuses a bad settings anchor at the point the reload
             # route used to, before anything is read or swapped (BACKLOG #2034).
             await self.preflight_settings()
-        path = self._resolve_reload_target(config_dir)
+        # Off the event loop: the resolve opens the target and each parent, and a slow volume would
+        # otherwise stall every listener for as long as that takes (vault BACKLOG #2581).
+        path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
         self.last_reload_dir = path
-        if not path.is_dir():
+        if not await asyncio.to_thread(path.is_dir):
             raise FileNotFoundError(f"config directory not found: {config_dir}")
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
@@ -2136,15 +2139,24 @@ class Engine:
         return ReloadOutcome(registry=registry, applied=True, failures=tuple(failures))
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
-        """Resolve the reload target and enforce the allow-list (see :class:`ConfigReloadDenied`)."""
+        """Resolve the reload target and enforce the allow-list (see :class:`ConfigReloadDenied`).
+
+        :func:`~messagefoundry.pipeline.path_confine.confine` judges the text of ``config_dir``
+        first, with no filesystem call on it, then resolves. One error for either refusal."""
         if config_dir is None:
             if self.config_dir is None:
                 raise WiringError("no config directory configured; pass one to reload")
             return self.config_dir
-        path = Path(config_dir).resolve()
-        if self._reload_roots and not any(_within(path, root) for root in self._reload_roots):
-            # Don't echo the rejected path back to the client (info disclosure); log it server-side.
-            log.warning("rejected /config/reload outside allowed roots: %s", path)
+        if not self._reload_roots:
+            return Path(config_dir).resolve()
+        path = confine(
+            config_dir,
+            lexical=self._reload_roots_lexical,
+            resolved=self._reload_roots,
+            what="/config/reload path",
+        )
+        if path is None:
+            # Don't echo the rejected path back to the client (info disclosure); confine logged it.
             raise ConfigReloadDenied("config directory is not an allowed reload root")
         return path
 

@@ -8,6 +8,7 @@ ADMINISTRATOR is allowed. GET /dr/status reports the posture. A custom role may 
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from messagefoundry.auth.permissions import (
     validate_custom_role_permissions,
 )
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import AuthSettings, DrSettings, StoreSettings
 from messagefoundry.pipeline import Engine
@@ -151,3 +153,53 @@ async def test_release_requires_dr_operate(engine: Engine) -> None:
         r = await c.post("/dr/release", headers=op)
         assert r.status_code == 403
         assert "dr:operate" in r.json()["detail"]
+
+
+async def test_dr_routes_demand_a_fresh_step_up(engine: Engine) -> None:
+    """Vault BACKLOG #2581. Promoting or releasing a DR standby asks for a fresh credential proof,
+    like the planned failover on ``POST /cluster/stepdown``.
+
+    RED when either route goes back to ``require_paced``: the stale session then reaches the
+    handler. The control is the first pair of calls. With the window the login opened, the same
+    session reaches both handlers, so the refusal below is the stale window and nothing else.
+    """
+    # The pacing floor is off: this test sends four writes at machine speed (BACKLOG #2301).
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
+    )
+    await service.initialize()
+    await _add(service, "dradmin", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        adm = await _login(c, "dradmin")
+        # 422 is the cold-seed refusal and 200 the already-released report: both are the handler.
+        assert (await c.post("/dr/activate", headers=adm, json={})).status_code == 422
+        assert (await c.post("/dr/release", headers=adm)).status_code == 200
+        aborted = len(await engine.store.list_audit(action="dr_activation_aborted"))
+        assert aborted == 1
+
+        token = adm["Authorization"].removeprefix("Bearer ")
+        await service.store.mark_session_reauthed(hash_token(token), now=0.0)
+        for path in ("/dr/activate", "/dr/release"):
+            stale = await c.post(path, headers=adm, json={})
+            assert stale.status_code == 403, (path, stale.text)
+            assert stale.headers.get("X-Step-Up-Required") == "1", path
+        # Neither handler ran: no second abort row, and the box is still passive.
+        assert len(await engine.store.list_audit(action="dr_activation_aborted")) == aborted
+        assert engine.dr_active is False
+
+
+async def test_a_refused_request_archive_is_not_echoed(engine: Engine, tmp_path: Path) -> None:
+    # Vault BACKLOG #2581: the route answers a refused archive path with a generic 422. This box
+    # sets no [dr].seed_dir, so no request may name an archive at all.
+    service = await _service(engine)
+    await _add(service, "dradmin", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        adm = await _login(c, "dradmin")
+        named = str(tmp_path / "probe-archive.mfbak")
+        r = await c.post("/dr/activate", headers=adm, json={"archive": named})
+        assert r.status_code == 422, r.text
+        assert "probe-archive" not in r.text
+        assert "seed_dir" in r.json()["detail"]  # names the setting, never the path
+        # The audit row alone records what was asked for, so repeated refusals can be told apart.
+        rows = await engine.store.list_audit(action="dr_activation_aborted")
+        assert [json.loads(row["detail"])["requested"] for row in rows] == [named]

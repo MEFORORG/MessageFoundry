@@ -5267,9 +5267,15 @@ class DrSettings(_Section):
     # silent retry-forever — ADR 0048 AC-14). Must be > 0.
     takeover_timeout_seconds: float = 30.0
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
-    # supplies the archive path in the POST /dr/activate request body instead (the runbook path). A
-    # cloud URL is rejected (the seed is local/UNC only, like the backup destination — no new egress).
+    # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
+    # which needs seed_dir below. A cloud URL is rejected (the seed is local/UNC only, like the
+    # backup destination — no new egress).
     seed_archive: str = ""
+    # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
+    # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
+    # which is operator configuration and is not confined. Must be absolute. A cloud URL is
+    # rejected, like seed_archive.
+    seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
     # JSON token the DBA/operator places on the DR box recording the EXPECTED source-backup anchor of a
     # native (postgres/sqlserver) restore: {"expected_backup_archive": "<the most-recent engine dr_backup
@@ -5298,15 +5304,27 @@ class DrSettings(_Section):
             raise ValueError("[dr].takeover_timeout_seconds must be > 0")
         return value
 
-    @field_validator("seed_archive")
+    @field_validator("seed_archive", "seed_dir")
     @classmethod
-    def _no_cloud_seed(cls, value: str) -> str:
+    def _no_cloud_seed(cls, value: str, info: ValidationInfo) -> str:
         low = value.strip().lower()
         if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
             raise ValueError(
-                f"[dr].seed_archive must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
+        return value
+
+    @field_validator("seed_dir")
+    @classmethod
+    def _seed_dir_absolute(cls, value: str) -> str:
+        # "" switches request-named archives off. A blank-but-present or relative value would
+        # instead resolve against the service's working directory and quietly open that. So blank
+        # reads as "" and relative fails at load. "Absolute" is judged for THIS platform, the one
+        # that will resolve it: a rooted path with no drive is relative on Windows.
+        value = value.strip()
+        if value and not os.path.isabs(value):
+            raise ValueError(f"[dr].seed_dir must be an absolute path, or omitted ({value!r})")
         return value
 
     @field_validator("restore_token")

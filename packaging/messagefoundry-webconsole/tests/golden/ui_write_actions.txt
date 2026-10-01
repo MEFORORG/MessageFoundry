@@ -21,6 +21,7 @@
 ^/ui/roles/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/roles/custom/[^/?#]+/delete$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/roles/new$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/status$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/uploaded-logs/file/[^/?#]+$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/uploaded-logs/file/[^/?#]+/delete$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
