@@ -6739,8 +6739,8 @@ def security_loosenings(
     DEVIATION is what the observation found, exactly as with the connection-scoped entries.
 
     ``audit_chain_unkeyed`` is the second store OBSERVATION (BACKLOG #1905), from the open store's
-    ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain is keyless SHA-256 because
-    rows were written before any key was in hand, and a keyed open never re-keys existing rows.
+    ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain does not open with a
+    genesis row naming that key, so it holds keyless rows. Nothing re-keys existing rows.
     ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
     nothing was observed -- and is never read as a clean result.
 
@@ -7208,18 +7208,19 @@ def security_loosenings(
                 )
             )
     # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no
-    # switch declares it. A store that holds a key but opened onto a keyless chain with rows carries
-    # tamper-evidence an attacker with write access can forge, and nothing else in this registry
+    # switch declares it. A store that holds a key but opened onto a chain that holds keyless rows
+    # carries rows a writer with no key could have recomputed, and nothing else in this registry
     # would say so -- the at-rest entries report a MISSING key, and here the key is present.
     if audit_chain_unkeyed:
         out.append(
             (
                 "audit_chain_unkeyed",
-                "the audit chain is keyless SHA-256 although a store key is configured -- its rows "
-                "were written before the key was in hand, and opening with a key does not re-key "
-                "existing rows, so anyone who can write audit_log can forge a row that verifies "
-                "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "
-                "key every row after it",
+                "the audit chain holds keyless rows although a store key is configured -- it does "
+                "not open with a genesis row naming its key. A store that holds a key requires "
+                "every audit row keyed, so `messagefoundry audit-verify` reports this chain as "
+                "broken, and no command converts the earlier rows. If the store was first started "
+                "without its key, start a new store with the key configured; otherwise treat the "
+                "chain as altered",
             )
         )
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the

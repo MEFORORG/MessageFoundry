@@ -274,7 +274,7 @@ def _bare_store(*, fold: bool = False, epoch: bool = False) -> SqlServerStore:
     store._claim_holders_discarded_total = 0
     store._message_events = "all"
     store._audit_mac_key = None
-    store._audit_keyed_from = None
+    store._audit_chain_keyed = False
     store._leader_epoch = None
     store._lease_key = None
     store.committed_txns = 0

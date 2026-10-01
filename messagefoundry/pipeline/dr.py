@@ -740,7 +740,7 @@ class DrCoordinator:
         chain's tip hash** (read via :meth:`Store.audit_anchor`). Each side then stays independently
         verifiable and the fork is explicit/attributable, rather than blindly extending the restored chain
         (ADR 0049/0041 audit-chain-fork handling). Returns the marker row's own hash digest (PHI-free)."""
-        restored_count, restored_tip = await self._store.audit_anchor()
+        restored_seq, restored_tip = await self._store.audit_anchor()
         cipher = self._store.cipher_info()
         marker = {
             "kind": "dr_seed",
@@ -748,7 +748,9 @@ class DrCoordinator:
             "verify": verify.status,
             # The source-backup fingerprints carried in the seed archive's manifest are summarized by the
             # verify result's row counts; record the restored chain's tip so the segment fork is anchored.
-            "restored_audit_count": restored_count,
+            # The restored chain's newest sequence number: the coordinate its row MACs cover and
+            # an anchor names, so the marker and an out-of-band anchor can be compared directly.
+            "restored_audit_seq": restored_seq,
             "restored_audit_tip": restored_tip,
             "config_fingerprint": self._config_fingerprint,
             "dek_fingerprint": cipher.active_key_id,  # one-way fingerprint, NEVER key bytes

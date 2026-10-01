@@ -64,7 +64,6 @@ from messagefoundry.store.privilege import (
     sqlite_not_applicable,
 )
 from messagefoundry.store.store import (
-    UNKEYED_CHAIN_WARNING,
     UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
     AlertSummary,
@@ -1754,36 +1753,26 @@ class AuditStore(Protocol):
         expected_prefix: tuple[int, str] | None = None,
     ) -> tuple[bool, str | None]: ...
 
-    async def rekey_audit_chain(
-        self, *, expected_anchor: tuple[int, str] | None = None
-    ) -> tuple[bool, str]:
-        """Non-silent #190-D migration: enable HMAC keying of the audit chain on an existing keyless
-        store. Refuses without a DEK and verifies the existing chain first (refusing on any break, so a
-        forged chain is never blessed). On an already-keyed chain it changes nothing and reports that
-        verify, so it never answers OK over a chain that does not verify (BACKLOG #1904). Sets a
-        watermark; never rewrites existing row hashes. Returns ``(ok, message)``."""
-        ...
-
     async def roll_audit_key_epoch(self) -> tuple[bool, str]:
         """``rotate-key``'s audit step (BACKLOG #1904, ADR 0193): open a range of the audit chain under
         the ACTIVE key. Verifies the whole chain first and refuses on a break; then appends one range row,
         MAC'd under the active key, carrying a digest of the range it closes, so that range stays
         provable after its key is dropped. Rewrites no existing row. A no-op when the current range is
-        already under the active key (verified first, BACKLOG #1945) or the chain is keyless. Run
-        offline. Returns ``(ok, message)``."""
+        already under the active key (verified first, BACKLOG #1945) or the store holds no key and
+        its chain is keyless. Run offline. Returns ``(ok, message)``."""
         ...
 
     def audit_chain_unkeyed(self) -> bool:
-        """True when this store holds a keying secret but its audit chain on disk is KEYLESS (#1905).
+        """True when this store holds a keying secret but its audit chain on disk holds KEYLESS
+        rows (BACKLOG #1905, vault BACKLOG #2594).
 
-        Observed once, at open, by ``_load_audit_chain_meta``: a key or isolated-module MAC is in hand,
-        no keying watermark is recorded, and ``audit_log`` already has rows. Those rows are plain
-        SHA-256, so anyone who can write the table can forge them. The open does not re-key them --
-        that would bless a forged row. A successful :meth:`rekey_audit_chain` on THIS handle clears
-        it; a rekey by another process (the ``rekey-audit`` CLI) is seen at the next open, which is
-        one reason that command is run with the engine stopped. A store with no key at all returns
-        False: that chain is keyless by the audited at-rest opt-out, which ``security_loosenings()``
-        already reports."""
+        Observed once, at open, by ``load_audit_chain``: a key or isolated-module MAC is in hand,
+        ``audit_log`` already has rows, and the first of them is not a genesis row naming its key.
+        A store that holds a key requires every audit row keyed, so ``verify_audit_chain`` reports
+        that chain as broken. The open does not re-key the rows -- that would bless whatever they
+        say today -- and no command does. New rows on this handle are keyed under the active key. A
+        store with no key at all returns False: that chain is keyless by the audited at-rest
+        opt-out, which ``security_loosenings()`` already reports."""
         ...
 
     def audit_append_refusal(self) -> str | None:
@@ -1791,7 +1780,8 @@ class AuditStore(Protocol):
 
         Answered without appending, from the same check every append makes, so a command that writes
         other rows before its audit row can refuse before its first write instead of leaving that
-        write unaudited. The case that needed it is a keyed chain opened with no key in hand."""
+        write unaudited. The case that needed it is a keyed chain opened with no key in hand: its
+        genesis row names a key, so the handle refuses to add a keyless row to it."""
         ...
 
     async def has_prior_backup_history(self) -> bool:
@@ -2718,8 +2708,8 @@ class KeylessAuditChainRefused(RuntimeError):
         )
         super().__init__(
             f"refusing to open {path} keyless: its audit log is empty, so the first audit row this "
-            "command wrote would start a KEYLESS audit chain, and a chain that starts keyless stays "
-            f"keyless (a later keyed open does not re-key existing rows). {cause}Set the key the "
+            "command wrote would start a KEYLESS audit chain, and a keyed open later reports a "
+            f"chain that starts keyless as broken (nothing re-keys existing rows). {cause}Set the key the "
             "service runs with -- MEFOR_STORE_ENCRYPTION_KEY, or [store].encryption_key_file -- in "
             "the environment running this command. If the service deliberately runs keyless, set "
             f"the same audited opt-out here. The deciding setting is {refused_by}."
@@ -2790,7 +2780,6 @@ async def open_store(
     message_events: str = "all",
     posture: HopPosture | None = None,
     keyless_chain_refusal: str | None = KEYLESS_REFUSED_BY_NO_OPT_OUT,
-    warn_unkeyed_chain: bool = True,
     refusal_hook: UnmarkedRefusalHook | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
@@ -2815,7 +2804,7 @@ async def open_store(
     no DDL and no ``ALTER DATABASE`` whatever ``schema_management`` says: a database with no
     ``schema_meta`` table raises :class:`StoreNotFoundError`, and a marker that is not current is
     opened as it is, with a WARNING, as on SQLite. It also skips the at-open writes there: salt bind,
-    invocation reserve, at-rest sweep and audit keying watermark. What stops a server write after the
+    invocation reserve, at-rest sweep and audit genesis row. What stops a server write after the
     open is the login's grants, not the handle.
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
@@ -2838,20 +2827,18 @@ async def open_store(
     ``keyless_chain_refusal`` (BACKLOG #1916) is the at-rest opt-out's verdict for this caller: the
     setting that refuses running keyless, or ``None`` when the audited opt-out applies. A service
     command passes :func:`~messagefoundry.config.settings.keyless_opt_out_refusal` of its settings. It
-    is consulted in exactly one state -- no keying secret in hand, an EMPTY ``audit_log``, and no
-    keying watermark, so the next append would be a keyless row 1 -- because that is the only open
-    whose first audit row starts a chain, and a chain that starts keyless stays keyless. There a
+    is consulted in exactly one state -- no keying secret in hand and an EMPTY ``audit_log``, so the
+    next append would be a keyless row 1 -- because that is the only open whose first audit row
+    starts a chain, and a chain that starts keyless stays keyless. There a
     non-``None`` value raises :class:`KeylessAuditChainRefused` with the handle closed. **The default
     is the refusal**, so a caller that does not decide is refused rather than waved through; that is
     what makes this the gate for every command, where #1905's gate covered only the two commands that
     called it. A ``read_only`` open is gated the same way: the verdict is the caller's to pass. A SQLite file this call created, or a server database's schema, is left in place on
-    refusal. That starts no chain -- a later keyed open still keys the empty log from row 1 -- and
-    deleting a file here would race a ``serve`` creating the same one.
-    An empty chain that is already KEYED is not refused here: its appends refuse on their own, and a
-    writer asks :meth:`Store.audit_append_refusal` before its first write.
-
-    ``warn_unkeyed_chain=False`` silences the #1905 keyless-chain WARNING for this open only. Only
-    ``rekey-audit`` passes it, because that command is the remedy the warning names.
+    refusal. That starts no chain -- a later keyed open still writes its genesis row into the empty
+    log -- and deleting a file here would race a ``serve`` creating the same one.
+    A chain that is already KEYED is never empty (it holds its genesis row), so it is not refused
+    here: its appends refuse on their own, and a writer asks :meth:`Store.audit_append_refusal`
+    before its first write.
 
     ``refusal_hook`` (BACKLOG #1169) is set on the cipher BEFORE the backend opens. The open itself can
     refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
@@ -2873,31 +2860,26 @@ async def open_store(
     if refusal_hook is not None and callable(setter):
         setter(refusal_hook)
     # #190: HKDF-derived HMAC key for the tamper-evident audit chain; None for the identity cipher (the
-    # chain then stays the keyless SHA-256 chain, byte-identical to a pre-#190 store).
+    # keyless store mode, whose chain is plain SHA-256).
     audit_mac_key = cipher.audit_mac_key()
     # ADR 0138: an isolated-module audit MAC (Vault/OpenBao Transit generate_hmac) — set only by the
     # vault_transit cipher, so the chain is keyed even though no HMAC key ever enters heap. None for the
-    # in-process (aesgcm/identity) ciphers, keeping their audit chain byte-identical. Wired into ALL
-    # THREE backends (ASVS 13.3.3): `TransitCipher.audit_mac_key()` returns None BY DESIGN, so a server
-    # backend given only `audit_mac_key` had no keying secret at all — under vault_transit its whole
-    # chain ran UNKEYED (never even a keyless PREFIX: with no secret in hand the fresh-store watermark
-    # was never written), while the posture claimed the most isolated MAC available. Every backend now
-    # takes both and gates on "either secret present" (`_audit_keyed_capable`).
+    # in-process (aesgcm/identity) ciphers. Wired into ALL THREE backends (ASVS 13.3.3):
+    # `TransitCipher.audit_mac_key()` returns None BY DESIGN, so a server backend given only
+    # `audit_mac_key` had no keying secret at all — under vault_transit its whole chain ran UNKEYED,
+    # while the posture claimed the most isolated MAC available. Every backend now takes both and
+    # gates on "either secret present" (`_audit_keyed_capable`).
     audit_mac_fn = cipher.audit_mac_fn()
-    token = UNKEYED_CHAIN_WARNING.set(warn_unkeyed_chain)
-    try:
-        store = await _open_backend(
-            settings,
-            cipher=cipher,
-            audit_mac_key=audit_mac_key,
-            audit_mac_fn=audit_mac_fn,
-            message_events=message_events,
-            posture=posture,
-            create=create,
-            read_only=read_only,
-        )
-    finally:
-        UNKEYED_CHAIN_WARNING.reset(token)
+    store = await _open_backend(
+        settings,
+        cipher=cipher,
+        audit_mac_key=audit_mac_key,
+        audit_mac_fn=audit_mac_fn,
+        message_events=message_events,
+        posture=posture,
+        create=create,
+        read_only=read_only,
+    )
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
         await _refuse_to_start_a_keyless_chain(
             store,
@@ -2914,8 +2896,8 @@ async def _refuse_to_start_a_keyless_chain(
     keyless row 1."""
     try:
         count, _head = await store.audit_anchor()
-        # An EMPTY chain that is already keyed (a watermark, no key here) is not a keyless start: its
-        # appends refuse on their own, so this message would give the wrong remedy.
+        # A keyed chain is never empty, since it holds its genesis row. The second test stays as a
+        # backstop: a handle whose appends already refuse is not about to start a keyless chain.
         starts_keyless = count == 0 and store.audit_append_refusal() is None
     except BaseException:
         await _close_quietly(store)
@@ -2995,7 +2977,7 @@ async def provision_store_schema(
     BACKLOG #305 split (``messagefoundry store provision-schema``). See :class:`SchemaProvisionResult`
     for what it reports.
 
-    It does DDL and nothing else: no cipher, no at-rest migration, no audit-chain watermark, no caches.
+    It does DDL and nothing else: no cipher, no at-rest migration, no audit genesis row, no caches.
     Those need the store key, and a DBA who provisions the schema should not have to hold it. It runs
     the batch whatever ``[store].schema_management`` says, because provisioning is the one caller
     external mode exists to route DDL to.

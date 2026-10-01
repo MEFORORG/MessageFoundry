@@ -6,7 +6,7 @@
 commands calls. Every other command that opens the store could still write the first audit row of a
 fresh store with no key -- at least ``backup`` (its ``dr_backup`` row) and ``admin-unlock`` (its
 ``auth.admin_unlocked`` row) -- and a chain that starts keyless stays keyless: a later keyed open
-auto-keys only an EMPTY ``audit_log``.
+starts a keyed chain only in an EMPTY ``audit_log``, and reports any other as broken.
 
 The fix moves the decision into ``open_store``, the one seam every command opens through: with no
 keying secret and an empty ``audit_log``, it refuses unless the caller passes the audited opt-out's
@@ -16,8 +16,7 @@ product caller routes around the seam.
 
 Also pinned: ``provision-admin`` refuses BEFORE writing when the opened store cannot take an audit row
 (a keyed chain opened from a shell with no key and a stale opt-out used to write the account and then
-crash on the audit row), and ``rekey-audit`` no longer prints the keyless-chain WARNING it exists to
-clear.
+crash on the audit row), and every command that opens a keyed store onto keyless rows says so.
 
 Severity is conditional (CLAUDE.md section 0): zero deployments, so this is what a first deployment
 would have inherited.
@@ -139,7 +138,6 @@ _STORE_OPENING_COMMANDS = (
     "admin-set-notify-email",
     "audit-anchor",
     "audit-verify",
-    "rekey-audit",
 )
 
 
@@ -218,7 +216,7 @@ def test_open_store_opens_a_fresh_keyless_store_when_the_opt_out_applies(tmp_pat
 
 
 def test_open_store_never_refuses_a_keyed_store(tmp_path: Path) -> None:
-    """Control arm: with a key the chain is keyed from row 1, so there is nothing to refuse."""
+    """Control arm: with a key the chain opens with its genesis row, so there is nothing to refuse."""
     db = tmp_path / "seam.db"
     key = generate_key()
     _fresh_store(db, key=key)
@@ -241,38 +239,26 @@ def test_provision_admin_refuses_before_writing_when_the_chain_cannot_take_a_row
     and crashed on the audit row, because the keyed chain refuses a keyless append. It must refuse
     before writing anything."""
     db = shell / "keyed.db"
-    _fresh_store(db, key=generate_key())  # the keyed open writes the watermark: keyed from row 1
+    _fresh_store(db, key=generate_key())  # the keyed open writes the genesis row: keyed from row 1
     _opt_out(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
     assert rc != 0
     assert "error" in json.loads(capsys.readouterr().out)
     assert _users(db) == 0, "the account was written before the audit row was refused"
-    assert _audit_rows(db) == 0
+    assert _audit_rows(db) == 1, "only the genesis row: the refused command appended nothing"
 
 
-# --- rekey-audit: the warning it exists to clear -----------------------------------------------------
+# --- keyless rows on a keyed store: every command says so ------------------------------------------
 
 
-def _keyless_chain_under_a_key(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def seed() -> None:
-        store = await MessageStore.open(db)
-        try:
-            await store.record_audit("seed", actor="test")
-        finally:
-            await store.close()
-
-    asyncio.run(seed())
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-
-
-_WARNING = "audit chain is KEYLESS"
+_REPORT = "does not open with a genesis row"
 
 
 class _Records(logging.Handler):
     """Collects records straight off the store's logger. ``caplog`` hangs off the root logger, and a
     CLI run reconfigures logging, so a test that reads caplog can see nothing for a reason unrelated
-    to what it asserts -- which is a silent pass for the suppression arm."""
+    to what it asserts -- which is a silent pass for a quiet arm."""
 
     def __init__(self) -> None:
         super().__init__(logging.WARNING)
@@ -282,36 +268,40 @@ class _Records(logging.Handler):
         self.messages.append(record.getMessage())
 
 
-def _run_capturing_store_warnings(argv: list[str]) -> tuple[int, list[str]]:
+def _run_capturing_store_reports(argv: list[str]) -> tuple[int, list[str]]:
     handler = _Records()
     logger = logging.getLogger("messagefoundry.store.store")
     logger.addHandler(handler)
     try:
-        return main(argv), [m for m in handler.messages if _WARNING in m]
+        return main(argv), [m for m in handler.messages if _REPORT in m]
     finally:
         logger.removeHandler(handler)
 
 
-def test_rekey_audit_does_not_print_the_warning_it_clears(
+def test_a_command_that_opens_a_keyed_store_onto_keyless_rows_reports_them(
     shell: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    db = shell / "rekey.db"
-    _keyless_chain_under_a_key(db, monkeypatch)
-    rc, warnings = _run_capturing_store_warnings(["rekey-audit", "--db", str(db)])
-    assert rc == 0
-    assert not warnings
+    """No command keys those rows in place (``rekey-audit`` is deleted, vault BACKLOG #2594), and no
+    open is silenced: the report names ``audit-verify`` and no remedy that does not exist. The
+    control is the same store before a key is set, which opens quietly."""
+    db = shell / "keyless-rows.db"
 
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            await store.record_audit("seed", actor="test")
+        finally:
+            await store.close()
 
-def test_other_commands_still_print_the_keyless_chain_warning(
-    shell: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Control arm for the suppression: the same store, opened by any other command, still warns --
-    so the empty list above is the suppression, not an instrument that cannot see the warning."""
-    db = shell / "rekey.db"
-    _keyless_chain_under_a_key(db, monkeypatch)
-    rc, warnings = _run_capturing_store_warnings(["audit-anchor", "--db", str(db), "--json"])
+    asyncio.run(seed())
+    rc, reports = _run_capturing_store_reports(["audit-anchor", "--db", str(db), "--json"])
+    assert rc == 0 and not reports  # the control: keyless by the store's own mode, nothing to say
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    rc, reports = _run_capturing_store_reports(["audit-anchor", "--db", str(db), "--json"])
     assert rc == 0
-    assert warnings
+    assert reports and "audit-verify" in reports[0] and "rekey-audit" not in reports[0]
+    assert main(["audit-verify", "--db", str(db)]) == 1, "a keyed verify must report the chain"
 
 
 # --- the source guard ----------------------------------------------------------------------------------
@@ -362,7 +352,6 @@ _CLI_OPENERS = {
     "_renew_api_tls_before_spawning._audit",
     "_audit_verify.run",
     "_audit_anchor.run",
-    "_rekey_audit.run",
     "_backup.run",
 }
 _CLI_DEFAULT = {"_rotate_key.run"}
@@ -499,12 +488,13 @@ def test_every_product_store_open_goes_through_the_seam_and_decides() -> None:
 # --- the round-1 review cases -------------------------------------------------------------------------
 
 
-def test_an_empty_KEYED_chain_opened_without_a_key_is_refused_before_any_write(
+def test_a_KEYED_chain_opened_without_a_key_is_refused_before_any_write(
     shell: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The service keyed the store (a watermark, no rows yet); a shell with no key and no opt-out runs
-    ``admin-unlock``. That is not a keyless START, so the seam does not claim it is. The append would
-    refuse, so the command must refuse before clearing the lockout rather than after."""
+    """The service keyed the store (its genesis row, nothing else yet); a shell with no key and no
+    opt-out runs ``admin-unlock``. That is not a keyless START, so the seam does not claim it is. The
+    handle reads from the genesis row that the chain is keyed, so the append would refuse, and the
+    command must refuse before clearing the lockout rather than after."""
     db = shell / "keyed-empty.db"
     _fresh_store(db, user="ops", key=generate_key())
     rc = main(_argv("admin-unlock", db, shell))
@@ -514,7 +504,7 @@ def test_an_empty_KEYED_chain_opened_without_a_key_is_refused_before_any_write(
     with sqlite3.connect(db) as conn:
         locked = conn.execute("SELECT locked_until FROM users WHERE id='u1'").fetchone()[0]
     assert locked is not None, "the lockout was cleared although its audit row could not be written"
-    assert _audit_rows(db) == 0
+    assert _audit_rows(db) == 1, "only the genesis row: the refused command appended nothing"
 
 
 def test_backup_refuses_before_running_when_its_audit_row_would_be_refused(
@@ -528,7 +518,7 @@ def test_backup_refuses_before_running_when_its_audit_row_would_be_refused(
     monkeypatch.setenv("MEFOR_BACKUP_ALLOW_UNENCRYPTED", "true")
     assert main(_argv("backup", db, shell)) == 2
     assert not (shell / "dest").exists() or not any((shell / "dest").iterdir())
-    assert _audit_rows(db) == 0
+    assert _audit_rows(db) == 1, "only the genesis row: the refused command appended nothing"
 
 
 def test_a_key_the_provider_did_not_resolve_is_refused_at_the_seam_with_its_cause(

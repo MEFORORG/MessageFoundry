@@ -977,10 +977,12 @@ def test_the_refusal_names_the_command_and_the_escape() -> None:
     assert "'MessageFoundry'" in text
 
 
-# --- owner ruling R16 (ASVS 16.4.2): the audit tables are append-only for the runtime login -------
+# --- owner ruling R16 (ASVS 16.4.2): the audit table is append-only for the runtime login --------
 #
-# The runtime login needs INSERT and SELECT on audit_log and audit_chain_meta and nothing more, so on a
-# first deployment a login that also held UPDATE or DELETE there could rewrite or drop audit rows. Under
+# The runtime login needs INSERT and SELECT on audit_log and nothing more, so on a first deployment a
+# login that also held UPDATE or DELETE there could rewrite or drop audit rows. R16 first listed
+# audit_chain_meta too; the owner amended it on 2026-10-01, when that table was removed and the
+# chain's genesis row took over naming the first key (vault BACKLOG #2594). Under
 # external schema management the probe names each such right as excess, which refuses the start under
 # the shipped `enforce` dial (ADR 0199). The engine's own write paths are INSERT-only, pinned below.
 
@@ -1105,7 +1107,7 @@ def test_sqlserver_table_alter_is_folded_into_db_ddladmin_only(
     )
     assert ("ALTER on table audit_log" in excess) is table_alter_named
     assert "UPDATE on table audit_log" in excess
-    assert "DELETE on table audit_chain_meta" in excess
+    assert "DELETE on table audit_log" in excess
 
 
 @pytest.mark.parametrize(
@@ -1195,38 +1197,39 @@ async def test_postgres_runtime_grants_ask_only_insert_and_select_of_the_audit_t
     assert "'UPDATE'" not in audit_arm and "'DELETE'" not in audit_arm
 
 
-class _AuditMetaPgConn:
-    """Answers the audit-chain keying reads and records every statement.
+class _GenesisPgConn:
+    """A connection for the genesis append: answers the head read and records every statement.
 
-    ``meta`` is what successive reads of ``audit_chain_meta`` return, in order; ``insert_status`` is
-    what asyncpg reports for the watermark INSERT (``INSERT 0 0`` when ``DO NOTHING`` skipped it)."""
+    ``head`` is what the append's read of the chain head returns under the advisory lock. ``None``
+    is an empty log; a row is a chain a peer engine started first."""
 
-    def __init__(self, *, meta: list[dict[str, Any] | None], insert_status: str) -> None:
-        self._meta = meta
-        self._insert_status = insert_status
+    def __init__(self, *, head: dict[str, Any] | None) -> None:
+        self._head = head
         self.statements: list[str] = []
+        self.inserted: list[tuple[Any, ...]] = []
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
         self.statements.append(sql)
-        if "COUNT(*)" in sql:
-            return {"n": 0}
-        if "MAX(id)" in sql:
-            return {"m": 4}
-        return self._meta.pop(0)
+        return self._head
 
-    async def execute(self, sql: str, *args: Any) -> str:
+    async def fetchval(self, sql: str, *args: Any) -> int:
         self.statements.append(sql)
-        return self._insert_status if sql.startswith("INSERT") else "SELECT 1"
+        self.inserted.append(args)
+        return 1
 
     def transaction(self) -> Any:
         return contextlib.nullcontext()
 
 
-def _keyed_postgres_store(conn: _AuditMetaPgConn) -> Any:
+def _keyed_postgres_store(conn: _GenesisPgConn, chain: list[list[dict[str, Any]]]) -> Any:
+    """A keyed PostgresStore over ``conn``. ``chain`` is what successive reads of the whole chain
+    return, in order: the open reads it, and reads it again after its genesis attempt."""
     from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import build_audit_mac_keys
 
     store = PostgresStore(None, _server(StoreBackend.POSTGRES))
     store._audit_mac_key = b"\x01" * 32  # a keying secret in hand, so a fresh chain is keyed
+    store._audit_mac_keys = build_audit_mac_keys(None, store._audit_mac_key)
 
     @contextlib.asynccontextmanager
     async def _timed_acquire(*, record: bool = True) -> AsyncIterator[Any]:
@@ -1235,8 +1238,13 @@ def _keyed_postgres_store(conn: _AuditMetaPgConn) -> Any:
     async def _no_lock(conn: Any, classid: int, key: str) -> None:
         return None
 
+    async def _fetchall(sql: str, *args: Any) -> list[dict[str, Any]]:
+        conn.statements.append(sql)
+        return [] if "WHERE action" in sql else chain.pop(0)
+
     store._timed_acquire = _timed_acquire  # type: ignore[method-assign]
     store._advisory_lock = _no_lock  # type: ignore[method-assign]
+    store._fetchall = _fetchall  # type: ignore[method-assign]
     return store
 
 
@@ -1246,85 +1254,88 @@ def _no_row_change(statements: list[str]) -> None:
         assert not sql.lstrip().upper().startswith(("UPDATE", "DELETE"))
 
 
-async def test_postgres_keys_a_fresh_chain_with_insert_alone() -> None:
-    conn = _AuditMetaPgConn(meta=[None], insert_status="INSERT 0 1")
-    store = _keyed_postgres_store(conn)
-    await store._load_audit_chain_meta()
-    assert store._audit_keyed_from == 1
-    assert any("ON CONFLICT (id) DO NOTHING" in sql for sql in conn.statements)
-    _no_row_change(conn.statements)
-
-
-async def test_postgres_adopts_the_watermark_a_peer_wrote_first(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Two engines opening one empty store both try the INSERT. The loser used to overwrite the row;
-    with INSERT alone it reads what the winner wrote and keys from that."""
-    settled: list[str | None] = []
-
-    async def _settle(_host: Any, key_id: str | None) -> None:
-        settled.append(key_id)
-
-    monkeypatch.setattr("messagefoundry.store.postgres.settle_audit_ranges", _settle)
-    conn = _AuditMetaPgConn(
-        meta=[None, {"keyed_from_id": 1, "key_id": "peer-key"}], insert_status="INSERT 0 0"
+def _genesis_row(key: bytes) -> dict[str, Any]:
+    """The genesis row a keyed open writes, as a read of the chain returns it."""
+    from messagefoundry.store.crypto import audit_key_id
+    from messagefoundry.store.store import (
+        AUDIT_KEY_EPOCH_ACTION,
+        audit_genesis_detail,
+        audit_row_hash,
     )
-    store = _keyed_postgres_store(conn)
-    await store._load_audit_chain_meta()
-    assert store._audit_keyed_from == 1
-    assert settled == ["peer-key"]
-    _no_row_change(conn.statements)
 
-
-async def test_postgres_refuses_to_key_over_a_row_with_no_watermark() -> None:
-    conn = _AuditMetaPgConn(
-        meta=[None, {"keyed_from_id": None, "key_id": None}], insert_status="INSERT 0 0"
+    detail = audit_genesis_detail(audit_key_id(key))
+    row: dict[str, Any] = {
+        "id": 1,
+        "seq": 1,
+        "ts": 1.0,
+        "actor": "system",
+        "action": AUDIT_KEY_EPOCH_ACTION,
+        "channel_id": None,
+        "detail": detail,
+        "client": None,
+    }
+    row["row_hash"] = audit_row_hash(
+        "",
+        seq=1,
+        ts=1.0,
+        actor="system",
+        action=AUDIT_KEY_EPOCH_ACTION,
+        channel_id=None,
+        detail=detail,
+        key=key,
     )
-    store = _keyed_postgres_store(conn)
-    with pytest.raises(RuntimeError, match="owns the store's schema"):
-        await store._load_audit_chain_meta()
-    assert store._audit_keyed_from is None
+    return row
+
+
+async def test_postgres_starts_a_fresh_chain_with_insert_alone() -> None:
+    """The open's one audit write is the genesis row, and it is an INSERT: the runtime role needs
+    no UPDATE or DELETE on ``audit_log`` to start a keyed chain (owner ruling R16)."""
+    from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION, load_audit_chain
+
+    conn = _GenesisPgConn(head=None)
+    key = b"\x01" * 32
+    store = _keyed_postgres_store(conn, [[], [_genesis_row(key)]])
+    await load_audit_chain(store, read_only=False)
+    assert store._audit_chain_keyed is True
+    (written,) = conn.inserted
+    assert written[0] == 1 and written[3] == AUDIT_KEY_EPOCH_ACTION  # seq 1, the genesis action
+    assert any(sql.startswith("INSERT INTO audit_log") for sql in conn.statements)
     _no_row_change(conn.statements)
 
 
-async def _verified(**_kw: Any) -> tuple[bool, str]:
-    return True, "verified 4 audit row(s)"
+async def test_postgres_adopts_the_genesis_row_a_peer_wrote_first() -> None:
+    """Two engines opening one empty store both try to start its chain. The append requires an
+    empty log under the advisory lock, so the loser writes nothing and reads what the winner
+    wrote."""
+    from messagefoundry.store.store import load_audit_chain
 
-
-@pytest.mark.parametrize(
-    ("held", "expected"),
-    [({"keyed_from_id": None}, "owns the store's schema"), ({"keyed_from_id": 3}, "id=3")],
-    ids=["no-watermark", "keyed-meanwhile"],
-)
-async def test_postgres_rekey_reports_a_row_it_will_not_replace(
-    monkeypatch: pytest.MonkeyPatch, held: dict[str, Any], expected: str
-) -> None:
-    conn = _AuditMetaPgConn(meta=[held], insert_status="INSERT 0 0")
-    store = _keyed_postgres_store(conn)
-    monkeypatch.setattr(store, "verify_audit_chain", _verified)
-    ok, message = await store.rekey_audit_chain()
-    assert not ok and expected in message
-    assert store._audit_keyed_from is None
+    key = b"\x01" * 32
+    peer = _genesis_row(key)
+    # Empty at the open's first read; a row is there by the time the append reads the head.
+    conn = _GenesisPgConn(head=peer)
+    store = _keyed_postgres_store(conn, [[], [peer]])
+    await load_audit_chain(store, read_only=False)
+    assert store._audit_chain_keyed is True and store._audit_range_from == 1
+    assert conn.inserted == [], "the loser must not write a second genesis row"
     _no_row_change(conn.statements)
 
 
-async def test_postgres_rekey_keys_with_insert_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = _AuditMetaPgConn(meta=[], insert_status="INSERT 0 1")
-    store = _keyed_postgres_store(conn)
-    monkeypatch.setattr(store, "verify_audit_chain", _verified)
-    ok, message = await store.rekey_audit_chain()
-    assert ok and "keyed from id=5" in message
-    _no_row_change(conn.statements)
+async def test_postgres_a_read_only_open_starts_no_chain() -> None:
+    """The control for the two above: told the open is read-only, the load writes nothing."""
+    from messagefoundry.store.store import load_audit_chain
+
+    conn = _GenesisPgConn(head=None)
+    store = _keyed_postgres_store(conn, [[]])
+    await load_audit_chain(store, read_only=True)
+    assert store._audit_chain_keyed is False and conn.inserted == []
 
 
-class _AuditMetaSsCursor:
-    """``inserted`` is whether the guarded INSERT's OUTPUT returns a row. ``rowcount`` is pinned to -1,
-    what a session under NOCOUNT reports, so a rekey that still read it would misjudge every case."""
+class _GenesisSsCursor:
+    """A cursor for the SQL Server genesis append. ``rowcount`` is pinned to -1, what a session
+    under NOCOUNT reports, so an append that read it would misjudge every case."""
 
-    def __init__(self, *, inserted: bool, held: tuple[Any, ...] | None) -> None:
+    def __init__(self) -> None:
         self.rowcount = -1
-        self._inserted = inserted
-        self._held = held
         self._last = ""
         self.statements: list[str] = []
 
@@ -1332,37 +1343,30 @@ class _AuditMetaSsCursor:
         self.statements.append(sql)
         self._last = sql
 
+    async def fetchall(self) -> list[tuple[Any, ...]]:
+        return []
+
     async def fetchone(self) -> tuple[Any, ...] | None:
-        if "MAX(id)" in self._last:
-            return (4,)
         if self._last.startswith("INSERT"):
-            return (1,) if self._inserted else None
-        return self._held
+            return (1,)  # OUTPUT INSERTED.id
+        return None  # the head read: an empty log
 
 
-@pytest.mark.parametrize(
-    ("inserted", "held", "ok", "expected"),
-    [
-        (True, None, True, "keyed from id=5"),
-        (False, (None,), False, "owns the store's schema"),
-        (False, (3,), False, "id=3"),
-    ],
-    ids=["fresh", "no-watermark", "keyed-meanwhile"],
-)
-async def test_sqlserver_rekey_writes_the_watermark_with_insert_alone(
+async def test_sqlserver_starts_a_fresh_chain_with_insert_alone(
     monkeypatch: pytest.MonkeyPatch,
-    inserted: bool,
-    held: tuple[Any, ...] | None,
-    ok: bool,
-    expected: str,
 ) -> None:
-    """The UPDATE-then-INSERT upsert needed UPDATE even when it touched no row: SQL Server checks the
-    permission when it compiles the statement. The watermark is now one guarded INSERT."""
+    """SQL Server checks an UPDATE's permission when it compiles the statement, touched rows or
+    not, so the genesis write must be an INSERT and nothing else. It is the ordinary append,
+    under the audit applock, told to require an empty log."""
     from messagefoundry.store.sqlserver import SqlServerStore
+    from messagefoundry.store.store import build_audit_mac_keys, load_audit_chain
 
-    cur = _AuditMetaSsCursor(inserted=inserted, held=held)
+    key = b"\x01" * 32
+    cur = _GenesisSsCursor()
     store = SqlServerStore(None, _server(StoreBackend.SQLSERVER))
-    store._audit_mac_key = b"\x01" * 32
+    store._audit_mac_key = key
+    store._audit_mac_keys = build_audit_mac_keys(None, key)
+    chain: list[list[dict[str, Any]]] = [[], [_genesis_row(key)]]
 
     class _Conn:
         async def rollback(self) -> None:
@@ -1379,20 +1383,26 @@ async def test_sqlserver_rekey_writes_the_watermark_with_insert_alone(
     async def _commit(_conn: Any) -> None:
         return None
 
+    async def _applock(_cur: Any, _resource: str) -> None:
+        return None
+
+    async def _fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        return [] if "WHERE action" in sql else chain.pop(0)
+
     monkeypatch.setattr(store, "_acquire", _acquire)
     monkeypatch.setattr(store, "_cursor", _cursor)
     monkeypatch.setattr(store, "_commit", _commit)
-    monkeypatch.setattr(store, "verify_audit_chain", _verified)
-    result, message = await store.rekey_audit_chain()
-    assert result is ok and expected in message
-    assert store._audit_keyed_from == (5 if ok else None)
-    assert "WITH (UPDLOCK, HOLDLOCK)" in cur.statements[1]
+    monkeypatch.setattr(store, "_applock", _applock)
+    monkeypatch.setattr(store, "_fetchall", _fetchall)
+    await load_audit_chain(store, read_only=False)
+    assert store._audit_chain_keyed is True
+    assert [s for s in cur.statements if s.startswith("INSERT INTO audit_log")]
     for sql in cur.statements:
         assert not sql.lstrip().upper().startswith(("UPDATE", "DELETE"))
 
 
 #: An audit table's name as a statement may spell it: bare, bracketed, or schema-qualified.
-_AUDIT_TABLE = r"(?:\[?\w+\]?\.)?\[?audit_(?:log|chain_meta)\]?(?!\w)"
+_AUDIT_TABLE = r"(?:\[?\w+\]?\.)?\[?audit_log\]?(?!\w)"
 _TOP = r"(?:TOP\s*\([^)]*\)\s*(?:PERCENT\s+)?)?"
 #: A statement that changes or removes rows of an append-only audit table.
 _AUDIT_ROW_CHANGE = re.compile(
@@ -1404,33 +1414,33 @@ _AUDIT_ROW_CHANGE = re.compile(
 
 def _audit_row_changes(source: str) -> list[str]:
     """Every LITERAL row-changing statement on an audit table in ``source``, plus any INSERT into one
-    that turns into an update on conflict (the old Postgres watermark upsert). It reads at least the
+    that turns into an update on conflict (an upsert). It reads at least the
     literal shapes, not a statement built from a variable or a schema-qualified name, so the live legs'
     DENY and REVOKE are the behavioural guard and this is only the cheap early one."""
     found = [m.group(0) for m in _AUDIT_ROW_CHANGE.finditer(source)]
-    for m in re.finditer(r"INTO\s+audit_(?:log|chain_meta)\b", source, re.IGNORECASE):
+    for m in re.finditer(r"INTO\s+audit_log\b", source, re.IGNORECASE):
         if "DO UPDATE" in source[m.end() : m.end() + 400]:
             found.append(source[m.start() : m.end() + 400])
     return found
 
 
 def test_the_row_change_scan_can_see_the_statements_it_forbids() -> None:
-    """Positive control: the scan must find the shapes it exists to catch, including the Postgres
-    upsert and the SQL Server UPDATE this change removed, or its zero below proves nothing."""
+    """Positive control: the scan must find the shapes it exists to catch, including an upsert,
+    or its zero below proves nothing."""
     removed = (
-        '"INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, $1, $2) "\n'
-        '"ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id, "\n'
-        '"UPDATE audit_chain_meta SET keyed_from_id=?, key_id=? WHERE id=1",\n'
+        '"INSERT INTO audit_log (seq, row_hash) VALUES ($1, $2) "\n'
+        '"ON CONFLICT (seq) DO UPDATE SET row_hash = EXCLUDED.row_hash, "\n'
+        '"UPDATE audit_log SET row_hash=? WHERE seq=1",\n'
         '"DELETE FROM audit_log WHERE id < ?"\n'
         '"DELETE TOP (1000) FROM dbo.audit_log WHERE ts < ?"\n'
-        '"DELETE audit_chain_meta WHERE id=1"\n'
+        '"DELETE audit_log WHERE seq=1"\n'
         '"UPDATE TOP (1) [audit_log] SET detail = ?"\n'
     )
     assert len(_audit_row_changes(removed)) == 6
     # ...and none of the INSERT and SELECT shapes the engine does run.
     kept = (
-        '"INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) OUTPUT INSERTED.id"\n'
-        '"SELECT keyed_from_id FROM audit_chain_meta WHERE id=1"\n'
+        '"INSERT INTO audit_log (seq, ts, actor) OUTPUT INSERTED.id"\n'
+        '"SELECT seq, row_hash FROM audit_log ORDER BY seq DESC"\n'
         '"UPDATE audit_log_archive SET x = 1"\n'
     )
     assert _audit_row_changes(kept) == []
@@ -1440,7 +1450,7 @@ def test_the_row_change_scan_can_see_the_statements_it_forbids() -> None:
 def test_no_server_store_statement_changes_an_audit_row(module: str) -> None:
     """The engine's own statements must fit the INSERT and SELECT grant R16 prescribes."""
     source = (_ROOT / "messagefoundry" / "store" / f"{module}.py").read_text(encoding="utf-8")
-    assert "INSERT INTO audit_chain_meta" in source  # the scan reads the file that writes the row
+    assert "INSERT INTO audit_log" in source  # the scan reads the file that writes the row
     assert _audit_row_changes(source) == []
 
 
@@ -1464,8 +1474,7 @@ def test_the_live_legs_of_this_file_are_run_by_a_server_db_ci_step(gate: str) ->
 def _update_of(table: str) -> str:
     """An UPDATE of one ordinary column of ``table``. Not the id: SQL Server refuses an identity column
     at compile time, before it checks the permission this statement exists to hit."""
-    column = "actor" if table == "audit_log" else "key_id"
-    return f"UPDATE {table} SET {column} = {column}"
+    return f"UPDATE {table} SET actor = actor"
 
 
 @pytest.fixture
@@ -1508,8 +1517,9 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
     1. external open of an EMPTY database refuses, and the database is still empty afterwards;
     2. provision-schema builds it, and a second run is a no-op;
     3. a login holding only db_datareader + db_datawriter is named for UPDATE and DELETE on the audit
-       tables; after the runbook's DENY it opens it, keys the chain with INSERT alone, probes clean,
-       and an UPDATE or DELETE of either audit table is refused (owner ruling R16);
+       table; after the runbook's DENY it opens it, starts the keyed chain with INSERT alone, appends,
+       verifies and rotates its key, probes clean, and an UPDATE or DELETE of the audit table is
+       refused (owner ruling R16);
     4. the same login given db_ddladmin is named as over-granted.
     """
     from messagefoundry.store.sqlserver import SqlServerStore
@@ -1556,23 +1566,18 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
     finally:
         await store.close()
     assert "UPDATE on table audit_log" in undenied.excess
-    assert "DELETE on table audit_chain_meta" in undenied.excess
+    assert "DELETE on table audit_log" in undenied.excess
     for table in AUDIT_APPEND_ONLY_TABLES:
         await bounded(
             sa,
             f"deny writes on {table}",
             admin.run_in(db, f"DENY UPDATE, DELETE ON {table} TO [{login}]"),
         )
-    # With a key, the open keys the empty chain, so the watermark INSERT runs as this login.
-    # A keyless row first, so the keyed open below leaves the chain unkeyed and `rekey-audit` writes
-    # the keying row: the guarded INSERT, under the DENY, as this login.
-    keyless = await bounded(sa, "open keyless", SqlServerStore.open(runtime))
-    try:
-        await bounded(sa, "keyless audit row", keyless.record_audit("r16.keyless", actor="live"))
-    finally:
-        await keyless.close()
-    # The audit key rides the cipher, and `open_store` is what hands it over; a direct open must too.
-    cipher = make_cipher(generate_key())
+    # With a key, the open starts the empty chain: the genesis row is an INSERT, run as this login
+    # under the DENY. The audit key rides the cipher, and `open_store` is what hands it over; a
+    # direct open must too.
+    old_key = generate_key()
+    cipher = make_cipher(old_key)
     keyed = await bounded(
         sa,
         "open as the row-only login",
@@ -1580,16 +1585,30 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
     )
     try:
         clean = await bounded(sa, "probe", keyed.probe_principal_privileges())
-        assert keyed.audit_chain_unkeyed(), "the keyless row must leave the chain for rekey-audit"
-        ok, message = await bounded(sa, "rekey under the DENY", keyed.rekey_audit_chain())
-        assert ok, f"the INSERT-only login must still key the chain: {message}"
+        assert not keyed.audit_chain_unkeyed(), "the INSERT-only login must start a keyed chain"
         await keyed.record_audit("r16.probe", actor="live-test", detail=None)
+        ok, message = await bounded(sa, "verify under the DENY", keyed.verify_audit_chain())
+        assert ok and "verified 2" in (message or ""), message  # the genesis row and the probe row
         for table in AUDIT_APPEND_ONLY_TABLES:
             for statement in (_update_of(table), f"DELETE FROM {table}"):
                 with pytest.raises(Exception, match="permission was denied"):
                     await bounded(sa, statement, keyed._execute(statement))
     finally:
         await keyed.close()
+    # A key rotation is one appended row too, so it also runs under the DENY.
+    cipher = make_cipher(generate_key(), (old_key,))
+    rotated = await bounded(
+        sa,
+        "open under the new key",
+        SqlServerStore.open(runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()),
+    )
+    try:
+        ok, message = await bounded(sa, "roll under the DENY", rotated.roll_audit_key_epoch())
+        assert ok, f"the INSERT-only login must still roll the audit key: {message}"
+        ok, message = await bounded(sa, "verify after the roll", rotated.verify_audit_chain())
+        assert ok, message
+    finally:
+        await rotated.close()
     assert clean.status is StorePrivilegeStatus.OBSERVED
     assert clean.excess == (), f"a row-only runtime login must be silent, got {clean.excess}"
     rows = f"SELECT COUNT(*) FROM [{db}].dbo.audit_log"
@@ -1614,7 +1633,7 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
 async def test_live_postgres_external_refuses_then_provisions_then_runs_row_only() -> None:
     """The Postgres twin, in a schema this test creates and drops. The provisioning principal owns
     every object it creates; the runtime role holds USAGE plus row grants and nothing else, and on the
-    two audit tables only INSERT and SELECT (owner ruling R16): an UPDATE or DELETE there is refused."""
+    audit table only INSERT and SELECT (owner ruling R16): an UPDATE or DELETE there is refused."""
     from messagefoundry.store.postgres import PostgresStore
 
     base = load_settings(environ=os.environ).store
@@ -1667,35 +1686,42 @@ async def test_live_postgres_external_refuses_then_provisions_then_runs_row_only
         finally:
             await store.close()
         assert "UPDATE on table audit_log" in unrevoked.excess
-        assert "DELETE on table audit_chain_meta" in unrevoked.excess
+        assert "DELETE on table audit_log" in unrevoked.excess
         audit_tables = ", ".join(f"{schema}.{table}" for table in AUDIT_APPEND_ONLY_TABLES)
         await admin._execute(
             f"REVOKE UPDATE, DELETE, TRUNCATE, TRIGGER ON {audit_tables} FROM {role}"
         )
-        # With a key, the open keys the empty chain, so the watermark INSERT runs as this role.
-        # A keyless row first, so the keyed open below leaves the chain unkeyed and `rekey-audit`
-        # writes the keying row: the INSERT ... DO NOTHING, under the REVOKE, as this role.
-        keyless = await PostgresStore.open(runtime)
-        try:
-            await keyless.record_audit("r16.keyless", actor="live")
-        finally:
-            await keyless.close()
-        # The audit key rides the cipher; `open_store` hands it over, so a direct open must too.
-        cipher = make_cipher(generate_key())
+        # With a key, the open starts the empty chain: the genesis row is an INSERT, run as this
+        # role under the REVOKE. The audit key rides the cipher; `open_store` hands it over, so a
+        # direct open must too.
+        old_key = generate_key()
+        cipher = make_cipher(old_key)
         store = await PostgresStore.open(
             runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
         )
         try:
             clean = await store.probe_principal_privileges()
-            assert store.audit_chain_unkeyed(), "the keyless row must leave the chain for rekey"
-            ok, message = await store.rekey_audit_chain()
-            assert ok, f"the INSERT-only role must still key the chain: {message}"
+            assert not store.audit_chain_unkeyed(), "the INSERT-only role must start a keyed chain"
             await store.record_audit("r16.probe", actor="live-test", detail=None)
+            ok, message = await store.verify_audit_chain()
+            assert ok and "verified 2" in (message or ""), message  # genesis row + probe row
             for table in AUDIT_APPEND_ONLY_TABLES:
                 statements = (_update_of(table), f"DELETE FROM {table}", f"TRUNCATE {table}")
                 for statement in statements:
                     with pytest.raises(Exception, match="permission denied"):
                         await store._execute(statement)
+        finally:
+            await store.close()
+        # A key rotation is one appended row too, so it also runs under the REVOKE.
+        cipher = make_cipher(generate_key(), (old_key,))
+        store = await PostgresStore.open(
+            runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
+        try:
+            ok, message = await store.roll_audit_key_epoch()
+            assert ok, f"the INSERT-only role must still roll the audit key: {message}"
+            ok, message = await store.verify_audit_chain()
+            assert ok, message
         finally:
             await store.close()
         assert clean.status is StorePrivilegeStatus.OBSERVED

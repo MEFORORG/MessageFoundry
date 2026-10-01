@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import sqlite3
+import struct
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -32,8 +33,10 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
+from messagefoundry.store.schema_verify import SchemaMismatchError
 from messagefoundry.store.store import (
     AUDIT_ANCHOR_MAX_BYTES,
+    AUDIT_KEY_EPOCH_ACTION,
     AUDIT_PREFIX_BREAK_MARKER,
     AuditAnchorError,
     audit_prefix_verdict,
@@ -115,15 +118,29 @@ async def test_row_hash_is_not_nullable_so_an_unchained_row_cannot_be_written(
         # POSITIVE CONTROL: the same INSERT with a hash present must succeed, or the refusal below
         # could be any other schema error and would prove nothing about row_hash.
         await store._db.execute(
-            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
-            " VALUES (?,?,?,?,?,?)",
-            (1.0, "u", "chained", None, None, "0" * 64),
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, row_hash)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (1, 1.0, "u", "chained", None, None, "0" * 64),
         )
-        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL.*row_hash"):
+            await store._db.execute(
+                "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, row_hash)"
+                " VALUES (?,?,?,?,?,?,NULL)",
+                (2, 2.0, "u", "unchained", None, None),
+            )
+        # The sequence number is held the same way: a row with none, or one already taken, is
+        # refused by the schema rather than left for a verify to interpret (vault BACKLOG #2594).
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL.*seq"):
             await store._db.execute(
                 "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
-                " VALUES (?,?,?,?,?,NULL)",
-                (2.0, "u", "unchained", None, None),
+                " VALUES (?,?,?,?,?,?)",
+                (2.0, "u", "unnumbered", None, None, "1" * 64),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            await store._db.execute(
+                "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, row_hash)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (1, 2.0, "u", "same position", None, None, "1" * 64),
             )
         # And the deleted repair path is really gone, not merely unused.
         assert not hasattr(store, "_backfill_audit_chain")
@@ -134,42 +151,72 @@ async def test_row_hash_is_not_nullable_so_an_unchained_row_cannot_be_written(
 # --- #190 keyed HMAC audit chain -------------------------------------------------------------------
 
 
-def test_keyless_hash_is_byte_identical_frozen_fixture() -> None:
-    # HARD compatibility gate: audit_row_hash(key=None) must stay BYTE-IDENTICAL to the pre-#190
-    # unkeyed SHA-256 chain, so keyless deployments + every legacy row still verify. Pinned to a frozen
-    # digest AND to the exact canonical formula (breaks if either the encoding or the keyless branch
-    # changes).
+def _typed(name: str, tag: bytes, body: bytes) -> bytes:
+    """One field of the row digest, written out by hand: name, type tag, value, length-prefixed."""
+    raw = name.encode("utf-8")
+    return struct.pack(">I", len(raw)) + raw + tag + struct.pack(">I", len(body)) + body
+
+
+def test_the_row_digest_is_pinned_to_a_frozen_fixture() -> None:
+    """The digest is pinned twice: to a frozen value, and to the encoding written out by hand here
+    with ``struct`` alone. Either breaks if the field list, the field order, a type tag or the
+    keyless branch changes. All three backends and every recorded anchor depend on these bytes
+    (vault BACKLOG #2594)."""
     args: dict[str, Any] = dict(  # noqa: C408
-        ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
+        seq=1, ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
     )
     keyless = audit_row_hash("prev", key=None, **args)
-    assert keyless == "f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e"
-    canonical = json.dumps(
-        ["prev", 1.5, "alice", "view", "ch", '{"n":1}'], sort_keys=True, default=str
+    assert keyless == "42aeab9417f5ad28918dfeb162e7e4be62fbfcb6081867fd5a4d6671d51f6566"
+    canonical = (
+        _typed("seq", b"I", b"1")
+        + _typed("prev_hash", b"S", b"prev")
+        + _typed("ts", b"F", (1.5).hex().encode("ascii"))
+        + _typed("actor", b"S", b"alice")
+        + _typed("action", b"S", b"view")
+        + _typed("channel_id", b"S", b"ch")
+        + _typed("detail", b"S", b'{"n":1}')
+        + _typed("client", b"N", b"")
     )
-    assert keyless == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    # Keyed is a DIFFERENT digest (HMAC over the same canonical), and matches stdlib hmac exactly.
+    assert keyless == hashlib.sha256(canonical).hexdigest()
+    # Keyed is a DIFFERENT digest (HMAC over the same bytes), and matches stdlib hmac exactly.
     key = b"\x00" * 32
     keyed = audit_row_hash("prev", key=key, **args)
     assert keyed != keyless
-    assert keyed == hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    assert keyed == hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    # An integer timestamp hashes as the float the column hands back.
+    assert audit_row_hash("prev", **{**args, "ts": 2}) == audit_row_hash(
+        "prev", **{**args, "ts": 2.0}
+    )
+
+
+def test_the_sequence_number_is_inside_the_digest() -> None:
+    """Two rows that differ only in their position are two digests, so a row cannot be renumbered
+    or moved without its MAC failing."""
+    args: dict[str, Any] = dict(  # noqa: C408
+        ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}', key=b"k" * 32
+    )
+    assert audit_row_hash("prev", seq=3, **args) != audit_row_hash("prev", seq=4, **args)
 
 
 async def test_keyed_store_chain_verifies(tmp_path: Path) -> None:
     store = await _keyed_store(tmp_path / "keyed.db")
     try:
-        assert store._audit_keyed_from == 1  # fresh encrypted store auto-keys from row 1
+        # A fresh keyed store writes its genesis row at open: row 1, naming the key it is under.
+        assert store._audit_chain_keyed is True
+        cur = await store._db.execute("SELECT seq, action FROM audit_log ORDER BY seq")
+        assert [tuple(r) for r in await cur.fetchall()] == [(1, AUDIT_KEY_EPOCH_ACTION)]
         for i in range(3):
-            await store.record_audit("action", actor="u", detail=f'{{"n":{i}}}')
+            await store.record_audit("action", actor="u", detail=f'{{"n":{i}}}', now=0.0)
         ok, message = await store.verify_audit_chain()
-        assert ok and "3" in (message or "")
+        assert ok and "4" in (message or ""), message  # the genesis row and three rows
         # The stored hash really is the HMAC (not the keyless SHA-256) — an attacker without the DEK
         # cannot recompute it.
-        cur = await store._db.execute("SELECT row_hash FROM audit_log ORDER BY id LIMIT 1")
-        row = await cur.fetchone()
-        assert row is not None
+        cur = await store._db.execute("SELECT seq, row_hash FROM audit_log ORDER BY seq")
+        rows = list(await cur.fetchall())
+        assert [r["seq"] for r in rows] == [1, 2, 3, 4]  # gapless, from 1
         keyless = audit_row_hash(
-            "",
+            rows[0]["row_hash"],
+            seq=2,
             ts=0.0,
             actor="u",
             action="action",
@@ -177,7 +224,7 @@ async def test_keyed_store_chain_verifies(tmp_path: Path) -> None:
             detail='{"n":0}',
             key=None,
         )
-        assert row["row_hash"] != keyless  # it's keyed, not the forgeable keyless hash
+        assert rows[1]["row_hash"] != keyless  # it's keyed, not the forgeable keyless hash
     finally:
         await store.close()
 
@@ -187,10 +234,10 @@ async def test_keyed_edit_breaks_verify(tmp_path: Path) -> None:
     try:
         await store.record_audit("login", actor="u")
         await store.record_audit("view", actor="u")
-        await store._db.execute("UPDATE audit_log SET action='HACKED' WHERE id=1")
+        await store._db.execute("UPDATE audit_log SET action='HACKED' WHERE seq=2")
         await store._db.commit()
         ok, message = await store.verify_audit_chain()
-        assert not ok and "id=1" in (message or "")
+        assert not ok and "seq=2" in (message or "")
     finally:
         await store.close()
 
@@ -206,7 +253,7 @@ async def test_keyed_chain_unverifiable_without_the_key(tmp_path: Path) -> None:
         await store.close()
     plain = await MessageStore.open(path)  # no cipher, no audit_mac_key
     try:
-        assert plain._audit_keyed_from == 1  # watermark persisted
+        assert plain._audit_chain_keyed is True  # read from the chain's own genesis row
         ok, message = await plain.verify_audit_chain()
         assert not ok and "no store encryption key" in (message or "")
     finally:
@@ -215,73 +262,74 @@ async def test_keyed_chain_unverifiable_without_the_key(tmp_path: Path) -> None:
 
 async def test_keyed_store_refuses_keyless_append_without_the_key(tmp_path: Path) -> None:
     # review major-1: a keyed store reopened WRITABLE without its DEK must REFUSE to append (raise),
-    # never write a keyless row above the keying watermark. Such a row would hash keyless yet land at an
-    # id ≥ the watermark, so a later keyed verify would expect an HMAC there and report a FALSE tamper —
-    # silently corrupting the tamper-evidence chain. Fail closed instead.
+    # never write a keyless row into the keyed chain. A keyed process requires every row keyed, so
+    # such a row would be a break. The handle learns the chain is keyed from its genesis row, so no
+    # state beside the chain has to say so. Fail closed instead.
     path = tmp_path / "refuse.db"
     store = await _keyed_store(path)
     try:
         await store.record_audit("login", actor="u")
     finally:
         await store.close()
-    plain = await MessageStore.open(path)  # no cipher/key, but the watermark persisted
+    plain = await MessageStore.open(path)  # no cipher/key
     try:
-        assert plain._audit_keyed_from == 1
+        assert plain._audit_chain_keyed is True
+        assert "genesis row" in (plain.audit_append_refusal() or "")
         with pytest.raises(RuntimeError, match="no store encryption key"):
             await plain.record_audit("view", actor="u")
-        # The refusal is total — no keyless row leaked in above the watermark.
+        # The refusal is total — no keyless row leaked into the keyed chain.
         cur = await plain._db.execute("SELECT COUNT(*) AS n FROM audit_log")
         row = await cur.fetchone()
-        assert row is not None and int(row["n"]) == 1
+        assert row is not None and int(row["n"]) == 2  # the genesis row and "login"
     finally:
         await plain.close()
 
 
-async def test_rekey_migration_of_existing_keyless_chain(tmp_path: Path) -> None:
-    # #190-D: an existing keyless chain is NOT auto-keyed on open; rekey_audit_chain enables keying from
-    # the next id — existing keyless rows keep verifying, new rows are keyed.
-    path = tmp_path / "migrate.db"
-    key = generate_key()
+async def test_a_keyless_chain_opened_with_a_key_is_reported_and_never_rekeyed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A store that holds a key requires every audit row keyed (vault BACKLOG #2594).
+
+    Rows written without a key are a reported break under a keyed open. The open does not re-key
+    them, no method or command does, and the rows it appends itself are keyed. The control is the
+    same chain under a keyless open, which verifies."""
+    path = tmp_path / "keyless_then_keyed.db"
     store = await MessageStore.open(path)  # keyless first
     try:
-        await store.record_audit("legacy1", actor="u")
-        await store.record_audit("legacy2", actor="u")
-        assert store._audit_keyed_from is None  # existing keyless chain left keyless
+        await store.record_audit("first", actor="u")
+        await store.record_audit("second", actor="u")
+        assert store._audit_chain_keyed is False and store.audit_chain_unkeyed() is False
+        ok, message = await store.verify_audit_chain()
+        assert ok, message  # the control: a keyless handle walks its keyless chain
+        cur = await store._db.execute("SELECT row_hash FROM audit_log ORDER BY seq")
+        before = [r["row_hash"] for r in await cur.fetchall()]
     finally:
         await store.close()
-    cipher = make_cipher(key)
-    store = await MessageStore.open(path, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+    cipher = make_cipher(generate_key())
+    with caplog.at_level(logging.ERROR):
+        store = await MessageStore.open(path, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
     try:
-        # Opening with a key does NOT silently re-key an existing non-empty chain.
-        assert store._audit_keyed_from is None
-        ok, msg = await store.rekey_audit_chain()
-        assert ok and "keyed from id=3" in msg
-        assert store._audit_keyed_from == 3
-        await store.record_audit("new_keyed", actor="u")
-        ok, _ = await store.verify_audit_chain()  # keyless prefix + keyed suffix both verify
-        assert ok
-    finally:
-        await store.close()
-
-
-async def test_rekey_refuses_broken_chain(tmp_path: Path) -> None:
-    # rekey must run ONLY on an operator-verified chain — a tampered keyless chain is never blessed.
-    path = tmp_path / "broken.db"
-    key = generate_key()
-    store = await MessageStore.open(path)
-    try:
-        await store.record_audit("a", actor="u")
-        await store.record_audit("b", actor="u")
-        await store._db.execute("UPDATE audit_log SET action='HACKED' WHERE id=1")
-        await store._db.commit()
-    finally:
-        await store.close()
-    cipher = make_cipher(key)
-    store = await MessageStore.open(path, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
-    try:
-        ok, msg = await store.rekey_audit_chain()
-        assert not ok and "refusing" in msg
-        assert store._audit_keyed_from is None  # watermark not set on refusal
+        assert any("genesis row" in r.getMessage() for r in caplog.records)
+        assert store._audit_chain_keyed is False and store.audit_chain_unkeyed() is True
+        assert not hasattr(store, "rekey_audit_chain")
+        ok, message = await store.verify_audit_chain()
+        assert not ok and "seq=1" in (message or "") and "genesis row" in (message or "")
+        # The open rewrote nothing.
+        cur = await store._db.execute("SELECT row_hash FROM audit_log ORDER BY seq")
+        assert [r["row_hash"] for r in await cur.fetchall()] == before
+        # A keyed handle never appends a keyless row: the new row is an HMAC under its key.
+        await store.record_audit("third", actor="u", now=7.0)
+        cur = await store._db.execute("SELECT seq, row_hash FROM audit_log ORDER BY seq")
+        rows = list(await cur.fetchall())
+        assert [r["seq"] for r in rows] == [1, 2, 3]
+        keyless = audit_row_hash(
+            before[-1], seq=3, ts=7.0, actor="u", action="third", channel_id=None, detail=None
+        )
+        assert rows[-1]["row_hash"] != keyless
+        ok, message = await store.verify_audit_chain()
+        assert not ok, "a keyed row after keyless rows must not make the chain verify"
+        ok, message = await store.roll_audit_key_epoch()
+        assert not ok and "genesis row" in message
     finally:
         await store.close()
 
@@ -409,7 +457,7 @@ def _empty_store(db: Path) -> None:
     asyncio.run(_run())
 
 
-@pytest.mark.parametrize("subcommand", ["audit-verify", "audit-anchor", "rekey-audit"])
+@pytest.mark.parametrize("subcommand", ["audit-verify", "audit-anchor"])
 def test_audit_cli_refuses_a_zero_byte_database(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], subcommand: str
 ) -> None:
@@ -424,7 +472,7 @@ def test_audit_cli_refuses_a_zero_byte_database(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["zero.db"]
 
 
-@pytest.mark.parametrize("subcommand", ["audit-verify", "audit-anchor", "rekey-audit"])
+@pytest.mark.parametrize("subcommand", ["audit-verify", "audit-anchor"])
 def test_audit_cli_refuses_a_file_that_is_not_a_database(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], subcommand: str
 ) -> None:
@@ -1034,65 +1082,49 @@ def test_expected_anchor_detects_a_same_count_tail_replacement(
     assert "truncated or rewritten" in capsys.readouterr().out
 
 
-def test_rekey_audit_cli(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+def test_the_rekey_audit_command_is_gone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # review major-2: the #190-D migration must be operator-reachable. Seed a keyless chain, then run
-    # `rekey-audit` with the DEK in the env — it re-verifies the keyless chain and enables keying.
-    db = tmp_path / "rekey.db"
+    """``rekey-audit`` set the keyed-from mark over rows that already existed. No such mark exists
+    now, so the command has nothing to do and is deleted (vault BACKLOG #2594). The parser refuses
+    the name, and the control is a sibling audit command the same parser still accepts."""
+    db = tmp_path / "gone.db"
 
     async def _seed() -> None:
         s = await MessageStore.open(db)
-        await s.record_audit("legacy1", actor="x")
-        await s.record_audit("legacy2", actor="x")
+        await s.record_audit("login", actor="x")
         await s.close()
 
     asyncio.run(_seed())
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    assert main(["rekey-audit", "--db", str(db)]) == 0
-    assert "OK" in (out := capsys.readouterr().out) and "keyed from id=3" in out
-    # Re-running is an idempotent no-op — already keyed, never a second watermark move.
-    assert main(["rekey-audit", "--db", str(db)]) == 0
-    assert "already keyed" in capsys.readouterr().out
-
-
-def test_rekey_audit_cli_refuses_missing_db(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A typo'd --db must NOT create a fresh SQLite DB (mirrors audit-verify's M-31 guard).
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    missing = tmp_path / "typo.db"
-    assert main(["rekey-audit", "--db", str(missing)]) == 2
-    assert "no audit database" in capsys.readouterr().err
-    assert not missing.exists()
+    with pytest.raises(SystemExit) as excinfo:
+        main(["rekey-audit", "--db", str(db)])
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+    assert main(["audit-verify", "--db", str(db)]) == 0
 
 
 # --- ADR 0150: the client address on the chained audit row ------------------------------------------
 
 
-def test_absent_client_reproduces_the_legacy_digest_exactly() -> None:
-    """The compatibility gate for ADR 0150. The address is a CONDITIONAL 7th element, so a row with no
-    client must hash over the same 6-element list as before — otherwise every row written before the
-    column existed would fail verification the moment the engine was upgraded."""
+def test_an_absent_client_and_an_empty_client_are_different_digests() -> None:
+    """``client`` is always in the digest, typed. An engine-internal write (``None``) and an empty
+    address are two encodings, so one cannot be rewritten into the other, and omitting the argument
+    is the same as passing ``None``."""
     args: dict[str, Any] = dict(  # noqa: C408
-        ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
+        seq=1, ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
     )
-    legacy = "f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e"
-    # Omitted and explicitly-None must BOTH collapse to the frozen pre-0150 digest.
-    assert audit_row_hash("prev", **args) == legacy
-    assert audit_row_hash("prev", client=None, **args) == legacy
-    # An UNCONDITIONAL 7th element would have produced this instead — the bug this test pins against.
-    unconditional = json.dumps(
-        ["prev", 1.5, "alice", "view", "ch", '{"n":1}', None], sort_keys=True, default=str
-    )
-    assert legacy != hashlib.sha256(unconditional.encode("utf-8")).hexdigest()
+    assert audit_row_hash("prev", **args) == audit_row_hash("prev", client=None, **args)
+    assert audit_row_hash("prev", client="", **args) != audit_row_hash("prev", client=None, **args)
+    # The same holds for every nullable text field: NULL, the empty string and the text None differ.
+    digests = {audit_row_hash("prev", **{**args, "actor": actor}) for actor in (None, "", "None")}
+    assert len(digests) == 3
 
 
 def test_client_is_inside_the_chained_payload() -> None:
     """The address must be CHAINED, not an unchained sibling column: attribution an attacker can
     rewrite without breaking tamper-evidence would be worse than no attribution at all."""
     args: dict[str, Any] = dict(  # noqa: C408
-        ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
+        seq=1, ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}'
     )
     assert audit_row_hash("prev", client="10.0.0.1", **args) != audit_row_hash("prev", **args)
     # …and two different addresses are two different digests (the field is genuinely covered).
@@ -1101,16 +1133,16 @@ def test_client_is_inside_the_chained_payload() -> None:
     )
 
 
-def test_no_crafted_detail_can_forge_the_trailing_client_element() -> None:
-    """JSON is uniquely decodable, so a 6- and a 7-element list can never render to the same bytes and
-    string values are escaped — a detail ending in a quote-comma-quote run cannot impersonate a client."""
-    forged = audit_row_hash(
-        "prev", ts=1.5, actor="a", action="v", channel_id=None, detail='x", "10.0.0.1'
+def test_no_crafted_detail_can_imitate_a_field_boundary() -> None:
+    """Every field is length-prefixed, so a value cannot run into its neighbour: moving bytes from
+    the end of one field to the start of the next is a different digest."""
+    one = audit_row_hash(
+        "prev", seq=1, ts=1.5, actor="a", action="v", channel_id=None, detail="x10.0", client=".0.1"
     )
-    real = audit_row_hash(
-        "prev", ts=1.5, actor="a", action="v", channel_id=None, detail="x", client="10.0.0.1"
+    other = audit_row_hash(
+        "prev", seq=1, ts=1.5, actor="a", action="v", channel_id=None, detail="x", client="10.0.0.1"
     )
-    assert forged != real
+    assert one != other
 
 
 async def test_authenticated_action_records_the_address(store: MessageStore) -> None:
@@ -1136,13 +1168,12 @@ async def test_system_write_records_null_rather_than_inheriting(store: MessageSt
 
 
 async def test_chain_verifies_across_mixed_old_and_new_format_rows(tmp_path: Path) -> None:
-    """The load-bearing migration property: one chain spanning rows written BEFORE the client column
-    existed and rows written after it, interleaved."""
+    """One chain spanning rows with a client address and rows without one, interleaved."""
     store = await MessageStore.open(tmp_path / "mixed.db")
     try:
-        await store.record_audit("legacy.a", actor="u")  # 6-element payload
-        await store.record_audit("new.b", actor="u", client="10.0.0.7")  # 7-element payload
-        await store.record_audit("legacy.c", actor="system")  # 6-element again
+        await store.record_audit("legacy.a", actor="u")  # no client
+        await store.record_audit("new.b", actor="u", client="10.0.0.7")  # with a client
+        await store.record_audit("legacy.c", actor="system")  # none again
         await store.record_audit("new.d", actor="u", client="192.168.1.5")
         ok, message = await store.verify_audit_chain()
         assert ok, message
@@ -1161,50 +1192,30 @@ async def test_tampering_with_a_recorded_address_breaks_the_chain(store: Message
     assert not ok and "id=1" in (message or "")
 
 
-async def test_migration_adds_client_to_a_preexisting_store(tmp_path: Path) -> None:
-    """Open a DB whose audit_log predates the column (the real upgrade path): the ALTER lands, the
-    legacy rows keep their original hashes, and the chain still verifies — then a NEW row carrying an
-    address chains cleanly onto them."""
-    import aiosqlite
+async def test_an_audit_log_in_an_earlier_layout_is_refused_not_converted(tmp_path: Path) -> None:
+    """No earlier ``audit_log`` layout is converted (vault BACKLOG #2594): ``seq`` is NOT NULL and
+    inside every row's MAC, so no ALTER can supply it for rows already written. The open refuses
+    such a store and names the missing column. This replaced
+    ``test_migration_adds_client_to_a_preexisting_store``, which proved an upgrade path for a
+    population that was never created (zero deployments).
 
-    db = tmp_path / "preexisting.db"
-    # Build the pre-ADR-0150 audit_log by hand, with correctly-computed OLD-FORMAT hashes.
-    async with aiosqlite.connect(db) as raw:
-        await raw.execute(
-            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,"
-            " actor TEXT, action TEXT NOT NULL, channel_id TEXT, detail TEXT, row_hash TEXT)"
-        )
-        prev = ""
-        for i in range(3):
-            prev = audit_row_hash(
-                prev, ts=float(i), actor="u", action="legacy", channel_id=None, detail=None
-            )
-            await raw.execute(
-                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
-                " VALUES (?,?,?,?,?,?)",
-                (float(i), "u", "legacy", None, None, prev),
-            )
-        await raw.commit()
-    legacy_head = prev
-
+    The control is the same file before its table is swapped: it opens."""
+    db = tmp_path / "earlier.db"
     store = await MessageStore.open(db)
-    try:
-        cur = await store._db.execute("PRAGMA table_info(audit_log)")
-        assert "client" in {r["name"] for r in await cur.fetchall()}  # the ALTER ran
-        # The pre-existing rows were NOT rewritten, and they still verify.
-        cur = await store._db.execute("SELECT client, row_hash FROM audit_log ORDER BY id")
-        rows = list(await cur.fetchall())
-        assert [r["client"] for r in rows] == [None, None, None]
-        assert rows[-1]["row_hash"] == legacy_head
-        ok, message = await store.verify_audit_chain()
-        assert ok, message
-        # A new address-bearing row chains onto the legacy tail without breaking it.
-        await store.record_audit("messages.export", actor="alice", client="10.4.2.9")
-        ok, message = await store.verify_audit_chain()
-        assert ok, message
-        assert "4" in (message or "")
-    finally:
-        await store.close()
+    await store.close()
+    store = await MessageStore.open(db)  # the control: this build's own layout opens
+    await store.close()
+    with sqlite3.connect(db) as raw:
+        raw.execute("DROP TABLE audit_log")
+        raw.execute(
+            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,"
+            " actor TEXT, action TEXT NOT NULL, channel_id TEXT, detail TEXT, client TEXT,"
+            " row_hash TEXT NOT NULL)"
+        )
+        raw.commit()
+    raw.close()
+    with pytest.raises(SchemaMismatchError, match="audit_log.*missing column 'seq'"):
+        await MessageStore.open(db)
 
 
 # --------------------------------------------------------------------------- BACKLOG #328
@@ -1488,7 +1499,7 @@ async def test_startup_chain_break_keeps_its_own_alert_subject(tmp_path: Path) -
     assert len(sink.events) == 1, sink.events
     subject, reason, _ = sink.events[0]
     assert subject == "audit-chain", "a chain break was filed under the truncation subject"
-    assert "broken at row id=2" in reason
+    assert "broken at seq=2, row id=2" in reason
     assert "chain break" in cap.text, cap.records
 
 

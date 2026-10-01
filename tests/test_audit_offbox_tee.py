@@ -81,7 +81,7 @@ async def test_record_audit_tees_metadata_off_box(store, audit_capture) -> None:
         client="10.4.2.9",
         now=123.0,
     )
-    cur = await store._db.execute("SELECT id, row_hash FROM audit_log")
+    cur = await store._db.execute("SELECT id, seq, row_hash FROM audit_log")
     row = await cur.fetchone()
     assert row is not None
     rec = _only(audit_capture)
@@ -94,6 +94,8 @@ async def test_record_audit_tees_metadata_off_box(store, audit_capture) -> None:
         "client": "10.4.2.9",  # ADR 0150: the recorded address travels off-box with the row
         # BACKLOG #1198 anchor fields, taken from the row that actually committed.
         "row_id": row["id"],
+        # The chain coordinate: the number inside the row's MAC, and the one an anchor names.
+        "seq": row["seq"],
         "row_hash": row["row_hash"],
         "detail": None,
     }
@@ -162,16 +164,42 @@ async def test_tee_anchor_fields_name_the_row_that_was_actually_committed(
     for i in range(3):
         await store.record_audit("act", actor="u", detail=f'{{"n":{i}}}', now=float(i))
 
-    cur = await store._db.execute("SELECT id, row_hash FROM audit_log ORDER BY id")
-    persisted = [(r["id"], r["row_hash"]) for r in await cur.fetchall()]
-    teed = [(json.loads(m)["row_id"], json.loads(m)["row_hash"]) for m in audit_capture.messages]
+    cur = await store._db.execute("SELECT id, seq, row_hash FROM audit_log ORDER BY seq")
+    persisted = [(r["id"], r["seq"], r["row_hash"]) for r in await cur.fetchall()]
+    teed = [
+        (json.loads(m)["row_id"], json.loads(m)["seq"], json.loads(m)["row_hash"])
+        for m in audit_capture.messages
+    ]
 
     # POSITIVE CONTROL: an empty chain would make the comparison below pass vacuously.
     assert len(persisted) == 3, persisted
     assert teed == persisted
+    assert [seq for _id, seq, _h in teed] == [1, 2, 3]  # gapless, from 1
     assert (
-        len({h for _id, h in persisted}) == 3
+        len({h for _id, _seq, h in persisted}) == 3
     )  # three distinct hashes, so equality is not trivial
+
+
+async def test_a_teed_record_is_an_anchor_the_verifier_takes_unchanged(
+    store, audit_capture
+) -> None:
+    """The collector and the verifier share one coordinate (vault BACKLOG #2594): a teed record's
+    ``(seq, row_hash)`` is an anchor. The second record, held off the host, still matches as a
+    prefix after a third row is appended, and reports the chain once its tail is cut back past it.
+    The control is the same anchor against the untouched chain."""
+    for i in range(3):
+        await store.record_audit("act", actor="u", detail=f'{{"n":{i}}}', now=float(i))
+    second = json.loads(audit_capture.messages[1])
+    anchor = (second["seq"], second["row_hash"])
+
+    ok, message = await store.verify_audit_chain(expected_prefix=anchor)
+    assert ok, message
+    await store._db.execute("DELETE FROM audit_log WHERE seq >= 2")
+    await store._db.commit()
+    ok, message = await store.verify_audit_chain()
+    assert ok, "the walk alone cannot see a cut tail"
+    ok, message = await store.verify_audit_chain(expected_prefix=anchor)
+    assert not ok and "truncated or rewritten" in (message or "")
 
 
 # --- the shared redaction path, tested directly (covers Postgres + SQL Server, which wire into the
@@ -187,6 +215,7 @@ def test_emit_audit_tee_shape_is_metadata_only(audit_capture) -> None:
         client="10.4.2.9",
         ts=10.0,
         row_id=7,
+        seq=7,
         row_hash=_HASH,
     )
     assert _only(audit_capture) == {
@@ -203,6 +232,7 @@ def test_emit_audit_tee_shape_is_metadata_only(audit_capture) -> None:
         # counter and a digest — no PHI, no key material. Whole-dict equality is what keeps this a
         # real shape guard: a field added later must be declared here or the assertion fails.
         "row_id": 7,
+        "seq": 7,
         "row_hash": _HASH,
         "detail": None,
     }
@@ -219,6 +249,7 @@ def test_emit_audit_tee_client_defaults_to_none_for_engine_internal_writes(audit
         detail=None,
         ts=3.0,
         row_id=1,
+        seq=1,
         row_hash=_HASH,
     )
     assert _only(audit_capture)["client"] is None
@@ -232,6 +263,7 @@ def test_emit_audit_tee_redacts_hl7_in_detail(audit_capture) -> None:
         detail="PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F",
         ts=1.0,
         row_id=1,
+        seq=1,
         row_hash=_HASH,
     )
     line = audit_capture.messages[0]
@@ -249,6 +281,7 @@ def test_emit_audit_tee_redacts_bare_delimiter_run_without_segment(audit_capture
         detail="DOE^JANE^M^MR",
         ts=1.0,
         row_id=1,
+        seq=1,
         row_hash=_HASH,
     )
     line = audit_capture.messages[0]
@@ -269,6 +302,7 @@ def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeyp
         detail=None,
         ts=1.0,
         row_id=1,
+        seq=1,
         row_hash=_HASH,
     )
 
@@ -535,6 +569,7 @@ def test_the_tee_reaches_a_handler_with_no_root_handler_installed(capsys) -> Non
             detail=None,
             ts=1.0,
             row_id=1,
+            seq=1,
             row_hash=_HASH,
         )
 
@@ -556,6 +591,7 @@ def test_the_tee_does_not_double_emit_when_a_sink_is_already_configured(audit_ca
         detail=None,
         ts=1.0,
         row_id=1,
+        seq=1,
         row_hash=_HASH,
     )
 
@@ -575,6 +611,7 @@ def test_the_fallback_sink_carries_the_identical_redaction_chain() -> None:
             detail=None,
             ts=1.0,
             row_id=1,
+            seq=1,
             row_hash=_HASH,
         )
         installed = list(audit_tee.audit_logger.handlers)
@@ -610,6 +647,7 @@ def test_the_fallback_sink_renders_phi_exactly_as_the_configured_sink_does(capsy
             detail=phi,
             ts=1.0,
             row_id=1,
+            seq=1,
             row_hash=_HASH,
         )
         # The same record through the handler `serve` installs, for a side-by-side rendering.
@@ -621,6 +659,7 @@ def test_the_fallback_sink_renders_phi_exactly_as_the_configured_sink_does(capsy
             detail=phi,
             ts=1.0,
             row_id=1,
+            seq=1,
             row_hash=_HASH,
         )
 
@@ -649,6 +688,7 @@ def test_the_fallback_sink_is_removed_once_the_process_configures_logging() -> N
             detail=None,
             ts=1.0,
             row_id=1,
+            seq=1,
             row_hash=_HASH,
         )
         assert len(audit_tee.audit_logger.handlers) == 1  # the fallback went in
@@ -661,6 +701,7 @@ def test_the_fallback_sink_is_removed_once_the_process_configures_logging() -> N
             detail=None,
             ts=2.0,
             row_id=1,
+            seq=1,
             row_hash=_HASH,
         )
 

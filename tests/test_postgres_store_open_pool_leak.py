@@ -91,7 +91,8 @@ async def test_open_closes_the_pool_when_a_later_init_step_raises(
     monkeypatch.setattr(PostgresStore, "_ensure_schema", _noop)
     monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _noop)
     monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _noop)
-    monkeypatch.setattr(PostgresStore, "_load_audit_chain_meta", _noop)
+    # The audit chain's load is the shared function the backend module imports, not a method.
+    monkeypatch.setattr("messagefoundry.store.postgres.load_audit_chain", _noop)
     monkeypatch.setattr(PostgresStore, "_load_state_cache", _noop)
     monkeypatch.setattr(PostgresStore, "_load_reference_cache", _boom)
 
@@ -114,14 +115,15 @@ async def test_a_read_only_open_writes_nothing_and_loads_no_cache(
         seen.append(f"ensure read_only={kwargs.get('read_only')}")
         return False
 
-    async def _audit(self: PostgresStore) -> None:
-        seen.append("audit")
+    async def _audit(self: PostgresStore, *, read_only: bool) -> None:
+        # The loader writes the genesis row only when it is NOT told the open is read-only.
+        seen.append(f"audit read_only={read_only}")
 
     async def _forbidden(self: PostgresStore, *args: object, **kwargs: object) -> None:
         raise AssertionError("a read-only open reached a step it must skip")
 
     monkeypatch.setattr(PostgresStore, "_ensure_schema", _ensure)
-    monkeypatch.setattr(PostgresStore, "_load_audit_chain_meta", _audit)
+    monkeypatch.setattr("messagefoundry.store.postgres.load_audit_chain", _audit)
     for step in (
         "_ensure_store_salt",
         "checkpoint_cipher_invocations",
@@ -133,6 +135,6 @@ async def test_a_read_only_open_writes_nothing_and_loads_no_cache(
 
     store = await PostgresStore.open(_settings(), read_only=True)
 
-    assert seen == ["ensure read_only=True", "audit"]
+    assert seen == ["ensure read_only=True", "audit read_only=True"]
     assert store._read_only is True
     assert pool.closed == 0

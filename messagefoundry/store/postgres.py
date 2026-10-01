@@ -153,8 +153,6 @@ from messagefoundry.store.store import (
     _ALERT_SEVERITY_RANK_SQL,
     _SESSION_CAP_ORDER_SQL,
     AUDIT_ALL_ROWS,
-    AUDIT_CHAIN_META_ROW_CHANGED,
-    AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -167,8 +165,8 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
+    AppendedAuditRow,
     AuditAppend,
-    AuditHeadMovedError,
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
@@ -207,16 +205,15 @@ from messagefoundry.store.store import (
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     _session_cap_groups,
-    audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
-    audit_rekey_refused,
-    audit_rekey_when_keyed,
+    audit_next_link,
     audit_row_hash,
     birth_notify_email,
     build_audit_mac_keys,
     check_password_generated,
     delivery_key,
+    load_audit_chain,
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
@@ -227,10 +224,8 @@ from messagefoundry.store.store import (
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
-    settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
-    warn_unkeyed_audit_chain,
 )
 from messagefoundry.support.redact import redact_log_line
 
@@ -598,6 +593,11 @@ _SCHEMA: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_alert_instance_status ON alert_instance(status, connection)",
     """CREATE TABLE IF NOT EXISTS audit_log (
         id         BIGSERIAL PRIMARY KEY,
+        -- The row's position in the hash chain: 1, then rising by one, with no gap. It is inside the
+        -- row's MAC and is what an anchor and the off-box tee name a row by. `id` is only the
+        -- surrogate key: a rolled-back INSERT burns a BIGSERIAL value, so `id` can skip. UNIQUE, so
+        -- two appends can never take one position.
+        seq        BIGINT NOT NULL UNIQUE,
         ts         DOUBLE PRECISION NOT NULL,
         actor      TEXT,
         action     TEXT NOT NULL,
@@ -608,22 +608,9 @@ _SCHEMA: list[str] = [
         -- row has no legitimate producer. See the SQLite `_SCHEMA` for the full reasoning.
         row_hash   TEXT NOT NULL
     )""",
-    # ADR 0150 client attribution for a pre-existing audit_log. Nullable with NO default: NULL on every
-    # existing row is CORRECT (their address was never captured) and is exactly what preserves their
-    # row_hash — audit_row_hash omits the conditional 7th element when client is None, so the legacy
-    # digest reproduces byte-for-byte and the chain verifies across the upgrade. No-op on a fresh DB.
-    "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS client TEXT",
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
-    # Audit-chain keying watermark (#190) — single row (id=1). keyed_from_id = the first audit_log.id
-    # hashed with the HMAC key; NULL/no row = the whole chain is keyless (byte-identical to pre-#190).
-    """CREATE TABLE IF NOT EXISTS audit_chain_meta (
-        id             INTEGER PRIMARY KEY CHECK (id = 1),
-        keyed_from_id  BIGINT
-    )""",
-    # BACKLOG #1904 (ADR 0193): the audit key the FIRST keyed range is MAC'd under. NULL on a
-    # pre-existing row, reported as a chain that does not record its key (ADR 0193). No-op on a
-    # fresh DB.
-    "ALTER TABLE audit_chain_meta ADD COLUMN IF NOT EXISTS key_id TEXT",
+    # No table beside audit_log says where its keying starts: the process that holds the key decides,
+    # and the chain's own first row (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
     # reserve-then-spend rationale and which key a row counts (the sealing key, ADR 0196). One row
     # per key_id; non-secret (a one-way fingerprint plus a counter).
@@ -1287,7 +1274,7 @@ class PostgresStore:
         # ``/stats`` consumer reads these with ``getattr(store, name, 0)``, so 0 here degrades gracefully.
         self.committed_txns = 0
         self.body_copies = 0
-        # #190 audit-chain HMAC key (HKDF-derived; None → keyless chain) + keying watermark.
+        # #190 audit-chain HMAC key (HKDF-derived; None, with no MAC provider, is the keyless mode).
         self._audit_mac_key = audit_mac_key
         # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit ``generate_hmac``) keying the
         # audit chain WITHOUT an in-heap key — set only in `vault_transit` mode (from Cipher.audit_mac_fn),
@@ -1295,12 +1282,13 @@ class PostgresStore:
         # server-DB deployment ran its audit chain fully UNKEYED under the posture meant to be the most
         # isolated one (ASVS 13.3.3).
         self._audit_mac_fn = audit_mac_fn
-        self._audit_keyed_from: int | None = None
-        self._audit_chain_unkeyed = False  # BACKLOG #1905 -- see the SQLite twin
-        # BACKLOG #1904 (ADR 0193): the audit keyring (active AND retired), the first keyed range's key and
-        # the CURRENT range -- see the SQLite twin and `settle_audit_ranges`.
+        # Whether the chain opens with a genesis row, so is keyed; and whether a keyed handle found
+        # keyless rows instead (BACKLOG #1905). Both read from the chain by `load_audit_chain`.
+        self._audit_chain_keyed = False
+        self._audit_chain_unkeyed = False
+        # BACKLOG #1904 (ADR 0193): the audit keyring (active AND retired) and the CURRENT range --
+        # see the SQLite twin and `settle_audit_ranges`. `_audit_range_from` is a sequence number.
         self._audit_mac_keys: dict[str, bytes] = build_audit_mac_keys(cipher, audit_mac_key)
-        self._audit_first_key_id: str | None = None
         self._audit_range_key_id: str | None = None
         self._audit_range_from: int | None = None
         self._audit_range_keys: list[str] = []
@@ -1391,7 +1379,9 @@ class PostgresStore:
                 await store.checkpoint_cipher_invocations()
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
-            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+            # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
+            # genesis append takes the audit advisory lock and needs INSERT and SELECT only.
+            await load_audit_chain(store, read_only=read_only)
             if not read_only:
                 # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
                 await (
@@ -1628,8 +1618,8 @@ class PostgresStore:
         mode never writes it. No ``schema_meta`` yet means nothing is provisioned, which the marker read
         that follows reports. Reads only.
 
-        The append-only audit tables (owner ruling R16) need SELECT and INSERT only, so a role granted
-        exactly that passes here. Holding more on them is an over-grant, which the privilege preflight
+        The append-only audit table (owner ruling R16) needs SELECT and INSERT only, so a role granted
+        exactly that passes here. Holding more on it is an over-grant, which the privilege preflight
         (:meth:`probe_principal_privileges`) reports; this check only asks what is missing."""
         rows = await conn.fetch(
             "SELECT c.relname, c.relkind FROM pg_catalog.pg_class c"
@@ -1661,7 +1651,7 @@ class PostgresStore:
             f"the postgres store schema in database {self._settings.database!r} is provisioned and "
             f"current, but this role lacks row access to {len(rows)} object(s): {names}{more}. "
             "Refusing to start rather than fail mid-pipeline. Grant SELECT, INSERT, UPDATE, DELETE on "
-            "the tables, SELECT and INSERT only on audit_log and audit_chain_meta, and USAGE on the "
+            "the tables, SELECT and INSERT only on audit_log, and USAGE on the "
             "sequences to the runtime role (docs/DEPLOY-SERVER-DB.md section 1.2); provision-schema "
             "cannot grant them"
         )
@@ -2007,8 +1997,7 @@ class PostgresStore:
             unread_note = (
                 f"the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this "
                 "role can change audit rows was not read; [store].schema_management is "
-                "'external', which requires INSERT and SELECT only on audit_log and "
-                "audit_chain_meta"
+                "'external', which requires INSERT and SELECT only on audit_log"
             )
             if not excess:
                 return StorePrivilegeReport(
@@ -2036,7 +2025,7 @@ class PostgresStore:
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r}, ownership of its "
-                    "objects, and UPDATE, DELETE, TRUNCATE or TRIGGER on audit_log or audit_chain_meta are "
+                    "objects, and UPDATE, DELETE, TRUNCATE or TRIGGER on audit_log are "
                     "excess"
                     if external
                     else "schema_management=auto, so schema DDL rights are expected"
@@ -2403,61 +2392,6 @@ class PostgresStore:
 
     # `_backfill_audit_chain` was deleted with BACKLOG #1198 — see the SQLite twin for why.
 
-    async def _load_audit_chain_meta(self) -> None:
-        """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
-        encrypted store (nothing to re-bless). An existing keyless chain stays keyless until the
-        explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin).
-
-        The watermark row is only ever INSERTed (owner ruling R16), so the runtime role needs no
-        UPDATE on ``audit_chain_meta``: ``ON CONFLICT ... DO UPDATE`` demands that grant even when no
-        row conflicts. ``DO NOTHING`` needs INSERT alone. When no row went in, or the chain already
-        has rows, the row is read again: a peer engine may have keyed the chain, and appended to it,
-        since the first read, and this open then adopts what the peer wrote."""
-        meta = "SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1"
-        async with self._timed_acquire() as conn:
-            row = await conn.fetchrow(meta)
-        if row is None or row["keyed_from_id"] is None:
-            if not self._audit_keyed_capable():
-                return  # keyless store — the chain stays byte-identical to pre-#190
-            async with self._timed_acquire() as conn:
-                cnt = await conn.fetchrow("SELECT COUNT(*) AS n FROM audit_log")
-                if cnt is None:
-                    return  # no count read: never key over rows that may exist
-                rows = int(cnt["n"])
-                if rows == 0 and self._read_only:
-                    return  # BACKLOG #1780: key nothing from a read-only handle
-                active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
-                inserted = False
-                if rows == 0:
-                    status = await conn.execute(
-                        "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, 1, $1) "
-                        "ON CONFLICT (id) DO NOTHING",
-                        active_id,
-                    )
-                    inserted = _rowcount(status) == 1  # fails closed: an unread tag re-reads
-                if not inserted:
-                    row = await conn.fetchrow(meta)
-            if inserted:
-                self._audit_keyed_from = 1
-                self._audit_first_key_id = self._audit_range_key_id = active_id
-                self._audit_range_from = 1
-                self._audit_range_keys = [active_id] if active_id is not None else []
-                return
-            if row is None or row["keyed_from_id"] is None:
-                if rows > 0:
-                    self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
-                    warn_unkeyed_audit_chain(log, rows)
-                    return
-                reason = (
-                    AUDIT_CHAIN_META_ROW_CHANGED
-                    if row is None
-                    else AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK
-                )
-                log.error("postgres: %s", reason)
-                raise RuntimeError(reason)
-        self._audit_keyed_from = int(row["keyed_from_id"])
-        await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
-
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
         return self._audit_chain_unkeyed
@@ -2468,10 +2402,10 @@ class PostgresStore:
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,
-        shared by all three backends: keyless below the #190 watermark, else the CURRENT range's key
-        (BACKLOG #1904), failing closed when that key is not held. See the SQLite twin."""
+        shared by all three backends: the CURRENT range's key whenever this handle holds a keying
+        secret (BACKLOG #1904), failing closed when that key is not held. See the SQLite twin."""
         return audit_append_secret(
-            keyed_from=self._audit_keyed_from,
+            chain_keyed=self._audit_chain_keyed,
             range_key_id=self._audit_range_key_id,
             mac_keys=self._audit_mac_keys,
             mac_key=self._audit_mac_key,
@@ -2487,67 +2421,27 @@ class PostgresStore:
         provider (``vault_transit`` mode, ADR 0138). Either keys the chain; neither leaves it keyless."""
         return self._audit_mac_key is not None or self._audit_mac_fn is not None
 
-    async def rekey_audit_chain(
-        self, *, expected_anchor: tuple[int, str] | None = None
-    ) -> tuple[bool, str]:
-        """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
-        without a DEK, verifies the existing chain first (refusing on any break), reports that verify
-        when already keyed (BACKLOG #1904), else sets the watermark to the next id (never rewrites
-        existing hashes). See the SQLite twin.
-
-        The watermark is INSERTed and never replaced (owner ruling R16), so the runtime role can run
-        this with INSERT and SELECT alone. A row already there is reported, not overwritten."""
-        if not self._audit_keyed_capable():
-            return False, "no store encryption key/MAC configured; cannot key the audit chain"
-        ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
-        if self._audit_keyed_from is not None:
-            return audit_rekey_when_keyed(self._audit_keyed_from, ok, msg)  # BACKLOG #1904
-        if not ok:
-            return False, f"refusing to key a broken audit chain: {msg}"
-        active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
-        async with self._timed_acquire() as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-            row = await conn.fetchrow("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
-            watermark = (int(row["m"]) if row is not None else 0) + 1
-            status = await conn.execute(
-                "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, $1, $2) "
-                "ON CONFLICT (id) DO NOTHING",
-                watermark,
-                active_id,
-            )
-            if _rowcount(status) != 1:  # fails closed: an unread tag is not a write
-                held = await conn.fetchrow("SELECT keyed_from_id FROM audit_chain_meta WHERE id=1")
-                return False, audit_rekey_refused(
-                    held is not None, None if held is None else held["keyed_from_id"]
-                )
-        self._audit_keyed_from = watermark
-        self._audit_first_key_id = self._audit_range_key_id = active_id
-        self._audit_range_from = watermark
-        self._audit_range_keys = [active_id] if active_id is not None else []
-        self._audit_ranges_trusted = True
-        self._audit_chain_unkeyed = False
-        return True, f"audit chain keyed from id={watermark}"
-
     async def _audit_rows(
-        self, from_id: int, *, limit: int | None = None
+        self, from_seq: int, *, limit: int | None = None
     ) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: audit rows with ``id >= from_id``, in id order."""
+        """``AuditRangeHost`` primitive: audit rows with ``seq >= from_seq``, in ``seq`` order."""
         sql = (
-            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log WHERE id >= $1 ORDER BY id"
+            "SELECT id, seq, ts, actor, action, channel_id, detail, client, row_hash"
+            " FROM audit_log WHERE seq >= $1 ORDER BY seq, id"
         )
         if limit is not None:
-            rows: list[Mapping[str, Any]] = await self._fetchall(sql + " LIMIT $2", from_id, limit)
+            rows: list[Mapping[str, Any]] = await self._fetchall(sql + " LIMIT $2", from_seq, limit)
         else:
-            rows = await self._fetchall(sql, from_id)
+            rows = await self._fetchall(sql, from_seq)
         return rows
 
-    async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: every range row at or after ``from_id``, in id order."""
+    async def _audit_range_rows(self, from_seq: int) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row at or after ``from_seq``, in ``seq`` order."""
         rows: list[Mapping[str, Any]] = await self._fetchall(
-            "SELECT id, detail FROM audit_log WHERE action = $1 AND id >= $2 ORDER BY id",
+            "SELECT id, seq, detail FROM audit_log WHERE action = $1 AND seq >= $2"
+            " ORDER BY seq, id",
             AUDIT_KEY_EPOCH_ACTION,
-            from_id,
+            from_seq,
         )
         return rows
 
@@ -7073,7 +6967,7 @@ class PostgresStore:
         path the SQLite and SQL Server backends use."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            new_id, row_hash = await self._append_audit_row(
+            appended = await self._append_audit_row(
                 conn,
                 action,
                 actor=actor,
@@ -7092,8 +6986,9 @@ class PostgresStore:
             detail=detail,
             client=client,
             ts=now,
-            row_id=new_id,
-            row_hash=row_hash,
+            row_id=appended.row_id,
+            seq=appended.seq,
+            row_hash=appended.row_hash,
         )
 
     async def _append_audit_row(
@@ -7107,22 +7002,24 @@ class PostgresStore:
         client: str | None,
         now: float,
         expect_prev: str | None = None,
-    ) -> tuple[int, str]:
+    ) -> AppendedAuditRow:
         """Append one chained ``audit_log`` row inside the caller's open transaction on ``conn``.
 
         Takes the audit-chain advisory lock first (H-7). The caller commits, then tees.
         :meth:`record_audit` is one caller; a write whose audit row must commit with it is the other
-        (BACKLOG #2100). Returns ``(row id, row hash)``."""
+        (BACKLOG #2100). The lock is transaction-scoped and every append on every node takes it, so
+        it is held from the head read below to the commit: ``head.seq + 1`` is the next sequence
+        number across engine shards and cluster nodes."""
         await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-        last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
-        prev = last["row_hash"] if last and last["row_hash"] else ""
-        if expect_prev is not None and prev != expect_prev:
-            raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
-        # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
-        # watermark is set, else keyless.
-        _key, _mac = self._audit_append_mac()
+        last = await conn.fetchrow("SELECT seq, row_hash FROM audit_log ORDER BY seq DESC LIMIT 1")
+        # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
+        seq, prev = audit_next_link(
+            None if last is None else (last["seq"], last["row_hash"]), expect_prev
+        )
+        _key, _mac = self._audit_append_mac()  # this handle's key for the current range
         row_hash = audit_row_hash(
             prev,
+            seq=seq,
             ts=now,
             actor=actor,
             action=action,
@@ -7132,11 +7029,12 @@ class PostgresStore:
             key=_key,
             mac=_mac,
         )
-        # RETURNING gives the anchor id without a second round trip or a currval() read that
+        # RETURNING gives the row id without a second round trip or a currval() read that
         # another session's insert could race.
         new_id = await conn.fetchval(
-            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+            seq,
             now,
             actor,
             action,
@@ -7145,7 +7043,7 @@ class PostgresStore:
             client,
             row_hash,
         )
-        return int(new_id or 0), row_hash
+        return AppendedAuditRow(int(new_id or 0), seq, row_hash)
 
     async def list_audit(
         self,
@@ -7404,14 +7302,12 @@ class PostgresStore:
         )
 
     async def audit_anchor(self) -> tuple[int, str]:
-        """The audit log's external anchor — ``(row_count, head_hash)`` (head ``""`` when empty)."""
-        row = await self._fetchone(
-            "SELECT COUNT(*) AS n, "
-            "(SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1) AS head FROM audit_log"
-        )
+        """The audit log's external anchor: ``(seq, head_hash)`` of its newest row, or ``(0, "")``
+        when it is empty. See the SQLite twin."""
+        row = await self._fetchone("SELECT seq, row_hash FROM audit_log ORDER BY seq DESC LIMIT 1")
         if row is None:
             return 0, ""
-        return int(row["n"]), (row["head"] or "")
+        return int(row["seq"]), (row["row_hash"] or "")
 
     async def has_prior_backup_history(self) -> bool:
         """See :meth:`AuditStore.has_prior_backup_history` — ≥1 ``dr_backup`` audit row (the #102 server-DB
@@ -7437,8 +7333,6 @@ class PostgresStore:
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
             await self._audit_rows(AUDIT_ALL_ROWS),
-            keyed_from=self._audit_keyed_from,
-            first_key_id=self._audit_first_key_id,
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
             capable=self._audit_keyed_capable(),
@@ -7495,7 +7389,7 @@ class PostgresStore:
         # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await conn.execute(sql, *params)
-            row_id, row_hash = await self._append_audit_row(
+            appended = await self._append_audit_row(
                 conn,
                 audit.action,
                 actor=audit.actor,
@@ -7504,7 +7398,7 @@ class PostgresStore:
                 client=audit.client,
                 now=now,
             )
-        audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
+        audit.tee(ts=now, row=appended)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)

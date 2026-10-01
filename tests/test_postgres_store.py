@@ -37,6 +37,8 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
+from messagefoundry.store.store import load_audit_chain
+from tests.audit_chain_cases import CASES, ChainBackend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
 _ADT_SEARCH = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -56,8 +58,6 @@ _ACK_AA = "MSH|^~\\&|C|D|A|B|20260101||ACK^A01|MSG1|P|2.5.1\rMSA|AA|MSG1\r"
 _TABLES = (
     "message_events",
     "audit_log",
-    "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it; leaving it
-    #                      would fail-close a later keyless record_audit (poison across tests)
     "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
     "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across runs
     #                      and break the key-rotation reencrypt scan (persistent contamination)
@@ -107,9 +107,10 @@ async def store() -> AsyncIterator[object]:
         # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
         await s._load_state_cache()
         await s._load_reference_cache()
-        # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
-        # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
-        s._audit_keyed_from = None
+        # audit_log was truncated above. The handle read the chain's state at open, and a keyed chain
+        # an earlier test left would make this keyless handle refuse every append, so read it again
+        # from the now-empty log. A keyless handle writes nothing here.
+        await load_audit_chain(s, read_only=False)
         yield s
     finally:
         await s.close()
@@ -4415,31 +4416,61 @@ async def test_audit_anchor_cli_server(store, capsys) -> None:
     assert "truncated or rewritten" in capsys.readouterr().out
 
 
-async def test_rekey_audit_cli_server(store, capsys, monkeypatch) -> None:
-    """CLI-23 (Postgres mirror): the ``rekey-audit`` CLI wrapper enables HMAC keying of an existing
-    keyless chain (#190-D). It reaches the live Postgres store purely via ``MEFOR_STORE_*`` env (no
-    ``--db``), needs a DEK to key, and writes ``audit_chain_meta.keyed_from_id = MAX(audit_log.id)+1`` via
-    PG's ``INSERT ... ON CONFLICT DO NOTHING`` under the advisory lock (owner ruling R16). Seed keyless (the fixture handle
-    opened without a DEK), compute the watermark at RUNTIME (the fixture TRUNCATE ... RESTART IDENTITY
-    reseeds the serial, but computing MAX(id)+1 is correct on either reseed behaviour), then drive the
-    CLI off the event loop (its internal ``asyncio.run`` would raise in a running loop)."""
+def _chain_backend(store) -> ChainBackend:
+    """The live Postgres store, as ``tests/audit_chain_cases.py`` drives it. The raw statements run
+    through the fixture's own handle, which holds no key."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+
+    async def open_keyed(active: str, retired: tuple[str, ...]):
+        cipher = make_cipher(active, retired)
+        return await PostgresStore.open(
+            settings, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
+
+    async def open_keyless():
+        return await PostgresStore.open(settings)
+
+    async def execute(sql: str) -> None:
+        await store._execute(sql)
+
+    async def fetch(sql: str):
+        return [dict(r) for r in await store._fetchall(sql)]
+
+    async def reset() -> None:
+        await store._execute("TRUNCATE audit_log RESTART IDENTITY")
+
+    return ChainBackend(
+        name="postgres",
+        open_keyed=open_keyed,
+        open_keyless=open_keyless,
+        execute=execute,
+        fetch=fetch,
+        reset=reset,
+        concurrent_open=True,
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c.__name__)
+async def test_audit_chain_case_on_postgres(store, case) -> None:
+    """Vault BACKLOG #2594, on the real backend: the genesis row, the sequence number inside the
+    MAC, the keyed-store rule and the key rotation, stated once in ``tests/audit_chain_cases.py``
+    and run here against Postgres's own append, read and lock statements. A SQLite-only run of
+    those cases is not evidence for this backend."""
+    await case(_chain_backend(store))
+
+
+async def test_the_rekey_audit_command_is_gone_server(store, capsys) -> None:
+    """``rekey-audit`` is deleted (vault BACKLOG #2594): the parser refuses the name on a server
+    backend as on SQLite, before it opens anything."""
     from messagefoundry.__main__ import main
 
-    await store.record_audit("legacy1", actor="x")
-    await store.record_audit("legacy2", actor="x")
-    row = await store._fetchone("SELECT MAX(id) + 1 AS wm FROM audit_log")
-    assert row is not None
-    wm = int(row["wm"])
-    # Give the CLI a DEK (set AFTER the keyless fixture opened, so the seeded chain stays keyless).
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    rc = await asyncio.to_thread(main, ["rekey-audit"])
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "OK:" in out and f"keyed from id={wm}" in out
-    # Idempotent: the watermark is set → a second run is a no-op, never a second move.
-    rc2 = await asyncio.to_thread(main, ["rekey-audit"])
-    assert rc2 == 0
-    assert "already keyed" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as excinfo:
+        await asyncio.to_thread(main, ["rekey-audit"])
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch, tmp_path) -> None:
@@ -4705,7 +4736,7 @@ async def test_strict_downgraded_to_header_only_over_threshold_pg(store, monkeyp
     assert (await _only_message(store))["status"] == MessageStatus.RECEIVED.value
 
 
-# --- ADR 0150: the client address column + its migration, on real Postgres --------------------------
+# --- ADR 0150: the client address column, on real Postgres ------------------------------------------
 
 
 async def test_audit_client_recorded_and_chained(store) -> None:
@@ -4718,53 +4749,6 @@ async def test_audit_client_recorded_and_chained(store) -> None:
     assert rows[1]["client"] == "10.4.2.9"
     ok, message = await store.verify_audit_chain()
     assert ok, message
-
-
-async def test_audit_client_migration_on_a_preexisting_table(store) -> None:
-    """The real upgrade path on Postgres: a DB whose ``audit_log`` predates ``client`` gets the column
-    ALTERed in, its legacy rows keep their ORIGINAL hashes, and the chain still verifies — then a new
-    address-bearing row chains cleanly onto them.
-
-    The DDL batch is skipped when the ADR 0064 ``schema_meta`` marker matches, so this clears the marker
-    to reproduce what a genuine upgrade does: adding statements to ``_SCHEMA`` changes ``_schema_hash()``,
-    which forces exactly this one full (idempotent) re-run."""
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.postgres import PostgresStore
-    from messagefoundry.store.store import audit_row_hash
-
-    async with store._pool.acquire() as conn:
-        await conn.execute("ALTER TABLE audit_log DROP COLUMN IF EXISTS client")
-        await conn.execute("DELETE FROM schema_meta")
-        prev = ""
-        for i in range(3):
-            prev = audit_row_hash(
-                prev, ts=float(i), actor="u", action="legacy", channel_id=None, detail=None
-            )
-            await conn.execute(
-                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
-                " VALUES ($1,$2,$3,$4,$5,$6)",
-                float(i),
-                "u",
-                "legacy",
-                None,
-                None,
-                prev,
-            )
-    legacy_head = prev
-
-    upgraded = await PostgresStore.open(load_settings(environ=os.environ).store)
-    try:
-        rows = await upgraded._fetchall("SELECT client, row_hash FROM audit_log ORDER BY id")
-        assert [r["client"] for r in rows] == [None, None, None]
-        assert rows[-1]["row_hash"] == legacy_head  # legacy hashes NOT rewritten
-        ok, message = await upgraded.verify_audit_chain()
-        assert ok, message
-        await upgraded.record_audit("messages.export", actor="alice", client="10.4.2.9")
-        ok, message = await upgraded.verify_audit_chain()
-        assert ok, message  # one chain over old-format + new-format rows
-        assert "4" in (message or "")
-    finally:
-        await upgraded.close()
 
 
 # --- ASVS 11.3.4: the persisted per-key AES-GCM invocation bound -------------

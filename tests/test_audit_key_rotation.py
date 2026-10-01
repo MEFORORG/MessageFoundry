@@ -6,11 +6,11 @@ The defect, reproduced at engine ``fcbe2f93a`` with synthetic data: ``AesGcmCiph
 audit MAC key from the ACTIVE key only, ``audit_chain_meta`` recorded no key, and ``rotate-key`` never
 touched the audit chain. So after the rotation ``docs/PHI.md`` documents -- new key B active, old key A
 retired, ``rotate-key``, then drop A -- ``audit-verify`` reported the chain broken at row 1, for good
-once A was gone, and ``rekey-audit`` still printed OK over it.
+once A was gone.
 
-The design these tests pin (ADR 0193): every keyed range of the chain names its key, the first in
-``audit_chain_meta.key_id`` and each later one in an ``audit.key_epoch`` row that ``rotate-key``
-appends. That row is the first row of the new range, MAC'd under the NEW key, and it carries a
+The design these tests pin (ADR 0193, as amended for vault BACKLOG #2594): every keyed range of the
+chain names its key, the first in the chain's genesis row and each later one in an
+``audit.key_epoch`` row that ``rotate-key`` appends. That row is the first row of the new range, MAC'd under the NEW key, and it carries a
 digest of the range it closes. So the old range stays provable after its key is dropped, and a
 forged or moved range fails verification instead of redirecting it.
 
@@ -30,7 +30,12 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION, MessageStore, audit_row_hash
+from messagefoundry.store.store import (
+    AUDIT_KEY_EPOCH_ACTION,
+    MessageStore,
+    audit_genesis_detail,
+    audit_row_hash,
+)
 
 _AT_REST_ENV = (
     "MEFOR_STORE_ENCRYPTION_KEY",
@@ -167,7 +172,9 @@ async def test_rolling_is_idempotent_and_refuses_a_broken_chain(tmp_path: Path) 
             "SELECT COUNT(*) AS n FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
         )
         row = await cur.fetchone()
-        assert row is not None and int(row["n"]) == 0, "a refused roll must write nothing"
+        assert row is not None and int(row["n"]) == 1, (
+            "a refused roll must write nothing: the genesis row stays the only range row"
+        )
     finally:
         await store.close()
 
@@ -212,12 +219,13 @@ async def test_a_moved_range_boundary_is_caught(tmp_path: Path) -> None:
     store = await _open(path, b)
     try:
         cur = await store._db.execute(
-            "SELECT id, detail FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
+            "SELECT id, detail FROM audit_log WHERE action=? AND seq > 1",
+            (AUDIT_KEY_EPOCH_ACTION,),
         )
         row = await cur.fetchone()
         assert row is not None
         detail = json.loads(row["detail"])
-        detail["closes"]["to_id"] -= 1  # claim A's range ended one row earlier
+        detail["closes"]["to_seq"] -= 1  # claim A's range ended one row earlier
         await store._db.execute(
             "UPDATE audit_log SET detail=? WHERE id=?", (json.dumps(detail), row["id"])
         )
@@ -229,23 +237,28 @@ async def test_a_moved_range_boundary_is_caught(tmp_path: Path) -> None:
 
 
 async def test_a_forged_range_meta_is_caught(tmp_path: Path) -> None:
-    """Re-pointing the first range at the key that is still configured must fail, not redirect."""
+    """Re-pointing the first range at the key that is still configured must fail, not redirect.
+
+    The first range's key is named by the genesis row, inside the chain. Rewriting that row to name
+    B changes a row A's range digest covers, so the B-keyed range row that closes it no longer matches."""
     path, _a, b = await _rotated_and_dropped(tmp_path)
     store = await _open(path, b)
     try:
         cur = await store._db.execute(
-            "SELECT detail FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
+            "SELECT detail FROM audit_log WHERE action=? AND seq > 1", (AUDIT_KEY_EPOCH_ACTION,)
         )
         row = await cur.fetchone()
         assert row is not None
         b_id = json.loads(row["detail"])["key_id"]
-        await store._db.execute("UPDATE audit_chain_meta SET key_id=? WHERE id=1", (b_id,))
+        await store._db.execute(
+            "UPDATE audit_log SET detail=? WHERE seq=1", (audit_genesis_detail(b_id),)
+        )
         await store._db.commit()
     finally:
         await store.close()
     ok, _msg = await _verify(
         path, b
-    )  # the range record is read at open, so reopen after the forgery
+    )  # the first range's key is read at open, so reopen after the forgery
     assert not ok
 
 
@@ -269,7 +282,9 @@ async def test_rotate_key_refuses_to_reopen_a_key_that_already_keyed_a_range(
             "SELECT COUNT(*) AS n FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
         )
         row = await cur.fetchone()
-        assert row is not None and int(row["n"]) == 1, "a refused roll must write nothing"
+        assert row is not None and int(row["n"]) == 2, (
+            "a refused roll must write nothing: the genesis row and the one range row remain"
+        )
     finally:
         await store.close()
 
@@ -291,13 +306,16 @@ async def test_a_forged_range_row_does_not_route_live_appends(
     x_id = audit_key_id(x_mac)
     store = await _open(path, b, (x,))
     try:
-        cur = await store._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        cur = await store._db.execute(
+            "SELECT seq, row_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
+        )
         head = await cur.fetchone()
         assert head is not None
+        forged_seq = int(head["seq"]) + 1
         closes = {
             "key_id": "whatever",
-            "from_id": 1,
-            "to_id": 1,
+            "from_seq": 1,
+            "to_seq": 1,
             "rows": 1,
             "digest": "",
             "prev_hash": "",
@@ -305,6 +323,7 @@ async def test_a_forged_range_row_does_not_route_live_appends(
         detail = audit_epoch_detail(x_id, closes, audit_handover_tag(x_id, closes, (x_mac, None)))
         forged = audit_row_hash(
             head["row_hash"],
+            seq=forged_seq,
             ts=9.0,
             actor="mallory",
             action=AUDIT_KEY_EPOCH_ACTION,
@@ -313,9 +332,9 @@ async def test_a_forged_range_row_does_not_route_live_appends(
             key=x_mac,
         )
         await store._db.execute(
-            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (9.0, "mallory", AUDIT_KEY_EPOCH_ACTION, None, detail, None, forged),
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (forged_seq, 9.0, "mallory", AUDIT_KEY_EPOCH_ACTION, None, detail, None, forged),
         )
         await store._db.commit()
     finally:
@@ -344,30 +363,56 @@ def test_a_deeply_nested_range_row_is_a_break_not_an_exception() -> None:
 
     deep = "[" * 100_000
     assert parse_audit_epoch(deep) is None
+    key = b"k" * 32
+    genesis = audit_genesis_detail("k")
+    first = audit_row_hash(
+        "",
+        seq=1,
+        ts=1.0,
+        actor="system",
+        action=AUDIT_KEY_EPOCH_ACTION,
+        channel_id=None,
+        detail=genesis,
+        key=key,
+    )
     rows = [
         {
             "id": 1,
+            "seq": 1,
             "ts": 1.0,
+            "actor": "system",
+            "action": AUDIT_KEY_EPOCH_ACTION,
+            "channel_id": None,
+            "detail": genesis,
+            "client": None,
+            "row_hash": first,
+        },
+        {
+            "id": 2,
+            "seq": 2,
+            "ts": 2.0,
             "actor": "u",
             "action": AUDIT_KEY_EPOCH_ACTION,
             "channel_id": None,
             "detail": deep,
             "client": None,
             "row_hash": audit_row_hash(
-                "",
-                ts=1.0,
+                first,
+                seq=2,
+                ts=2.0,
                 actor="u",
                 action=AUDIT_KEY_EPOCH_ACTION,
                 channel_id=None,
                 detail=deep,
-                key=b"k" * 32,
+                key=key,
             ),
-        }
+        },
     ]
-    ok, msg = verify_audit_rows(
-        rows, keyed_from=1, first_key_id="k", mac_keys={"k": b"k" * 32}, mac_fn=None, capable=True
-    )
+    ok, msg = verify_audit_rows(rows, mac_keys={"k": key}, mac_fn=None, capable=True)
     assert not ok and "malformed" in (msg or ""), msg
+    # The control: the genesis row alone verifies, so the red above is the nested row.
+    ok, msg = verify_audit_rows(rows[:1], mac_keys={"k": key}, mac_fn=None, capable=True)
+    assert ok, msg
 
 
 # --- the CLI surface -------------------------------------------------------------------------------
@@ -403,30 +448,6 @@ def test_rotate_key_then_audit_verify_round_trip_through_the_cli(
     assert main(["audit-verify", "--db", str(db)]) == 0, capsys.readouterr()
 
 
-def test_rekey_audit_does_not_print_ok_over_a_chain_that_does_not_verify(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    for name in _AT_REST_ENV:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.chdir(tmp_path)
-    db, a = tmp_path / "rekey.db", generate_key()
-
-    async def seed_and_tamper() -> None:
-        store = await _open(db, a)
-        try:
-            await _seed(store, "a", 3)
-            await store._db.execute("UPDATE audit_log SET actor='mallory' WHERE id=2")
-            await store._db.commit()
-        finally:
-            await store.close()
-
-    asyncio.run(seed_and_tamper())
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", a)
-    assert main(["rekey-audit", "--db", str(db)]) != 0
-    out = capsys.readouterr().out
-    assert "OK" not in out and "FAIL" in out, out
-
-
 # --- the server backends, offline ------------------------------------------------------------------
 
 
@@ -438,8 +459,8 @@ def _rows_across_a_rotation(
     closes_edit: dict[str, object] | None = None,
     then: tuple[bytes, bytes] | None = None,
 ) -> list[dict[str, object]]:
-    """Three rows under A, a range row opening B, two rows under B -- the shape ``rotate-key`` leaves,
-    built with the shared helpers so every test reads one fixture.
+    """The genesis row naming A, three rows under A, a range row opening B, two rows under B -- the
+    shape ``rotate-key`` leaves, built with the shared helpers so every test reads one fixture.
 
     ``tag_key`` signs the handover (the outgoing key A by default -- pass another to forge it);
     ``closes_edit`` overrides fields of the ``closes`` record; ``then=(outgoing, incoming)`` appends a
@@ -459,6 +480,7 @@ def _rows_across_a_rotation(
         rid = len(rows) + 1
         row: dict[str, object] = {
             "id": rid,
+            "seq": rid,
             "ts": float(rid),
             "actor": "u",
             "action": action,
@@ -468,6 +490,7 @@ def _rows_across_a_rotation(
         }
         prev = audit_row_hash(
             prev,
+            seq=rid,
             ts=float(rid),
             actor="u",
             action=action,
@@ -478,14 +501,14 @@ def _rows_across_a_rotation(
         row["row_hash"] = prev
         rows.append(row)
 
-    def open_range(outgoing: bytes, incoming: bytes, signer: bytes, from_id: int) -> None:
-        closed = [r for r in rows if int(str(r["id"])) >= from_id]
-        before = [r for r in rows if int(str(r["id"])) < from_id]
+    def open_range(outgoing: bytes, incoming: bytes, signer: bytes, from_seq: int) -> None:
+        closed = [r for r in rows if int(str(r["seq"])) >= from_seq]
+        before = [r for r in rows if int(str(r["seq"])) < from_seq]
         closes = dict(
             audit_range_closing(
                 closed,
                 key_id=audit_key_id(outgoing),
-                from_id=from_id,
+                from_seq=from_seq,
                 prev_hash=str(before[-1]["row_hash"]) if before else "",
             )
         )
@@ -497,6 +520,7 @@ def _rows_across_a_rotation(
             incoming,
         )
 
+    add(AUDIT_KEY_EPOCH_ACTION, audit_genesis_detail(audit_key_id(a_key)), a_key)
     for i in range(3):
         add("a", json.dumps({"n": i}), a_key)
     open_range(a_key, b_key, tag_key or a_key, 1)
@@ -504,21 +528,17 @@ def _rows_across_a_rotation(
         add("b", json.dumps({"n": i}), b_key)
     if then is not None:
         outgoing, incoming = then
-        open_range(outgoing, incoming, outgoing, 4)
+        open_range(outgoing, incoming, outgoing, 5)  # B's range opens at its own range row
         add("c", json.dumps({"n": 0}), incoming)
     return rows
 
 
-def _verify_rows(
-    rows: list[dict[str, object]], first: bytes, held: tuple[bytes, ...]
-) -> tuple[bool, str | None]:
+def _verify_rows(rows: list[dict[str, object]], held: tuple[bytes, ...]) -> tuple[bool, str | None]:
     from messagefoundry.store.crypto import audit_key_id
     from messagefoundry.store.store import verify_audit_rows
 
     return verify_audit_rows(
         rows,
-        keyed_from=1,
-        first_key_id=audit_key_id(first),
         mac_keys={audit_key_id(k): k for k in held},
         mac_fn=None,
         capable=True,
@@ -529,8 +549,8 @@ _A, _B, _X = b"a" * 32, b"b" * 32, b"x" * 32
 
 
 def test_the_offline_fixture_verifies_so_each_forgery_below_is_the_only_change() -> None:
-    assert _verify_rows(_rows_across_a_rotation(_A, _B), _A, (_A, _B))[0]
-    assert _verify_rows(_rows_across_a_rotation(_A, _B, then=(_B, _X)), _A, (_B, _X))[0]
+    assert _verify_rows(_rows_across_a_rotation(_A, _B), (_A, _B))[0]
+    assert _verify_rows(_rows_across_a_rotation(_A, _B, then=(_B, _X)), (_B, _X))[0]
 
 
 def test_a_configured_key_that_never_keyed_a_range_cannot_open_one() -> None:
@@ -538,7 +558,7 @@ def test_a_configured_key_that_never_keyed_a_range_cannot_open_one() -> None:
     a range. A writer holding X appends a range row naming X, with a CORRECT closing record and a
     valid MAC under X -- everything but the outgoing key's tag. The tag check alone catches it."""
     rows = _rows_across_a_rotation(_A, _B, tag_key=_X)
-    ok, msg = _verify_rows(rows, _A, (_A, _B, _X))
+    ok, msg = _verify_rows(rows, (_A, _B, _X))
     assert not ok and "not authorised" in (msg or ""), msg
 
 
@@ -546,15 +566,15 @@ def test_a_key_cannot_open_a_second_range_even_when_authorised() -> None:
     """A -> B -> back to A, handed over correctly under B. Only the one-range-per-key rule catches it,
     and it is what stops a leaked old key being brought back by anyone who can get one tag signed."""
     rows = _rows_across_a_rotation(_A, _B, then=(_B, _A))
-    ok, msg = _verify_rows(rows, _A, (_A, _B))
+    ok, msg = _verify_rows(rows, (_A, _B))
     assert not ok and "second range" in (msg or ""), msg
 
 
 def test_a_key_holders_range_row_that_misstates_its_range_is_caught() -> None:
     """A key holder signs a range row whose closing record claims A's range ended a row early. MAC
     and tag are both valid, so the closing-record check alone catches it."""
-    rows = _rows_across_a_rotation(_A, _B, closes_edit={"to_id": 2})
-    ok, msg = _verify_rows(rows, _A, (_A, _B))
+    rows = _rows_across_a_rotation(_A, _B, closes_edit={"to_seq": 2})
+    ok, msg = _verify_rows(rows, (_A, _B))
     assert not ok and "does not match" in (msg or ""), msg
 
 
@@ -565,14 +585,12 @@ async def test_both_server_backends_verify_across_a_rotation_with_the_old_key_dr
     """The real ``verify_audit_chain`` of each server backend, driven offline through the same
     bare-instance seam the Transit rider uses. Their live-database legs run on a hosted runner."""
 
-    from messagefoundry.store.crypto import audit_key_id
     from tests.test_asvs_transit_audit_mac_server_backends import _bare
 
     a_key, b_key = b"a" * 32, b"b" * 32
     rows = _rows_across_a_rotation(a_key, b_key)
     store = _bare(backend, mac_key=b_key)  # A dropped: only B is held
-    store._audit_keyed_from = 1
-    store._audit_first_key_id = audit_key_id(a_key)
+    store._audit_chain_keyed = True
 
     async def _fetchall(_sql: str, *_a: Any, **_kw: Any) -> list[dict[str, Any]]:
         return rows
@@ -583,7 +601,7 @@ async def test_both_server_backends_verify_across_a_rotation_with_the_old_key_dr
 
     rows[1]["actor"] = "mallory"  # a row of the dropped key's range
     ok, msg = await store.verify_audit_chain()
-    assert not ok and "id=4" in (msg or ""), (
+    assert not ok and "seq=5" in (msg or ""), (
         f"{backend}: the closing range row must catch it: {msg}"
     )
 
@@ -591,20 +609,22 @@ async def test_both_server_backends_verify_across_a_rotation_with_the_old_key_dr
 # --- review round 2 --------------------------------------------------------------------------------
 
 
-async def test_a_row_with_a_negative_id_is_still_walked(tmp_path: Path) -> None:
-    """The walk reads every row. A lower bound of 0 silently dropped a row a writer inserted with an
-    explicit negative id, which the unfiltered pre-#1904 walk reported."""
+async def test_a_row_with_a_negative_sequence_number_is_still_walked(tmp_path: Path) -> None:
+    """The walk reads every row. A lower bound of 0 would silently drop a row a writer inserted
+    with a negative sequence number; the walk starts at the column's floor and reports it."""
     path, a = tmp_path / "neg.db", generate_key()
     store = await _open(path, a)
     try:
         await _seed(store, "a", 2)
+        ok, msg = await store.verify_audit_chain()
+        assert ok, msg  # the control
         await store._db.execute(
-            "INSERT INTO audit_log (id, ts, actor, action, channel_id, detail, client, row_hash)"
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
             " VALUES (-5, 1.0, 'admin', 'auth.login', NULL, NULL, NULL, 'deadbeef')"
         )
         await store._db.commit()
         ok, msg = await store.verify_audit_chain()
-        assert not ok and "id=-5" in (msg or ""), msg
+        assert not ok and "seq=1" in (msg or "") and "-5" in (msg or ""), msg
     finally:
         await store.close()
 
@@ -633,8 +653,9 @@ async def test_a_nested_closing_record_neither_raises_at_open_nor_in_verify(tmp_
             + "}}"
         )
         await store._db.execute(
-            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-            " VALUES (9.0, 'mallory', ?, NULL, ?, NULL, 'deadbeef')",
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES ((SELECT MAX(seq) + 1 FROM audit_log), 9.0, 'mallory', ?, NULL, ?, NULL,"
+            " 'deadbeef')",
             (AUDIT_KEY_EPOCH_ACTION, nested),
         )
         await store._db.commit()
@@ -649,15 +670,17 @@ async def test_a_nested_closing_record_neither_raises_at_open_nor_in_verify(tmp_
 
 
 async def test_an_empty_first_range_is_not_read_as_a_forged_first_key(tmp_path: Path) -> None:
-    """A fresh keyed store rolled before any row is written has an EMPTY first range, so its first
-    keyed row is the next range's own row. That is not a check of the first key."""
+    """A fresh keyed store rolled before any caller writes a row: its first range holds the genesis
+    row alone, and the next range's own row follows it at once. Both must authenticate."""
     path, a, b, c = tmp_path / "empty.db", generate_key(), generate_key(), generate_key()
     store = await _open(path, a)
     await store.close()
     await _rotate(path, a, b)
     store = await _open(path, b, (a,))
     try:
-        assert store._audit_ranges_trusted, "a legitimate empty first range must authenticate"
+        assert store._audit_ranges_trusted, (
+            "a first range of the genesis row alone must authenticate"
+        )
     finally:
         await store.close()
     await _rotate(path, b, c)
@@ -714,78 +737,38 @@ def test_rotate_key_does_not_print_ok_when_the_audit_roll_fails(
     assert "Do NOT remove" in captured.err
 
 
-# --- Lander blocker on PR 1446: the keyless prefix below a dropped first range ----------------------
+# --- a range below TWO dropped keys ------------------------------------------------------------------
+#
+# PR 1446's Lander blocker was a keyless prefix below a dropped first range: rows no range covered,
+# tied in only by the first key's MAC. Since vault BACKLOG #2594 a keyed chain has no such rows -- the
+# genesis row opens the first range at row 1, so every row sits in a range and under a closing
+# digest. What remains to pin is that the proof still chains through more than one dropped key.
 
 
-async def _keyless_then_rekeyed_then_rotated(tmp_path: Path) -> tuple[Path, str]:
-    """The Lander's reproduction, the path #1905 points operators down: keyless rows, `rekey-audit`
-    under A (watermark id=4), two A rows, `rotate-key` to B, one B row. Returns (path, B)."""
-    path, a, b = tmp_path / "prefix.db", generate_key(), generate_key()
-    store = await MessageStore.open(path)
-    try:
-        await _seed(store, "keyless", 3)
-    finally:
-        await store.close()
+async def test_editing_the_oldest_range_is_caught_with_two_keys_dropped(tmp_path: Path) -> None:
+    """A -> B -> C, then A and B dropped. A's range is proved by B's range row, and that row by C's.
+    The control is the untouched chain, which verifies under C alone."""
+    path, a, b, c = tmp_path / "two.db", generate_key(), generate_key(), generate_key()
     store = await _open(path, a)
     try:
-        ok, msg = await store.rekey_audit_chain()
-        assert ok and "keyed from id=4" in msg, msg
         await _seed(store, "a", 2)
     finally:
         await store.close()
     await _rotate(path, a, b)
     store = await _open(path, b, (a,))
     try:
-        await _seed(store, "b", 1)
+        await _seed(store, "b", 2)
     finally:
         await store.close()
-    return path, b
-
-
-async def test_an_untampered_keyless_prefix_verifies_after_the_first_key_is_dropped(
-    tmp_path: Path,
-) -> None:
-    """The control: without it, a red below could be the drop itself, not the forgery."""
-    path, b = await _keyless_then_rekeyed_then_rotated(tmp_path)
-    ok, msg = await _verify(path, b)
+    await _rotate(path, b, c)
+    ok, msg = await _verify(path, c)
     assert ok, msg
-
-
-async def test_a_forged_keyless_prefix_is_caught_after_the_first_key_is_dropped(
-    tmp_path: Path,
-) -> None:
-    """Edit keyless row 2 and recompute SHA-256 for rows 2 and 3. Only A's MAC on row 4 tied the
-    keyless prefix in; with A dropped, the B-keyed range row must still pin it."""
-    path, b = await _keyless_then_rekeyed_then_rotated(tmp_path)
-    store = await _open(path, b)
+    store = await _open(path, c)
     try:
-        cur = await store._db.execute(
-            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log WHERE id <= 3 ORDER BY id"
-        )
-        rows = [dict(r) for r in await cur.fetchall()]
-        rows[1]["actor"] = "mallory"
-        prev = rows[0]["row_hash"]
-        for r in rows[1:]:
-            r["row_hash"] = audit_row_hash(
-                prev,
-                ts=r["ts"],
-                actor=r["actor"],
-                action=r["action"],
-                channel_id=r["channel_id"],
-                detail=r["detail"],
-                client=r["client"],
-            )
-            prev = r["row_hash"]
-            await store._db.execute(
-                "UPDATE audit_log SET actor=?, row_hash=? WHERE id=?",
-                (r["actor"], r["row_hash"], r["id"]),
-            )
+        await store._db.execute("UPDATE audit_log SET actor='mallory' WHERE seq=2")
         await store._db.commit()
         ok, msg = await store.verify_audit_chain()
-        assert not ok, f"a forged keyless prefix verified with the first key dropped: {msg}"
-        # Reported at the B-keyed range row (id=6), which holds the proof, naming the rows below id=4.
-        assert "id=6" in (msg or "") and "rows before id=4" in (msg or ""), msg
+        assert not ok, f"the oldest range must stay tamper-evident with two keys dropped: {msg}"
     finally:
         await store.close()
 
@@ -794,14 +777,14 @@ def test_a_key_holders_range_row_that_misstates_its_link_is_caught() -> None:
     """Offline, with every key held: a key holder signs a range row whose ``prev_hash`` is wrong.
     MAC, tag, digest and fields are all valid, so only the link check catches it."""
     rows = _rows_across_a_rotation(_A, _B, closes_edit={"prev_hash": "0" * 64})
-    ok, msg = _verify_rows(rows, _A, (_A, _B))
-    assert not ok and "rows before id=1" in (msg or ""), msg
+    ok, msg = _verify_rows(rows, (_A, _B))
+    assert not ok and "rows before seq=1" in (msg or ""), msg
 
 
 def test_a_closing_record_without_its_link_is_malformed() -> None:
     from messagefoundry.store.store import parse_audit_epoch
 
-    closes = {"key_id": "k", "from_id": 1, "to_id": 1, "rows": 1, "digest": "d"}
+    closes = {"key_id": "k", "from_seq": 1, "to_seq": 1, "rows": 1, "digest": "d"}
     assert parse_audit_epoch(json.dumps({"key_id": "n", "closes": closes, "handover": "t"})) is None
     closes["prev_hash"] = ""
     assert parse_audit_epoch(json.dumps({"key_id": "n", "closes": closes, "handover": "t"}))
@@ -821,9 +804,9 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
         real_rows = store._audit_rows
 
         async def rows_then_a_racing_append(
-            from_id: int, *, limit: int | None = None
+            from_seq: int, *, limit: int | None = None
         ) -> list[Mapping[str, Any]]:
-            got = await real_rows(from_id, limit=limit)
+            got = await real_rows(from_seq, limit=limit)
             await store.record_audit("racing", actor="engine")  # lands after the seal
             return got
 
@@ -835,16 +818,18 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
             "SELECT COUNT(*) AS n FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
         )
         row = await cur.fetchone()
-        assert row is not None and int(row["n"]) == 0, "a refused roll must write nothing"
+        assert row is not None and int(row["n"]) == 1, (
+            "a refused roll must write nothing: the genesis row stays the only range row"
+        )
         ok, detail = await store.verify_audit_chain()
         assert ok, detail
     finally:
         await store.close()
 
 
-async def test_sql_server_clamps_the_every_row_floor_to_int() -> None:
-    """``audit_log.id`` is INT on SQL Server; the floor handed to it must be INT's minimum, and a real
-    lower bound must pass through unchanged."""
+async def test_sql_server_passes_the_every_row_floor_through() -> None:
+    """``audit_log.seq`` is BIGINT on SQL Server, so the every-row floor fits the column and is
+    handed over unchanged, as is a real lower bound."""
 
     from messagefoundry.store.store import AUDIT_ALL_ROWS
     from tests.test_asvs_transit_audit_mac_server_backends import _bare
@@ -859,4 +844,4 @@ async def test_sql_server_clamps_the_every_row_floor_to_int() -> None:
     store._fetchall = _fetchall
     await store._audit_rows(AUDIT_ALL_ROWS)
     await store._audit_rows(7)
-    assert seen == [(-(2**31),), (7,)]
+    assert seen == [(AUDIT_ALL_ROWS,), (7,)]

@@ -2243,7 +2243,7 @@ def _count_tables(db_path: Path) -> dict[str, int]:
     rather than a hand-picked sample (BACKLOG #1722): the old fixed four-table list
     (``messages``/``queue``/``message_events``/``audit_log``) covered 4 of this schema's 30 tables —
     a truncated or absent table among the other 26 (at least the auth tables ``users``/``sessions``/
-    ``roles``/``webauthn_credentials`` and the audit chain's ``audit_chain_meta``) passed
+    ``roles``/``webauthn_credentials``) passed
     restore-verify PASS undetected, and the old list could not have named all of them: it predates
     several of those tables entirely, and the next one added to the schema would have been silently
     out of scope again. Called once against the just-taken snapshot when the manifest is written and
