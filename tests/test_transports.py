@@ -634,10 +634,10 @@ async def test_file_source_move_failure_leaves_file_in_place(
     (inbox / ".processed").mkdir()
     (inbox / "m.hl7").write_bytes(ADT.encode("utf-8"))
     src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))
-    # The atomic destination-name claim is the seam now (#1046): _move claims the name with
-    # os.link/O_EXCL instead of exists()-then-replace, so a locked/unwritable destination surfaces
-    # there rather than at Path.replace.
-    monkeypatch.setattr(file_mod, "_claim_unique", _raise_locked)  # every move raises
+    # The atomic destination-name claim is the seam now (#1046): _move claims the name through
+    # _archive (an os.link/O_EXCL claim on POSIX, a rename by handle on Windows, #2535) instead of
+    # exists()-then-replace, so a locked/unwritable destination surfaces there.
+    monkeypatch.setattr(file_mod, "_archive", _raise_locked)  # every move raises
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         src._after_processing(inbox / "m.hl7")  # default after_read="move"
     assert (inbox / "m.hl7").exists()  # left in place, not lost
@@ -650,14 +650,17 @@ async def test_file_source_delete_failure_leaves_file_in_place(
 ) -> None:
     # FILE-5 (delete mode): after_read="delete" that can't unlink the processed file catches OSError,
     # logs it (the file will be re-read = a bounded duplicate), and swallows — never crashes the poller.
+    from messagefoundry.transports import file as file_mod
+
     inbox = tmp_path / "in"
     inbox.mkdir()
     (inbox / "m.hl7").write_bytes(ADT.encode("utf-8"))
     src = FileSource(
         Source(type=ConnectorType.FILE, settings={"directory": str(inbox), "after_read": "delete"})
     )
-    # Every delete raises. The delete arm unlinks by dir_fd on POSIX; Path.unlink calls os.unlink too.
-    monkeypatch.setattr(os, "unlink", _raise_locked)
+    # Every delete raises. The delete arm unlinks by dir_fd on POSIX and deletes by handle on Windows
+    # (#2535); both go through _remove_pinned.
+    monkeypatch.setattr(file_mod, "_remove_pinned", _raise_locked)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         src._after_processing(inbox / "m.hl7")
     assert (inbox / "m.hl7").exists()  # still there, not silently dropped
@@ -2030,7 +2033,7 @@ async def test_file_source_move_failure_logs_neither_the_name_nor_a_raw_exceptio
     def _locked(*_a: object, **_k: object) -> None:
         raise OSError(f"locked: {name}")  # the path rides the exception too
 
-    monkeypatch.setattr(file_mod, "_claim_unique", _locked)
+    monkeypatch.setattr(file_mod, "_archive", _locked)
     with filtered_sink(_FILE_LOGGER) as sink:
         _file_source_for(inbox)._after_processing(inbox / name)
     assert "could not move" in sink.text  # the arm ran
@@ -2042,6 +2045,8 @@ async def test_file_source_move_failure_logs_neither_the_name_nor_a_raw_exceptio
 async def test_file_source_delete_failure_logs_neither_the_name_nor_a_raw_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from messagefoundry.transports import file as file_mod
+
     inbox = tmp_path / "in"
     inbox.mkdir()
     name = "PID-100001-DOE-JANE.hl7"
@@ -2050,7 +2055,8 @@ async def test_file_source_delete_failure_logs_neither_the_name_nor_a_raw_except
     def _locked(*_a: object, **_k: object) -> None:
         raise OSError(f"locked: {name}")
 
-    monkeypatch.setattr(os, "unlink", _locked)  # the delete arm unlinks by dir_fd on POSIX
+    # The delete unlinks on POSIX and deletes by handle on Windows; both go through _remove_pinned.
+    monkeypatch.setattr(file_mod, "_remove_pinned", _locked)
     with filtered_sink(_FILE_LOGGER) as sink:
         _file_source_for(inbox, after_read="delete")._after_processing(inbox / name)
     assert "could not delete" in sink.text

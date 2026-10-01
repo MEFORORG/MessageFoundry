@@ -212,7 +212,7 @@ async def test_a_link_swapped_in_before_a_quarantine_move_is_not_archived(
     await src._scan_once()
     real_read = src._read_settled
 
-    def read_then_swap(path: Path) -> tuple[bytes, tuple[int, int]]:
+    def read_then_swap(path: Path) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
         result = real_read(path)
         path.rename(tmp_path / "parked.hl7")
         path.symlink_to(outside)
@@ -306,7 +306,7 @@ def test_the_read_is_cut_off_at_the_cap_even_when_the_handle_under_reports_its_s
     with pytest.raises(file_mod._OverCap):
         file_mod._read_confined(drop, inbox, inbox.resolve(), 100)
     monkeypatch.undo()
-    assert file_mod._read_confined(drop, inbox, inbox.resolve(), 4096) == b"X" * 4096
+    assert file_mod._read_confined(drop, inbox, inbox.resolve(), 4096)[0] == b"X" * 4096
 
 
 def test_a_small_drop_does_not_reserve_the_whole_cap(tmp_path: Path) -> None:
@@ -319,7 +319,7 @@ def test_a_small_drop_does_not_reserve_the_whole_cap(tmp_path: Path) -> None:
     drop.write_bytes(_DROP)
     tracemalloc.start()
     try:
-        raw = file_mod._read_confined(drop, inbox, inbox.resolve(), 16 << 20)
+        raw, _file_id = file_mod._read_confined(drop, inbox, inbox.resolve(), 16 << 20)
         _now, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()

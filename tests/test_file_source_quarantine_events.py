@@ -149,7 +149,7 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
     source._handler = handler
     moves: list[Path] = []
 
-    def failed_move(path: Path, _dest: Path) -> bool:
+    def failed_move(path: Path, _dest: Path, *_rest: object) -> bool:
         moves.append(path)
         return False
 

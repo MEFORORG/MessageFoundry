@@ -150,7 +150,7 @@ async def test_a_file_that_grows_during_the_read_is_not_emitted(
     drop.write_bytes(_HEAD)
     real_read = file_mod._read_confined
 
-    def read_then_partner_writes(path: Path, *rest: Any) -> bytes:
+    def read_then_partner_writes(path: Path, *rest: Any) -> tuple[bytes, tuple[int, int]]:
         data = real_read(path, *rest)
         if path.name == name:
             _append_tail(path)  # the partner's next write lands as the read finishes
@@ -183,7 +183,7 @@ async def test_a_same_length_rewrite_during_the_read_is_caught_by_the_mtime(
     drop.write_bytes(_WHOLE)
     real_read = file_mod._read_confined
 
-    def read_then_partner_rewrites(path: Path, *rest: Any) -> bytes:
+    def read_then_partner_rewrites(path: Path, *rest: Any) -> tuple[bytes, tuple[int, int]]:
         data = real_read(path, *rest)
         st = path.stat()
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
