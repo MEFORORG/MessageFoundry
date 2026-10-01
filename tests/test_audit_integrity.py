@@ -657,6 +657,83 @@ def test_audit_anchor_json_refusal_of_a_non_database_is_json_on_stdout(
     assert "cannot open the store" not in captured.err
 
 
+# --- BACKLOG #2094: a service-settings refusal honours --json too ------------------------------------
+#
+# The #1922 fix covered the guard's refusals, but the `load_settings` refusal ahead of it still printed
+# text to stderr under --json. At least four shapes of bad settings file reach that refusal, one per
+# exception family `_load_service_settings` catches: an absent file (FileNotFoundError), a TOML parse
+# error (ValueError), a section that fails validation (ValidationError) and a directory named as the
+# file (OSError, a PermissionError on Windows). Each runs in both modes. The two modes must carry the
+# same message, and neither may carry a value from the file: the ValidationError case plants a canary
+# where pydantic's `input_value=` would echo it.
+
+_SETTINGS_CANARY = "CANARY2094settingsvalue"
+
+
+def _absent_settings(tmp_path: Path) -> Path:
+    return tmp_path / "nope.toml"
+
+
+def _malformed_settings(tmp_path: Path) -> Path:
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[store\npath = \n", encoding="utf-8")
+    return bad
+
+
+def _invalid_settings(tmp_path: Path) -> Path:
+    # A TLS key password with no certificate fails [api] validation, and a stringified
+    # ValidationError would echo the whole section, the password included.
+    bad = tmp_path / "invalid.toml"
+    bad.write_text(f'[api]\ntls_key_password = "{_SETTINGS_CANARY}"\n', encoding="utf-8")
+    return bad
+
+
+def _directory_settings(tmp_path: Path) -> Path:
+    folder = tmp_path / "config-dir"
+    folder.mkdir()
+    return folder
+
+
+_BAD_SETTINGS = [
+    pytest.param(_absent_settings, "service config not found", id="absent-file"),
+    pytest.param(_malformed_settings, "", id="malformed-toml"),
+    pytest.param(_invalid_settings, "tls_cert_file", id="validation-error"),
+    pytest.param(_directory_settings, "", id="directory"),
+]
+
+
+def _assert_no_canary(output: str) -> None:
+    # Both halves: pydantic abbreviates a long `input_value` from the middle out.
+    assert _SETTINGS_CANARY[:8] not in output
+    assert _SETTINGS_CANARY[-8:] not in output
+
+
+@pytest.mark.parametrize(("make_settings", "names"), _BAD_SETTINGS)
+def test_audit_anchor_settings_refusal_is_json_on_stdout_under_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    make_settings: Callable[[Path], Path],
+    names: str,
+) -> None:
+    settings = make_settings(tmp_path)
+    argv = ["audit-anchor", "--service-config", str(settings)]
+
+    assert main([*argv, "--json"]) == 2
+    as_json = capsys.readouterr()
+    payload = json.loads(as_json.out)
+    assert list(payload) == ["error"]
+    assert names in payload["error"]
+    assert f"error: {payload['error']}" not in as_json.err
+    _assert_no_canary(as_json.out + as_json.err)
+
+    # The text arm is the control: same exit, same message, on stderr and not stdout.
+    assert main(argv) == 2
+    as_text = capsys.readouterr()
+    assert as_text.out == ""
+    assert f"error: {payload['error']}\n" in as_text.err
+    _assert_no_canary(as_text.err)
+
+
 def test_expected_anchor_detects_a_truncated_tail(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

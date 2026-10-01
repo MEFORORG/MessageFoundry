@@ -151,7 +151,7 @@ def verify_totp_step(
     own current-step code (a non-greater step) for up to ~30 s — a self-inflicted lockout, not a
     bypass.
 
-    ⚠️ **At ``window >= 1`` the clamp does not preserve single-use — it is what costs it.** Because a
+    **WARNING: At ``window >= 1`` the clamp does not preserve single-use — it is what costs it.** Because a
     tolerated future code is recorded at ``counter`` rather than at its OWN step, that step is left
     unspent, so the SAME code verifies again once the clock reaches ``counter+1``: two successful uses
     of one code, which is what ASVS 6.5.1 forbids. Measured — ``verify_totp_step(s, totp(s, now=t+30),

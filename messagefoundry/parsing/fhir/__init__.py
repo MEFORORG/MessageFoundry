@@ -11,7 +11,7 @@ and a code-first Router/Handler calls it **on demand** against a
 the literal string ``"fhir"`` (never imported from ``config``) to keep this purity (enforced by the two
 import-purity tests).
 
-Two tiers, mirroring python-hl7 (tolerant) / hl7apy (strict):
+Two tiers, mirroring HL7 v2's built-in tolerant parser / hl7apy (strict):
 
 * **Tolerant (the hot path):** :class:`~messagefoundry.parsing.fhir.peek.FhirPeek` — a cheap shallow
   read of ``resourceType``/``id``/``meta.profile``/``Bundle.type``/entry resource types for routing,
@@ -20,7 +20,7 @@ Two tiers, mirroring python-hl7 (tolerant) / hl7apy (strict):
   full, validated :mod:`fhir.resources` (pydantic-v2) model for transforms, lazily pulling the optional
   ``messagefoundry[fhir]`` extra. JSON is the MVP format; FHIR-XML is deferred (ADR 0022 Options #5).
 
-HL7 v2 ↔ FHIR mapping stays in code-first Handlers (python-hl7 ``Message`` in → ``fhir.resources``
+HL7 v2 ↔ FHIR mapping stays in code-first Handlers (HL7 ``Message`` in → ``fhir.resources``
 resource out), never here.
 """
 

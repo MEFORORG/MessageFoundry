@@ -637,7 +637,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `login_rate_limit_per_ip` | int | 10 | max attempts per client IP per window (`0` disables). **One number, two limiters:** it is also the per-**actor** budget of the credential-**ceremony** limiter (`/me/password`, `/me/reauth`, `/me/mfa/confirm` + the console re-auth routes) — the `_per_ip` name is historical, and retuning it retunes both |
 | `login_rate_limit_global` | int | 60 | max attempts across all clients per window (`0` disables). Sign-in window only — the ceremony limiter has **no** global dimension (`glob=0`) |
 | `login_rate_limit_window_seconds` | float | 60 | sliding-window length — shared by the sign-in window **and** the per-actor credential-**ceremony** limiter, exactly as `login_rate_limit_per_ip` is |
-| `phi_read_rate_limit_enabled` | bool | `true` | per-actor anti-automation throttle (ASVS 2.4.1) — bounds scripted PHI harvesting on top of pagination + access auditing. Charged on **8 JSON routes** via `require_phi_read`, on the **4 bulk-PHI step-up GETs** at admission (`/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, `/search/layered` — `require_step_up` paces NON-GET only, so these charge it themselves), and on the **8 `/ui` PHI views** via `require_ui(…, phi=True)` |
+| `phi_read_rate_limit_enabled` | bool | `true` | per-actor anti-automation throttle (ASVS 2.4.1) — bounds scripted PHI harvesting on top of pagination + access auditing. Charged on **8 JSON routes** via `require_phi_read`, on the **4 bulk-PHI step-up GETs** at admission (`/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, `/search/layered` — `require_step_up` paces NON-GET only, so these charge it themselves), and on the **11 `/ui` PHI views** via `require_ui(…, phi=True)` |
 | `phi_read_rate_limit_per_actor` | int | 120 | max PHI reads per user per window (generous — clears console/human use; `0` disables this dimension) |
 | `phi_read_rate_limit_global` | int | 0 | max PHI reads across all users per window (`0` = off) |
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length |
@@ -1167,13 +1167,11 @@ The engine raises it when a pause starts, and again every 300 seconds while the 
 does `queue_buildup`. That spacing is fixed. The notifier's throttle (`realert_seconds`, or a rule's
 `cooldown_seconds`) decides which of those raises pages, and escalation tiers and suspend windows
 count them. So a cooldown under 300 seconds does not page faster. A second pause soon after the first
-raises at once, but the throttle may hold its page; a later reminder in that pause sends it. A rule
-with a `control_action` fires it on every raise that the throttle passes, so a long pause repeats
-the action. With no `[alerts]` transport the engine raises no event; its own WARNING line records
-each pause. Its `connection` is
-`intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert. A rule's
-`control_action` sent to that name reaches no connection. A rule that sets `control_target` still
-restarts the connection it names.
+raises at once, but the throttle may hold its page; a later reminder in that pause sends it. With no
+`[alerts]` transport the engine raises no event; its own WARNING line records each pause. Its
+`connection` is `intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert.
+A rule cannot attach a `control_action` to `intake_paused`, because it is not a connection-scoped
+event (see `control_action` in the rule table below).
 
 The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit` and `store_kind`
 (`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`, `value` and
@@ -1221,13 +1219,15 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `content_match`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
 | `severity` | str | `warning` | `info` \| `warning` \| `critical` — tagged onto the event (webhook JSON + email subject) for downstream triage |
 | `transports` | list | _all_ | which transports fire: subset of `["webhook", "email"]`; **unset = all configured**; **`[]` = SUPPRESS** (drop silently) |
 | `cooldown_seconds` | num | _global_ | override `realert_seconds` for matching events (e.g. re-page a critical sooner) |
+| `control_action` | str | _unset_ | `restart_inbound` \| `restart_outbound` — restart a connection when the rule fires ([ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md)). **Allowed only with a connection-scoped `event_type`** (BACKLOG #1898). The source of record is `_ALERT_CONTROL_EVENT_TYPES` in `messagefoundry/config/settings.py`; at the time of writing it holds `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and `lane_stuck`. Config load refuses the action with `any` and with every other type. Those other types put a stand-in in `connection`, such as a bare username, `store` or a cert label. A restart aimed at a stand-in could hit an unrelated connection with the same name. With no `control_target`, the action aims at the event's own name, so pair `restart_outbound` with events from outbound connections and `restart_inbound` with events from inbound ones |
+| `control_target` | str | _the event's connection_ | the connection `control_action` restarts, when it is not the one that fired. Config load refuses a value that is not a connection name, and refuses it on a rule with no `control_action` |
 
 ```toml
 [alerts]

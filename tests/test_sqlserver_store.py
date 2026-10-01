@@ -4739,7 +4739,7 @@ async def test_rekey_audit_cli_server(store, capsys, monkeypatch) -> None:
     """CLI-23: the ``rekey-audit`` CLI wrapper enables HMAC keying of an existing keyless chain
     (#190-D). It reaches the live SQL Server store purely via ``MEFOR_STORE_*`` env (no ``--db``; the
     SQLite missing-file guard is inert for server backends), needs a DEK to key, and writes
-    ``audit_chain_meta.keyed_from_id = MAX(audit_log.id)+1`` via the SS UPDATE-then-INSERT upsert. Seed
+    ``audit_chain_meta.keyed_from_id = MAX(audit_log.id)+1`` via the SS guarded INSERT (owner ruling R16: never an UPDATE). Seed
     keyless (the fixture handle opened without a DEK), compute the watermark at RUNTIME (DELETE does not
     reseed SS IDENTITY, so the SQLite test's literal ``id=3`` is invalid here), then drive the CLI off
     the event loop (its internal ``asyncio.run`` would raise in a running loop)."""

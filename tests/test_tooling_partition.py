@@ -117,10 +117,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # reads the real `git ls-files` scope -- which is the half that makes it engine-subject.
         "test_control_char_check.py",
         "test_crypto_inventory_scanner.py",
-        # AST-scans messagefoundry/**/*.py for every ctypes import and every process start, and
-        # holds docs/DANGEROUS-FUNCTIONALITY.md to both inventories (BACKLOG #1934). A new site
-        # arrives as an ENGINE diff, which does not trip the tooling path gate, so as tooling it
-        # would face nothing on the change it exists to catch.
+        # AST-scans at least messagefoundry/**/*.py and messagefoundry_toolkit/**/*.py for every
+        # ctypes import and every process start. It holds docs/DANGEROUS-FUNCTIONALITY.md to those
+        # inventories (BACKLOG #1934, #1190). A new site arrives as an ENGINE or TOOLKIT diff. That
+        # diff does not trip the tooling path gate. So as tooling this test would face nothing on
+        # the change it exists to catch.
         "test_dangerous_functionality_doc.py",
         "test_dependency_boundaries.py",
         "test_ech_record_premise.py",
@@ -196,6 +197,18 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
         # leave exactly the change that reintroduces the defect facing nothing.
         "test_username_access_key_screen.py",
+        # NOT engine source, so this entry widens the list's stated rule, as
+        # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
+        # TEST TREES: it AST-scans both `testpaths` roots for `assert not <collected list>` with no
+        # earlier count assertion (BACKLOG #1746 limb 2). What it catches arrives as a new test in an
+        # ordinary engine PR, which sets `code=true` but NOT `tooling=true`, so listed as tooling it
+        # would run on no leg for the change that adds the vacuous assertion.
+        "test_vacuous_absence_assert_lint.py",
+        # Reads messagefoundry/** off disk: every row of scripts/ci/invariant_mutations.toml names
+        # engine text that must occur exactly once (BACKLOG #1746 limb 5). What breaks a row is an
+        # engine refactor moving that text, which is an engine diff the tooling path gate does not
+        # see, so listed as tooling the list would rot on exactly the change that stales it.
+        "test_invariant_mutations.py",
         # AST-scans messagefoundry/store/store.py and reds on any `execute("BEGIN")` -- or on the
         # nested-transaction verbs `SAVEPOINT`, `ROLLBACK TO` and `RELEASE` -- outside
         # `_writer_txn` (ADR 0159). Same shape as sqlserver_encrypt_pass_tables below -- a guard whose

@@ -87,7 +87,7 @@ blocker is the hypervisor, not the CPU:
 | Platform | Confidential guest for a **Windows** engine VM |
 |---|---|
 | **Hyper-V on-premises** (Windows Server 2019–2025) | ⛔ None. Windows Server 2025 ships no confidential VM; the vNext Insider "Trusted Launch" (Secure Boot + vTPM) is **not** memory encryption. |
-| **VMware ESXi 9.0** | ⚠️ SEV-SNP is a *Limited Availability* release and its guest requirements are stated in Linux-kernel terms; Windows is not listed as a supported SEV-SNP guest. |
+| **VMware ESXi 9.0** | **CAUTION:** SEV-SNP is a *Limited Availability* release and its guest requirements are stated in Linux-kernel terms; Windows is not listed as a supported SEV-SNP guest. |
 | **Azure / Azure Local confidential VMs** | ✅ SEV-SNP and TDX with Windows Server guests (a Microsoft paravisor supplies what a Windows guest needs). |
 | **Linux guests on KVM / AWS / GCP / ESXi 9** | ✅ Where the host is SEV-SNP/TDX-capable and the guest is launched confidential. |
 
@@ -104,7 +104,7 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 | Windows Server 2019 | ✅ Supported |
 | Windows 10 / 11 | ✅ Supported (development, pilot, test-harness host) |
 | **Linux** (modern x86-64 distributions) | ✅ Engine supported (cross-platform Python); no bundled service installer — run under systemd yourself |
-| macOS | ⚠️ Development / test-harness use only |
+| macOS | **CAUTION:** Development / test-harness use only |
 
 ## Runtime
 
@@ -112,7 +112,7 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 |---|---|
 | **Python** | **3.14**, 64-bit (the only supported runtime; CI-validated on Linux + Windows Server 2022 + 2025, the primary deploy target) |
 | Service manager (Windows) | **NSSM** (auto-provisioned, SHA-256-pinned, by the installer; or pre-staged). Requires administrator / elevation to register the service. |
-| C compiler | Not required for the default install (runtime dependencies ship as wheels) |
+| C compiler | Not required for the default install with standard CPython 3.14 on x86-64 Windows, glibc Linux (x86-64 or arm64) or arm64 macOS. The locked runtime dependencies ship wheels there (read from `uv.lock`, 2026-09-30). At least two other interpreters build packages from source. arm64 Windows builds `cryptography` and `httptools`. x86-64 macOS builds `cryptography` and `argon2-cffi-bindings`. Building `cryptography` needs a C compiler, a Rust toolchain and OpenSSL headers. |
 
 ## Databases (message store)
 

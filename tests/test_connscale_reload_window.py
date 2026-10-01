@@ -25,6 +25,7 @@ send across the window's edge.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from dataclasses import replace
 
@@ -491,6 +492,10 @@ def test_the_record_carries_the_same_clamped_count_the_reconcile_prints() -> Non
         "extra_hold_s": 0.0,
         "reply_s": None,
         "drops_after": None,
+        "aged": 0,
+        "lookback_s": 0.25,
+        "reconnect_timeout_s": 10.0,
+        "not_applied": False,
     }
 
 
@@ -512,6 +517,10 @@ def test_no_reload_probe_records_not_measured_rather_than_zero() -> None:
         "extra_hold_s": None,
         "reply_s": None,
         "drops_after": None,
+        "aged": None,
+        "lookback_s": None,
+        "reconnect_timeout_s": None,
+        "not_applied": None,
     }
 
 
@@ -952,10 +961,11 @@ async def test_the_runner_waits_the_shipped_reply_wait_by_default(
 
 
 def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
-    # The constant's comment sizes it against the smoke: every step waiting in full must still fit
-    # the module timeout beside the 40.8 s the fixture's setup took on the failing runner. Read from
-    # the smoke module itself, so adding a count, a mode or a trial, or cutting the timeout, fails
-    # here. What it cannot see is a runner slower than that one.
+    # The constant's comment sizes it against the smoke: every step waiting in full, and then
+    # spending its full stop grace, must still fit the module timeout beside the 40.8 s the fixture's
+    # setup took on the failing runner. Read from the smoke module itself, so adding a count, a mode
+    # or a trial, or cutting the timeout, fails here. What it cannot see is a runner slower than that
+    # one. The grace was left out of this sum until BACKLOG #2024.
     import tests.test_connscale_smoke as smoke
 
     profile = smoke._smoke_profile(30000)
@@ -970,7 +980,8 @@ def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
     )
     (module_timeout,) = smoke.pytestmark.args
     assert steps == 4  # the control: the count the constant's comment was written against
-    assert 40.8 + steps * runner._POST_RELOAD_REPLY_WAIT_S < module_timeout
+    per_step = runner._POST_RELOAD_REPLY_WAIT_S + runner._STOP_GRACE
+    assert 40.8 + steps * per_step < module_timeout
     assert runner._POST_RELOAD_REPLY_WAIT_S > runner._STOP_GRACE  # it must add to the grace
 
 
@@ -1051,3 +1062,140 @@ async def test_a_connection_this_side_stops_is_not_a_drop() -> None:
         await server.wait_closed()
     assert driver.generations() == [1]  # the control: one socket opened, and this side closed it
     assert driver.drops == 0
+
+
+# --- BACKLOG #2024: the window's own terms are saved, and the rate window ends with the hold -------
+
+
+def test_the_record_saves_the_reload_windows_own_terms() -> None:
+    # Every value differs from its dataclass default, so a field wired to the default, or to a
+    # neighbour, fails here. The two pinned dicts above hold defaults and cannot tell.
+    counters = Counters(sent=36, acked=30, timeouts=6, sink_received=36)
+    account = runner._ReloadAccount(
+        seconds=None,
+        stranded=2,
+        not_reconnected=0,
+        extra_hold_s=0.375,
+        after=Counters(sent=10, acked=4),
+        not_applied=True,
+        aged=4,
+        lookback_s=0.75,
+        reconnect_timeout_s=30.0,
+    )
+    rec = _record(counters, account)
+    assert rec.reload_aged == 4
+    assert rec.reload_lookback_s == 0.75
+    assert rec.reload_reconnect_timeout_s == 30.0
+    assert rec.reload_not_applied is True
+    wall5 = rec.to_json_dict()["wall5_reload"]
+    assert isinstance(wall5, dict)
+    assert {k: wall5[k] for k in ("aged", "lookback_s", "reconnect_timeout_s", "not_applied")} == {
+        "aged": 4,
+        "lookback_s": 0.75,
+        "reconnect_timeout_s": 30.0,
+        "not_applied": True,
+    }
+
+
+def _plain_account() -> runner._ReloadAccount:
+    return runner._ReloadAccount(
+        seconds=0.1, stranded=0, not_reconnected=0, extra_hold_s=0.0, after=Counters()
+    )
+
+
+async def test_the_hold_ending_ends_the_wait_while_the_probe_still_runs() -> None:
+    # The probe is still in its reconnect wait when the hold ends. The step must stop its engine
+    # sampler THEN, so the wait returns with the probe still running.
+    hold_task = asyncio.create_task(asyncio.sleep(0.05))
+    released = asyncio.Event()
+    account = _plain_account()
+
+    async def probe() -> runner._ReloadAccount:
+        await hold_task
+        await released.wait()  # connections not back yet, past the hold's end
+        return account
+
+    reload_task = asyncio.create_task(probe())
+    await asyncio.wait_for(runner._await_hold(hold_task, reload_task), timeout=5.0)
+    assert hold_task.done()
+    assert not reload_task.done()
+    released.set()
+    assert await reload_task is account
+
+
+async def test_the_wait_without_a_probe_is_the_hold() -> None:
+    hold_task = asyncio.create_task(asyncio.sleep(0.01))
+    await asyncio.wait_for(runner._await_hold(hold_task, None), timeout=5.0)
+    assert hold_task.done()
+
+
+async def test_a_failed_probe_raises_its_own_error_rather_than_the_holds_cancel() -> None:
+    hold_task = asyncio.create_task(asyncio.sleep(30))
+
+    async def reload() -> tuple[float | None, bool]:
+        raise RuntimeError("decode failed")
+
+    async def run_hold(seconds: float) -> None:
+        raise AssertionError("no extra hold after a failed probe")
+
+    reload_task = asyncio.create_task(
+        runner._reload_mid_hold(
+            driver=_FakeDriver(1),  # type: ignore[arg-type]
+            counters=Counters(),
+            reload=reload,
+            run_hold=run_hold,
+            hold_task=hold_task,
+            hold_seconds=0.02,
+            hold_started=asyncio.get_running_loop().time(),
+        )
+    )
+    with pytest.raises(RuntimeError, match="decode failed"):
+        await asyncio.wait_for(runner._await_hold(hold_task, reload_task), timeout=5.0)
+    # The control: the hold alone reports only its cancellation, which reads as the step cancelled.
+    with pytest.raises(asyncio.CancelledError):
+        await hold_task
+
+
+#: The order `_run_one_step` must keep so the rate window ends with the hold (BACKLOG #2024): wait
+#: for the hold, stop the engine sampler and count its readings, and only then take the probe's
+#: account, stop the OS probe and wait for the first post-reload reply.
+_HOLD_ORDERING = (
+    "await _await_hold(hold_task, reload_task)",
+    "sampler_stop.set()",
+    "in_hold_samples = len(samples)",
+    "reload_account = await reload_task",
+    "probe_stop.set()",
+    "reload_account = await _await_post_reload_reply(",
+)
+
+
+def _first_out_of_order(source: str, landmarks: tuple[str, ...]) -> str | None:
+    at = 0
+    for landmark in landmarks:
+        found = source.find(landmark, at)
+        if found < 0:
+            return landmark
+        at = found + len(landmark)
+    return None
+
+
+def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns() -> None:
+    source = inspect.getsource(runner._run_one_step)
+    assert _first_out_of_order(source, _HOLD_ORDERING) is None
+    # The probe runs BESIDE the hold. Awaited inline, it would hold the sampler open to its end.
+    assert "await _reload_mid_hold(" not in source
+    assert "reload_task = asyncio.create_task(" in source
+    # The OS probe keeps its own stop, so the graded FD window did not move with the rate window.
+    assert "probe_stop, proc_readings, origin" in source
+    # The control: the order before #2024, where the probe returned before the sampler stopped.
+    before = "\n".join(
+        (
+            "reload_account = await reload_task",
+            "await _await_hold(hold_task, reload_task)",
+            "sampler_stop.set()",
+            "in_hold_samples = len(samples)",
+            "probe_stop.set()",
+            "reload_account = await _await_post_reload_reply(",
+        )
+    )
+    assert _first_out_of_order(before, _HOLD_ORDERING) == "reload_account = await reload_task"

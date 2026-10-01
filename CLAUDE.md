@@ -4,7 +4,7 @@ An **open-source, Python** healthcare integration engine — an alternative to *
 and **Corepoint**. Handles **HL7 v2.x by default** (payload-agnostic for other formats — JSON,
 XML/SOAP, X12, DB records) with routing/handling **written in Python** (vs Mirth's Rhino JS;
 Corepoint is low/no-code), and connections that can be code *or* data (`connections.toml`/GUI).
-Stack: **python-hl7** (tolerant parsing) + **hl7apy** (strict validation), **FastAPI/uvicorn**
+Stack: a **built-in tolerant HL7 parser** (ADR 0054) + **hl7apy** (strict validation), **FastAPI/uvicorn**
 (localhost engine API), **SQLite/aiosqlite** (message store), a **browser web console** (`/ui`,
 `messagefoundry_webconsole`) as the operator UI, and **PySide6** (the standalone test harness GUI).
 
@@ -190,7 +190,7 @@ messagefoundry/
   config/          # connector models (models.py) + code-first wiring (wiring.py) + service settings (settings.py)
   pipeline/        # engine.py (Engine), wiring_runner.py (RegistryRunner), dryrun.py
   transports/      # base.py (connector registry), mllp.py, file.py, dicom.py (C-STORE SCP + SCU/C-ECHO), dicomweb.py (STOW-RS, ADR 0025), smart.py (SMART Backend Services token provider, ADR 0024)   ← "connectors"
-  parsing/         # peek.py (python-hl7, hot path), tree.py, validate.py (hl7apy, strict); x12/ (X12 EDI codec, ADR 0012), dicom/ (DICOM codec, ADR 0025), binary.py (base64 carriage, ADR 0028)
+  parsing/         # peek.py + _builtin_hl7.py (tolerant, hot path), tree.py, validate.py (hl7apy, strict); x12/ (X12 EDI codec, ADR 0012), dicom/ (DICOM codec, ADR 0025), binary.py (base64 carriage, ADR 0028)
   anon/            # de-identification framework (ADR 0030; vendored to tee/anon/)
   store/           # base.py (Store protocol + open_store factory), store.py (SQLite WAL inbox/outbox), sqlserver.py, postgres.py
   auth/            # authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, service.py
@@ -952,7 +952,7 @@ QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM=
 # format / lint / types
 ruff format .
 ruff check .
-mypy messagefoundry
+mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit   # the packages ci.yml checks
 mypy --explicit-package-bases tests   # BACKLOG #1799; the profile and its exemptions: pyproject.toml
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
@@ -1080,22 +1080,36 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
   is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
   anywhere; it is decoration, which the rule above forbids outright. Retiring it is **BACKLOG #1265**,
-  a filed migration — *not* a licence to start editing the lines that remain, and not a cp1252 hazard
-  (the cp1252 gate covers `scripts/**/*.py`, which contains none of them).
+  a filed migration, sliced by owner go (the 2026-09-30 ruling quoted below is the latest) — *not* a
+  licence to edit lines outside a ruled slice, and not a cp1252 hazard (the cp1252 gate covers
+  `scripts/**/*.py`, which contains none of them).
 
   **The measured population is recorded here so nobody re-derives the false zero that stalled this
   question once already. Re-censused over git-tracked files 2026-09-13, after the ledger left: 256
   occurrences across 67 files** — 172 under `docs/`, 37 in `docs/adr/`, 26 in `harness/`, 8 in
   `tests/`, 4 in `ide/`, 3 in engine source, 3 at the repository root, 2 in the web console, 1 under
   `.github/`, and **zero in `scripts/`**. 23 tracked files did not decode and were not counted.
+  **Re-censused 2026-09-30 by codepoint: 223 across 48 files at `a4c42c86e9`, and 161 across 26
+  after the live-docs slice below**, with the control
+  `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` at 93 both times and the same 23 undecodable
+  files skipped. 142 of the 161 sit under `docs/benchmarks/`.
 
   **The previous figure was 476, and 218 of those left with the ledger rather than being fixed.** That
   is the whole of the drop: `BACKLOG.md` carried 125 and `BACKLOG-CLOSED.md` 93. A migration is not
   remediation, and reading the smaller number as progress on #1265 would be wrong.
 
-  Earlier slices were real: the five shipped operator docs — `SECURITY.md`, `PHI.md`,
-  `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md` — are at zero and pinned there by
-  `tests/test_operator_docs_no_warning_sign.py`.
+  Earlier slices were real, and `tests/test_operator_docs_no_warning_sign.py` pins each at zero or
+  at a named ceiling: the five shipped operator docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`,
+  `DEPLOYMENT.md`, `CONNECTIONS.md`; every top-level `docs/adr/*.md` (PR 1604, 31 sites, with
+  `README.md` finished later); and the live docs plus code comments and docstrings, 62 sites. That
+  last slice rests on the owner ruling of 2026-09-30, given to the batch 183 Manager in session:
+  *"the sweep extends beyond docs/adr/ to live docs and code comments. Dated benchmark and status
+  records are exempt and must be named as exempt. The CLA and license banners are reviewed
+  separately, not in this sweep."* What still carries the glyph is named in that test with its
+  reason: `docs/benchmarks/` and `CHANGELOG.md` as dated records, `CLA.md` and
+  `COMMERCIAL-LICENSE.md` for the owner's separate review, seven glyphs inside user-visible string
+  literals, test data in `tests/test_ledger_check.py`, and `docs/CONFIGURATION.md` plus
+  `messagefoundry/config/settings.py`, left until BACKLOG #1504 lands.
 
   **Two rows of the filed table were instrument errors, both SDS-3.8, and they are kept because the
   errors recur.** It read the web console as zero by counting `packaging/`; the console's source is
@@ -1132,7 +1146,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 ## 12. Do / Don't Quick Reference
 
 **Do**
-- Parse with python-hl7 on the hot path; use hl7apy for opt-in strict validation.
+- Parse with the built-in tolerant parser (`Peek`/`Message`) on the hot path; use hl7apy for opt-in
+  strict validation.
 - Keep the engine free of GUI imports; reach it from the web console / harness via the HTTP API.
 - Preserve the raw message; **log every received message with its disposition** (route bad
   messages to the error/dead-letter path — never accept-and-drop).

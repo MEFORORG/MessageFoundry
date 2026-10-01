@@ -19,6 +19,7 @@ switch be added at an insecure value with nothing reporting it.
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
 import httpx
@@ -235,9 +236,11 @@ def test_new_ip_step_up_off_with_auth_off_is_NOT_a_loosening() -> None:
     )
 
 
-# --- [auth] sign-in limiter and lockout (BACKLOG #1131, ASVS 6.1.1) ------------------------------
-# Owner ruling 2026-09-27 (#2006): a silent weakening of the sign-in anti-automation controls keeps
-# ASVS 6.1.1 at partial. Each value the limiter or the lockout rule reads as OFF must be named.
+# --- [auth] anti-automation limits (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2) --------------------
+# Owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control keeps its ASVS
+# cell at partial. E16 named each value the code reads as OFF; a vault re-read then measured near-off
+# values that were still silent (a 1e-6 s window, a count of 1e9), so every value LOOSER THAN THE
+# SHIPPED DEFAULT is named now (Manager decision 2026-09-30), and a stricter one never is.
 
 #: (field, value that turns it off). Zero is the documented off value; the other arms are the values
 #: the code also reads as off (a window that prunes every hit, a lock that ends before now, a
@@ -254,7 +257,97 @@ _SIGN_IN_OFF_VALUES = [
     ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING + 1),
     ("lockout_threshold", 1_000_000),
 ]
-_SIGN_IN_FIELDS = {field for field, _ in _SIGN_IN_OFF_VALUES}
+
+#: (field, value looser than its shipped default). Each is named ALONE under its own field. The
+#: near-off values the vault measured as silent are here: a 1e-6 s window and counts of 1e9.
+_LOOSER_THAN_DEFAULT = [
+    ("login_rate_limit_per_ip", 11),
+    ("login_rate_limit_per_ip", 1_000_000_000),
+    ("login_rate_limit_global", 61),
+    ("login_rate_limit_global", 1_000_000_000),
+    ("login_rate_limit_window_seconds", 59.9),
+    ("login_rate_limit_window_seconds", 1e-6),
+    ("lockout_minutes", 14),
+    ("lockout_minutes", 1),
+    ("lockout_threshold", 6),
+    ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING),
+    ("lockout_max_minutes", 1439),
+    ("lockout_max_minutes", 15),  # equal to lockout_minutes: escalation off
+    ("phi_read_rate_limit_enabled", False),
+    ("phi_read_rate_limit_per_actor", 0),
+    ("phi_read_rate_limit_per_actor", 121),
+    ("phi_read_rate_limit_per_actor", 1_000_000_000),
+    ("phi_read_rate_limit_window_seconds", 0.0),
+    ("phi_read_rate_limit_window_seconds", -1.0),
+    ("phi_read_rate_limit_window_seconds", 59.0),
+    ("phi_read_rate_limit_window_seconds", 1e-6),
+    ("admin_write_rate_limit_enabled", False),
+    ("admin_write_rate_limit_per_actor", 0),
+    ("admin_write_rate_limit_per_actor", 13),
+    ("admin_write_rate_limit_per_actor", 1_000_000_000),
+    ("admin_write_rate_limit_window_seconds", 14.0),
+    ("admin_write_rate_limit_window_seconds", 0.2),  # still above the 0.15 s gap, so it loads
+    ("admin_write_min_interval_seconds", 0.0),
+    ("admin_write_min_interval_seconds", 0.1),
+    ("mfa_verify_min_elapsed_seconds", 0.0),
+    ("mfa_verify_min_elapsed_seconds", 0.5),
+    ("mfa_verify_min_elapsed_seconds", 1e-6),
+    ("max_sessions_per_user", 0),
+    ("max_sessions_per_user", -1),
+    ("max_sessions_per_user", 6),
+    ("max_sessions_per_user", 1_000_000_000),
+]
+
+#: (field, value at or stricter than its shipped default). None is named. The defaults are listed
+#: too, so a direction flipped to ">=" or "<=" reds here.
+_STRICTER_OR_DEFAULT = [
+    # A negative count refuses more, and a NaN or +inf window never prunes, so each refuses MORE.
+    ("login_rate_limit_per_ip", 10),
+    ("login_rate_limit_per_ip", 9),
+    ("login_rate_limit_per_ip", 1),
+    ("login_rate_limit_per_ip", -1),
+    ("login_rate_limit_global", 60),
+    ("login_rate_limit_global", 59),
+    ("login_rate_limit_global", -1),
+    ("login_rate_limit_window_seconds", 60.0),
+    ("login_rate_limit_window_seconds", 61.0),
+    ("login_rate_limit_window_seconds", float("inf")),
+    ("login_rate_limit_window_seconds", float("nan")),
+    ("lockout_minutes", 15),
+    ("lockout_minutes", 16),
+    # 0 or less locks on the FIRST failure.
+    ("lockout_threshold", 5),
+    ("lockout_threshold", 4),
+    ("lockout_threshold", 0),
+    ("lockout_threshold", -1),
+    ("lockout_max_minutes", 1440),
+    ("lockout_max_minutes", 1441),
+    ("phi_read_rate_limit_per_actor", 120),
+    ("phi_read_rate_limit_per_actor", 119),
+    ("phi_read_rate_limit_per_actor", -1),
+    # The all-users PHI-read count ships OFF, so no value of it is looser.
+    ("phi_read_rate_limit_global", 0),
+    ("phi_read_rate_limit_global", 1),
+    ("phi_read_rate_limit_window_seconds", 60.0),
+    ("phi_read_rate_limit_window_seconds", 61.0),
+    ("phi_read_rate_limit_window_seconds", float("inf")),
+    ("phi_read_rate_limit_window_seconds", float("nan")),
+    ("admin_write_rate_limit_per_actor", 12),
+    ("admin_write_rate_limit_per_actor", 11),
+    ("admin_write_rate_limit_per_actor", -1),
+    ("admin_write_rate_limit_window_seconds", 15.0),
+    ("admin_write_rate_limit_window_seconds", 16.0),
+    ("admin_write_min_interval_seconds", 0.15),
+    ("admin_write_min_interval_seconds", 0.2),
+    ("mfa_verify_min_elapsed_seconds", 1.0),
+    ("mfa_verify_min_elapsed_seconds", 2.5),
+    ("max_sessions_per_user", 5),
+    ("max_sessions_per_user", 4),
+    ("max_sessions_per_user", 1),
+]
+_SIGN_IN_FIELDS = {
+    field for field, _ in _SIGN_IN_OFF_VALUES + _LOOSER_THAN_DEFAULT + _STRICTER_OR_DEFAULT
+}
 
 
 def _risk(auth: AuthSettings, switch: str) -> str | None:
@@ -287,6 +380,17 @@ def test_sign_in_limiter_and_lockout_defaults_are_not_loosenings() -> None:
     assert auth.login_rate_limit_window_seconds == 60.0
     assert auth.lockout_minutes == 15
     assert auth.lockout_threshold == 5
+    assert auth.lockout_max_minutes == 1440
+    assert auth.phi_read_rate_limit_enabled is True
+    assert auth.phi_read_rate_limit_per_actor == 120
+    assert auth.phi_read_rate_limit_global == 0
+    assert auth.phi_read_rate_limit_window_seconds == 60.0
+    assert auth.admin_write_rate_limit_enabled is True
+    assert auth.admin_write_rate_limit_per_actor == 12
+    assert auth.admin_write_rate_limit_window_seconds == 15.0
+    assert auth.admin_write_min_interval_seconds == 0.15
+    assert auth.max_sessions_per_user == 5
+    assert auth.oidc_flow_cache_max == 512
     assert not _SIGN_IN_FIELDS & set(_names())
 
 
@@ -301,24 +405,74 @@ def test_each_sign_in_off_value_is_a_named_loosening(field: str, value: object) 
     assert _names(auth=auth) == [field]
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        # Each of these refuses MORE, not less, so none is a loosening.
-        ("login_rate_limit_per_ip", -1),
-        ("login_rate_limit_global", -1),
-        ("login_rate_limit_window_seconds", float("inf")),
-        ("login_rate_limit_window_seconds", float("nan")),
-        ("login_rate_limit_per_ip", 1),
-        ("lockout_minutes", 1),
-        # 0 or less locks on the FIRST failure, and NIST's ceiling itself is allowed.
-        ("lockout_threshold", 0),
-        ("lockout_threshold", -1),
-        ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING),
-    ],
-)
-def test_a_value_that_keeps_the_control_on_is_not_a_loosening(field: str, value: object) -> None:
+@pytest.mark.parametrize(("field", "value"), _LOOSER_THAN_DEFAULT)
+def test_each_value_looser_than_the_default_is_a_named_loosening(field: str, value: object) -> None:
+    """The present arm for a weak but non-zero value, which E16 left silent: named, alone."""
+    auth = AuthSettings(**{field: value})  # type: ignore[arg-type]
+    assert _risk(auth, field) is not None, f"[auth].{field} = {value!r} is looser, silently"
+    assert _names(auth=auth) == [field]
+
+
+@pytest.mark.parametrize(("field", "value"), _STRICTER_OR_DEFAULT)
+def test_a_value_at_or_stricter_than_the_default_is_not_a_loosening(
+    field: str, value: object
+) -> None:
+    """A value that refuses as much as the default, or more, is never named. E16 held
+    lockout_minutes = 1 and a threshold of 100 here; both are looser than the default, so both moved
+    to the list above."""
     assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+
+
+def test_a_weak_value_says_looser_than_the_default_and_an_off_value_says_off() -> None:
+    """One entry per setting, and its text tells the two cases apart."""
+    weak = _risk(AuthSettings(login_rate_limit_per_ip=11), "login_rate_limit_per_ip")
+    assert weak is not None
+    assert "above the default of 10" in weak
+    off = _risk(AuthSettings(login_rate_limit_per_ip=0), "login_rate_limit_per_ip")
+    assert off is not None
+    assert "no per-address sign-in limit" in off
+    short = _risk(
+        AuthSettings(login_rate_limit_window_seconds=1e-6), "login_rate_limit_window_seconds"
+    )
+    assert short is not None
+    assert "shorter than the default of 60 s" in short
+    flat = _risk(AuthSettings(lockout_max_minutes=15), "lockout_max_minutes")
+    assert flat is not None
+    assert "escalation is OFF" in flat
+    lower = _risk(AuthSettings(lockout_max_minutes=60), "lockout_max_minutes")
+    assert lower is not None
+    assert "below the default of 1440" in lower
+    # NIST is cited only past its own ceiling.
+    t_weak = _risk(AuthSettings(lockout_threshold=6), "lockout_threshold")
+    assert t_weak is not None
+    assert "NIST" not in t_weak
+    t_nist = _risk(AuthSettings(lockout_threshold=101), "lockout_threshold")
+    assert t_nist is not None
+    assert "NIST SP 800-63B" in t_nist
+
+
+def test_the_near_off_values_the_vault_measured_are_named() -> None:
+    """The three measured silent cases, together: each named under its own field."""
+    named = _names(
+        auth=AuthSettings(
+            login_rate_limit_window_seconds=1e-6,
+            login_rate_limit_global=1_000_000_000,
+            login_rate_limit_per_ip=1_000_000_000,
+        )
+    )
+    assert named == [
+        "login_rate_limit_window_seconds",
+        "login_rate_limit_per_ip",
+        "login_rate_limit_global",
+    ]
+    # The admin-write window refuses 0 at load, so its near-off value is a tiny positive one; the
+    # gap must then be shorter still, so it is named beside it.
+    admin = _names(
+        auth=AuthSettings(
+            admin_write_rate_limit_window_seconds=1e-6, admin_write_min_interval_seconds=0
+        )
+    )
+    assert admin == ["admin_write_rate_limit_window_seconds", "admin_write_min_interval_seconds"]
 
 
 def test_the_threshold_ceiling_is_nists() -> None:
@@ -421,10 +575,22 @@ def test_sign_in_limiter_and_lockout_off_with_sign_in_off_are_NOT_loosenings() -
             login_rate_limit_enabled=False,
             lockout_minutes=0,
             lockout_threshold=1_000_000,
+            phi_read_rate_limit_enabled=False,
+            admin_write_rate_limit_enabled=False,
+            max_sessions_per_user=0,
+            mfa_verify_min_elapsed_seconds=0,
         ),
     )
     assert "require_sign_in" in named
     assert not _SIGN_IN_FIELDS & set(named)
+    assert "mfa_verify_min_elapsed_seconds" not in named
+    # The OIDC-gated entries sit behind the sign-in gate too.
+    federated = _names(
+        sec=SecuritySettings(require_sign_in=False),
+        auth=_oidc(oidc_callback_min_elapsed_seconds=0, oidc_flow_cache_max=1_000_000_000),
+    )
+    assert "oidc_callback_min_elapsed_seconds" not in federated
+    assert "oidc_flow_cache_max" not in federated
 
 
 def test_gated_on_the_security_switch_not_a_stale_auth_section() -> None:
@@ -453,6 +619,371 @@ def test_a_disabled_limiter_does_not_also_report_its_zeroed_parts() -> None:
 def test_both_zero_counts_are_each_named() -> None:
     named = _names(auth=AuthSettings(login_rate_limit_per_ip=0, login_rate_limit_global=0))
     assert named == ["login_rate_limit_per_ip", "login_rate_limit_global"]
+
+
+def test_a_short_window_is_named_beside_its_loose_counts() -> None:
+    """Only a window of 0 or less stands in for its counts. A merely short one still counts, so a
+    loose count beside it is a second, separate loosening."""
+    named = _names(
+        auth=AuthSettings(login_rate_limit_window_seconds=30.0, login_rate_limit_per_ip=20)
+    )
+    assert named == ["login_rate_limit_window_seconds", "login_rate_limit_per_ip"]
+    off = _names(auth=AuthSettings(login_rate_limit_window_seconds=0.0, login_rate_limit_per_ip=20))
+    assert off == ["login_rate_limit_window_seconds"]
+
+
+def test_a_short_window_over_counts_that_are_all_off_is_not_named() -> None:
+    """Review round 2: a window paces only its counts. With every one at 0 it paces nothing, so
+    naming it as looser would be a false warning; the zeroed counts are named instead."""
+    assert _names(
+        auth=AuthSettings(
+            login_rate_limit_per_ip=0,
+            login_rate_limit_global=0,
+            login_rate_limit_window_seconds=1.0,
+        )
+    ) == ["login_rate_limit_per_ip", "login_rate_limit_global"]
+    assert _names(
+        auth=AuthSettings(phi_read_rate_limit_per_actor=0, phi_read_rate_limit_window_seconds=1.0)
+    ) == ["phi_read_rate_limit_per_actor"]
+    assert _names(
+        auth=AuthSettings(
+            admin_write_rate_limit_per_actor=0, admin_write_rate_limit_window_seconds=1.0
+        )
+    ) == ["admin_write_rate_limit_per_actor"]
+    # One live count is enough for the window to matter again.
+    assert _names(
+        auth=AuthSettings(login_rate_limit_per_ip=0, login_rate_limit_window_seconds=1.0)
+    ) == ["login_rate_limit_window_seconds", "login_rate_limit_per_ip"]
+    assert _names(
+        auth=AuthSettings(
+            phi_read_rate_limit_per_actor=0,
+            phi_read_rate_limit_global=50,
+            phi_read_rate_limit_window_seconds=1.0,
+        )
+    ) == ["phi_read_rate_limit_window_seconds", "phi_read_rate_limit_per_actor"]
+
+
+def test_a_disabled_or_windowless_limiter_does_not_also_report_its_parts() -> None:
+    """The PHI-read and admin-write limiters follow the sign-in limiter's rule: with the limiter
+    unbuilt, or its window at 0 or less, its parts change nothing and are not named."""
+    assert _names(
+        auth=AuthSettings(
+            phi_read_rate_limit_enabled=False,
+            phi_read_rate_limit_per_actor=0,
+            phi_read_rate_limit_window_seconds=0.0,
+        )
+    ) == ["phi_read_rate_limit_enabled"]
+    assert _names(
+        auth=AuthSettings(
+            phi_read_rate_limit_window_seconds=0.0, phi_read_rate_limit_per_actor=1_000_000
+        )
+    ) == ["phi_read_rate_limit_window_seconds"]
+    assert _names(
+        auth=AuthSettings(
+            admin_write_rate_limit_enabled=False,
+            admin_write_rate_limit_per_actor=0,
+            admin_write_rate_limit_window_seconds=1.0,
+            admin_write_min_interval_seconds=0.0,
+        )
+    ) == ["admin_write_rate_limit_enabled"]
+
+
+def test_a_lock_that_never_holds_does_not_also_report_its_ceiling() -> None:
+    """At lockout_minutes of 0 or less no lock holds, so the ceiling it doubles to changes nothing."""
+    named = _names(auth=AuthSettings(lockout_minutes=0, lockout_max_minutes=0))
+    assert named == ["lockout_minutes"]
+
+
+def test_a_ceiling_at_the_default_or_above_is_not_named_even_with_escalation_off() -> None:
+    """With lockout_minutes at or above the default ceiling, every lock already lasts at least as
+    long as the default's longest, so a flat ceiling there is not looser than the default."""
+    assert _names(auth=AuthSettings(lockout_minutes=1440, lockout_max_minutes=1440)) == []
+    assert _names(auth=AuthSettings(lockout_minutes=2000, lockout_max_minutes=2000)) == []
+
+
+def test_escalation_off_above_the_default_lock_names_only_the_ceiling() -> None:
+    """A longer-than-default lock with escalation off: the lock is stricter, the ceiling is not."""
+    auth = AuthSettings(lockout_minutes=16, lockout_max_minutes=16)
+    assert _names(auth=auth) == ["lockout_max_minutes"]
+    risk = _risk(auth, "lockout_max_minutes")
+    assert risk is not None
+    assert "escalation is OFF" in risk
+
+
+def test_a_short_lock_with_the_default_ceiling_names_only_the_lock() -> None:
+    assert _names(auth=AuthSettings(lockout_minutes=1, lockout_max_minutes=1440)) == [
+        "lockout_minutes"
+    ]
+
+
+def _oidc(**over: object) -> AuthSettings:
+    """OIDC-enabled auth settings with the fields the model requires (it needs AD for roles)."""
+    base: dict[str, object] = {
+        "ad_enabled": True,
+        "ad_server": "ldaps://dc.test.invalid",
+        "ad_user_search_base": "OU=Staff,DC=test,DC=invalid",
+        "ad_bind_dn": "CN=svc-mefor,OU=Service,DC=test,DC=invalid",
+        "ad_bind_password": "synthetic",
+        "ad_domain": "test.invalid",  # the UPN suffix the username allow-list falls back to
+        "oidc_enabled": True,
+        "oidc_issuer": "https://idp.test.invalid",
+        "oidc_client_id": "mefor-console",
+        "oidc_client_secret": "synthetic",
+        "oidc_authorization_endpoint": "https://idp.test.invalid/authorize",
+        "oidc_token_endpoint": "https://idp.test.invalid/token",
+        "oidc_jwks_uri": "https://idp.test.invalid/jwks",
+        "oidc_allowed_endpoints": ["idp.test.invalid"],
+    }
+    base.update(over)
+    return AuthSettings(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("cap", "named"),
+    [
+        (512, False),  # the default
+        (511, False),
+        (1, False),
+        # FlowCache refuses at len >= cap, so 0 or less refuses EVERY flow: stricter, not off.
+        (0, False),
+        (-1, False),
+        (513, True),
+        (1_000_000_000, True),  # the value the vault measured as silently lifting the cap
+    ],
+)
+def test_the_oidc_flow_cache_cap_is_named_only_above_its_default(cap: int, named: bool) -> None:
+    got = _names(auth=_oidc(oidc_flow_cache_max=cap))
+    assert got == (["oidc_flow_cache_max"] if named else [])
+
+
+@pytest.mark.parametrize(
+    ("floor", "named"),
+    [
+        (1.0, False),  # the default
+        (2.5, False),  # stricter; the load keeps it below the flow lifetime
+        (0.5, True),
+        (1e-6, True),
+        (0.0, True),  # off
+    ],
+)
+def test_the_oidc_callback_floor_is_named_only_below_its_default(floor: float, named: bool) -> None:
+    got = _names(auth=_oidc(oidc_callback_min_elapsed_seconds=floor))
+    assert got == (["oidc_callback_min_elapsed_seconds"] if named else [])
+
+
+def test_the_oidc_callback_floor_is_not_named_without_oidc() -> None:
+    """The flows it floors exist only with OIDC on."""
+    assert _names(auth=AuthSettings(oidc_callback_min_elapsed_seconds=0)) == []
+
+
+def test_a_time_floor_says_off_at_zero_and_looser_below_the_default() -> None:
+    off = _risk(AuthSettings(mfa_verify_min_elapsed_seconds=0), "mfa_verify_min_elapsed_seconds")
+    assert off is not None
+    assert "there is no least time" in off
+    weak = _risk(AuthSettings(mfa_verify_min_elapsed_seconds=0.5), "mfa_verify_min_elapsed_seconds")
+    assert weak is not None
+    assert "shorter than the default of 1 s" in weak
+
+
+def test_the_second_factor_floor_entry_never_quotes_the_configured_value() -> None:
+    """PR 1842: CodeQL reads an mfa_* attribute as a password source, and this entry reaches the
+    serve WARNING and stdout, so the configured number must stay out of it. The other floors still
+    quote theirs (the control arm), so a text that dropped every value would not pass either."""
+    mfa = _risk(AuthSettings(mfa_verify_min_elapsed_seconds=0.37), "mfa_verify_min_elapsed_seconds")
+    assert mfa is not None
+    assert "0.37" not in mfa
+    gap = _risk(
+        AuthSettings(admin_write_min_interval_seconds=0.037), "admin_write_min_interval_seconds"
+    )
+    assert gap is not None
+    assert "0.037" in gap
+
+
+def test_the_oidc_flow_cache_cap_is_not_named_without_oidc() -> None:
+    """The cache is built only with OIDC on, so the cap is inert without it."""
+    assert _names(auth=AuthSettings(oidc_flow_cache_max=1_000_000_000)) == []
+
+
+def test_a_zero_flow_cache_cap_refuses_every_flow() -> None:
+    """Ground the direction in FlowCache: 0 is stricter, which is why it is not named."""
+    from messagefoundry.auth.oidc.flow import FlowCache, FlowCacheFullError, PendingFlow
+
+    flow = PendingFlow(
+        state="s",
+        nonce="n",
+        code_verifier="v",
+        return_to="/ui",
+        client_ip="10.0.0.1",
+        deadline=0.0,
+    )
+    FlowCache(global_cap=1).put("flow-0", flow)  # the control: a cap of 1 admits one
+    for cap in (0, -1):
+        with pytest.raises(FlowCacheFullError):
+            FlowCache(global_cap=cap).put("flow-1", flow)
+
+
+async def test_near_off_values_admit_what_the_default_refuses(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ground the near-off entries in AuthService's own limiters. A fake clock steps 1 ms per call,
+    so the measurement does not depend on the host's timer resolution; it replaces the name only
+    inside the limiter module, never the event loop's clock."""
+    import types
+
+    from messagefoundry.auth import ratelimit
+    from messagefoundry.auth.service import AuthService
+
+    ticks = iter(range(10**9))
+    monkeypatch.setattr(
+        ratelimit, "time", types.SimpleNamespace(monotonic=lambda: next(ticks) / 1000)
+    )
+
+    def admitted(settings: AuthSettings, leg: str, *, addresses: int = 1) -> int:
+        service = AuthService(engine.store, settings)
+        calls = {
+            "login": lambda i: service.allow_login_attempt(f"10.0.0.{i % addresses}"),
+            "ceremony": lambda i: service.allow_reauth_attempt("user-1"),
+            "phi": lambda i: service.allow_phi_read("user-1"),
+            "admin": lambda i: service.allow_admin_write("user-1"),
+        }
+        return sum(calls[leg](i) for i in range(200))
+
+    default = AuthSettings()
+    assert admitted(default, "login") == 10
+    assert admitted(default, "login", addresses=50) == 60
+    assert admitted(default, "ceremony") == 10
+    assert admitted(default, "phi") == 120
+    assert admitted(default, "admin") == 2  # the 0.15 s gap: t = 0 and t = 0.15 of a 0.2 s burst
+
+    tiny = AuthSettings(login_rate_limit_window_seconds=1e-6)
+    assert admitted(tiny, "login") == 200
+    assert admitted(tiny, "ceremony") == 200
+    assert admitted(AuthSettings(login_rate_limit_per_ip=1_000_000_000), "login") == 60
+    assert admitted(AuthSettings(login_rate_limit_per_ip=1_000_000_000), "ceremony") == 200
+    huge_global = AuthSettings(login_rate_limit_global=1_000_000_000)
+    assert admitted(huge_global, "login", addresses=50) == 200
+    assert admitted(AuthSettings(phi_read_rate_limit_window_seconds=1e-6), "phi") == 200
+    assert admitted(AuthSettings(phi_read_rate_limit_per_actor=1_000_000_000), "phi") == 200
+    no_gap = AuthSettings(admin_write_min_interval_seconds=0)
+    assert admitted(no_gap, "admin") == 12
+    near_off = AuthSettings(
+        admin_write_rate_limit_window_seconds=1e-6, admin_write_min_interval_seconds=0
+    )
+    assert admitted(near_off, "admin") == 200
+
+
+# --- [api].trusted_proxies with a prefix of 0 (BACKLOG #1131) ----------------------------------
+
+
+def _proxied(*entries: str) -> ApiSettings:
+    return ApiSettings(tls_terminated_upstream=True, trusted_proxies=list(entries))
+
+
+@pytest.mark.parametrize("entry", ["0.0.0.0/0", "::/0"])
+def test_a_trust_every_peer_proxy_entry_is_a_named_loosening(entry: str) -> None:
+    """A prefix of 0 trusts X-Forwarded-For from every peer of its family, as the refused '*' does.
+    It still loads (this change names it, it does not refuse it)."""
+    api = _proxied("10.0.0.1", entry)
+    assert _names(api=api) == ["trusted_proxies"]
+    # Not gated on sign-in: a forged source address poisons the audit trail either way.
+    no_auth = _names(sec=SecuritySettings(require_sign_in=False), api=api)
+    assert "trusted_proxies" in no_auth
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "10.0.0.1",
+        "10.0.0.0/8",
+        "::1",
+        "fd00::/8",
+        # Host bits set: loads, but uvicorn's strict parse makes it a literal that trusts no peer.
+        "10.1.2.3/0",
+    ],
+)
+def test_a_bounded_proxy_entry_is_not_a_loosening(entry: str) -> None:
+    assert _names(api=_proxied(entry)) == []
+
+
+def _split(network: str, bits: int) -> list[str]:
+    """``network`` cut into 2**bits equal ranges. Built rather than written out, so the file carries
+    no routable address literal for the forbidden-content scan to stop on."""
+    return [str(n) for n in ipaddress.ip_network(network).subnets(prefixlen_diff=bits)]
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        _split("0.0.0.0/0", 1),
+        _split("::/0", 1),
+        ["10.0.0.1", *_split("0.0.0.0/0", 2)],
+    ],
+)
+def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[str]) -> None:
+    """Review round 1: two halves trust every peer as surely as one /0 does."""
+    risk = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            api=_proxied(*entries),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    ).get("trusted_proxies")
+    assert risk is not None
+    # Every range in the union is named, so a regression naming only one half reds here.
+    for entry in entries:
+        if ipaddress.ip_network(entry).num_addresses > 1:
+            assert entry in risk
+    # The single-host proxy entry adds nothing to the union, so it is not blamed.
+    assert "10.0.0.1" not in risk
+
+
+def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
+    risk = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            api=_proxied("::/0", "::/0"),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    )["trusted_proxies"]
+    assert risk.count("::/0") == 1
+
+
+def test_ranges_that_leave_a_gap_are_not_a_loosening() -> None:
+    assert _names(api=_proxied(*_split("0.0.0.0/0", 2)[:3])) == []
+    # Two families never union into one.
+    assert _names(api=_proxied(_split("0.0.0.0/0", 1)[0], _split("::/0", 1)[1])) == []
+
+
+def test_uvicorn_reads_a_prefix_zero_entry_the_way_the_registry_does() -> None:
+    """Ground the discriminator in uvicorn's own parser, which __main__ hands the list verbatim."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    assert "203.0.113.9" in _TrustedHosts(["0.0.0.0/0"])
+    assert "2001:db8::9" in _TrustedHosts(["::/0"])
+    assert "203.0.113.9" not in _TrustedHosts(["10.1.2.3/0"])
+    halves = _TrustedHosts(_split("0.0.0.0/0", 1))
+    assert "10.9.9.9" in halves
+    assert "203.0.113.9" in halves
 
 
 # --- [api].plaintext_upstream_hop_acknowledged (BACKLOG #1179) --------------------------------
@@ -1422,8 +1953,8 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "ad_tls_verify",  # gated by weakened_tls_escape_permitted
         "ad_allow_insecure_ldap",  # gated by the same clamp
         "oidc_require_mfa_claim",  # gated by the OIDC serve gate
-        "phi_read_rate_limit_enabled",
-        "admin_write_rate_limit_enabled",
+        # phi_read_rate_limit_enabled and admin_write_rate_limit_enabled left this set when
+        # BACKLOG #1131 (E17) began naming them; the loop below now pins that they are reported.
     }
     for model, exempt, section in (
         (StoreSettings, exempt_store, "store"),

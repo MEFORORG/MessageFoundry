@@ -207,8 +207,8 @@ crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)
 #
 #   * `sbom`, `trivy`             -- advisory BY DESIGN; they declare `continue-on-error: true`
 #                                    (`sbom` on the job, `trivy` on its scan step).
-#   * `released-line-audit`       -- advisory BY PLACEMENT; schedule/dispatch-only, so it can never
-#                                    report on a pull request. It still goes red on a finding.
+#   * `released-line-audit`,      -- advisory BY PLACEMENT; schedule/dispatch-only, so neither can
+#     `cla-action-audit`             report on a pull request. Each still goes red on a finding.
 #   * the SEVEN original scans    -- SUPERSEDED. See the block below. They hard-fail and they report
 #                                    on every pull request; they simply no longer gate the merge.
 #
@@ -386,11 +386,19 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 actioned by a PR author -- its remedy is cutting a release on the
 #                                 latest line (docs/SUPPORT-POLICY.md), not editing the branch under
 #                                 review. BACKLOG #1081.
+#   security.yml's             -- `cla-action-audit (vendored CLA action's declared closure)`, the
+#   cla-action-audit              same posture for the same trap. Its subject is a frozen upstream
+#                                 lockfile that only a newly published advisory changes, so a PR
+#                                 author could not action it either. BACKLOG #1578.
 #   ingress-rate-probe.yml     -- workflow_dispatch only, so it never reports on a PR. It is also
 #                                 structurally unfit to gate anything: it MEASURES a runner's ingress
 #                                 service rate and exits 0 even when the reconcile fails, because a
 #                                 machine too slow to keep up is the finding, not an error. See #320.
 #   freethread-smoke.yml       -- a 3.14t canary; informational only.
+#   invariant-mutations.yml    -- schedule/dispatch only, so it never reports on a PR
+#                                 (required-but-absent trap). Advisory by placement, not by
+#                                 continue-on-error: it goes red when a mutation survives. BACKLOG
+#                                 #1746.
 #   py315-canary.yml           -- a Python 3.15 readiness canary; advisory, allowed to go red. No
 #                                 merge_group trigger, so required it would wedge the queue.
 #   manifest-lint.yml          -- paths-filtered to the k8s manifests.

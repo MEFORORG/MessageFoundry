@@ -75,7 +75,7 @@ is sourced, and the Mirth/NextGen Connect parity reference lives in
 
 | Feature | Status | Notes |
 |---------|:--:|-------|
-| python-hl7 tolerant peek (hot path) | ✅ | Routing/filtering |
+| Built-in tolerant peek (hot path, ADR 0054) | ✅ | Routing/filtering |
 | hl7apy strict validation (opt-in per inbound) | ✅ | `validation.strict`; slow path, off routing |
 | Parse-tree model + viewer | ✅ | The web console's message detail + the PySide6 test harness render it |
 | MSH-driven encoding-character awareness | ✅ | No hardcoded separators |
@@ -154,7 +154,7 @@ is sourced, and the Mirth/NextGen Connect parity reference lives in
 | Feature | Status | Notes |
 |---------|:--:|-------|
 | PHI-at-rest encryption + user-attributed PHI-access audit | ✅ | |
-| python-hl7 PHI-logger silencing + control-char scrub filter | ✅ | Targeted, not a general redactor |
+| Control-char scrub filter | ✅ | Targeted, not a general redactor |
 | **Full PHI log redaction** (chained-exception traceback scrubbing + proof test) | ✅ | **Gate #1** — safe to run above DEBUG with PHI |
 | `serve` prod-DEBUG guard | ✅ | Gate #1 |
 | structlog / JSON logs / off-box (SIEM) forwarding | ⏭️ | Gate #1 closes without structlog |

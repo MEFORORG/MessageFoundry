@@ -79,6 +79,67 @@ on:
 permissions: {}
 
 jobs:
+  sbom-windows:
+    # The Windows-resolved engine SBOM, built HERE and signed by the `release` job below.
+    #
+    # WHY A SECOND SBOM: the core lock's sys_platform markers install a different package set on
+    # win32, and the engine also deploys as a Windows service, so the Linux SBOM would be wrong for a
+    # Windows site. Only a Windows interpreter resolves those markers as a Windows install does. The
+    # decision and the rejected alternatives are in ADR 0149's 2026-09-30 amendment.
+    #
+    # SPLIT FROM `release` ON PURPOSE. This job holds `contents: read` and nothing else: no id-token,
+    # no attestations, no write. It produces bytes, and the privileged job signs and attests them.
+    # Nothing from the artifact EXECUTES in that job; it is read by sbomqs and by `sigstore sign`.
+    # Same repository guard and the same console-tag exclusion as `release`, so it runs exactly when
+    # that job does, and `release` carries `needs: sbom-windows`: a release that cannot produce the
+    # Windows SBOM does not ship, rather than shipping without it.
+    if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
+    runs-on: windows-latest
+    # Two hash-locked installs and one SBOM render; security.yml's sbom-windows twin runs in minutes.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Generate the Windows-resolved CycloneDX SBOM (license-complete, hash-locked core runtime)
+        # bash (Git Bash on the Windows runner), so this step reads like its Linux twin and the
+        # workflow shell-syntax and pipefail screens can parse it.
+        shell: bash
+        run: |
+          # The Linux step's recipe in the `release` job, pip-less scan venv included (that step says
+          # why the venv carries no pip), with one difference a Windows runner forces: the venv lives
+          # under $RUNNER_TEMP and every path to it is ABSOLUTE, with the Windows layout
+          # (Scripts/python.exe). Measured on Windows: `pip --python` given a RELATIVE interpreter path
+          # fails with WinError 2 and installs nothing.
+          # HASH-PINNED and BYTE-IDENTICAL to security.yml's sbom-windows install, enforced by
+          # tests/test_ci_venv_pinning.py, for the reason the Linux pair is: security.yml's job is the
+          # pre-tag dry-run for this one.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m venv --without-pip "$RUNNER_TEMP/sbomenv"
+          python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install --require-hashes -r docker/locks/requirements-core.lock
+          python -m cyclonedx_py environment "$RUNNER_TEMP/sbomenv/Scripts/python.exe" \
+            --pyproject pyproject.toml --mc-type application \
+            --of JSON -o messagefoundry-sbom-windows.cdx.json
+          python scripts/security/sbom_finalize.py messagefoundry-sbom-windows.cdx.json \
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+
+      - name: Hand the Windows SBOM to the signing job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-windows
+          path: messagefoundry-sbom-windows.cdx.json
+          # `error`, not `ignore`: the `release` job needs this file, and a missing one must fail HERE
+          # with the cause named rather than at a download step two jobs later.
+          if-no-files-found: error
+
   release:
     # Source-repo only — and since the MEFORORG cutover, MEFORORG/MessageFoundry IS the source repo.
     #
@@ -99,6 +160,8 @@ jobs:
     # NOT on a console tag: the console has its own job below and its own version root, so an
     # engine release built from `webconsole-v*` would ship the engine at the console's version.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
+    # The Windows-resolved SBOM it signs beside the Linux one; that job's header says why it is split.
+    needs: sbom-windows
     runs-on: ubuntu-latest
     # Hang backstop against GitHub's 360-minute default; security.yml's `jobs:` note carries the
     # reasoning. The most generous cap in this file: it builds, signs and publishes, so it waits on
@@ -406,8 +469,8 @@ jobs:
       # the toolkit is published while the name is unclaimed, and no person has to remember an order.
       # A separate job gated on a repository variable, as `release-harness` is, was rejected: a variable
       # that can be unset IS that window. Built into toolkit-dist/, never dist/: sharing dist/ would
-      # pull the toolkit into the engine smoke above, the py.typed check, the signing and the staged
-      # engine upload.
+      # pull the toolkit into the engine smoke above, the py.typed check and the staged engine upload.
+      # The Sigstore, SLSA and release-asset steps below name toolkit-dist/ explicitly instead.
       - name: Build the toolkit wheel (wheel-only, into toolkit-dist/ — ADR 0201)
         run: |
           # HASH-PINNED, and installed HERE rather than trusted from the engine's build step: a step
@@ -422,7 +485,18 @@ jobs:
       - name: Member gate — the toolkit wheel (maintainer files, test content, the engine and toolkit split)
         # Its own id: `member-gate` is the engine gate's, and the artifact-upload guard below reads it.
         id: toolkit-member-gate
-        run: python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
+        run: |
+          # BACKLOG #1192: exactly one wheel and nothing else, BEFORE signing, so a stray or second
+          # wheel is refused before it gets a public Rekor entry. dotglob, so a hidden file counts.
+          shopt -s dotglob nullglob
+          entries=(toolkit-dist/*)
+          shopt -u dotglob nullglob
+          if [ "${#entries[@]}" -ne 1 ] || [[ "${entries[0]}" != *.whl ]]; then
+            echo "::error::toolkit-dist/ must hold exactly one wheel and nothing else; it holds: ${entries[*]:-nothing}"; exit 1
+          fi
+          python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
+          # And the wheel's own dist-info carries LICENSE and NOTICE, with no member escaping it.
+          python scripts/release/wheel_license_files.py 'toolkit-dist/*.whl'
 
       - name: Smoke-check the toolkit wheel (clean venv, install, lockstep pin, version == tag)
         run: |
@@ -646,7 +720,15 @@ jobs:
           # the root component's version (hatchling-dynamic, so --pyproject leaves it null). Exits non-zero
           # on a structurally broken BOM, failing the release before it ships one.
           python scripts/security/sbom_finalize.py messagefoundry-sbom.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+
+      - name: Fetch the Windows-resolved SBOM from the sbom-windows job
+        # Built on a Windows runner by the unprivileged job above. It lands beside the Linux SBOM and
+        # is signed, attested and attached exactly like it; nothing in it runs here.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom-windows
+          path: .
 
       - name: Stage the VEX companion (from the maintained source of truth)
         run: |
@@ -713,8 +795,12 @@ jobs:
           # gate (ADR 0149). It calls the binary the BLOCKING step above verified, by the path it was
           # installed at, so no other `sbomqs` earlier on PATH can stand in for it. This
           # continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG #1698).
+          # The Windows-resolved SBOM is scored by the same verified binary: it was built on another
+          # runner, but the scoring happens here, behind the same pin.
           /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom-windows.cdx.json
           /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
+          /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom-windows.cdx.json || true
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |
@@ -751,9 +837,41 @@ jobs:
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
           # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
-          python -m sigstore sign dist/*.tar.gz dist/*.whl \
-            messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json
-          ls -l dist/ messagefoundry-sbom.cdx.json.sigstore* messagefoundry-vex.openvex.json.sigstore*
+          # The toolkit wheel is signed in the same call (ADR 0201, BACKLOG #1192). Its bundle lands in
+          # toolkit-dist/, and the next step moves it out.
+          python -m sigstore sign dist/*.tar.gz dist/*.whl toolkit-dist/*.whl \
+            messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json \
+            messagefoundry-sbom-windows.cdx.json
+          ls -l dist/ messagefoundry-sbom.cdx.json.sigstore* messagefoundry-vex.openvex.json.sigstore* \
+            messagefoundry-sbom-windows.cdx.json.sigstore*
+
+      - name: Move the toolkit Sigstore bundle out of toolkit-dist/ (it must hold only the wheel)
+        # Its own id, read by the dry-run upload's guard below: a refusal here must not hand out
+        # toolkit-dist/ as a workflow artifact either (BACKLOG #1838).
+        id: toolkit-bundle-move
+        run: |
+          # `sigstore sign` writes `<input>.sigstore.json` beside each input, and the toolkit's PyPI
+          # publish below uploads toolkit-dist/ WHOLE, where twine rejects anything but a distribution
+          # (the reason dist-pub/ exists for the engine). So the bundle moves to toolkit-sigstore/,
+          # which carries it to the release assets (BACKLOG #1192). The mv fails the step if no bundle
+          # was written.
+          mkdir -p toolkit-sigstore
+          mv toolkit-dist/*.sigstore* toolkit-sigstore/
+          # THEN CHECK THE DIRECTORY, not only the move: any other file here, from a later edit or an
+          # output name the glob above misses, would fail the toolkit upload on a tag, after the
+          # GitHub release already exists. The toolkit member gate ran this check before signing;
+          # this is the state the upload will read. dotglob, so a hidden file counts too.
+          # tests/test_release_pipeline.py runs this step.
+          shopt -s dotglob nullglob
+          entries=(toolkit-dist/*)
+          shopt -u dotglob nullglob
+          if [ "${#entries[@]}" -ne 1 ] || [[ "${entries[0]}" != *.whl ]]; then
+            echo "::error::toolkit-dist/ must hold exactly one wheel and nothing else; it holds: ${entries[*]:-nothing}"; exit 1
+          fi
+          # The member gate again, on what the upload reads. The engine's dist-pub/ re-gate has the
+          # same shape.
+          python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
+          ls -l toolkit-dist/ toolkit-sigstore/
 
       # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
       # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
@@ -788,7 +906,7 @@ jobs:
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && !github.event.repository.private }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"
+          subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json, messagefoundry-sbom-windows.cdx.json, toolkit-dist/*.whl"
 
       # CREATE-OR-UPDATE, not create. This was a bare `gh release create`, which fails with "a release
       # with the same tag name already exists" on any re-run — and because it sits BEFORE the PyPI
@@ -817,8 +935,9 @@ jobs:
             *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
             *)   pre_create="";             pre_edit="--prerelease=false" ;;
           esac
-          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore* toolkit-dist/*.whl
+          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore* toolkit-dist/*.whl toolkit-sigstore/*.sigstore*
                    messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore*
+                   messagefoundry-sbom-windows.cdx.json messagefoundry-sbom-windows.cdx.json.sigstore*
                    messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* )
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists — updating in place (this is a re-run)."
@@ -841,7 +960,10 @@ jobs:
         # with the implicit success(); release-harness is `needs: release` and release-webconsole is
         # gated on a mutually exclusive ref), so the singular wording is the finding.
         # Every OTHER failure mode keeps the always() behaviour this step exists for: a build, sign,
-        # SBOM, release or publish failure still uploads whatever dist/ holds.
+        # SBOM, release or publish failure still uploads whatever dist/ holds. ONE EXCEPTION sits
+        # outside this job: when the `sbom-windows` job fails, `needs:` skips this whole job, so a
+        # dry run uploads nothing. That job's own log names the cause, and a release that cannot
+        # produce the Windows SBOM must not ship, so the trade is taken deliberately.
         # DELIBERATELY THE WHOLE STEP'S OUTCOME, not just its leak branch. The gate exits non-zero
         # from several paths and only one of them is "a member is outside the allowlist" — the rest
         # are "the listing did not succeed / did not cover the file / is not our archive". Narrowing
@@ -863,18 +985,22 @@ jobs:
         # tests/test_release_pipeline.py pins the gate itself as unconditional and free of
         # `continue-on-error`, which are the two ways the skipped-gate case could be made common.
         #
-        # EVERY gate is named here, not just the leak gate (BACKLOG #1838), the toolkit gate included. They refuse different
+        # EVERY gate is named here, not just the leak gate (BACKLOG #1838), the toolkit gate and the
+        # toolkit bundle move's directory check included (BACKLOG #1192). They refuse different
         # things -- the leak gate asks where a member sits, the member gate asks what kind of file it
         # is -- so guarding on one and not the other uploads whatever the other one caught.
-        if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure' && steps.toolkit-member-gate.outcome != 'failure'
+        if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure' && steps.toolkit-member-gate.outcome != 'failure' && steps.toolkit-bundle-move.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-artifacts
           path: |
             dist/
             toolkit-dist/
+            toolkit-sigstore/
             messagefoundry-sbom.cdx.json
             messagefoundry-sbom.cdx.json.sigstore*
+            messagefoundry-sbom-windows.cdx.json
+            messagefoundry-sbom-windows.cdx.json.sigstore*
             messagefoundry-vex.openvex.json
             messagefoundry-vex.openvex.json.sigstore*
           if-no-files-found: ignore

@@ -47,6 +47,7 @@ import sys
 import sysconfig
 import tarfile
 import tomllib
+import zipfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -200,13 +201,15 @@ def test_release_load_bearing_canaries_present() -> None:
         "Sigstore keyless sign": "python -m sigstore sign dist/*.tar.gz dist/*.whl",
         "Sigstore signs SBOM + VEX": "messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json",
         # SLSA build provenance; subjects now also bind the SBOM + VEX (comma-separated in
-        # subject-path). Its guard is checked on the step itself, not as a whole-file literal: the
+        # subject-path). No closing quote, so a subject appended later does not break it.
+        # Its guard is checked on the step itself, not as a whole-file literal: the
         # visibility half by `test_the_attestation_step_keeps_its_visibility_test`, the event-and-ref
         # half by section (4b) (BACKLOG #1805).
         "SLSA attest action pinned": "uses: actions/attest-build-provenance@",
         "SLSA subjects incl SBOM + VEX": (
             'subject-path: "dist/*.tar.gz, dist/*.whl, '
-            'messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"'
+            "messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json, "
+            "messagefoundry-sbom-windows.cdx.json"
         ),
         # PyPI publish via the pinned pypa action, tag-gated, reading the clean staging dir
         "PyPI publish action pinned": "uses: pypa/gh-action-pypi-publish@",
@@ -218,6 +221,99 @@ def test_release_load_bearing_canaries_present() -> None:
     }
     missing = [name for name, tok in required.items() if tok not in rel]
     assert not missing, f"release.yml lost these load-bearing guards: {missing}"
+
+
+#: The Windows-resolved engine SBOM, built by the unprivileged `sbom-windows` job and shipped by the
+#: `release` job beside the Linux one (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30 amendment).
+_WINDOWS_SBOM = "messagefoundry-sbom-windows.cdx.json"
+_ENGINE_SBOMS = ("messagefoundry-sbom.cdx.json", _WINDOWS_SBOM)
+
+
+def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one() -> None:
+    """The Windows SBOM must reach every sink the Linux SBOM reaches, and be built without the key.
+
+    Each assertion names a way it silently goes wrong:
+
+    - the job must run on a WINDOWS runner, because only a Windows interpreter resolves the core lock's
+      ``sys_platform`` markers as a Windows install does -- moved to Linux, it is a second Linux SBOM
+      with a Windows filename;
+    - it holds ``contents: read`` ONLY, so nothing it runs sits beside the signing identity;
+    - it runs exactly when ``release`` does: the same job ``if:``, and ``release`` needs it, so a
+      release cannot proceed without the file or ship one from a skipped job;
+    - its upload refuses a missing file, rather than failing two jobs later at the download;
+    - the ``release`` job downloads it, and it is signed, SLSA-attested, attached to the GitHub
+      release and uploaded as a workflow artifact. Both engine SBOMs are held to those four sinks, so
+      neither can drop out of one while the other still reaches it.
+    """
+    jobs = _jobs()
+    win, rel = jobs.get("sbom-windows"), jobs.get("release")
+    assert win and rel, "release.yml lost its `sbom-windows` or `release` job"
+
+    assert win.get("runs-on") == "windows-latest", win.get("runs-on")
+    assert win.get("permissions") == {"contents": "read"}, win.get("permissions")
+    assert _despace(str(win.get("if"))) == _despace(str(rel.get("if"))), (
+        f"sbom-windows and release must share one job guard: {win.get('if')!r} vs {rel.get('if')!r}"
+    )
+    needs = rel.get("needs")
+    assert "sbom-windows" in ([needs] if isinstance(needs, str) else list(needs or [])), needs
+
+    uploads = [
+        st
+        for st in win.get("steps") or []
+        if str(st.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1, f"sbom-windows has {len(uploads)} artifact uploads"
+    assert uploads[0]["with"].get("if-no-files-found") == "error", uploads[0]["with"]
+    artifact = uploads[0]["with"]["name"]
+    assert uploads[0]["with"]["path"] == _WINDOWS_SBOM
+
+    steps = rel.get("steps") or []
+    downloads = [
+        st
+        for st in steps
+        if str(st.get("uses", "")).startswith("actions/download-artifact@")
+        and (st.get("with") or {}).get("name") == artifact
+    ]
+    assert len(downloads) == 1, (
+        f"release downloads the {artifact!r} artifact {len(downloads)} times"
+    )
+
+    def body(pred: Callable[[dict], bool]) -> str:
+        hits = [st for st in steps if pred(st)]
+        assert len(hits) == 1, f"expected exactly one matching step, found {len(hits)}"
+        return _executed_shell(str(hits[0].get("run") or "")) + str(hits[0].get("with") or "")
+
+    # THE SIGN COMMAND ITSELF, continuations joined, not the whole step: the step's `ls -l` names the
+    # file's `.sigstore*` bundle too, so a whole-body match stayed green with the file dropped from
+    # `sigstore sign`. Measured by that mutation while writing this test.
+    signing = body(lambda st: "python -m sigstore sign" in str(st.get("run") or ""))
+    sign_cmd = [
+        ln for ln in signing.replace("\\\n", " ").splitlines() if "python -m sigstore sign" in ln
+    ]
+    assert len(sign_cmd) == 1, f"expected one `sigstore sign` command, found {sign_cmd}"
+    sinks = {
+        "Sigstore signing": sign_cmd[0],
+        "SLSA attestation": body(
+            lambda st: str(st.get("uses", "")).startswith("actions/attest-build-provenance@")
+        ),
+        "GitHub release assets": body(lambda st: "gh release create" in str(st.get("run") or "")),
+        "workflow artifact upload": body(
+            lambda st: str(st.get("uses", "")).startswith("actions/upload-artifact@")
+        ),
+    }
+    # Both walks below draw from this tuple: the Linux SBOM and the Windows one (PR 1849).
+    assert len(set(_ENGINE_SBOMS)) >= 2, f"expected two distinct engine SBOMs: {_ENGINE_SBOMS}"
+    assert _WINDOWS_SBOM in _ENGINE_SBOMS, f"the Windows SBOM left the walk: {_ENGINE_SBOMS}"
+    missing = [(f, sink) for f in _ENGINE_SBOMS for sink, text in sinks.items() if f not in text]
+    assert not missing, f"an engine SBOM does not reach these sinks: {missing}"
+    # The Sigstore bundle must ride along wherever the file does, or an operator cannot verify it.
+    unbundled = [
+        (f, sink)
+        for f in _ENGINE_SBOMS
+        for sink in ("GitHub release assets", "workflow artifact upload")
+        if f"{f}.sigstore" not in sinks[sink]
+    ]
+    assert not unbundled, f"an engine SBOM ships without its Sigstore bundle: {unbundled}"
 
 
 #: The two halves every publish/release guard in release.yml must carry.
@@ -2158,6 +2254,33 @@ def test_the_toolkit_smoke_refuses_a_wheel_without_its_console_script_target(
     assert "console script would fail" in out, out
 
 
+def _release_steps() -> list[dict]:
+    """The `release` job's steps, in order. Indexes returned below refer to this list."""
+    return [s for s in _jobs()["release"]["steps"] if isinstance(s, dict)]
+
+
+def _release_step_index(pred: Callable[[dict], bool], what: str) -> int:
+    """Index of the one `release` step matching ``pred``.
+
+    ONE locator for the toolkit tests below, for the reason ``_step_script_by_prefix`` gives: two
+    copies of one lookup drift apart the first time either is fixed. A predicate over a step's shell
+    reads it through ``_executed_shell`` (see ``_runs``), so a comment quoting a command cannot match.
+    """
+    hits = [i for i, s in enumerate(_release_steps()) if pred(s)]
+    assert len(hits) == 1, f"expected one {what} step in `release`, found {hits}"
+    return hits[0]
+
+
+def _named(prefix: str) -> Callable[[dict], bool]:
+    """A predicate for the step whose name (or ``uses:``) starts with ``prefix``."""
+    return lambda s: str(s.get("name") or s.get("uses") or "").startswith(prefix)
+
+
+def _runs(needle: str) -> Callable[[dict], bool]:
+    """A predicate for the step whose EXECUTED shell contains ``needle``."""
+    return lambda s: needle in _executed_shell(str(s.get("run") or ""))
+
+
 def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
     """ADR 0201 section 1: the toolkit's first upload claims its name, and the engine names it.
 
@@ -2166,13 +2289,11 @@ def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
     runs immediately before the engine's upload, so a failure in it skips the engine's. A separate
     job gated on a repository variable would reopen the window the order closes.
     """
-    steps = [s for s in _jobs()["release"]["steps"] if isinstance(s, dict)]
+    steps = _release_steps()
     names = [str(s.get("name") or s.get("uses") or "") for s in steps]
 
     def at(prefix: str) -> int:
-        hits = [i for i, n in enumerate(names) if n.startswith(prefix)]
-        assert len(hits) == 1, f"expected one step starting {prefix!r} in `release`, found {hits}"
-        return hits[0]
+        return _release_step_index(_named(prefix), f"step starting {prefix!r}")
 
     build = at("Build the toolkit wheel")
     gate = at("Member gate — the toolkit wheel")
@@ -2194,8 +2315,150 @@ def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
         "the toolkit upload is gated on a repository variable -- ADR 0201 rejects that, because an "
         "unset variable lets an engine that names the toolkit reach PyPI with the name unclaimed"
     )
-    # Never into dist/: that would pull the toolkit into the engine smoke, signing and staged upload.
+    # Never into dist/: that would pull the toolkit into the engine smoke and the staged upload.
     assert "--outdir toolkit-dist" in str(steps[build].get("run") or "")
+
+
+#: The step that moves the toolkit's Sigstore bundle out of toolkit-dist/ and then proves the
+#: directory holds only wheels. Matched as a name prefix.
+_TOOLKIT_BUNDLE_STEP_PREFIX = "Move the toolkit Sigstore bundle out of toolkit-dist/"
+
+
+def test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle() -> None:
+    """BACKLOG #1192: the toolkit wheel gets the engine wheel's provenance, by explicit name.
+
+    It lives in toolkit-dist/, so no `dist/*` glob reaches it. Each assertion names one sink it
+    could silently drop out of: the Sigstore call, the SLSA subjects, the GitHub release assets and
+    the dry-run upload. The bundle must also LEAVE toolkit-dist/ before the toolkit's PyPI publish,
+    which uploads that directory whole: `sigstore sign` writes the bundle beside its input, and twine
+    rejects a bundle, so a bundle left there fails the upload that claims the toolkit's name. What
+    the move step DOES is graded by running it, in the tests after this one.
+    """
+    steps = _release_steps()
+    sign = _release_step_index(_runs("python -m sigstore sign"), "Sigstore")
+    lines = _executed_shell(str(steps[sign]["run"])).replace("\\\n", " ").splitlines()
+    sign_lines = [ln.split() for ln in lines if "python -m sigstore sign" in ln]
+    assert len(sign_lines) == 1, sign_lines
+    assert "toolkit-dist/*.whl" in sign_lines[0], sign_lines[0]
+
+    move = _release_step_index(_named(_TOOLKIT_BUNDLE_STEP_PREFIX), "toolkit bundle move")
+    attest = _release_step_index(
+        lambda s: str(s.get("uses") or "").startswith("actions/attest-build-provenance@"), "SLSA"
+    )
+    subjects = [p.strip() for p in str(steps[attest]["with"]["subject-path"]).split(",")]
+    assert "toolkit-dist/*.whl" in subjects, subjects
+
+    release = _release_step_index(_runs("gh release upload"), "GitHub release")
+    assets = re.search(r"assets=\((.*?)\)", _executed_shell(str(steps[release]["run"])), re.S)
+    assert assets, "the GitHub release step lost its `assets=( ... )` array"
+    assert {"toolkit-dist/*.whl", "toolkit-sigstore/*.sigstore*"} <= set(assets.group(1).split())
+
+    upload = _release_step_index(
+        lambda s: (
+            "upload-artifact" in str(s.get("uses") or "")
+            and "toolkit-dist/" in str((s.get("with") or {}).get("path") or "")
+        ),
+        "dry-run upload",
+    )
+    assert "toolkit-sigstore/" in str(steps[upload]["with"]["path"]).split(), steps[upload]
+
+    publish = _release_step_index(_named("Publish messagefoundry-toolkit"), "toolkit publish")
+    assert sign < move < attest < release < publish, (sign, move, attest, release, publish)
+
+
+@pytest.fixture
+def toolkit_bundle_step(tmp_path: Path) -> tuple[str, Path, dict[str, str]]:
+    """A usable bash and the bundle-move step, written as BYTES, for the leak-gate fixture's
+    reasons: ``require_bash`` fails loudly, and ``write_text`` would hand bash CRLF lines.
+
+    The step re-runs the member gate as ``python scripts/release/forbidden_members.py``, so THIS
+    interpreter's directory goes first on PATH, as tests/test_release_member_gate.py's
+    ``_run_control`` does, and each work directory gets a copy of the real gate script (see
+    ``_toolkit_dist``). The gate is stdlib-only, so any 3.14 runs it the same way.
+    """
+    script = tmp_path / "toolkit_bundle.sh"
+    body = _step_script_by_prefix(_TOOLKIT_BUNDLE_STEP_PREFIX, "the toolkit bundle move")
+    script.write_bytes(body.encode("utf-8"))
+    env = _posix_tool_env()
+    env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env["PATH"]])
+    return require_bash(tmp_path, env), script, env
+
+
+_TOOLKIT_WHEEL_NAME = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
+_TOOLKIT_BUNDLE_NAME = f"{_TOOLKIT_WHEEL_NAME}.sigstore.json"
+_SECOND_TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.1-py3-none-any.whl"
+
+
+def _toolkit_dist(root: Path, names: Sequence[str], leak: bool = False) -> Path:
+    """A work directory with the real member gate script and a toolkit-dist/ holding ``names``.
+
+    A ``.whl`` name gets a real zip, which the re-run gate lists; ``leak`` adds a member that gate
+    refuses. Any other name gets a small plain file.
+    """
+    gate = root / "scripts" / "release" / "forbidden_members.py"
+    gate.parent.mkdir(parents=True)
+    shutil.copyfile(_REPO / "scripts" / "release" / "forbidden_members.py", gate)
+    (root / "toolkit-dist").mkdir()
+    for name in names:
+        path = root / "toolkit-dist" / name
+        if name.endswith(".whl"):
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr("messagefoundry_toolkit/__init__.py", "")
+                if leak:
+                    zf.writestr("messagefoundry_toolkit/CLAUDE.md", "internal\n")
+        else:
+            path.write_bytes(b"fixture\n")
+    return root
+
+
+def test_the_toolkit_bundle_step_moves_the_bundle_and_passes_a_wheel_only_dir(
+    toolkit_bundle_step: tuple[str, Path, dict[str, str]], tmp_path: Path
+) -> None:
+    """POSITIVE CONTROL for the refusals below. A harness that cannot run the step at all exits
+    non-zero on every refusal, so those are evidence only while this passes. The gate's own
+    success line proves the re-run gate really ran, rather than a shim that exits 0."""
+    bash, script, env = toolkit_bundle_step
+    work = _toolkit_dist(tmp_path / "ok", [_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME])
+
+    rc, out = _run_leak_gate(bash, work, script, env)
+    assert rc == 0, out
+    assert "member gate passed" in out, out
+    assert [p.name for p in (work / "toolkit-dist").iterdir()] == [_TOOLKIT_WHEEL_NAME]
+    assert [p.name for p in (work / "toolkit-sigstore").iterdir()] == [_TOOLKIT_BUNDLE_NAME]
+
+
+@pytest.mark.parametrize(
+    ("names", "leak", "expected"),
+    [
+        # mv exits non-zero on an unmatched glob and names it.
+        ([_TOOLKIT_WHEEL_NAME], False, "toolkit-dist/*.sigstore*"),
+        ([_TOOLKIT_BUNDLE_NAME], False, "it holds: nothing"),
+        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, "stray.txt"], False, "stray.txt"),
+        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME, ".hidden"], False, ".hidden"),
+        (
+            [_TOOLKIT_WHEEL_NAME, _SECOND_TOOLKIT_WHEEL, _TOOLKIT_BUNDLE_NAME],
+            False,
+            _SECOND_TOOLKIT_WHEEL,
+        ),
+        ([_TOOLKIT_WHEEL_NAME, _TOOLKIT_BUNDLE_NAME], True, "maintainer-internal"),
+    ],
+    ids=["no-bundle", "no-wheel", "stray-file", "hidden-file", "two-wheels", "leaking-wheel"],
+)
+def test_the_toolkit_bundle_step_refuses(
+    toolkit_bundle_step: tuple[str, Path, dict[str, str]],
+    tmp_path: Path,
+    names: list[str],
+    leak: bool,
+    expected: str,
+) -> None:
+    """Each case is graded on its OWN message, so a refusal for some other reason (a harness
+    fault, or another arm catching it) does not read as this arm working."""
+    bash, script, env = toolkit_bundle_step
+    work = _toolkit_dist(tmp_path / "bad", names, leak=leak)
+
+    rc, out = _run_leak_gate(bash, work, script, env)
+    assert rc != 0, f"the step passed a toolkit-dist/ it should refuse ({expected!r}):\n{out}"
+    assert expected in out, out
 
 
 #: The engine smoke's import probe. ``flags`` is what the step passes the interpreter BEFORE ``-c``;
