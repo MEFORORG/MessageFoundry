@@ -26,7 +26,9 @@ Trust is earned incrementally:
   final decision-maker.
 - **Architecture: by ADR.** Any change touching the engine's invariants or core model is proposed as
   an **Architecture Decision Record** under [`docs/adr/`](docs/adr/) and discussed before
-  implementation. "ADR or it didn't happen" for anything load-bearing.
+  implementation. "ADR or it didn't happen" for anything load-bearing. An outside contributor
+  proposes the ADR as a draft, in a Discussion or a draft pull request, and a maintainer allocates
+  its number. The ADR is still required; only the numbering is a maintainer's step.
 
 ## What we welcome — and what to discuss first
 

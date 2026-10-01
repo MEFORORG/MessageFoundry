@@ -5,8 +5,9 @@ reports seriously and appreciate responsible disclosure.
 
 ## Supported versions
 
-The project is pre-1.0 and evolving rapidly; only the latest `main` is supported. Please
-verify a report against current `main` before filing.
+The project is pre-1.0 and evolving rapidly; only the latest release is supported, as
+[`docs/SUPPORT-POLICY.md`](../docs/SUPPORT-POLICY.md) states. Please verify a report against the
+latest release before filing.
 
 ## Reporting a vulnerability
 
@@ -22,8 +23,9 @@ verify a report against current `main` before filing.
   third-party form service.
 
 If you cannot reach a maintainer privately within a few business days, you may request a contact via a
-**non-detail** public post in [GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions)
-(title only, e.g. "requesting a private security contact") — **never** put vulnerability details,
+**non-detail** public post in the
+[Bugs category of GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions/categories/bugs),
+which the maintainers watch (title only, e.g. "requesting a private security contact") — **never** put vulnerability details,
 reproduction steps, or any message content in a public post.
 
 Please include: affected component (e.g. MLLP/file transport, store, API/auth, console),

@@ -172,6 +172,10 @@ work list.
 These are the routes, and this section is where they are recorded:
 
 - **A fix or a feature:** open a pull request. A bug fix carries a test that reproduces the bug.
+- **A bug you cannot fix yourself:** post it in the
+  [Bugs category of GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions/categories/bugs).
+  The maintainers watch that category. Reproduce it on the latest release first, because that is
+  the only supported version ([docs/SUPPORT-POLICY.md](docs/SUPPORT-POLICY.md)).
 - **A question or design discussion:** use
   [GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions).
 - **Anything larger or architectural:** discuss it first, in a Discussion or a draft pull request.
