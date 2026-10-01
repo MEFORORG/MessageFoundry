@@ -12,7 +12,6 @@ import ast
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -38,9 +37,7 @@ from messagefoundry.corepoint_import import (
     strip_markup,
     tokenize_statement,
 )
-
-if TYPE_CHECKING:  # the runtime import stays local to the tests that load a handler
-    from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import Message
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "corepoint"
@@ -1078,14 +1075,19 @@ def _role_line(data: str) -> str:
     return f'<Line Data="{escaped}"/>'
 
 
-_WRITE_INPUT = _role_line(
-    _span("keyword", "ItemCopy")
-    + " "
-    + _span("literal", '"X"')
-    + " to "
-    + _span("input-handle", "%ADT")
-    + _span("path", "/MSH-6")
-)
+def _write(handle_class: str, handle: str, value: str) -> str:
+    """A role-marked ``ItemCopy "<value>" to <handle>/MSH-6``."""
+    return _role_line(
+        _span("keyword", "ItemCopy")
+        + " "
+        + _span("literal", '"' + value + '"')
+        + " to "
+        + _span(handle_class, handle)
+        + _span("path", "/MSH-6")
+    )
+
+
+_WRITE_INPUT = _write("input-handle", "%ADT", "X")
 
 
 def _role_send(handle_class: str, handle: str, dest: str) -> str:
@@ -1234,7 +1236,6 @@ def _run_handler(tmp_path: Path, body: str, inbound: Message | None = None) -> o
     ``inbound`` lets a test keep a reference to the message it passed in; by default a fresh
     synthetic ADT is used."""
     from messagefoundry.config.wiring import load_config
-    from messagefoundry.parsing.message import Message
 
     export = tmp_path / "pkg.xml"
     export.write_text(_package(body), encoding="utf-8")
@@ -1412,8 +1413,7 @@ def test_an_input_overwritten_by_anything_else_is_not_msg(copy: str) -> None:
     """Any whole-tree copy INTO the input from something that is not the input overwrites it, so
     from that point neither a send nor a field write may treat the input as msg. A write made BEFORE
     the overwrite was a write to msg and still maps: the flow reads statement order (#313 step 2)."""
-    write_after = _WRITE_INPUT.replace("&quot;X&quot;", "&quot;Z&quot;")
-    assert write_after != _WRITE_INPUT
+    write_after = _write("input-handle", "%ADT", "Z")
     body = _handler_body(
         _handler_source(
             _WRITE_INPUT + copy + write_after + _role_send("input-handle", "%ADT", "OB_IN")
@@ -1438,14 +1438,7 @@ def test_an_overwrite_inside_an_unmodelled_element_still_counts() -> None:
 def test_a_write_to_an_unsent_clone_does_not_reach_the_input_send() -> None:
     """Only the ONE delivered tree is msg. A write to a clone that is never sent is a write to a
     different Corepoint tree, so it must not land in the input's send."""
-    write_clone = _role_line(
-        _span("keyword", "ItemCopy")
-        + " "
-        + _span("literal", '"Y"')
-        + " to "
-        + _span("other-handle", "%OUT")
-        + _span("path", "/MSH-6")
-    )
+    write_clone = _write("other-handle", "%OUT", "Y")
     body = _handler_body(
         _handler_source(
             _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1460,14 +1453,7 @@ def test_a_write_to_an_unsent_clone_does_not_reach_the_input_send() -> None:
 def test_a_write_to_the_sent_clone_still_maps() -> None:
     """The control arm: a write to the clone maps onto the clone's own local, which is what the list
     sends (BACKLOG #313 step 2)."""
-    write_clone = _role_line(
-        _span("keyword", "ItemCopy")
-        + " "
-        + _span("literal", '"Y"')
-        + " to "
-        + _span("other-handle", "%OUT")
-        + _span("path", "/MSH-6")
-    )
+    write_clone = _write("other-handle", "%OUT", "Y")
     body = _handler_body(
         _handler_source(
             _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1523,18 +1509,6 @@ def test_a_refused_send_still_passes_the_required_check_gate(tmp_path: Path) -> 
 # delivers its local. What the flow cannot settle keeps the step 1 raise. All fixtures are synthetic.
 
 
-def _write(handle_class: str, handle: str, value: str) -> str:
-    """A role-marked ``ItemCopy "<value>" to <handle>/MSH-6``."""
-    return _role_line(
-        _span("keyword", "ItemCopy")
-        + " "
-        + _span("literal", '"' + value + '"')
-        + " to "
-        + _span(handle_class, handle)
-        + _span("path", "/MSH-6")
-    )
-
-
 def _create(handle: str, *operands: str) -> str:
     """A role-marked ``MsgCreate <handle> <operands>``; each operand is raw markup."""
     return _role_line(
@@ -1556,7 +1530,6 @@ def test_clone_then_write_then_send_delivers_the_clone_and_leaves_the_input_alon
 ) -> None:
     """The clone is its own Message: the write lands on it, the send delivers it, and the inbound
     message the Handler received is not changed or sent."""
-    from messagefoundry.parsing.message import Message
 
     body = _handler_body(_handler_source(_CLONE_WRITE_SEND))
     assert "    out_msg = msg.copy()" in body
@@ -1580,7 +1553,6 @@ def test_a_send_that_falls_back_to_msg_is_caught(
     """The mutation arm. If a send the flow cannot settle fell back to sending msg, the render and
     the runtime checks this section relies on both go red."""
     import messagefoundry.corepoint_import as importer
-    from messagefoundry.parsing.message import Message
 
     send_before_clone = _role_send("other-handle", "%OUT", "OB_ACME") + _root_copy(
         "input-handle", "%ADT", "other-handle", "%OUT"
@@ -1600,7 +1572,6 @@ def test_a_send_that_falls_back_to_msg_is_caught(
 def test_msgcreate_then_send_delivers_the_new_message(tmp_path: Path) -> None:
     """A MsgCreate naming a type and a version builds a skeleton through the Message API: default
     encoding characters, MSH-9 and MSH-12, nothing else. The send delivers it, not msg."""
-    from messagefoundry.parsing.message import Message
 
     body = _create("%NEW", _ADT_A04) + _role_send("other-handle", "%NEW", "OB_NEW")
     src = _handler_source(body)
@@ -1848,6 +1819,57 @@ def test_a_hostile_handle_name_becomes_a_safe_local() -> None:
     assert "    o_ut_import_os_msg_2 = msg.copy()" in body
     assert 'sends.append(Send("OB_A", o_ut_import_os_msg))' in body
     assert 'sends.append(Send("OB_B", o_ut_import_os_msg_2))' in body
+
+
+def test_colliding_handle_names_number_on_from_the_last_one() -> None:
+    """Handles that fold onto one base get ``_msg``, ``_msg_2``, ``_msg_3`` in the order they are
+    first bound, and a handle bound again keeps its first name."""
+    handles = ["%A-B", "%A.B", "%a b"]
+    body = "".join(_root_copy("input-handle", "%ADT", "other-handle", h) for h in handles)
+    body += _root_copy("input-handle", "%ADT", "other-handle", handles[0])
+    src = _handler_body(_handler_source(body))
+    assert [ln.split(" = ")[0].strip() for ln in src.splitlines() if ".copy()" in ln] == [
+        "a_b_msg",
+        "a_b_msg_2",
+        "a_b_msg_3",
+        "a_b_msg",
+    ]
+
+
+def test_deeply_nested_loops_and_trys_settle_in_linear_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The export is untrusted, so the flow must not rewalk a body once per enclosing loop or Try,
+    nor once per bound handle. Counted in calls to the write reader rather than in seconds, so the
+    budget is exact: a body walked again at every level costs about depth x statements calls."""
+    import messagefoundry.corepoint_import as importer
+
+    depth, statements = 20, 40
+    inner = "".join(
+        _root_copy("input-handle", "%ADT", "other-handle", f"%T{i}") for i in range(statements)
+    )
+    body = inner  # the same handles bound up front too, so every level has many live handles
+    for level in range(depth):
+        tag = "Foreach" if level % 2 else "Try"
+        body = f"<{tag}>{body}</{tag}>"
+    body = inner + body + _role_send("other-handle", "%T0", "OB_A")
+
+    calls = 0
+    real = importer._whole_written
+
+    def counting(verb: str, operands: tuple[object, ...]) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        return real(verb, operands)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importer, "_whole_written", counting)
+    src = _handler_source(body)
+    compile(src, "generated.py", "exec")
+    # Linear: each nested statement is read once by the memoized walk. Rewalking at every level
+    # would cost about depth x statements = 800 calls.
+    assert 0 < calls <= 2 * statements
+    # The handle the loops overwrite is unknown after them, so the send refuses rather than guess.
+    assert 'Send("OB_A"' not in _handler_body(src)
 
 
 def test_a_module_with_scratch_locals_round_trips_through_the_lens() -> None:

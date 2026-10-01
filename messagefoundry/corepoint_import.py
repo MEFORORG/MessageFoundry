@@ -209,9 +209,11 @@ class Control:
                   ``message`` is the local it delivers. ``refusal`` is non-empty when the handle it
                   sends holds no message the import can identify at that point; the render then
                   raises at the send site instead of sending (BACKLOG #313).
-    ``"assign"``  a ``MsgTreeCopy`` clone or a ``MsgCreate`` that binds a handle to a local:
-                  ``args`` is ``(local, expression)``. A ``MsgCreate`` with too little to build a
-                  valid MSH carries a ``refusal`` instead and renders as a raise (BACKLOG #313).
+    ``"clone"``   a whole-tree ``MsgTreeCopy`` that binds a handle to a local: ``args`` is
+                  ``(local, "<source>.copy()")`` (BACKLOG #313).
+    ``"create"``  a ``MsgCreate`` that binds a handle to a local: ``args`` is
+                  ``(local, "Message.parse(<skeleton>)")``. One with too little to build a valid MSH
+                  carries a ``refusal`` instead and renders as a raise (BACKLOG #313).
     ``"pending"`` the parse's placeholder for a statement whose rendering depends on what each
                   handle holds at that point. :class:`_Flow` replaces every one; none is rendered.
     ``"exit"``    ``Returns``/``ActionListExit``/``ActionListStop`` — no faithful vocabulary form, so a
@@ -234,7 +236,7 @@ class Control:
     args: tuple[str, ...] = ()
     body: tuple[Step, ...] = field(default_factory=tuple)
     branches: tuple[Control, ...] = field(default_factory=tuple)
-    # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` and ``"assign"`` set it.
+    # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` and ``"create"`` set it.
     refusal: str = ""
     # The local a ``"send"`` delivers. A name this module generated, never export text.
     message: str = "msg"
@@ -899,6 +901,9 @@ _KIND_BY_VERB = {
     "actionlistexit": "exit",
     "actionliststop": "exit",
 }
+
+# Kinds that bind a message handle to a Python local; both render as ``<local> = <expression>``.
+_BINDING_KINDS = frozenset({"clone", "create"})
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
 _BRANCH_PARENT = {"elif": "if", "else": "if", "except": "try", "match": "case"}
@@ -1657,24 +1662,6 @@ def _whole_written(verb: str, operands: tuple[Operand, ...]) -> tuple[str, ...]:
     return tuple(h for h in whole if h)
 
 
-def _written(steps: tuple[Step, ...]) -> set[str]:
-    """Every handle any live statement in ``steps`` may overwrite whole, nested constructs included.
-
-    Read on the UNSETTLED tree, so it is a syntactic answer: a clone that :class:`_Flow` will bind
-    counts as a write as surely as an overwrite it cannot model. A loop and a ``Try`` use it to say
-    which handles may differ on a later pass or in a ``Catch``."""
-    found: set[str] = set()
-    for step in steps:
-        if not isinstance(step, Control) or step.kind == "disabled":
-            continue
-        if step.deferred is not None and step.kind in ("pending", "unknown"):
-            found.update(_whole_written(step.deferred.verb, step.deferred.operands))
-        found |= _written(step.body)
-        for branch in step.branches:
-            found |= _written(branch.body)
-    return found
-
-
 # The message-type and version shapes a ``MsgCreate`` must name to build a valid MSH. Only the caret
 # form of the type is read: ``ADT_A01`` is also how HL7 spells a message STRUCTURE (MSH-9.3), so
 # splitting an underscore would guess which of the two the export meant.
@@ -1693,12 +1680,14 @@ def _create_skeleton(deferred: _Deferred) -> tuple[str, str]:
     whose header the skeleton would silently omit."""
     if deferred.qualified:
         return "", "the statement carries a qualifier this import does not read"
-    types: list[str] = []
+    types: list[re.Match[str]] = []
     versions: list[str] = []
     for operand in deferred.operands[1:]:
-        if operand.kind in ("literal", "numeral") and _MESSAGE_TYPE.match(operand.text):
-            types.append(operand.text)
-        elif operand.kind in ("literal", "numeral") and _HL7_VERSION.match(operand.text):
+        if operand.kind not in ("literal", "numeral"):
+            return "", "it names something other than an HL7 message type and version"
+        if (found := _MESSAGE_TYPE.match(operand.text)) is not None:
+            types.append(found)
+        elif _HL7_VERSION.match(operand.text):
             versions.append(operand.text)
         else:
             return "", "it names something other than an HL7 message type and version"
@@ -1707,11 +1696,9 @@ def _create_skeleton(deferred: _Deferred) -> tuple[str, str]:
             "it does not name exactly one HL7 message type (such as ADT^A01) and one HL7 version "
             "(such as 2.5), so no valid MSH can be built"
         )
-    match = _MESSAGE_TYPE.match(types[0])
-    assert match is not None
     try:
         skeleton = Message.parse("MSH|^~\\&|")
-        for index, part in enumerate(match.groups(), start=1):
+        for index, part in enumerate(types[0].groups(), start=1):
             if part is not None:
                 skeleton.set(f"MSH-9.{index}", part)
         skeleton.set("MSH-12", versions[0])
@@ -1720,14 +1707,21 @@ def _create_skeleton(deferred: _Deferred) -> tuple[str, str]:
     return skeleton.encode().rstrip("\r"), ""
 
 
-def _join(entry: dict[str, str], outcomes: list[dict[str, str]]) -> dict[str, str]:
-    """The handles still bound after paths that each started from ``entry`` meet again.
+def _narrow(live: dict[str, str], outcomes: list[dict[str, str]]) -> None:
+    """Drop from ``live`` every handle not still bound, on the same local, after every path.
 
-    A handle survives only when every path ends with it on the same local it had at ``entry``. One
-    bound on some paths only, or overwritten on any, is unknown after the join. A handle each path
-    binds afresh is unknown too: the conditions are dead placeholders until a human writes them, so
-    no path is known to run."""
-    return {h: v for h, v in entry.items() if all(out.get(h) == v for out in outcomes)}
+    ``live`` is what held where the paths began. A handle bound on some paths only, or overwritten on
+    any, is unknown after they meet. A handle each path binds afresh is unknown too: the conditions are
+    dead placeholders until a human writes them, so no path is known to run."""
+    for handle, local in list(live.items()):
+        if any(out.get(handle) != local for out in outcomes):
+            del live[handle]
+
+
+def _forget(live: dict[str, str], verb: str, operands: tuple[Operand, ...]) -> None:
+    """Unbind every handle the statement may overwrite whole (see :func:`_whole_written`)."""
+    for handle in _whole_written(verb, operands):
+        live.pop(handle, None)
 
 
 class _Flow:
@@ -1742,12 +1736,19 @@ class _Flow:
 
     The walk follows the rendered tree, so it sees exactly the order and nesting the generated Python
     runs in. Each local name is fixed per handle for the whole handler, so a handle bound again inside
-    a branch rebinds the same Python variable and the join stays faithful."""
+    a branch rebinds the same Python variable and the join stays faithful.
+
+    The export is untrusted, so the walk is linear in the size of the tree: :meth:`_written` is
+    memoized per body, and :meth:`_local` resumes each name's counter instead of probing from 2."""
 
     def __init__(self, input_handle: str) -> None:
         self._input = input_handle
         self._names: dict[str, str] = {}
         self._taken: set[str] = {"msg", "sends", "_item"}
+        self._next: dict[str, int] = {}
+        # Keyed by the id of a body tuple of the unsettled tree. The tuple rides in the value, so it
+        # stays alive and its id cannot be reused for another body while this walk runs.
+        self._written_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
 
     def handler(self, steps: tuple[Step, ...]) -> tuple[Step, ...]:
         resolved, _ = self._run(steps, {self._input: "msg"} if self._input else {})
@@ -1756,11 +1757,36 @@ class _Flow:
     def _run(
         self, steps: tuple[Step, ...], entry: dict[str, str]
     ) -> tuple[list[Step], dict[str, str]]:
+        """Settle ``steps`` from a copy of ``entry``; return them and what holds after them."""
         live = dict(entry)
-        out: list[Step] = []
+        return self._run_in_line(steps, live), live
+
+    def _run_in_line(self, steps: tuple[Step, ...], live: dict[str, str]) -> list[Step]:
+        """Settle ``steps`` in line, updating ``live`` itself to what holds after them."""
+        return [self._step(step, live) for step in steps]
+
+    def _written(self, steps: tuple[Step, ...]) -> frozenset[str]:
+        """Every handle any live statement in ``steps`` may overwrite whole, nested constructs included.
+
+        Read on the UNSETTLED tree, so it is a syntactic answer: a clone this walk will bind counts as
+        a write as surely as an overwrite it cannot model. A loop and a ``Try`` use it to say which
+        handles may differ on a later pass or in a ``Catch``. Memoized, so nested loops and ``Try``
+        blocks share one pass over each body rather than walking it again at every level."""
+        cached = self._written_memo.get(id(steps))
+        if cached is not None:
+            return cached[1]
+        found: set[str] = set()
         for step in steps:
-            out.extend(self._step(step, live))
-        return out, live
+            if not isinstance(step, Control) or step.kind == "disabled":
+                continue
+            if step.deferred is not None and step.kind in ("pending", "unknown"):
+                found.update(_whole_written(step.deferred.verb, step.deferred.operands))
+            found |= self._written(step.body)
+            for branch in step.branches:
+                found |= self._written(branch.body)
+        result = frozenset(found)
+        self._written_memo[id(steps)] = (steps, result)
+        return result
 
     def _local(self, handle: str) -> str:
         """The Python local for ``handle``: fixed per handler, ASCII, never a keyword or a name the
@@ -1771,50 +1797,50 @@ class _Flow:
         base = re.sub(r"[^a-z0-9]+", "_", handle.lower()).strip("_")[:40].rstrip("_")
         if not base or not base[0].isalpha():
             base = f"tree_{base}".rstrip("_")
-        name = f"{base}_msg"
-        n = 2
+        n = self._next.get(base, 1)
+        name = f"{base}_msg" if n == 1 else f"{base}_msg_{n}"
         while name in self._taken:
-            name = f"{base}_msg_{n}"
             n += 1
+            name = f"{base}_msg_{n}"
+        self._next[base] = n + 1
         self._taken.add(name)
         self._names[handle] = name
         return name
 
-    def _step(self, step: Step, live: dict[str, str]) -> list[Step]:
+    def _step(self, step: Step, live: dict[str, str]) -> Step:
         """Settle one step, updating ``live`` to what holds after it."""
         if not isinstance(step, Control):
-            return [step]
+            return step
         kind = step.kind
         if kind == "disabled":
             # Settled for the comment block only: it never ran, so nothing it binds leaks out.
             body, _ = self._run(step.body, live)
-            return [replace(step, body=tuple(body))]
+            return replace(step, body=tuple(body))
         if kind == "pending":
             assert step.deferred is not None
-            return [self._statement(step, step.deferred, live)]
+            return self._statement(step, step.deferred, live)
         if kind == "send":
-            operands = step.deferred.operands if step.deferred is not None else ()
+            assert step.deferred is not None  # the parse gives every send its operands
+            operands = step.deferred.operands
             sent = _whole_tree(operands[0]) if operands else ""
             if sent and sent in live:
-                return [replace(step, message=live[sent])]
-            return [replace(step, refusal=_send_refusal(sent, live))]
+                return replace(step, message=live[sent])
+            return replace(step, refusal=_send_refusal(sent, live))
         if kind in ("block", "call"):
-            body, after = self._run(step.body, live)  # a label: its body runs in line
-            live.clear()
-            live.update(after)
-            settled = replace(step, body=tuple(body))
+            # A label: its body runs in line.
+            settled = replace(step, body=tuple(self._run_in_line(step.body, live)))
         elif kind in _LOOP_KINDS:
             # A later pass may start from what an earlier one overwrote, so a handle the body may
             # overwrite is unknown throughout it, and after it (the body may run no times at all).
-            entry = {h: v for h, v in live.items() if h not in _written(step.body)}
-            body, _ = self._run(step.body, entry)
-            live.clear()
-            live.update(entry)
+            for handle in self._written(step.body):
+                live.pop(handle, None)
+            body, _ = self._run(step.body, live)
             settled = replace(step, body=tuple(body))
         elif kind == "try":
             body, body_out = self._run(step.body, live)
             # A Catch may start anywhere in the body, so what the body may overwrite is unknown there.
-            caught = {h: v for h, v in live.items() if h not in _written(step.body)}
+            written = self._written(step.body)
+            caught = {h: v for h, v in live.items() if h not in written}
             outcomes = [body_out]
             branches: list[Control] = []
             for branch in step.branches:
@@ -1824,52 +1850,44 @@ class _Flow:
                     branches.append(replace(branch, body=tuple(arm)))
                 else:
                     branches.append(branch)  # a stray, settled below where the render puts it
-            after = _join(live, outcomes)
-            live.clear()
-            live.update(after)
+            _narrow(live, outcomes)
             settled = replace(step, body=tuple(body), branches=tuple(branches))
         elif kind in ("if", "case"):
-            # A ChooseFrom's statements before its first arm run unconditionally, in line.
             if kind == "case":
-                body, start = self._run(step.body, live)
+                # A ChooseFrom's statements before its first arm run unconditionally, in line.
+                body = self._run_in_line(step.body, live)
                 outcomes = []
             else:
-                start = dict(live)
-                body, body_out = self._run(step.body, start)
+                body, body_out = self._run(step.body, live)
                 outcomes = [body_out]
             branches = []
             for branch in step.branches:
-                arm, arm_out = self._run(branch.body, start)
+                arm, arm_out = self._run(branch.body, live)
                 outcomes.append(arm_out)
                 branches.append(replace(branch, body=tuple(arm)))
-            after = _join(start, outcomes)
-            live.clear()
-            live.update(after)
+            _narrow(live, outcomes)
             settled = replace(step, body=tuple(body), branches=tuple(branches))
         else:
             # "unknown", an orphaned branch marker, "break", "exit": the body is inlined in place
             # but its own scope was lost, so nothing it binds is trusted after it.
             if kind == "unknown" and step.deferred is not None:
-                for handle in _whole_written(step.deferred.verb, step.deferred.operands):
-                    live.pop(handle, None)
+                _forget(live, step.deferred.verb, step.deferred.operands)
             body, body_out = self._run(step.body, live)
-            after = _join(live, [body_out])
-            live.clear()
-            live.update(after)
+            _narrow(live, [body_out])
             settled = replace(step, body=tuple(body))
-        return [self._strays(settled, live)]
+        return self._strays(settled, live)
 
     def _strays(self, ctrl: Control, live: dict[str, str]) -> Control:
         """Settle the branches the render inlines AFTER ``ctrl`` (see :func:`_stray_branches`)."""
+        if all(_renders_as_branch(ctrl.kind, branch.kind) for branch in ctrl.branches):
+            return ctrl
         branches: list[Control] = []
         for branch in ctrl.branches:
             if _renders_as_branch(ctrl.kind, branch.kind):
                 branches.append(branch)
                 continue
             arm, arm_out = self._run(branch.body, live)
-            after = _join(live, [arm_out])
-            live.clear()
-            live.update(after)
+            _narrow(live, [arm_out])
             branches.append(replace(branch, body=tuple(arm)))
         return replace(ctrl, branches=tuple(branches))
 
@@ -1878,8 +1896,7 @@ class _Flow:
         verb, operands = deferred.verb, deferred.operands
         lowered = verb.lower()
         if deferred.flat is not None:
-            for handle in _whole_written(verb, operands):
-                live.pop(handle, None)
+            _forget(live, verb, operands)
             return deferred.flat
         if lowered == "msgtreecopy" and len(operands) == 2 and _whole_tree(operands[1]):
             return self._tree_copy(step, operands, live)
@@ -1894,8 +1911,7 @@ class _Flow:
             in_control=deferred.in_control,
         )
         result: Step = mapped if mapped is not None else _decline(verb, operands, live)
-        for handle in _whole_written(verb, operands):
-            live.pop(handle, None)
+        _forget(live, verb, operands)
         return result
 
     def _tree_copy(
@@ -1916,7 +1932,7 @@ class _Flow:
             expression = f"{live[source]}.copy()"
             local = self._local(dest)
             live[dest] = local
-            return Control("assign", verb, step.detail, args=(local, expression))
+            return Control("clone", verb, step.detail, args=(local, expression))
         live.pop(dest, None)
         what = (
             f"{_comment_text(source, 60)}, which holds no message this import can identify here"
@@ -1939,13 +1955,13 @@ class _Flow:
                 local = self._local(handle)
                 live[handle] = local
                 return Control(
-                    "assign",
+                    "create",
                     step.source_verb,
                     step.detail,
                     args=(local, f"Message.parse({_lit(skeleton)})"),
                 )
         return Control(
-            "assign",
+            "create",
             step.source_verb,
             step.detail,
             refusal=f"{name} is not built: {why}; the import refuses to guess the message",
@@ -2312,7 +2328,7 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         return [
             f"{pad}sends.append(Send({ctrl.args[0]}, {ctrl.message}))  # Corepoint {ctrl.source_verb}"
         ]
-    if ctrl.kind == "assign":
+    if ctrl.kind in _BINDING_KINDS:
         if ctrl.refusal:
             # Reaching this line is a loud ERROR (dead-letter), exactly like a refused send: the
             # handle would otherwise be sent, or written, holding a message nobody built.
@@ -2545,7 +2561,7 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list."""
-    return _any_live_send(steps, lambda send: bool(send.args))
+    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
 
 
 def _has_refusal(steps: tuple[Step, ...]) -> bool:
@@ -2555,12 +2571,7 @@ def _has_refusal(steps: tuple[Step, ...]) -> bool:
 
 def _builds_a_message(ctrl: Control) -> bool:
     """Whether ``ctrl`` renders a ``Message.parse`` (a ``MsgCreate`` with a skeleton)."""
-    return ctrl.kind == "assign" and not ctrl.refusal and ctrl.args[1].startswith("Message.parse(")
-
-
-def _any_live_send(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
-    """Whether any live ``send`` in the tree, branches included, passes ``test``."""
-    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and test(ctrl))
+    return ctrl.kind == "create" and not ctrl.refusal
 
 
 def _any_live_control(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
@@ -2694,8 +2705,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
 # ``break`` is faithful only inside a loop, so :func:`_count_steps` also reads its loop context: a
 # ``LoopExit`` outside a loop is a TODO marker and counts unmapped (BACKLOG #1860). A ``send`` that is
-# refused, or names no destination, is not sent either, and also counts unmapped; so does an ``assign``
-# that is refused, which renders as a raise rather than the build (BACKLOG #313).
+# refused, or names no destination, is not sent either, and also counts unmapped; so does a refused
+# ``create``, which renders as a raise rather than the build (BACKLOG #313).
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -2709,8 +2720,8 @@ _MAPPED_CONTROL_KINDS = frozenset(
         "match",
         "break",
         "send",
-        "assign",
         "call",
+        *_BINDING_KINDS,
     }
 )
 
