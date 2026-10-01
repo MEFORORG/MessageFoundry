@@ -60,6 +60,11 @@ from typing import NoReturn
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
+from messagefoundry.pipeline.path_confine import (
+    lexical_roots,
+    lexically_within,
+    resolves_within,
+)
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
@@ -75,6 +80,14 @@ _ACTION_SEED = "dr_seed"
 _ACTION_ACTIVATE = "dr.activate"
 _ACTION_RELEASE = "dr.release"
 _ACTION_ABORTED = "dr_activation_aborted"
+
+#: The one answer for every refused request archive, whichever check refused it. It names the
+#: setting and no part of the path, so the refusal says nothing about what exists on the DR box.
+_REQUEST_ARCHIVE_REFUSED = (
+    "the archive named in the request was refused: a request may name only an archive under "
+    "[dr].seed_dir, and with [dr].seed_dir unset it may name none. Set [dr].seed_dir, or name "
+    "the archive in [dr].seed_archive — refusing to activate (ADR 0048 fail-closed)"
+)
 
 
 class DrActivationError(RuntimeError):
@@ -172,7 +185,8 @@ class DrCoordinator:
         operator ``actor`` for the audit rows.
 
         ``archive`` overrides ``[dr].seed_archive`` (the runbook may pass the chosen #60 backup in the
-        request body). ``dba_attests_restored`` is the operator's explicit, per-activation attestation that
+        request body), and is confined to ``[dr].seed_dir`` before anything opens it
+        (:meth:`_confine_request_archive`). ``dba_attests_restored`` is the operator's explicit, per-activation attestation that
         a DBA has restored the server-DB ``mefor`` database for THIS failover — REQUIRED on a
         Postgres/SQL Server store (the config-only cold-seed archive cannot restore or verify a
         DBA-managed DB) and IGNORED on SQLite (BACKLOG #102). Raises :class:`DrActivationError` and records
@@ -195,6 +209,8 @@ class DrCoordinator:
                 )
             seed = archive or self._settings.seed_archive
             now = self._clock()
+            if archive:
+                await self._confine_request_archive(archive, actor, now)
 
             # (1) Cold-seed restore-verify — FAIL-CLOSED, BEFORE any VIP step (AC-9/AC-14). A missing
             # seed path is itself an abort: a DR box must never promote onto an unverified store.
@@ -356,6 +372,24 @@ class DrCoordinator:
             )
 
     # --- internals -----------------------------------------------------------
+
+    async def _confine_request_archive(self, archive: str, actor: str, now: float) -> None:
+        """Refuse a request-named ``archive`` that is not under ``[dr].seed_dir`` (vault BACKLOG
+        #2581). Deny by default: with ``seed_dir`` unset, a request may name no archive.
+
+        The two lines of :mod:`~messagefoundry.pipeline.path_confine`: the text of ``archive``
+        first, with no filesystem call on it, then the resolve, off the event loop. Either
+        refusal aborts with one message through :meth:`_record_aborted`."""
+        seed_dir = self._settings.seed_dir
+        if (
+            not seed_dir
+            or not lexically_within(archive, lexical_roots([seed_dir]))
+            or not await asyncio.to_thread(_resolves_under, archive, seed_dir)
+        ):
+            log.warning(
+                "DR activation: refused a request archive outside [dr].seed_dir: %r", archive
+            )
+            await self._record_aborted("seed", _REQUEST_ARCHIVE_REFUSED, actor, now)
 
     async def _verify_seed(self, archive: str, actor: str, now: float) -> VerifyResult:
         """Restore-verify the #60 cold-seed archive, FAIL-CLOSED. Reuses ADR 0049's owned primitive
@@ -786,6 +820,12 @@ async def _run_command(command: str) -> bool:
     )
     await proc.wait()
     return proc.returncode == 0
+
+
+def _resolves_under(path: str, root: str) -> bool:
+    """Does ``path`` resolve to somewhere at or under ``root``? Resolves both, so the caller runs
+    it off the event loop and only after the text check has passed."""
+    return resolves_within(path, [Path(root).resolve()]) is not None
 
 
 def _basename(path: str) -> str:

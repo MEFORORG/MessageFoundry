@@ -6895,16 +6895,22 @@ def create_app(
     @app.post("/dr/activate", response_model=DrActionResult)
     async def dr_activate(
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_paced(Permission.DR_OPERATE)),
+        # Step-up, like the planned failover on POST /cluster/stepdown (vault BACKLOG #2581): a site
+        # promotion runs the operator's takeover hook and binds the priority listeners, so it asks
+        # for a fresh credential proof and takes the new-client-address check that proof carries.
+        identity: Identity = Depends(require_step_up(Permission.DR_OPERATE)),
         body: DrActivateRequest | None = Body(default=None),
     ) -> DrActionResult:
         """**Manually promote** this DR standby (#61, ADR 0048). Gated by the dedicated ``dr:operate``
-        permission (held by ADMINISTRATOR — NOT a reuse of ``connections:control``) and audited (every
-        action + every abort via ``auth/service.py``'s ``record_audit``). The fixed ordering is
+        permission (held by ADMINISTRATOR — NOT a reuse of ``connections:control``) behind
+        ``require_step_up``, and audited (every action + every abort via ``auth/service.py``'s
+        ``record_audit``). The fixed ordering is
         cold-seed restore-verify (**fail-closed** if the KeyProvider/DEK is unavailable at the DR site) →
         a new audit-chain segment → acquire-VIP-or-abort → serve under the DR run-profile. An optional
         ``{"archive": "<path>"}`` body overrides ``[dr].seed_archive`` (the runbook may pass the chosen
-        #60 backup); ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
+        #60 backup). A request may name only an archive under ``[dr].seed_dir``; with that unset, or for
+        a path outside it, activation aborts (422) before the path is touched (vault BACKLOG #2581).
+        ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
         the DBA restored the server-DB ``mefor`` database (REQUIRED on postgres/sqlserver, ignored on
         SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
         coord = engine.dr_coordinator
@@ -6940,11 +6946,13 @@ def create_app(
     @app.post("/dr/release", response_model=DrActionResult)
     async def dr_release(
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_paced(Permission.DR_OPERATE)),
+        # Step-up for the same reason as dr_activate above: a release runs the operator's release
+        # hook and unbinds every inbound listener (vault BACKLOG #2581).
+        identity: Identity = Depends(require_step_up(Permission.DR_OPERATE)),
     ) -> DrActionResult:
         """**Fail back** from this DR standby to the recovered primary (#61, ADR 0048) — drain-then-hand-
-        back, gated by ``dr:operate`` and audited. Releases the VIP (the optional release hook / the
-        passive LB returns it to the primary), unbinds all inbound listeners, and drains the staged queue
+        back, gated by ``dr:operate`` behind ``require_step_up`` and audited. Releases the VIP (the
+        optional release hook / the passive LB returns it to the primary), unbinds all inbound listeners, and drains the staged queue
         to completion before returning success (no dual-accept window while the VIP moves). Cross-store
         reconciliation with the recovered primary is operator-verified per the runbook (the engine gives
         no cross-store loss/duplicate guarantee)."""

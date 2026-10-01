@@ -22,6 +22,7 @@ from messagefoundry.pipeline.dr import DrActivationError, DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
+from tests import _fs_spy
 
 # A trivially-succeeding / trivially-failing shell command that works on the runner's shell (Git Bash on
 # the dev box, /bin/sh on CI, cmd on a bare Windows box). `exit N` is portable across all of them.
@@ -204,3 +205,93 @@ async def test_activate_on_non_dr_box_refused(tmp_path: Path) -> None:
 
 async def _noop() -> None:
     return None
+
+
+# --- vault BACKLOG #2581: an archive named in the request is confined to [dr].seed_dir ----------
+
+
+async def test_a_request_archive_outside_seed_dir_is_refused_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request may name only an archive under ``[dr].seed_dir``, judged from the text of the path
+    before any filesystem call on it.
+
+    RED when ``activate`` hands a request path to the restore-verify unconfined: the spy records
+    calls naming the refused path. The control is the last block: the archive inside ``seed_dir``
+    still activates through the same argument, and the spy records calls naming it.
+    """
+    store, archive, ss = await _seed(tmp_path)
+    seed_dir = Path(archive).parent
+    refused = [
+        str(tmp_path / "probe-outside" / "seed.mfbak"),
+        str(Path(str(seed_dir) + "-probe-sibling") / "seed.mfbak"),
+        str(seed_dir / ".." / "probe-climb.mfbak"),
+        *_fs_spy.NON_LOCAL_SHAPES,
+    ]
+    try:
+        coord, state = _coord(store, ss, seed_dir=str(seed_dir))
+        calls = _fs_spy.install(monkeypatch)
+        messages = set()
+        for path in refused:
+            with pytest.raises(DrActivationError) as exc:
+                await coord.activate(archive=path, actor="alice")
+            assert exc.value.kind == "seed", path
+            messages.add(str(exc.value))
+        # One generic answer, naming no part of any path, so the refusal cannot probe the filesystem.
+        assert len(messages) == 1
+        assert "probe" not in messages.pop()
+        assert _fs_spy.naming(calls, "probe") == []
+        assert not coord.active and not state["active"]
+        assert (await _actions(store)).count("dr_activation_aborted") == len(refused)
+
+        result = await coord.activate(archive=archive, actor="alice")
+        assert result.active and result.archive == Path(archive).name
+        assert _fs_spy.naming(calls, Path(archive).name)
+    finally:
+        await store.close()
+
+
+async def test_a_request_archive_is_refused_while_no_seed_dir_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deny by default: with no [dr].seed_dir there is nowhere a request may point, so even a good
+    # archive is refused untouched. The control is the same archive named in [dr].seed_archive,
+    # which is operator configuration and is not confined.
+    store, archive, ss = await _seed(tmp_path)
+    name = Path(archive).name
+    try:
+        coord, _state = _coord(store, ss)
+        calls = _fs_spy.install(monkeypatch)
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=archive, actor="alice")
+        assert exc.value.kind == "seed"
+        assert name not in str(exc.value)
+        assert _fs_spy.naming(calls, name) == []
+        assert not coord.active
+
+        configured, _state = _coord(store, ss, seed_archive=archive)
+        assert (await configured.activate(actor="alice")).active
+        assert _fs_spy.naming(calls, name)
+    finally:
+        await store.close()
+
+
+async def test_a_link_inside_seed_dir_that_leaves_it_is_refused(tmp_path: Path) -> None:
+    # The second line: the text check passes a path under seed_dir, and only the resolve can see
+    # that a link there points outside it.
+    store, archive, ss = await _seed(tmp_path)
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    link = seed_dir / "linked.mfbak"
+    try:
+        try:
+            link.symlink_to(archive)
+        except OSError:
+            pytest.skip("this account cannot create a symbolic link")
+        coord, _state = _coord(store, ss, seed_dir=str(seed_dir))
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=str(link), actor="alice")
+        assert exc.value.kind == "seed"
+        assert not coord.active
+    finally:
+        await store.close()

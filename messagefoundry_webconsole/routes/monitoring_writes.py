@@ -23,7 +23,9 @@ from messagefoundry.auth import Identity, Permission
 from .. import pages
 from .._auth import (
     assert_same_origin,
+    register_ui_action,
     require_ui,
+    require_ui_step_up,
 )
 from ._common import ACTIVE_ALERTS_LIMIT
 
@@ -35,15 +37,22 @@ _BAD_SUSPEND_WINDOW = (
     f"at most {ALERT_SUSPEND_MINUTES_MAX} (30 days)"
 )
 
+# The DR pair is step-up-gated like its JSON twin (vault BACKLOG #2581). Both are body-less POSTs with
+# no path parameters, so the /ui/reauth flow may re-POST them once the operator has re-verified, as
+# it does /ui/config/reload. The stepdown control maps back to a confirm page instead; DR has none.
+register_ui_action(r"^/ui/dr/activate$", Permission.DR_OPERATE)
+register_ui_action(r"^/ui/dr/release$", Permission.DR_OPERATE)
+
 
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L3a: monitoring write actions (alert ack/resolve, statistics reset, DB integrity check,
-    DR activate/release). Permission-gated to MATCH the JSON handlers (no step-up — they are not
-    require_step_up), CSRF-guarded by assert_same_origin, each redirecting back to its page.
+    DR activate/release). Gated to MATCH the JSON handlers, CSRF-guarded by assert_same_origin, each
+    redirecting back to its page.
 
-    These deliberately do NOT call register_ui_action(): that registry only gates the
-    step-up re-auth AUTO-RETRY allow-list (is_safe_ui_action), and these use plain require_ui —
-    they never route through /ui/reauth, so they have nothing to register."""
+    The DR pair is the exception to the rest of this module: its JSON twin is require_step_up, so it
+    takes require_ui_step_up and is registered above. Every other route here is plain require_ui,
+    like its twin. Those never route through /ui/reauth, so they call no register_ui_action(): that
+    registry only gates the step-up re-auth AUTO-RETRY allow-list (is_safe_ui_action)."""
     core = deps.core
 
     @app.post("/ui/alerts/{alert_id}/ack")
@@ -224,7 +233,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_dr_activate(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui(Permission.DR_OPERATE)),
+        identity: Identity = Depends(require_ui_step_up(Permission.DR_OPERATE)),
     ) -> Response:
         assert_same_origin(request)
         await core.dr_activate(engine=engine, identity=identity, body=None)
@@ -234,7 +243,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_dr_release(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui(Permission.DR_OPERATE)),
+        identity: Identity = Depends(require_ui_step_up(Permission.DR_OPERATE)),
     ) -> Response:
         assert_same_origin(request)
         await core.dr_release(engine=engine, identity=identity)

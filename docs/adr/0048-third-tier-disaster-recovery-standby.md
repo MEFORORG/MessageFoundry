@@ -317,6 +317,24 @@ configurable `[dr].activation_mode`:
   `activation_mode = auto` with a clear "not yet supported" error until that future mode lands — never a silent
   no-op.
 
+> **Amendment (vault BACKLOG #2581): both DR endpoints ask for step-up, and a request-named archive is
+> confined.** This ADR said who may call `POST /dr/activate` and `POST /dr/release` and never said whether
+> either asks for a fresh credential proof. They shipped behind `require_paced`, while the smaller planned
+> failover on `POST /cluster/stepdown` ([ADR 0056](0056-engine-managed-vip-failover.md)) shipped behind
+> `require_step_up`. That gap was unrecorded, not decided. **Decision:** both DR endpoints sit behind
+> `require_step_up(Permission.DR_OPERATE)`, and their console twins behind `require_ui_step_up`. A promotion
+> runs the operator's takeover hook and binds the priority listeners; a release runs the release hook and
+> unbinds every inbound. Each is at least as consequential as a stepdown, so each takes the same fresh proof
+> and the new-client-address check that comes with it. The cost is a typed password during a site failover.
+> The window form is used, not the action-bound form of ADR 0077, because the comparable operator writes
+> (stepdown, purge, reload) use it.
+>
+> **The `archive` in the request body is confined to a new `[dr].seed_dir`.** The path was unconfined, and
+> the restore-verify opened whatever it named. Now a request may name only an archive under `seed_dir`, and
+> none at all while that key is empty. The check reads the text of the path first, before any filesystem
+> call on it, then resolves and compares again. `[dr].seed_archive` is operator configuration and stays
+> unconfined.
+
 This setting lives in **engine service settings** (`messagefoundry.toml` `[dr]`), **not** `connections.toml` — it
 is a property of the DR deployment, not of any endpoint. A new `DrSettings` section is added to
 `config/settings.py` (alongside `ClusterSettings`/`RetentionSettings`) and threaded into `ServiceSettings` and the

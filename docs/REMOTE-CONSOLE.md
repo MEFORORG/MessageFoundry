@@ -261,7 +261,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 | Acknowledge / resolve / suspend / resume an alert | `/ui/alerts/{alert_id}/ack`, `/resolve`, `/suspend`, `/resume` | `monitoring:diagnose` | — |
 | Reset cumulative statistics — all of them, one connection, or a selection | `/ui/statistics/reset`, `/reset-one`, `/reset-many` | `monitoring:diagnose` | — |
 | Run an on-demand store integrity check (`PRAGMA quick_check` — reads, changes nothing) | `/ui/status/integrity-check` | `monitoring:diagnose` | — |
-| Activate / release a DR standby | `/ui/dr/activate`, `/ui/dr/release` | `dr:operate` | — |
+| Activate / release a DR standby | `/ui/dr/activate`, `/ui/dr/release` | `dr:operate` | step-up |
 | Upload a message file into the engine — **writes real PHI at rest** | `/ui/uploaded-logs/upload` | `files:upload` | step-up |
 | Re-inject a message out of an uploaded file | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | step-up |
 | Delete an uploaded file | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | step-up |

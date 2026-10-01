@@ -1690,6 +1690,7 @@ def test_invalid_priority_and_dr_settings_rejected(tmp_path: Path) -> None:
         "[dr]\ntakeover_hook = '   '\n",  # blank-but-present hook
         "[dr]\ntakeover_timeout_seconds = 0\n",  # non-positive timeout
         "[dr]\nseed_archive = 's3://bucket/seed.mfbak'\n",  # cloud seed source
+        "[dr]\nseed_dir = 's3://bucket/seeds'\n",  # vault BACKLOG #2581: cloud seed directory
         "[dr]\nrestore_token = 'https://x/token.json'\n",  # BACKLOG #223: cloud restore-token source
     ]
     for i, body in enumerate(bad_configs):
@@ -1708,6 +1709,14 @@ def test_dr_restore_token_local_path_parses(tmp_path: Path) -> None:
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.dr.restore_token == "D:/dr/restore.token"
+
+
+def test_dr_seed_dir_parses_and_defaults_off(tmp_path: Path) -> None:
+    # Vault BACKLOG #2581: "" (the default) means a request may name no archive at all. A local
+    # path parses; a cloud URL is the only rejected form (covered above).
+    assert DrSettings().seed_dir == ""
+    cfg = _write(tmp_path / "dr_seed_dir.toml", "[dr]\nenabled = true\nseed_dir = 'D:/dr/seeds'\n")
+    assert load_settings(config_path=cfg, environ={}).dr.seed_dir == "D:/dr/seeds"
 
 
 def test_auth_mfa_secure_defaults_and_totp_skew_validation() -> None:
