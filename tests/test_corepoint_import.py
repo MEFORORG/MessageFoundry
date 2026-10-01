@@ -3636,3 +3636,20 @@ def test_a_foreach_over_a_path_with_a_variable_still_reads() -> None:
     loop = '<Foreach Data="ForEach %ADT/OBX $obx"><List>' + _MSGLOG_P + "</List></Foreach>"
     body = _handler_body(_handler_source(_CLONE_OUT + loop + _SEND_OUT))
     assert '    sends.append(Send("OB_OUT", out_msg))' in body
+
+
+def test_a_try_holding_a_nested_try_is_not_a_branch_group_wrapper() -> None:
+    """A ``<Try>`` with no ``@Data`` dissolved whenever its body held another Try, so its Catch came
+    loose and a clone made in its body read as made on every path. Only a wrapper whose children
+    are all the construct's own branch lines dissolves (the differential guard's sweep, seed 4)."""
+    inner = "<Try><List>" + _MSGLOG_P + _CATCH_LINE + _MSGLOG_P + "</List></Try>"
+    outer = "<Try><List>" + inner + _CLONE_OUT + _CATCH_LINE + _MSGLOG_P + "</List></Try>"
+    # In a Block, so a loose Catch's lost scope ends before the send (see _Flow._lost).
+    block = '<Block Data="Section"><List>' + outer + "</List></Block>"
+    body = _handler_body(_handler_source(_WRITE_INPUT + block + _SEND_OUT))
+    assert "with no enclosing construct" not in body
+    assert body.count("try:") == 2
+    assert 'Send("OB_OUT"' not in body
+
+
+_CATCH_LINE = '<Line Data="Catch"/>'

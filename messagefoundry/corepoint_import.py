@@ -1703,17 +1703,20 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
 
     # Never a ``<Call>``: dissolving one would run the called list's statements in the caller's
     # scope, so a handle the called list rebuilt would keep the caller's stale local.
-    if not data and kind != "call" and any(isinstance(s, Control) and s.kind == kind for s in body):
+    if not data and kind not in (None, "call") and _holds_branch_lines(elem, kind):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
         # at all, holding one child per branch (``<Line Data="If (…)">``, ``<Line Data="Else">``,
         # ``<Line Data="Catch">``) that each carry their OWN condition and their OWN body. Emitting a
         # construct for the wrapper too produced a second, condition-less ``if False:`` around an
         # already-complete chain — 757 of them, every one counted as a mapped step it never was.
         #
-        # The test is that the body ALREADY contains the same construct, not merely that the element
-        # has no ``@Data``: an exporter that puts the condition on the container and the statements
-        # directly beneath it (the shape the synthetic fixture models) has no inner construct to
-        # inherit, and passing that through would delete the try/except or the if entirely.
+        # The test is that every child is one of the construct's own branch LINES, not merely that
+        # the element has no ``@Data``: an exporter that puts the condition on the container and the
+        # statements directly beneath it (the shape the synthetic fixture models) has no inner
+        # construct to inherit, and passing that through would delete the try/except or the if
+        # entirely. *Corrected 2026-10-01:* the test was that the body held any construct of the same
+        # kind, so a ``<Try>`` holding a nested ``<Try>`` element dissolved, its Catch arms came loose,
+        # and what its body bound was read as bound on every path (the differential guard's sweep).
         return list(body)
 
     if kind is None:
@@ -1780,6 +1783,30 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
     inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
     return [Control(kind, source, detail, body=inner, branches=branches)]
+
+
+def _holds_branch_lines(elem: Element, kind: str) -> bool:
+    """Whether ``elem`` is a branch-group wrapper for ``kind``: every statement child, through any
+    ``<List>``/``<Actions>`` wrapper, is a ``<Line>`` carrying ``kind`` itself or one of its branch
+    verbs, and at least one carries ``kind``."""
+    lines: list[str] = []
+    stack = list(elem)
+    while stack:
+        child = stack.pop()
+        tag = _local(child.tag).lower()
+        if tag in _LIST_TAGS:
+            stack.extend(child)
+            continue
+        if tag != "line":
+            return False
+        data = _attr(child, "Data")
+        line_kind = _statement_kind(
+            "line", _statement_verb(parse_roles(data), _split_verb(strip_markup(data))[0])
+        )
+        if line_kind != kind and _BRANCH_PARENT.get(line_kind or "") != kind:
+            return False
+        lines.append(line_kind or "")
+    return kind in lines
 
 
 def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:
