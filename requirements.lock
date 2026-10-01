@@ -895,7 +895,9 @@ pyyaml==6.0.3 \
 requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
     --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
-    # via hvac
+    # via
+    #   hvac
+    #   messagefoundry
 ruff==0.15.22 \
     --hash=sha256:11c1c715af53a09f714e011106bffc419751ec8232fcb5da42173284ea3fec6f \
     --hash=sha256:1877d63b9d24ed278744f1523fd11b85540566d54641f97c566d7d9dc5ca5296 \
