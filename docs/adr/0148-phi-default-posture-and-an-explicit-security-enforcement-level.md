@@ -16,6 +16,15 @@
 > (`[security].enforcement`) is unchanged and is now the sole refuse/warn key**, as is the retained
 > informational `production` tier. Read every `data_class` mention below as historical.
 
+> **Amended 2026-10-01 (vault BACKLOG #2611):** the retained `production` tier fact gains a third
+> reader, beside FIX 2 (the AI ceiling) and FIX 3 (the DEBUG refusal). Under `enforcement = enforce`,
+> `serve` refuses `[security].require_sign_in = false` on a production-tier instance, on any bind.
+> The tier is the key for FIX 3's reason: sign-in off is a development escape hatch, so whether a
+> box may use it is a fact about the tier. It differs from FIX 3 in one way: `enforcement = warn`
+> opens it, as GIVEN 2 says of every refusal. `enforcement` stays the refuse/warn dial, and no other
+> gate reads the tier. The exposed-instance refusal of sign-in off is unchanged and still holds at
+> any enforcement level.
+
 ---
 
 ## Context

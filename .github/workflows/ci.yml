@@ -3797,6 +3797,11 @@ jobs:
           # (cert/key/password + WS-Security creds) so the SOAP feed wires — placeholders, never used
           # since no VXU is sent; the non-secret endpoints live in environments/prod.toml (selected by
           # the -Environment prod passed to install-service.ps1 above).
+          # An enforcing production-tier instance refuses sign-in off on any bind (vault BACKLOG
+          # #2611), so this auth-off smoke sets MEFOR_SECURITY_PRODUCTION_INSTANCE=false. The name
+          # stays `prod` and the gates below key on [security].enforcement, so they still apply. What
+          # reads the tier does not: at least the DEBUG refusal and the AI data-scope ceiling. The
+          # auth-on arms further down run on the production tier.
           # `prod` also FAIL-CLOSES on unrestricted egress (a transform could send PHI anywhere): lock it
           # down (deny_by_default) AND allowlist the samples/config graph's 8 outbound destinations, or the
           # engine refuses to start at wiring. [egress] is SERVICE settings (MEFOR_EGRESS_*), NOT an
@@ -3816,6 +3821,7 @@ jobs:
           # a window, so the smoke exercises the path it is meant to validate instead of opting out of it.
           & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry AppEnvironmentExtra `
             "MEFOR_SECURITY_REQUIRE_SIGN_IN=false" `
+            "MEFOR_SECURITY_PRODUCTION_INSTANCE=false" `
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
             "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
             "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
