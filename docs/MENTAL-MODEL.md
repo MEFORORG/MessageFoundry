@@ -466,6 +466,60 @@ messagefoundry supervise --config ./config --base-port 8765   # one subprocess p
 
 **What’s measured, and what isn’t.** On a consumer 8-core test box, supervise scaled roughly linearly — 1 → 2 → 4 shards at ~50 → 88.7 → 165.5 msg/s aggregate, about η ≈ 0.85 of a core per added shard. The portable result is that **speedup shape**, not the absolute rate: multiply η by *your* measured single-shard rate. Two honest caveats — that run used the since-deprecated per-shard SQLite store, and N shards actively sharing one server DB, while built and invariant-tested, is **not yet certified as a supported production topology** (it awaits a clean multi-engine no-loss bench). Until it is, size production multi-engine deployments as active-passive (§14). Detail: docs/SYSTEM-REQUIREMENTS.md and docs/benchmarks/TUNING-BASELINE.md.
 
+### Engine shards split the inbound Connections and share one message store
+
+This diagram shows how MessageFoundry scales past one process. `messagefoundry supervise` starts one
+engine process for each engine shard id, each with `serve --shard <id>` and its own API port. Each
+inbound Connection belongs to exactly one engine shard. Every engine shard reads and writes ONE
+shared message store.
+
+```mermaid
+flowchart TB
+  classDef io fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+
+  SUPERVISE["messagefoundry supervise<br/>finds the engine shard ids in the config<br/>restarts a process that exits"]:::ext
+
+  subgraph ES_A["Engine shard a"]
+    IN_A["Inbound Connections tagged a"]:::io
+    PROC_A["Engine process: serve --shard a<br/>API port: base"]:::core
+  end
+
+  subgraph ES_B["Engine shard b"]
+    IN_B["Inbound Connections tagged b"]:::io
+    PROC_B["Engine process: serve --shard b<br/>API port: base + 1"]:::core
+  end
+
+  subgraph ES_DEFAULT["Engine shard default"]
+    IN_DEFAULT["Inbound Connections with no tag"]:::io
+    PROC_DEFAULT["Engine process: serve --shard default<br/>API port: base + 2"]:::core
+  end
+
+  UNIFIED_STORE[("ONE message store<br/>one PostgreSQL or SQL Server database")]:::store
+
+  SUPERVISE -.->|"starts"| PROC_A
+  SUPERVISE -.->|"starts"| PROC_B
+  SUPERVISE -.->|"starts"| PROC_DEFAULT
+  IN_A ==> PROC_A
+  IN_B ==> PROC_B
+  IN_DEFAULT ==> PROC_DEFAULT
+  PROC_A ==> UNIFIED_STORE
+  PROC_B ==> UNIFIED_STORE
+  PROC_DEFAULT ==> UNIFIED_STORE
+```
+
+**Legend.** Thick arrows carry messages. Dotted arrows are process control. The cylinder is the
+message store. API ports follow the sorted order of the engine shard ids.
+
+This is **engine sharding**: [ADR 0037](adr/0037-multi-process-sharding-l3.md) defines it, and
+[ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md) requires the one shared store.
+Every engine process also loads the same Routers, Handlers and outbound Connections, and exactly
+one engine shard delivers for each outbound Connection. **Database sharding** is a different idea:
+it would split the message store across several databases.
+[ADR 0039](adr/0039-database-tier-sharding-l5.md) proposed it, and its status is declined.
+
 ## 16. Dependencies & supply chain
 
 MessageFoundry keeps its dependency surface deliberately small and stdlib-first (FTP, for instance, uses the standard library — no package at all), and treats every third-party library as **SOUP — Software of Unknown Provenance**: a black box you control at your own boundary rather than by reading its source.
