@@ -65,13 +65,14 @@ XML is parsed through **defusedxml** with ``forbid_dtd``/``forbid_entities``/``f
 on, so a billion-laughs or external-entity payload raises instead of expanding.
 Paths ride across as data to :meth:`Message.set` at run time.
 
-**Message handles become Python locals (BACKLOG #313).** An action-list works on several message
-trees at once; a Handler receives one ``msg``. The parse builds the step tree first, then
-:class:`_Flow` walks it in statement order: the input handle is ``msg``, a whole-tree clone binds
-``<local> = <source>.copy()``, a ``MsgCreate`` naming a message type and a version binds
-``<local> = Message.parse(<skeleton>)``, and field writes and sends address the local of the handle
-they name. Whatever the walk cannot settle raises at the send or ``MsgCreate`` site; nothing falls
-back to sending ``msg``.
+**Message handles become Python locals, in a FULLY UNDERSTOOD list only (BACKLOG #313 step 2, ADR
+0086).** An action-list works on several message trees at once; a Handler receives one ``msg``. Before
+a list is parsed, :func:`_understood_list` decides once whether every element in it, at every depth,
+is on a small allow-list: a plain clone, a buildable ``MsgCreate``, a field write, a ``MsgLog``, a
+``MsgSend``, a ``<Block>`` whose label is prose, and a surely disabled step, each in exactly one
+shape with nothing unread. Only then does :class:`_Binder` give each handle its own local, in
+statement order. Every other list takes the step 1 path unchanged, byte for byte: a send it cannot
+prove is ``msg`` raises.
 
 Pure (parse + string codegen): no network, no message content, no dependency beyond the engine's
 vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) and its own HL7 model
@@ -84,8 +85,6 @@ import html
 import json
 import keyword
 import re
-import unicodedata
-from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import Path
@@ -101,7 +100,7 @@ from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.message import Message
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
         Element,
     )
@@ -153,9 +152,8 @@ class Action:
     leading message argument; ``keywords`` are ``(name, rendered_value)`` pairs. ``source_class`` is
     the originating Corepoint action class (kept for provenance in comments/summaries).
 
-    ``target`` is the Python local the call writes: ``msg`` for the input handle, or the local a
-    clone or ``MsgCreate`` bound for another handle (BACKLOG #313, step 2). It is always a name this
-    module generated, never export text."""
+    ``target`` is the Python local the call writes: ``msg``, or in a fully understood list the local
+    :class:`_Binder` gave another handle (BACKLOG #313 step 2). Always a name this module generated."""
 
     source_class: str
     vocabulary: str
@@ -177,36 +175,6 @@ class UnmappedAction:
 
 
 @dataclass(frozen=True)
-class _Deferred:
-    """What the handle flow needs to settle a statement once it knows what each handle holds there.
-
-    Produced by the parse, read by :class:`_Flow`, never rendered. ``flat`` is the markup-free
-    reading's finished step: such a statement has no handle roles to map against, so the flow only
-    applies the statement's whole-tree writes and then emits ``flat`` unchanged."""
-
-    verb: str
-    operands: tuple[Operand, ...]
-    qualified: bool = False
-    in_control: bool = False
-    flat: Action | UnmappedAction | None = None
-    # Every handle the statement names as a whole tree, in EITHER reading of its markup, so a span
-    # class the role layer does not list does not hide a ``%`` handle from the fail-closed write
-    # rule. It is still blind to at least a handle spelled with no ``%`` in a markup-free or
-    # unlisted-class statement, which is why such a statement leaves every handle unknown (see
-    # _unread) and a call is never judged from it (see _Flow._call_keys).
-    named: frozenset[str] = frozenset()
-    # Every word of the statement that is neither an operand nor the verb, styled or not (see
-    # :func:`_statement_words`). Field writes, clones and ``MsgCreate`` are all judged on these.
-    words: tuple[str, ...] = ()
-    # Whether the verb was styled as a keyword span. Only a field write reads this (see _Flow), and
-    # the default is the fail-closed one: an unstyled verb declines.
-    styled: bool = False
-    # Whether a span fell out of both readings (a ``block``, ``pass`` or ``custom`` span). A handle
-    # inside one is invisible to every rule, so the flow reads the statement as unread.
-    dropped: bool = False
-
-
-@dataclass(frozen=True)
 class Control:
     """A non-leaf element of the ``<Package>`` control-flow tree — a construct with a nested body.
 
@@ -215,25 +183,19 @@ class Control:
 
     ``"block"``   a ``<Block>`` section label / ``<Call>`` inline — a **comment** plus its body at the
                   *same* indentation (a ``<Block>`` is a label, never an action, so it emits no step).
-    ``"call"``    an ``ActionListCall``. With its target list inlined it renders like ``"block"``, and
-                  the list runs in its own handle scope (see :meth:`_Flow._call`). With nothing
-                  inlined it renders a TODO marker and counts unmapped.
+    ``"call"``    an ``ActionListCall`` whose target list is inlined — rendered like ``"block"``.
     ``"if"``      with ``branches`` of kind ``"elif"``/``"else"``.
     ``"for"``     ``ForEach`` · ``"while"`` ``Loop`` · ``"break"`` ``LoopExit``.
     ``"try"``     with ``branches`` of kind ``"except"`` (``Catch``).
     ``"case"``    ``ChooseFrom``/``<Case>`` with ``branches`` of kind ``"match"`` (``Matching``).
     ``"send"``    a ``MsgSend`` — ``args`` carries the rendered destination-name literal (empty when
                   the export names none, which degrades to a TODO marker rather than a guess).
-                  ``message`` is the local it delivers. ``refusal`` is non-empty when the handle it
-                  sends holds no message the import can identify at that point; the render then
-                  raises at the send site instead of sending (BACKLOG #313).
-    ``"clone"``   a whole-tree ``MsgTreeCopy`` that binds a handle to a local: ``args`` is
-                  ``(local, "<source>.copy()")`` (BACKLOG #313).
-    ``"create"``  a ``MsgCreate`` that binds a handle to a local: ``args`` is
-                  ``(local, "Message.parse(<skeleton>)")``. One with too little to build a valid MSH
-                  carries a ``refusal`` instead and renders as a raise (BACKLOG #313).
-    ``"pending"`` the parse's placeholder for a statement whose rendering depends on what each
-                  handle holds at that point. :class:`_Flow` replaces every one; none is rendered.
+                  ``refusal`` is non-empty when the statement delivers a handle that is not provably
+                  ``msg``; the render then raises at the send site instead of sending (BACKLOG #313).
+                  ``message`` is the local it delivers.
+    ``"clone"``   a whole-tree ``MsgTreeCopy`` that binds a handle to a local, and ``"create"`` a
+                  ``MsgCreate`` that does: ``args`` is ``(local, expression)``. Only :class:`_Binder`
+                  makes either, in a fully understood list (BACKLOG #313 step 2).
     ``"exit"``    ``Returns``/``ActionListExit``/``ActionListStop`` — no faithful vocabulary form, so a
                   TODO marker (never a silent flatten).
     ``"unknown"`` an element in a statement position whose TAG this layer does not model (a ``<Switch>``,
@@ -254,17 +216,10 @@ class Control:
     args: tuple[str, ...] = ()
     body: tuple[Step, ...] = field(default_factory=tuple)
     branches: tuple[Control, ...] = field(default_factory=tuple)
-    # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` and ``"create"`` set it.
+    # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` sets it.
     refusal: str = ""
-    # The local a ``"send"`` delivers. A name this module generated, never export text. Empty until
-    # :class:`_Flow` binds it, and the render refuses an empty one, so no send can default to ``msg``.
-    message: str = ""
-    # What :class:`_Flow` reads to settle a ``"pending"``/``"send"``, and the writes of an ``"unknown"``.
-    deferred: _Deferred | None = None
-    # RAW text, set on a construct or a branch whose own line the flow cannot trust (see
-    # :func:`_unreadable`). It stays IN its chain, so an ``Else`` after it is still adopted, and the
-    # flow vouches for no handle across the whole chain it belongs to (see :func:`_bracketed`).
-    unread: str = ""
+    # The local a live ``"send"`` delivers: a name this module generated, never export text.
+    message: str = "msg"
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -830,68 +785,115 @@ def _role_verb(tokens: tuple[RoleToken, ...]) -> str:
     return ""
 
 
-def _input_handle(action_list: Element) -> tuple[str, bool]:
-    """The list's one ``input-handle``, which the Handler receives as ``msg``, or ``""``.
+def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[str]]:
+    """``(subject, held)`` for an action-list: the handles its steps may be mapped against, and the
+    handles known to hold ``msg``.
 
     A Corepoint action-list manipulates **several** messages at once (input, output, scratch), while a
-    MessageFoundry Handler receives exactly **one** ``msg``. The input handle is the one the role
-    markup tags ``input-handle``; every other handle starts out holding nothing the import can name,
-    and gains a Python local only where :class:`_Flow` sees a clone or a ``MsgCreate`` bind it.
+    MessageFoundry Handler has exactly **one** ``msg``. So a field write is only faithfully
+    representable when we can say *which* handle became ``msg`` — and in the validated corpus that is
+    genuinely ambiguous for a large minority of lists (most lists carry 2+ handles, and more of them
+    deliver a handle *other* than their input than deliver the input itself, so "the input handle" is
+    the wrong answer).
 
-    The answer requires exactly one distinct ``input-handle`` name across the list's live elements.
-    With none, or two, no handle is known to be ``msg``, so every field write and send that addresses
-    the input fails closed. The scan skips ``@Disabled`` statements exactly where
-    :func:`_parse_statement` does, so a switched-off line naming a second input does not count.
+    In a Handler, ``msg`` is the message that arrived **and** the message returned by ``Send`` — the
+    two are the same object. So the subject is the list's **input** handle, and only when that same
+    handle is what the list delivers. A list that builds a *separate* output tree and sends that has
+    no equivalent at all: writing its fields onto ``msg`` would mutate the inbound message, which is
+    not the message Corepoint was populating. (This is not hypothetical — more lists deliver a
+    non-input handle than deliver the input one, which is exactly why "the input handle" alone is the
+    wrong predicate.)
 
-    The second value says whether any live element carries role markup at all. Only a list with none
-    keeps the superseded model's reading, in which a markup-free field write lands on ``msg``."""
+    ``held`` therefore requires exactly one distinct ``input-handle`` in the list, and is that handle
+    **plus its whole-tree clones**. A clone — a ``MsgTreeCopy`` of the input's ROOT into another
+    handle — holds exactly the input's content, so a write to it is a write to what ``msg`` will be; a
+    *partial* copy is not, and is excluded, because the destination tree then holds only the sub-node
+    that was copied. A handle that ALSO receives a whole-tree copy of anything else (another tree, a
+    ``$variable``, a partial path) is not held, since its content may be that other thing; when that
+    handle is the input itself, nothing is held.
+
+    ``subject`` is ``held`` when the list sends nothing, the one held handle it delivers when the live
+    ``MsgSend`` statements deliver exactly one, and empty otherwise. Two held handles are two trees in
+    Corepoint, and folding both onto one ``msg`` would put a write meant for one into the other's send.
+    An empty subject means **every**
+    path-bearing statement in the list degrades to a TODO — the honest output, because a
+    cross-message write rendered as ``msg.set`` silently mutates the wrong message. A ``MsgSend`` of
+    anything outside ``held`` is refused by :func:`_send_refusal` (BACKLOG #313).
+
+    The scan skips ``@Disabled`` statements exactly where :func:`_parse_statement` does, and reads each
+    verb and kind through the same helpers. It is **flow-insensitive**: it does not see statement order
+    or whether a copy sits in a branch, so a send that runs before its clone is made, or a clone made
+    only on one branch, still counts as held. Modelling that is #313 step 2."""
     inputs: set[str] = set()
-    # Input names inside an inlined ``<Call>`` body. They may make the caller's input ambiguous,
-    # because nothing establishes that a call passing nothing does not hand the caller's input to
-    # the called list's input handle. They never decide it: the called list's input is whatever
-    # it was passed, so with no input of the caller's own, a scratch handle that shares the called
-    # list's input name would otherwise be read as msg. Both ways fail closed.
-    called_inputs: set[str] = set()
-    # Everything beneath a call, whether a ``<Call>`` tag or any element whose verb the parse reads
-    # as a call (see :func:`_statement_kind`). Document order puts each call before its body.
-    called: set[int] = set()
-    # Role markup anywhere, a called list included, counts: it only ever makes a markup-free write
-    # decline rather than land on msg.
-    marked = False
-    for elem, unsure in _live_elements(action_list):
+    delivered: set[str] = set()
+    root_copies: list[tuple[str, str]] = []  # (source handle, destination handle)
+    for elem in _live_elements(action_list):
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
-        marked = marked or bool(tokens)
-        names = {t.text for t in tokens if t.source_class == "input-handle"}
-        inside = id(elem) in called
-        # A line that may or may not have run votes like a called list: never supplies the input.
-        (called_inputs if inside or unsure else inputs).update(names)
-        tag = _local(elem.tag)
+        if not tokens:
+            continue  # markup-free: no handle roles to learn from
+        inputs.update(t.text for t in tokens if t.source_class == "input-handle")
+        # Every live element counts, an unmodelled tag included: it ran in Corepoint even though the
+        # render only marks it, and counting it can only narrow what is held.
         verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
-        if not inside and (tag.lower() == "call" or _statement_kind(tag, verb) == "call"):
-            called.update(id(inner) for inner in elem.iter() if inner is not elem)
-    one = next(iter(inputs)) if len(inputs) == 1 and called_inputs <= inputs else ""
-    return one, marked
+        operands = _operands_from_roles(tokens)
+        if _statement_kind(_local(elem.tag), verb) == "send":
+            delivered.add(_whole_tree(operands[0]) if operands else "")  # "" is never held
+        elif verb.lower() == "msgtreecopy" and len(operands) == 2:
+            src, dst = (_whole_tree(o) for o in operands)
+            if dst:
+                # A source that is not a whole tree ("") overwrites ``dst`` with something foreign.
+                root_copies.append((src, dst))
+    if len(inputs) != 1:
+        return frozenset(), frozenset()
+    source = next(iter(inputs))
+    same = _clones_of(source, root_copies)
+    while True:
+        # A handle overwritten from outside the clone set may hold that other tree instead. Drop it,
+        # and every copy into or out of it, until nothing more drops.
+        foreign = {dst for src, dst in root_copies if src not in same}
+        if source in foreign:
+            return frozenset(), frozenset()
+        kept = [(s, d) for s, d in root_copies if s not in foreign and d not in foreign]
+        narrowed = _clones_of(source, kept)
+        if narrowed == same:
+            break
+        same = narrowed
+    held = frozenset(same)
+    if not delivered:
+        return held, held
+    # Only the ONE delivered tree is msg. A write to another held handle (the input after it was
+    # cloned, or a clone that is never sent) would otherwise land in the delivered message.
+    return (
+        frozenset(delivered) if len(delivered) == 1 and delivered <= held else frozenset()
+    ), held
 
 
-def _live_elements(action_list: Element) -> list[tuple[Element, bool]]:
-    """Every element under ``action_list`` in document order, less each surely ``@Disabled``
-    subtree, each with whether it sits under a ``@Disabled`` value that may mean enabled.
+def _clones_of(source: str, root_copies: list[tuple[str, str]]) -> set[str]:
+    """``source`` plus every handle a chain of root copies reaches from it, only ever forward."""
+    same = {source}
+    for _ in range(len(root_copies)):
+        grew = {dst for src, dst in root_copies if src in same}
+        if grew <= same:
+            break
+        same |= grew
+    return same
+
+
+def _live_elements(action_list: Element) -> list[Element]:
+    """Every element under ``action_list`` in document order, less each ``@Disabled`` subtree.
 
     A ``<List>``/``<Actions>`` wrapper is walked even when it carries ``@Disabled``, because
     :func:`_parse_list` flattens it and renders its statements live; the scan must see the same
-    statements the render emits. A value outside :data:`_DISABLED_SURE` may have run, so its
-    subtree is walked too and flagged."""
-    live: list[tuple[Element, bool]] = []
-    stack = [(child, False) for child in reversed(list(action_list))]
+    statements the render emits."""
+    live: list[Element] = []
+    stack = list(reversed(list(action_list)))
     while stack:
-        elem, unsure = stack.pop()
+        elem = stack.pop()
         if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:
-            if _attr(elem, "Disabled").strip().lower() in _DISABLED_SURE:
-                continue
-            unsure = True
-        live.append((elem, unsure))
-        stack.extend((child, unsure) for child in reversed(list(elem)))
+            continue
+        live.append(elem)
+        stack.extend(reversed(list(elem)))
     return live
 
 
@@ -953,9 +955,6 @@ _KIND_BY_VERB = {
     "actionliststop": "exit",
 }
 
-# Kinds that bind a message handle to a Python local; both render as ``<local> = <expression>``.
-_BINDING_KINDS = frozenset({"clone", "create"})
-
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
 _BRANCH_PARENT = {"elif": "if", "else": "if", "except": "try", "match": "case"}
 
@@ -963,12 +962,6 @@ _BRANCH_PARENT = {"elif": "if", "else": "if", "except": "try", "match": "case"}
 # that rewrites the same occurrence each pass. A statement anywhere beneath one of these is not
 # unambiguous, so no field write may be emitted there (see :func:`_map_roles`).
 _NESTING_KINDS = frozenset({"if", "elif", "else", "for", "while", "try", "except", "case", "match"})
-
-# The constructs whose own line may BIND a message handle: a ``ForEach`` its loop handle, a ``Catch
-# into`` the error. Any text after the verb on one of these lines makes it unread, whatever that text
-# names (see :func:`_unreadable`). A condition (``If``, ``ElseIf``, ``Loop``, ``ChooseFrom``,
-# ``Matching``) is read as reading only: ADR 0086 records that assumption.
-_BINDING_CONSTRUCTS = frozenset({"for", "except"})
 
 # An HL7 field path in the ``SEG-F[.C[.S]]`` grammar :class:`Message` understands.
 _HL7_PATH = re.compile(r"^[A-Za-z0-9]{3}-\d+(?:\.\d+){0,2}$")
@@ -980,17 +973,12 @@ def _local(tag: str) -> str:
 
 
 def _attr(elem: Element, name: str) -> str:
-    """Case-insensitively read attribute ``name``, or ``""``. Untrusted input: never assume casing.
-
-    Two attributes that fold to the same name with different values are refused: this module would
-    read one and a case-sensitive reader the other, and nothing says which Corepoint runs."""
+    """Case-insensitively read attribute ``name``, or ``""``. Untrusted input: never assume casing."""
     lowered = name.lower()
-    found = {value for key, value in elem.attrib.items() if _local(key).lower() == lowered}
-    if len(found) > 1:
-        raise CorepointImportError(
-            f"an element carries more than one {name} attribute with different values — refusing"
-        )
-    return next(iter(found), "")
+    for key, value in elem.attrib.items():
+        if _local(key).lower() == lowered:
+            return value
+    return ""
 
 
 def _disabled_scope(elem: Element, parents: dict[Element, Element]) -> tuple[str, str] | None:
@@ -1191,34 +1179,30 @@ def _map_statement(verb: str, operands: list[str], statement: str) -> Action | U
     return UnmappedAction(verb or "<unparsed>", f"{lead}: {statement}")
 
 
-def _field_of(operand: Operand, live: Mapping[str, str]) -> str | None:
-    """The :class:`Message` path this operand addresses on a handle with a live local, or ``None``.
+def _subject_field(operand: Operand, subject: frozenset[str]) -> str | None:
+    """The :class:`Message` path this operand addresses, or ``None`` if it is not ``msg``'s own field.
 
-    Three conditions, all required: the operand is a path, the handle it addresses holds a message
-    the import can name at this point (``live``, from :class:`_Flow`), and its leaf resolves to HL7
-    coordinates. Relaxing any one of them produces code that writes a real field of the wrong
-    message, or the wrong field — the failure mode this importer exists to avoid."""
-    if operand.kind != "path" or operand.handle not in live:
+    Three conditions, all required: the list has an unambiguous subject handle, the operand addresses
+    **that** handle, and its leaf resolves to HL7 coordinates. Relaxing any one of them produces code
+    that writes a real field with the wrong value — the failure mode this importer exists to avoid."""
+    if operand.kind != "path" or operand.handle not in subject:
         return None
     return _corepoint_path(operand.text)
 
 
-def _decline_reason(operands: tuple[Operand, ...], live: Mapping[str, str]) -> str:
+def _decline_reason(operands: tuple[Operand, ...], subject: frozenset[str]) -> str:
     """Why a role-parsed statement could not be mapped — named precisely so a human can act on it.
 
     A generic "no mapping" marker makes 5,000 TODOs look identical; naming the *cause* is what lets a
-    migrator triage them (a cross-message write needs its tree built first; an unresolvable node path
-    needs a field decision; a variable needs hand-written Python)."""
+    migrator triage them (a cross-message write needs a second Handler; an unresolvable node path needs
+    a field decision; a variable needs hand-written Python)."""
     paths = [o for o in operands if o.kind == "path"]
-    if not live and paths:
+    if not subject and paths:
         return (
-            "no handle in this action-list holds a message this import can identify at this point"
+            "the action-list works on several messages and none is identifiably the one delivered"
         )
-    if any(o.handle not in live for o in paths):
-        return (
-            "addresses a message handle that holds no message this import can identify at this "
-            "point (cross-message)"
-        )
+    if any(o.handle not in subject for o in paths):
+        return "addresses a different message than the one this handler delivers (cross-message)"
     if any(_corepoint_path(o.text) is None for o in paths):
         return "path names a message-tree node with no HL7 field coordinates"
     if any(o.kind == "variable" for o in operands):
@@ -1270,9 +1254,9 @@ def _writable(path: str | None) -> bool:
 def _map_roles(
     verb: str,
     operands: tuple[Operand, ...],
-    live: Mapping[str, str],
+    subject: frozenset[str],
     *,
-    words: tuple[str, ...],
+    connectives: tuple[str, ...],
     qualified: bool,
     in_control: bool,
 ) -> Action | UnmappedAction | None:
@@ -1287,7 +1271,7 @@ def _map_roles(
     if allowed is None:
         return None
     # Guards that apply to every field write, checked before any per-verb shape.
-    if qualified or not {w.lower() for w in words} <= allowed:
+    if qualified or not {c.lower() for c in connectives} <= allowed:
         return None
     if in_control:
         # Inside an If/ForEach/Loop/Try the statement is conditional or repeated in the SOURCE, but the
@@ -1297,48 +1281,36 @@ def _map_roles(
         return None
 
     if lowered == "itemcopy" and len(operands) == 2:
-        dst = _field_of(operands[1], live)
+        dst = _subject_field(operands[1], subject)
         if _writable(dst):
             assert dst is not None
             if operands[0].kind == "literal" and operands[0].quoted:
                 # A constant source is a set, not a copy — the vocabulary's exact equivalent. Only a
                 # QUOTED literal is taken: a bare literal span is the exporter's un-delimited form and
                 # its extent is not reliably recoverable.
-                return Action(
-                    verb,
-                    "set_field",
-                    (_lit(dst), _lit(operands[0].text)),
-                    target=live[operands[1].handle],
-                )
-            src = _field_of(operands[0], live)
+                return Action(verb, "set_field", (_lit(dst), _lit(operands[0].text)))
+            src = _subject_field(operands[0], subject)
             if src is not None:
                 # NOT mapped to ``copy_field``: it writes "" when the source is absent, which would
                 # CLEAR a populated destination, and nothing in the export says Corepoint does that
                 # rather than leave the destination untouched. Declined deliberately (see _decline).
                 return None
     elif lowered == "itemclear" and len(operands) == 1:
-        target = _field_of(operands[0], live)
+        target = _subject_field(operands[0], subject)
         if _writable(target):
             assert target is not None
             # Clearing is setting empty; ``Message.set`` re-encodes structurally.
-            return Action(
-                verb, "set_field", (_lit(target), _lit("")), target=live[operands[0].handle]
-            )
+            return Action(verb, "set_field", (_lit(target), _lit("")))
     elif lowered == "itemappend" and len(operands) == 2:
         # ``ItemAppend "<suffix>" to <target>`` — value FIRST, target second.
-        target = _field_of(operands[1], live)
+        target = _subject_field(operands[1], subject)
         if _writable(target) and operands[0].kind == "literal" and operands[0].quoted:
             assert target is not None
-            return Action(
-                verb,
-                "append_to_field",
-                (_lit(target), _lit(operands[0].text)),
-                target=live[operands[1].handle],
-            )
+            return Action(verb, "append_to_field", (_lit(target), _lit(operands[0].text)))
     return None
 
 
-def _decline(verb: str, operands: tuple[Operand, ...], live: Mapping[str, str]) -> UnmappedAction:
+def _decline(verb: str, operands: tuple[Operand, ...], subject: frozenset[str]) -> UnmappedAction:
     """Turn a declined role-parsed statement into a TODO marker that says *why*, and emits no code.
 
     The recovered target is the first operand that is genuinely ``msg``'s own field, so the hand-finish
@@ -1350,10 +1322,10 @@ def _decline(verb: str, operands: tuple[Operand, ...], live: Mapping[str, str]) 
     # dead-letter it, so the recovered target rides into the comment instead. Every other
     # ``UnmappedAction`` site now does the same (#1681); this one did it first.
     target = next(
-        (field for field in (_field_of(o, live) for o in operands) if field is not None),
+        (field for field in (_subject_field(o, subject) for o in operands) if field is not None),
         None,
     )
-    reason = _decline_reason(operands, live)
+    reason = _decline_reason(operands, subject)
     detail = f"{reason}; intended target {target}" if target else reason
     return UnmappedAction(verb, detail)
 
@@ -1371,35 +1343,34 @@ def _role_send_args(operands: tuple[Operand, ...]) -> tuple[str, ...]:
     return ()
 
 
-def _send_refusal(sent: str, live: Mapping[str, str]) -> str:
-    """Why a ``MsgSend`` of handle ``sent`` (``""`` when it names none) must not render, or ``""``.
+def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
+    """Why a role-parsed ``MsgSend`` must not render as ``Send(dest, msg)``, or ``""`` when it may.
 
-    A Handler can send any Message it holds, but the import knows what a handle holds only where
-    :class:`_Flow` saw it bound: the input handle is ``msg``, and a clone or a ``MsgCreate`` binds
-    another handle to its own local. A send of anything else would have to guess, and the old guess,
-    ``msg``, delivered the unmodified input in place of the message Corepoint built. So the render
-    raises at the send site instead (BACKLOG #313). Dropping the send would make the handler filter
-    silently.
+    A Handler has one ``msg``: the inbound message. A ``MsgSend`` that names another handle (a scratch
+    or output tree the list built) would render as a send of ``msg`` and deliver the unmodified input
+    in place of the message Corepoint built. So the render raises at the send site instead
+    (BACKLOG #313, step 1). Dropping the send would make the handler filter silently.
 
-    It fails CLOSED. A ``$variable``, a partial path, no handle at all, and a handle bound on only
-    some of the paths that reach the send are all refused. The markup-free reading is judged the
-    same way, from the handle its first operand names. The handle is untrusted and unbounded, so it
-    is flattened and elided before it enters the text."""
-    if sent and sent in live:
+    It fails CLOSED: a send is allowed only when :func:`_whole_tree` names a handle in ``held``, the
+    same reading :func:`_message_handles` uses to fill ``delivered``. A ``$variable``, a partial path
+    or no handle at all is refused, because which message it sends is not known. A markup-free
+    statement has no roles and never reaches here. The handle is untrusted and unbounded, so it is
+    flattened and elided before it enters the text."""
+    sent = _whole_tree(operands[0]) if operands else ""
+    if sent and sent in held:
         return ""
     refuse = "the import refuses to send msg in its place"
     if not sent:
-        return f"MsgSend names no message handle this import can identify; {refuse}"
+        return f"MsgSend names no message handle this import can identify as msg; {refuse}"
     handle = _comment_text(sent, 60)
-    if not live:
+    if not held:
         return (
-            f"MsgSend delivers {handle}, and no handle in this action-list holds a message this "
-            f"import can identify at this point (it has no single input handle, or another tree "
-            f"overwrote it); {refuse}"
+            f"MsgSend delivers {handle}, and no handle in this action-list is known to be msg (it "
+            f"has no single input handle, or another tree overwrites its input); {refuse}"
         )
     return (
-        f"MsgSend delivers {handle}, which at this point is not the input handle, nor bound by a "
-        f"whole-tree clone or a MsgCreate on every path before this send; {refuse}"
+        f"MsgSend delivers {handle}, which is not the input handle or a whole-tree clone of it, "
+        f"so it is not msg; {refuse}"
     )
 
 
@@ -1462,7 +1433,13 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
 _MAX_NESTING = 100
 
 
-def _parse_list(container: Element, in_control: bool, depth: int = 0) -> list[Step]:
+def _parse_list(
+    container: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
+) -> list[Step]:
     """Parse the statement children of a ``<List>``/``<Actions>`` into ordered steps.
 
     A branch marker that follows a compatible construct as a *sibling* is adopted by it; the more
@@ -1476,10 +1453,7 @@ def _parse_list(container: Element, in_control: bool, depth: int = 0) -> list[St
         tag = _local(child.tag).lower()
         if tag in _LIST_TAGS:
             # A doubly-wrapped list: flatten rather than lose the statements.
-            inner = _parse_list(child, in_control, depth + 1)
-            # A @Disabled wrapper still renders its statements (they run in step 1 too), but
-            # whether Corepoint runs them is not known, so their scope is not modelled.
-            steps.extend(_scoped(tag, inner) if _is_disabled(child) else inner)
+            steps.extend(_parse_list(child, subject, held, in_control, depth + 1))
             continue
         # EVERY other child is a statement position and goes through _parse_statement — including a tag
         # this layer does not model, which comes back as an "unknown" marker plus its parsed subtree.
@@ -1487,7 +1461,7 @@ def _parse_list(container: Element, in_control: bool, depth: int = 0) -> list[St
         # <DataPoint> package subtrees) dropped whole subtrees silently: those subtrees are children of
         # <Package>, NEVER of a <List>, so the tolerance was applied exactly where statements live and a
         # <Switch> — or a <Lines> typo — vanished with its body. Untrusted input is still never a crash.
-        produced = _parse_statement(child, in_control, depth + 1)
+        produced = _parse_statement(child, subject, held, in_control, depth + 1)
         if (
             len(produced) == 1
             and isinstance(produced[0], Control)
@@ -1503,7 +1477,13 @@ def _parse_list(container: Element, in_control: bool, depth: int = 0) -> list[St
     return steps
 
 
-def _container_steps(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
+def _container_steps(
+    elem: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
+) -> list[Step]:
     """The nested body of ``elem``, in document order — every child, whatever shape it takes.
 
     :func:`_parse_list` already flattens a ``<List>``/``<Actions>`` wrapper, so walking ``elem`` itself
@@ -1511,206 +1491,17 @@ def _container_steps(elem: Element, in_control: bool, depth: int = 0) -> list[St
     is a **sibling** of the wrapper. Returning only the wrapper's children — as an earlier cut did the
     moment any wrapper existed — silently discarded those siblings, including an ``Else`` marker and its
     whole branch body."""
-    return _parse_list(elem, in_control, depth + 1)
+    return _parse_list(elem, subject, held, in_control, depth + 1)
 
 
-# The @Disabled values this import reads as disabled with confidence. Any other value that
-# :func:`_is_disabled` still reads as disabled may mean enabled to Corepoint.
-_DISABLED_SURE = frozenset({"1", "true", "yes"})
-# Attributes a ``<Line>`` with no ``@Data`` may carry and still hold no statement.
-_INERT_LINE_ATTRIBUTES = frozenset({"comment", "disabled"})
-
-
-# Attributes a ``<Call>`` may carry while its line is all the import needs to read.
-_INERT_CALL_ATTRIBUTES = frozenset({"data", "comment", "disabled"})
-# Words a send may carry besides its verb and operands.
-_SEND_WORDS = frozenset({"to", "connection"})
-
-
-def _unreadable(elem: Element) -> tuple[str, str]:
-    """``(why, verb)``: why the flow cannot trust what ``elem`` may write, or ``""``.
-
-    Each of these may write a handle the flow never sees, so the parse brackets the element's steps
-    with markers that leave every handle unknown, before and after (see :func:`_parse_statement`)."""
-    tag = _local(elem.tag).lower()
-    data = _attr(elem, "Data")
-    statement = strip_markup(data)
-    roles = parse_roles(data)
-    flat_verb, tokens = _split_verb(statement)
-    verb = _statement_verb(roles, flat_verb)
-    kind = _statement_kind(tag, verb)
-    if _is_disabled(elem):
-        if _attr(elem, "Disabled").strip().lower() in _DISABLED_SURE:
-            return "", verb
-        return "its @Disabled value may mean enabled, so it may have run", verb
-    if tag == "line":
-        if (elem.text or "").strip():
-            return "it carries a statement outside @Data", verb
-        extra = any(_local(k).lower() not in _INERT_LINE_ATTRIBUTES for k in elem.attrib)
-        if not statement and extra:
-            return "its statement is not in @Data", verb
-    if tag == "call":
-        if kind != "call":
-            return (
-                f"a <Call> carrying {_comment_text(verb, 40) or 'no verb'}, not ActionListCall",
-                verb,
-            )
-        if any(_local(k).lower() not in _INERT_CALL_ATTRIBUTES for k in elem.attrib):
-            return "a <Call> carrying an attribute this import does not read", verb
-    if kind in _BINDING_CONSTRUCTS and not _names_no_whole_tree(data, kind):
-        return f"a {_comment_text(verb, 20) or tag} line may bind a message it names", verb
-    if tag == "block" and _label_may_write(data):
-        return "a <Block> label that reads as a statement may write a message", verb
-    if kind in (None, "block", "call") or not verb:
-        return "", verb
-    if [w.lower() for w in statement.split()[:1]] != [verb.lower()]:
-        return "its verb is not its first word", verb
-    # One reading only: a handle span holding a space would otherwise count as two handles.
-    operands = _operands_from_roles(roles) if roles else _flat_operands(tokens)
-    named = {h for h in map(_whole_tree, operands) if h}
-    if kind == "send":
-        words = {w.lower() for w in _statement_words(roles, verb)}
-        bare = not roles and any(
-            _string_literal(t) is None
-            and _option(t) is None
-            and not t.startswith(("%", "$"))
-            and t.lower() not in _SEND_WORDS
-            for t in tokens
-        )
-        if len(named) > 1 or not words <= _SEND_WORDS or bare:
-            return "the send names more than one message, or carries a word it may write by", verb
-    elif kind in _NESTING_KINDS and named:
-        return "the construct names a whole message, which it may bind", verb
-    return "", verb
-
-
-# The words a ``ForEach`` or ``Catch`` line may carry besides its verb that name no message.
-_BINDING_CONNECTIVES = frozenset({"in", "into"})
-
-
-def _names_no_whole_tree(data: str, kind: str) -> bool:
-    """Whether every word of a ``ForEach`` or ``Catch`` line is known to be something other than a
-    whole message tree, so the line can bind none.
-
-    The first word must be the construct's own verb. Every other word passes only as ``in``/
-    ``into``, a path INTO a named handle that addresses an HL7 segment or field, a ``$variable``, a
-    quoted literal or a number, judged by its text: a span's class is never trusted for it, and
-    prose spans are words too. The one exception is a path's own label, a ``(...)`` detail span right
-    after the path, holding no ``%`` or ``$``. Everything else may be a handle: one spelled with no
-    ``%``, a whole ``%HANDLE``, or text in a span class neither reading lists. This is judged on
-    words, never on which handle a reading found, because every rule that trusted a reading to find
-    the handles missed some spelling."""
-    roles = parse_roles(data)
-    if not roles:
-        plain = tokenize_statement(strip_markup(data))
-        return not plain or _verb_then_harmless(plain, kind)
-    words: list[str] = []
-    handle = False
-    after_path = False
-    for token in roles:
-        label = after_path and token.role == "detail"
-        after_path = False
-        if label and _is_path_label(token.text):
-            continue
-        if handle and token.role != "path":
-            return False  # a handle span with no path after it: a whole tree
-        if token.role == "handle":
-            handle = True
-        elif token.role == "path":
-            if not handle or not _addresses_hl7(token.text):
-                return False
-            handle = False
-            after_path = True
-        elif token.role in ("keyword", "text", "literal", "variable", "numeral", *_PROSE_ROLES):
-            words.extend(tokenize_statement(token.text))
-        else:
-            return False  # a span that falls out of both readings
-    return not handle and _verb_then_harmless(words, kind)
-
-
-def _verb_then_harmless(words: list[str], kind: str) -> bool:
-    """Whether ``words`` open with the construct's own verb and every later word names no tree."""
-    if not words or _KIND_BY_VERB.get(words[0].lower()) != kind:
-        return False
-    return all(_names_no_tree(word) for word in words[1:])
-
-
-def _names_no_tree(word: str) -> bool:
-    """Whether one word after a construct's verb is known not to name a whole message tree."""
-    if word.lower() in _BINDING_CONNECTIVES or _string_literal(word) is not None:
-        return True
-    if re.fullmatch(r"\$\w+|\d+(?:\.\d+)?", word):
-        return True
-    name, _, rest = word.partition("/")
-    return word.startswith("%") and len(name) > 1 and _addresses_hl7("/" + rest)
-
-
-def _addresses_hl7(path: str) -> bool:
-    """Whether a path span (or the part of a ``%`` word after its handle) addresses an HL7 segment
-    or field. ``/.``, ``/*`` or ``//x`` may mean the whole tree, which nothing here can tell."""
-    return _corepoint_path(path) is not None or _corepoint_segment(path) is not None
-
-
-def _is_path_label(text: str) -> bool:
-    """Whether a ``detail`` span is a path's human label: ``(...)`` with no ``%`` or ``$`` in it."""
-    body = text.strip()
-    return body.startswith("(") and body.endswith(")") and not any(c in body for c in "%$")
-
-
-# A first word that may be a Corepoint verb, which no label's prose is expected to start with.
-_VERB_SHAPED = re.compile(r"(?:Msg|Item|Seg|Env|ActionList)[A-Z]\w*")
-
-
-def _label_may_write(data: str) -> bool:
-    """Whether a ``<Block>`` label may be a statement rather than prose, so it may write a message.
-
-    Fail closed and deliberately broad, because telling a label from a statement is not modelled:
-    any span the role layer reads as more than prose (a verb, a handle, a path, a value, an unlisted
-    class), or, in any prose run, a ``%`` or ``$`` word or a run whose first word is shaped like a
-    verb. A ``block`` span's text is judged the same way: its class is not trusted."""
-    roles = parse_roles(data)
-    if not roles:
-        return _run_may_write(strip_markup(data))
-    for token in roles:
-        if token.role not in ("block", "text", *_PROSE_ROLES):
-            return True
-        if (token.role == "text" and token.source_class) or _run_may_write(token.text):
-            return True
-    return False
-
-
-def _run_may_write(run: str) -> bool:
-    words = run.split()
-    if any(w.startswith(("%", "$")) for w in words):
-        return True
-    return bool(
-        words and (_KIND_BY_VERB.get(words[0].lower()) or _READ_VERB_WORDS.get(words[0].lower()))
-    ) or bool(words and _VERB_SHAPED.fullmatch(words[0]))
-
-
-def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
-    """Parse one statement element, bracketed by markers when the flow cannot trust it.
-
-    A construct or a branch is never bracketed by markers. A marker after an ``If`` hid it from the
-    ``Else`` that follows, and a marker around an ``Else`` hid the ``Else`` from its ``If``, so the
-    branch came loose and its body ran for every message. It carries ``unread`` instead, keeps its
-    place in its chain, and the flow brackets the whole chain (see :func:`_bracketed`)."""
-    steps = _parse_one(elem, in_control, depth)
-    why, verb = _unreadable(elem)
-    if not why:
-        return steps
-    if len(steps) == 1 and isinstance(steps[0], Control) and steps[0].kind in _NESTING_KINDS:
-        return [replace(steps[0], unread=why)]
-    marker = Control("unknown", _local(elem.tag), why, deferred=_Deferred(verb, ()))
-    return [marker, *steps, marker]
-
-
-def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
-    """Parse one statement element into zero or more steps (a list, so a leaf can carry a body).
-
-    A statement whose rendering depends on what a message handle holds at that point comes back as a
-    ``"pending"`` node (or a ``"send"`` carrying its operands); :class:`_Flow` settles both in
-    statement order once the whole tree is parsed (BACKLOG #313, step 2)."""
+def _parse_statement(
+    elem: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
+) -> list[Step]:
+    """Parse one statement element into zero or more steps (a list, so a leaf can carry a body)."""
     tag = _local(elem.tag)
     data = _attr(elem, "Data")
     statement = strip_markup(data)
@@ -1721,9 +1512,9 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
     flat_verb, operands = _split_verb(statement)
     # Unspanned runs and ``detail`` spans are NOT inert decoration: measured against the export they
     # carry comparison operators (``=``/``<>``/``contains``) and mode flags ("replace all", "interpret
-    # escapes"). A mapping may only fire when the statement's words (see :func:`_statement_words`,
-    # unspanned or styled as a keyword) fall inside that verb's known set and it carries no qualifier —
-    # otherwise the emitted call would silently lose an operator.
+    # escapes"). A mapping may only fire when the statement's connectives fall inside that verb's known
+    # set and it carries no qualifier — otherwise the emitted call would silently lose an operator.
+    connectives = tuple(t.text for t in roles if t.role == "text" and t.text)
     qualified = any(t.role == "detail" for t in roles)
     verb = _statement_verb(roles, flat_verb)
     role_operands = _operands_from_roles(roles) if roles else ()
@@ -1733,15 +1524,7 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
 
     # A construct NESTS its body under a placeholder condition; a ``<Block>``/``<Call>`` is a label
     # whose body stays at the same indentation, so it does not deepen control scope.
-    body = _container_steps(elem, in_control or kind in _NESTING_KINDS, depth)
-    # The handle operands, read the same way for both layers, so a markup-free statement is judged
-    # by the same flow rules as a role-parsed one. A role reading that found no operand at all (its
-    # spans carry classes the role layer does not list) falls back to the flat reading.
-    flat_operands = _flat_operands(operands)
-    handle_operands = role_operands or flat_operands
-    named = frozenset(h for h in map(_whole_tree, (*role_operands, *flat_operands)) if h)
-    words = _statement_words(roles, verb)
-    dropped = any(t.role in ("block", "pass", "custom") for t in roles)
+    body = _container_steps(elem, subject, held, in_control or kind in _NESTING_KINDS, depth)
 
     if _is_disabled(elem):
         # Preserved in full as commented-out pseudo-source — the subtree is parsed (so it is visible and
@@ -1754,61 +1537,37 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
         # with its parsed subtree inlined beneath the marker — never dropped (count-and-log). The marker
         # says the element's SCOPE was lost, because an unmodelled construct may well have been
         # conditional: inlining its body is the honest, visible degradation, guessing the scope is not.
-        # The element still ran in Corepoint and may have written any handle, so the flow vouches
-        # for none after it.
-        deferred = _Deferred(verb, handle_operands, qualified=qualified, named=named, words=words)
-        return [Control("unknown", tag, statement or note, body=tuple(body), deferred=deferred)]
+        return [Control("unknown", tag, statement or note, body=tuple(body))]
 
-    # Never a ``<Call>``: dissolving one would run the called list's statements in the caller's
-    # scope, so a handle the called list rebuilt would keep the caller's stale local.
-    if not data and kind not in (None, "call") and _holds_branch_lines(elem, kind):
+    if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
         # at all, holding one child per branch (``<Line Data="If (…)">``, ``<Line Data="Else">``,
         # ``<Line Data="Catch">``) that each carry their OWN condition and their OWN body. Emitting a
         # construct for the wrapper too produced a second, condition-less ``if False:`` around an
         # already-complete chain — 757 of them, every one counted as a mapped step it never was.
         #
-        # The test is that every child is one of the construct's own branch LINES, not merely that
-        # the element has no ``@Data``: an exporter that puts the condition on the container and the
-        # statements directly beneath it (the shape the synthetic fixture models) has no inner
-        # construct to inherit, and passing that through would delete the try/except or the if
-        # entirely. *Corrected 2026-10-01:* the test was that the body held any construct of the same
-        # kind, so a ``<Try>`` holding a nested ``<Try>`` element dissolved, its Catch arms came loose,
-        # and what its body bound was read as bound on every path (the differential guard's sweep).
+        # The test is that the body ALREADY contains the same construct, not merely that the element
+        # has no ``@Data``: an exporter that puts the condition on the container and the statements
+        # directly beneath it (the shape the synthetic fixture models) has no inner construct to
+        # inherit, and passing that through would delete the try/except or the if entirely.
         return list(body)
 
     if kind is None:
-        mapped: Step
+        mapped: Action | UnmappedAction
         if roles and verb:
-            # Which handle each operand addresses holds a known message only at some points, so the
-            # mapping waits for :class:`_Flow`, which walks the statements in order.
-            mapped = Control(
-                "pending",
+            role_mapped = _map_roles(
                 verb,
-                statement,
-                deferred=_Deferred(
-                    verb,
-                    role_operands,
-                    qualified=qualified,
-                    in_control=in_control,
-                    named=named,
-                    words=words,
-                    styled=bool(_role_verb(roles)),
-                    dropped=dropped,
-                ),
+                role_operands,
+                subject,
+                connectives=connectives,
+                qualified=qualified,
+                in_control=in_control,
+            )
+            mapped = (
+                role_mapped if role_mapped is not None else _decline(verb, role_operands, subject)
             )
         elif statement:
-            # The markup-free reading maps without handles. The flow still decides which local a
-            # mapped write lands on, and sees any whole-tree write it makes.
-            flat = _map_statement(verb, operands, statement)
-            mapped = Control(
-                "pending",
-                verb,
-                statement,
-                deferred=_Deferred(
-                    verb, flat_operands, in_control=in_control, flat=flat, named=named
-                ),
-            )
+            mapped = _map_statement(verb, operands, statement)
         else:
             # No statement at all — reported rather than skipped, because a silently-ignored element is
             # exactly the accept-and-drop this importer refuses (count-and-log).
@@ -1817,28 +1576,19 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
         # OUT of the statement — is preserved beside the step it annotates, never dropped.
         prose = note or _role_prose(roles)
         lead: list[Step] = [Control("block", "Comment", prose)] if prose else []
-        return [*lead, mapped, *_scoped(tag, body)]
+        return [*lead, mapped, *body]
 
     if kind == "send":
         # ``*body`` matters: a ``MsgSend`` element that carries a nested list would otherwise lose it
-        # (the break/exit path below always kept its body — this one silently did not). Whether the
-        # handle it names holds a known message is the flow's question, settled in statement order.
+        # (the break/exit path below always kept its body — this one silently did not).
         args = _role_send_args(role_operands) if roles else _send_args(operands)
-        deferred = _Deferred(verb, handle_operands, named=named)
-        return [
-            Control("send", source, statement, args=args, deferred=deferred),
-            *_scoped(tag, body),
-        ]
+        refusal = _send_refusal(role_operands, held) if roles else ""
+        return [Control("send", source, statement, args=args, refusal=refusal), *body]
     if kind in ("break", "exit"):
-        return [Control(kind, source, statement), *_scoped(tag, body)]
+        return [Control(kind, source, statement), *body]
     if kind in ("block", "call"):
         # A ``<Block>`` is a section LABEL, not an action, and a ``<Call>``'s target list is inlined:
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
-        # :meth:`_Flow._call` decides what a call leaves unknown, and never from what its line names.
-        if kind == "call" and not statement:
-            # The @Comment is prose, never a call line (see _PLAIN_CALL): kept beside it instead.
-            remark: list[Step] = [Control("block", "Comment", note)] if note else []
-            return [*remark, Control(kind, source, tag, body=tuple(body))]
         return [Control(kind, source, statement or note or tag, body=tuple(body))]
 
     inner, branches = _split_branches(body)
@@ -1846,82 +1596,14 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
     return [Control(kind, source, detail, body=inner, branches=branches)]
 
 
-def _scoped(tag: str, body: list[Step]) -> list[Step]:
-    """A nested list under a statement that is not a construct, kept as an unmodelled element.
-
-    Its scope is not modelled (Corepoint may run it once, never, or repeatedly), so it renders as
-    an unmodelled element does: a TODO marker with the body inlined, after which no handle is
-    vouched for. *Corrected 2026-10-01:* the body was flattened into the parent list, so the flow
-    walked it as straight-line code and could bind and send there."""
-    if all(
-        isinstance(s, UnmappedAction)
-        or (isinstance(s, Control) and s.kind == "block" and not s.body)
-        for s in body
-    ):
-        # Nothing in it runs: only comments and lines carrying no statement. Kept in line.
-        return list(body)
-    detail = "a statement carrying a nested list, whose scope this import does not model"
-    return [
-        Control(
-            "unknown", f"{tag} nested list", detail, body=tuple(body), deferred=_Deferred("", ())
-        )
-    ]
-
-
-def _holds_branch_lines(elem: Element, kind: str) -> bool:
-    """Whether ``elem`` is a branch-group wrapper for ``kind``: every statement child, through any
-    ``<List>``/``<Actions>`` wrapper, is a live ``<Line>`` (or an element of ``elem``'s own tag)
-    whose ``@Data`` carries ``kind`` itself or one of its branch verbs, and at least one carries
-    ``kind``. A ``@Disabled`` child keeps the wrapper whole: dissolving it would leave an ``Else``
-    after a disabled ``If`` with nothing to continue, rendered for every message."""
-    lines: list[str] = []
-    stack = list(elem)
-    while stack:
-        child = stack.pop()
-        tag = _local(child.tag).lower()
-        if tag in _LIST_TAGS:
-            stack.extend(child)
-            continue
-        data = _attr(child, "Data")
-        # A branch line carries its own verb; so may a nested element of the wrapper's own tag.
-        # One with no @Data (a nested data-less <Try>) is a construct, not a branch.
-        if _is_disabled(child) or not data or tag not in ("line", _local(elem.tag).lower()):
-            return False
-        line_kind = _statement_kind(
-            "line", _statement_verb(parse_roles(data), _split_verb(strip_markup(data))[0])
-        )
-        if line_kind != kind and _BRANCH_PARENT.get(line_kind or "") != kind:
-            return False
-        lines.append(line_kind or "")
-    return kind in lines
-
-
 def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:
-    """A statement's verb, read the same way for every statement :func:`_parse_statement` builds.
+    """A statement's verb. Shared by :func:`_parse_statement` and :func:`_message_handles`, so the
+    scan that judges sends and the parse that renders them agree on which statements are sends.
 
     Prefer the role layer's verb, but keep the flat reading as a NAMING fallback: a handful of verbs
     are not styled as a ``keyword`` span at all, and letting those collapse into "<unparsed>" would
     throw away the one thing that makes a TODO triageable — which verb it was."""
     return (_role_verb(roles) or flat_verb) if roles else flat_verb
-
-
-def _statement_words(roles: tuple[RoleToken, ...], verb: str) -> tuple[str, ...]:
-    """The statement's words that are neither an operand nor the verb, in order.
-
-    The exporter styles some connectives as ``keyword`` spans and leaves others as unspanned text, so
-    both count: a ``from`` styled as a keyword reverses a copy exactly as an unstyled one does. The
-    verb is dropped whichever way it was written, so an unstyled verb is not read as a word."""
-    words: list[str] = []
-    verb_seen = False
-    for token in roles:
-        if token.role not in ("text", "keyword"):
-            continue
-        for word in token.text.split():
-            if not verb_seen and word.lower() == verb.lower():
-                verb_seen = True
-                continue
-            words.append(word)
-    return tuple(words)
 
 
 def _statement_kind(tag: str, verb: str) -> str | None:
@@ -1968,884 +1650,343 @@ def _send_args(operands: list[str]) -> tuple[str, ...]:
     return ()
 
 
-def _flat_operands(tokens: list[str]) -> tuple[Operand, ...]:
-    """Read the markup-free operands as the role layer would, for the handle questions only.
+# --- step 2: handle locals, in a fully understood list only (BACKLOG #313, ADR 0086) --------------
+#
+# Six review rounds of step 2 each built a list in which the previous repair failed open: the handler
+# sent a message Corepoint never sent. Every repair taught the flow one more construct or spelling,
+# and the next round found the next one. So step 2 no longer reasons about constructs at all. Before a
+# list renders, the gate below decides ONCE whether the whole list is fully understood: every element
+# at every depth is on this allow-list and reads in exactly one shape, with no word, span, attribute,
+# marker or text left unread. Only such a list binds locals. Any other list takes the step 1 path
+# untouched, so its output is step 1's byte for byte. When in doubt, a list is not understood: that
+# costs a hand-finish, as under step 1, and never a wrong delivery.
 
-    A ``%NAME`` or ``%NAME/`` token is a whole message handle and ``%NAME/path`` a path addressed
-    against it; a ``$variable`` is a variable; anything else (a quoted literal, a bracketed option)
-    is a literal. Nothing here is mapped onto the vocabulary: :func:`_map_statement` still does that,
-    without handles, exactly as before."""
-    operands: list[Operand] = []
-    for token in tokens:
-        if token.startswith("%"):
-            name, _, rest = token.partition("/")
-            if rest.strip("/").strip():
-                operands.append(Operand("path", "/" + rest, name))
-            else:
-                operands.append(Operand("handle", name, name))
-        elif token.startswith("$"):
-            operands.append(Operand("variable", token))
+#: The statements the gate reads, each as ONE token sequence after its verb, which must be the first
+#: token and a ``keyword`` span spelled exactly so. ``H`` is a message-handle span, ``/`` a path span
+#: holding only ``/``, ``F`` a path span naming a writable HL7 field, ``L`` a quoted literal span, and
+#: any other entry that exact word, unstyled.
+_UNDERSTOOD: dict[str, tuple[str, ...]] = {
+    "MsgTreeCopy": ("H", "/", "to", "H", "/"),
+    "MsgCreate": ("H", "as", "L", "version", "L"),
+    "ItemCopy": ("L", "to", "H", "F"),
+    "ItemClear": ("H", "F"),
+    "ItemAppend": ("L", "to", "H", "F"),
+    "MsgLog": ("H",),
+    "MsgSend": ("H", "to", "connection", "L"),
+}
+_HANDLE_CLASSES = frozenset({"input-handle", "other-handle"})
+# One token of an understood ``@Data``: a span holding plain text (no nesting, no entity, no attribute
+# but its class), or an unstyled run. Anything else in the value makes the statement unread.
+_STRICT_TOKEN = re.compile(r"<span class=(['\"])([a-z-]+)\1>([^<>&]*)</span>|([^<>&]+)")
+# ASCII only, short, and no ``/``, so a handle has one spelling, one reading and a safe local name.
+_HANDLE_NAME = re.compile(r"%[A-Za-z][A-Za-z0-9_]{0,39}", re.ASCII)
+# ``/PID-5-1``, ``/PID-5-1 (Patient Name)`` or ``/PID-5.1``: a field, never a tree node or a segment.
+_FIELD_PATH = re.compile(
+    r"/[A-Z][A-Z0-9]{2}(?:(?:-[1-9][0-9]*){1,3}(?: \([A-Za-z0-9 ]+\))?"
+    r"|-[1-9][0-9]*(?:\.[1-9][0-9]*){1,2})",
+    re.ASCII,
+)
+# The ``@Disabled`` values read as disabled with confidence. Any other value closes the gate.
+_DISABLED_SURE = frozenset({"1", "true", "yes"})
+# A ``<Block>`` label is read as prose only when it is letters, digits and spaces, and no word of it is
+# a Corepoint verb, begins like one, or has a capital past its first letter (a CamelCase verb, or a
+# handle spelled without ``%``). Whether Corepoint runs a label that is a statement is not known.
+_LABEL = re.compile(r"[A-Za-z0-9 ]*", re.ASCII)
+_VERB_FAMILIES = ("msg", "item", "seg", "env", "var", "actionlist")
+# The message-type and version a ``MsgCreate`` must name to build a valid MSH. Only the caret form of
+# the type is read: ``ADT_A01`` is also how HL7 spells a message STRUCTURE (MSH-9.3).
+_MESSAGE_TYPE = re.compile(r"([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?")
+_HL7_VERSION = re.compile(r"2\.[1-9](?:\.[1-9])?")
+
+
+@dataclass(frozen=True)
+class _Statement:
+    """One statement the gate read: its verb, each handle with whether it is styled as the input,
+    the field a write addresses, its literals, a ``MsgCreate``'s skeleton, and the plain text."""
+
+    verb: str
+    handles: tuple[tuple[str, bool], ...]
+    path: str
+    literals: tuple[str, ...]
+    skeleton: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _Understood:
+    """One element of a fully understood list: a statement line, or a ``<Block>`` (``statement`` is
+    ``None``) with its body. ``disabled`` marks a surely ``@Disabled`` element."""
+
+    elem: Element
+    statement: _Statement | None
+    body: tuple[_Understood, ...]
+    disabled: bool
+
+
+def _understood_list(action_list: Element) -> tuple[str, tuple[_Understood, ...]] | None:
+    """``(input handle, elements)`` when the whole list is fully understood, else ``None``.
+
+    Beyond each element's own shape (see :func:`_understood_body`), the list as a whole must name its
+    handles unambiguously: no two spellings that differ only in case (whether Corepoint folds case
+    is unverified), each handle styled the same way everywhere, at most one input handle, and no
+    clone or ``MsgCreate`` into the input, which would replace ``msg``."""
+    if not set(action_list.attrib) <= {"Name", "Desc"} or (action_list.text or "").strip():
+        return None
+    body = _understood_body(action_list, 0)
+    if body is None:
+        return None
+    styles: dict[str, set[bool]] = {}
+    written: set[str] = set()
+    stack = list(body)
+    while stack:
+        item = stack.pop()
+        stack.extend(item.body)
+        if item.statement is None:
+            continue
+        for handle, is_input in item.statement.handles:
+            styles.setdefault(handle, set()).add(is_input)
+        if item.statement.verb in ("MsgTreeCopy", "MsgCreate"):
+            written.add(item.statement.handles[-1][0])
+    inputs = [handle for handle, style in styles.items() if True in style]
+    if (
+        len({handle.lower() for handle in styles}) != len(styles)
+        or any(len(style) > 1 for style in styles.values())
+        or len(inputs) > 1
+        or written & set(inputs)
+    ):
+        return None
+    return (inputs[0] if inputs else ""), body
+
+
+def _understood_body(container: Element, depth: int) -> tuple[_Understood, ...] | None:
+    """The elements under ``container`` when every one is understood, else ``None``.
+
+    A ``<List>`` wrapper must carry no attribute and is flattened; every other child must be a
+    ``<Line>`` holding one understood statement in ``@Data`` and nothing else, or a ``<Block>`` with
+    a prose label (see :data:`_LABEL`) whose body is understood too. Each may carry ``@Disabled`` only
+    with a sure value. No element may hold text outside its attributes. Tags are matched exactly, so a
+    namespaced or differently cased tag is not understood."""
+    if depth > _MAX_NESTING:
+        return None  # the step 1 path refuses the depth with a clean error
+    found: list[_Understood] = []
+    for child in container:
+        if (child.tail or "").strip() or (child.text or "").strip():
+            return None
+        if child.tag == "List":
+            inner = _understood_body(child, depth + 1) if not child.attrib else None
+            if inner is None:
+                return None
+            found.extend(inner)
+            continue
+        attrs = dict(child.attrib)
+        disabled = "Disabled" in attrs
+        if disabled and attrs.pop("Disabled").lower() not in _DISABLED_SURE:
+            return None
+        data = attrs.pop("Data", "")
+        if attrs:
+            return None
+        if child.tag == "Line" and not len(child):
+            statement = _understood_statement(data)
+            if statement is None:
+                return None
+            found.append(_Understood(child, statement, (), disabled))
+        elif child.tag == "Block" and _prose_label(data):
+            inner = _understood_body(child, depth + 1)
+            if inner is None:
+                return None
+            found.append(_Understood(child, None, inner, disabled))
         else:
-            operands.append(Operand("literal", token))
-    return tuple(operands)
+            return None
+    return tuple(found)
 
 
-# Verbs that name a whole message handle only to READ it. Deliberately small: a verb missing from it
-# makes a handle it names unknown afterwards, which costs a raise at a later send of that handle; a
-# verb wrongly in it lets a handle keep a local after Corepoint replaced its content, which costs a
-# delivery of the wrong message.
-_READ_ONLY_VERBS = frozenset({"msgsend", "msglog"})
+def _prose_label(data: str) -> bool:
+    """Whether a ``<Block>`` label is provably not a statement (see :data:`_LABEL`)."""
+    if not _LABEL.fullmatch(data):
+        return False
+    return not any(
+        word.lower() in _KIND_BY_VERB
+        or word.lower().startswith(_VERB_FAMILIES)
+        or any(c.isupper() for c in word[1:])
+        for word in data.split()
+    )
 
 
-def _written_path(action: Action) -> str:
-    """The HL7 path a write helper writes: ``copy_field(src, dst)`` its LAST, every other its first."""
-    if not action.args:
-        return ""
-    value = json.loads(action.args[-1] if action.vocabulary == "copy_field" else action.args[0])
-    return value if isinstance(value, str) else ""
-
-
-def _clone_target(deferred: _Deferred) -> str:
-    """The destination handle of a ``MsgTreeCopy`` this module reads as a plain whole-tree copy, or
-    ``""``.
-
-    The shape is exact: two operands, a whole-tree destination, no qualifier, and no connective but
-    ``to``. A mode flag (``merge``, ``append``), a ``from`` that reverses the direction, or a third
-    operand means the copy is not a plain one, so the statement falls to the fail-closed rule below."""
-    if deferred.verb.lower() != "msgtreecopy" or len(deferred.operands) != 2 or deferred.qualified:
-        return ""
-    if not {w.lower() for w in deferred.words} <= {"to"}:
-        return ""
-    return _whole_tree(deferred.operands[1])
-
-
-def _whole_written(deferred: _Deferred) -> frozenset[str]:
-    """The handles a statement may overwrite as a WHOLE tree, judged from the statement alone.
-
-    A plain clone overwrites only its destination, and a read-only verb overwrites nothing. Every
-    other statement may overwrite every handle it names whole, in either reading of its markup,
-    because nothing this module reads says which operand it writes. That is fail-closed: a handle
-    wrongly unbound costs a raise at a later send, a handle wrongly kept costs a wrong delivery. A
-    field write (a path into a handle) is not here: it changes part of a tree the local still holds."""
-    if deferred.verb.lower() in _READ_ONLY_VERBS:
-        return frozenset()
-    target = _clone_target(deferred)
-    return frozenset({target}) if target else deferred.named
-
-
-# The message-type and version shapes a ``MsgCreate`` must name to build a valid MSH. Only the caret
-# form of the type is read: ``ADT_A01`` is also how HL7 spells a message STRUCTURE (MSH-9.3), so
-# splitting an underscore would guess which of the two the export meant.
-_MESSAGE_TYPE = re.compile(r"^([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?$")
-_HL7_VERSION = re.compile(r"^2\.[1-9](?:\.[1-9])?$")
-# The only words a ``MsgCreate`` may carry besides its verb and operands, styled as a keyword or not
-# (see :func:`_statement_words`). Anything else (``merging input``) may change what
-# is built, and the skeleton would silently drop it.
-_MSGCREATE_CONNECTIVES = frozenset({"as", "version"})
-
-
-def _create_skeleton(deferred: _Deferred) -> tuple[str, str]:
-    """``(skeleton, "")`` for a ``MsgCreate``, or ``("", why)`` when no valid MSH can be built.
-
-    The skeleton carries the default encoding characters, the message type in MSH-9 and the version in
-    MSH-12, and nothing else. Every other header field is whatever the action-list itself writes. It
-    is built through :class:`Message` and encoded, never assembled by string slicing. The export must
-    name exactly one message type and one version and nothing else beside the handle, because a
-    ``MsgCreate`` naming a template, a variable or a model this module cannot read builds a message
-    whose header the skeleton would silently omit."""
-    if deferred.qualified:
-        return "", "the statement carries a qualifier this import does not read"
-    if not {w.lower() for w in deferred.words} <= _MSGCREATE_CONNECTIVES:
-        return (
-            "",
-            "the statement carries a word this import does not read, which may change the build",
-        )
-    types: list[re.Match[str]] = []
-    versions: list[str] = []
-    for operand in deferred.operands[1:]:
-        if operand.kind not in ("literal", "numeral"):
-            return "", "it names something other than an HL7 message type and version"
-        if (found := _MESSAGE_TYPE.fullmatch(operand.text)) is not None:
-            types.append(found)
-        elif _HL7_VERSION.fullmatch(operand.text):
-            versions.append(operand.text)
+def _understood_statement(data: str) -> _Statement | None:
+    """Read ``@Data`` in the one shape :data:`_UNDERSTOOD` gives its verb, or ``None``."""
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(data):
+        token = _STRICT_TOKEN.match(data, pos)
+        if token is None:
+            return None
+        if token.group(2) is not None:
+            tokens.append((token.group(2), token.group(3)))
         else:
-            return "", "it names something other than an HL7 message type and version"
-    if len(types) != 1 or len(versions) != 1:
-        return "", (
-            "it does not name exactly one HL7 message type (such as ADT^A01) and one HL7 version "
-            "(such as 2.5), so no valid MSH can be built"
-        )
+            tokens.extend(("", word) for word in token.group(4).split())
+        pos = token.end()
+    if not tokens or tokens[0][0] != "keyword":
+        return None
+    verb = tokens[0][1]
+    shape = _UNDERSTOOD.get(verb)
+    if shape is None or len(tokens) != len(shape) + 1:
+        return None
+    handles: list[tuple[str, bool]] = []
+    literals: list[str] = []
+    path: str | None = ""
+    for want, (cls, text) in zip(shape, tokens[1:], strict=True):
+        if want == "H":
+            if cls not in _HANDLE_CLASSES or not _HANDLE_NAME.fullmatch(text):
+                return None
+            handles.append((text, cls == "input-handle"))
+        elif want == "/":
+            if cls != "path" or text != "/":
+                return None
+        elif want == "F":
+            path = _corepoint_path(text) if cls == "path" and _FIELD_PATH.fullmatch(text) else None
+            if not _writable(path) or (path or "").split(".", 1)[0] in _FRAMING_PATHS:
+                return None
+        elif want == "L":
+            if cls != "literal" or len(text) < 2 or text[0] != '"' or '"' in text[1:-1]:
+                return None
+            if text[-1] != '"':
+                return None
+            literals.append(text[1:-1])
+        elif cls or text != want:
+            return None
+    skeleton = ""
+    if verb == "MsgCreate":
+        skeleton = _skeleton(*literals)
+        if not skeleton:
+            return None
+    if verb == "MsgSend" and not literals[0].strip():
+        return None
+    assert path is not None  # a write's path was checked by _writable above
+    return _Statement(verb, tuple(handles), path, tuple(literals), skeleton, strip_markup(data))
+
+
+def _skeleton(message_type: str, version: str) -> str:
+    """The MSH a ``MsgCreate`` builds, or ``""`` when no valid MSH can be built.
+
+    It carries the default encoding characters, the message type in MSH-9 and the version in MSH-12,
+    and nothing else: every other header field is whatever the list itself writes. Built through
+    :class:`Message` and encoded, never assembled by string slicing."""
+    found = _MESSAGE_TYPE.fullmatch(message_type)
+    if found is None or not _HL7_VERSION.fullmatch(version):
+        return ""
     try:
         skeleton = Message.parse("MSH|^~\\&|")
-        for index, part in enumerate(types[0].groups(), start=1):
+        for index, part in enumerate(found.groups(), start=1):
             if part is not None:
                 skeleton.set(f"MSH-9.{index}", part)
-        skeleton.set("MSH-12", versions[0])
-    except ValueError as exc:  # HL7PeekError included: a refusal, never a traceback
-        return "", f"the MSH could not be built ({type(exc).__name__})"
-    return skeleton.encode().rstrip("\r"), ""
-
-
-class _Env(Mapping[str, str]):
-    """Which local each handle holds at the current point of the walk, with an undo journal.
-
-    A construct's arms each start from the same state. Copying the whole map for every arm costs the
-    number of bound handles per construct, which an untrusted export can make quadratic. Instead each
-    arm runs in place, reports the handles it touched, and is undone, so the cost of an arm is the
-    number of handles it actually changes. An index by :func:`_handle_key` keeps an unbind by key
-    from scanning every bound handle."""
-
-    def __init__(self, initial: dict[str, str]) -> None:
-        self._live: dict[str, str] = {}
-        self._by_key: dict[str, set[str]] = {}
-        self._journal: list[tuple[str, str | None]] = []
-        for handle, local in initial.items():
-            self._set(handle, local)
-
-    def __getitem__(self, handle: str) -> str:
-        return self._live[handle]
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._live)
-
-    def __len__(self) -> int:
-        return len(self._live)
-
-    def _set(self, handle: str, local: str | None) -> None:
-        key = _handle_key(handle)
-        if local is None:
-            self._live.pop(handle, None)
-            spellings = self._by_key.get(key)
-            if spellings is not None:
-                spellings.discard(handle)
-                if not spellings:
-                    del self._by_key[key]
-        else:
-            self._live[handle] = local
-            self._by_key.setdefault(key, set()).add(handle)
-
-    def bind(self, handle: str, local: str) -> None:
-        self._journal.append((handle, self._live.get(handle)))
-        self._set(handle, local)
-
-    def unbind(self, handle: str) -> None:
-        if handle in self._live:
-            self._journal.append((handle, self._live[handle]))
-            self._set(handle, None)
-
-    def unbind_key(self, handle: str) -> None:
-        """Unbind every bound spelling of ``handle`` (see :func:`_handle_key`)."""
-        for bound in sorted(self._by_key.get(_handle_key(handle), ())):
-            self.unbind(bound)
-
-    def mark(self) -> int:
-        return len(self._journal)
-
-    def changes(self, mark: int) -> dict[str, str | None]:
-        """Each handle touched since ``mark``, with the local it holds now (``None``: unbound)."""
-        return {handle: self._live.get(handle) for handle, _ in self._journal[mark:]}
-
-    def undo(self, mark: int) -> None:
-        while len(self._journal) > mark:
-            handle, previous = self._journal.pop()
-            self._set(handle, previous)
-
-    def narrow(self, outcomes: list[dict[str, str | None]]) -> None:
-        """Unbind every handle any path touched.
-
-        Each outcome is a :meth:`changes` of a path that began at this state. A handle bound on some
-        paths only, or overwritten on any, is unknown after they meet. A handle each path binds afresh
-        is unknown too: the conditions are dead placeholders until a human writes them, so no path is
-        known to run.
-
-        Touched, not changed: a handle's local NAME is fixed for the whole handler, so a rebind
-        inside a branch leaves the same name here while the tree under it is a different one.
-        Comparing names read that rebind as no change and kept the handle bound after the branch."""
-        for outcome in outcomes:
-            for handle in outcome:
-                self.unbind(handle)
-
-
-#: In a set of handle keys: the statement may reach ANY handle, the input included (a call whose list
-#: is not inlined, or whose list may do more than read).
-_EVERY_HANDLE = "\x00every"
-#: In a set of handle keys: the statement may reach every handle except the input while it is still
-#: ``msg`` (an inlined call, see :meth:`_Flow._call`).
-_EVERY_LOCAL = "\x00every-local"
-
-
-def _handle_key(handle: str) -> str:
-    """A handle's name for matching whole-tree writes: no ``%`` or trailing ``/``, and folded.
-
-    Whether Corepoint handle names are case-sensitive is unverified, so the import assumes the
-    worst: a write to ``%adt`` may be a write to ``%ADT``. The fold is broad on purpose: Unicode
-    compatibility forms are normalised, and upper-casing first also joins letters such as a dotless
-    ``i`` that a case fold alone keeps apart. Only unbinding reads this key; how a local is NAMED
-    does not."""
-    name = unicodedata.normalize("NFKC", handle).strip().lstrip("%").rstrip("/")
-    return unicodedata.normalize("NFKC", name.upper().casefold())
-
-
-def _hit(keys: frozenset[str], handle: str, local: str) -> bool:
-    """Whether a set of handle keys (see :meth:`_Flow._written`) reaches ``handle``, which holds
-    ``local``."""
-    if _EVERY_HANDLE in keys or (_EVERY_LOCAL in keys and local != "msg"):
-        return True
-    return _handle_key(handle) in keys
-
-
-def _forget(env: _Env, deferred: _Deferred) -> None:
-    """Unbind every handle the statement may overwrite whole (see :func:`_whole_written`), in any
-    spelling of its case."""
-    for handle in _whole_written(deferred):
-        env.unbind_key(handle)
-
-
-def _forget_all(env: _Env) -> None:
-    for handle in list(env):
-        env.unbind(handle)
-
-
-#: The verbs the flow reads, each with the only connective words it may carry. Every other verb may
-#: write a handle the flow cannot see, so a statement using one leaves every handle unknown.
-_READ_VERB_WORDS = {
-    **_VERB_CONNECTIVES,
-    "msgtreecopy": frozenset({"to"}),
-    "msgcreate": _MSGCREATE_CONNECTIVES,
-    "msglog": frozenset[str](),
-}
-
-
-def _unread(step: Control) -> bool:
-    """Whether the flow cannot read everything ``step`` (a ``"pending"`` statement) may write.
-
-    It reads a statement only when its verb is one it models (:data:`_READ_VERB_WORDS`), that verb
-    is the statement's first word (so a verb is never misread from a later span), every other word
-    is one that verb may carry, no span fell out of both readings, and its operands fit the verb's
-    grammar (see :func:`_fits`). Anything else may overwrite any handle, the input included, so
-    nothing is vouched for after it. That is judged by verb and shape, never by a handle's name."""
-    deferred = step.deferred
-    if deferred is None or deferred.dropped:
-        return True
-    verb = deferred.verb.lower()
-    allowed = _READ_VERB_WORDS.get(verb)
-    if allowed is None or [w.lower() for w in step.detail.split()[:1]] != [verb]:
-        return True
-    if not {w.lower() for w in deferred.words} <= allowed:
-        return True
-    operands = deferred.operands
-    if deferred.flat is not None:
-        # Markup-free: a connective is a bare token here, and every other bare token may be a
-        # handle spelled without ``%`` (``MsgCreate ADT as ...``), which no reading sees.
-        operands = tuple(o for o in operands if not (o.kind == "literal" and o.text in allowed))
-        if any(o.kind == "literal" and _string_literal(o.text) is None for o in operands):
-            return True
-    return not _fits(verb, operands, deferred)
-
-
-def _fits(verb: str, operands: tuple[Operand, ...], deferred: _Deferred) -> bool:
-    """Whether ``operands`` take the one shape the flow reads for ``verb``: a plain clone, a
-    ``MsgCreate`` whose first operand is the whole tree it builds, a ``MsgLog`` of one whole tree,
-    or a field write whose destination is an HL7 field path into a named handle or a ``$variable``,
-    which is not a message handle. Any other shape, a whole-tree
-    path the flow does not read as one (``%ADT/*``) included, may overwrite a tree it cannot see."""
-    if verb == "msgtreecopy":
-        return bool(_clone_target(deferred))
-    if verb == "msgcreate":
-        if not operands or not _whole_tree(operands[0]):
-            return False
-        # Markup-free, the bare-token check already holds the rest to quoted literals.
-        return deferred.flat is not None or not _create_skeleton(deferred)[1]
-    if verb == "msglog":
-        return not deferred.qualified and len(operands) == 1 and bool(_whole_tree(operands[0]))
-    arity = 1 if verb == "itemclear" else 2
-    if len(operands) != arity:
-        return False
-    # The role grammar writes ``<source> to <destination>``; the markup-free one puts an
-    # ItemAppend's target first.
-    at = 0 if deferred.flat is not None and verb == "itemappend" else arity - 1
-    if not _field_operand(operands[at]):
-        return False
-    return all(
-        _field_operand(o)
-        or (o.kind == "literal" and (o.quoted or _string_literal(o.text) is not None))
-        for i, o in enumerate(operands)
-        if i != at
-    )
-
-
-def _field_operand(operand: Operand) -> bool:
-    """Whether ``operand`` is an HL7 field path into a named handle, or a ``$variable``, which is
-    not a message handle."""
-    if operand.kind == "variable":
-        return operand.text.startswith("$")
-    return (
-        operand.kind == "path"
-        and bool(operand.handle)
-        and _corepoint_path(operand.text) is not None
-    )
-
-
-#: The only call line that may spare the input: the list name, then at most ``pass <one word>``.
-#: Any other word may be a result clause that writes the input (``returning %ADT``).
-_PLAIN_CALL = re.compile(r'ActionListCall\s+"[^"]*"(?:\s+pass\s+\S+)?', re.IGNORECASE)
-
-
-#: Why a clone or a ``MsgCreate`` binds nothing under the narrowing (see :meth:`_Flow._enter`).
-_NO_BIND = (
-    "inside a branch, loop, Try, ChooseFrom, call or unmodelled element, or after the list stopped "
-    "being straight-line, where this import binds no local (ADR 0086); it is unknown from here on"
-)
-
-
-def _may_not_complete(step: Control) -> bool:
-    """Whether Corepoint may stop the list at ``step`` or inside it, so what follows may never run.
-
-    Fail closed: at least an exit (``Returns``, ``ActionListExit``, ``ActionListStop``), a
-    ``LoopExit`` anywhere (outside a loop it may leave the caller's), an element this module does not
-    model (a marker included: what it brackets may be any of these, a step whose ``@Disabled`` value
-    may mean enabled among them), a call whose list is not inlined, a branch marker with no
-    construct or a branch its construct cannot continue, a construct line that owns nothing (it may
-    open a flat-form block), and a branch carrying branches of its own, which nothing here walks. A
-    surely disabled step never runs."""
-    if step.kind == "disabled":
-        return False
-    if step.kind in ("exit", "break", "unknown") or step.kind in _BRANCH_PARENT:
-        return True
-    if step.kind == "call" and not step.body:
-        return True
-    if step.kind in _NESTING_KINDS and not step.body and not step.branches:
-        return True
-    if _drops_statements(step):
-        return True
-    if any(not _renders_as_branch(step.kind, branch.kind) for branch in step.branches):
-        return True  # a stray branch: a marker its construct cannot continue
-    nested = (step.body, *(branch.body for branch in step.branches))
-    return any(isinstance(s, Control) and _may_not_complete(s) for body in nested for s in body)
-
-
-def _bracketed(step: Control) -> bool:
-    """Whether ``step`` or one of its branches carries a line the flow cannot trust (see
-    :attr:`Control.unread`): the flow then vouches for no handle in the chain or after it."""
-    return bool(step.unread) or any(branch.unread for branch in step.branches)
-
-
-def _drops_statements(step: Control) -> bool:
-    """Whether a branch of ``step`` carries branches of its own. The walk and the render read only
-    each branch's body, so whatever those hold, a call or an overwrite included, is never seen:
-    nothing is vouched for after it (see :meth:`_Flow._step`)."""
-    return any(branch.branches for branch in step.branches)
-
-
-def _is_plain_log(step: Control) -> bool:
-    """Whether a statement is ``MsgLog <handle>`` and nothing more: the verb is its first word,
-    the one other word names a whole message tree, and it carries no qualifier or connective. Any
-    other shape might write what it names, or be a different verb misread as ``MsgLog``."""
-    deferred = step.deferred
-    if deferred is None or deferred.verb.lower() != "msglog":
-        return False
-    if deferred.qualified or deferred.words or len(deferred.operands) != 1:
-        return False
-    words = step.detail.split()
-    return (
-        len(words) == 2 and words[0].lower() == "msglog" and bool(_whole_tree(deferred.operands[0]))
-    )
-
-
-class _Flow:
-    """Settle one handler's step tree in statement order, binding each message handle to a local.
-
-    The input handle is ``msg``. A ``MsgTreeCopy`` of a bound handle's whole tree binds its
-    destination to ``<local> = <source>.copy()``, and a ``MsgCreate`` naming a type and a version
-    binds its handle to ``<local> = Message.parse(<skeleton>)``. A field write maps onto the local of
-    the handle it addresses, and a ``MsgSend`` of a bound handle delivers that local. Anything this
-    cannot settle keeps the step 1 refusal: a TODO marker, and at a send or a ``MsgCreate`` a raise.
-    Nothing ever falls back to sending ``msg`` (BACKLOG #313, step 2).
-
-    The walk follows the rendered tree, so it sees exactly the order and nesting the generated Python
-    runs in. Each local name is fixed per handle for the whole handler, so a handle bound again inside
-    a branch rebinds the same Python variable and the join stays faithful.
-
-    The export is untrusted, so the work stays near-linear in the size of the tree: :meth:`_written`
-    is memoized per body, each arm runs in place on an :class:`_Env` and is undone, and :meth:`_local`
-    resumes each name's counter instead of probing from 2."""
-
-    def __init__(self, input_handle: str, marked: bool = True) -> None:
-        self._input = input_handle
-        self._marked = marked
-        # Locals a MsgCreate built: their skeleton holds only an MSH.
-        self._created: set[str] = set()
-        self._names: dict[str, str] = {}
-        self._taken: set[str] = {"msg", "sends", "_item"}
-        self._next: dict[str, int] = {}
-        # Keyed by the id of a body tuple of the unsettled tree. The tuple rides in the value, so it
-        # stays alive and its id cannot be reused for another body while this walk runs.
-        self._written_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
-        self._reads_memo: dict[int, tuple[tuple[Step, ...], int]] = {}
-        # The narrowing (ADR 0086, Manager decision): a local other than msg is bound only by a
-        # statement at the top level of the list (a Block's body counts as top level), and only
-        # while the list is still straight-line. ``_depth`` counts the constructs being settled;
-        # ``_frozen`` turns binding off for the rest of the handler; ``_bound`` says whether any
-        # local other than msg was bound yet (see :meth:`_enter`).
-        self._depth = 0
-        self._frozen = False
-        self._bound = False
-
-    def handler(self, steps: tuple[Step, ...]) -> tuple[Step, ...]:
-        env = _Env({self._input: "msg"} if self._input else {})
-        return tuple(self._run_in_line(steps, env))
-
-    def _run_in_line(self, steps: tuple[Step, ...], env: _Env) -> list[Step]:
-        """Settle ``steps`` in line, leaving ``env`` at what holds after them."""
-        return [self._step(step, env) for step in steps]
-
-    def _binds(self) -> bool:
-        """Whether a clone or a ``MsgCreate`` here may bind a local (see :meth:`_enter`)."""
-        return not self._depth and not self._frozen
-
-    def _enter(self, step: Control, env: _Env) -> None:
-        """Apply the narrowing at ``step``: every step but a statement, a send, a block (whose body
-        is walked in line) and a disabled step.
-
-        Only the top level decides. Once a local other than msg is bound, any such step unbinds
-        every handle, the input included, and turns binding off for the rest of the handler: from
-        there every send raises, a send of the input included. Before any such local is bound, a
-        construct that surely completes changes nothing here, because nothing inside a construct
-        binds. One that may not complete (see :func:`_may_not_complete`) turns binding off even
-        then: what follows it may never run in Corepoint, and the render runs it for every
-        message."""
-        if self._depth:
-            return
-        if self._bound:
-            _forget_all(env)
-            self._frozen = True
-        elif _may_not_complete(step):
-            self._frozen = True
-
-    def _arm(self, steps: tuple[Step, ...], env: _Env) -> tuple[list[Step], dict[str, str | None]]:
-        """Settle one path from the current state, then restore it; return the path's changes."""
-        mark = env.mark()
-        settled = self._run_in_line(steps, env)
-        changes = env.changes(mark)
-        env.undo(mark)
-        return settled, changes
-
-    def _written(self, steps: tuple[Step, ...]) -> frozenset[str]:
-        """The keys (see :func:`_hit`) of every handle any live statement in ``steps`` may overwrite
-        whole, nested constructs included; :data:`_EVERY_LOCAL` or :data:`_EVERY_HANDLE` when a call
-        may reach any handle (see :meth:`_call_keys`).
-
-        Read on the UNSETTLED tree, so it is a syntactic answer: a clone this walk will bind counts as
-        a write as surely as an overwrite it cannot model. A loop and a ``Try`` use it to say which
-        handles may differ on a later pass or in a ``Catch``. Memoized, so nested loops and ``Try``
-        blocks share one pass over each body rather than walking it again at every level."""
-        cached = self._written_memo.get(id(steps))
-        if cached is not None:
-            return cached[1]
-        found: set[str] = set()
-        for step in steps:
-            if not isinstance(step, Control) or step.kind == "disabled":
-                continue
-            if step.deferred is not None and step.kind in ("pending", "unknown"):
-                if step.kind == "unknown" or _unread(step):
-                    found.add(_EVERY_HANDLE)  # see _statement
-                else:
-                    found.update(_handle_key(h) for h in _whole_written(step.deferred))
-            if step.kind == "call":
-                found |= self._call_keys(step)  # what a call leaves unknown (see _call)
-            if _drops_statements(step) or _bracketed(step):
-                found.add(_EVERY_HANDLE)
-            found |= self._written(step.body)
-            for branch in step.branches:
-                found |= self._written(branch.body)
-        result = frozenset(found)
-        self._written_memo[id(steps)] = (steps, result)
-        return result
-
-    def _local(self, handle: str) -> str:
-        """The Python local for ``handle``: fixed per handler, ASCII, never a keyword or a name the
-        generated module already uses (every one ends ``_msg``, which none of those does)."""
-        name = self._names.get(handle)
-        if name is not None:
-            return name
-        base = re.sub(r"[^a-z0-9]+", "_", handle.lower()).strip("_")[:40].rstrip("_")
-        if not base or not base[0].isalpha():
-            base = f"tree_{base}".rstrip("_")
-        n = self._next.get(base, 1)
-        name = f"{base}_msg" if n == 1 else f"{base}_msg_{n}"
-        while name in self._taken:
-            n += 1
-            name = f"{base}_msg_{n}"
-        self._next[base] = n + 1
-        self._taken.add(name)
-        self._names[handle] = name
-        return name
-
-    def _step(self, step: Step, env: _Env) -> Step:
-        """Settle one step, leaving ``env`` at what holds after it."""
-        if not isinstance(step, Control):
-            return step
-        kind = step.kind
-        bracketed = _bracketed(step)
-        if bracketed:
-            # A line of this chain may bind a handle the flow cannot see, and each arm may follow
-            # it: nothing is vouched for in any arm, nor after the chain.
-            _forget_all(env)
-        if kind == "disabled":
-            # Settled for the comment block only: it never ran, so nothing it binds leaks out.
-            self._depth += 1
-            body, _ = self._arm(step.body, env)
-            self._depth -= 1
-            return replace(step, body=tuple(body))
-        if kind == "pending":
-            assert step.deferred is not None
-            return self._statement(step, step.deferred, env)
-        if kind == "send":
-            return self._send(step, env)
-        if kind == "block":
-            # A section label: its body runs in line, at the level the block itself sits.
-            settled = replace(step, body=tuple(self._run_in_line(step.body, env)))
-        else:
-            self._enter(step, env)
-            self._depth += 1
-            # A stray branch renders after the construct but was written inside it, so it is
-            # settled at the construct's depth too.
-            settled = self._strays(self._construct(step, env), env)
-            self._depth -= 1
-        if _drops_statements(step) or bracketed:
-            _forget_all(env)
-        return settled
-
-    def _construct(self, step: Control, env: _Env) -> Control:
-        """Settle a construct: every kind but a statement, a send, a block and a disabled step."""
-        kind = step.kind
-        settled: Control
-        if kind == "call":
-            settled = self._call(step, env)
-        elif kind in _LOOP_KINDS:
-            # A later pass may start from what an earlier one overwrote, so a handle the body may
-            # overwrite is unknown throughout it, and after it (the body may run no times at all).
-            # A stray branch renders after the loop but was written inside it, so it counts too.
-            written = self._written((step,))
-            for handle in list(env):
-                if _hit(written, handle, env[handle]):
-                    env.unbind(handle)
-            body, _ = self._arm(step.body, env)
-            settled = replace(step, body=tuple(body))
-        elif kind == "try":
-            settled = self._try(step, env)
-        elif kind in ("if", "case"):
-            if kind == "case":
-                # A ChooseFrom's statements before its first arm run unconditionally, in line.
-                body = self._run_in_line(step.body, env)
-                outcomes = []
+        skeleton.set("MSH-12", version)
+    except ValueError:  # HL7PeekError included: a refusal, never a traceback
+        return ""
+    return skeleton.encode().rstrip("\r")
+
+
+class _Binder:
+    """Render a fully understood list in statement order, each handle holding its own local.
+
+    The input handle is ``msg``. A clone of a handle that holds a local binds its destination to
+    ``<local> = <source>.copy()``, a ``MsgCreate`` binds its handle to ``<local> =
+    Message.parse(<skeleton>)``, a field write addresses the local of its handle, and a send of a
+    handle that holds a local delivers it. A send of any other handle raises, as in step 1. The list
+    is straight-line (the gate admits no construct), so no state ever has to be joined.
+
+    A write to a handle after a send of it would change the message already sent, because a ``Send``
+    holds the object, not a copy, unless ``[pipeline].snapshot_on_send`` is on (ADR 0104). So that
+    write is a TODO, and the handle is unknown from there: a later send of it raises."""
+
+    def __init__(self, input_handle: str) -> None:
+        self._held: dict[str, str] = {input_handle: "msg"} if input_handle else {}
+        self._sent: set[str] = set()
+        self._built: set[str] = set()  # locals holding a MsgCreate skeleton: an MSH only
+
+    def run(self, items: tuple[_Understood, ...]) -> tuple[Step, ...]:
+        steps: list[Step] = []
+        for item in items:
+            if item.disabled:
+                # Never runs, so it touches no handle: step 1 renders it as commented-out source.
+                steps.extend(_parse_statement(item.elem, frozenset(), frozenset(), False))
+            elif item.statement is None:
+                label = _attr(item.elem, "Data") or "Block"
+                steps.append(Control("block", "Block", label, body=self.run(item.body)))
             else:
-                body, first = self._arm(step.body, env)
-                outcomes = [first]
-            branches: list[Control] = []
-            for branch in step.branches:
-                arm, changes = self._arm(branch.body, env)
-                outcomes.append(changes)
-                branches.append(replace(branch, body=tuple(arm)))
-            env.narrow(outcomes)
-            settled = replace(step, body=tuple(body), branches=tuple(branches))
-        else:
-            # "unknown", an orphaned branch marker, "break", "exit": the body is inlined in place
-            # but its own scope was lost, so nothing it binds is trusted after it. An unmodelled
-            # element carrying a statement may write any handle, so nothing is vouched for at all.
-            if kind == "unknown" and step.deferred is not None:
-                _forget_all(env)
-            body, changes = self._arm(step.body, env)
-            env.narrow([changes])
-            settled = replace(step, body=tuple(body))
-        return settled
+                steps.append(self._statement(item.statement))
+        return tuple(steps)
 
-    def _try(self, step: Control, env: _Env) -> Control:
-        """Settle a ``Try``: its body, then each ``Catch`` from what the body cannot have changed."""
-        catches = [b for b in step.branches if _renders_as_branch(step.kind, b.kind)]
-        if not catches:
-            # No Catch renders as ``except Exception: raise``, so the code after the Try runs only
-            # when the body completed, and the body's state is exactly what holds there.
-            body = self._run_in_line(step.body, env)
-            return replace(step, body=tuple(body))
-        body, body_changes = self._arm(step.body, env)
-        outcomes = [body_changes]
-        # A Catch may start anywhere in the body, so what the body may overwrite is unknown there.
-        mark = env.mark()
-        written = self._written(step.body)
-        for handle in list(env):
-            if _hit(written, handle, env[handle]):
-                env.unbind(handle)
-        settled_catches: dict[int, Control] = {}
-        for branch in catches:
-            start = env.mark()
-            arm = self._run_in_line(branch.body, env)
-            outcomes.append(env.changes(mark))  # from the Try's start: the unbinds and this Catch
-            env.undo(start)
-            settled_catches[id(branch)] = replace(branch, body=tuple(arm))
-        env.undo(mark)
-        env.narrow(outcomes)
-        # A stray stays as it is here; :meth:`_strays` settles it where the render puts it.
-        branches = tuple(settled_catches.get(id(b), b) for b in step.branches)
-        return replace(step, body=tuple(body), branches=branches)
-
-    def _call(self, step: Control, env: _Env) -> Control:
-        """Settle an ``ActionListCall``: the called list runs in its OWN scope.
-
-        Nothing ties the handle names inside a called list to the caller's: it may name the message
-        it was passed by its own input handle, or reuse a caller's name for a different tree. So the
-        inlined body starts knowing no handle at all, and afterwards the caller vouches for none of
-        its own handles, whatever their names (see :meth:`_call_keys`). No name is matched: a handle
-        is untrusted text, and every earlier rule that matched by name missed some spelling. Fail
-        closed: a later send of a clone or a built message raises."""
-        keys = self._call_keys(step)
-        body = self._run_in_line(step.body, _Env({}))
-        for handle in list(env):
-            if _hit(keys, handle, env[handle]):
-                env.unbind(handle)
-        return replace(step, body=tuple(body))
-
-    def _call_keys(self, step: Control) -> frozenset[str]:
-        """What a call leaves unknown: every handle, and the input too unless the call spares it.
-
-        Generated code never rebinds ``msg``. But Corepoint can replace the input whole through a
-        call, because the called list names what it was passed by its own handle, under any
-        spelling, so no reading of its operands can rule that out. And an edit it makes in place
-        is a TODO in the inlined body, so ``msg`` would go out without it. So the input survives
-        only a call whose inlined list does nothing but read (see :meth:`_reads_only`), judged by
-        verb and never by a handle's name, and whose line is plain (see :data:`_PLAIN_CALL`): a
-        result clause may write the input. A call whose list is not inlined may do anything."""
-        if _PLAIN_CALL.fullmatch(step.detail.strip()) and self._reads_only(step.body) > 0:
-            return frozenset({_EVERY_LOCAL})
-        return frozenset({_EVERY_HANDLE})
-
-    def _reads_only(self, steps: tuple[Step, ...]) -> int:
-        """How many statements ``steps`` holds when every one is a plain log (see
-        :func:`_is_plain_log`), nested constructs included; ``-1`` when any one may be more.
-
-        Deliberately narrow: anything else counts as more, a step with no statement at all and a
-        disabled one included. Memoized like :meth:`_written`."""
-        cached = self._reads_memo.get(id(steps))
-        if cached is not None:
-            return cached[1]
-        count = 0
-        for step in steps:
-            if not isinstance(step, Control):
-                count = -1
-            elif step.kind == "pending":
-                count = count + 1 if _is_plain_log(step) else -1
-            elif (
-                step.kind in ("block", *_NESTING_KINDS)
-                and not _drops_statements(step)
-                and not _bracketed(step)
-            ):
-                for nested in (step.body, *(branch.body for branch in step.branches)):
-                    inner = self._reads_only(nested)
-                    count = -1 if inner < 0 else count + inner
-                    if count < 0:
-                        break
-            else:
-                # A send, an exit, a LoopExit (it would leave the CALLER's loop), a nested call, an
-                # unmodelled element, a step whose @Disabled spelling may not mean disabled, and a
-                # branch carrying branches of its own, whose statements the walk never reaches.
-                count = -1
-            if count < 0:
-                break
-        self._reads_memo[id(steps)] = (steps, count)
-        return count
-
-    def _strays(self, ctrl: Control, env: _Env) -> Control:
-        """Settle the branches the render inlines AFTER ``ctrl`` (see :func:`_stray_branches`)."""
-        if all(_renders_as_branch(ctrl.kind, branch.kind) for branch in ctrl.branches):
-            return ctrl
-        branches: list[Control] = []
-        for branch in ctrl.branches:
-            if _renders_as_branch(ctrl.kind, branch.kind):
-                branches.append(branch)
-                continue
-            arm, changes = self._arm(branch.body, env)
-            env.narrow([changes])
-            branches.append(replace(branch, body=tuple(arm)))
-        return replace(ctrl, branches=tuple(branches))
-
-    def _send(self, step: Control, env: _Env) -> Control:
-        """A send of a bound handle delivers its local; anything else raises at the send site."""
-        assert step.deferred is not None  # the parse gives every send its operands
-        operands = step.deferred.operands
-        sent = _whole_tree(operands[0]) if operands else ""
-        refusal = _send_refusal(sent, env)
-        if refusal:
-            return replace(step, refusal=refusal)
-        return replace(step, message=env[sent])
-
-    def _statement(self, step: Control, deferred: _Deferred, env: _Env) -> Step:
-        """Settle one transform statement: a field write, a clone, a ``MsgCreate``, or a marker."""
-        verb, operands = deferred.verb, deferred.operands
-        unread = _unread(step)
-        if deferred.flat is not None:
-            result = self._flat_write(deferred.flat, deferred, env)
-        elif _clone_target(deferred) and not unread:
-            return self._tree_copy(step, operands, env)
-        elif verb.lower() == "msgcreate" and operands and _whole_tree(operands[0]):
-            return self._create(step, deferred, env, unread=unread)
-        else:
-            mapped = _map_roles(
-                verb,
-                operands,
-                env,
-                # An unstyled verb is not read as a word for clones (see _statement_words), but a field
-                # write keeps declining on it, as it always did: whether that is safe was never decided.
-                words=deferred.words if deferred.styled else (verb, *deferred.words),
-                qualified=deferred.qualified,
-                in_control=deferred.in_control,
-            )
-            result = mapped if mapped is not None else _decline(verb, operands, env)
-        _forget(env, deferred)
-        if unread:
-            # Settled against what held before it, so a decline still names its own cause; then
-            # nothing is vouched for, and nothing it might have written is emitted.
-            _forget_all(env)
-            if isinstance(result, Action):
-                result = UnmappedAction(
-                    result.source_class,
-                    "the statement carries something this import does not read, so it may write "
-                    f"more than this; intended target {_written_path(result)}",
-                )
-        return self._skeleton_guard(result)
-
-    def _skeleton_guard(self, result: Step) -> Step:
-        """Decline a write a ``MsgCreate`` skeleton cannot take.
-
-        The skeleton holds only an MSH, and :meth:`Message.set` raises on an absent segment, so a
-        mapped write to any other segment of a built message would dead-letter every message, or be
-        swallowed by a ``Catch``. It becomes a TODO instead: the segment has to be added by hand. A
-        write to MSH-1/MSH-2 is refused as everywhere else (see :func:`_writable`)."""
-        if not isinstance(result, Action) or result.target not in self._created:
-            return result
-        path = _written_path(result)
-        if (
-            result.vocabulary in ("set_field", "append_to_field")
-            and _writable(path)
-            and path.split("-", 1)[0].upper() == "MSH"
-        ):
-            return result
-        return UnmappedAction(
-            result.source_class,
-            f"writes a message MsgCreate built, whose skeleton has only an MSH segment, so the "
-            f"segment this write needs must be added by hand; intended target {path}",
-        )
-
-    def _flat_write(
-        self, flat: Action | UnmappedAction, deferred: _Deferred, env: _Env
-    ) -> Action | UnmappedAction:
-        """Point a markup-free write at the local of the one handle its paths address.
-
-        A list with no role markup at all keeps the superseded model's reading: its writes land on
-        ``msg``. In any list with role markup, a markup-free write must not land on ``msg`` by
-        default: it lands on the local of the one handle it addresses, or declines. It also maps
-        only as the role layer would map it: never ``copy_field``, which clears the destination when
-        the source is absent, never a repeating segment, never MSH-1/MSH-2."""
-        if not isinstance(flat, Action):
-            return flat
-        if not self._marked:
-            # MSH-1/MSH-2 corrupt the framing whichever model reads the list (see _FRAMING_PATHS).
-            if _written_path(flat) in _FRAMING_PATHS:
+    def _statement(self, st: _Statement) -> Step:
+        if st.verb == "MsgSend":
+            return self._send(st)
+        if st.verb == "MsgLog":
+            return UnmappedAction(st.verb, "no v1 vocabulary mapping")
+        if st.verb == "MsgCreate":
+            return self._bind(st, f"Message.parse({_lit(st.skeleton)})", built=True)
+        if st.verb == "MsgTreeCopy":
+            source, dest = st.handles[0][0], st.handles[1][0]
+            held = self._held.get(source)
+            if held is None:
+                self._held.pop(dest, None)
                 return UnmappedAction(
-                    flat.source_class,
-                    f"targets {_written_path(flat)}, a framing field this import never writes",
+                    st.verb,
+                    f"copies {source}, which holds no message this import can identify here, "
+                    f"over {dest}, which is unknown from here on",
                 )
-            return flat
-        if deferred.in_control:
-            return UnmappedAction(
-                flat.source_class,
-                "a markup-free write inside a branch or loop declines, as a role-parsed one does; "
-                f"intended target {_written_path(flat)}",
-            )
-        target = _written_path(flat)
-        if flat.vocabulary not in ("set_field", "append_to_field") or not _writable(target):
-            return UnmappedAction(
-                flat.source_class,
-                "a markup-free write in a list with role markup maps only as the role layer would "
-                "(no copy_field, no repeating segment, no MSH-1/MSH-2); "
-                f"intended target {target}",
-            )
-        handles = {o.handle for o in deferred.operands if o.kind == "path"}
-        handle = next(iter(handles)) if len(handles) == 1 else ""
-        if handle in env:
-            return replace(flat, target=env[handle])
-        return UnmappedAction(
-            flat.source_class,
-            "a markup-free write that addresses a message handle that holds no message this "
-            f"import can identify at this point (cross-message); intended target {target}",
-        )
+            return self._bind(st, f"{held}.copy()", built=held in self._built)
+        return self._write(st)
 
-    def _tree_copy(self, step: Control, operands: tuple[Operand, ...], env: _Env) -> Step:
-        source, dest = _whole_tree(operands[0]), _whole_tree(operands[1])
-        verb = step.source_verb
-        held = env.get(source) if source else None
-        env.unbind_key(dest)  # every spelling of its case, the input's included
-        if _handle_key(dest) == _handle_key(self._input):
-            # Rebinding msg would leave every later write and send of the input addressing a
-            # different object than the one that arrived. Unknown from here on instead.
-            return UnmappedAction(
-                verb,
-                "overwrites the input handle; msg stays the message that arrived, so the input is "
-                "unknown from here on",
-            )
-        if held is not None and not self._binds():
-            return UnmappedAction(
-                verb,
-                f"copies {_comment_text(source, 60)} over {_comment_text(dest, 60)} {_NO_BIND}",
-            )
-        if held is not None:
-            expression = f"{held}.copy()"
-            local = self._local(dest)
-            env.bind(dest, local)
-            self._bound = True
-            if held in self._created:
-                self._created.add(local)  # a copy of a skeleton is still only a skeleton
-            return Control("clone", verb, step.detail, args=(local, expression))
-        what = (
-            f"{_comment_text(source, 60)}, which holds no message this import can identify here"
-            if source
-            else "something that is not a whole message tree"
-        )
-        return UnmappedAction(
-            verb, f"copies {what} over {_comment_text(dest, 60)}, which is unknown from here on"
-        )
-
-    def _create(self, step: Control, deferred: _Deferred, env: _Env, *, unread: bool) -> Step:
-        handle = _whole_tree(deferred.operands[0])
-        _forget(env, deferred)  # every handle it names, not only the one it builds
-        name = _comment_text(handle, 60)
-        if unread:
-            _forget_all(env)
-        if _handle_key(handle) == _handle_key(self._input):
-            why = "a new message in the input handle would replace msg, the message that arrived"
-        elif not self._binds():
-            return UnmappedAction(step.source_verb, f"builds {name} {_NO_BIND}")
+    def _bind(self, st: _Statement, expression: str, *, built: bool) -> Control:
+        handle = st.handles[-1][0]
+        local = f"{handle[1:].lower()}_msg"  # unique: the gate refused a case collision
+        self._held[handle] = local
+        self._sent.discard(local)  # a fresh object: the one already sent is not this one
+        if built:
+            self._built.add(local)
         else:
-            skeleton, why = _create_skeleton(deferred)
-            if unread and not why:
-                why = "the statement carries something this import does not read"
-            if not why:
-                local = self._local(handle)
-                env.bind(handle, local)
-                self._bound = True
-                self._created.add(local)
-                return Control(
-                    "create",
-                    step.source_verb,
-                    step.detail,
-                    args=(local, f"Message.parse({_lit(skeleton)})"),
-                )
-        return Control(
-            "create",
-            step.source_verb,
-            step.detail,
-            refusal=f"{name} is not built: {why}; the import refuses to guess the message",
-        )
+            self._built.discard(local)
+        kind = "create" if st.verb == "MsgCreate" else "clone"
+        return Control(kind, st.verb, st.text, args=(local, expression))
+
+    def _write(self, st: _Statement) -> Action | UnmappedAction:
+        handle = st.handles[0][0]
+        local = self._held.get(handle)
+        why = ""
+        if local is None:
+            why = (
+                f"addresses {handle}, which holds no message this import can identify at this "
+                "point (cross-message)"
+            )
+        elif local in self._sent:
+            del self._held[handle]
+            why = (
+                f"writes {handle} after a MsgSend of it, which would change the message already "
+                f"sent; {handle} is unknown from here on"
+            )
+        elif local in self._built and not st.path.startswith("MSH-"):
+            why = (
+                "writes a message MsgCreate built, whose skeleton has only an MSH segment, so the "
+                "segment this write needs must be added by hand"
+            )
+        if why or local is None:
+            return UnmappedAction(st.verb, f"{why}; intended target {st.path}")
+        value = "" if st.verb == "ItemClear" else st.literals[0]
+        vocabulary = "append_to_field" if st.verb == "ItemAppend" else "set_field"
+        return Action(st.verb, vocabulary, (_lit(st.path), _lit(value)), target=local)
+
+    def _send(self, st: _Statement) -> Control:
+        handle = st.handles[0][0]
+        local = self._held.get(handle)
+        args = (_lit(_connection_name(_sanitize(st.literals[0]))),)
+        if local is None:
+            refusal = (
+                f"MsgSend delivers {handle}, which at this point holds no message this import can "
+                "identify (it is not the input handle, nor bound by a clone or a MsgCreate before "
+                "this send); the import refuses to send msg in its place"
+            )
+            return Control("send", st.verb, st.text, args=args, refusal=refusal)
+        self._sent.add(local)
+        return Control("send", st.verb, st.text, args=args, message=local)
 
 
 def _hardened_fromstring(text: str) -> Element:
@@ -2917,11 +2058,16 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
                 n += 1
             name = f"{name}_{n}"
         taken.add(name)
-        # Parse the whole tree first, then settle it in statement order: which message a handle holds
-        # depends on what ran before it, and only the parsed tree knows the branch structure.
-        parsed = tuple(_container_steps(action_list, False))
-        steps = _Flow(*_input_handle(action_list)).handler(parsed)
         scope = _disabled_scope(action_list, parents)
+        # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
+        # list it does not fully understand takes the step 1 path below untouched, so its output is
+        # step 1's byte for byte; there is no partial binding.
+        understood = _understood_list(action_list) if scope is None else None
+        if understood is not None:
+            steps = _Binder(understood[0]).run(understood[1])
+        else:
+            subject, held = _message_handles(action_list)
+            steps = tuple(_container_steps(action_list, subject, held, False))
         if scope is not None:
             # The whole list is switched off: wrap it in ONE disabled node so it is preserved as
             # commented-out pseudo-source, counted as disabled, and — because _collect_sends skips a
@@ -2965,12 +2111,7 @@ def _collect_sends(steps: tuple[Step, ...]) -> tuple[str, ...]:
     A ``@Disabled`` subtree is skipped, and that skip is load-bearing rather than cosmetic: these names
     become the handler's ``destinations``, and a handler with destinations but no *inline* send falls
     back to emitting a trailing ``return Send(...)``. Walking into a disabled subtree would therefore
-    resurrect a switched-off send as live code — the one thing ``@Disabled`` must never do.
-
-    It walks exactly what the render emits: each step's body and each branch's BODY. A branch's own
-    ``branches`` (a marker nested inside a branch) is not rendered, so a send there must not be
-    collected either, or it would come back as a trailing ``Send(dest, msg)``: the fallback to msg
-    BACKLOG #313 removed, made unconditional (the nested-branch drop itself is a separate defect)."""
+    resurrect a switched-off send as live code — the one thing ``@Disabled`` must never do."""
     found: list[str] = []
     for step in steps:
         if not isinstance(step, Control) or step.kind == "disabled":
@@ -2979,8 +2120,7 @@ def _collect_sends(steps: tuple[Step, ...]) -> tuple[str, ...]:
             name = json.loads(step.args[0])
             if name not in found:
                 found.append(name)
-        nested_bodies = (step.body, *(branch.body for branch in step.branches))
-        for nested in (name for body in nested_bodies for name in _collect_sends(body)):
+        for nested in (*_collect_sends(step.body), *_collect_sends(step.branches)):
             if nested not in found:
                 found.append(nested)
     return tuple(found)
@@ -3036,7 +2176,7 @@ def generate_module(channel: Channel) -> str:
     ]
 
     surface = ["Send", "handler", "inbound", "outbound", "router"]
-    if any(_any_live_control(h.steps, _builds_a_message) for h in channel.handlers):
+    if any(_any_live_send(h.steps, lambda _: True, "create") for h in channel.handlers):
         surface.append("Message")  # a MsgCreate binds its handle to Message.parse(...)
     surface_imports = sorted({*surface, *used_connectors})
     lines.append(f"from messagefoundry import {', '.join(surface_imports)}")
@@ -3161,22 +2301,7 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     forgetting to ask for it — see :func:`_stray_branches` (BACKLOG #1854)."""
     out = _generate_construct(ctrl, indent, in_loop=in_loop)
     out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))
-    if ctrl.kind != "disabled":
-        # Said once, ahead of the construct, for its own line and for each branch's.
-        pad = "    " * indent
-        out[:0] = [
-            f"{pad}# TODO: Corepoint {_comment_text(verb, 60)} — hand-finish: {_comment_text(why)}; "
-            "no message handle is vouched for in this construct or after it"
-            for verb, why in _unread_lines(ctrl)
-        ]
     return out
-
-
-def _unread_lines(ctrl: Control) -> list[tuple[str, str]]:
-    """``(verb, why)`` for the construct's own line and each branch line the flow cannot trust.
-    The render writes one TODO for each, and the count reports each unmapped."""
-    lines = [(ctrl.source_verb, ctrl.unread), *((b.source_verb, b.unread) for b in ctrl.branches)]
-    return [(verb, why) for verb, why in lines if why]
 
 
 def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
@@ -3190,9 +2315,6 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
     if ctrl.kind in ("block", "call"):
         # A section label / an inlined call: a comment, then the body at the SAME indentation.
         head = f"Corepoint {ctrl.source_verb}"
-        if ctrl.kind == "call" and not ctrl.body:
-            # Nothing was inlined, so what the called list did is absent: say so, never "inlined".
-            return [f"{pad}# TODO: Corepoint {ctrl.source_verb} — called list not inlined{suffix}"]
         if ctrl.kind == "call":
             head += " (called list inlined)"
         out = [f"{pad}# {head}: {label}" if label else f"{pad}# {head}"]
@@ -3229,35 +2351,15 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: no destination named "
                 f"({label})"
             ]
-        if not ctrl.message:
-            # :class:`_Flow` either binds the local or sets a refusal. Neither happened, which is a
-            # defect in this module; guessing ``msg`` here is the exact fallback #313 removed.
-            raise CorepointImportError(
-                f"internal: a Corepoint {ctrl.source_verb} reached the render with no message"
-            )
         return [
             f"{pad}sends.append(Send({ctrl.args[0]}, {ctrl.message}))  # Corepoint {ctrl.source_verb}"
         ]
-    if ctrl.kind in _BINDING_KINDS:
-        if ctrl.refusal:
-            # Reaching this line is a loud ERROR (dead-letter), exactly like a refused send: the
-            # handle would otherwise be sent, or written, holding a message nobody built.
-            message = _lit(f"Corepoint import: {ctrl.source_verb}: {ctrl.refusal}")
-            return [
-                f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: "
-                f"{_comment_text(ctrl.refusal)} ({label})",
-                f"{pad}raise NotImplementedError({message})",
-            ]
-        # Both halves are generated: the local is a name _Flow made, the expression a local plus
+    if ctrl.kind in ("clone", "create"):
+        # Both halves are generated: the local is a name _Binder made from a handle the gate held to
+        # ``%`` plus ASCII letters, digits and underscores, and the expression is a local plus
         # ``.copy()`` or a ``Message.parse`` of a :func:`_lit` literal. No export text reaches here raw.
         local, expression = ctrl.args
         return [f"{pad}{local} = {expression}  # Corepoint {label or ctrl.source_verb}"]
-    if ctrl.kind == "pending":
-        # :class:`_Flow` settles every one. Reaching the render unsettled is a defect in this module,
-        # and emitting nothing here would silently drop the statement.
-        raise CorepointImportError(
-            f"internal: a Corepoint {ctrl.source_verb} statement reached the render unsettled"
-        )
     if ctrl.kind == "break":
         if in_loop:
             return [f"{pad}break  # Corepoint {ctrl.source_verb}"]
@@ -3272,12 +2374,11 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
         # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
         handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
-        if _has_refusal(ctrl.body):
+        if _has_refused_send(ctrl.body):
             # Every Catch renders as ``except Exception:``, which would swallow the refusal's raise
             # and run the Catch body instead: a delivery or a silent filter (BACKLOG #313).
             out.append(
-                f"{pad}except NotImplementedError:  # a refused Corepoint statement above — "
-                "never caught"
+                f"{pad}except NotImplementedError:  # a refused MsgSend above — never caught"
             )
             out.append(f"{pad}    raise")
         if not handlers:
@@ -3440,12 +2541,10 @@ def _disabled_body(steps: tuple[Step, ...], pad: str, depth: int) -> list[str]:
     prefix = f"{pad}#{'  ' * depth}"
     for step in steps:
         if isinstance(step, Action):
-            # ``args`` are already rendered literals (escaped by _lit); ``source_class`` is not. A
-            # write to a local other than msg names it, so re-enabling it keeps its message.
-            on = "" if step.target == "msg" else f" on {step.target}"
+            # ``args`` are already rendered literals (escaped by _lit); ``source_class`` is not.
             out.append(
                 f"{prefix}{_comment_text(step.source_class, 60)} -> "
-                f"{step.vocabulary}({', '.join(step.args)}){on}"
+                f"{step.vocabulary}({', '.join(step.args)})"
             )
         elif isinstance(step, UnmappedAction):
             out.append(f"{prefix}{_comment_text(step.source_class, 60)} (no vocabulary mapping)")
@@ -3473,28 +2572,26 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list."""
-    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
+    return _any_live_send(steps, lambda send: bool(send.args))
 
 
-def _has_refusal(steps: tuple[Step, ...]) -> bool:
-    """Whether the tree renders a refused ``MsgSend`` or ``MsgCreate`` as a live ``raise``."""
-    return _any_live_control(steps, lambda ctrl: bool(ctrl.refusal))
+def _has_refused_send(steps: tuple[Step, ...]) -> bool:
+    """Whether the tree renders a refused ``MsgSend`` as a live ``raise`` (see :func:`_send_refusal`)."""
+    return _any_live_send(steps, lambda send: bool(send.refusal))
 
 
-def _builds_a_message(ctrl: Control) -> bool:
-    """Whether ``ctrl`` renders a ``Message.parse`` (a ``MsgCreate`` with a skeleton)."""
-    return ctrl.kind == "create" and not ctrl.refusal
-
-
-def _any_live_control(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
-    """Whether any live (not ``@Disabled``) control in the tree, branches included, passes ``test``."""
+def _any_live_send(
+    steps: tuple[Step, ...], test: Callable[[Control], bool], kind: str = "send"
+) -> bool:
+    """Whether any live (not ``@Disabled``) ``send`` in the tree, branches included, passes ``test``.
+    ``kind`` asks the same of another control kind (a ``"create"``)."""
     for step in steps:
         if not isinstance(step, Control) or step.kind == "disabled":
             continue
-        if test(step):
+        if step.kind == kind and test(step):
             return True
-        if _any_live_control(step.body, test) or any(
-            _any_live_control(b.body, test) for b in step.branches
+        if _any_live_send(step.body, test, kind) or any(
+            _any_live_send(b.body, test, kind) for b in step.branches
         ):
             return True
     return False
@@ -3617,8 +2714,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
 # ``break`` is faithful only inside a loop, so :func:`_count_steps` also reads its loop context: a
 # ``LoopExit`` outside a loop is a TODO marker and counts unmapped (BACKLOG #1860). A ``send`` that is
-# refused, or names no destination, is not sent either, and also counts unmapped; so does a refused
-# ``create``, which renders as a raise rather than the build (BACKLOG #313).
+# refused, or names no destination, is not sent either, and also counts unmapped (BACKLOG #313). A
+# ``clone`` or ``create`` is the local a fully understood list binds (BACKLOG #313 step 2).
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -3633,7 +2730,8 @@ _MAPPED_CONTROL_KINDS = frozenset(
         "break",
         "send",
         "call",
-        *_BINDING_KINDS,
+        "clone",
+        "create",
     }
 )
 
@@ -3643,9 +2741,8 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
 
     Every source element lands in exactly one bucket: emitted as a vocabulary call or as real control
     flow (*mapped*), emitted as an in-place TODO marker or a refusal — at least an unmapped verb, an
-    ``exit``, a ``LoopExit`` outside a loop, an element whose tag is not modelled at all, a
-    ``MsgSend`` that is refused or names no destination, and a refused ``MsgCreate`` (*unmapped*), or
-    preserved as
+    ``exit``, a ``LoopExit`` outside a loop, an element whose tag is not modelled at all, and a
+    ``MsgSend`` that is refused or names no destination (*unmapped*), or preserved as
     commented-out pseudo-source under a ``@Disabled`` element or action-list (*disabled*). Nothing is
     ever silently dropped.
 
@@ -3670,19 +2767,11 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            # A line the flow cannot trust renders a TODO of its own (see _generate_control).
-            unmapped.extend(verb for verb, _ in _unread_lines(step))
-            if (
-                step.refusal
-                or (step.kind == "send" and not step.args)
-                or (step.kind == "call" and not step.body)
-            ):
-                # Rendered as a raise or a bare TODO, never as the send, the build or the inlined
-                # list, so not reported as shipped.
+            if step.kind == "send" and (step.refusal or not step.args):
+                # Rendered as a raise or a bare TODO, never as the send, so not reported as shipped.
                 unmapped.append(step.source_verb)
             elif (
-                not step.unread
-                and step.kind in _MAPPED_CONTROL_KINDS
+                step.kind in _MAPPED_CONTROL_KINDS
                 and step.kind not in _BRANCH_PARENT
                 and (step.kind != "break" or in_loop)
             ):
@@ -3711,8 +2800,6 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             for branch in step.branches:
                 # A branch the render cannot emit as control flow becomes a TODO marker instead, so
                 # it lands in the unmapped bucket; its body statements are real and counted above.
-                if branch.unread:
-                    continue  # counted unmapped with its TODO line, above
                 if _renders_as_branch(step.kind, branch.kind):
                     mapped += 1
                 else:

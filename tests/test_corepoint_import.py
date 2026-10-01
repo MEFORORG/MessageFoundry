@@ -9,10 +9,8 @@ the ``messagefoundry check`` structural gate on emitted modules, and the untrust
 from __future__ import annotations
 
 import ast
-import html
 import json
 import re
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,7 +25,6 @@ from messagefoundry.corepoint_import import (
     _corepoint_path,
     _corepoint_segment,
     _count_steps,
-    _Deferred,
     _operands_from_roles,
     _role_prose,
     _role_verb,
@@ -730,21 +727,11 @@ def test_a_disabled_send_is_not_resurrected_as_a_trailing_send() -> None:
 
 def test_a_hostile_destination_name_cannot_become_a_traversal_path() -> None:
     """A destination name is untrusted export text — it must not ride raw into the wiring."""
-    src = _handler_source(_role_send("input-handle", "%ADT", "../../etc/passwd"))
+    src = _handler_source('<Line Data="MsgSend $out [../../etc/passwd]"/>')
     assert "../.." not in src
     # ONE sanitized name, used identically as the connection id, the Send target and the directory.
     assert 'sends.append(Send("etc_passwd", msg))' in src
     assert 'outbound("etc_passwd", File(directory="./corepoint-import/IB_ACME_X/etc_passwd")' in src
-
-    # The markup-free send of a ``$variable`` is refused (BACKLOG #313 step 2), so its statement
-    # rides only into the TODO comment. The wiring and the raise still carry the sanitized name alone.
-    flat = _handler_source('<Line Data="MsgSend $out [../../etc/passwd]"/>')
-    code = [ln for ln in flat.splitlines() if not ln.lstrip().startswith("#")]
-    assert not any("../.." in ln for ln in code)
-    assert (
-        'outbound("etc_passwd", File(directory="./corepoint-import/IB_ACME_X/etc_passwd")' in flat
-    )
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to etc_passwd:' in flat
 
 
 def test_nested_control_flow_round_trips() -> None:
@@ -941,7 +928,9 @@ def test_a_stray_branch_body_is_live_code_outside_the_loop_it_was_adopted_by() -
         "<Foreach>"
         '<Line Data="ItemClear %ADT/PID-19"/>'
         '<Line Data="Catch"/>'
-        '<Line Data="LoopExit"/>' + _role_send("input-handle", "%ADT", "OB_ACME_ADT") + "</Foreach>"
+        '<Line Data="LoopExit"/>'
+        '<Line Data="MsgSend $out [OB_ACME_ADT]"/>'
+        "</Foreach>"
     )
     assert "# TODO: Corepoint LoopExit outside a loop" in src
     assert "break" not in src
@@ -1028,12 +1017,10 @@ def test_exit_verbs_are_flagged_never_flattened() -> None:
 
 def test_msgsend_becomes_an_inline_send_and_a_placeholder_outbound() -> None:
     """A ``MsgSend`` sends where the export put it — flattening it to a trailing Send would turn a
-    conditional send into an unconditional one. The shape is unchanged by the handle flow of
-    BACKLOG #313 step 2; the send names the input handle, which is msg."""
+    conditional send into an unconditional one."""
     src = _handler_source(
-        '<If Data="If (%ADT/PID-8 = &quot;M&quot;)"><List>'
-        + _role_send("input-handle", "%ADT", "OB_ACME_ADT")
-        + "</List></If>"
+        '<If Data="If (%ADT/PID-8 = &quot;M&quot;)">'
+        '<List><Line Data="MsgSend $out [OB_ACME_ADT]"/></List></If>'
     )
     assert "    sends = []" in src
     assert '        sends.append(Send("OB_ACME_ADT", msg))' in src
@@ -1045,18 +1032,9 @@ def test_msgsend_becomes_an_inline_send_and_a_placeholder_outbound() -> None:
 
 
 def test_msgsend_without_a_recoverable_destination_is_a_marker() -> None:
-    """A send of msg with no destination is a marker. A send of a handle nobody bound, with no
-    destination, is still a refusal and raises (see test_a_refused_send_with_no_destination_still_raises)."""
-    src = _handler_source(
-        _role_line(_span("keyword", "MsgSend") + " " + _span("input-handle", "%ADT"))
-    )
+    src = _handler_source('<Line Data="MsgSend $out"/>')
     assert "# TODO: Corepoint MsgSend — hand-finish: no destination named" in src
     assert "Send(" not in src.split('"""')[-1]
-    assert "raise NotImplementedError" not in src
-
-    flat = _handler_body(_handler_source('<Line Data="MsgSend $out"/>'))
-    assert "Send(" not in flat
-    assert 'raise NotImplementedError("Corepoint import: MsgSend (no destination named):' in flat
 
 
 # --- a MsgSend of a handle that is not msg (BACKLOG #313, step 1) -------------------------------
@@ -1078,19 +1056,14 @@ def _role_line(data: str) -> str:
     return f'<Line Data="{escaped}"/>'
 
 
-def _write(handle_class: str, handle: str, value: str) -> str:
-    """A role-marked ``ItemCopy "<value>" to <handle>/MSH-6``."""
-    return _role_line(
-        _span("keyword", "ItemCopy")
-        + " "
-        + _span("literal", '"' + value + '"')
-        + " to "
-        + _span(handle_class, handle)
-        + _span("path", "/MSH-6")
-    )
-
-
-_WRITE_INPUT = _write("input-handle", "%ADT", "X")
+_WRITE_INPUT = _role_line(
+    _span("keyword", "ItemCopy")
+    + " "
+    + _span("literal", '"X"')
+    + " to "
+    + _span("input-handle", "%ADT")
+    + _span("path", "/MSH-6")
+)
 
 
 def _role_send(handle_class: str, handle: str, dest: str) -> str:
@@ -1127,8 +1100,7 @@ def test_a_msgsend_of_a_non_subject_handle_fails_loudly_and_sends_nothing() -> N
     assert "return None" not in body  # not a silent filter
     assert (
         '    raise NotImplementedError("Corepoint import: MsgSend to OB_ACME: MsgSend delivers %OUT, '
-        "which at this point is not the input handle, nor bound by a whole-tree clone or a "
-        "MsgCreate on every path before this send" in body
+        "which at this point holds no message this import can identify" in body
     )
     assert "# TODO: Corepoint MsgSend to OB_ACME — hand-finish: MsgSend delivers %OUT" in body
     # The destination stays declared, so the hand-finisher has somewhere to send the right message.
@@ -1161,17 +1133,13 @@ def test_a_send_with_no_single_input_handle_is_refused() -> None:
     """With no input handle at all, no handle is known to be msg, so the send is refused too."""
     body = _handler_body(_handler_source(_role_send("other-handle", "%OUT", "OB_ACME")))
     assert "Send(" not in body
-    assert (
-        "no handle in this action-list holds a message this import can identify at this point"
-        in body
-    )
+    assert "holds no message this import can identify" in body
     assert "raise NotImplementedError" in body
 
 
 def test_a_mixed_list_refuses_only_the_non_subject_send() -> None:
-    """One list sending both handles: the input send stays live, the other one raises. The write
-    addresses the input, which is msg at that point, so it maps (BACKLOG #313 step 2: each handle has
-    its own local, so a write can no longer land in another handle's send)."""
+    """One list sending both handles: the input send stays live, the other one raises. The list is
+    fully understood, so the write to the input maps onto msg (BACKLOG #313 step 2)."""
     src = _handler_source(
         _WRITE_INPUT
         + _role_send("input-handle", "%ADT", "OB_IN")
@@ -1230,22 +1198,17 @@ def _root_copy(
     return line.replace("<Line ", '<Line Disabled="1" ', 1) if disabled else line
 
 
-_INBOUND = "MSH|^~\\&|A|B|C|D|20260930||ADT^A01|1|P|2.5\rPID|1||123"
-
-
-def _run_handler(tmp_path: Path, body: str, inbound: Message | None = None) -> object:
-    """Import a one-list package, load it through the real loader, and call its handler once.
-
-    ``inbound`` lets a test keep a reference to the message it passed in; by default a fresh
-    synthetic ADT is used."""
+def _run_handler(tmp_path: Path, body: str) -> object:
+    """Import a one-list package, load it through the real loader, and call its handler once."""
     from messagefoundry.config.wiring import load_config
+    from messagefoundry.parsing.message import Message
 
     export = tmp_path / "pkg.xml"
     export.write_text(_package(body), encoding="utf-8")
     out = tmp_path / "out"
     import_corepoint(export, out)
     handler_fn = load_config(out).handlers["t"]
-    return handler_fn(inbound if inbound is not None else Message.parse(_INBOUND))
+    return handler_fn(Message.parse("MSH|^~\\&|A|B|C|D|20260930||ADT^A01|1|P|2.5\rPID|1||123"))
 
 
 def test_a_catch_cannot_swallow_a_refused_send(tmp_path: Path) -> None:
@@ -1287,15 +1250,15 @@ def test_a_try_with_no_refused_send_renders_as_before() -> None:
     ],
 )
 def test_a_send_of_an_unidentified_or_other_message_is_refused(operand: str) -> None:
-    """Fail closed: a send is live only when its handle holds a known message. A root-path spelling
-    of another handle, a ``$variable`` and a partial path all refuse. The list's write to the input
-    still maps: it is a write to msg, whatever the list later sends."""
+    """Fail closed: a send is live only when its handle is provably msg. A root-path spelling of
+    another handle, a ``$variable`` and a partial path all refuse, and the list's field write then
+    degrades to a TODO because the list does not provably deliver msg."""
     literal = _span("literal", '"OB_ACME"')
     send = _role_line(_span("keyword", "MsgSend") + " " + operand + " to connection " + literal)
     body = _handler_body(_handler_source(_WRITE_INPUT + send))
     assert "Send(" not in body
     assert "raise NotImplementedError" in body
-    assert 'set_field(msg, "MSH-6", "X")' in body
+    assert 'set_field(msg, "MSH-6"' not in body
 
 
 def test_a_root_path_send_of_the_input_handle_still_sends() -> None:
@@ -1309,8 +1272,8 @@ def test_a_root_path_send_of_the_input_handle_still_sends() -> None:
 
 
 def test_a_live_whole_tree_clone_still_sends() -> None:
-    """The control arm: a live root copy of the input binds the clone to its own local, and the
-    send delivers that local (BACKLOG #313 step 2), never msg itself."""
+    """The control arm: a live root copy of the input binds the clone to its own local, and the send
+    delivers that local, never msg (BACKLOG #313 step 2)."""
     body = _handler_body(
         _handler_source(
             _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1343,17 +1306,17 @@ def test_an_input_overwritten_by_another_tree_is_not_msg() -> None:
         )
     )
     assert "Send(" not in body
-    assert "no handle in this action-list holds a message this import can identify" in body
+    assert "no handle in this action-list is known to be msg" in body
 
 
 def test_an_unstyled_send_verb_is_judged_like_a_styled_one() -> None:
-    """The input scan and the parse read the verb the same way. A ``MsgSend`` with no ``keyword``
-    span is still a send of another handle, so it refuses."""
+    """The scan and the parse read the verb the same way. A ``MsgSend`` with no ``keyword`` span is
+    still a send of another handle, so the list's field write degrades as well as the send refusing."""
     literal = _span("literal", '"OB_ACME"')
     send = _role_line("MsgSend " + _span("other-handle", "%OUT") + " to connection " + literal)
     body = _handler_body(_handler_source(_WRITE_INPUT + send))
     assert "raise NotImplementedError" in body
-    assert "Send(" not in body
+    assert 'set_field(msg, "MSH-6"' not in body
 
 
 def test_two_input_handle_names_refuse_even_an_input_classed_send() -> None:
@@ -1368,7 +1331,7 @@ def test_two_input_handle_names_refuse_even_an_input_classed_send() -> None:
     send = _role_send("input-handle", "%ADT", "OB_IN")
     body = _handler_body(_handler_source(second_input + send))
     assert "Send(" not in body
-    assert "no handle in this action-list holds a message this import can identify" in body
+    assert "no handle in this action-list is known to be msg" in body
     disabled_second = second_input.replace("<Line ", '<Line Disabled="1" ', 1)
     body = _handler_body(_handler_source(disabled_second + send))
     assert '    sends.append(Send("OB_IN", msg))' in body
@@ -1414,18 +1377,13 @@ def _tree_copy(src: str, dst: str) -> str:
 )
 def test_an_input_overwritten_by_anything_else_is_not_msg(copy: str) -> None:
     """Any whole-tree copy INTO the input from something that is not the input overwrites it, so
-    from that point neither a send nor a field write may treat the input as msg. A write made BEFORE
-    the overwrite was a write to msg and still maps: the flow reads statement order (#313 step 2)."""
-    write_after = _write("input-handle", "%ADT", "Z")
+    neither the send nor the field write may treat the input as msg any more."""
     body = _handler_body(
-        _handler_source(
-            _WRITE_INPUT + copy + write_after + _role_send("input-handle", "%ADT", "OB_IN")
-        )
+        _handler_source(_WRITE_INPUT + copy + _role_send("input-handle", "%ADT", "OB_IN"))
     )
     assert "Send(" not in body
     assert "raise NotImplementedError" in body
-    assert 'set_field(msg, "MSH-6", "X")' in body
-    assert 'set_field(msg, "MSH-6", "Z")' not in body
+    assert 'set_field(msg, "MSH-6"' not in body
 
 
 def test_an_overwrite_inside_an_unmodelled_element_still_counts() -> None:
@@ -1441,7 +1399,14 @@ def test_an_overwrite_inside_an_unmodelled_element_still_counts() -> None:
 def test_a_write_to_an_unsent_clone_does_not_reach_the_input_send() -> None:
     """Only the ONE delivered tree is msg. A write to a clone that is never sent is a write to a
     different Corepoint tree, so it must not land in the input's send."""
-    write_clone = _write("other-handle", "%OUT", "Y")
+    write_clone = _role_line(
+        _span("keyword", "ItemCopy")
+        + " "
+        + _span("literal", '"Y"')
+        + " to "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/MSH-6")
+    )
     body = _handler_body(
         _handler_source(
             _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1454,9 +1419,16 @@ def test_a_write_to_an_unsent_clone_does_not_reach_the_input_send() -> None:
 
 
 def test_a_write_to_the_sent_clone_still_maps() -> None:
-    """The control arm: a write to the clone maps onto the clone's own local, which is what the list
+    """The control arm: a write to the clone lands on the clone's own local, which is what the list
     sends (BACKLOG #313 step 2)."""
-    write_clone = _write("other-handle", "%OUT", "Y")
+    write_clone = _role_line(
+        _span("keyword", "ItemCopy")
+        + " "
+        + _span("literal", '"Y"')
+        + " to "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/MSH-6")
+    )
     body = _handler_body(
         _handler_source(
             _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1470,18 +1442,13 @@ def test_a_write_to_the_sent_clone_still_maps() -> None:
 
 
 def test_a_disabled_list_wrapper_is_scanned_as_the_render_emits_it() -> None:
-    """The render keeps a ``<List>`` wrapper's statements even under ``@Disabled``, so its send is
-    live and is judged like any other: a send of a handle nobody bound refuses. Whether Corepoint
-    runs a disabled wrapper's statements is not known, so they render as an unmodelled element's
-    body, and no handle is vouched for after it: the input send after it refuses too (it used to
-    send; the scope is fail-closed now)."""
+    """The render flattens a ``<List>`` wrapper even under ``@Disabled``, so the scan must see its
+    statements too, or the field write maps live beside a send the scan never counted."""
     wrapped = '<List Disabled="1">' + _role_send("other-handle", "%OUT", "OB_ACME") + "</List>"
-    send_in = _role_send("input-handle", "%ADT", "OB_IN")
-    body = _handler_body(_handler_source(_WRITE_INPUT + wrapped + send_in))
-    assert "raise NotImplementedError" in body
-    assert 'Send("OB_ACME"' not in body
-    assert 'Send("OB_IN"' not in body
-    assert "nested list" in body
+    body = _handler_body(
+        _handler_source(_WRITE_INPUT + wrapped + _role_send("input-handle", "%ADT", "OB_IN"))
+    )
+    assert 'set_field(msg, "MSH-6"' not in body
 
 
 def test_a_refused_send_with_no_destination_still_raises() -> None:
@@ -1508,21 +1475,44 @@ def test_a_refused_send_still_passes_the_required_check_gate(tmp_path: Path) -> 
     assert not dead.required and "outbound:OB_ACME" in dead.detail
 
 
-# --- each handle becomes a Python local, settled in statement order (BACKLOG #313, step 2) --------
+# --- each handle becomes a Python local, in a fully understood list (BACKLOG #313, step 2) --------
 #
-# The input handle is msg. A whole-tree clone binds ``<local> = <source>.copy()``, a MsgCreate naming a
-# type and a version binds ``<local> = Message.parse(<skeleton>)``, and a send of a bound handle
-# delivers its local. What the flow cannot settle keeps the step 1 raise. All fixtures are synthetic.
+# The whole-list gate (ADR 0086): a list binds locals only when every element in it is on the
+# allow-list. Any other list renders exactly as step 1 does; the differential guard
+# (tests/test_corepoint_import_differential.py) checks that byte for byte. All fixtures are synthetic.
+
+_INBOUND = "MSH|^~\\&|A|B|C|D|20260930||ADT^A01|1|P|2.5\rPID|1||123"
+_ADT_A04 = " as " + _span("literal", '"ADT^A04"') + " version " + _span("literal", '"2.5.1"')
 
 
-def _create(handle: str, *operands: str) -> str:
-    """A role-marked ``MsgCreate <handle> <operands>``; each operand is raw markup."""
+def _write(handle_class: str, handle: str, value: str, path: str = "/MSH-6") -> str:
+    """A role-marked ``ItemCopy "<value>" to <handle><path>``."""
     return _role_line(
-        _span("keyword", "MsgCreate") + " " + _span("other-handle", handle) + "".join(operands)
+        _span("keyword", "ItemCopy")
+        + " "
+        + _span("literal", '"' + value + '"')
+        + " to "
+        + _span(handle_class, handle)
+        + _span("path", path)
     )
 
 
-_ADT_A04 = " as " + _span("literal", '"ADT^A04"') + " version " + _span("literal", '"2.5.1"')
+def _create(handle: str, operands: str = _ADT_A04) -> str:
+    return _role_line(
+        _span("keyword", "MsgCreate") + " " + _span("other-handle", handle) + operands
+    )
+
+
+def _run_with(tmp_path: Path, body: str) -> tuple[object, Message]:
+    """Import a one-list package, load it, call its handler once; return the result and the input."""
+    from messagefoundry.config.wiring import load_config
+
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(body), encoding="utf-8")
+    import_corepoint(export, tmp_path / "out")
+    inbound = Message.parse(_INBOUND)
+    return load_config(tmp_path / "out").handlers["t"](inbound), inbound
+
 
 _CLONE_WRITE_SEND = (
     _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1534,118 +1524,33 @@ _CLONE_WRITE_SEND = (
 def test_clone_then_write_then_send_delivers_the_clone_and_leaves_the_input_alone(
     tmp_path: Path,
 ) -> None:
-    """The clone is its own Message: the write lands on it, the send delivers it, and the inbound
-    message the Handler received is not changed or sent."""
-
+    """The clone is its own Message: the write lands on it, the send delivers it, and the input the
+    Handler received is neither changed nor sent."""
     body = _handler_body(_handler_source(_CLONE_WRITE_SEND))
     assert "    out_msg = msg.copy()" in body
     assert '    set_field(out_msg, "MSH-6", "Y")' in body
     assert '    sends.append(Send("OB_ACME", out_msg))' in body
-    assert "raise NotImplementedError" not in body
-
-    inbound = Message.parse(_INBOUND)
-    result = _run_handler(tmp_path, _CLONE_WRITE_SEND, inbound)
+    result, inbound = _run_with(tmp_path, _CLONE_WRITE_SEND)
     assert isinstance(result, list) and len(result) == 1
     sent = result[0].message
     assert sent is not inbound
-    assert sent.field("MSH-6") == "Y"
-    assert sent.field("PID-3") == "123"  # a whole-tree clone carries the input's content
-    assert inbound.field("MSH-6") == "D"  # the input stays untouched
-
-
-def test_a_send_that_falls_back_to_msg_is_caught(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The mutation arm. If a send the flow cannot settle fell back to sending msg, the render and
-    the runtime checks this section relies on both go red."""
-    import messagefoundry.corepoint_import as importer
-
-    send_before_clone = _role_send("other-handle", "%OUT", "OB_ACME") + _root_copy(
-        "input-handle", "%ADT", "other-handle", "%OUT"
-    )
-
-    def delivers_msg(body: str) -> bool:
-        return 'Send("OB_ACME", msg)' in _handler_body(_handler_source(body))
-
-    assert not delivers_msg(send_before_clone)
-
-    def falls_back(self: object, step: Control, env: object) -> Control:
-        return replace(step, message="msg")  # the mutant: every send delivers msg
-
-    monkeypatch.setattr(importer._Flow, "_send", falls_back)
-    assert delivers_msg(send_before_clone)  # the mutant renders the old fallback ...
-    inbound = Message.parse(_INBOUND)
-    result = _run_handler(tmp_path, send_before_clone, inbound)
-    assert isinstance(result, list) and result[0].message is inbound  # ... and delivers the input
+    assert sent.field("MSH-6") == "Y" and sent.field("PID-3") == "123"
+    assert inbound.field("MSH-6") == "D"
 
 
 def test_msgcreate_then_send_delivers_the_new_message(tmp_path: Path) -> None:
     """A MsgCreate naming a type and a version builds a skeleton through the Message API: default
     encoding characters, MSH-9 and MSH-12, nothing else. The send delivers it, not msg."""
-
-    body = _create("%NEW", _ADT_A04) + _role_send("other-handle", "%NEW", "OB_NEW")
+    body = _create("%NEW") + _role_send("other-handle", "%NEW", "OB_NEW")
     src = _handler_source(body)
     assert "from messagefoundry import File, Message, Send, handler" in src
     assert '    new_msg = Message.parse("MSH|^~\\\\&|||||||ADT^A04|||2.5.1")' in src
     assert '    sends.append(Send("OB_NEW", new_msg))' in src
-
-    inbound = Message.parse(_INBOUND)
-    result = _run_handler(tmp_path, body, inbound)
-    assert isinstance(result, list) and len(result) == 1
+    result, inbound = _run_with(tmp_path, body)
+    assert isinstance(result, list)
     created = result[0].message
     assert created is not inbound
-    assert created.field("MSH-9") == "ADT^A04"
-    assert created.field("MSH-12") == "2.5.1"
-    assert created.field("PID-3") is None
-
-
-@pytest.mark.parametrize(
-    "operands",
-    [
-        pytest.param("", id="nothing"),
-        pytest.param(" as " + _span("literal", '"ADT^A04"'), id="type-only"),
-        pytest.param(" version " + _span("literal", '"2.5"'), id="version-only"),
-        pytest.param(
-            " as " + _span("literal", '"ADT_A04"') + " v " + _span("literal", '"2.5"'),
-            id="structure-form",
-        ),
-        pytest.param(_ADT_A04 + " from " + _span("variable", "$template"), id="extra-operand"),
-    ],
-)
-def test_a_msgcreate_without_a_type_and_version_raises(operands: str, tmp_path: Path) -> None:
-    """Too little to build a valid MSH: a TODO and a raise at the MsgCreate, and the handle stays
-    unbound, so a later send of it refuses too. Nothing guesses the header."""
-    body = _create("%NEW", operands) + _role_send("other-handle", "%NEW", "OB_NEW")
-    src = _handler_body(_handler_source(body))
-    assert "Message.parse(" not in src
-    assert "Send(" not in src
-    assert '    raise NotImplementedError("Corepoint import: MsgCreate: %NEW is not built:' in src
-    with pytest.raises(NotImplementedError, match="MsgCreate: %NEW is not built"):
-        _run_handler(tmp_path, body)
-
-
-def test_a_msgcreate_into_the_input_handle_raises() -> None:
-    """Building a new message in the input handle would replace msg; it refuses instead."""
-    create = _role_line(
-        _span("keyword", "MsgCreate") + " " + _span("input-handle", "%ADT") + _ADT_A04
-    )
-    body = _handler_body(_handler_source(create + _role_send("input-handle", "%ADT", "OB_IN")))
-    assert "would replace msg, the message that arrived" in body
-    assert "Send(" not in body
-
-
-def test_a_catch_cannot_swallow_a_refused_msgcreate(tmp_path: Path) -> None:
-    """A refused MsgCreate raises like a refused send, so the Try gains the same re-raise arm. The
-    MsgCreate builds the input handle, which is refused wherever it sits: a ``MsgCreate`` of any
-    other handle inside a Try binds nothing under the narrowing and stays a TODO (ADR 0086)."""
-    create = _role_line(
-        _span("keyword", "MsgCreate") + " " + _span("input-handle", "%ADT") + _ADT_A04
-    )
-    body = "<Try><List>" + create + '<Line Data="Catch"/>' + "</List></Try>"
-    src = _handler_body(_handler_source(body))
-    assert src.index("except NotImplementedError:") < src.index("except Exception:")
-    with pytest.raises(NotImplementedError, match="MsgCreate"):
-        _run_handler(tmp_path, body)
+    assert created.field("MSH-9") == "ADT^A04" and created.field("MSH-12") == "2.5.1"
 
 
 def test_a_send_before_its_clone_fails_loudly(tmp_path: Path) -> None:
@@ -1657,1444 +1562,99 @@ def test_a_send_before_its_clone_fails_loudly(tmp_path: Path) -> None:
     assert "Send(" not in src
     assert src.index("raise NotImplementedError") < src.index("out_msg = msg.copy()")
     with pytest.raises(NotImplementedError, match="MsgSend delivers %OUT"):
-        _run_handler(tmp_path, body)
+        _run_with(tmp_path, body)
 
 
-def test_a_clone_on_one_branch_is_unbound_after_the_join(tmp_path: Path) -> None:
-    """A clone made inside a branch binds nothing (the narrowing, ADR 0086), so neither a send in
-    the branch nor one after it delivers it. Bound before a branch that does not touch it, a send
-    neither inside nor after the branch delivers it either: the branch is the first construct
-    after a bind, so it unbinds every handle. The straight-line control delivers."""
-    branch = (
-        '<If Data="If (a)"><List>'
-        + _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
-        + _role_send("other-handle", "%OUT", "OB_IN_BRANCH")
-        + "</List></If>"
-    )
-    body = branch + _role_send("other-handle", "%OUT", "OB_AFTER")
-    src = _handler_body(_handler_source(body))
-    assert 'Send("OB_IN_BRANCH"' not in src
-    assert 'Send("OB_AFTER"' not in src
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_AFTER:' in src
-    with pytest.raises(NotImplementedError, match="MsgSend to OB_AFTER"):
-        _run_handler(tmp_path, body)
-
-    untouched = '<If Data="If (a)"><List>' + _role_send("other-handle", "%OUT", "OB_IN_BRANCH")
-    control = (
-        _CLONE_OUT + untouched + "</List></If>" + _role_send("other-handle", "%OUT", "OB_AFTER")
-    )
-    control_src = _handler_body(_handler_source(control))
-    assert 'Send("OB_IN_BRANCH"' not in control_src
-    assert 'Send("OB_AFTER"' not in control_src
-    straight = _handler_body(_handler_source(_CLONE_OUT + _SEND_OUT))
-    assert '    sends.append(Send("OB_OUT", out_msg))' in straight
-
-
-def test_a_handle_rebound_inside_a_branch_is_unbound_after_the_join() -> None:
-    """Bound before the branch AND rebound inside it, the handle may hold either tree after the
-    join. Its local keeps one name for the whole handler, so a join that compared local names read
-    the rebind as no change and sent ``out_msg`` after it (the differential guard's finding on
-    d26545d6f, PR 1900)."""
-    rebuilt = '<If Data="If (a)"><List>' + _create("%OUT", _ADT_A04) + "</List></If>"
-    body = _handler_body(_handler_source(_CLONE_OUT + rebuilt + _SEND_OUT))
-    assert 'Send("OB_OUT"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
-
-
-def test_a_clone_on_every_branch_is_still_unbound_after_the_join() -> None:
-    """Conservative by design: every condition is a dead placeholder until a human writes it, so no
-    branch is known to run, and a handle bound only inside branches is unknown after them."""
-    clone = _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
+def test_a_write_after_a_send_never_reaches_the_sent_message(tmp_path: Path) -> None:
+    """A Send holds the object, so a write after it would change the message already sent. The write
+    is a TODO instead, and the handle is unknown from there: sending it again raises."""
     body = (
-        '<If Data="If (a)"><List>'
-        + clone
-        + '<Line Data="Else"/>'
-        + clone
-        + "</List></If>"
-        + _role_send("other-handle", "%OUT", "OB_AFTER")
+        _CLONE_WRITE_SEND
+        + _write("other-handle", "%OUT", "LATE")
+        + _role_send("other-handle", "%OUT", "OB_AGAIN")
     )
     src = _handler_body(_handler_source(body))
-    assert 'Send("OB_AFTER"' not in src
-    assert "raise NotImplementedError" in src
-
-
-def test_a_handle_overwritten_on_one_branch_is_unbound_after_the_join() -> None:
-    """Bound before the branch, but overwritten by something unknown on one path: after the join it
-    may hold either, so it is unbound."""
-    body = (
-        _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
-        + '<If Data="If (a)"><List>'
-        + _tree_copy(
-            _span("variable", "$saved"), _span("other-handle", "%OUT") + _span("path", "/")
-        )
-        + "</List></If>"
-        + _role_send("other-handle", "%OUT", "OB_AFTER")
-    )
-    src = _handler_body(_handler_source(body))
-    assert 'Send("OB_AFTER"' not in src
-    assert "raise NotImplementedError" in src
-
-
-def test_a_loop_body_cannot_trust_a_handle_it_overwrites() -> None:
-    """A later pass may start from what an earlier pass overwrote. A send at the top of the body of
-    a handle the body later overwrites refuses. Under the narrowing (ADR 0086) a clone inside the
-    loop binds nothing, so a send after it in the same pass refuses too."""
-    overwrite = _tree_copy(
-        _span("variable", "$saved"), _span("other-handle", "%OUT") + _span("path", "/")
-    )
-    clone = _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
-    stale = _handler_body(
-        _handler_source(
-            clone
-            + "<Foreach><List>"
-            + _role_send("other-handle", "%OUT", "OB_TOP")
-            + overwrite
-            + "</List></Foreach>"
-        )
-    )
-    assert 'Send("OB_TOP"' not in stale
-    assert "raise NotImplementedError" in stale
-
-    fresh = _handler_body(
-        _handler_source(
-            "<Foreach><List>"
-            + clone
-            + _role_send("other-handle", "%OUT", "OB_FRESH")
-            + "</List></Foreach>"
-        )
-    )
-    assert 'Send("OB_FRESH"' not in fresh
-    assert "raise NotImplementedError" in fresh
-
-
-def test_a_flat_msgsend_of_the_input_sends_msg() -> None:
-    """Brief decision (BACKLOG #313 step 2, Manager's call): a markup-free ``MsgSend`` of a handle
-    the flow knows sends that local, judged from the handle its first operand names."""
-    body = _handler_body(_handler_source(_WRITE_INPUT + '<Line Data="MsgSend %ADT [OB_FLAT]"/>'))
-    assert '    sends.append(Send("OB_FLAT", msg))' in body
-    assert "raise NotImplementedError" not in body
-    root = _handler_body(_handler_source(_WRITE_INPUT + '<Line Data="MsgSend %ADT/ [OB_FLAT]"/>'))
-    assert '    sends.append(Send("OB_FLAT", msg))' in root
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        pytest.param("MsgSend $out [OB_FLAT]", id="variable"),
-        pytest.param("MsgSend %OUT [OB_FLAT]", id="unbound-handle"),
-        pytest.param("MsgSend %ADT/PID [OB_FLAT]", id="partial-path"),
-        pytest.param("MsgSend [OB_FLAT]", id="no-handle"),
-    ],
-)
-def test_a_flat_msgsend_the_flow_cannot_settle_fails_loudly(statement: str) -> None:
-    """The same rule refuses a markup-free send it cannot settle. This is what turned the synthetic
-    fixture's ``MsgSend $out [OB_ACME_ADT]`` from a send of msg into a raise."""
-    body = _handler_body(_handler_source(_WRITE_INPUT + f'<Line Data="{statement}"/>'))
-    assert "Send(" not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_FLAT:' in body
-
-
-def test_the_fixtures_flat_send_now_refuses() -> None:
-    """The synthetic package's markup-free list ends ``MsgSend $out [OB_ACME_ADT]``. A ``$variable``
-    names no handle, so it raises where it used to send msg. The outbound stays declared."""
-    src = _package_source()
-    flat = src.split("def acme_adt_transform")[1].split("@handler")[0]
-    assert "Send(" not in flat
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_ACME_ADT:' in flat
-    assert 'outbound("OB_ACME_ADT", File(directory=' in src
-
-
-def test_a_flat_whole_tree_write_unbinds_the_handle() -> None:
-    """The markup-free reading maps without handles, but a whole-tree write it makes still unbinds
-    the handle it names, so a later send of that handle refuses."""
-    body = _handler_body(
-        _handler_source(
-            _WRITE_INPUT
-            + '<Line Data="MsgTreeCopy %OTHER %ADT"/>'
-            + '<Line Data="MsgSend %ADT [OB_FLAT]"/>'
-        )
-    )
-    assert "Send(" not in body
-    assert "raise NotImplementedError" in body
-
-
-@pytest.mark.parametrize(
-    ("verb", "sends"),
-    [
-        pytest.param("MsgLoad", False, id="unread-verb-unbinds"),
-        pytest.param("MsgLog", True, id="read-only-verb-keeps"),
-    ],
-)
-def test_a_verb_the_flow_does_not_read_unbinds_a_whole_handle(verb: str, sends: bool) -> None:
-    """A verb outside the small read-only set may overwrite every handle it names whole, so a later
-    send of that handle refuses. ``MsgLoad`` keeps its own TODO marker; only the send changes."""
-    statement = _role_line(_span("keyword", verb) + " " + _span("input-handle", "%ADT"))
-    body = _handler_body(_handler_source(statement + _role_send("input-handle", "%ADT", "OB_IN")))
-    assert ('sends.append(Send("OB_IN", msg))' in body) is sends
-    assert ("raise NotImplementedError" in body) is not sends
-    assert f"# TODO: Corepoint {verb} — hand-finish" in body
-
-
-def test_a_hostile_handle_name_becomes_a_safe_local() -> None:
-    """The local is derived from untrusted export text: folded to ASCII word characters, suffixed
-    ``_msg``, de-duplicated when two handles fold onto one name, and never able to inject code."""
-    first = '%O"UT)\nimport os'
-    second = "%O-UT import.os"
-    src = _handler_source(
-        _root_copy("input-handle", "%ADT", "other-handle", first)
-        + _root_copy("input-handle", "%ADT", "other-handle", second)
-        + _role_send("other-handle", first, "OB_A")
-        + _role_send("other-handle", second, "OB_B")
-    )
-    compile(src, "generated.py", "exec")
-    assert "\nimport os" not in src
-    body = _handler_body(src)
-    assert "    o_ut_import_os_msg = msg.copy()" in body
-    assert "    o_ut_import_os_msg_2 = msg.copy()" in body
-    assert 'sends.append(Send("OB_A", o_ut_import_os_msg))' in body
-    assert 'sends.append(Send("OB_B", o_ut_import_os_msg_2))' in body
-
-
-def test_colliding_handle_names_number_on_from_the_last_one() -> None:
-    """Handles that fold onto one base get ``_msg``, ``_msg_2``, ``_msg_3`` in the order they are
-    first bound, and a handle bound again keeps its first name."""
-    handles = ["%A-B", "%A.B", "%a b"]
-    body = "".join(_root_copy("input-handle", "%ADT", "other-handle", h) for h in handles)
-    body += _root_copy("input-handle", "%ADT", "other-handle", handles[0])
-    src = _handler_body(_handler_source(body))
-    assert [ln.split(" = ")[0].strip() for ln in src.splitlines() if ".copy()" in ln] == [
-        "a_b_msg",
-        "a_b_msg_2",
-        "a_b_msg_3",
-        "a_b_msg",
-    ]
-
-
-def test_deeply_nested_loops_and_trys_settle_in_linear_work(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The export is untrusted, so the flow must not rewalk a body once per enclosing loop or Try,
-    nor once per bound handle. Counted in calls to the write reader rather than in seconds, so the
-    budget is exact: a body walked again at every level costs about depth x statements calls."""
-    import messagefoundry.corepoint_import as importer
-
-    depth, statements = 20, 40
-    inner = "".join(
-        _root_copy("input-handle", "%ADT", "other-handle", f"%T{i}") for i in range(statements)
-    )
-    body = inner  # the same handles bound up front too, so every level has many live handles
-    for level in range(depth):
-        tag = "Foreach" if level % 2 else "Try"
-        body = f"<{tag}>{body}</{tag}>"
-    body = inner + body + _role_send("other-handle", "%T0", "OB_A")
-
-    calls = 0
-    real = importer._whole_written
-
-    def counting(deferred: _Deferred) -> frozenset[str]:
-        nonlocal calls
-        calls += 1
-        return real(deferred)
-
-    monkeypatch.setattr(importer, "_whole_written", counting)
-    src = _handler_source(body)
-    compile(src, "generated.py", "exec")
-    # Linear: each nested statement is read once by the memoized walk. Rewalking at every level
-    # would cost about depth x statements = 800 calls.
-    assert 0 < calls <= 2 * statements
-    # The handle the loops overwrite is unknown after them, so the send refuses rather than guess.
-    assert 'Send("OB_A"' not in _handler_body(src)
-
-
-_CLONE_OUT = _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
-_SEND_OUT = _role_send("other-handle", "%OUT", "OB_OUT")
-
-
-@pytest.mark.parametrize(
-    "overwrite",
-    [
-        pytest.param(
-            _tree_copy(
-                _span("input-handle", "%ADT") + _span("path", "/"),
-                _span("other-handle", "%OUT") + _span("path", "/"),
-            ).replace(" to ", " merging into "),
-            id="mode-word",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgTreeCopy")
-                + " "
-                + _span("variable", "$saved")
-                + " to "
-                + _span("other-handle", "%OUT")
-                + _span("path", "/")
-                + " mode "
-                + _span("literal", '"replace"')
-            ),
-            id="third-operand",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgCreate")
-                + " "
-                + _span("literal", '"ADT^A04"')
-                + " "
-                + _span("literal", '"2.5.1"')
-                + " in "
-                + _span("other-handle", "%OUT")
-            ),
-            id="msgcreate-handle-last",
-        ),
-        pytest.param(
-            "<Line Data=\"&lt;span class='kw'&gt;MsgTreeCopy&lt;/span&gt; "
-            "&lt;span class='pth'&gt;%OTHER/&lt;/span&gt; "
-            "&lt;span class='pth'&gt;%OUT/&lt;/span&gt;\"/>",
-            id="unlisted-span-classes",
-        ),
-        pytest.param(
-            '<Call Data="ActionListCall &quot;Rebuild&quot; pass %OUT"><Actions/></Call>',
-            id="call-naming-the-handle",
-        ),
-        pytest.param('<Line Data="ItemAppend %OUT/ &quot;x&quot;"/>', id="flat-whole-write"),
-    ],
-)
-def test_a_statement_that_may_overwrite_a_bound_handle_unbinds_it(overwrite: str) -> None:
-    """Fail closed: a statement this module does not read as a plain clone or a field write may
-    overwrite every handle it names, whatever operand order or markup it uses. A later send of
-    that handle raises rather than deliver the clone made before it."""
-    body = _handler_body(_handler_source(_CLONE_OUT + overwrite + _SEND_OUT))
-    assert "out_msg = msg.copy()" in body
-    assert 'Send("OB_OUT"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
-
-
-def test_a_tree_copy_read_the_other_way_round_does_not_bind() -> None:
-    """``MsgTreeCopy %OUT/ from %A2/`` names its operands in the other order: it overwrites %OUT.
-    Reading it as a clone would bind %A2 from the stale %OUT and keep %OUT, so it is not a clone and
-    both handles it names are unknown after it."""
-    reverse = _tree_copy(
-        _span("other-handle", "%OUT") + _span("path", "/"),
-        _span("other-handle", "%A2") + _span("path", "/"),
-    ).replace(" to ", " from ")
-    body = _handler_body(_handler_source(_CLONE_OUT + reverse + _SEND_OUT))
-    assert "a2_msg" not in body
-    assert 'Send("OB_OUT"' not in body
-
-
-def test_a_msgcreate_with_a_word_it_does_not_read_raises() -> None:
-    """An unstyled word beyond ``as``/``version`` may change what is built, so it refuses."""
-    merging = _create("%NEW", _ADT_A04, " merging input")
-    body = _handler_body(_handler_source(merging + _role_send("other-handle", "%NEW", "OB_NEW")))
-    assert "Message.parse(" not in body
-    assert "a word this import does not read" in body
-
-
-def test_a_markup_free_write_lands_on_the_handle_it_addresses() -> None:
-    """Once the list names an input, a markup-free write to a clone lands on the clone's local, and
-    one to a handle nobody bound declines rather than land on msg."""
-    body = _handler_body(
-        _handler_source(
-            _CLONE_OUT
-            + '<Line Data="ItemClear %OUT/PID-19"/>'
-            + '<Line Data="ItemClear %GONE/PID-20"/>'
-            + _SEND_OUT
-        )
-    )
-    assert '    set_field(out_msg, "PID-19", "")' in body
-    assert "PID-20" not in body.split("# TODO")[0]
-    assert "(cross-message); intended target PID-20" in body
-    assert 'set_field(msg, "PID-20"' not in body
-    assert '    sends.append(Send("OB_OUT", out_msg))' in body
-
-
-def test_a_try_with_no_catch_keeps_what_its_body_bound() -> None:
-    """Under the narrowing (ADR 0086) a clone inside a Try binds nothing, with or without a Catch,
-    so a send after it refuses either way."""
-    body = _handler_body(_handler_source("<Try><List>" + _CLONE_OUT + "</List></Try>" + _SEND_OUT))
-    assert 'Send("OB_OUT"' not in body
-    with_catch = _handler_body(
-        _handler_source(
-            "<Try><List>" + _CLONE_OUT + '<Line Data="Catch"/></List></Try>' + _SEND_OUT
-        )
-    )
-    assert 'Send("OB_OUT"' not in with_catch
-
-
-def test_a_disabled_write_names_the_local_it_would_write() -> None:
-    """Re-enabling a preserved write must not lose which message it targeted."""
-    disabled = (
-        '<Block Disabled="1" Data="old"><List>'
-        + _write("other-handle", "%OUT", "Y")
-        + "</List></Block>"
-    )
-    src = _handler_source(_CLONE_OUT + disabled + _SEND_OUT)
-    assert 'ItemCopy -> set_field("MSH-6", "Y") on out_msg' in src
-
-
-def _reverse_copy(verb_markup: str = "", from_markup: str = " from ") -> str:
-    """``MsgTreeCopy %OUT/ from %A2/``: overwrites %OUT, with the verb and ``from`` styled or not."""
-    return _role_line(
-        (verb_markup or _span("keyword", "MsgTreeCopy"))
-        + " "
-        + _span("other-handle", "%OUT")
-        + _span("path", "/")
-        + from_markup
-        + _span("other-handle", "%A2")
-        + _span("path", "/")
-    )
-
-
-@pytest.mark.parametrize(
-    "reverse",
-    [
-        pytest.param(_reverse_copy(from_markup=" " + _span("keyword", "from") + " "), id="styled"),
-        pytest.param(_reverse_copy().replace("<Line ", "<Lines ", 1), id="in-unknown-tag"),
-    ],
-)
-def test_a_reversed_copy_is_never_read_as_a_clone(reverse: str) -> None:
-    """A ``from`` reverses the copy whether the exporter styles it as a keyword or leaves it as
-    text, and whether the statement sits in a modelled tag or an unknown one."""
-    body = _handler_body(_handler_source(_CLONE_OUT + reverse + _SEND_OUT))
-    assert "a2_msg" not in body
-    assert 'Send("OB_OUT"' not in body
-
-
-def test_an_unstyled_msgcreate_verb_is_not_read_as_a_word() -> None:
-    """When the exporter leaves the verb unstyled, the verb itself is not an extra word."""
-    create = _role_line("MsgCreate " + _span("other-handle", "%NEW") + _ADT_A04)
-    body = _handler_body(_handler_source(create + _role_send("other-handle", "%NEW", "OB_NEW")))
-    assert '    sends.append(Send("OB_NEW", new_msg))' in body
-
-
-def test_a_msgcreate_type_with_a_trailing_newline_is_refused() -> None:
-    """The shapes are matched whole: a type literal carrying a newline is not ``ADT^A04``."""
-    create = _create(
-        "%NEW", " as " + _span("literal", '"ADT^A04\n"') + " version " + _span("literal", '"2.5"')
-    )
-    body = _handler_body(_handler_source(create))
-    assert "Message.parse(" not in body
-    assert "raise NotImplementedError" in body
+    assert 'set_field(out_msg, "MSH-6", "LATE")' not in src
+    assert "after a MsgSend of it, which would change the message already sent" in src
+    assert 'Send("OB_AGAIN"' not in src
+    with pytest.raises(NotImplementedError, match="MsgSend to OB_AGAIN"):
+        _run_with(tmp_path, body)
+    # Without the second send: the first send still carries what it held when it was sent.
+    (tmp_path / "control").mkdir()
+    first = _run_with(tmp_path / "control", _CLONE_WRITE_SEND + _write("other-handle", "%OUT", "Z"))
+    assert isinstance(first[0], list) and first[0][0].message.field("MSH-6") == "Y"
 
 
 def test_a_write_to_a_built_message_outside_its_msh_declines() -> None:
-    """A MsgCreate skeleton holds only an MSH, and ``Message.set`` raises on an absent segment. A
-    write to its MSH maps; a write to any other segment is a TODO, never a call certain to raise."""
+    """The skeleton holds only an MSH, and Message.set raises on an absent segment, so a write to
+    another segment of a built message is a TODO."""
     body = _handler_body(
         _handler_source(
-            _create("%NEW", _ADT_A04)
-            + _write("other-handle", "%NEW", "X")
-            + _role_line(
-                _span("keyword", "ItemCopy")
-                + " "
-                + _span("literal", '"M"')
-                + " to "
-                + _span("other-handle", "%NEW")
-                + _span("path", "/PID-8")
-            )
+            _create("%NEW")
+            + _write("other-handle", "%NEW", "A", "/PID-8")
+            + _write("other-handle", "%NEW", "B", "/MSH-10")
             + _role_send("other-handle", "%NEW", "OB_NEW")
         )
     )
-    assert '    set_field(new_msg, "MSH-6", "X")' in body
     assert 'set_field(new_msg, "PID-8"' not in body
-    assert "skeleton has only an MSH segment" in body
-    assert "intended target PID-8" in body
-
-
-def test_a_markup_free_write_without_an_input_still_lands_on_its_handle() -> None:
-    """A list with role markup but no input handle does not fall back to msg either."""
-    body = _handler_body(
-        _handler_source(
-            _create("%NEW", _ADT_A04)
-            + '<Line Data="ItemClear %NEW/MSH-12"/>'
-            + _role_send("other-handle", "%NEW", "OB_NEW")
-        )
-    )
-    assert '    set_field(new_msg, "MSH-12", "")' in body
-    assert 'set_field(msg, "MSH-12"' not in body
-
-
-def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
-    """The Lander's PR 1900 repro. An inlined list names the passed message by its OWN handle, which
-    nothing ties to the caller's, so it can rebuild the message unseen: here a MsgCreate under %P.
-    What the call line passes is unknown after it, inlined or not, and a later send raises."""
-    rebuild = (
-        '<Call Data="ActionListCall &quot;Rebuild&quot; pass %OUT"><Actions>'
-        + _create("%P", _ADT_A04)
-        + "</Actions></Call>"
-    )
-    body = _handler_body(
-        _handler_source(_CLONE_OUT + rebuild + '<Line Data="MsgSend %OUT [OB_OUT]"/>')
-    )
-    assert 'Send("OB_OUT"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
-
-    # The input handed to an inlined list is unknown after it too: an edit the list makes in place
-    # is a TODO in its body (it never lands on msg), so sending msg would drop it. A raise instead.
-    call = (
-        '<Call Data="ActionListCall &quot;Sub&quot; pass %ADT"><Actions>'
-        '<Line Data="ItemClear %ADT/PID-19"/></Actions></Call>'
-    )
-    passed = _handler_body(
-        _handler_source(_WRITE_INPUT + call + _role_send("input-handle", "%ADT", "OB_IN"))
-    )
-    assert 'Send("OB_IN"' not in passed
-    assert 'set_field(msg, "PID-19"' not in passed
-
-    # A called list that builds any message may be replacing the input under its own name.
-    rebuilt = _handler_body(
-        _handler_source(
-            _WRITE_INPUT
-            + _inlined_call(_create("%P", _ADT_A04), passing=" pass %ADT")
-            + _role_send("input-handle", "%ADT", "OB_IN")
-        )
-    )
-    assert 'Send("OB_IN"' not in rebuilt
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in rebuilt
-
-    # The control arm: a call whose list only reads (MsgLog) leaves the input bound.
-    plain = _inlined_call(_MSGLOG_P, passing="")
-    kept = _handler_body(
-        _handler_source(_WRITE_INPUT + plain + _role_send("input-handle", "%ADT", "OB_IN"))
-    )
-    assert '    sends.append(Send("OB_IN", msg))' in kept
-
-
-_MSGLOG_P = _role_line(_span("keyword", "MsgLog") + " " + _span("other-handle", "%P"))
-
-
-def _inlined_call(*statements: str, passing: str = " pass %OUT") -> str:
-    return (
-        f'<Call Data="ActionListCall &quot;Sub&quot;{passing}"><Actions>'
-        + "".join(statements)
-        + "</Actions></Call>"
-    )
+    assert "whose skeleton has only an MSH segment" in body
+    assert 'set_field(new_msg, "MSH-10", "B")' in body
 
 
 @pytest.mark.parametrize(
-    "call",
+    "spoiler",
     [
-        pytest.param(_inlined_call(_create("%OUT", _ADT_A04)), id="rebuilt-under-the-same-name"),
+        pytest.param(_write("other-handle", "%out", "Q"), id="a-case-variant-of-a-handle"),
         pytest.param(
-            _inlined_call(_write("other-handle", "%OUT", "SUB"), passing=""),
-            id="body-writes-a-caller-name",
-        ),
-        pytest.param(
-            _inlined_call('<Line Data="EnvLogText &quot;x&quot;"/>', passing=" pass %OUT/PID"),
-            id="partial-path-pass",
-        ),
-        pytest.param(
-            _inlined_call(_create("%P", _ADT_A04), passing=" (%OUT)"), id="parenthesised-pass"
-        ),
-        pytest.param(
-            _inlined_call(
-                _create("%P", _ADT_A04),
-                passing=" &lt;span class='action-list-call-pass'&gt;Pass: OUT&lt;/span&gt;",
-            ),
-            id="pass-span-without-percent",
-        ),
-        pytest.param(_inlined_call(_create("%out", _ADT_A04), passing=""), id="other-case"),
-        pytest.param(
-            _inlined_call('<Switch Data="Mystery %OUT/PID-5"/>', passing=""),
-            id="unknown-tag-in-the-list",
-        ),
-        pytest.param('<Line Data="ActionListCall &quot;Rebuild&quot;"/>', id="not-inlined"),
-    ],
-)
-def test_an_inlined_call_runs_in_its_own_scope(call: str) -> None:
-    """A called list starts knowing no handle, and every handle its call line passes (whole or as a
-    path) or its body names or binds is unknown to the caller afterwards. So none of these sends the
-    caller's %OUT, and a send inside the list of a handle it did not bind refuses."""
-    body = _handler_body(_handler_source(_CLONE_OUT + call + _SEND_OUT))
-    assert 'Send("OB_OUT"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
-
-
-def _call_of(passing: str, *statements: str) -> str:
-    """An inlined ``ActionListCall "Sub"<passing>``. ``passing`` is raw text, escaped here, where
-    :func:`_inlined_call` takes it already escaped."""
-    return (
-        f'<Call Data="ActionListCall &quot;Sub&quot;{html.escape(passing)}"><Actions>'
-        + "".join(statements)
-        + "</Actions></Call>"
-    )
-
-
-def _lander_case(handle: str, call: str, *, loop: bool = False) -> str:
-    """Clone the input into ``handle``, run ``call``, then send ``handle``. With ``loop``, the send
-    and the call sit in a ForEach, so a later pass would send what an earlier call rebuilt."""
-    send = _role_send("other-handle", handle, "OB_OUT")
-    clone = _root_copy("input-handle", "%ADT", "other-handle", handle)
-    if loop:
-        return clone + "<Foreach>" + send + call + "</Foreach>"
-    return clone + call + send
-
-
-@pytest.mark.parametrize(
-    "export",
-    [
-        pytest.param(
-            _lander_case("%OUT-A", _call_of(" pass %OUT-A", _create("%P", _ADT_A04))),
-            id="hyphen-passed",
-        ),
-        pytest.param(
-            _lander_case("%OUT-A", _call_of("", _create("%OUT-A", _ADT_A04))),
-            id="hyphen-rebuilt-without-a-pass",
-        ),
-        pytest.param(
-            _lander_case("%OUT.A", _call_of(" pass %OUT.A", _create("%P", _ADT_A04))),
-            id="dot",
-        ),
-        pytest.param(
-            _lander_case("%AUSGANGÄ", _call_of("", _create("%AUSGANGÄ", _ADT_A04))),
-            id="non-ascii",
-        ),
-        pytest.param(
-            _root_copy("input-handle", "ADT", "other-handle", "OUT")
-            + _call_of("", _create("OUT", _ADT_A04))
-            + _role_send("other-handle", "OUT", "OB_OUT"),
-            id="no-percent-anywhere",
-        ),
-        pytest.param(
-            _lander_case("%OUT-A", _call_of(" pass %OUT-A", _create("%P", _ADT_A04)), loop=True),
-            id="hyphen-in-a-foreach",
-        ),
-    ],
-)
-def test_the_landers_stale_local_repros_all_raise(export: str) -> None:
-    """The Lander's QA of d401cdb5b on PR 1900: name matching missed ``-``, ``.``, non-ASCII and
-    ``%``-free handles, so each of these sent the clone a called list had rebuilt. A call now leaves
-    every caller handle but the input unknown, whatever its name."""
-    body = _handler_body(_handler_source(export))
-    assert 'Send("OB_OUT"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
-
-
-# Handle spellings an export may carry, each one the clone below binds to its own local (the control
-# in the test proves that). A rule that matched handles by name missed at least the first four.
-_HOSTILE_HANDLES = (
-    "%OUT-A",
-    "%OUT.A",
-    "%AUSGANGÄ",
-    "OUT",
-    "%out",
-    "%OUT A",
-    "%OUT-",
-    "%Ω",
-    "%ÄÖ-ß.x",
-    "%OUT$1",
-    "%OUT(1)",
-    "%OUT;A",
-    '%O"UT',
-    "%OUT/X",
-    "%_",
-    "%1OUT",
-    "%ADT2",
-)
-
-
-def _call_shapes(handle: str) -> list[str]:
-    """Calls that may rebuild ``handle`` or leave it alone, passing it or not."""
-    log = '<Line Data="EnvLogText &quot;x&quot;"/>'
-    return [
-        _call_of(f" pass {handle}", _create("%P", _ADT_A04)),
-        _call_of("", _create(handle, _ADT_A04)),
-        _call_of(f" pass {handle}", log),
-        _call_of("", log),
-        # The only shape that spares the input: the clone must still be unknown after it.
-        _call_of(f" pass {handle}", _MSGLOG_P),
-        _call_of("", _MSGLOG_P),
-        _call_of(f" ({handle})", _write("other-handle", handle, "SUB")),
-        '<Line Data="ActionListCall &quot;Sub&quot;"/>',
-    ]
-
-
-@pytest.mark.parametrize("handle", _HOSTILE_HANDLES)
-def test_no_handle_spelling_sends_a_clone_made_before_a_call(handle: str) -> None:
-    """Property: for every spelling and every call shape, clone, then call, then send never renders
-    a Send of the clone. The control arm, the same clone sent BEFORE the call, does send it, so the
-    spelling really binds and the refusal is the call's doing."""
-    clone = _root_copy("input-handle", "%ADT", "other-handle", handle)
-    send = _role_send("other-handle", handle, "OB_OUT")
-    for call in _call_shapes(handle):
-        before = _handler_body(_handler_source(clone + send + call))
-        assert re.search(r'sends\.append\(Send\("OB_OUT", \w+_msg(_\d+)?\)\)', before), handle
-        after = _handler_body(_handler_source(clone + call + send))
-        assert 'Send("OB_OUT"' not in after, (handle, call)
-        assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in after
-
-
-def test_a_call_that_only_reads_leaves_the_input_bound() -> None:
-    """The control for the input: a call whose list only reads leaves the input as msg, whatever
-    it passes. A clone made before the same call is unknown after it, and so is the input then:
-    the call is the first construct after a bind (the narrowing, ADR 0086)."""
-    send_in = _role_send("input-handle", "%ADT", "OB_IN")
-    body = _handler_body(_handler_source(_call_of(" pass %ADT", _MSGLOG_P) + send_in))
-    assert '    sends.append(Send("OB_IN", msg))' in body
-    cloned = _handler_body(
-        _handler_source(_CLONE_OUT + _call_of(" pass %ADT", _MSGLOG_P) + send_in + _SEND_OUT)
-    )
-    assert 'Send("OB_IN"' not in cloned
-    assert 'Send("OB_OUT"' not in cloned
-
-
-_A04 = "as &quot;ADT^A04&quot; version &quot;2.5.1&quot;"
-
-
-@pytest.mark.parametrize(
-    "call",
-    [
-        pytest.param(
-            _call_of(" pass ADT", f'<Line Data="MsgCreate ADT {_A04}"/>'),
-            id="markup-free-msgcreate-without-percent",
-        ),
-        pytest.param(
-            _call_of(" pass ADT", '<Line Data="MsgTreeCopy NEW/ to ADT/"/>'),
-            id="markup-free-copy-without-percent",
-        ),
-        pytest.param(
-            _call_of(
-                " pass ADT",
-                f"<Line Data=\"&lt;span class='handle'&gt;MsgCreate&lt;/span&gt; "
-                f"&lt;span class='handle'&gt;ADT&lt;/span&gt; {_A04}\"/>",
-            ),
-            id="unlisted-span-class",
-        ),
-        pytest.param(
-            _call_of(" pass ADT", f'<Switch Data="MsgCreate ADT {_A04}"/>'),
-            id="unknown-tag",
-        ),
-        pytest.param(
-            '<Call Data="ActionListCall &quot;Sub&quot; pass ADT"><Param Name="x"/></Call>',
-            id="param-only",
-        ),
-        pytest.param(_call_of(" pass ADT", "<Line/>"), id="empty-line-only"),
-        pytest.param(_call_of(" pass ADT", '<Line Comment="see Sub"/>'), id="comment-only"),
-        pytest.param(_call_of(" pass ADT", '<Line Data="Returns %P"/>'), id="returns"),
-        pytest.param(
-            _call_of(" pass ADT returning ADT", '<Line Data="EnvLogText &quot;x&quot;"/>'),
-            id="unread-verb-and-a-result-clause",
-        ),
-        pytest.param(_call_of(" pass ADT", _write("other-handle", "%P", "SUB")), id="field-write"),
-        pytest.param(
-            _call_of(" pass ADT", _call_of("", _MSGLOG_P)), id="nested-call-that-only-reads"
-        ),
-    ],
-)
-def test_a_call_that_may_do_more_than_read_unbinds_the_input(call: str) -> None:
-    """The input survives a call only when the called list does nothing but read, judged by verb.
-    Each of these could replace the input whole under a spelling no operand reading sees, or edit
-    it in place in a TODO, so the send of the input after it raises. The control (no call) sends."""
-    write = _write("input-handle", "ADT", "X")
-    send = _role_send("input-handle", "ADT", "OB_IN")
-    control = _handler_body(_handler_source(write + send))
-    assert '    sends.append(Send("OB_IN", msg))' in control
-    body = _handler_body(_handler_source(write + call + send))
-    assert 'Send("OB_IN"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
-
-
-_ELSE = '<Line Data="Else"/>'
-
-
-def _else_hiding(*statements: str) -> str:
-    """An If whose Else list holds a second bodyless Else marker, so what follows it becomes a
-    branch of the Else branch: a shape the walk and the render never reach."""
-    return (
-        f'<Line Data="If (x)"><List>{_MSGLOG_P}</List></Line>'
-        f'<Line Data="Else"><List>{_MSGLOG_P}{_ELSE}' + "".join(statements) + "</List></Line>"
-    )
-
-
-@pytest.mark.parametrize(
-    "call",
-    [
-        pytest.param(_call_of(" returning %ADT", _MSGLOG_P), id="result-clause"),
-        pytest.param(_call_of(" pass %ADT", _else_hiding(_create("%Q", _ADT_A04))), id="hidden"),
-        pytest.param(
-            _call_of(
-                " pass %ADT",
-                _role_line(
-                    _span("keyword", "MsgLog")
-                    + " "
-                    + _span("other-handle", "%P")
-                    + " into "
-                    + _span("other-handle", "%ADT")
-                    + _span("path", "/")
-                ),
-            ),
-            id="log-with-a-second-handle",
-        ),
-        pytest.param(
-            _call_of(
-                " pass %ADT",
-                _role_line(
-                    "MsgCreate " + _span("keyword", "MsgLog") + " " + _span("other-handle", "%P")
-                ),
-            ),
-            id="verb-misread-as-msglog",
-        ),
-        pytest.param(
-            _call_of(
-                " pass %ADT",
-                _MSGLOG_P,
-                _create("%ADT", _ADT_A04).replace("<Line ", '<Line Disabled="off" ', 1),
-            ),
-            id="unrecognised-disabled-spelling",
-        ),
-        pytest.param(_call_of(" pass %ADT", _MSGLOG_P, '<Line Data="LoopExit"/>'), id="loop-exit"),
-        pytest.param(
-            _call_of(" pass %ADT", _role_send("other-handle", "%P", "OB_P")), id="send-in-the-list"
-        ),
-    ],
-)
-def test_round_two_call_shapes_unbind_the_input(call: str) -> None:
-    """Code review round 2 of the re-cut: each of these sent msg after a call that could replace or
-    edit it. The input now survives only a plain call line over a list of plain ``MsgLog`` lines."""
-    body = _handler_body(
-        _handler_source(_WRITE_INPUT + call + _role_send("input-handle", "%ADT", "OB_IN"))
-    )
-    assert 'Send("OB_IN"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
-
-
-def test_a_call_hidden_in_a_branch_of_a_branch_unbinds_every_handle() -> None:
-    """The walk never reaches a branch's own branches, so a construct carrying one leaves nothing
-    vouched for after it: a call hidden there cannot leave a stale clone bound."""
-    call = _call_of(" pass %OUT", _create("%OUT", _ADT_A04))
-    body = _handler_body(_handler_source(_CLONE_OUT + _else_hiding(call) + _SEND_OUT))
-    assert 'Send("OB_OUT"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
-
-
-def test_a_call_in_a_loops_stray_branch_unbinds_the_clone_inside_the_loop() -> None:
-    """A misplaced Catch moves the rest of a loop's list into a stray branch that renders after the
-    loop. In the source the call is still inside the loop, so a send early in the loop raises."""
-    loop = (
-        "<Foreach><List>"
-        + _SEND_OUT
-        + '<Line Data="Catch"/>'
-        + _call_of(" pass %OUT", _create("%P", _ADT_A04))
-        + "</List></Foreach>"
-    )
-    body = _handler_body(_handler_source(_CLONE_OUT + loop))
-    assert 'Send("OB_OUT"' not in body
-
-
-@pytest.mark.parametrize("tag", ["Line", "Block"])
-def test_a_call_on_a_line_or_block_never_supplies_the_callers_input(tag: str) -> None:
-    """A call spelled on a ``<Line>`` or ``<Block>`` is a call too: its list's input name never
-    becomes the caller's input, so a caller scratch handle with that name is not read as msg."""
-    log_input = _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%P"))
-    call = f'<{tag} Data="ActionListCall &quot;Sub&quot;"><Actions>{log_input}</Actions></{tag}>'
-    body = _handler_body(
-        _handler_source(
-            _write("other-handle", "%P", "BUILT")
-            + call
-            + _role_send("other-handle", "%P", "OB_OUT")
-        )
-    )
-    assert "set_field(msg" not in body
-    assert 'Send("OB_OUT"' not in body
-
-
-def test_a_called_lists_input_name_never_becomes_the_callers_input() -> None:
-    """Code review of the re-cut: with no input-handle of the caller's own, the called list's input
-    name must not decide the caller's input, or a caller scratch handle with that name is read as
-    msg. The control (no call) refuses the same send."""
-    write = _write("other-handle", "%OUT", "BUILT")
-    send = _role_send("other-handle", "%OUT", "OB_OUT")
-    call = _call_of(" pass %OUT", _write("input-handle", "%OUT", "STAMP"))
-    for export in (write + send, write + call + send):
-        body = _handler_body(_handler_source(export))
-        assert "set_field(msg" not in body
-        assert 'Send("OB_OUT"' not in body
-
-
-def test_a_call_with_no_data_wrapping_a_nested_call_keeps_its_own_scope() -> None:
-    """A ``<Call>`` with no ``@Data`` is never dissolved as a branch-group wrapper, so its list
-    runs in its own scope even when it holds a nested call, and a handle it rebuilds is unknown."""
-    call = (
-        '<Call Name="Sub"><Actions><Line Data="ActionListCall &quot;Inner&quot;"/>'
-        + _create("%OUT", _ADT_A04)
-        + "</Actions></Call>"
-    )
-    body = _handler_body(_handler_source(_CLONE_OUT + call + _SEND_OUT))
-    assert 'Send("OB_OUT"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
-
-
-# --- a statement the flow does not read unbinds every handle; handle case is ignored --------------
-#
-# The Manager's decisions after the re-cut, all fail closed. Synthetic fixtures only.
-
-_WRITE_BARE_INPUT = _write("input-handle", "ADT", "X")
-_SEND_BARE_INPUT = _role_send("input-handle", "ADT", "OB_IN")
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        pytest.param(f'<Line Data="MsgCreate ADT {_A04}"/>', id="markup-free-msgcreate"),
-        pytest.param('<Line Data="MsgTreeCopy NEW/ to ADT/"/>', id="markup-free-copy"),
-        pytest.param('<Line Data="MsgLoad ADT"/>', id="unread-verb"),
-    ],
-)
-def test_a_whole_write_of_a_handle_without_percent_unbinds_the_input(statement: str) -> None:
-    """Open finding 1 of the re-cut, verified as ``Send("OB_IN", msg)``: a markup-free whole-tree
-    write of a handle spelled without ``%`` was invisible. Now the send raises. The control, the
-    same list without the statement, still sends msg."""
-    control = _handler_body(_handler_source(_WRITE_BARE_INPUT + _SEND_BARE_INPUT))
-    assert '    sends.append(Send("OB_IN", msg))' in control
-    body = _handler_body(_handler_source(_WRITE_BARE_INPUT + statement + _SEND_BARE_INPUT))
-    assert 'Send("OB_IN"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
-
-
-_UNREAD_STATEMENTS = [
-    pytest.param('<Line Data="CallActionList &quot;Rebuild&quot; pass %ADT"/>', id="call-alias"),
-    pytest.param(
-        f'<Call Data="ActionListExit"><Actions>{_create("%OUT", _ADT_A04)}</Actions></Call>',
-        id="call-tag-with-another-verb",
-    ),
-    pytest.param('<Line Data="EnvLogText &quot;x&quot;"/>', id="unread-verb-naming-no-handle"),
-    pytest.param(
-        _role_line("MsgCreate " + _span("keyword", "MsgLog") + " " + _span("other-handle", "%P")),
-        id="verb-misread-from-a-later-span",
-    ),
-    pytest.param(
-        _role_line(
-            _span("keyword", "MsgTreeCopy")
-            + " "
-            + _span("other-handle", "%NEW")
-            + _span("path", "/")
-            + " to "
-            + "<span class='handle'>OUT</span>"
-        ),
-        id="unlisted-span-class",
-    ),
-]
-
-
-@pytest.mark.parametrize("statement", _UNREAD_STATEMENTS)
-def test_a_statement_the_flow_does_not_read_unbinds_every_handle(statement: str) -> None:
-    """Open findings 2 and 3, and their family: a verb the flow does not model, an
-    ``ActionListCall`` under another spelling, a ``<Call>`` carrying another verb, or a verb read
-    from a later span may write any handle. Neither the clone nor the input is sent after it."""
-    body = _handler_body(
-        _handler_source(
-            _WRITE_INPUT
-            + _CLONE_OUT
-            + statement
-            + _SEND_OUT
-            + _role_send("input-handle", "%ADT", "OB_IN")
-        )
-    )
-    assert 'Send("OB_OUT"' not in body
-    assert 'Send("OB_IN"' not in body
-
-
-@pytest.mark.parametrize("statement", _UNREAD_STATEMENTS)
-def test_a_statement_the_flow_does_not_read_unbinds_every_handle_in_a_loop(statement: str) -> None:
-    """The same rule through a loop: a later pass may start from what it wrote, so the send at the
-    top of the loop raises too."""
-    loop = "<Foreach><List>" + _SEND_OUT + statement + "</List></Foreach>"
-    body = _handler_body(_handler_source(_CLONE_OUT + loop))
-    assert 'Send("OB_OUT"' not in body
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        pytest.param(_MSGLOG_P, id="msglog"),
-        pytest.param('<Line Data="MsgLog %P"/>', id="markup-free-msglog"),
-        pytest.param(_write("input-handle", "%ADT", "Y"), id="field-write"),
-        pytest.param('<Line Data="ItemClear %OUT/PID-19"/>', id="markup-free-field-write"),
-    ],
-)
-def test_a_read_only_statement_between_a_clone_and_its_send_keeps_the_clone(
-    statement: str,
-) -> None:
-    """The control: a statement the flow does read, and that names the clone only as a path or
-    not at all, leaves the clone bound."""
-    body = _handler_body(_handler_source(_CLONE_OUT + statement + _SEND_OUT))
-    assert '    sends.append(Send("OB_OUT", out_msg))' in body
-
-
-@pytest.mark.parametrize(
-    ("export", "dest"),
-    [
-        pytest.param(
-            _WRITE_INPUT + _create("%adt", _ADT_A04) + _role_send("input-handle", "%ADT", "OB_IN"),
-            "OB_IN",
-            id="msgcreate-into-the-input-in-another-case",
-        ),
-        pytest.param(
-            _WRITE_INPUT
-            + _root_copy("other-handle", "%NEW", "other-handle", "%adt")
-            + _role_send("input-handle", "%ADT", "OB_IN"),
-            "OB_IN",
-            id="copy-into-the-input-in-another-case",
-        ),
-        pytest.param(
-            _CLONE_OUT + _create("%out", _ADT_A04) + _SEND_OUT,
-            "OB_OUT",
-            id="msgcreate-over-a-clone-in-another-case",
-        ),
-        pytest.param(
-            _CLONE_OUT
-            + _root_copy("input-handle", "%ADT", "other-handle", "%Out")
-            + _write("other-handle", "%Out", "Y")
-            + _SEND_OUT,
-            "OB_OUT",
-            id="clone-over-a-clone-in-another-case",
-        ),
-    ],
-)
-def test_handle_case_is_ignored_for_every_unbind(export: str, dest: str) -> None:
-    """Corepoint's handle case-sensitivity is unverified, so the import assumes the worst: a write
-    to ``%adt`` may overwrite ``%ADT``. A later send of ``%ADT`` raises rather than send the old
-    local."""
-    body = _handler_body(_handler_source(export))
-    assert f'Send("{dest}"' not in body
-    assert f'raise NotImplementedError("Corepoint import: MsgSend to {dest}:' in body
-
-
-_SEND_INPUT = _role_send("input-handle", "%ADT", "OB_IN")
-_REPLACE_ADT = _root_copy("other-handle", "%NEW", "other-handle", "%ADT")
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        pytest.param(
-            _role_line(
-                "MsgCreate "
-                + _span("keyword", "Returns")
-                + " "
-                + _span("other-handle", "%ADT")
-                + _ADT_A04
-            ),
-            id="exit-verb-misread-from-a-later-span",
-        ),
-        pytest.param(
-            _role_line(
-                "MsgLoad " + _span("keyword", "LoopExit") + " " + _span("other-handle", "%ADT")
-            ),
-            id="break-verb-misread-from-a-later-span",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgCreate")
-                + " "
-                + _span("literal", "ADT")
-                + " as "
-                + _span("literal", '"ADT^A04"')
-                + " version "
-                + _span("literal", '"2.5.1"')
-            ),
-            id="handle-in-a-bare-literal-span",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgTreeCopy")
-                + " "
-                + _span("other-handle", "%NEW")
-                + _span("path", "/")
-                + " to "
-                + _span("variable", "ADT")
-            ),
-            id="handle-in-a-variable-span",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgTreeCopy")
-                + " "
-                + _span("other-handle", "%NEW")
-                + _span("path", "/")
-                + " to "
-                + _span("other-handle", "%OUT")
-                + _span("path", "/")
-                + " "
-                + _span("action-list-call-pass", "%ADT")
-            ),
-            id="handle-in-a-pass-span",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgTreeCopy")
-                + " "
-                + _span("other-handle", "%NEW")
-                + _span("path", "/*")
-                + " to "
-                + _span("input-handle", "%ADT")
-                + _span("path", "/*")
-            ),
-            id="whole-tree-path-not-spelled-slash",
+            _CLONE_WRITE_SEND.replace("<Line ", '<Line Enabled="false" ', 1), id="unread-attribute"
         ),
         pytest.param(
             _role_line(
                 _span("keyword", "MsgLog")
                 + " "
-                + _span("other-handle", "%NEW")
-                + " "
-                + _span("other-handle", "%ADT")
-            ),
-            id="msglog-with-two-handles",
-        ),
-        pytest.param(
-            _REPLACE_ADT.replace("<Line ", '<Line Disabled="N" ', 1), id="disabled-spelled-N"
-        ),
-        pytest.param("<Line>MsgTreeCopy %NEW/ to %ADT/</Line>", id="statement-in-element-text"),
-        pytest.param('<MsgCreate Handle="%ADT" Type="ADT^A04"/>', id="unmodelled-element-no-data"),
-    ],
-)
-def test_round_three_shapes_unbind_the_input(statement: str) -> None:
-    """Code review of the unread-statement rule: each of these could replace the input in a way no
-    rule saw, and the send of the input after it rendered ``Send("OB_IN", msg)``. Now it raises."""
-    body = _handler_body(_handler_source(_WRITE_INPUT + statement + _SEND_INPUT))
-    assert 'Send("OB_IN"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        pytest.param(
-            _role_line(
-                _span("keyword", "ItemClear") + " " + _span("variable", "ADT"),
-            ),
-            id="variable-span-without-a-dollar",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "ItemClear")
-                + " "
                 + _span("input-handle", "%ADT")
-                + _span("path", "/*")
+                + " "
+                + _span("description", "note")
             ),
-            id="field-write-to-a-whole-tree-path",
+            id="a-description-span",
         ),
         pytest.param(
-            '<Line Data="ItemClear %ADT/*"/>', id="markup-free-field-write-to-a-whole-tree"
+            _role_line(_span("keyword", "msglog") + " " + _span("input-handle", "%ADT")),
+            id="a-lowercase-verb",
         ),
-        pytest.param(_create("％ADT", _ADT_A04), id="fullwidth-percent"),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgLog")
-                + " "
-                + _span("other-handle", "%NEW")
-                + " "
-                + _span("detail", "into ADT")
-            ),
-            id="msglog-with-a-detail-span",
-        ),
-        pytest.param(
-            _create("%OUT", _ADT_A04, " " + _span("variable", "ADT")),
-            id="msgcreate-with-a-trailing-handle",
-        ),
-        pytest.param('<Line Data=" ">MsgTreeCopy %NEW/ to %ADT/</Line>', id="blank-data-and-text"),
-        pytest.param(
-            '<Line Data="MsgLog %P">MsgTreeCopy %NEW/ to %ADT/</Line>', id="data-and-text"
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgSend")
-                + " "
-                + _span("other-handle", "%NEW")
-                + " to connection "
-                + _span("literal", '"OB_X"')
-                + " reply into "
-                + _span("input-handle", "%ADT")
-            ),
-            id="send-with-a-second-handle",
-        ),
-        pytest.param(
-            '<Foreach Data="ForEach %ADT in %BATCH"><List>' + _MSGLOG_P + "</List></Foreach>",
-            id="foreach-binding-a-handle",
-        ),
-        pytest.param(
-            '<Call Comment=\'ActionListCall "Sub"\' Returning="%ADT"><Actions>'
-            + _MSGLOG_P
-            + "</Actions></Call>",
-            id="call-line-in-a-comment",
-        ),
-        pytest.param(
-            _role_line(
-                _span("keyword", "MsgCreate")
-                + " "
-                + _span("other-handle", "%NEW")
-                + _ADT_A04
-                + " "
-                + _span("action-list-call-custom", "from template X")
-            )
-            + _role_send("other-handle", "%NEW", "OB_NEW"),
-            id="unread-msgcreate-never-binds",
-        ),
+        pytest.param('<Block Data="itemclear OUT"><List></List></Block>', id="a-verb-label"),
+        pytest.param('<If Data="If (x)"><List></List></If>', id="any-construct"),
+        pytest.param('<Line Data="ItemClear %ADT/PID-19"/>', id="a-markup-free-statement"),
     ],
 )
-def test_round_four_shapes_unbind_the_input(statement: str) -> None:
-    """Code review round 2 of the unread-statement rule: each of these sent msg, or a message the
-    export never built, after Corepoint could have replaced it. Now each send raises."""
-    body = _handler_body(_handler_source(_WRITE_INPUT + statement + _SEND_INPUT))
-    assert 'Send("OB_IN"' not in body
-    assert 'Send("OB_NEW"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+def test_one_element_off_the_allow_list_renders_the_whole_list_as_step_1(spoiler: str) -> None:
+    """The gate is decided for the WHOLE list: one element it does not fully understand, anywhere,
+    and the clone is msg again exactly as step 1 renders it. No local is bound."""
+    body = _handler_body(_handler_source(_CLONE_WRITE_SEND + spoiler))
+    assert "_msg = " not in body
+    assert "out_msg" not in body
 
 
-def test_a_line_that_may_not_be_disabled_votes_on_the_input() -> None:
-    """A ``Disabled="2"`` line may have run, so its input-handle name makes the input ambiguous,
-    and even a send BEFORE it raises."""
-    maybe = _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%OTHER")).replace(
-        "<Line ", '<Line Disabled="2" ', 1
-    )
-    body = _handler_body(_handler_source(_WRITE_INPUT + _SEND_INPUT + maybe))
-    assert 'Send("OB_IN"' not in body
-
-
-def test_a_self_copy_keeps_its_clone() -> None:
-    """Reading the source before the destination's spellings are unbound keeps a copy onto itself
-    a clone, rather than a false refusal."""
-    again = _root_copy("other-handle", "%OUT", "other-handle", "%OUT")
-    body = _handler_body(_handler_source(_CLONE_OUT + again + _SEND_OUT))
-    assert "out_msg = out_msg.copy()" in body
-    assert '    sends.append(Send("OB_OUT", out_msg))' in body
-
-
-def test_a_call_carrying_a_control_verb_keeps_its_construct() -> None:
-    """A ``<Call>`` whose verb is ``If`` still renders under the dead placeholder, so nothing in it
-    runs unconditionally, and markers around it leave every handle unknown."""
-    call = (
-        '<Call Data="If %ADT/PID-3 = &quot;x&quot;"><Actions>'
-        + _create("%OUT", _ADT_A04)
-        + _SEND_OUT
-        + "</Actions></Call>"
-    )
-    body = _handler_body(_handler_source(_WRITE_INPUT + call + _SEND_INPUT))
-    assert "    if False:" in body
-    assert '\n    sends.append(Send("OB_OUT"' not in body  # never at the handler's own level
-    assert 'Send("OB_IN"' not in body
-
-
-def test_a_call_carrying_msgsend_raises_rather_than_filter() -> None:
-    """A ``<Call>`` whose verb is ``MsgSend`` keeps its send and its declared destination, and the
-    marker before it makes that send raise: never a silent filter."""
-    src = _handler_source(
-        _WRITE_INPUT + '<Call Data="MsgSend %ADT to connection &quot;OB_IN&quot;"><Actions/></Call>'
-    )
-    body = _handler_body(src)
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
-    assert "return None" not in body
-    assert 'outbound("OB_IN"' in src
-
-
-def test_an_input_handle_spelled_with_a_trailing_slash_is_still_overwritten() -> None:
-    """The key drops a trailing ``/``, so a handle span written ``%ADT/`` and a write to ``%ADT``
-    are one handle."""
-    write = _write("input-handle", "%ADT/", "X")
-    send = _role_send("input-handle", "%ADT/", "OB_IN")
-    control = _handler_body(_handler_source(write + send))
-    assert '    sends.append(Send("OB_IN", msg))' in control
-    body = _handler_body(_handler_source(write + _REPLACE_ADT + send))
-    assert 'Send("OB_IN"' not in body
-
-
-@pytest.mark.parametrize(
-    ("input_handle", "written"),
-    [
-        pytest.param("%ADI", "%adı", id="dotless-i"),
-        pytest.param("%CAFÉ", "%café", id="decomposed-accent"),
-    ],
-)
-def test_handle_case_folding_covers_unicode(input_handle: str, written: str) -> None:
-    """The key upper-cases before it folds and normalises compatibility forms, so neither a dotless
-    ``i`` nor a decomposed accent keeps a write from reaching the input."""
-    write = _write("input-handle", input_handle, "X")
-    send = _role_send("input-handle", input_handle, "OB_IN")
-    body = _handler_body(_handler_source(write + _create(written, _ADT_A04) + send))
-    assert 'Send("OB_IN"' not in body
-
-
-def test_two_data_attributes_that_differ_only_in_case_are_refused() -> None:
-    """One reader would take ``data`` and another ``Data``, so the import refuses the export."""
-    with pytest.raises(CorepointImportError, match="more than one Data attribute"):
-        _handler_source('<Line data="MsgLog %P" Data="MsgTreeCopy %NEW/ to %ADT/"/>')
-
-
-def test_a_called_lists_input_is_not_the_callers_msg() -> None:
-    """Inside the called list, its input handle is whatever was passed, not the caller's msg. A
-    write there must not land on msg, and a handle the list binds is not the caller's to send."""
-    inner = _inlined_call(
-        _write("input-handle", "%ADT", "SUB"),
-        _create("%P", _ADT_A04),
-    )
-    body = _handler_body(
-        _handler_source(
-            _CLONE_OUT
-            + inner
-            + _role_send("other-handle", "%P", "OB_P")
-            + _role_send("input-handle", "%ADT", "OB_IN")
-        )
-    )
-    assert 'set_field(msg, "MSH-6", "SUB")' not in body
-    assert "p_msg = Message.parse(" not in body  # inside a call nothing binds (ADR 0086)
-    assert 'Send("OB_P"' not in body and 'Send("OB_IN"' not in body
-
-
-@pytest.mark.parametrize(
-    "rebuild",
-    [
-        pytest.param(_create("%P", _ADT_A04), id="lander-repro"),
-        pytest.param("", id="input-handle-only"),
-    ],
-)
-def test_a_called_lists_input_handle_makes_the_callers_input_ambiguous(rebuild: str) -> None:
-    """The Lander's LOW 2 on PR 1900. Nothing establishes that a call passing nothing does not hand
-    the caller's input to the called list's input handle, so a second input-handle name inside an
-    inlined list makes the caller's input ambiguous: no handle is msg, and the send raises. The
-    ``input-handle-only`` arm overwrites no tree, so only this rule refuses it."""
-    inner = _inlined_call(
-        _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%P")),
-        rebuild,
-        passing="",
-    )
-    body = _handler_body(
-        _handler_source(_WRITE_INPUT + inner + _role_send("input-handle", "%ADT", "OB_IN"))
-    )
-    assert 'set_field(msg, "MSH-6", "X")' not in body
-    assert 'Send("OB_IN"' not in body
-    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
-
-
-def test_a_markup_free_write_in_a_branch_of_a_marked_list_declines() -> None:
-    """Inside a construct a role-parsed write declines (its condition is a dead placeholder), so a
-    markup-free one in the same list does too, rather than run live inside ``try:``."""
-    body = _handler_body(
-        _handler_source(
-            _WRITE_INPUT
-            + '<Try><Line Data="ItemClear %ADT/PID-19"/></Try>'
-            + _role_send("input-handle", "%ADT", "OB_IN")
-        )
-    )
-    assert 'set_field(msg, "PID-19"' not in body
-    assert "inside a branch or loop declines" in body
-
-
-def test_a_markup_free_framing_write_is_never_emitted() -> None:
-    """MSH-1/MSH-2 corrupt the framing, so even a list with no role markup never writes them."""
-    src = _handler_body(_handler_source('<Line Data="ItemCopy &quot;#&quot; %ADT/MSH-2"/>'))
-    assert "set_field(" not in src
-    assert "a framing field this import never writes" in src
-
-
-def test_a_call_with_no_inlined_list_is_a_marker_and_counted_unmapped() -> None:
-    """Nothing was inlined, so the render must not say it was, nor count it as shipped."""
-    steps = '<Line Data="ActionListCall &quot;Sub&quot;"/>'
-    src = _handler_body(_handler_source(steps))
-    assert "# TODO: Corepoint ActionListCall — called list not inlined" in src
-    assert "(called list inlined)" not in src
-    assert _count_steps(_handler_steps(steps), in_loop=False) == (0, ["ActionListCall"], 0)
-
-
-def test_framing_and_markup_free_copies_never_reach_a_built_or_cloned_message() -> None:
-    """MSH-2 is refused on a built message as everywhere else, and in a list with role markup a
-    markup-free copy (which clears an absent source's destination) or a repeating-segment write
-    declines as the role layer would."""
-    body = _handler_body(
-        _handler_source(
-            _create("%NEW", _ADT_A04)
-            + '<Line Data="ItemClear %NEW/MSH-2"/>'
-            + _CLONE_OUT
-            + '<Line Data="ItemCopy %OUT/PID-5 %OUT/PID-6"/>'
-            + '<Line Data="ItemClear %OUT/OBX-5"/>'
-            + _SEND_OUT
-        )
-    )
-    assert "MSH-2" not in body.split("# TODO")[0]
-    assert 'set_field(new_msg, "MSH-2"' not in body
-    assert "copy_field(" not in body
-    assert 'set_field(out_msg, "OBX-5"' not in body
-    assert "intended target PID-6" in body
-
-
-def test_an_unstyled_field_write_verb_still_declines() -> None:
-    """Reading words styled or not must not widen field-write mapping: a field write whose verb is
-    unstyled declined before step 2 and still does. A keyword-styled ``to`` still maps."""
-    unstyled = _role_line(
-        "ItemCopy "
-        + _span("literal", '"X"')
-        + " to "
-        + _span("input-handle", "%ADT")
-        + _span("path", "/MSH-6")
-    )
-    assert "set_field(" not in _handler_body(_handler_source(unstyled))
-    styled_to = _role_line(
-        _span("keyword", "ItemCopy")
-        + " "
-        + _span("literal", '"X"')
-        + " "
-        + _span("keyword", "to")
-        + " "
-        + _span("input-handle", "%ADT")
-        + _span("path", "/MSH-6")
-    )
-    assert '    set_field(msg, "MSH-6", "X")' in _handler_body(_handler_source(styled_to))
-
-
-def test_a_keyword_styled_word_stops_a_field_write_mapping() -> None:
-    """A mode word the exporter styles as a keyword counts like an unstyled one: ``ItemAppend "x"
-    before PID-8`` is not an append, so it declines rather than map to ``append_to_field``."""
-    styled = _role_line(
-        _span("keyword", "ItemAppend")
-        + " "
-        + _span("literal", '"x"')
-        + " "
-        + _span("keyword", "before")
-        + " "
-        + _span("input-handle", "%ADT")
-        + _span("path", "/PID-8")
-    )
-    body = _handler_body(_handler_source(styled))
-    assert "append_to_field(" not in body
-    assert "# TODO: Corepoint ItemAppend" in body
-
-
-def test_a_declined_copy_into_a_built_message_names_the_field_it_writes() -> None:
-    """``copy_field(src, dst)`` writes its LAST path, so the decline names the destination."""
-    body = _handler_body(
-        _handler_source(
-            _create("%NEW", _ADT_A04)
-            + '<Line Data="ItemCopy %NEW/MSH-6 %NEW/PID-5"/>'
-            + _role_send("other-handle", "%NEW", "OB_NEW")
-        )
-    )
-    assert "copy_field(" not in body
-    assert "intended target PID-5" in body
-
-
-def test_a_send_in_a_branch_the_render_does_not_emit_never_becomes_a_send_of_msg() -> None:
-    """A marker nested inside a branch is not rendered. Its send must not be collected as a
-    destination, or the handler would gain a trailing, unconditional ``Send(dest, msg)``."""
-    nested = (
-        '<If><Line Data="If (a)"><List><Line Data="ItemClear %ADT/PID-19"/></List></Line>'
-        '<Line Data="Else"><List><Line Data="Catch"/>'
-        + _role_send("other-handle", "%OUT", "OB_NESTED")
-        + "</List></Line></If>"
-    )
-    body = _handler_body(_handler_source(_WRITE_INPUT + nested))
-    assert "Send(" not in body
-
-
-def test_a_module_with_scratch_locals_round_trips_through_the_lens() -> None:
-    """ADR 0086 AC-4 for the new shapes: no whole-file refusal, and every live send is a send row.
-    What the rows do NOT show (which message a write or a send addresses) is recorded in the ADR."""
+def test_a_module_with_locals_round_trips_through_the_lens() -> None:
+    """ADR 0086 AC-4 for the new shapes: no whole-file refusal, and every live send is a send row."""
     from messagefoundry.lens import parse_source
 
     src = _handler_source(
-        _CLONE_WRITE_SEND + _create("%NEW", _ADT_A04) + _role_send("other-handle", "%NEW", "OB_NEW")
+        _CLONE_WRITE_SEND + _create("%NEW") + _role_send("other-handle", "%NEW", "OB_NEW")
     )
     (contract,) = parse_source(src)
     sends = [row for row in contract["rows"] if row["kind"] == "send"]
     assert [row["outbounds"] for row in sends] == [["OB_ACME"], ["OB_NEW"]]
+
+
+def test_a_fully_understood_module_passes_check(tmp_path: Path) -> None:
+    """The emitted module with locals parses, compiles and passes ``messagefoundry check``."""
+    export = tmp_path / "pkg.xml"
+    body = _CLONE_WRITE_SEND + _create("%NEW") + _role_send("other-handle", "%NEW", "OB_NEW")
+    export.write_text(_package(body), encoding="utf-8")
+    summary = import_corepoint(export, tmp_path / "out").to_json()
+    assert summary["total_unmapped"] == 0
+    assert run_checks(tmp_path / "out", run_lint=False).ok
 
 
 def test_generated_xml_module_compiles_and_passes_check(tmp_path: Path) -> None:
@@ -3123,11 +1683,10 @@ def test_every_statement_is_accounted_for(tmp_path: Path) -> None:
     """Count-and-log: mapped + unmapped + disabled covers the fixture, nothing silently vanishes."""
     result = import_corepoint(FIXTURES / "acme_adt_package.xml", tmp_path)
     summary = result.to_json()
-    # 3 vocabulary calls from the flat list + 3 from the role list + 14 control constructs.
-    assert summary["total_mapped"] == 20
-    # 3 from the flat list + its refused ``MsgSend $out`` (BACKLOG #313 step 2: a ``$variable`` names
-    # no handle the import can identify) + 5 role statements the guards correctly refuse to map.
-    assert summary["total_unmapped"] == 9
+    # 3 vocabulary calls from the flat list + 3 from the role list + 15 control constructs.
+    assert summary["total_mapped"] == 21
+    # 3 from the flat list + 5 role statements the guards correctly refuse to map.
+    assert summary["total_unmapped"] == 8
     assert summary["total_disabled"] == 1
     # The whole fixture is accounted for: every source element lands in exactly one bucket.
     assert summary["total_mapped"] + summary["total_unmapped"] + summary["total_disabled"] == 30
@@ -3479,16 +2038,12 @@ def test_else_under_a_dead_condition_is_not_emitted_as_a_live_branch() -> None:
 
 def test_a_send_statement_keeps_its_nested_body() -> None:
     """The ``send`` path returned only the ``Send`` and dropped ``*body`` — unlike ``break``/``exit``
-    beside it, which have always carried theirs. The body is kept as an unmodelled element's body
-    (its scope is not modelled), so it renders, and no handle is vouched for inside it: the write
-    to the input is a TODO naming its target."""
-    send = _role_send("input-handle", "%ADT", "OB_A")
-    assert send.endswith("/>")
-    src = _handler_source(send[:-2] + '><List><Line Data="ItemClear %ADT/PID-19"/></List></Line>')
+    beside it, which have always carried theirs."""
+    src = _handler_source(
+        '<Line Data="MsgSend $o [OB_A]"><List><Line Data="ItemClear %ADT/PID-19"/></List></Line>'
+    )
     assert 'sends.append(Send("OB_A", msg))' in src
-    assert "a statement carrying a nested list" in src
-    assert "intended target PID-19" in src
-    assert 'set_field(msg, "PID-19", "")' not in src
+    assert 'set_field(msg, "PID-19", "")' in src
     ast.parse(src)
 
 
@@ -3509,8 +2064,8 @@ def test_cli_imports_the_xml_package(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     assert code == 0
     summary = json.loads(capsys.readouterr().out)
-    assert summary["total_mapped"] == 20
-    assert summary["total_unmapped"] == 9
+    assert summary["total_mapped"] == 21
+    assert summary["total_unmapped"] == 8
     assert summary["total_disabled"] == 1
     assert (out / "IB_ACME_ADT.py").is_file()
 
@@ -3540,146 +2095,3 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     assert "\nos.system(" not in src
     assert 'set_field(msg, "MSH-6", "A\\nimport os")' in src  # escaped, inert literal
     ast.parse(src)  # still one well-formed module — no literal or comment breakout
-
-
-# --- the d26545d6f HIGH on PR 1900, and the shapes the differential guard found with it ----------
-# tests/test_corepoint_import_differential.py runs these shapes and about 5,300 more against step 1;
-# these name the HIGH's four shapes so a reader sees them without the guard's machinery.
-
-_NEW_SENT = _create("%NEW", _ADT_A04) + _role_send("other-handle", "%NEW", "OB_NEW")
-
-
-def _line_with(data: str, body: str) -> str:
-    return _role_line(data).replace("/>", f"><List>{body}</List></Line>")
-
-
-_IF_ADT_EXISTS = _span("keyword", "If") + " " + _span("input-handle", "%ADT") + " exists"
-
-
-@pytest.mark.parametrize(
-    "export",
-    [
-        pytest.param(
-            "<If>"
-            + _line_with(_IF_ADT_EXISTS, _MSGLOG_P)
-            + _line_with("Else", _NEW_SENT)
-            + "</If>",
-            id="if-names-a-handle-then-else",
-        ),
-        pytest.param(
-            '<If><Line Data="If $X = &quot;1&quot;"><List>'
-            + _MSGLOG_P
-            + "</List></Line>"
-            + _line_with(
-                _span("keyword", "ElseIf") + " " + _span("input-handle", "%ADT") + " exists",
-                _NEW_SENT,
-            )
-            + "</If>",
-            id="elseif-names-a-handle",
-        ),
-        pytest.param(
-            '<Try><Line Data="Try"><List>'
-            + _MSGLOG_P
-            + "</List></Line>"
-            + _line_with(
-                _span("keyword", "Catch") + " into " + _span("other-handle", "%ERR"), _NEW_SENT
-            )
-            + "</Try>",
-            id="catch-names-a-handle",
-        ),
-        pytest.param(
-            '<If Data="If %ADT exists"><List>'
-            + _MSGLOG_P
-            + "</List></If>"
-            + _line_with("Else", _NEW_SENT),
-            id="sibling-if-names-a-handle-then-else",
-        ),
-    ],
-)
-def test_a_branch_whose_construct_names_a_handle_stays_a_branch(export: str) -> None:
-    """The Lander's HIGH on d26545d6f: markers around an If, ElseIf or Catch that names a whole
-    message hid the branch from its construct, so the branch rendered with no enclosing construct
-    and its body ran for every message. The line now carries the reason instead, and stays in its
-    chain."""
-    body = _handler_body(_handler_source(export))
-    assert '\n    sends.append(Send("OB_NEW"' not in body  # never at the handler's own level
-    assert "with no enclosing construct" not in body
-    assert "elif False:" in body or "    except Exception:" in body
-
-
-def test_a_branch_marker_with_no_construct_stops_binding() -> None:
-    """A branch marker with no construct inlines what follows it, which Corepoint may never have
-    run. From the marker on nothing binds (the narrowing, ADR 0086), so a send of a message built
-    after it raises, while a send of msg stays as step 1 had it."""
-    lost = '<Block Data="Section"><List>' + _ELSE + _NEW_SENT + _SEND_INPUT + "</List></Block>"
-    body = _handler_body(_handler_source(_WRITE_INPUT + lost))
-    assert 'Send("OB_NEW"' not in body
-    assert "new_msg = Message.parse(" not in body
-    assert '    sends.append(Send("OB_IN", msg))' in body
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        pytest.param('<Line Data="ForEach OUT in %SRC/OBX">', id="foreach-no-percent"),
-        pytest.param(
-            "<Line Data=\"&lt;span class='keyword'&gt;ForEach&lt;/span&gt; "
-            "&lt;span class='handle'&gt;%OUT&lt;/span&gt;\">",
-            id="foreach-unlisted-span-class",
-        ),
-        pytest.param('<Line Data="Catch into OUT">', id="catch-no-percent"),
-    ],
-)
-def test_a_foreach_or_catch_naming_a_handle_in_any_spelling_unbinds_it(line: str) -> None:
-    """A ForEach or Catch may bind the handle it names. A spelling neither reading sees made the
-    flow keep the clone, so a send of it went out after the construct had rebound it. The line is
-    now judged word by word: anything it cannot classify may be a handle."""
-    clone = _root_copy("input-handle", "%ADT", "other-handle", "OUT")
-    send = _role_send("other-handle", "OUT", "OB_OUT")
-    construct = line + "<List>" + _MSGLOG_P + "</List></Line>"
-    if "Catch" in line:
-        construct = '<Try><Line Data="Try"><List>' + _MSGLOG_P + "</List></Line>" + construct
-        construct += "</Try>"
-    body = _handler_body(_handler_source(clone + construct + send))
-    assert 'Send("OB_OUT"' not in body
-    control = _handler_body(_handler_source(clone + send))
-    assert '    sends.append(Send("OB_OUT", out_msg))' in control
-
-
-def test_a_foreach_over_a_path_with_a_variable_still_reads() -> None:
-    """The control for the word rule: ``ForEach %ADT/OBX $obx`` names a path into a handle and a
-    variable, neither a whole tree, so the input is still msg after it. (A clone made before it is
-    not: the loop is the first construct after a bind, ADR 0086.)"""
-    loop = '<Foreach Data="ForEach %ADT/OBX $obx"><List>' + _MSGLOG_P + "</List></Foreach>"
-    body = _handler_body(_handler_source(loop + _SEND_INPUT))
-    assert '    sends.append(Send("OB_IN", msg))' in body
-    named = '<Foreach Data="ForEach ADT in %SRC/OBX"><List>' + _MSGLOG_P + "</List></Foreach>"
-    assert 'Send("OB_IN"' not in _handler_body(_handler_source(named + _SEND_INPUT))
-
-
-def test_a_try_holding_a_nested_try_is_not_a_branch_group_wrapper() -> None:
-    """A ``<Try>`` with no ``@Data`` dissolved whenever its body held another Try, so its Catch came
-    loose and a clone made in its body read as made on every path. Only a wrapper whose children
-    are all the construct's own branch lines dissolves (the differential guard's sweep, seed 4)."""
-    inner = "<Try><List>" + _MSGLOG_P + _CATCH_LINE + _MSGLOG_P + "</List></Try>"
-    outer = "<Try><List>" + inner + _CLONE_OUT + _CATCH_LINE + _MSGLOG_P + "</List></Try>"
-    # In a Block, so the old reading's loose Catch was not the last line before the send.
-    block = '<Block Data="Section"><List>' + outer + "</List></Block>"
-    body = _handler_body(_handler_source(_WRITE_INPUT + block + _SEND_OUT))
-    assert "with no enclosing construct" not in body
-    assert body.count("try:") == 2
-    assert 'Send("OB_OUT"' not in body
-
-
-_CATCH_LINE = '<Line Data="Catch"/>'
-
-
-def test_a_nested_list_holding_only_comments_stays_in_line() -> None:
-    """A nested list under a statement is an unmodelled element only when something in it runs. A
-    list of comments and empty lines changes nothing, so a send of msg after it still sends, as in
-    step 1 (round 3 of code review on PR 1900: it raised)."""
-    log = _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%ADT"))
-    nested = log[:-2] + '><List><Line Comment="why"/></List></Line>'
-    body = _handler_body(_handler_source(nested + _SEND_INPUT))
-    assert '    sends.append(Send("OB_IN", msg))' in body
-    assert "nested list" not in body

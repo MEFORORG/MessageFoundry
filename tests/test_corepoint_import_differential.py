@@ -22,13 +22,24 @@ by the step 1 importer, vendored byte-for-byte from main at ``bca583f2a`` (blob 
 origin/main``, because once step 2 merges ``origin/main`` IS the head, and the comparison would become
 the head against itself; and because a CI checkout need not hold that ref.
 
+**The invariant (the whole-list gate, ADR 0086).** For every shape, EITHER the head's generated
+module and summary counts are step 1's byte for byte (the gate is closed), OR the guard's own
+allow-list walker (:func:`_fully_understood`, written apart from the importer and never calling its
+gate) finds every element of the list allow-listed AND every oracle check below passes (the gate is
+open). The constructs above close the gate, so most of the battery is a byte-identity check; the
+shapes drawn from the allow-list alone (:func:`_open_shapes`) open it, and one in four carries one
+spoiler just off the allow-list to test its edge.
+
 Each shape also carries its own ORACLE: an abstract interpreter over the shape (not over the XML)
 that says, for every ``MsgSend``, which trees the export may send there, over every path, and in
-both a case-sensitive and a case-insensitive reading of handle names (Corepoint's is unverified).
-Anything the oracle does not model makes every handle unknown. The generated handlers are then
-EXECUTED against one synthetic input, and their source is read, and the guard asserts:
+both a case-sensitive and a case-insensitive reading of handle names (Corepoint's is unverified),
+and which literals each tree held AT the send. Anything the oracle does not model makes every handle
+unknown. Where the gate is open, the generated handlers are EXECUTED against one synthetic input,
+and their source is read, and the guard asserts:
 
-1. (i) the head never delivers where step 1 raises or filters unless the oracle proves the tree;
+1. (i) the head never delivers where step 1 raises or filters unless the oracle proves the tree,
+   and the delivered message carries no literal its tree did not hold at the send (a write after a
+   send must not reach the message already sent);
 2. (ii) the head never lifts a send out of a branch: no send line sits at a shallower indent than in
    step 1, and no send the oracle places in a branch runs on the all-placeholders-false path;
 3. (iii) the head never delivers ``msg`` for a send of another handle, or of a tree the oracle
@@ -36,8 +47,8 @@ EXECUTED against one synthetic input, and their source is read, and the guard as
 4. every LIVE send line in the head is provable on every path: the oracle's tree set at that send is
    exactly one known tree, of the same kind as the local (``msg`` only for the input itself). This
    reaches the branches the executed path skips;
-5. a local other than ``msg`` is bound, and sent, only at the handler's own level (the narrowing,
-   ADR 0086). Together with an execution that runs past every refusal (each ``raise
+5. a local other than ``msg`` is bound, and sent, only at the handler's own level (the gate admits
+   no construct, ADR 0086). Together with an execution that runs past every refusal (each ``raise
    NotImplementedError`` is read as a human deleting it), that puts every such send on the executed
    path, so (i) compares the tree it actually delivers, not only its kind.
 
@@ -497,6 +508,176 @@ def _package(body: str) -> str:
     return f'<Package Name="ACME X"><ActionList Name="T"><List>{body}</List></ActionList></Package>'
 
 
+# --- the guard's own allow-list walker ------------------------------------------------------------
+#
+# The whole-list gate's specification, written a second time and on purpose apart from the importer:
+# nothing here imports or calls the importer's gate. Where the head's output differs from step 1, the
+# list must be fully understood by THIS walker, or the importer's gate is wider than the allow-list.
+
+# Each verb's one shape after its keyword: H a handle span, R a path span "/", F a path span naming a
+# writable field, L a quoted literal span, and any other entry that exact unstyled word.
+_ALLOWED = {
+    "MsgTreeCopy": "H R to H R",
+    "MsgCreate": "H as L version L",
+    "ItemCopy": "L to H F",
+    "ItemClear": "H F",
+    "ItemAppend": "L to H F",
+    "MsgLog": "H",
+    "MsgSend": "H to connection L",
+}
+_SPAN_PIECE = re.compile(r"<span class=(['\"])([a-z-]+)\1>([^<>&]*)</span>")
+_G_HANDLE = re.compile(r"%[A-Za-z][A-Za-z0-9_]{0,39}")
+_G_FIELD = re.compile(
+    r"/(MSH|EVN|PID|PD1|PV1|PV2|MRG|ACC|UB1|UB2)"
+    r"(?:-([1-9]\d*)(?:-[1-9]\d*){0,2}(?: \([A-Za-z0-9 ]+\))?|-([1-9]\d*)(?:\.[1-9]\d*){1,2})"
+)
+_G_TYPE = re.compile(r"[A-Z0-9]{3}\^[A-Z0-9]{3}(?:\^[A-Z0-9_]{3,7})?")
+_G_VERSION = re.compile(r"2\.[1-9](?:\.[1-9])?")
+_G_CONTROL_WORDS = frozenset(
+    [
+        "if",
+        "elseif",
+        "else",
+        "foreach",
+        "loop",
+        "loopexit",
+        "try",
+        "catch",
+        "choosefrom",
+        "case",
+        "matching",
+        "msgsend",
+        "actionlistcall",
+        "returns",
+        "actionlistexit",
+        "actionliststop",
+    ]
+)
+
+
+def _g_tokens(data: str) -> list[tuple[str, str]] | None:
+    """``[(span class, text)]`` with each unstyled word as ``("", word)``, or None."""
+    out: list[tuple[str, str]] = []
+    rest = data
+    while rest:
+        found = _SPAN_PIECE.match(rest)
+        if found:
+            out.append((found.group(2), found.group(3)))
+            rest = rest[found.end() :]
+            continue
+        plain = re.match(r"[^<>&]+", rest)
+        if plain is None:
+            return None
+        out.extend(("", w) for w in plain.group(0).split())
+        rest = rest[plain.end() :]
+    return out
+
+
+def _g_statement(data: str, handles: list[tuple[str, str]], writes: list[str]) -> bool:
+    """Whether ``data`` is one allowed statement; record its handles and what it overwrites."""
+    tokens = _g_tokens(data)
+    if not tokens or tokens[0][0] != "keyword" or tokens[0][1] not in _ALLOWED:
+        return False
+    verb = tokens[0][1]
+    want = _ALLOWED[verb].split()
+    if len(tokens) - 1 != len(want):
+        return False
+    named: list[str] = []
+    lits: list[str] = []
+    for w, (cls, text) in zip(want, tokens[1:], strict=True):
+        if w == "H":
+            if cls not in ("input-handle", "other-handle") or not _G_HANDLE.fullmatch(text):
+                return False
+            handles.append((text, cls))
+            named.append(text)
+        elif w == "R":
+            if (cls, text) != ("path", "/"):
+                return False
+        elif w == "F":
+            field_path = _G_FIELD.fullmatch(text) if cls == "path" else None
+            if field_path is None:
+                return False
+            if field_path.group(1) == "MSH" and (field_path.group(2) or field_path.group(3)) in (
+                "1",
+                "2",
+            ):
+                return False
+        elif w == "L":
+            if cls != "literal" or not re.fullmatch(r'"[^"]*"', text):
+                return False
+            lits.append(text[1:-1])
+        elif (cls, text) != ("", w):
+            return False
+    if verb == "MsgCreate" and not (_G_TYPE.fullmatch(lits[0]) and _G_VERSION.fullmatch(lits[1])):
+        return False
+    if verb == "MsgSend" and not lits[0].strip():
+        return False
+    if verb in ("MsgTreeCopy", "MsgCreate"):
+        writes.append(named[-1])
+    return True
+
+
+def _g_label(data: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9 ]*", data):
+        return False
+    for word in data.split():
+        low = word.lower()
+        if low in _G_CONTROL_WORDS or re.match(r"(msg|item|seg|env|var|actionlist)", low):
+            return False
+        if word[1:] != word[1:].lower():
+            return False
+    return True
+
+
+def _fully_understood(xml: str) -> bool:
+    """Whether every element of the list, at every depth, is on the allow-list (ADR 0086)."""
+    from messagefoundry._vendor.defusedxml.ElementTree import fromstring
+
+    try:
+        (action_list,) = list(fromstring(_package(xml)))
+    except Exception:  # noqa: BLE001 - malformed is not understood
+        return False
+    handles: list[tuple[str, str]] = []
+    writes: list[str] = []
+
+    def walk(elem: Any) -> bool:
+        for child in elem:
+            if (child.text or "").strip() or (child.tail or "").strip():
+                return False
+            attrs = dict(child.attrib)
+            if child.tag == "List":
+                if attrs or not walk(child):
+                    return False
+                continue
+            off = attrs.pop("Disabled", None)
+            if off is not None and off.lower() not in ("1", "true", "yes"):
+                return False
+            data = attrs.pop("Data", "")
+            if attrs:
+                return False
+            if child.tag == "Line":
+                if len(child) or not _g_statement(data, handles, writes):
+                    return False
+            elif child.tag != "Block" or not _g_label(data) or not walk(child):
+                return False
+        return True
+
+    if set(action_list.attrib) - {"Name", "Desc"} or (action_list.text or "").strip():
+        return False
+    if not walk(action_list):
+        return False
+    classes: dict[str, set[str]] = {}
+    for text, cls in handles:
+        classes.setdefault(text, set()).add(cls)
+    inputs = {t for t, c in classes.items() if "input-handle" in c}
+    return (
+        all(len(c) == 1 for c in classes.values())
+        and len({t.lower() for t in classes}) == len(classes)
+        and len(inputs) <= 1
+        and not inputs & set(writes)
+    )
+
+
 # --- the oracle -----------------------------------------------------------------------------------
 
 Val = tuple[Any, ...]
@@ -584,7 +765,9 @@ class _Oracle:
         self.doubt: set[str] = set()
         self.may_skip: set[str] = set()
         self.lits: dict[Val, set[str]] = {}
-        self.sources: dict[Val, set[Val]] = {}
+        # The literals each send's tree held AT the send: a later write changes the tree in
+        # Corepoint, not the message already sent.
+        self.sent_lits: dict[str, set[str]] = {}
         env = _Env()
         env.vals[self.inp_key] = frozenset({IN})
         self.run(shape.nodes, env, _Ctx())
@@ -614,7 +797,8 @@ class _Oracle:
                         continue
                     root = v[2] if v[0] == "clone" else v
                     made: Val = ("clone", uid, root)
-                    self.sources.setdefault(made, set()).add(v)
+                    # A copy holds what its source held at the copy, and nothing written later.
+                    self.lits.setdefault(made, set()).update(self.lits.get(v, set()))
                     new.add(made)
                 env.vals[self.key(dst.name)] = frozenset(new)
             case Create(h, k, good, _):
@@ -630,6 +814,8 @@ class _Oracle:
                 pass
             case SendS(h, dest, _):
                 self.sends.setdefault(dest, set()).update(env.get(self.key(h.name)))
+                for v in env.get(self.key(h.name)):
+                    self.sent_lits.setdefault(dest, set()).update(self.lits.get(v, set()))
                 self.send_keys.setdefault(dest, set()).add(self.key(h.name))
                 if ctx.dead and not env.ended:
                     self.dead.add(dest)
@@ -742,26 +928,12 @@ class _Verdict:
     dead: set[str]
     doubt: set[str]
     may_skip: set[str]
-    lits: dict[Val, set[str]]
-    sources: dict[Val, set[Val]]
-
-    def allowed(self, value: Val) -> set[str]:
-        seen: set[Val] = set()
-        out: set[str] = set()
-        todo = [value]
-        while todo:
-            v = todo.pop()
-            if v in seen:
-                continue
-            seen.add(v)
-            out |= self.lits.get(v, set())
-            todo.extend(self.sources.get(v, ()))
-        return out
+    sent_lits: dict[str, set[str]]
 
 
 def _oracle(shape: Shape) -> _Verdict:
     worlds = [_Oracle(shape, fold) for fold in (False, True)]
-    verdict = _Verdict(tuple(w.inp_key for w in worlds), {}, {}, set(), set(), set(), {}, {})
+    verdict = _Verdict(tuple(w.inp_key for w in worlds), {}, {}, set(), set(), set(), {})
     for w in worlds:
         for dest, vals in w.sends.items():
             verdict.sends.setdefault(dest, set()).update(vals)
@@ -770,10 +942,8 @@ def _oracle(shape: Shape) -> _Verdict:
         verdict.dead |= w.dead
         verdict.doubt |= w.doubt
         verdict.may_skip |= w.may_skip
-        for v, lits in w.lits.items():
-            verdict.lits.setdefault(v, set()).update(lits)
-        for v, srcs in w.sources.items():
-            verdict.sources.setdefault(v, set()).update(srcs)
+        for dest, lits in w.sent_lits.items():
+            verdict.sent_lits.setdefault(dest, set()).update(lits)
     return verdict
 
 
@@ -805,9 +975,8 @@ class _Run:
 
 
 def _execute(module: Any, xml: str, where: Path) -> _Run:
-    try:
-        src = module.generate_module(module.parse_package(_package(xml))[0])
-    except module.CorepointImportError:
+    src, _ = _generate(module, xml)
+    if not src:
         return _Run("", [], None)
     registry = Registry()
     namespace: dict[str, Any] = {"__name__": "mefor_differential_generated"}
@@ -879,9 +1048,33 @@ def _send_indent(src: str, dest: str, *, live_only: bool = False) -> int | None:
     return min(found) if found else None
 
 
+def _generate(module: Any, xml: str) -> tuple[str, tuple[object, ...]]:
+    """The generated module and the summary counts, or ``("", ())`` when the import refuses."""
+    try:
+        channel = module.parse_package(_package(xml))[0]
+        src = module.generate_module(channel)
+    except module.CorepointImportError:
+        return "", ()
+    return src, tuple(module._count_steps(h.steps, in_loop=False) for h in channel.handlers)
+
+
 def _violations(shape: Shape) -> list[str]:
-    """Every way the head's handler for ``shape`` fails open against step 1 and the oracle."""
+    """Every way the head breaks the whole-list gate's invariant for ``shape``.
+
+    The gate is closed, and then the head's module and summary counts are step 1's byte for byte;
+    or it is open, and then the guard's OWN walker (:func:`_fully_understood`, never the importer's
+    gate) must find every element allow-listed, and every oracle check must pass."""
     xml = _render(shape.nodes, shape.inp)
+    if _generate(head, xml) == _generate(step1, xml):
+        return []
+    found: list[str] = []
+    if not _fully_understood(xml):
+        found.append("(gate) the head differs from step 1 on a list that is not fully understood")
+    return found + _oracle_violations(shape, xml)
+
+
+def _oracle_violations(shape: Shape, xml: str) -> list[str]:
+    """Every way the head's handler for ``shape`` fails open against step 1 and the oracle."""
     verdict = _oracle(shape)
     out_head = _execute(head, xml, _WHERE)
     out_step1 = _execute(step1, xml, _WHERE)
@@ -955,9 +1148,11 @@ def _violations(shape: Shape) -> list[str]:
             if _kind(value) != seen:
                 found.append(f"(i) {dest} delivers {seen}; the export sends {_kind(value)}")
             assert isinstance(message, Message)
-            stray = set(_LITERAL.findall(message.encode())) - verdict.allowed(value)
+            stray = set(_LITERAL.findall(message.encode())) - verdict.sent_lits.get(dest, set())
             if stray:
-                found.append(f"(i) {dest} carries {sorted(stray)}, written to another tree")
+                found.append(
+                    f"(i) {dest} carries {sorted(stray)}, written to another tree or after the send"
+                )
     return found
 
 
@@ -1238,6 +1433,85 @@ def _random_shapes(seed: int, count: int) -> Iterator[Shape]:
         b = _Build(random.Random(rng.random()))
         middle = Block(tuple(_random_node(b, 3) for _ in range(rng.randint(1, 4))))
         yield _framed(b, middle, f"random-{k}")
+
+
+# --- shapes the gate is meant to open -------------------------------------------------------------
+#
+# The constructs above all close the gate, so on their own they test only byte-identity. These draw
+# from the allow-list alone (straight-line statements, prose Blocks, surely disabled steps) with
+# handles the gate reads, so the gate opens and the oracle's checks do the work. One in four also
+# carries ONE spoiler, an element just outside the allow-list, so the gate's edge is tested too.
+
+_SAFE_OTHERS = ("%OUT", "%NEW", "%OUT_A", "%X1", "%Tmp")
+
+
+class _OpenBuild(_Build):
+    def __init__(self, rng: random.Random) -> None:
+        super().__init__(rng)
+        self.inp = H("%ADT")
+        self.out, self.new = (H(n) for n in rng.sample(_SAFE_OTHERS, 2))
+        self.variant = False
+        self.mode = "role"
+
+
+def _spoiler(b: _OpenBuild) -> Node:
+    """One element just outside the allow-list."""
+    o = b.out
+    w = _leaf_data(b.write(o), b.inp.name)
+    s = _leaf_data(b.send(o), b.inp.name)
+    assert w is not None and s is not None
+    return b.rng.choice(
+        (
+            Raw(_line(w.replace("ItemCopy", "itemcopy")), havoc=False),
+            Raw(_line(s + _span("description", "note")), havoc=False),
+            Raw(_line(s + _span("comment", "note")), havoc=False),
+            Raw(_line(w).replace("<Line ", '<Line Enabled="false" ', 1), havoc=False),
+            Raw(_line(w).replace("<Line ", '<Line Comment="note" ', 1), havoc=False),
+            Raw(_line(w).replace("/PID-8", "//PID-8").replace("/MSH-10", "//MSH-10"), havoc=False),
+            b.write(H(o.name.swapcase())),
+            Write(o, f"W{b._next()}Z", "/PID-8", markup=False),
+            Off(b.write(o), "on"),
+            Block((b.write(o),), "itemclear OUT", havoc=True),
+            Block((b.write(o),), "Patient MSH", havoc=False),
+            If((("If", None, (b.write(o),)),)),
+            Unread("merge", b.out, b.new),
+            Clone(b.out, b.inp, b._next()),
+            b.create(o, good=False),
+            OffList((b.write(o),)),
+        )
+    )
+
+
+def _open_node(b: _OpenBuild, depth: int) -> Node:
+    rng = b.rng
+    handles = (b.inp, b.out, b.new)
+    roll = rng.random()
+    if depth > 0 and roll < 0.12:
+        body = tuple(_open_node(b, depth - 1) for _ in range(rng.randint(1, 3)))
+        return Block(body, rng.choice(("Section", "Patient identity", "")))
+    if roll < 0.18:
+        return Off(_open_node(b, 0), rng.choice(("1", "true", "yes")))
+    return rng.choice(
+        (
+            lambda: b.clone(rng.choice(handles), rng.choice((b.out, b.new))),
+            lambda: b.create(rng.choice((b.out, b.new))),
+            lambda: b.write(rng.choice(handles)),
+            lambda: b.write(rng.choice(handles)),
+            lambda: b.send(rng.choice(handles)),
+            lambda: b.send(rng.choice(handles)),
+            lambda: b.log(rng.choice(handles)),
+        )
+    )()
+
+
+def _open_shapes(seed: int, count: int) -> Iterator[Shape]:
+    rng = random.Random(seed)
+    for k in range(count):
+        b = _OpenBuild(random.Random(rng.random()))
+        nodes = [_open_node(b, 2) for _ in range(rng.randint(2, 9))]
+        if rng.random() < 0.25:
+            nodes.insert(rng.randint(0, len(nodes)), _spoiler(b))
+        yield Shape(f"open-{k}", b.inp.name, tuple(nodes))
 
 
 # --- the fixed seeds: every repro from every review of PR 1900 ------------------------------------
@@ -1547,27 +1821,225 @@ def _seed_shapes() -> Iterator[Shape]:
             "%ADT",
             (Clone(_ADT, h, 1), SendS(h, "OB_BEFORE"), Call((Log(_P),)), SendS(h, "OB_AFTER")),
         )
+    yield from _round3_shapes()
+    # The Lander's QA of db8873d19e, pre-existing on main: a line between an If and its Else.
+    for between in (
+        "<Line/>",
+        '<Line Comment="note"/>',
+        _line(_leaf_data(Log(_ADT), "%ADT") or ""),
+    ):
+        yield Shape(
+            f"lander-db8873d19e-line-between-if-and-else-{len(between)}",
+            "%ADT",
+            (
+                Raw(
+                    '<If><List><Line Data="If (x)"><List>'
+                    + _line(_leaf_data(Log(_ADT), "%ADT") or "")
+                    + "</List></Line>"
+                    + between
+                    + '<Line Data="Else"><List>'
+                    + _line(_leaf_data(SendS(_ADT, "OB_IN"), "%ADT") or "")
+                    + "</List></Line></List></If>"
+                ),
+            ),
+        )
+
+
+def _round3_shapes() -> Iterator[Shape]:
+    """The report-only review of 6fa49a9d5 (round 3 of the differential-guard pass): seven fail-open
+    shapes that passed the guard as it then was, in the review's own spellings. Each spoils the
+    allow-list except the write after a send, which the gate admits and :class:`_Binder` declines."""
+    log_adt = _line(f"{_kw('MsgLog')} {_hs(_ADT, '%ADT')}")
+    send_in = _line(f"{_kw('MsgSend')} {_hs(_ADT, '%ADT')} to connection {_lit('OB_IN')}")
+    new_sent: tuple[Node, ...] = (Create(_NEW, 4), SendS(_NEW, "OB_NEW"))
+    out = H("%OUT")
+
+    def raw_line(data: str) -> Raw:
+        return Raw(_line(data), havoc=False)
+
+    try_el = Raw("<Try><List>" + log_adt + "</List></Try>", havoc=False)
+    if_el = Raw('<If Data="If (x = &quot;1&quot;)"><List>' + log_adt + "</List></If>", havoc=False)
+    shapes: dict[str, tuple[Node, ...]] = {
+        # (1) a loose Catch or Matching line after its construct
+        "C-flat-catch": (try_el, raw_line("Catch"), *new_sent),
+        "C-flat-else": (if_el, raw_line("Else"), *new_sent, raw_line("EndIf")),
+        "C-flat-if-else": (raw_line('If (x = "1")'), raw_line("Else"), *new_sent),
+        "flat-choosefrom": (raw_line("ChooseFrom (x)"), raw_line('Matching "A"'), *new_sent),
+        "flat-while": (raw_line(_kw("While") + ' (x = "1")'), *new_sent, raw_line("EndWhile")),
+        "own-tag-catch": (
+            Raw(
+                "<Try>"
+                + _line("Try", log_adt)
+                + '<Try Data="Catch"><List>'
+                + send_in
+                + "</List></Try></Try>",
+                havoc=False,
+            ),
+        ),
+        "own-tag-matching": (
+            Raw(
+                "<Case>"
+                + _line("ChooseFrom (x)", log_adt)
+                + '<Case Data="Matching &quot;A&quot;"><List>'
+                + send_in
+                + "</List></Case></Case>",
+                havoc=False,
+            ),
+        ),
+        "split-list-wrapper": (
+            Raw(
+                "<If><List>"
+                + _line('If (x = "1")', log_adt)
+                + "</List><List>"
+                + _line("Else", send_in)
+                + "</List></If>",
+                havoc=False,
+            ),
+        ),
+        # (2) a statement the import cannot read, which never stopped binding
+        "B-split-exit": (Log(_ADT), raw_line(_kw("ActionList") + _kw("Exit")), *new_sent),
+        "B-unread-verb": (
+            Log(_ADT),
+            Raw(_line(_kw("MsgDiscard") + " " + _hs(_ADT, "%ADT")), havoc=True),
+            *new_sent,
+        ),
+        "B-after-bind": (
+            Create(out, 4),
+            raw_line(_kw("ActionList") + _kw("Exit")),
+            Create(_NEW, 5),
+            SendS(_NEW, "OB_NEW"),
+        ),
+        # (3) a lowercase verb label
+        "label-itemclear-lower": (
+            Create(out, 4),
+            Block((SendS(out, "OB_OUT"),), "itemclear OUT", True),
+        ),
+        "label-itemclear-lower-nohavoc": (
+            Create(out, 4),
+            Block((SendS(out, "OB_OUT"),), "itemclear OUT", False),
+        ),
+        # (4) a write after a send reaching the sent message (copy-on-Send off, as here)
+        "A-write-after-send": (Clone(_ADT, out, 1), SendS(out, "OB_OUT"), Write(out, "W9Z")),
+        "A-created-write-after-send": (
+            Create(out, 4),
+            SendS(out, "OB_OUT"),
+            Write(out, "W9Z", "/MSH-10"),
+        ),
+        "A-write-after-send-then-resend": (
+            Clone(_ADT, out, 1),
+            SendS(out, "OB_OUT"),
+            Write(out, "W9Z"),
+            SendS(out, "OB_AGAIN"),
+        ),
+        # (5) description or comment spans on MsgTreeCopy and MsgCreate
+        "clone-description-qualifier": (
+            raw_line(
+                f"{_kw('MsgTreeCopy')} {_hs(_ADT, '%ADT')}{_span('path', '/')} to "
+                f"{_hs(out, '%ADT')}{_span('path', '/')} {_span('description', 'append')}"
+            ),
+            SendS(out, "OB_OUT"),
+        ),
+        "create-description-template": (
+            raw_line(
+                f"{_kw('MsgCreate')} {_hs(out, '%ADT')} as {_lit('ADT^A04')} version "
+                f"{_lit('2.5.1')} {_span('description', 'from template T')}"
+            ),
+            SendS(out, "OB_OUT"),
+        ),
+        "create-comment-template": (
+            raw_line(
+                f"{_kw('MsgCreate')} {_hs(out, '%ADT')} as {_lit('ADT^A04')} version "
+                f"{_lit('2.5.1')} {_span('comment', 'from template T')}"
+            ),
+            SendS(out, "OB_OUT"),
+        ),
+        # (6) an unread attribute on a statement line
+        "enabled-false": (
+            Log(_ADT),
+            Raw(
+                _line(_leaf_data(Create(_NEW, 4), "%ADT") or "").replace(
+                    "<Line ", '<Line Enabled="false" ', 1
+                ),
+                havoc=False,
+            ),
+            Raw(
+                _line(_leaf_data(SendS(_NEW, "OB_NEW"), "%ADT") or "").replace(
+                    "<Line ", '<Line Enabled="false" ', 1
+                ),
+                havoc=False,
+            ),
+        ),
+        # (7) a //ADT path
+        "foreach-double-slash": (
+            raw_line(f"{_kw('ForEach')} {_hs(_ADT, '%ADT')}{_span('path', '//ADT')}"),
+            Clone(_ADT, out, 1),
+            SendS(out, "OB_OUT"),
+        ),
+        "clone-double-slash": (
+            raw_line(
+                f"{_kw('MsgTreeCopy')} {_hs(_ADT, '%ADT')}{_span('path', '//ADT')} to "
+                f"{_hs(out, '%ADT')}{_span('path', '/')}"
+            ),
+            SendS(out, "OB_OUT"),
+        ),
+        # The same review's refusal-text shape after the narrowing.
+        "narrow-refusal-text": (
+            Clone(_ADT, out, 1),
+            If((("If", None, (Log(_P),)),)),
+            SendS(out, "OB_OUT"),
+            SendS(_ADT, "OB_IN"),
+        ),
+    }
+    for name, nodes in shapes.items():
+        yield Shape(f"review-6fa49a9d5-{name}", "%ADT", nodes)
 
 
 # --- the guard ------------------------------------------------------------------------------------
 
 _SEED = 313
 _RANDOM = 1000
+_OPEN = 2400
 _CHUNKS = 24
 
 
 def _all_shapes() -> list[Shape]:
-    return [*_seed_shapes(), *_paired_shapes(_SEED), *_random_shapes(_SEED, _RANDOM)]
+    return [
+        *_seed_shapes(),
+        *_paired_shapes(_SEED),
+        *_random_shapes(_SEED, _RANDOM),
+        *_open_shapes(_SEED, _OPEN),
+    ]
 
 
 _SHAPES = _all_shapes()
 
 
 def test_the_battery_is_as_wide_as_it_claims() -> None:
-    """Every ordered construct pair at depth 2, every payload, plus the seeds and random shapes."""
+    """Every ordered construct pair at depth 2, every payload, plus the seeds, the random shapes and
+    the shapes drawn from the allow-list."""
     pairs = {s.name.rsplit("/", 1)[0] for s in _SHAPES if s.name.count("/") == 2}
     assert len(pairs) == len(_KINDS) ** 2
-    assert len(_SHAPES) == len(list(_seed_shapes())) + len(_KINDS) ** 2 * 6 + _RANDOM
+    assert len(_SHAPES) == len(list(_seed_shapes())) + len(_KINDS) ** 2 * 6 + _RANDOM + _OPEN
+
+
+def test_open_gate_shapes_are_well_represented() -> None:
+    """The guard's own walker finds a large share of the battery fully understood, and on most of
+    those the head binds a local, so the oracle checks have real work to do. Measured at the time of
+    writing: see ADR 0086."""
+    understood = [s for s in _SHAPES if _fully_understood(_render(s.nodes, s.inp))]
+    bound = [s for s in understood if "_msg = " in _generate(head, _render(s.nodes, s.inp))[0]]
+    assert len(understood) >= 1500
+    assert len(bound) >= 1000
+
+
+def test_the_walker_tells_the_gate_apart_on_its_own_seeds() -> None:
+    """The control for the walker: it accepts a plain clone-write-send and refuses one spoiler of
+    each kind, so a walker that accepts everything (or nothing) cannot pass the guard."""
+    plain = (Clone(_ADT, _OUT, 1), Write(_OUT, "W1Z"), SendS(_OUT, "OB_OUT"))
+    assert _fully_understood(_render(plain, "%ADT"))
+    spoiled = [s for s in _round3_shapes() if "write-after-send" not in s.name]
+    assert len(spoiled) == 20
+    assert not any(_fully_understood(_render(s.nodes, s.inp)) for s in spoiled)
 
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
