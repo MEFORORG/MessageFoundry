@@ -24,6 +24,7 @@ import ssl
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -192,9 +193,12 @@ def test_the_c_store_check_still_refuses_a_peer_the_accept_gate_did_not_see(
     event = _FakeStoreEvent(transfer_syntax="1.2.840.10008.1.2.1", data_set=b"\x00" * 32)
     refused = _build_scp(captured, source_ip_allowlist=_NOT_LOOPBACK)
     with caplog.at_level(logging.WARNING, logger=_LOG):
-        assert refused._on_c_store(event) == 0x0124  # Refused: Not Authorized, before any decode
-    # This path means the accept gate did not run, so the line names the calling AE as well.
-    assert any("a C-STORE (AE 'MODALITY1')" in m for m in _warnings(caplog))
+        for _ in range(3):
+            assert refused._on_c_store(event) == 0x0124  # Not Authorized, before any decode
+    # Each of these is an object the SCP received and refused, so each one is logged, with the
+    # calling AE. The per-address throttle is for refused connections, which carry no object.
+    lines = [m for m in _warnings(caplog) if "C-STORE from 127.0.0.1 (AE 'MODALITY1')" in m]
+    assert len(lines) == 3, _warnings(caplog)
     # CONTROL: the same event from an allowed address goes on to the decode trap (0xC000).
     allowed = _build_scp(captured, source_ip_allowlist=_LOOPBACK)
     assert allowed._on_c_store(event) == 0xC000
@@ -223,8 +227,8 @@ async def test_a_fault_in_the_accept_gate_refuses_the_peer_and_keeps_the_listene
 async def test_a_fault_in_the_refusal_path_is_logged_once_and_still_refuses(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # The last line of defence on the accept loop. It must refuse, say so once, and not once per
-    # connection, because in this state every connection is refused.
+    # The last line of defence on the accept loop. It must refuse, and say so once per window, not
+    # once per connection, because in this state every connection is refused.
     def broken(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("refusal path fault")
 
@@ -233,8 +237,18 @@ async def test_a_fault_in_the_refusal_path_is_logged_once_and_still_refuses(
         with caplog.at_level(logging.DEBUG, logger=_LOG):
             for _ in range(3):
                 assert await asyncio.to_thread(_closed_after, scp.sockport, wait=3.0) is not None
-        faults = [m for m in _warnings(caplog) if "admission check itself failed" in m]
-        assert len(faults) == 1, faults
+
+            def faults() -> list[str]:
+                return [m for m in _warnings(caplog) if "admission check itself failed" in m]
+
+            assert len(faults()) == 1, faults()
+            # A later window logs it again, so a fault that returns is not silent for good. The
+            # line is due again no later than one window from now; move that time here, not the clock.
+            window = dicom_module._REFUSAL_LOG_WINDOW_SECONDS
+            assert scp._server._gate_fault_log_after <= time.monotonic() + window
+            scp._server._gate_fault_log_after = 0.0
+            assert await asyncio.to_thread(_closed_after, scp.sockport, wait=3.0) is not None
+            assert len(faults()) == 2, faults()
 
 
 # --- Refusals are logged per peer, not per connection --------------------------------------------
@@ -275,15 +289,15 @@ def test_the_refusal_log_is_per_peer_and_capped_across_peers(
 
 
 def test_a_later_refusal_line_carries_the_running_count(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setattr(dicom_module, "_REFUSAL_LOG_WINDOW_SECONDS", 0.2)
     scp = _build_scp([], source_ip_allowlist=_NOT_LOOPBACK)
     with caplog.at_level(logging.WARNING, logger=_LOG):
         for _ in range(5):
             scp._admit_connection(("192.0.2.1", 40000))
         assert len(_warnings(caplog)) == 1
-        time.sleep(0.3)  # the window has passed, so the next refusal is logged again
+        # Age this address's line past the window, in place of sleeping through one.
+        scp._refusal_logged["192.0.2.1"] -= dicom_module._REFUSAL_LOG_WINDOW_SECONDS + 1
         scp._admit_connection(("192.0.2.1", 40000))
     lines = _warnings(caplog)
     assert len(lines) == 2
@@ -482,10 +496,15 @@ async def test_a_slot_is_given_back_when_no_thread_could_be_started(
 ) -> None:
     # The slot is taken on the accept loop, before the connection's thread exists. If that thread
     # cannot be started, nothing else would ever give the slot back.
-    def cannot_start(self: object, request: object, client_address: object) -> None:
-        raise RuntimeError("no thread for this connection")
+    start_thread = socketserver.ThreadingMixIn.process_request
 
     async with _running_scp(_tls_settings(tmp_path)) as scp:
+
+        def cannot_start(self: Any, request: Any, client_address: Any) -> None:
+            if self is not scp._server:  # any other server in this process is left alone
+                return start_thread(self, request, client_address)
+            raise RuntimeError("no thread for this connection")
+
         with monkeypatch.context() as patched:
             patched.setattr(socketserver.ThreadingMixIn, "process_request", cannot_start)
             took = await asyncio.to_thread(_closed_after, scp.sockport, wait=3.0)
@@ -502,10 +521,16 @@ async def test_a_connection_that_times_out_ends_its_handshake_at_once(
     # A poll slice that finds nothing to read raises a TimeoutError with no errno, and the handshake
     # goes on. The transport itself timing out raises one WITH an errno. That one must end the
     # handshake, not be retried until the bound.
-    def transport_timed_out(self: ssl.SSLSocket, block: bool = False) -> None:
-        raise TimeoutError(errno.ETIMEDOUT, "connection timed out")
+    handshake = ssl.SSLSocket.do_handshake
 
     async with _running_scp(_tls_settings(tmp_path)) as scp:  # the shipped 10 s handshake bound
+        port = scp.sockport
+
+        def transport_timed_out(self: ssl.SSLSocket, block: bool = False) -> None:
+            if not (self.server_side and self.getsockname()[1] == port):
+                return handshake(self, block)  # any other TLS socket in this process
+            raise TimeoutError(errno.ETIMEDOUT, "connection timed out")
+
         monkeypatch.setattr(ssl.SSLSocket, "do_handshake", transport_timed_out)
         took = await asyncio.to_thread(_closed_after, scp.sockport, wait=4.0)
         assert took is not None, "the handshake was retried instead of ended"
@@ -605,7 +630,6 @@ def test_the_scp_runs_its_own_server_class_over_the_pinned_hooks() -> None:
     assert issubclass(ThreadedAssociationServer, socketserver.TCPServer)
     assert "get_request" in vars(AssociationServer)
     assert "process_request_thread" in vars(ThreadedAssociationServer)
-    assert callable(socketserver.BaseServer.verify_request)
     for name in (
         "get_request",
         "verify_request",
@@ -615,7 +639,7 @@ def test_the_scp_runs_its_own_server_class_over_the_pinned_hooks() -> None:
     ):
         assert name in vars(cls), f"the admitting server no longer defines {name}"
     assert AE()._servers == [], "start_serving records the server on AE._servers"
-    assert callable(make_target)
+    assert make_target(print) is print, "start_serving wraps its target as AE.start_server does"
 
 
 def test_a_pynetdicom_that_left_the_socketserver_routing_is_refused() -> None:
@@ -634,9 +658,13 @@ def test_a_pynetdicom_that_left_the_socketserver_routing_is_refused() -> None:
         def process_request(self, request: object, client_address: object) -> None:
             raise NotImplementedError
 
+    class OwnPerConnectionStep(ThreadedAssociationServer):
+        def _handle_request_noblock(self) -> None:
+            raise NotImplementedError
+
     class NotThreaded(socketserver.TCPServer):
         pass
 
-    for left in (OwnLoop, OwnDispatch, NotThreaded):
+    for left in (OwnLoop, OwnDispatch, OwnPerConnectionStep, NotThreaded):
         with pytest.raises(RuntimeError, match="does not route an accepted connection"):
             dicom_module._require_socketserver_routing(left)

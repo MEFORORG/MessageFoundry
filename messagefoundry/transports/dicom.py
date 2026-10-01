@@ -199,10 +199,10 @@ _HANDSHAKE_POLL_SECONDS = 0.5
 #: address. The handshake runs on the connection's own thread, so these are what bound how many such
 #: threads exist. A connection over either is closed before a thread is started. They are the MLLP
 #: listener's two shipped connection caps, read from it so the numbers cannot drift apart; its
-#: constants say why 256 and why an eighth of it. Here they cover the handshake only: once it
-#: completes, the connection is pynetdicom's to count (``max_associations``). Constants, not
-#: settings, for the reason ``_TLS_HANDSHAKE_TIMEOUT`` gives. A handshake takes milliseconds, so
-#: senders that share one address behind a NAT do not meet the per-address number in normal use.
+#: constants say why 256 and why an eighth of it. Here they count a connection only while it is in
+#: its handshake. Constants, not settings, for the reason ``_TLS_HANDSHAKE_TIMEOUT`` gives. A
+#: handshake takes milliseconds, so senders that share one address behind a NAT do not meet the
+#: per-address number in normal use.
 _MAX_PENDING_HANDSHAKES = DEFAULT_MAX_CONNECTIONS
 _MAX_PENDING_HANDSHAKES_PER_HOST = DEFAULT_MAX_CONNECTIONS_PER_HOST
 
@@ -236,8 +236,10 @@ def _require_socketserver_routing(stock: type[Any]) -> None:
         and stock.serve_forever is socketserver.BaseServer.serve_forever
         and stock.verify_request is socketserver.BaseServer.verify_request
         and stock.process_request is socketserver.ThreadingMixIn.process_request
-        and callable(getattr(stock, "get_request", None))
-        and callable(getattr(stock, "process_request_thread", None))
+        # The private method serve_forever calls for each connection, and the one that calls
+        # get_request, verify_request and process_request in that order.
+        and getattr(stock, "_handle_request_noblock", None)
+        is getattr(socketserver.BaseServer, "_handle_request_noblock", None)
     )
     if not routed:
         raise RuntimeError(
@@ -299,7 +301,8 @@ def _admitting_server_class() -> type[Any]:
             #: Handshakes in flight per peer address. Its values sum to the listener's total.
             self._pending: dict[str, int] = {}
             self._pending_lock = threading.Lock()
-            self._gate_fault_logged = False
+            #: When the next admission-check fault may be logged (monotonic). See verify_request.
+            self._gate_fault_log_after = 0.0
             super().__init__(*args, **kwargs)
 
         def start_serving(self) -> None:
@@ -322,16 +325,19 @@ def _admitting_server_class() -> type[Any]:
             try:
                 return self._admit(client_address)
             except Exception as exc:  # noqa: BLE001 - fail closed, and keep the accept loop alive
-                if not self._gate_fault_logged:
-                    # Once per listener: this state refuses every connection, and a line for each
+                now = time.monotonic()
+                if now >= self._gate_fault_log_after:
+                    # Once per window: this state refuses every connection, and a line for each
                     # would be a way to fill the log. The line is best effort; the refusal is not.
-                    self._gate_fault_logged = True
+                    self._gate_fault_log_after = now + _REFUSAL_LOG_WINDOW_SECONDS
                     with contextlib.suppress(Exception):
                         logger.error(
                             "DICOM server (SCP) %s: the admission check itself failed (%s). "
-                            "Connections it cannot check are refused. This is logged once.",
+                            "Connections it cannot check are refused. This is logged at most "
+                            "once every %gs.",
                             self.ae_title,
                             safe_exc(exc),
+                            _REFUSAL_LOG_WINDOW_SECONDS,
                         )
                 return False
 
@@ -944,7 +950,14 @@ class DicomScpSource(SourceConnector):
             # hooks in pynetdicom's server class, and this check does not: if the gate were ever not
             # run, a non-allowlisted peer's object would still be refused BEFORE any commit.
             if not peer_ip_allowed((peer_ip, 0), self._source_ip_allowlist):
-                self._log_refused_peer(peer_ip, f"a C-STORE (AE {calling_ae!r})", _NOT_IN_ALLOWLIST)
+                # Not through the per-address throttle: this is an object the SCP received and
+                # refused, and every one of those is logged.
+                logger.warning(
+                    "DICOM C-STORE from %s (AE %r) refused: %s",
+                    peer_ip,
+                    calling_ae,
+                    _NOT_IN_ALLOWLIST,
+                )
                 return _STATUS_NOT_AUTHORIZED
             # BACKLOG #1727: charge max_object_bytes against the RAW received Data Set FIRST. The
             # post-encode check below fires only after event.dataset has copied and decoded the whole
