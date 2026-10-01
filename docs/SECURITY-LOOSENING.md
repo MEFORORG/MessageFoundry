@@ -86,6 +86,7 @@ section reference.
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
+| | `tls_check_hostname` | `true` on every connection whose TLS context reads it (*connection-scoped*; `false` is the loosening) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
@@ -851,7 +852,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   it when the peer renews.
 - **What you keep, and it is most of it:** the chain signature, name constraints, key usage / EKU, basic
   constraints and the hostname match all still apply — it ORs exactly one flag
-  (`X509_V_FLAG_NO_CHECK_TIME`). A wrong-host or broken-chain peer is still rejected. This is genuinely
+  (`X509_V_FLAG_NO_CHECK_TIME`). The hostname match holds only while the same connection leaves
+  `tls_check_hostname` on; see the next entry. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): this said
+  the hostname match applies without condition, and the construction WARN said the same, which was
+  false on a hop that also set `tls_check_hostname = false`. A wrong-host or broken-chain peer is still
+  rejected on a hop that checks the name. This is genuinely
   narrower than `tls_verify = false`, which is the entire point of it: the alternative operators reach
   for otherwise is the blunt switch.
 - **When acceptable:** a short bridge while a partner renews a lapsed certificate. It should be
@@ -870,6 +875,36 @@ This section is kept rather than deleted, because the claim it used to make is t
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
+
+### `tls_check_hostname = false` on a connection — any certificate from the trust anchor is accepted
+> **Connection-scoped**: a parameter on the `MLLP`, `Email` and `Direct` outbound factories, and a
+> `connections.toml` `[settings]` key. `Ftp()` does not take it, but the FTPS context honours it from a
+> hand-built spec or a `[settings]` table, so it is a loosening there too. ASVS 12.3.2.
+- **What you lose:** the check that the server certificate names the host the engine dialled. The
+  chain is still verified, so the certificate must come from the hop's trust anchor. But any
+  certificate from that anchor is accepted, whatever host it was issued to. On the public trust store
+  that means a certificate any public CA issued to anyone. Whoever holds one, on the path, could
+  impersonate the peer and read the payload.
+- **What you keep:** the chain signature, expiry (unless `tls_allow_expired` is also set), key usage
+  and the TLS floor. It is narrower than `tls_verify = false`, which drops the chain too.
+- **When acceptable:** a partner whose certificate names a different host than the one you dial, such
+  as an IP address, while they reissue it. Prefer a private trust anchor in `tls_ca_file`, which narrows
+  "any certificate from the anchor" to the partner's own CA.
+- **Compensating controls:** a private `tls_ca_file` is the one that matters. With credentials it is
+  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential.
+- **It is never silent:** a WARNING at each construction naming the connection and the host; a
+  `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
+  and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a
+  running engine. The readers walk inbound and outbound, and inbound names are prefixed `inbound:`. An
+  `env()` value counts as declared, because it cannot be read before it resolves. CORRECTED (ASVS
+  12.3.2 re-read, 2026-10-01): before this, it was accepted with no line at all on MLLP, on Email and
+  Direct without credentials, and on a hand-built FTPS spec, and the posture floor test exempted it as
+  "gated by the ADR 0092 hop cell", which was false. **Not** the serve-time loosening warning, which
+  fires before the graph is loaded, as for `tls_allow_expired`.
+- **What it cannot do:** it is **advisory only**, on the `tls_allow_expired` precedent. No posture gate
+  keys on it, and `[security].enforcement = enforce` does not refuse it. Where it is NOT reported is the
+  same list as `cleartext_accepted` above: `messagefoundry security show` and a graphless
+  `GET /security/posture` say so in `loosenings_scope`.
 
 ### `tls_revocation_attested = true` on a connection — revocation checked outside the engine
 > **Connection-scoped**, both directions: an `inbound()`/`outbound()` keyword, or a **top-level**
@@ -1111,6 +1146,7 @@ chapter was not part of the verification above.
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
+| `tls_check_hostname` (per-connection host-name match off) | V12 Secure Communication (12.3.2) | **SC-8(1)** Cryptographic Protection · **IA-3** Device Identification and Authentication | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
 | `tls_hop_attested` (per-connection hop attested secure) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |

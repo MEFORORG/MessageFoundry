@@ -248,6 +248,7 @@ def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
                 SecretRotationSettings(),
                 cleartext_hops=(),
                 expiry_relaxed_hops=(),
+                hostname_unchecked_hops=(),
                 unverified_db_hops=(),
                 attested_hops=(),
                 revocation_attested_hops=(),

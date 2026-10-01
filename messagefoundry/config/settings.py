@@ -6639,6 +6639,7 @@ def security_loosenings(
     *,
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
+    hostname_unchecked_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
@@ -6662,7 +6663,8 @@ def security_loosenings(
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
-    deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
+    deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
+    12.3.2), a generic-ODBC ``DATABASE`` hop
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
     ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), and
@@ -6714,14 +6716,16 @@ def security_loosenings(
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
-    ``tls_allow_expired`` (#129 / ADR 0094), ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
+    ``tls_allow_expired`` (#129 / ADR 0094), ``hostname_unchecked_hops`` declares
+    ``tls_check_hostname=false`` (ASVS 12.3.2), ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24), and
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173). They arrive as
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
-    connections; ``expiry_relaxed_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
+    connections; ``expiry_relaxed_hops``; ``hostname_unchecked_hops``, which walks inbound as well as
+    outbound; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
@@ -7103,8 +7107,23 @@ def security_loosenings(
                 "tls_allow_expired",
                 f"{len(expiry_relaxed_hops)} outbound connection(s) accept an EXPIRED server "
                 f"certificate ({named}) — indefinitely, with nothing that expires the relaxation or "
-                "re-checks it; the chain signature, hostname match and key usage are still fully "
-                "verified, so this is narrower than verify-off",
+                "re-checks it; the chain signature and key usage are still fully verified, and so is "
+                "the hostname match unless the same connection also sets tls_check_hostname=false "
+                "(listed under its own entry), so this is narrower than verify-off",
+            )
+        )
+    if hostname_unchecked_hops:
+        named = ", ".join(sorted(hostname_unchecked_hops))
+        # BOTH halves, for the reason tls_allow_expired gives above. The chain IS verified, so this
+        # is not verify-off; the name is NOT, so a certificate for any host that chains to the
+        # anchor is accepted. Stating only the first half would be the false-premise shape.
+        out.append(
+            (
+                "tls_check_hostname",
+                f"{len(hostname_unchecked_hops)} connection(s) do NOT match the server certificate "
+                f"to the host they dial ({named}) — the chain is still verified, but any "
+                "certificate that chains to the trust anchor is accepted whatever host it names, "
+                "so anyone holding one could impersonate the peer and read the payload",
             )
         )
     if unverified_db_hops:

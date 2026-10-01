@@ -151,6 +151,7 @@ __all__ = [
     "validate_config",
     "accepted_cleartext_hops",
     "expiry_relaxed_hops",
+    "hostname_unchecked_hops",
     "path_form_fhir_updates",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
@@ -5067,6 +5068,47 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
         for oc in registry.outbound.values()
         if oc.spec.settings.get("tls_allow_expired")
     )
+
+
+def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
+    """Whether a connection's settings turn ``tls_check_hostname`` off, or might.
+
+    An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
+    reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
+    construction WARNING names the resolved value either way."""
+    value = settings.get("tls_check_hostname", True)
+    return isinstance(value, EnvRef) or not value
+
+
+def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every connection that declares ``tls_check_hostname=false``, as ``(name, peer)`` (ASVS 12.3.2).
+
+    The sibling of :func:`expiry_relaxed_hops`, on the same contract: the SINGLE reader, so
+    ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
+    different sets. Sorted by name.
+
+    The flag keeps the chain check and drops the name check, so any certificate that chains to the
+    hop's trust anchor is accepted whatever host it names. The ``MLLP``, ``Email`` and ``Direct``
+    factories take it; ``Ftp()`` does not, but the FTPS context honours it from a hand-built spec or
+    a ``connections.toml`` ``[settings]`` table, and that is why this reads the settings dict of
+    EVERY connection rather than a list of factories. Inbound is walked too, because a REMOTEFILE
+    poller dials out over FTPS; inbound names are prefixed ``inbound:``, as
+    :func:`revocation_attested_hops` prefixes them.
+
+    It lists what is DECLARED, including on a hop whose TLS is off, where the flag is inert, and
+    including an ``env()`` value it cannot resolve. Over-reporting an inert flag is the safe
+    direction for a register whose job is to show what an operator loosened. Pure."""
+    out = [
+        (oc.name, _peer_label(oc.spec.settings))
+        for oc in registry.outbound.values()
+        if _declares_hostname_check_off(oc.spec.settings)
+    ]
+    out.extend(
+        (inbound_record_name(ic.name), _peer_label(ic.spec.settings))
+        for ic in registry.inbound.values()
+        if _declares_hostname_check_off(ic.spec.settings)
+    )
+    return sorted(out)
 
 
 def path_form_fhir_updates(registry: Registry) -> list[str]:

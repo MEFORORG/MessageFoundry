@@ -115,6 +115,7 @@ __all__ = [
     "narrow_tls13_suites",
     "narrow_to_approved_suites",
     "relax_verify_expiry",
+    "warn_hostname_check_off",
     "requests_verify_from_anchor",
     "vault_client_verify_kwargs",
     "SYSTEM_TRUST_ANCHOR",
@@ -460,7 +461,12 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
     no-op (a caller bug is neutralised, not amplified into a silent downgrade).
 
     Emits a construction-time WARNING (``host`` only — never a credential or a body) so an operator sees
-    that the hop deliberately tolerates an expired certificate. The warning fires when the relaxation is
+    that the hop deliberately tolerates an expired certificate. The warning states what is still
+    verified by reading ``ctx.check_hostname``, so call this AFTER the caller has set it: on a hop with
+    ``tls_check_hostname=false`` the hostname is NOT verified, and the line says so rather than
+    claiming it is. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): it used to say "the chain, hostname,
+    and key-usage are still verified" unconditionally, which was false on exactly that hop. The
+    warning fires when the relaxation is
     ENABLED (once per connector build); whether an expired cert is then actually presented is an
     OpenSSL-internal handshake detail this context-level flag does not surface. It NEVER weakens the
     posture-keyed cleartext/verify-off refusals (#200, ADR 0092): those key on ``tls_verify=false`` /
@@ -471,10 +477,44 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
         # non-verifying context (that path is the tls_verify=false escape, refused/warned elsewhere).
         return
     ctx.verify_flags |= _X509_V_FLAG_NO_CHECK_TIME
+    still_verified = (
+        "the chain, hostname, and key-usage are still verified"
+        if ctx.check_hostname
+        else "the chain and key-usage are still verified, but the hostname is NOT "
+        "(tls_check_hostname=false)"
+    )
     logger.warning(
         "TLS certificate expiry validation is RELAXED for the hop to %s (tls_allow_expired=true): an "
-        "EXPIRED server certificate will be accepted, but the chain, hostname, and key-usage are still "
-        "verified. Restore a valid certificate as soon as possible.",
+        "EXPIRED server certificate will be accepted; %s. Restore a valid certificate as soon as "
+        "possible.",
+        host or "(unspecified host)",
+        still_verified,
+    )
+
+
+def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
+    """Log that a verifying client hop does NOT match the server certificate to its host (ASVS 12.3.2).
+
+    ``tls_check_hostname=false`` keeps the chain check and drops the name check, so any certificate
+    that chains to the hop's trust anchor is accepted, whatever host it was issued to. On a public
+    trust store that is any certificate any public CA has issued to anyone. It is the per-connection
+    sibling of ``tls_allow_expired`` (:func:`relax_verify_expiry`) and is treated the same way: a
+    WARNING at every construction, an advisory ``messagefoundry check`` line, and a
+    ``security_loosenings()`` entry. It is NOT refused under ``[security].enforcement = enforce``,
+    because ``tls_allow_expired`` is not either. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): before
+    this, the MLLP, FTPS, Email and Direct hops accepted it with no line at all, which the owner's
+    answer to vault #2006 calls a silent weakening.
+
+    ``connector`` is the operator-recognisable cell (``"MLLP destination"``), ``name`` the connection
+    name (``""`` where the build has none), ``host`` the peer. Never a credential or a body. Call it
+    only on the VERIFY path: on a ``tls_verify=false`` hop the name check is already off along with
+    the chain, and that hop has its own refusal and its own warning."""
+    logger.warning(
+        "%s%s: TLS hostname checking is OFF for the hop to %s (tls_check_hostname=false). The "
+        "certificate chain is still verified, but any certificate that chains to the trust anchor "
+        "is accepted whatever host it names, so anyone holding one could impersonate this peer.",
+        connector,
+        f" {name!r}" if name else "",
         host or "(unspecified host)",
     )
 
@@ -2578,8 +2618,13 @@ def build_smtp_tls_context(
     ca_file: str | None = None,
     check_hostname: bool = True,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    name: str = "",
 ) -> ssl.SSLContext:
     """Build the TLS context for an outbound SMTP hop (#323) — STARTTLS or implicit ``SMTP_SSL``.
+
+    ``check_hostname=False`` on the verify path logs :func:`warn_hostname_check_off` naming ``cell``,
+    ``name`` (the connection, when the caller has one) and ``host``. The Email and Direct connectors
+    refuse it outright when they carry an SMTP credential; without one it is a recorded loosening.
 
     ``smtplib`` accepts no context by default, and its fallback is
     :func:`ssl._create_stdlib_context`, which **is** ``ssl._create_unverified_context`` — measured on
@@ -2611,6 +2656,8 @@ def build_smtp_tls_context(
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = check_hostname
+        if not check_hostname:
+            warn_hostname_check_off(connector=cell, name=name, host=host)
     else:
         warn_smtp_verification_off(cell=cell, host=host)
         # Order is load-bearing: check_hostname must go False BEFORE verify_mode, or ssl raises.

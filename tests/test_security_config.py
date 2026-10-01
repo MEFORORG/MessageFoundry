@@ -47,6 +47,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         SecretRotationSettings(),
         cleartext_hops=(),
         expiry_relaxed_hops=(),
+        hostname_unchecked_hops=(),
         unverified_db_hops=(),
         attested_hops=(),
         revocation_attested_hops=(),

@@ -259,6 +259,9 @@ def run_checks(
         # reported by a construction log line and nothing else, and a log line emitted once at startup
         # is not the surface anyone queries three months later. Advisory — see the checks.
         _check_expiry_relaxed(config_dir),
+        # ASVS 12.3.2: tls_check_hostname=false, the third per-connection TLS relaxation, which no
+        # surface listed at all until 2026-10-01. Advisory, as tls_allow_expired is -- see the check.
+        _check_hostname_unchecked(config_dir),
         _check_generic_db_tls(config_dir),
         # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
         _check_hop_attested(config_dir),
@@ -2021,7 +2024,12 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     switch. It exists so the set is visible in review, next to the hosts.
 
     SKIPs when the graph will not load — same convention and same reason as its sibling."""
-    from messagefoundry.config.wiring import WiringError, expiry_relaxed_hops, load_config
+    from messagefoundry.config.wiring import (
+        WiringError,
+        expiry_relaxed_hops,
+        hostname_unchecked_hops,
+        load_config,
+    )
 
     try:
         registry = load_config(config_dir)
@@ -2042,13 +2050,62 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
             detail="no connection declares tls_allow_expired",
         )
     listed = "; ".join(f"{name} -> {peer}" for name, peer in relaxed)
+    # The hostname half is true only where the connection does not ALSO turn the name check off.
+    # CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): this said "chain, hostname and key usage are still
+    # verified" for every listed hop, which was false on a hop that also set tls_check_hostname=false.
+    unchecked = {name for name, _ in hostname_unchecked_hops(registry)}
+    both = sorted(name for name, _ in relaxed if name in unchecked)
+    still = (
+        "chain and key usage are still verified; the hostname is NOT on "
+        f"{', '.join(both)} (tls_check_hostname=false), and is on the rest"
+        if both
+        else "chain, hostname and key usage are still verified"
+    )
     return CheckResult(
         "tls-allow-expired",
         ok=True,
         required=False,
         detail=(
             f"{len(relaxed)} outbound connection(s) accept an EXPIRED server certificate "
-            f"indefinitely — {listed} (chain, hostname and key usage are still verified)"
+            f"indefinitely — {listed} ({still})"
+        ),
+    )
+
+
+def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
+    """Name every connection that declares ``tls_check_hostname=false``, with its peer (ASVS 12.3.2).
+
+    The sibling of :func:`_check_expiry_relaxed`, built for the reason the owner's answer to vault
+    #2006 gives: a weakening with no refusal, no warning, no audit line and no
+    ``security_loosenings()`` entry is a SILENT one. The chain is still verified, but any certificate
+    that chains to the anchor is accepted whatever host it names.
+
+    Advisory (``required=False``) on the ``tls_allow_expired`` precedent: a per-connection TLS
+    relaxation is reported, not refused, under any ``[security].enforcement``. SKIPs when the graph
+    will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, hostname_unchecked_hops, load_config
+
+    name = "tls-check-hostname"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    unchecked = hostname_unchecked_hops(registry)
+    if not unchecked:
+        return CheckResult(
+            name, ok=True, required=False, detail="no connection declares tls_check_hostname=false"
+        )
+    listed = "; ".join(f"{conn} -> {peer}" for conn, peer in unchecked)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(unchecked)} connection(s) do not match the server certificate to the host they "
+            f"dial — {listed} (the chain is still verified; any certificate chaining to the trust "
+            "anchor is accepted whatever host it names)"
         ),
     )
 
