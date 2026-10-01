@@ -12,6 +12,84 @@ This guide explains how an organization installs **MessageFoundry (MEFOR)** and 
 
 ---
 
+## Which package to install for which job
+
+This map answers one question: which package does each job need? The project builds four
+distributions. The engine is the base, and the other three each require it. Extras add optional
+dependencies to the engine. They are not separate packages.
+
+```mermaid
+flowchart TB
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef opstool fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef devtool fill:#e0f2f1,stroke:#00796b,color:#06302b;
+  classDef cfg fill:#f1f8e9,stroke:#9e9d24,color:#1f2400;
+
+  CONSOLE["messagefoundry-webconsole<br/>the operator web console, served at /ui<br/>its own version line"]:::opstool
+  TOOLKIT["messagefoundry-toolkit<br/>authoring and development commands<br/>the engine's version"]:::devtool
+  HARNESS["messagefoundry-harness<br/>synthetic send, receive, load and failover testing<br/>the engine's version"]:::devtool
+
+  ENGINE["messagefoundry<br/>the engine, its API and the messagefoundry command<br/>the Windows tray, messagefoundry-tray"]:::core
+
+  subgraph EXTRAS["Optional extras of the messagefoundry distribution"]
+    XSTORE["Store backends<br/>sqlserver, postgres"]:::cfg
+    XFORMAT["Message formats<br/>fhir, dicom, x12, xml"]:::cfg
+    XCONN["Connectors, keys and sign-in<br/>sftp, vault, webauthn"]:::cfg
+    XMETRIC["Metrics export<br/>otel"]:::cfg
+    XTEST["Test and development<br/>harness, dev, fuzz"]:::cfg
+  end
+
+  CONSOLE -->|"requires the engine, at a minimum version"| ENGINE
+  TOOLKIT -->|"requires the engine, at the same version"| ENGINE
+  HARNESS -->|"requires the engine, at the same version"| ENGINE
+  HARNESS -->|"requires the harness extra"| XTEST
+  ENGINE -.->|"add only what a host needs"| EXTRAS
+```
+
+**Legend.** The four boxes outside the extras group are distributions, each with its own wheel. A
+solid arrow is a declared dependency, so `pip` installs the target for you. The dotted arrow is
+your choice.
+
+| Job | Distribution | What it holds | Command |
+|---|---|---|---|
+| Run an engine instance | `messagefoundry` | The `messagefoundry` package: the engine, its API, the CLI and the Windows tray | `messagefoundry`, `messagefoundry-tray` |
+| Operate an instance from a browser | `messagefoundry-webconsole` | The `messagefoundry_webconsole` package. The engine mounts it in-process and serves it at `/ui` | none of its own |
+| Use the authoring and development commands | `messagefoundry-toolkit` | The `messagefoundry_toolkit` package | `messagefoundry-toolkit` |
+| Send and receive synthetic test traffic | `messagefoundry-harness` | The `harness` package: MLLP send and receive, load and failover tools | `messagefoundry-harness` |
+
+Three facts about versions:
+
+- The toolkit and the harness pin the engine to their own version, so the three always move
+  together.
+- The web console has its own version line. It names a lowest engine version, and the engine
+  checks the pair when it mounts the console. Section 7 says which console release to install.
+- Every distribution needs Python 3.14 or later.
+
+The toolkit holds the authoring commands that
+[ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
+moves out of the engine wheel. Run `messagefoundry-toolkit --help` to list the ones your version
+holds.
+
+The extras, by group. `pyproject.toml` holds the live list.
+
+| Group | Extra | What it adds |
+|---|---|---|
+| Store backends | `sqlserver` | SQL Server store, and the database connector. It also needs the Microsoft ODBC Driver 18 on the host |
+| Store backends | `postgres` | PostgreSQL store |
+| Message formats | `fhir` | FHIR models and FHIRPath |
+| Message formats | `dicom` | DICOM connectors and codec |
+| Message formats | `x12` | Strict X12 validation |
+| Message formats | `xml` | XML and SOAP access, schema validation and signatures |
+| Connectors, keys and sign-in | `sftp` | SFTP for the remote-file connector |
+| Connectors, keys and sign-in | `vault` | HashiCorp Vault key provider |
+| Connectors, keys and sign-in | `webauthn` | Browser passkeys for the web console |
+| Metrics export | `otel` | OpenTelemetry metrics export |
+| Test and development | `harness` | PySide6, for the test harness window |
+| Test and development | `dev` | pytest, ruff and mypy |
+| Test and development | `fuzz` | Atheris fuzzing, on Linux x86-64 only |
+
+---
+
 ## 1. The model in one paragraph
 
 MessageFoundry ships as a **read-only, version-pinned engine** (a Python wheel) that your team installs
