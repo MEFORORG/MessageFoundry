@@ -138,6 +138,40 @@ def test_neutralization_is_idempotent() -> None:
             assert helper(once) == once
 
 
+def test_the_connscale_harvest_writer_emits_the_canonical_rule_cell_for_cell(
+    tmp_path: Path,
+) -> None:
+    # scripts/connscale_harvest.py calls the engine rule rather than keeping a helper of its own, so
+    # it is checked here on its OUTPUT: every shared vector, written as a payload-derived cell and
+    # read back, must come out exactly as the canonical rule renders it. A local copy swapped into
+    # write_csvs, or a cell that skips the rule, reds here whatever the import says.
+    from scripts import connscale_harvest as harvest
+
+    vectors = [*_HOSTILE, *_BENIGN]
+    rows = [
+        harvest.BaseReading(
+            population="post_2024",
+            leg="ubuntu-latest py3.14",
+            lane=vector,
+            count=12,
+            value=-1.5,
+            job_conclusion="success",
+            run_id=1,
+            run_attempt=1,
+            job_id=1,
+            head_sha="0",
+            artifact_created_at="2026-10-01T00:00:00Z",
+        )
+        for vector in vectors
+    ]
+    result = harvest.Harvest("r", "w", None, "s", "u", readings=rows)
+    harvest.write_csvs(result, tmp_path)
+    with (tmp_path / "readings.csv").open(encoding="utf-8", newline="") as handle:
+        written = list(csv.DictReader(handle))
+    assert [r["lane"] for r in written] == [engine_rule.spreadsheet_safe(v) for v in vectors]
+    assert {r["value"] for r in written} == {"-1.5"}, "a number is never quoted"
+
+
 def test_engine_and_harness_mirrors_agree() -> None:
     # The two modules are separate by design (CLAUDE.md §4/§10 keeps the harness off engine
     # internals); this is what keeps the copy honest.
@@ -181,7 +215,8 @@ _RECORDED_SPREADSHEET_WRITERS = {
     "harness/load/connscale/report.py": "escapes profile/claim_mode/sweep_mode; others numeric",
     "scripts/connscale_harvest.py": (
         "--csv-dir: every cell of readings/jobs/unjoined goes through the engine's canonical "
-        "messagefoundry.spreadsheet.spreadsheet_safe (lane, reason and name come from CI artifacts); "
+        "messagefoundry.spreadsheet.spreadsheet_safe (lane, reason and name come from CI artifacts), "
+        "checked on its output over the shared vectors; "
         "numbers and None pass through it untouched (BACKLOG #1415)"
     ),
     "scripts/security/vuln_metrics.py": (

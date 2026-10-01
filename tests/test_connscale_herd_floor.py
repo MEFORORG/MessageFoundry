@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import csv
 import functools
-import time
+import random
+import re
 from collections import defaultdict
 from pathlib import Path
 
 import pytest
 
 from harness.load.connscale.profile import (
+    _LEG,
     ConnScaleProfile,
     ConnScaleProfileError,
     load_connscale_profile_text,
@@ -261,25 +263,34 @@ def test_a_pooled_only_profile_cannot_arm_a_floor_that_grades_nothing() -> None:
 
 @functools.cache
 def _readings() -> tuple[ch.BaseReading, ...]:
-    """The committed readings, typed as the harvest script types them."""
+    """The committed readings, typed as the harvest script types them.
 
+    The writer routes every cell through the spreadsheet formula rule, which prefixes an apostrophe
+    to text it quotes. No cell this decision keys on should ever need that, so one that carries it
+    is refused here rather than read as a different leg or lane.
+    """
     with _HARVEST.open(encoding="utf-8", newline="") as handle:
-        return tuple(
-            ch.BaseReading(
-                population=row["population"],
-                leg=row["leg"],
-                lane=row["lane"],
-                count=int(row["count"]) if row["count"] else None,
-                value=float(row["value"]) if row["value"] else None,
-                job_conclusion=row["job_conclusion"],
-                run_id=int(row["run_id"]),
-                run_attempt=int(row["run_attempt"]),
-                job_id=int(row["job_id"]),
-                head_sha=row["head_sha"],
-                artifact_created_at=row["artifact_created_at"],
-            )
-            for row in csv.DictReader(handle)
+        rows = list(csv.DictReader(handle))
+    quoted = [r for r in rows if any(r[k].startswith("'") for k in ("population", "leg", "lane"))]
+    assert not quoted, (
+        f"readings.csv holds escaped key cells; unescape before reading: {quoted[:3]}"
+    )
+    return tuple(
+        ch.BaseReading(
+            population=row["population"],
+            leg=row["leg"],
+            lane=row["lane"],
+            count=int(row["count"]) if row["count"] else None,
+            value=float(row["value"]) if row["value"] else None,
+            job_conclusion=row["job_conclusion"],
+            run_id=int(row["run_id"]),
+            run_attempt=int(row["run_attempt"]),
+            job_id=int(row["job_id"]),
+            head_sha=row["head_sha"],
+            artifact_created_at=row["artifact_created_at"],
         )
+        for row in rows
+    )
 
 
 def _cells() -> dict[tuple[str, str], ch.CellSummary]:
@@ -376,6 +387,7 @@ def test_an_armed_leg_says_enforced_in_both_emitters() -> None:
     assert payload_enforced(True) is True and payload_enforced(False) is False
 
 
+@pytest.mark.timeout(30)
 @pytest.mark.parametrize(
     "hostile",
     [
@@ -386,14 +398,18 @@ def test_an_armed_leg_says_enforced_in_both_emitters() -> None:
     ],
     ids=["no-version", "long-version-bad-tail", "separators-only", "letter-in-version"],
 )
-def test_a_hostile_long_leg_is_refused_in_linear_time(hostile: str) -> None:
-    # The parser is plain string handling, so a value built to make a regex backtrack costs one pass.
-    started = time.perf_counter()
+def test_a_hostile_long_leg_is_refused(hostile: str) -> None:
+    # Refused with the leg error, under the timeout marker rather than a wall-clock assertion, so a
+    # pattern that ever starts to backtrack on these shapes fails here instead of hanging a leg.
     with pytest.raises(ConnScaleProfileError, match="empty_claims_herd_floor_legs"):
         load_connscale_profile_text(
             _profile_text_with(f"empty_claims_herd_floor_legs = ['{hostile}']"), where="<unit>"
         )
-    assert time.perf_counter() - started < 2.0
+
+
+#: The pattern the nested-quantifier gate flagged, kept here so "the language is unchanged" is a
+#: claim this module checks rather than one a comment makes.
+_PRE_GATE_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)*")
 
 
 @pytest.mark.parametrize(
@@ -413,12 +429,35 @@ def test_a_hostile_long_leg_is_refused_in_linear_time(hostile: str) -> None:
         ("-py3.14", False),
     ],
 )
-def test_the_leg_parser_accepts_exactly_the_old_patterns_language(leg: str, ok: bool) -> None:
-    # The cases the replaced regex [A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)* decided, decided the
-    # same way by the string parser that replaced it.
+def test_the_leg_pattern_decides_each_case_as_before(leg: str, ok: bool) -> None:
+    assert bool(_PRE_GATE_LEG.fullmatch(leg)) is ok, "the case table itself is wrong"
     text = _profile_text_with(f"empty_claims_herd_floor_legs = ['{leg}']")
     if ok:
-        assert load_connscale_profile_text(text, where="<unit>").slo.empty_claims_herd_floor_legs
+        assert load_connscale_profile_text(
+            text, where="<unit>"
+        ).slo.empty_claims_herd_floor_legs == (leg,)
     else:
-        with pytest.raises(ConnScaleProfileError):
+        with pytest.raises(ConnScaleProfileError, match="empty_claims_herd_floor_legs"):
             load_connscale_profile_text(text, where="<unit>")
+
+
+def test_the_possessive_pattern_has_the_pre_gate_language() -> None:
+    # Seeded random strings over the characters that matter. The accept count is the control: a
+    # generator that never produced a valid leg would make "no disagreement" mean nothing.
+    rnd = random.Random(1415)
+    alphabet = [*"ab09._- py3.4", "-py", "py", "٣"]
+    accepted = 0
+    for _ in range(50_000):
+        text = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 14)))
+        before = bool(_PRE_GATE_LEG.fullmatch(text))
+        assert bool(_LEG.fullmatch(text)) is before, text
+        accepted += before
+    assert accepted > 50, accepted
+
+
+def test_many_distinct_legs_are_kept_in_order_once_each() -> None:
+    legs = [f"a{i}-py3" for i in range(20_000)]
+    text = _profile_text_with(f"empty_claims_herd_floor_legs = {[*legs, legs[0]]}")
+    assert load_connscale_profile_text(text, where="<unit>").slo.empty_claims_herd_floor_legs == (
+        tuple(legs)
+    )

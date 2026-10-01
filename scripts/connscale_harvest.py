@@ -97,9 +97,12 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
-# Anchor on the script, not on whatever sys.path offers (the same insert as kerberos_epa_spike.py),
-# so the canonical spreadsheet rule below is this checkout's own.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Run as `python scripts/connscale_harvest.py`, sys.path[0] is scripts/, so the checkout root is put
+# on the path for the engine import below. Only when it is missing: under pytest the root is already
+# there, and an import-time insert would reorder sys.path for every test that imports this module.
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 # ASVS 1.2.10: the --csv-dir writer is a recorded spreadsheet writer, and its cells go through the
 # one canonical formula-injection rule (tests/test_csv_formula_consistency.py), never a local copy.
@@ -993,7 +996,8 @@ def write_csvs(result: Harvest, out_dir: Path) -> list[Path]:
 
     EVERY CELL goes through the canonical ``spreadsheet_safe`` (ASVS 1.2.10). Text such as a lane
     name or a reason comes from a CI artifact; numbers and ``None`` pass through it untouched, so a
-    negative reading stays a number.
+    negative reading stays a number. A reader that loads the CSV back as data gets the escaped text:
+    a text cell the rule quoted starts with an apostrophe that is not part of the value.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     tables: list[tuple[str, list[str], list[dict[str, Any]]]] = [

@@ -19,6 +19,7 @@ so a broken profile is rejected before any engine is spawned. All numbers are ge
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -430,40 +431,26 @@ def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
         return ()
     if not isinstance(raw, list):
         raise ConnScaleProfileError(f"{where}: 'empty_claims_herd_floor_legs' must be a list")
-    out: list[str] = []
+    # A dict keeps first-seen order and dedupes in one pass, so many entries cost linear time too.
+    out: dict[str, None] = {}
     for item in raw:
         # The shape is checked, not just non-emptiness: the harvest report prints a leg with a SPACE
         # ("ubuntu-latest py3.14"), and a leg copied from it would parse, never match, and disarm the
         # floor with nothing reporting it.
-        if not isinstance(item, str) or not _is_leg(item.strip()):
+        if not isinstance(item, str) or not _LEG.fullmatch(item.strip()):
             raise ConnScaleProfileError(
                 f"{where}: every 'empty_claims_herd_floor_legs' entry must name a CI leg as "
                 f"'<os>-py<version>' with no spaces, e.g. 'ubuntu-latest-py3.14'; got {item!r}"
             )
-        if item.strip() not in out:
-            out.append(item.strip())
+        out.setdefault(item.strip(), None)
     return tuple(out)
 
 
-_LEG_OS_HEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
-_LEG_OS_TAIL = _LEG_OS_HEAD | frozenset("._-")
-
-
-def _is_leg(text: str) -> bool:
-    """A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``.
-
-    Plain string parsing, linear in the input, so a hostile profile value cannot make it backtrack.
-    The version holds only digits and dots, so the separator is always the LAST ``-py``. The os part
-    starts with an ASCII letter or digit and then allows ``.``, ``_`` and ``-``; the version is one
-    or more groups of decimal digits joined by single dots.
-    """
-    os_name, sep, version = text.rpartition("-py")
-    if not sep or not os_name or os_name[0] not in _LEG_OS_HEAD:
-        return False
-    if not set(os_name) <= _LEG_OS_TAIL:
-        return False
-    # isdecimal is exactly what the regex's \d accepted (Unicode category Nd), kept identical.
-    return all(part.isdecimal() for part in version.split("."))
+#: A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``. The
+#: version group is POSSESSIVE (``*+``): nothing follows it under ``fullmatch``, so the language is
+#: unchanged, and it never gives characters back, which is the mitigation
+#: ``tests/test_security_static.py``'s nested-quantifier gate recognises.
+_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)*+")
 
 
 def _claim_modes_from(raw: Any, where: str) -> tuple[str, ...]:
