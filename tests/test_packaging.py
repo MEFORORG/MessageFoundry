@@ -982,7 +982,16 @@ def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> 
     notice = (project_dir / "NOTICE").read_text(encoding="utf-8")
     assert notice.startswith(f"{distribution} ("), f"{distribution} NOTICE opens {notice[:80]!r}"
     assert "AGPL-3.0-or-later" in notice, f"{distribution} NOTICE does not state the license"
-    assert (project_dir / "LICENSE").read_bytes() == (_REPO / "LICENSE").read_bytes(), (
+    license_bytes = (project_dir / "LICENSE").read_bytes()
+    if b"\r\n" in license_bytes and b"\r\n" not in (_REPO / "LICENSE").read_bytes():
+        # A Windows checkout made before the eol=lf pin (BACKLOG #2513) keeps CRLF here while
+        # `git status` stays clean, so name the cure rather than leave it looking like an edit.
+        pytest.fail(
+            f"packaging/{distribution}/LICENSE has CRLF line endings in this checkout: it predates "
+            f"the eol=lf pin. Delete packaging/{distribution}/LICENSE and NOTICE, then run "
+            f"`git checkout -- packaging/{distribution}/LICENSE packaging/{distribution}/NOTICE`."
+        )
+    assert license_bytes == (_REPO / "LICENSE").read_bytes(), (
         f"packaging/{distribution}/LICENSE differs from the root LICENSE"
     )
 
