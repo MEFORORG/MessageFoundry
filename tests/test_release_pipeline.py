@@ -3126,7 +3126,7 @@ def _notes_steps() -> list[tuple[str, str]]:
 
 
 def test_every_release_body_is_bounded_between_its_extraction_and_gh_release() -> None:
-    """The 0.5.0 CHANGELOG section is about 233,000 characters and GitHub refuses a body over
+    """The 0.5.0 CHANGELOG section is about 256,000 characters and GitHub refuses a body over
     125,000. The step sits before the PyPI publish, so an unbounded body stops the release there.
 
     Order is the claim, not presence: the bound must run after the last write to `notes.md` and

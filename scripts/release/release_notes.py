@@ -6,7 +6,7 @@
 WHY THIS EXISTS. The release jobs in ``.github/workflows/release.yml`` feed one CHANGELOG section to
 ``gh release create --notes-file`` and ``gh release edit --notes-file``. GitHub refuses a release
 body longer than 125,000 characters, with ``body is too long (maximum is 125000 characters)``. The
-engine's 0.5.0 section is about 233,000 characters, so the release step would fail on the tag. That
+engine's 0.5.0 section is about 256,000 characters, so the release step would fail on the tag. That
 step sits BEFORE the PyPI publish, so a refusal there also stops the publish.
 
 WHAT IT DOES. A file at or under ``--limit`` characters is left byte for byte as it was. A longer

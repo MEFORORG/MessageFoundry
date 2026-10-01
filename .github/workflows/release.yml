@@ -942,7 +942,7 @@ jobs:
           awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "MessageFoundry $tag" > notes.md
           # GitHub refuses a release body over 125,000 characters, and the 0.5.0 section is about
-          # 233,000. Shrink an over-long body to each entry's title plus a link to the full section at
+          # 256,000. Shrink an over-long body to each entry's title plus a link to the full section at
           # this tag, or `gh release create` fails here and the PyPI publish below never runs.
           python scripts/release/release_notes.py notes.md \
             --full-url "https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/CHANGELOG.md"

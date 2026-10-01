@@ -148,8 +148,8 @@ different ecosystem); see *VS Code extension & test harness* below for where to 
 > and published with **PEP 740 attestations** — all three publish jobs set `attestations: true`.
 >
 > **Sigstore signing and SLSA build-provenance cover the ENGINE release files and the TOOLKIT wheel
-> only.** The engine files are its wheel, sdist, SBOM and VEX. The CycloneDX SBOM covers the engine
-> only. The `messagefoundry-toolkit` wheel is built in the engine's release job, which signs and
+> only.** The engine files are its wheel, sdist, two SBOMs (Linux- and Windows-resolved) and VEX.
+> The CycloneDX SBOMs cover the engine only. The `messagefoundry-toolkit` wheel is built in the engine's release job, which signs and
 > attests it (BACKLOG #1192). The
 > `messagefoundry-webconsole` and `messagefoundry-harness` release jobs contain no signing, attestation
 > or SBOM step (BACKLOG #1193) — this note previously said "every release", which is why it is spelled
