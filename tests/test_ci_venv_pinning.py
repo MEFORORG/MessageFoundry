@@ -156,6 +156,12 @@ def _code_lines(wf: Path) -> list[str]:
     ]
 
 
+def _venv_tool(venv: str, tools: str) -> str:
+    """A regex fragment for one of ``tools`` inside ``venv``, in either layout: ``<venv>/bin/pip3.14``
+    or ``"<venv>/Scripts/python.exe"``, with any version suffix and an optional closing quote."""
+    return rf'{re.escape(venv)}/(?:bin|Scripts)/(?:{tools})[\d.]*(?:\.exe)?"?'
+
+
 def _installs_into(venv: str, line: str) -> bool:
     """True when ``line`` runs a pip install INTO ``venv``, in any of three spellings:
     ``<venv>/bin/pip install ...``, ``<venv>/bin/python -m pip install ...``, and the OUTER pip driving
@@ -166,11 +172,7 @@ def _installs_into(venv: str, line: str) -> bool:
     is named before the subcommand. Each command in a ``&&``/``;``/``|`` chain is judged on its own, so
     an earlier install on the same line cannot hide a later one.
     """
-    # Either layout, and an optional closing quote: the Windows steps name
-    # `"$RUNNER_TEMP/sbomenv/Scripts/python.exe"`.
-    named = re.compile(
-        rf'{re.escape(venv)}(?:/(?:bin|Scripts)/(?:pip|python)[\d.]*(?:\.exe)?|/)?"?(?=\s|$)'
-    )
+    named = re.compile(rf'(?:{_venv_tool(venv, "pip|python")}|{re.escape(venv)}/?"?)(?=\s|$)')
     for command in re.split(r"&&|\|\||[;|]", line):
         match = _PIP_INSTALL.search(command)
         if match is not None and named.search(command[: match.end()]):
@@ -302,66 +304,48 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
 def _own_pip_re(venv: str) -> re.Pattern[str]:
     """A command run through ``venv``'s OWN pip: ``<venv>/bin/pip ...`` or ``<venv>/bin/python -m pip``.
 
-    Either layout, and the interpreter may be double-quoted, as the Windows steps'
-    ``"$RUNNER_TEMP/sbomenv/Scripts/python.exe"`` is (BACKLOG #2521: the quote used to hide it). The
-    OUTER pip's ``--python "<venv>/Scripts/python.exe" install`` is not a match: there the venv's
+    The OUTER pip's ``--python "<venv>/Scripts/python.exe" install`` is not a match: there the venv's
     interpreter is an argument, followed by ``install`` rather than ``-m pip``.
     """
     return re.compile(
-        rf"{re.escape(venv)}/(?:bin|Scripts)/"
-        rf'(?:pip[\d.]*(?:\.exe)?"?(?=\s|$)|python[\d.]*(?:\.exe)?"?\s+-m\s+pip\b)'
+        rf"{_venv_tool(venv, 'pip')}(?=\s|$)|{_venv_tool(venv, 'python')}\s+-m\s+pip\b"
     )
 
 
+_WIN = "$RUNNER_TEMP/sbomenv"
+_WIN_PY = f'"{_WIN}/Scripts/python.exe"'
+
+
 @pytest.mark.parametrize(
-    ("venv", "line", "own"),
+    ("venv", "line", "own", "installs"),
     [
-        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip install x", True),
-        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python -m pip install x", True),
-        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python3.14 -m pip install x", True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip install x", True, True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip3.14 install x", True, True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python -m pip install x", True, True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python3.14 -m pip install x", True, True),
+        # BACKLOG #2521 finding 2: the closing quote used to hide the Windows interpreter.
+        (_WIN, f"{_WIN_PY} -m pip install x", True, True),
+        (_WIN, f"{_WIN}/Scripts/python.exe -m pip install x", True, True),
+        (_WIN, f'"{_WIN}/Scripts/pip.exe" install x', True, True),
+        # The outer pip driving the venv: an install into it, but not through its own pip.
+        (_WIN, f"python -m pip --python {_WIN_PY} install -r a.lock", False, True),
         (
-            "$RUNNER_TEMP/sbomenv",
-            '"$RUNNER_TEMP/sbomenv/Scripts/python.exe" -m pip install x',
+            "/tmp/sbomenv",
+            "python -m pip --python /tmp/sbomenv/bin/python install -r a",
+            False,
             True,
         ),
-        ("$RUNNER_TEMP/sbomenv", "$RUNNER_TEMP/sbomenv/Scripts/python.exe -m pip install x", True),
-        ("$RUNNER_TEMP/sbomenv", '"$RUNNER_TEMP/sbomenv/Scripts/pip.exe" install x', True),
-        (
-            "$RUNNER_TEMP/sbomenv",
-            'python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install -r a.lock',
-            False,
-        ),
-        ("/tmp/sbomenv", "python -m pip --python /tmp/sbomenv/bin/python install -r a.lock", False),
-        (
-            "$RUNNER_TEMP/sbomenv",
-            'python -m cyclonedx_py environment "$RUNNER_TEMP/sbomenv/Scripts/python.exe" \\',
-            False,
-        ),
+        # The control: a line naming the venv that installs nothing must match neither.
+        (_WIN, f"python -m cyclonedx_py environment {_WIN_PY} \\", False, False),
     ],
 )
-def test_own_pip_pattern_sees_every_spelling(venv: str, line: str, own: bool) -> None:
-    """The SBOM test's own-pip refusal must see a quoted Windows interpreter and miss the outer pip.
-
-    The second half is the control: a pattern that matched every line naming the venv would refuse
-    the one install the pip-less venv is meant to receive.
+def test_venv_patterns_see_every_spelling(venv: str, line: str, own: bool, installs: bool) -> None:
+    """The own-pip refusal and ``LOCK_ONLY_VENVS``'s install finder each see only what their pattern
+    matches, so a missed spelling is a silent pass. Each must see a quoted Windows interpreter and a
+    versioned or ``.exe`` pip, and the own-pip one must miss the outer pip the venv is meant to get.
     """
     assert bool(_own_pip_re(venv).search(line)) is own
-
-
-@pytest.mark.parametrize(
-    ("venv", "line"),
-    [
-        (
-            "$RUNNER_TEMP/sbomenv",
-            'python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install -r a.lock',
-        ),
-        ("/tmp/sbomenv", "python -m pip --python /tmp/sbomenv/bin/python install -r a.lock"),
-        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip install x"),
-    ],
-)
-def test_installs_into_sees_a_quoted_windows_interpreter(venv: str, line: str) -> None:
-    """``LOCK_ONLY_VENVS`` checks only the installs this finds, so a miss is a silent pass."""
-    assert _installs_into(venv, line)
+    assert _installs_into(venv, line) is installs
 
 
 # --- the release path: every named package must carry a version ------------------------------------
@@ -393,8 +377,10 @@ _PIP_VALUE_FLAGS = (
     "--use-deprecated",
     "--resume-retries",
 )
+# `pip`, `pip3.14`, and a quoted `".../Scripts/pip.exe"` (BACKLOG #2521): a spelling this misses is an
+# install no pin rule ever sees.
 _PIP_INSTALL = re.compile(
-    r"\bpip3?\s+(?:(?:(?:"
+    r"\bpip[\d.]*(?:\.exe)?\"?\s+(?:(?:(?:"
     + "|".join(re.escape(f) for f in _PIP_VALUE_FLAGS)
     + r")\s+\S+|-\S+)\s+)*install\b"
 )
