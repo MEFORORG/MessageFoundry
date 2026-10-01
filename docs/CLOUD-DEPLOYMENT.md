@@ -228,18 +228,21 @@ cross a WAN to an on-prem EHR, and MLLP has no native TLS. The industry answer �
 recommended cloud path — is **hybrid**: terminate MLLP **near the EHR** and forward it over a **private
 encrypted link** to the cloud engine.
 
-### 5.1 MLLP ends at the edge relay, and the relay's store buffers the WAN
+### 5.1 The sender's MLLP ends at the edge relay, and the relay's store buffers the WAN
 
 This diagram shows where each hop ends and what holds the messages while the WAN link is down. The
-sender speaks MLLP only on the LAN, to an edge relay beside it. The relay forwards over the private
-link, and its staged message store holds the outbound rows while that link is down. In the cloud, an
-L4 load balancer passes the traffic to the one engine replica that holds the leader lease.
+sender speaks MLLP only on the LAN, to an edge relay beside it. The relay commits each message to its
+staged message store, and its delivery worker forwards the message over the private link. In the
+cloud, an L4 load balancer passes the traffic to the leader of the HA engine
+([section 3](#3-mllp-exposure--an-operator-built-l4-load-balancer-that-follows-failover) and
+[`CLUSTERING.md`](CLUSTERING.md) hold that detail).
 
-**Legend.** A cylinder is a persisted message store. A solid arrow carries messages. A dotted arrow
-is a store write or read.
+**Legend.** A dotted arrow is a network hop. A solid arrow stays inside the relay and its store. Each
+arrow follows the message. A cylinder is a message store. Green is MessageFoundry, orange is a store,
+and grey is a system that is not part of MessageFoundry.
 
 ```mermaid
-flowchart LR
+flowchart TB
   classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
   classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
   classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
@@ -247,10 +250,10 @@ flowchart LR
   subgraph SITE["On-prem hospital network"]
     SENDER(["EHR, lab or PACS<br/>sends HL7 v2"]):::ext
     subgraph RELAY["Edge relay, the same engine image"]
-      RELAY_IN["Inbound MLLP()<br/>MLLP from the sender ends here"]:::core
-      RELAY_LOGIC["Router and Handler"]:::core
-      RELAY_OUT["Outbound MLLP() or Tcp()"]:::core
+      RELAY_IN["Inbound MLLP() listener<br/>MLLP from the sender ends here"]:::core
       RELAY_STORE[("Staged message store<br/>the WAN buffer")]:::store
+      RELAY_WORK["Router and Handler workers"]:::core
+      RELAY_OUT["Delivery worker<br/>outbound MLLP() or Tcp()"]:::core
     end
   end
 
@@ -258,29 +261,34 @@ flowchart LR
 
   subgraph CLOUD["Your cloud VPC"]
     LB["L4 load balancer<br/>operator-built, section 3"]:::ext
-    subgraph HA["Cloud engine, active-passive HA, replicas 3"]
-      LEADER["Leader<br/>inbound listener open"]:::core
-      STANDBY["2 warm standbys<br/>listener port closed"]:::core
-    end
+    CLOUD_ENGINE["Cloud engine, active-passive HA<br/>replicas 3, the leader holds the listener"]:::core
     CLOUD_STORE[("Managed Postgres<br/>the one shared message store")]:::store
   end
 
-  SENDER -->|"MLLP on the LAN"| RELAY_IN
-  RELAY_IN --> RELAY_LOGIC
-  RELAY_LOGIC --> RELAY_OUT
-  RELAY_IN -.->|"commit, then ACK"| RELAY_STORE
-  RELAY_OUT -.->|"rows wait and retry<br/>while the link is down"| RELAY_STORE
-  RELAY_OUT -->|"MLLP or TCP"| WAN_LINK
-  WAN_LINK --> LB
-  LB -->|"TCP-connect health check<br/>passes on the leader only"| LEADER
-  LEADER -.->|"commits each message"| CLOUD_STORE
-  STANDBY -.->|"same store, waits for the lease"| CLOUD_STORE
+  SENDER -.->|"MLLP on the LAN"| RELAY_IN
+  RELAY_IN -->|"commits the message, then ACKs"| RELAY_STORE
+  RELAY_STORE -->|"claim rows"| RELAY_WORK
+  RELAY_WORK -->|"commit outbound rows"| RELAY_STORE
+  RELAY_STORE -->|"outbound rows<br/>kept and retried while the link is down"| RELAY_OUT
+  RELAY_OUT -.->|"MLLP or TCP"| WAN_LINK
+  WAN_LINK -.-> LB
+  LB -.->|"MLLP or TCP, to the leader"| CLOUD_ENGINE
+  CLOUD_ENGINE -.->|"commits each message"| CLOUD_STORE
 ```
 
-A row that cannot deliver retries under the outbound Connection's retry policy. The default policy
-is finite: a row that uses up its attempts moves to the dead-letter queue, and an operator can replay
-it from there. [`CONNECTIONS.md`](CONNECTIONS.md), "Retry strategy", gives the numbers and how to
-change them.
+Either connector can carry the hop to the cloud, and they complete a row at different points. An
+outbound `MLLP()` completes a row when the cloud engine's ACK arrives. An outbound `Tcp()` gets no
+reply from the cloud engine, because a `Tcp()` inbound writes nothing back, so it completes a row on
+the write.
+
+The buffer has a bound. A delivery that fails for a transient reason, such as a link that is down,
+retries under the outbound Connection's retry policy. The default policy is finite: a row that uses
+up its attempts moves to the dead-letter queue, and an operator can replay it from there. The lane
+then moves on to the next row, so a replayed row arrives out of order. The "Retry strategy" paragraph
+under [Resource management & limits](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326)
+in `CONNECTIONS.md` gives the numbers and how to change them.
+
+### 5.2 The relay is an ordinary engine with a forwarding graph
 
 **The edge relay is the SAME engine image — no new code** (ADR 0047 ratification). It is just an
 on-prem MessageFoundry instance (the container image, or the Windows-service install) whose graph is:
