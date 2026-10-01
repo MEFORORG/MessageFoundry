@@ -38,16 +38,18 @@ from __future__ import annotations
 
 import ast
 import functools
+import math
+import struct
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator
+from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, _ldap3_receive_timeout
 from messagefoundry.config.settings import AuthSettings
 
 _CONNECT_TIMEOUT = 7.5  # deliberately not the default, so a hardcoded literal cannot pass
-_RECEIVE_TIMEOUT = 9.25
+_RECEIVE_TIMEOUT = 9.25  # fractional on purpose: ldap3 needs an int on POSIX (see below)
 
 
 def _ad_settings(**over: Any) -> AuthSettings:
@@ -201,12 +203,35 @@ def _assert_all_finite(rec: _Recorder) -> None:
         assert isinstance(value, int | float) and 0 < float(value) < float("inf"), (
             f"ldap3.Connection #{i} receive_timeout is not a finite positive number: {value!r}"
         )
-        assert float(value) == _RECEIVE_TIMEOUT, (
-            f"ldap3.Connection #{i} receive_timeout {value!r} is not [auth].ad_receive_timeout"
+        # An INT, not merely a number: ldap3 packs it with struct.pack('LL', value, 0) on every
+        # non-Windows host, and a float raises struct.error there before the socket is used. These
+        # fakes never open a socket, so only this assertion sees the type in this file; the
+        # real-socket arm is tests/test_ldap_referrals.py, which went red on Linux CI over it.
+        assert type(value) is int, (
+            f"ldap3.Connection #{i} receive_timeout {value!r} is not an int; ldap3's POSIX branch "
+            "struct.pack()s it, so a float breaks every AD connection on Linux"
         )
+        assert value == math.ceil(_RECEIVE_TIMEOUT), (
+            f"ldap3.Connection #{i} receive_timeout {value!r} is not [auth].ad_receive_timeout "
+            "rounded up to whole seconds"
+        )
+        struct.pack("LL", value, 0)  # ldap3's own POSIX call; raises struct.error on a float
 
 
 # --- runtime guard ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("seconds", "expected"), [(10.0, 10), (9.25, 10), (0.001, 1), (3, 3)])
+def test_receive_timeout_is_whole_seconds_rounded_up(seconds: float, expected: int) -> None:
+    """Never shorter than configured, never 0 (ldap3's "wait forever"), and always an int that
+    ldap3's POSIX ``struct.pack('LL', ...)`` accepts. The float arm is the control: it is what the
+    engine used to pass, and it must raise, or this test is not measuring the Linux failure."""
+    value = _ldap3_receive_timeout(seconds)
+    assert type(value) is int and value == expected
+    struct.pack("LL", value, 0)
+    if isinstance(seconds, float):
+        with pytest.raises(struct.error):
+            struct.pack("LL", seconds, 0)
 
 
 def test_authenticate_builds_only_finitely_timed_ldap_objects(

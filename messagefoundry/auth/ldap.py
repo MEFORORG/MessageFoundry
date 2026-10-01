@@ -21,6 +21,7 @@ local-only deployment never touches them.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import ssl
 import uuid
@@ -131,6 +132,22 @@ class _Lookup(NamedTuple):
 
     answer: DirectoryAnswer
     info: dict[str, Any] | None = None
+
+
+def _ldap3_receive_timeout(seconds: float) -> int:
+    """``[auth].ad_receive_timeout`` as the whole seconds ldap3 can actually apply on every OS.
+
+    ldap3 sets ``SO_RCVTIMEO`` with ``struct.pack('LL', receive_timeout, 0)`` on every non-Windows
+    host, and ``struct.pack`` refuses a float. The setting is a float (default ``10.0``), so passing
+    it straight through made EVERY ldap3 socket open raise ``struct.error`` on Linux before a single
+    byte reached the domain controller: AD sign-in could not work there at all. Windows hides it,
+    because ldap3 converts with ``int(1000 * t)`` on that branch.
+
+    Rounds UP, never to nearest: the result is never shorter than the operator configured and never
+    zero, which ldap3 reads as "wait forever" (ASVS 13.1.3). The POSIX branch drops sub-second
+    precision anyway (``tv_usec`` is always 0), so ``ceil`` loses nothing that branch could keep.
+    """
+    return math.ceil(seconds)
 
 
 def _escape_filter(value: str) -> str:
@@ -578,7 +595,7 @@ class LdapAuthenticator:
             password=self._bind_password,  # resolved once in __init__ (env or [secrets].provider)
             authentication=ldap3.SIMPLE,
             auto_bind=True,
-            receive_timeout=self._s.ad_receive_timeout,
+            receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
             auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
         )
 
@@ -611,7 +628,7 @@ class LdapAuthenticator:
                 user=f"CN=mf-nonexistent-timing-equalizer,{self._s.ad_user_search_base}",
                 password=password,
                 authentication=ldap3.SIMPLE,
-                receive_timeout=self._s.ad_receive_timeout,
+                receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
                 auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
             )
             try:
@@ -820,7 +837,7 @@ class LdapAuthenticator:
                     user=user_dn,
                     password=password,
                     authentication=ldap3.SIMPLE,
-                    receive_timeout=self._s.ad_receive_timeout,
+                    receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
                     auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
                 )
                 # Released on BOTH paths. A rejected password is the common adversarial case, so
