@@ -955,22 +955,31 @@ its own policy block below):
   following a link there. A drop is read only if the opened handle is a regular file at the listed
   name inside the watch directory, reached through no symbolic link or junction: POSIX opens each path
   component with `O_NOFOLLOW`, and Windows opens each one as itself and holds the directories it
-  passes, then compares the handle's final path. So nothing a link names is ever opened, which on
-  Windows means a link to a UNC path or a named pipe never reaches that server (BACKLOG #2535). The
+  passes, then compares the handle's final path. The listing, the read and the move open a link
+  itself rather than what it names, so on Windows a link to a UNC path or a named pipe does not reach
+  that server through them (BACKLOG #2535); the one exception is listed below. The
   same check runs again just before the file is archived, quarantined or deleted, and must find the
   very file that was read: a file renamed over the name after the read is left for the next scan to
   read rather than archived or deleted unread. POSIX then acts on the name relative to its checked
   directory; Windows renames or deletes through the checked handle, so neither resolves the name again.
   `.processed` and `.error` are opened the same way for every move, so if either is replaced by a link
-  after start the move is refused and nothing is written through the link. A refused entry is logged (a
-  WARNING the first time) and left in place, never read or moved. This includes a link that points
+  after start the move is refused and nothing is written through the link; one that is already a link
+  or junction when the source starts fails the start, naming `processed_subdir`/`error_subdir`. To
+  archive elsewhere, set those to an absolute path outside the watch directory. A refused entry is
+  logged (a WARNING the first time) and left in place, never read or moved. This includes a link that points
   inside the watch directory: drop real files, not links. **What this does not cover, at least:** a
   hard link, which is the same file as every other name for it, so an outside file hard-linked into the
   drop directory is read like a drop (keep the drop directory on a volume holding nothing a partner may
   not read; Linux's default `fs.protected_hardlinks` also stops a user linking a file they cannot
-  write); on POSIX, a file renamed over the name in the instant between the final check and a
-  `delete`'s unlink, which is deleted unread; and an archive directory configured *outside* the watch
-  directory, which is the operator's and is used as configured.
+  write); on POSIX, a file renamed over the name in the instant between the last check and the unlink
+  that removes the original (for `delete`, or after an archive had to copy), which is deleted unread;
+  on Windows, a deduplicated, cloud or tiered file (a reparse point that names no other path), which
+  is opened a second time by name so its filter can serve the data, and that second open follows a
+  link swapped in at that instant before the identity check refuses it; a filesystem whose inode
+  numbers are not stable (some FUSE or sshfs mounts, CIFS with `noserverino`), where the identity check
+  fails, so each file is left in place and read again; and an archive directory configured *outside*
+  the watch directory, which is the operator's and is used as configured, judged by its configured
+  path and not by where links lead.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
   `decompress=` set the connector performs no decompression itself, so it materialises nothing beyond
   `max_file_bytes` where that cap is set. An earlier revision went further and said there is "no

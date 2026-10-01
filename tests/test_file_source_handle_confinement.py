@@ -138,10 +138,10 @@ def _swap_when_settled(
 
 
 def _holds(directory: Path, body: bytes) -> list[str]:
-    """Entries under ``directory`` that are links, or that read back as ``body`` through any link."""
+    """Entries under ``directory`` that are links or junctions, or that read back as ``body``."""
     found: list[str] = []
     for entry in directory.rglob("*"):
-        if entry.is_symlink():
+        if entry.is_symlink() or entry.is_junction():
             found.append(f"{entry.name} (a link)")
         elif entry.is_file() and entry.read_bytes() == body:
             found.append(entry.name)

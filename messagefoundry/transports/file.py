@@ -35,7 +35,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, BinaryIO, TypeVar
+from typing import Any, BinaryIO, Self, TypeVar
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -475,9 +475,9 @@ class FileSource(SourceConnector):
         if "directory" not in s:
             raise ValueError("file source requires a 'directory' setting")
         self.directory = Path(s["directory"])
-        # Resolved watch root for path-confinement: a recursive scan must not be walked out of the
-        # configured directory via a symlinked file/subdir (see _within_root). resolve() is
-        # non-strict, so it's fine that the directory is created later in start().
+        # Resolved watch root for path-confinement: every read and move walks down from it, so a
+        # recursive scan cannot be walked out of the configured directory through a link (BACKLOG
+        # #2507, #2535). resolve() is non-strict, so it's fine that the directory is created later.
         self._root_real = self.directory.resolve()
         self.pattern: str = s.get("pattern", "*")
         self.poll_seconds: float = float(s.get("poll_seconds", 1.0))
@@ -580,6 +580,21 @@ class FileSource(SourceConnector):
         else:
             self.processed_dir.mkdir(parents=True, exist_ok=True)
             self.error_dir.mkdir(parents=True, exist_ok=True)
+            # Every move opens its archive directory through no link (BACKLOG #2535). One that is
+            # already a link at start would refuse every move, so each processed file would be read
+            # and handed off again on every other poll. Fail the start instead, naming the fix.
+            for dest in (self.processed_dir, self.error_dir):
+                try:
+                    _open_dest(dest, self.directory, self._root_real).close()
+                except _Unconfined:
+                    refused = dest.name
+                else:
+                    continue
+                raise SourceStartupError(
+                    f"file source archive directory {refused!r} under {self.directory} is a link or a "
+                    "junction, and every move would be refused; make it a real directory, or set "
+                    "processed_subdir/error_subdir to an absolute path outside the watch directory"
+                )
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -1225,8 +1240,8 @@ class FileSource(SourceConnector):
         LARGE backlog is where it bites: the ceiling turns one expensive tick into many, so this
         listing is now paid once per tick over a shrinking set instead of once in total.
 
-        Bounding it properly is a separate change and a real one -- deferring ``is_file`` and
-        ``_within_root`` into the scan loop so they are paid only for candidates actually reached,
+        Bounding it properly is a separate change and a real one -- deferring the ``lstat`` screen
+        into the scan loop so they are paid only for candidates actually reached,
         which is available under ``sort="name"`` because that key needs no syscall, and not under
         ``sort="mtime"`` because the key IS the syscall. It also costs the accurate ``remaining``
         count the ceiling's log line carries. Not folded in here: it changes what the screens mean
@@ -1274,37 +1289,21 @@ class FileSource(SourceConnector):
         """Whether a listed name is a candidate, judged without following a link at that name
         (BACKLOG #2535).
 
-        A regular file is screened by :meth:`_within_root`. A link at the name is kept UNRESOLVED, so
-        the read refuses it and says so once: resolving it here would open its target, and on Windows
-        a link to a UNC path makes that open authenticate to the named server. A link to a directory
-        is dropped on Windows, which marks one, as any directory is. A POSIX link carries no such mark,
-        so every POSIX link is kept and refused at the read."""
+        Nothing here resolves a name: a listed name is confined when it is OPENED
+        (:func:`_open_confined`), which refuses one reached through any link below the root. A
+        ``resolve()`` here used to screen it first, and that opened whatever a link at the name
+        named, so on Windows a link to a UNC path or a pipe reached its server before any refusal.
+
+        A link at the name is kept UNRESOLVED, so the read refuses it and says so once. A link to a
+        directory is dropped on Windows, which marks one, as any directory is. A POSIX link carries no
+        such mark, so every POSIX link is kept and refused at the read."""
         try:
             st = path.lstat()
         except OSError:
             return False
-        if stat.S_ISREG(st.st_mode) and not _names_another_path(st):
-            return self._within_root(path)
-        is_dir = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_DIRECTORY
-        return (stat.S_ISLNK(st.st_mode) or _names_another_path(st)) and not is_dir
-
-    def _within_root(self, path: Path) -> bool:
-        """True if ``path`` resolves inside the configured watch root.
-
-        A symlinked file or subdirectory that points outside the root (e.g. ``in/link -> /etc``)
-        resolves elsewhere and is skipped, so a recursive scan can't be walked out of its directory
-        to read arbitrary files (path-confinement / symlink-escape guard)."""
-        try:
-            resolved = path.resolve()
-        except OSError:
-            return False
-        if resolved == self._root_real or self._root_real in resolved.parents:
-            return True
-        logger.warning(
-            "file source: skipping %s — it resolves outside the watch root (symlink escape?)",
-            safe_name(path.name),
-        )
-        return False
+        if stat.S_ISLNK(st.st_mode) or _names_another_path(st):
+            return not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_DIRECTORY
+        return stat.S_ISREG(st.st_mode)
 
     def _read_settled(self, path: Path) -> tuple[bytes, _FileSig, _FileId]:
         """Read ``path``, then stat it, in one hop off the event loop (BACKLOG #116).
@@ -1611,7 +1610,9 @@ def _claim_unique(
     and raises :class:`_Replaced` if the name now leads to another (BACKLOG #2535). ``dst_dir_fd`` is
     the archive directory, opened through no link: every name the claim makes is then made relative
     to it, so a link put where the directory was cannot redirect the claim (BACKLOG #2535)."""
-    claimed = _link_free_name(tmp, target, src_dir_fd, expect, dst_dir_fd)
+    claimed = _link_free_name(
+        tmp, target, src_dir_fd=src_dir_fd, expect=expect, dst_dir_fd=dst_dir_fd
+    )
     if claimed is not None:
         return claimed
     with open(
@@ -1627,7 +1628,7 @@ def _claim_staged(staged: Path, target: Path, dir_fd: int | None = None) -> Path
     ``dir_fd`` both names are relative to that directory."""
     consumed = False
     try:
-        claimed = _link_free_name(_at(staged, dir_fd), target, dir_fd, None, dir_fd)
+        claimed = _link_free_name(_at(staged, dir_fd), target, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         if claimed is None:
             claimed = _publish_staged(staged, target, dir_fd)
             consumed = True  # renamed onto the final name, so there is no staged file left
@@ -1656,6 +1657,7 @@ def _at(path: Path, dir_fd: int | None) -> Path:
 def _link_free_name(
     source: Path,
     target: Path,
+    *,
     src_dir_fd: int | None = None,
     expect: _FileId | None = None,
     dst_dir_fd: int | None = None,
@@ -1688,8 +1690,11 @@ def _link_free_name(
         except OSError:
             return None  # not a taken name: links are unusable here, so the caller copies instead
         if expect is not None:
-            made = os.stat(name, dir_fd=dst_dir_fd, follow_symlinks=False)
-            if _file_id(made) != expect:
+            try:
+                same = _file_id(os.stat(name, dir_fd=dst_dir_fd, follow_symlinks=False)) == expect
+            except OSError:
+                same = False  # cannot show it is the file read, so it must not stay archived
+            if not same:
                 _discard(candidate, dst_dir_fd)
                 raise _Replaced("not the file that was read")
         return candidate
@@ -1918,8 +1923,9 @@ _DISPOSITION_DELETE_POSIX = 0x1 | 0x2  # FILE_DISPOSITION_FLAG_DELETE | ..._POSI
 #: ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER: "this volume does not do
 #: that", not "that failed". They send a POSIX-semantics delete to the classic one.
 _WIN_UNSUPPORTED = frozenset({1, 50, 87})
-#: Those, and ERROR_NOT_SAME_DEVICE (the archive is on another volume), send a rename to the copy.
-_RENAME_COPIES = _WIN_UNSUPPORTED | {17}
+#: ERROR_NOT_SAME_DEVICE (the archive is on another volume) and ERROR_NOT_SUPPORTED send a rename
+#: to the copy. Any other failure is reported, so a bad request cannot quietly become a copy.
+_RENAME_COPIES = frozenset({17, 50})
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
 
@@ -1935,8 +1941,8 @@ def _open_confined(
     """Open ``path`` to read only if it is a regular file inside the watch root reached through no link
     (BACKLOG #2507). Returns the descriptor and its ``fstat``; the caller closes the descriptor.
 
-    ``_within_root`` screens a NAME when it is listed; the read and the move come later. This check is
-    on what was OPENED, so a link swapped in between is caught.
+    The listing screens a NAME, without following it; the read and the move come later. This check
+    is on what was OPENED, so a link swapped in between is caught.
 
     **POSIX** opens each component below the root relative to its parent's descriptor with
     ``O_NOFOLLOW``, so no component can be a link and nothing is resolved by name after the check. The
@@ -1954,7 +1960,7 @@ def _open_confined(
     :func:`_pin_confined` for why."""
     parts = _listed_parts(path, directory)
     if _WALK_BY_DIR_FD:
-        parent = _open_parent(root_real, parts)
+        parent = _open_dir(root_real, parts[:-1])
         try:
             fd = _open_no_link(parts[-1], os.O_RDONLY | _O_NONBLOCK, parent)
         finally:
@@ -1989,11 +1995,6 @@ def _listed_parts(path: Path, directory: Path) -> tuple[str, ...]:
     return parts
 
 
-def _open_parent(root: Path, parts: tuple[str, ...]) -> int:
-    """POSIX: open the directory that holds ``root/parts...``. See :func:`_open_dir`."""
-    return _open_dir(root, parts[:-1])
-
-
 def _open_dir(root: Path, dirs: tuple[str, ...]) -> int:
     """POSIX: open the directory ``root/dirs...``, one component at a time, following no link below
     ``root``. The caller closes the descriptor."""
@@ -2009,7 +2010,22 @@ def _open_dir(root: Path, dirs: tuple[str, ...]) -> int:
     return dir_fd
 
 
-class _Pin:
+class _Held:
+    """A context manager that calls ``close()`` on exit."""
+
+    __slots__ = ()
+
+    def close(self) -> None:  # pragma: no cover - every subclass defines it
+        raise NotImplementedError
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+class _Pin(_Held):
     """A file checked just before it is moved or deleted, held for that act (BACKLOG #2507, #2535).
 
     POSIX holds the parent directory's descriptor (``dir_fd``) and the bare ``name``. Windows holds a
@@ -2031,12 +2047,6 @@ class _Pin:
             if held is not None:
                 os.close(held)
         self.dir_fd = self.fd = None
-
-    def __enter__(self) -> _Pin:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
 
 
 def _pin_confined(
@@ -2073,7 +2083,7 @@ def _pin_confined(
         pin = _Pin(path, _file_id(st), fd=fd)
     else:
         parts = _listed_parts(path, directory)
-        parent = _open_parent(root_real, parts)
+        parent = _open_dir(root_real, parts[:-1])
         try:
             st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
             if not stat.S_ISREG(st.st_mode):
@@ -2088,7 +2098,7 @@ def _pin_confined(
     return pin
 
 
-class _Dest:
+class _Dest(_Held):
     """An archive directory (``.processed`` or ``.error``) opened for one move, so a link put where it
     was cannot redirect the move (BACKLOG #2535).
 
@@ -2111,12 +2121,6 @@ class _Dest:
         if self.held:
             _win_release(self.held)
             self.held = []
-
-    def __enter__(self) -> _Dest:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
 
 
 def _open_dest(dest_dir: Path, directory: Path, root_real: Path) -> _Dest:
@@ -2170,8 +2174,15 @@ def _archive(pin: _Pin, dest: _Dest, name: str) -> bool:
 def _remove_pinned(pin: _Pin) -> None:
     """Remove the pinned original, after an archive linked or copied it, or for
     ``after_read="delete"``. POSIX unlinks the bare name relative to the checked directory; Windows
-    deletes through the checked handle, so it removes exactly the file checked."""
+    deletes through the checked handle, so it removes exactly the file checked.
+
+    POSIX checks the name is still that file just before the unlink: after an archive's copy that
+    is a whole copy, flush and publish since the pin, time enough for a resend by rename. It has no
+    call that unlinks a name only if it is still a given file, so the moment between this check and
+    the unlink stays open (see :func:`_pin_confined`)."""
     if pin.fd is None:
+        if _file_id(os.stat(pin.name, dir_fd=pin.dir_fd, follow_symlinks=False)) != pin.file_id:
+            raise _Replaced("not the file that was read")
         os.unlink(pin.name, dir_fd=pin.dir_fd)
     else:
         _delete_by_handle(pin.fd)
@@ -2276,14 +2287,20 @@ def _win_open_file(path: Path, access: int) -> int:
     return fd
 
 
+def _win_error(code: int | None = None) -> OSError:
+    """The ``OSError`` for a failed Win32 call: ``code``, else the thread's last error. It carries the
+    Windows code and text, never a path."""
+    if sys.platform != "win32":  # pragma: no cover - only the Windows arm calls this; narrows mypy
+        return _Unconfined("no Windows errors on this platform")
+    return ctypes.WinError(ctypes.get_last_error() if code is None else code)
+
+
 def _win_create(path: Path, access: int, share: int, flags: int) -> int:
     """``CreateFileW`` on an existing ``path``. Its error carries the Windows code and text, never the
     path."""
-    if sys.platform != "win32":  # pragma: no cover - only the Windows arm calls this; narrows mypy
-        raise _Unconfined("no CreateFileW on this platform")
     handle = _kernel32().CreateFileW(str(path), access, share, None, _OPEN_EXISTING, flags, None)
     if handle is None or handle == _INVALID_HANDLE:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _win_error()
     return int(handle)
 
 
@@ -2310,13 +2327,11 @@ def _os_handle(fd: int) -> int:
 
 def _attribute_tag(handle: int) -> tuple[int, int]:
     """Windows: the attributes and the reparse tag of the file open on ``handle``."""
-    if sys.platform != "win32":  # pragma: no cover - narrows mypy
-        raise _Unconfined("no reparse tags on this platform")
     info = _AttributeTag()
     if not _kernel32().GetFileInformationByHandleEx(
         handle, _FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(info), ctypes.sizeof(info)
     ):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _win_error()
     return int(info.attributes), int(info.tag)
 
 
@@ -2324,8 +2339,6 @@ def _rename_by_handle(fd: int, target: Path) -> None:
     """Windows: rename the file open on ``fd`` to ``target``, refusing an existing name with
     ``FileExistsError``. ``SetFileInformationByHandle(FileRenameInfo)``, which is what ``MoveFileExW``
     does after it opens the source by name."""
-    if sys.platform != "win32":  # pragma: no cover - narrows mypy
-        raise _Unconfined("no rename by handle on this platform")
     name = os.path.abspath(target)
     units = len(name.encode("utf-16-le", "surrogatepass")) // 2
 
@@ -2341,15 +2354,13 @@ def _rename_by_handle(fd: int, target: Path) -> None:
     if not _kernel32().SetFileInformationByHandle(
         _os_handle(fd), _FILE_RENAME_INFO, ctypes.byref(info), ctypes.sizeof(info)
     ):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _win_error()
 
 
 def _delete_by_handle(fd: int) -> None:
     """Windows: delete the file open on ``fd``. POSIX semantics first, so the name goes at once even
     while another process holds the file open; the classic disposition where the volume has no such
     thing, which removes the name when the last handle closes."""
-    if sys.platform != "win32":  # pragma: no cover - narrows mypy
-        raise _Unconfined("no delete by handle on this platform")
     k32 = _kernel32()
     handle = _os_handle(fd)
     flags = ctypes.c_uint32(_DISPOSITION_DELETE_POSIX)
@@ -2357,14 +2368,14 @@ def _delete_by_handle(fd: int) -> None:
         handle, _FILE_DISPOSITION_INFO_EX, ctypes.byref(flags), ctypes.sizeof(flags)
     ):
         return
-    code = ctypes.get_last_error()
-    if code not in _WIN_UNSUPPORTED:
-        raise ctypes.WinError(code)
+    error = _win_error()
+    if getattr(error, "winerror", None) not in _WIN_UNSUPPORTED:
+        raise error
     delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO.DeleteFile
     if not k32.SetFileInformationByHandle(
         handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)
     ):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _win_error()
 
 
 def _open_no_link(name: str, flags: int, dir_fd: int) -> int:
@@ -2383,8 +2394,6 @@ def _open_no_link(name: str, flags: int, dir_fd: int) -> int:
 
 def _final_path(fd: int) -> str:
     """Windows: the final path of the file open on ``fd``, every link and junction resolved."""
-    if sys.platform != "win32":  # pragma: no cover - only the Windows arm calls this; narrows mypy
-        raise _Unconfined("no final-path query on this platform")
     handle = _os_handle(fd)
     query = _kernel32().GetFinalPathNameByHandleW
     size = 512
@@ -2392,7 +2401,7 @@ def _final_path(fd: int) -> str:
         buf = ctypes.create_unicode_buffer(size)
         needed = query(handle, buf, size, 0)
         if needed == 0:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error()
         if needed < size:
             return str(buf.value)
         size = needed  # too small: the return is the size needed, terminator included

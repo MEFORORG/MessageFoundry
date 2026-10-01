@@ -35,82 +35,46 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.transports import file as file_mod
+from messagefoundry.transports.base import SourceStartupError
 from messagefoundry.transports.file import FileSource
+from tests.test_file_source_handle_confinement import (
+    _DROP,
+    _assert_outside_untouched,
+    _holds,
+    _layout,
+    _Recorder,
+    _require_symlinks,
+    _source,
+    _twin,
+)
 
-_DROP = rb"MSH|^~\&|LAB|FAC|EHR|FAC|20260930||ADT^A01|CTRL1|P|2.5" + b"\rPID|1||SYN01\r"
 #: The same length as the drop, so no size compare can tell them apart.
 _TWIN = _DROP.replace(b"SYN01", b"SYN02")
 _SECRET = _DROP.replace(b"SYN01", b"SEC99")
 
 
-class _Recorder:
-    def __init__(self, on_first: Callable[[], None] | None = None) -> None:
-        self.got: list[bytes] = []
-        self._on_first = on_first
-
-    async def __call__(self, raw: bytes) -> str | None:
-        self.got.append(raw)
-        if len(self.got) == 1 and self._on_first is not None:
-            self._on_first()
-        return None
+def _other_volume(*_a: object, **_k: object) -> None:
+    """A Windows rename by handle refused because the archive is on another volume."""
+    raise OSError(None, "The system cannot move the file to a different disk drive", None, 17)
 
 
-def _source(inbox: Path, **over: object) -> FileSource:
-    settings: dict[str, object] = {"directory": str(inbox), "pattern": "*.hl7"}
-    settings.update(over)
-    src = FileSource(Source(type=ConnectorType.FILE, settings=settings))
-    src._prepare_subdirs()
-    return src
-
-
-def _require_symlinks(tmp_path: Path) -> None:
-    probe = tmp_path / "symlink-probe"
-    try:
-        probe.symlink_to(tmp_path)
-    except (OSError, NotImplementedError):
-        pytest.skip("this process cannot create a symbolic link here")
-    probe.unlink()
-
-
-def _same_stat(model: Path, path: Path) -> None:
-    """Give ``path`` ``model``'s modification time, so the #116 size-and-mtime compare passes."""
-    st = model.stat()
-    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
-
-
-def _holds(directory: Path, body: bytes) -> list[str]:
-    """Entries under ``directory`` that are links, or that read back as ``body``."""
-    found: list[str] = []
-    for entry in directory.rglob("*"):
-        if entry.is_symlink() or entry.is_junction():
-            found.append(f"{entry.name} (a link)")
-        elif entry.is_file() and entry.read_bytes() == body:
-            found.append(entry.name)
-    return found
-
-
-def _after_pin(monkeypatch: pytest.MonkeyPatch, swap: Callable[[], None]) -> list[str]:
-    """Run ``swap`` once, just after the move's or delete's check has passed. Returns a list that
-    records whether the swap was refused by the filesystem (NTFS refuses to rename a directory with
-    a file open below it, which the new Windows pin holds)."""
+def _after_pin(monkeypatch: pytest.MonkeyPatch, swap: Callable[[], None]) -> None:
+    """Run ``swap`` once, just after the move's or delete's check has passed. A swap the filesystem
+    refuses is ignored: NTFS refuses to rename a directory with a file open below it, which the
+    Windows pin holds, and that refusal is one of the controls under test."""
     real = file_mod._pin_confined
-    refused: list[str] = []
     done: list[bool] = []
 
     def pinned(*args: Any, **kwargs: Any) -> Any:
         pin = real(*args, **kwargs)
         if not done:
             done.append(True)
-            try:
+            with contextlib.suppress(OSError):
                 swap()
-            except OSError as exc:
-                refused.append(type(exc).__name__)
         return pin
 
     monkeypatch.setattr(file_mod, "_pin_confined", pinned)
-    return refused
 
 
 async def _read_and_hand_off(src: FileSource) -> None:
@@ -137,8 +101,7 @@ async def test_a_file_renamed_over_the_name_after_the_read_is_left_for_the_next_
     staged = tmp_path / "resend.part"
 
     def resend() -> None:
-        staged.write_bytes(_TWIN)
-        _same_stat(drop, staged)
+        _twin(drop, staged, _TWIN)
         os.replace(staged, drop)
 
     src = _source(inbox, after_read=after_read)
@@ -157,40 +120,6 @@ async def test_a_file_renamed_over_the_name_after_the_read_is_left_for_the_next_
 # === a link swapped in after the pin ===============================================================
 
 
-def _layout(tmp_path: Path, kind: str) -> tuple[Path, Path, Path, Callable[[], None]]:
-    """The drop, the watch root, the outside file, and a swap that puts a link where the drop (or its
-    subdirectory) was."""
-    inbox = tmp_path / "in"
-    outside_dir = tmp_path / "outside"
-    outside_dir.mkdir()
-    parked = tmp_path / "parked"
-    parked.mkdir()
-    if kind == "file":
-        inbox.mkdir()
-        drop = inbox / "drop.hl7"
-        drop.write_bytes(_DROP)
-        outside = outside_dir / "secret.hl7"
-        outside.write_bytes(_SECRET)
-
-        def swap() -> None:
-            drop.rename(parked / drop.name)
-            drop.symlink_to(outside)
-
-        return drop, inbox, outside, swap
-    sub = inbox / "sub"
-    sub.mkdir(parents=True)
-    drop = sub / "drop.hl7"
-    drop.write_bytes(_DROP)
-    outside = outside_dir / drop.name
-    outside.write_bytes(_SECRET)
-
-    def swap_dir() -> None:
-        sub.rename(parked / sub.name)
-        sub.symlink_to(outside_dir, target_is_directory=True)
-
-    return drop, inbox, outside, swap_dir
-
-
 @pytest.mark.parametrize(
     ("kind", "after_read"),
     [("file", "move"), ("dir", "move"), ("dir", "delete")],
@@ -204,16 +133,13 @@ async def test_a_link_swapped_in_after_the_pin_is_neither_archived_nor_deleted_t
     file and ``delete`` through the swapped directory deleted it. On POSIX the ``file`` case is red
     too: the claim hard-linked the link itself into ``.processed``."""
     _require_symlinks(tmp_path)
-    drop, inbox, outside, swap = _layout(tmp_path, kind)
+    _drop, inbox, outside, swap = _layout(tmp_path, kind, _SECRET)
     src = _source(inbox, recursive=kind == "dir", after_read=after_read)
     src._handler = _Recorder()
     await src._scan_once()
     _after_pin(monkeypatch, swap)
     await src._scan_once()
-    assert outside.is_file(), "the outside file was moved or deleted through the link"
-    assert outside.read_bytes() == _SECRET
-    for sub in (".processed", ".error"):
-        assert _holds(inbox / sub, _SECRET) == [], f"the outside file or a link reached {sub}"
+    _assert_outside_untouched(inbox, outside, _SECRET)
 
 
 async def test_the_copy_fallback_copies_the_checked_file_and_not_a_link_swapped_in(
@@ -224,16 +150,13 @@ async def test_the_copy_fallback_copies_the_checked_file_and_not_a_link_swapped_
     Red on origin/main on Windows: the copy opened the name again, without ``O_NOFOLLOW`` (Windows has
     none), so a link swapped in after the check put the outside file in ``.processed``."""
     _require_symlinks(tmp_path)
-    drop, inbox, outside, swap = _layout(tmp_path, "file")
+    _drop, inbox, outside, swap = _layout(tmp_path, "file", _SECRET)
 
     def no_links(*_a: object, **_k: object) -> None:
         raise OSError(errno.EXDEV, "Invalid cross-device link")
 
-    def other_volume(*_a: object, **_k: object) -> None:
-        raise OSError(None, "The system cannot move the file to a different disk drive", None, 17)
-
     monkeypatch.setattr(os, "link", no_links)
-    monkeypatch.setattr(file_mod, "_rename_by_handle", other_volume, raising=False)
+    monkeypatch.setattr(file_mod, "_rename_by_handle", _other_volume, raising=False)
     src = _source(inbox)
     src._handler = _Recorder()
     await src._scan_once()
@@ -264,11 +187,8 @@ async def test_the_copy_fallback_still_archives_the_drop(
             raise OSError(errno.EXDEV, "Invalid cross-device link")
         real_link(src, dst, **kw)
 
-    def other_volume(*_a: object, **_k: object) -> None:
-        raise OSError(None, "The system cannot move the file to a different disk drive", None, 17)
-
     monkeypatch.setattr(os, "link", link)
-    monkeypatch.setattr(file_mod, "_rename_by_handle", other_volume, raising=False)
+    monkeypatch.setattr(file_mod, "_rename_by_handle", _other_volume, raising=False)
     src = _source(inbox)
     handler = _Recorder()
     src._handler = handler
@@ -278,6 +198,53 @@ async def test_the_copy_fallback_still_archives_the_drop(
     archived = sorted(p.name for p in (inbox / ".processed").iterdir())
     assert archived == ["drop.hl7"], archived
     assert (inbox / ".processed" / "drop.hl7").read_bytes() == _DROP
+
+
+async def test_a_resend_during_the_copy_fallback_is_not_deleted_unread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy fallback is a whole copy, flush and publish between the check and the removal of the
+    original, which on Linux is the usual path. A partner's resend by rename in that time must stay.
+
+    Red on origin/main: the original's name is unlinked after the copy with no check, so the resent
+    file is deleted without ever being read."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    drop = inbox / "drop.hl7"
+    drop.write_bytes(_DROP)
+    staged = tmp_path / "resend.part"
+    real_stage = file_mod._stage_copy
+    done: list[bool] = []
+    resent: list[bool] = []
+
+    def stage_then_resend(*args: Any, **kwargs: Any) -> Path:
+        result = real_stage(*args, **kwargs)
+        if not done:
+            done.append(True)
+            _twin(drop, staged, _TWIN)
+            # Windows refuses to replace a file the pin holds open, which is the control there.
+            with contextlib.suppress(PermissionError):
+                os.replace(staged, drop)
+                resent.append(True)
+        return result
+
+    def no_links(*_a: object, **_k: object) -> None:
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", no_links)
+    monkeypatch.setattr(file_mod, "_rename_by_handle", _other_volume, raising=False)
+    monkeypatch.setattr(file_mod, "_stage_copy", stage_then_resend)
+    src = _source(inbox)
+    handler = _Recorder()
+    src._handler = handler
+    await _read_and_hand_off(src)
+    assert done, "the copy fallback did not run"
+    assert (inbox / ".processed" / "drop.hl7").read_bytes() == _DROP
+    if resent:
+        assert drop.read_bytes() == _TWIN, "the resent file was deleted unread"
+    else:
+        assert sys.platform == "win32", "only the Windows pin may refuse the resend"
+        assert staged.read_bytes() == _TWIN and not drop.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
@@ -377,6 +344,27 @@ def _junction(link: Path, target: Path) -> None:
     _winapi.CreateJunction(str(target), str(link))
 
 
+@pytest.mark.parametrize("link_kind", ["symlink", "junction"])
+def test_an_archive_directory_that_is_a_link_at_start_fails_the_start(
+    tmp_path: Path, link_kind: str
+) -> None:
+    """Every move refuses an archive directory reached through a link, so one that is a link when the
+    source starts would refuse every move, and each file would be read and handed off again every
+    other poll. The start fails instead, naming the setting to change."""
+    if link_kind == "symlink":
+        _require_symlinks(tmp_path)
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if link_kind == "symlink":
+        (inbox / ".processed").symlink_to(elsewhere, target_is_directory=True)
+    else:
+        _junction(inbox / ".processed", elsewhere)
+    with pytest.raises(SourceStartupError, match="processed_subdir"):
+        _source(inbox)
+
+
 @pytest.mark.parametrize("dest", [".processed", ".error"])
 @pytest.mark.parametrize("link_kind", ["symlink", "junction"])
 async def test_an_archive_directory_swapped_for_a_link_is_refused_and_nothing_is_written_through(
@@ -449,3 +437,31 @@ def test_a_non_link_reparse_point_is_reopened_and_must_stay_the_same_file(
     monkeypatch.setattr(file_mod, "_win_create", swap_before_reopen)
     with pytest.raises(file_mod._Replaced):
         file_mod._read_confined(drop, inbox, inbox.resolve(), None)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the rename by handle is the Windows move")
+async def test_a_same_volume_windows_archive_is_one_rename_and_never_a_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy fallback exists for another volume only. If the rename by handle broke, every move
+    would quietly become a copy and a delete, and every other test would still pass.
+
+    Mutation: make ``_rename_by_handle`` raise ERROR_NOT_SUPPORTED. Red: the copy runs."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    drop = inbox / "drop.hl7"
+    drop.write_bytes(_DROP)
+    copies: list[bool] = []
+    real_stage = file_mod._stage_copy
+
+    def spy(*args: Any, **kwargs: Any) -> Path:
+        copies.append(True)
+        return real_stage(*args, **kwargs)
+
+    monkeypatch.setattr(file_mod, "_stage_copy", spy)
+    src = _source(inbox)
+    src._handler = _Recorder()
+    await _read_and_hand_off(src)
+    assert (inbox / ".processed" / "drop.hl7").read_bytes() == _DROP
+    assert not drop.exists()
+    assert not copies, "a same-volume archive took the copy fallback"
