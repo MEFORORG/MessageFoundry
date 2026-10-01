@@ -19,13 +19,14 @@ cut over — with rollback being "just stop the relay."
 ### The relay forwards to production and copies to the shadow
 
 This diagram shows where each copy of a message goes during a parallel run. The source sends MLLP to
-the tee relay, and the relay always ACKs on receipt. The relay forwards the unchanged bytes to
-Corepoint, which stays the production path, and to MEFOR in shadow, with its egress suppressed. An
-optional second listener takes the copies Corepoint sends of its own output, the reverse feed, and
-forwards them to MEFOR for comparison.
+the tee relay, which always ACKs on receipt and forwards the unchanged bytes to Corepoint, the
+production path. Once Corepoint answers, the relay queues a copy for MEFOR in shadow, with its egress
+suppressed. An optional second listener takes the copies Corepoint sends of its own output, the
+reverse feed, for comparison.
 
-**Legend.** A solid arrow carries messages, and each one that crosses the relay's edge is MLLP. A
-dotted arrow is a write to the relay's own SQLite log. The box named "Tee relay" is one process.
+**Legend.** A dotted arrow is an MLLP hop between processes. A solid arrow stays inside the relay
+process and its SQLite file. Each arrow follows the message. Grey is a system outside MessageFoundry,
+pink is the tee relay, green is the shadow MessageFoundry instance, and orange is a store.
 
 ```mermaid
 flowchart LR
@@ -42,17 +43,18 @@ flowchart LR
     TEE_A["Listener A, the tee<br/>always ACKs AA on receipt"]:::standalone
     TEE_B["Listener B, the copy feed, optional<br/>ACKs AA on receipt"]:::standalone
     TEE_QUEUE["Shadow queue and worker<br/>bounded, in memory"]:::standalone
-    TEE_LOG[("SQLite log<br/>the only store the relay has")]:::store
+    TEE_DB[("SQLite database<br/>the only store the relay has")]:::store
   end
 
-  EPIC -->|"MLLP"| TEE_A
-  TEE_A -->|"MLLP, unchanged bytes<br/>the production leg"| COREPOINT
-  TEE_A -->|"copy"| TEE_QUEUE
-  COREPOINT -->|"MLLP, duplicate-send copy<br/>the reverse feed"| TEE_B
-  TEE_B -->|"copy, for comparison"| TEE_QUEUE
-  TEE_QUEUE -->|"MLLP, unchanged bytes<br/>the shadow leg"| MEFOR
-  TEE_A -.->|"logs the corepoint leg"| TEE_LOG
-  TEE_QUEUE -.->|"logs the mefor leg"| TEE_LOG
+  EPIC -.->|"MLLP"| TEE_A
+  TEE_A -.->|"MLLP, unchanged bytes<br/>the production leg"| COREPOINT
+  TEE_A -->|"copy, once the production leg answers"| TEE_QUEUE
+  COREPOINT -.->|"MLLP, duplicate-send copy<br/>the reverse feed, for comparison"| TEE_B
+  TEE_B -->|"copy"| TEE_QUEUE
+  TEE_QUEUE -.->|"MLLP, unchanged bytes<br/>the shadow leg"| MEFOR
+  TEE_A -->|"logs the corepoint leg<br/>captures the body when switched on"| TEE_DB
+  TEE_B -->|"captures the body when switched on"| TEE_DB
+  TEE_QUEUE -->|"logs the mefor leg"| TEE_DB
 ```
 
 * **Listener A — the tee (`--listen-epic`).** Repoint Epic's outbound at the relay. For every message it
