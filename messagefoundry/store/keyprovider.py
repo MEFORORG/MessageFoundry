@@ -89,12 +89,17 @@ class DpapiKeyProvider:
     def __init__(self, settings: StoreSettings) -> None:
         self._settings = settings
 
+    def key_file(self) -> str | None:
+        """The key file this provider loads the active key from, or ``None`` when it loads none."""
+        return self._settings.encryption_key_file or None
+
     def active_key(self) -> str | None:
-        if not self._settings.encryption_key_file:
+        key_file = self.key_file()
+        if key_file is None:
             return None
         from messagefoundry.secrets_dpapi import load_protected_key
 
-        return load_protected_key(self._settings.encryption_key_file)
+        return load_protected_key(key_file)
 
     def retired_keys(self) -> Sequence[str]:
         return _split_retired(self._settings.encryption_keys_retired)
@@ -110,14 +115,22 @@ class AutoKeyProvider:
     def __init__(self, settings: StoreSettings) -> None:
         self._settings = settings
 
+    def key_file(self) -> str | None:
+        """The key file this provider loads the active key from, or ``None`` when it loads none:
+        the environment key wins, so the file is loaded only when that key is unset."""
+        if self._settings.encryption_key:
+            return None
+        return self._settings.encryption_key_file or None
+
     def active_key(self) -> str | None:
         if self._settings.encryption_key:
             return self._settings.encryption_key
-        if self._settings.encryption_key_file:
-            from messagefoundry.secrets_dpapi import load_protected_key
+        key_file = self.key_file()
+        if key_file is None:
+            return None
+        from messagefoundry.secrets_dpapi import load_protected_key
 
-            return load_protected_key(self._settings.encryption_key_file)
-        return None
+        return load_protected_key(key_file)
 
     def retired_keys(self) -> Sequence[str]:
         return _split_retired(self._settings.encryption_keys_retired)
@@ -169,6 +182,20 @@ def provider_reads_a_configured_key(settings: StoreSettings) -> bool:
     if pinned is not None:
         return bool(getattr(settings, pinned[0]))
     return bool(settings.encryption_key or settings.encryption_key_file)
+
+
+def provider_key_file(settings: StoreSettings) -> str | None:
+    """The key file ``[store].key_provider`` loads the active key from, or ``None``.
+
+    Asked of the provider itself (``key_file`` on :class:`AutoKeyProvider` and
+    :class:`DpapiKeyProvider`), so this cannot drift from what ``active_key`` loads. ``env`` and
+    every external provider load no file. ``serve`` checks the access of the file this names before
+    it is used (vault BACKLOG #2601)."""
+    if settings.key_provider == "auto":
+        return AutoKeyProvider(settings).key_file()
+    if settings.key_provider == "dpapi":
+        return DpapiKeyProvider(settings).key_file()
+    return None
 
 
 def unread_key_refusal(settings: StoreSettings) -> str | None:

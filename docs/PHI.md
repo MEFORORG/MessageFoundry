@@ -240,6 +240,25 @@ a suppressed `OSError` and never calls the `icacls` enforcer, so **on Windows th
 no engine-applied ACL at all**. The File-connector spill dirs likewise remain operator-owned — harden
 all of these per [§10](#10-secure-deployment--operations-checklist).
 
+**Key files `[BUILT]`.** A file that holds a key is not tightened after the fact. The engine
+creates it restricted, in the call that creates it, and refuses to replace a file or link already at
+that name. This covers the DPAPI store key file that `protect-key` writes and every TLS private key
+the engine writes: the pair it mints for the API, `cert self-signed` and `cert import`. On POSIX the
+file is created with mode `0600`. On Windows its access list names SYSTEM, Administrators and the
+account that created it, plus read for each `protect-key --grant-account`, and it does not inherit
+from the directory. If the file cannot be created that way, the command fails and writes no file
+([restricted_file.py](../messagefoundry/restricted_file.py)).
+
+`serve` also checks two of these files before it uses them: the store key file, when
+`[store].key_provider` reads it, and the TLS key the engine minted. If Everyone, Authenticated Users,
+the local Users group or another broad group can read the file, or its access cannot be read, the
+engine refuses to start under `[security].enforcement = "enforce"` and warns under `"warn"`. On POSIX
+the test is a group or other read bit. Every other command that reads the store key file, such as
+`provision-admin` and `rotate-key`, logs a warning for the same finding and goes on. **What this
+check does not cover:** it judges read access
+only, it does not vet the file's owner or a narrow account you granted yourself, and it does not
+look at an operator-supplied `[api].tls_key_file` or a connection's key file. Restrict those yourself.
+
 **Git hygiene `[BUILT]`.** `.gitignore` excludes `*.db` / `-wal` / `-shm`, generated message corpora,
 and logs, so runtime PHI is never committed. Keep it that way — never `git add -f` a database or a
 real message file.

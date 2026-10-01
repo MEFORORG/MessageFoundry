@@ -2026,6 +2026,29 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # The store key file is checked BEFORE it is used (vault BACKLOG #2601). Machine-scope DPAPI lets
+    # any account on the host unprotect the blob, so the file's access list is what keeps the key
+    # from the others. `protect-key` creates the file restricted; this catches one that was moved,
+    # copied or re-granted since. The refuse/warn split is [security].enforcement. A file that is
+    # absent is left to the key provider, which fails closed on it at store open and says why.
+    from messagefoundry.store.keyprovider import provider_key_file
+
+    _key_file = provider_key_file(settings.store)
+    if (
+        _key_file is not None
+        and Path(_key_file).exists()
+        and not _key_file_access_gate(
+            _key_file,
+            what="the store key file named by [store].encryption_key_file",
+            remedy=(
+                "Restrict it to the account the engine runs as, SYSTEM and Administrators, or "
+                "write it again with `messagefoundry protect-key` to a new path"
+            ),
+            enforcing=enforcing,
+        )
+    ):
+        return 2
+
     # PHI-at-rest invariant (#186b, ASVS 13.2.4): at-rest encryption is effective-by-default on ANY
     # instance, not only a production one — the keyless gate ABOVE already fails
     # closed in every environment unless an encryption key is configured or the audited
@@ -4071,6 +4094,7 @@ def _serve(args: argparse.Namespace) -> int:
         GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
+        plan_api_tls_material,
     )
 
     # A renewal or recovery of the generated pair is reported here and audited by the lifespan once
@@ -4090,6 +4114,27 @@ def _serve(args: argparse.Namespace) -> int:
     # unwatched (BACKLOG #1276). None only behind a declared upstream terminator: the engine then
     # serves no certificate of its own, so it has none to watch.
     _served_api_cert = _material[0] if _material is not None else None
+    # The key the engine minted is checked before it is served (vault BACKLOG #2601). It is created
+    # restricted, so this catches a pair that was copied into a broader directory or re-granted
+    # since. Only the generated pair, as the plan names it: an operator's own key file is not
+    # judged here.
+    _tls_plan = plan_api_tls_material(
+        settings.api, state_dir=generated_state_dir(settings.store.path)
+    )
+    if (
+        _tls_plan.source == "generated"
+        and _tls_plan.key_file is not None
+        and not _key_file_access_gate(
+            _tls_plan.key_file,
+            what=f"the generated TLS private key {_tls_plan.key_file}",
+            remedy=(
+                "Restrict it to the account the engine runs as, or delete it and its certificate "
+                "so the next start mints a new pair"
+            ),
+            enforcing=enforcing,
+        )
+    ):
+        return 2
 
     app = create_managed_app(
         store_settings=settings.store,
@@ -4981,36 +5026,17 @@ def _cert_fail(message: str, *, as_json: bool, code: int = 2) -> int:
 
 
 def _write_private_key(path: Path, pem: bytes) -> None:
-    """Write a private-key PEM with ``O_EXCL`` (refuse to overwrite) + ``0o600``, then tighten the
-    Windows DACL via ``_secure_file`` — the write-then-secure sequence ``protect-key`` uses. Raises
-    ``FileExistsError`` when ``path`` already exists (never clobber a key) or ``OSError`` on write
-    failure. The PEM bytes are secret — never logged or surfaced in an exception."""
-    import os
+    """Write a private-key PEM to a NEW file that is restricted from the moment it exists.
 
-    from messagefoundry.store.store import _secure_file
+    The create is exclusive and carries the restriction itself (``restricted_file``): mode ``0o600``
+    on POSIX, and on Windows an access list attached in the creating call. It is the same helper
+    ``protect-key`` uses, and it fails closed (vault BACKLOG #2601). Raises ``FileExistsError`` when
+    ``path`` already exists (never clobber a key), ``RestrictedFileError`` when the file cannot be
+    created restricted, or ``OSError`` on write failure; in the last two cases nothing is left at
+    ``path``. The PEM bytes are secret — never logged or surfaced in an exception."""
+    from messagefoundry.restricted_file import write_restricted_file
 
-    # The exclusive create sits OUTSIDE the cleanup guard on purpose: a pre-existing key raises
-    # FileExistsError HERE, and that file is the operator's real key — unlinking it is precisely the
-    # clobber the O_EXCL refusal exists to prevent.
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    placed = False
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(pem)
-        # Inside the guard for breadth, not because it raises today: _secure_file is best-effort and
-        # non-fatal by contract (it logs a failed restriction rather than raising, so the engine can
-        # still start). Were that ever to change, the key it could not lock down must not be the one
-        # thing left behind.
-        _secure_file(path)
-        placed = True
-    finally:
-        # A write that dies partway (a full volume) would otherwise leave a TRUNCATED key that
-        # nothing removes, and the O_EXCL refusal above then fires on it forever: the caller cannot
-        # re-mint, and all it gets is a FileExistsError naming no cause. `finally`, not `except`, so
-        # nothing is caught or relabelled. It runs after the `with` closed the handle, which Windows
-        # requires before an unlink.
-        if not placed:
-            path.unlink(missing_ok=True)
+    write_restricted_file(path, pem)
 
 
 def _cert(args: argparse.Namespace) -> int:
@@ -5356,9 +5382,15 @@ def _protect_key(args: argparse.Namespace) -> int:
 
     Source: ``--generate`` mints a fresh key (also printed once to stderr so it can be backed up
     offline — the machine-bound file is unrecoverable if the host is lost); otherwise the key is read
-    from ``MEFOR_STORE_ENCRYPTION_KEY``. The file is written with a tight DACL — the minting owner plus
-    READ for the engine's service principal (SYSTEM by default, or ``--grant-account``) — atop DPAPI, so
-    the service account (not just the minting admin) can read the key at startup.
+    from ``MEFOR_STORE_ENCRYPTION_KEY``. The file is CREATED with a tight DACL, in the call that creates
+    it: SYSTEM (a LocalSystem service), Administrators and the minting owner, plus READ for
+    ``--grant-account`` (a virtual / gMSA service account). So the service account, not just the
+    minting admin, can read the key at startup, and the file never exists with the directory's
+    inherited access (vault BACKLOG #2601).
+
+    Fails closed: if the file cannot be created that way, or ``--out`` already exists, the command
+    exits non-zero, writes no file and prints no success line. A generated key is printed only once
+    the file that holds it exists.
     """
     import base64
     import os
@@ -5366,15 +5398,9 @@ def _protect_key(args: argparse.Namespace) -> int:
 
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable, protect_key_to_file
     from messagefoundry.store.crypto import generate_key
-    from messagefoundry.store.store import _secure_file
 
     if args.generate:
         key_b64 = generate_key()
-        print(
-            "Generated a new store key. BACK IT UP OFFLINE — the protected file is bound to this "
-            f"machine and cannot be recovered if the host is lost:\n  {key_b64}",
-            file=sys.stderr,
-        )
     else:
         key_b64 = os.environ.get("MEFOR_STORE_ENCRYPTION_KEY", "").strip()
         if not key_b64:
@@ -5397,8 +5423,13 @@ def _protect_key(args: argparse.Namespace) -> int:
         return 2
 
     out = Path(args.out)
+    # Machine-scope DPAPI lets any host principal decrypt, so the file's access list is the control.
+    # The restricted create always names SYSTEM and Administrators; --grant-account adds read for a
+    # virtual / gMSA service account, without which the service would fail closed at startup
+    # (DpapiError).
+    grants = [args.grant_account] if args.grant_account else []
     try:
-        protect_key_to_file(key_b64, out, machine_scope=not args.user)
+        protect_key_to_file(key_b64, out, machine_scope=not args.user, read_grants=grants)
     except DpapiUnavailable as exc:
         print(
             f"error: {exc}. protect-key is Windows-only; on other platforms keep the key in "
@@ -5406,18 +5437,27 @@ def _protect_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    except FileExistsError:
+        print(
+            f"error: refusing to overwrite an existing file: {out}. No key file was written. "
+            "Choose a new --out path, or remove that file first if no store still needs its key.",
+            file=sys.stderr,
+        )
+        return 2
+    except OSError as exc:
+        # The file could not be created restricted, or the write failed. Either way the helper
+        # removed what it created, so there is nothing to print a success line about.
+        print(f"error: cannot write {out}: {exc}. No key file was written.", file=sys.stderr)
+        return 2
     except DpapiError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    # Lock the key file down, but keep it readable by the engine's service principal: SYSTEM by default
-    # (a LocalSystem service) plus an explicit --grant-account for a virtual / gMSA account. Machine-scope
-    # DPAPI already lets any host principal decrypt; without these read grants the owner-only DACL would
-    # lock the file to the minting admin and the service would fail closed at startup (DpapiError). The
-    # generic _secure_file (store DB/WAL) passes no grants and stays owner-only.
-    grants = ["*S-1-5-18"]  # NT AUTHORITY\SYSTEM — well-known SID, robust on non-English Windows
-    if args.grant_account:
-        grants.append(args.grant_account)
-    _secure_file(out, extra_read_grants=grants)
+    if args.generate:
+        print(
+            "Generated a new store key. BACK IT UP OFFLINE — the protected file is bound to this "
+            f"machine and cannot be recovered if the host is lost:\n  {key_b64}",
+            file=sys.stderr,
+        )
     granted = "SYSTEM" + (f" + {args.grant_account!r}" if args.grant_account else "")
     print(
         f"Wrote DPAPI-protected key to {out} (read-granted to {granted}).\n"
@@ -5937,6 +5977,28 @@ def _refuse_an_unauditable_write(store: Store) -> None:
         raise _UnauditableWrite(
             f"refusing to write anything: this command's audit row would be refused ({refusal})"
         )
+
+
+def _key_file_access_gate(path: str, *, what: str, remedy: str, enforcing: bool) -> bool:
+    """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
+
+    The file must not be readable by a broad account (``restricted_file.broad_read_problem``, which
+    also reports a file whose access could not be read). Under ``[security].enforcement = enforce``
+    a problem is an error and the answer is ``False``; under ``warn`` it is a warning and the start
+    goes on. ``what`` names the file for the operator and ``remedy`` says what to do about it."""
+    from messagefoundry.restricted_file import broad_read_problem
+
+    problem = broad_read_problem(Path(path))
+    if problem is None:
+        return True
+    if enforcing:
+        print(
+            f"error: {what} is not restricted: {problem}. {remedy}; refusing to start.",
+            file=sys.stderr,
+        )
+        return False
+    print(f"warning: {what} is not restricted: {problem}. {remedy}.", file=sys.stderr)
+    return True
 
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
