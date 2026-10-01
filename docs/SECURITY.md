@@ -1992,7 +1992,8 @@ it, and the start failure is `safe_exc()` text. A holder of `messages:view_summa
 until the `reveal=<connection name>` act, which lifts the error on every row of that name. A name
 can be both an inbound and an outbound, so that act can lift two rows. It needs
 `messages:view_summary`, charges the PHI-read budget, and writes a `connection_error_reveal` audit
-row. The `status` word and the `errored` count stay readable, so an operator can still tell that a
+row. A channel-scoped caller that names a connection outside its scope, any outbound included, gets
+403 and an `auth.channel_denied` row, as on `GET /connections/{name}/events`. The `status` word and the `errored` count stay readable, so an operator can still tell that a
 connection failed.
 
 **`ConnectionMetadata.error` is still outside the map, and that is a known gap.**

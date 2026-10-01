@@ -479,6 +479,7 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
         assert failed[0]["direction"] == "out"
         assert failed[0]["error"] is None
         revealed = [row for row in shown if row["status"] == "failed" and "bad_out" in row["name"]]
+        assert revealed, f"the operator's reveal returned no failed bad_out row: {shown}"
         assert "out_dir" in (revealed[0]["error"] or "")
     finally:
         await engine.stop()

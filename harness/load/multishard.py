@@ -735,8 +735,11 @@ def _attribute_engines_sync(
             # guaranteed and a default would only ever mask a RENAME -- after which this would report
             # "no failed lanes" forever, silently, on exactly the runs it exists to explain. A
             # diagnostic field that fails closed to "nothing to report" is worse than no field.
-            if row.error:
-                failed.append(f"{row.name}: {reasons.get(row.channel_id, row.error)}")
+            # Detection also reads `status`, because `error` is null for a caller without
+            # messages:view_summary (BACKLOG #2443) and the failure must not vanish with it.
+            if _lane_failed(row):
+                reason = reasons.get(row.channel_id) or row.error or "(reason withheld)"
+                failed.append(f"{row.name}: {reason}")
         out.append(
             EngineAttribution(node.node_id, tag, inbound_rows, foreign_rows, reads, tuple(failed))
         )
@@ -746,6 +749,15 @@ def _attribute_engines_sync(
 #: How many failed lanes per engine get their reason revealed. Each reveal is one audited PHI read
 #: that spends the per-actor budget, so a run with every lane down must not spend it all here.
 _REVEAL_FAILED_CAP = 5
+
+#: The dashboard statuses that mean "this lane is not listening, and the engine knows why".
+_NOT_LISTENING = frozenset({"failed", "filtered"})
+
+
+def _lane_failed(row: ConnectionRow) -> bool:
+    """True for an inbound lane the engine reports as not listening. Keyed on ``status`` as well as
+    ``error``: ``error`` is null for a caller without ``messages:view_summary`` (BACKLOG #2443)."""
+    return row.status in _NOT_LISTENING or bool(row.error)
 
 
 def _reveal_failed_reasons(client: EngineClient, rows: list[ConnectionRow]) -> dict[str, str]:
@@ -757,7 +769,7 @@ def _reveal_failed_reasons(client: EngineClient, rows: list[ConnectionRow]) -> d
     masked value: that still says the lane failed, which is the half the diagnosis needs most."""
     from messagefoundry.apiclient import ApiError
 
-    names = [r.channel_id for r in rows if r.read is not None and r.error]
+    names = [r.channel_id for r in rows if r.read is not None and _lane_failed(r)]
     out: dict[str, str] = {}
     for name in names[:_REVEAL_FAILED_CAP]:
         try:

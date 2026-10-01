@@ -354,16 +354,16 @@ def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> No
     # BACKLOG #2443 step 4 added the connections dashboard's per-connection reveal, pinned the same
     # way: it lifts ConnectionRow's error-text set on the rows of the one name the request gives.
     per_conn = re.findall(
-        r"return revealable\(ConnectionRow, summary=False, error_text=_row_conn\(row\) == reveal\)",
-        source,
+        r"lift = revealable\(ConnectionRow, summary=False, error_text=True\)", source
     )
     assert len(per_conn) == 1, f"expected the one per-connection reveal set, found {per_conn}"
-    assert source.count("revealed=lifted(r)") == 1, "the per-connection set has one call site"
+    conn_sites = re.findall(r"revealed=lift if _row_conn\(r\) == reveal else _NO_REVEAL", source)
+    assert len(conn_sites) == 1, f"expected the one per-connection reveal site, found {conn_sites}"
     # Every other reveal site reads one of those sets, and together they cover all three models.
     sites = [
         s
         for s in re.findall(r"revealed=([^\n,]+?)(?=[,)\n])", source)
-        if not s.startswith(("revealable(type(i", "lifted("))
+        if not s.startswith(("revealable(type(i", "lift if _row_conn("))
     ]
     models = [m.group(1) for m in (re.fullmatch(r"reveal\[(\w+)\]", s) for s in sites) if m]
     assert len(models) == len(sites), (

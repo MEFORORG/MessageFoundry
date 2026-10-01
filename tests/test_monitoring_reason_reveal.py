@@ -15,17 +15,19 @@ start, revealed per connection name with ``reveal=<name>``. The same two control
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.api.field_authz import redact_unauthorized
-from messagefoundry.api.models import AlertInstanceInfo
+from messagefoundry.api.models import AlertInstanceInfo, ConnectionRow
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider
 from messagefoundry.auth.service import AuthService
@@ -84,7 +86,9 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
-async def _add(service: AuthService, username: str, role: Role) -> None:
+async def _add(
+    service: AuthService, username: str, role: Role, *, scope: list[str] | None = None
+) -> None:
     user_id = await create_local_user_chosen(
         service,
         username=username,
@@ -94,7 +98,7 @@ async def _add(service: AuthService, username: str, role: Role) -> None:
         roles=[role.value],
         actor="test",
     )
-    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
+    await service.set_channel_scope(user_id, scope or [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
@@ -314,13 +318,15 @@ async def dash(tmp_path: Path) -> AsyncIterator[Engine]:
     from messagefoundry.config.wiring import Registry
 
     eng = await Engine.create(tmp_path / "dash.db", poll_interval=0.02)
-    reg = Registry()
-    reg.add_outbound(_broken_outbound("OB_A"))
-    reg.add_outbound(_broken_outbound("OB_B"))
-    eng.add_registry(reg)
-    await eng.start()  # degraded on both outbounds; does NOT raise (ADR 0031)
-    yield eng
-    await eng.stop()
+    try:
+        reg = Registry()
+        reg.add_outbound(_broken_outbound("OB_A"))
+        reg.add_outbound(_broken_outbound("OB_B"))
+        eng.add_registry(reg)
+        await eng.start()  # degraded on both outbounds; does NOT raise (ADR 0031)
+        yield eng
+    finally:
+        await eng.stop()
 
 
 def _failed_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -425,3 +431,99 @@ async def test_a_reveal_of_a_name_not_on_the_dashboard_is_audited_as_revealing_n
             "revealed": [],
         }
     ]
+
+
+async def test_a_scoped_caller_revealing_a_connection_outside_its_scope_is_refused(
+    dash: Engine,
+) -> None:
+    """As on ``GET /connections/{name}/events``: an out-of-scope name is a channel denial, refused
+    and audited as one, never answered as a reveal of nothing. An outbound spans channels, so a
+    scoped caller is refused every outbound name. The bare load is the control: it still answers."""
+    service = await _service(dash)
+    await _add(service, "scoped", Role.OPERATOR, scope=["IB_MINE"])
+    async with _client(dash, service) as c:
+        h = await _login(c, "scoped")
+        assert (await c.get("/connections", headers=h)).status_code == 200
+        refused = await c.get("/connections", params={"reveal": "OB_A"}, headers=h)
+        assert refused.status_code == 403
+    audits = [dict(a) for a in await dash.store.list_audit(limit=200)]
+    assert [a["channel_id"] for a in audits if a["action"] == "auth.channel_denied"] == ["OB_A"]
+    assert await _reveal_audits(dash, "connection_error_reveal") == []
+
+
+async def test_the_stats_socket_pushes_the_dashboard_rows_masked(dash: Engine) -> None:
+    """``/ws/stats`` hands the console's renderer the same rows as ``GET /connections``. The renderer
+    reads no ``error`` today, so the rows must arrive redacted rather than rely on that."""
+    from tests.test_ws_stats_revalidation import (
+        _HARNESS_TIMEOUT,
+        _wait_for_first_frame,
+        _WSHarness,
+    )
+
+    service = await _service(dash)
+    await _add(service, "op", Role.OPERATOR)
+    token = (await service.login("op", PW)).token
+    assert token is not None
+    app = create_app(dash, auth=service)
+    seen: list[ConnectionRow] = []
+
+    def render(rows: list[ConnectionRow]) -> str:
+        seen.extend(rows)
+        return ""
+
+    app.state.ui_connections_render = render
+    harness = _WSHarness(app, token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    try:
+        await _wait_for_first_frame(harness, task)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    errors = {r.destination: r.error for r in seen if r.role == "destination"}
+    assert errors.get("OB_A") == "****" and errors.get("OB_B") == "****", errors
+
+
+def _source_row(name: str, status: str, error: str | None) -> ConnectionRow:
+    return ConnectionRow(
+        role="source",
+        channel_id=name,
+        channel_name=name,
+        destination=None,
+        name=f"{name} in",
+        status=status,
+        direction="in",
+        method="MLLP",
+        peer=None,
+        port=None,
+        queue_depth=None,
+        idle_seconds=None,
+        alerts_active=0,
+        errored=0,
+        read=0,
+        written=None,
+        backlog_seconds=None,
+        delivered_age_seconds=None,
+        error=error,
+    )
+
+
+def test_the_multishard_attribution_finds_a_failed_lane_by_status_and_reveals_its_reason() -> None:
+    """The load harness explains a ``reads == 0`` run with each failed lane's reason. With the error
+    null (a caller without ``messages:view_summary``), the lane must still be found by its status,
+    and its reason must come from a per-lane reveal. The running lane is the control: no reveal."""
+    from harness.load.multishard import _lane_failed, _reveal_failed_reasons
+
+    masked = [_source_row("IB_E0_A", "failed", None), _source_row("IB_E0_B", "running", None)]
+    calls: list[str | None] = []
+
+    class _Client:
+        def connections(self, *, reveal: str | None = None) -> list[ConnectionRow]:
+            calls.append(reveal)
+            reason = "bind refused on port 2575" if reveal == "IB_E0_A" else None
+            return [_source_row("IB_E0_A", "failed", reason), masked[1]]
+
+    assert _lane_failed(masked[0]) and not _lane_failed(masked[1])
+    reasons = _reveal_failed_reasons(cast(Any, _Client()), masked)
+    assert reasons == {"IB_E0_A": "bind refused on port 2575"}
+    assert calls == ["IB_E0_A"]

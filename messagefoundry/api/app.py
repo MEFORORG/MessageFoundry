@@ -467,6 +467,9 @@ _log = logging.getLogger(__name__)
 #: The two monitoring rows whose ``reason`` is masked until a per-item reveal (BACKLOG #2443).
 _ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 
+#: The reveal set of every connections-dashboard row the request did not name (BACKLOG #2443).
+_NO_REVEAL: frozenset[str] = frozenset()
+
 
 def _matched_route_path(request: Request) -> str | None:
     """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
@@ -2425,6 +2428,12 @@ def create_app(
         as ``connection_error_reveal``. The ``status`` word and the ``errored`` count stay
         readable, so an operator can still tell that a connection failed."""
         await _admit_reveal(request, identity, reveal)
+        # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
+        # outside the caller's scope is refused and audited, not answered as "revealed nothing".
+        # A scoped caller is refused every outbound name, since an outbound spans channels.
+        if reveal is not None and not identity.can_access_channel(reveal):
+            await _audit_channel_denied(engine, identity, reveal, client_ip(request))
+            raise HTTPException(403, "not authorized for this connection")
         out = await _dashboard_rows(engine, identity, reveal=reveal)
         if reveal is not None:
             # The audit records what the response carried, not what was asked for: a name that is
@@ -2460,12 +2469,15 @@ def create_app(
         """The dashboard rows, channel-scoped, with ``error`` gated and masked on every row and
         lifted on the rows of the ONE connection ``reveal`` names (BACKLOG #2443). The caller has
         already passed :func:`_admit_reveal` for any ``reveal``; the stats socket passes none."""
-
-        def lifted(row: ConnectionRow) -> frozenset[str]:
-            return revealable(ConnectionRow, summary=False, error_text=_row_conn(row) == reveal)
-
+        # Built once, not per row: the stats socket runs this every second for every open dashboard.
+        lift = revealable(ConnectionRow, summary=False, error_text=True)
         rows = await _connection_rows(engine, identity)
-        return [redact_unauthorized(r, identity, revealed=lifted(r)) for r in rows]
+        return [
+            redact_unauthorized(
+                r, identity, revealed=lift if _row_conn(r) == reveal else _NO_REVEAL
+            )
+            for r in rows
+        ]
 
     async def _connection_rows(engine: Engine, identity: Identity) -> list[ConnectionRow]:
         """The UNREDACTED dashboard rows, already channel-scoped. Only :func:`_dashboard_rows`
@@ -5997,7 +6009,7 @@ def create_app(
         # Per-channel RBAC (#76 review — SECURITY): a channel-scoped caller must NOT see shared-outbound
         # topology or its live status — an outbound spans channels, so its running/failed/filtered state
         # can reflect ANOTHER channel's downstream. This mirrors the connections dashboard EXACTLY, which
-        # shows a scoped user NO destination (outbound) rows at all (see list_connections: `if scoped:
+        # shows a scoped user NO destination (outbound) rows at all (see _connection_rows: `if scoped:
         # continue`). So a scoped user sees only the inbound → router → handler subgraph reachable from
         # their accessible inbound connections: the BFS never traverses INTO an outbound node (dropping
         # every shared-outbound node AND its handler→outbound edges), nor into a pass-through inbound the

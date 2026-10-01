@@ -1505,9 +1505,7 @@ class ConnectionMetadata(BaseModel):
     simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
     # Why this connection failed to start (ADR 0031) or was DR-parked (ADR 0048). Rated in
     # docs/PHI.md section 2 (BACKLOG #1185). NOT yet gated or masked, unlike ConnectionRow.error
-    # (BACKLOG #2443): this model cannot simply become a PhiGatedModel, because the gate's shared
-    # serializer covers every field named ``metadata`` and types it ``str | None``, and this
-    # ``metadata`` is a dict.
+    # (BACKLOG #2443); docs/SECURITY.md "Field-level (property) authorization" says why.
     error: str | None = None
 
 

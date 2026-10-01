@@ -102,7 +102,7 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     # The connections dashboard row (BACKLOG #2443, step 4). ``GET /connections`` needs only
     # ``monitoring:read``, and ``error`` is why a connection failed to start: the same ``safe_exc``
     # text whose stored copy is an alert reason. ``ConnectionMetadata.error`` carries the same
-    # string and is NOT mapped yet; see that model's comment.
+    # string and is NOT mapped yet; docs/SECURITY.md "Field-level (property) authorization" says why.
     ConnectionRow: {
         "error": Permission.MESSAGES_VIEW_SUMMARY,
     },
