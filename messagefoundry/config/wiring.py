@@ -151,6 +151,7 @@ __all__ = [
     "validate_config",
     "accepted_cleartext_hops",
     "expiry_relaxed_hops",
+    "path_form_fhir_updates",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
     "overbroad_smart_scopes",
@@ -2634,6 +2635,9 @@ def FHIR(
     | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
     | None = None,  # search params for if-none-exist / conditional-update (e.g. "identifier=sys|val")
+    update_url_form: Literal[
+        "transaction", "path"
+    ] = "transaction",  # how an update/if-match is sent; "path" puts the id in the URL (a listed loosening)
     headers: dict[str, str]
     | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (SMART/OAuth; use env())
@@ -2675,7 +2679,11 @@ def FHIR(
     ``conditional-update`` (search-based ``PUT`` with ``conditional_query`` in the URL), ``if-match``
     (version-aware update, sent like ``update``, whose ETag is derived from the resource's
     ``meta.versionId`` and carried in the entry's ``request.ifMatch``). An ``update`` or ``if-match``
-    connection needs a server that supports the ``transaction`` interaction. A 2xx is delivered;
+    connection needs a server that supports the ``transaction`` interaction, unless it sets
+    ``update_url_form="path"``, the plain ``PUT {base}/{ResourceType}/{id}`` with the ETag in an
+    ``If-Match`` header. That opt-in puts the message-derived id back in the URL, so it is a listed
+    loosening, warned at every construction and named by ``messagefoundry check`` (vault BACKLOG
+    #2550; docs/SECURITY-LOOSENING.md). A 2xx is delivered;
     5xx / a transient OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter.
     Redirects are refused and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
@@ -2699,6 +2707,7 @@ def FHIR(
             "interaction": interaction,
             "conditional": conditional,
             "conditional_query": conditional_query,
+            "update_url_form": update_url_form,
             "headers": headers or {},
             "bearer_token": bearer_token,
             "basic_user": basic_user,
@@ -5048,6 +5057,24 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
         (oc.name, _peer_label(oc.spec.settings))
         for oc in registry.outbound.values()
         if oc.spec.settings.get("tls_allow_expired")
+    )
+
+
+def path_form_fhir_updates(registry: Registry) -> list[str]:
+    """Every outbound ``FHIR()`` connection that sets ``update_url_form="path"`` (vault BACKLOG #2550).
+
+    The single reader of that set, on the contract of :func:`expiry_relaxed_hops`: ``messagefoundry
+    check`` reads it, and any later surface must read it too, so they cannot disagree. Sorted by name.
+
+    The path form puts each message's resource id in the request URL, which owner ruling R3 (ASVS
+    14.2.1) keeps out of it by default. It is an interoperability relaxation for a server with no
+    ``transaction`` interaction, reported rather than refused, as ``tls_allow_expired`` is.
+
+    Pure: it reads the loaded graph and touches nothing else."""
+    return sorted(
+        oc.name
+        for oc in registry.outbound.values()
+        if oc.spec.type == ConnectorType.FHIR and oc.spec.settings.get("update_url_form") == "path"
     )
 
 
