@@ -8,7 +8,7 @@ then finding what is exposed. This page feeds both for MessageFoundry.
 It is a map, so it restates as little as it can. If this page and a linked document disagree, the
 code decides.
 
-Three limits apply to the whole page:
+These limits apply to the whole page:
 
 - It describes the engine as shipped. What a deployment would expose depends on its configuration.
   [Read your own instance's lists](#read-your-own-instances-lists) says how to get that.
@@ -86,22 +86,35 @@ A host firewall is the layer under all of this. For the "No list" rows, the engi
 allow-list of its own. [ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) lists ports
 for some of these hops. It says to mirror each outbound firewall rule with its allow-list entry.
 
-## Two guards stop `serve`, and a third stops one listener
+## Startup guards stop `serve`, and a listener guard stops only its own Connection
 
-[DEPLOYMENT.md](DEPLOYMENT.md#bind-guard-behavior-summary) describes each guard and its override,
+[DEPLOYMENT.md](DEPLOYMENT.md#bind-guard-behavior-summary) describes the guards and their overrides,
 and [Before you expose off-loopback](DEPLOYMENT.md#before-you-expose-off-loopback) is the checklist.
-A deploying site would meet at least these:
+Under the default `[security].enforcement = enforce`, `serve` would exit with code 2, before it
+starts the web server, on at least these:
 
-| Guard | What it refuses | What happens |
-|---|---|---|
-| Operator bind | A non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator | `serve` exits with code 2 before it starts the web server |
-| Open egress | Under the default `[security].enforcement = enforce`, outbound egress that is fully open: no destination list is populated and `[security].block_unlisted_outbound` is not set to true | `serve` exits with code 2 |
-| Listener bind | A non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS. Raw TCP and X12 have no TLS to turn on | That listener does not bind, and its Connection shows as failed. The engine keeps running |
+| Guard | What it refuses |
+|---|---|
+| Sign-in off | `[security].require_sign_in = false` on an exposed instance. Exposed means a non-loopback operator bind or a declared TLS terminator (`[api].tls_terminated_upstream`) |
+| Operator bind | A non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator |
+| Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
+| Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
+| Proxy attestations | A non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
+| Open egress | Outbound egress that is fully open: no destination list is populated and `[security].block_unlisted_outbound` is not set to true |
 
-So a running engine does not prove that every listener passed. The listener check runs when each
-inbound Connection starts, in `RegistryRunner` in `messagefoundry/pipeline/wiring_runner.py`. A
-Connection that sets `tls_hop_attested` with a reason crosses the listener guard, and the engine
-reports it as a loosening.
+`serve` refuses on more than this table. It also checks at least the web console on an exposed
+instance, `[security].require_mfa` turned off on an exposed instance, and off-box log forwarding.
+The checklist covers those settings. So clearing one guard does not mean `serve` starts. A site that
+sets `[api].tls_cert_file` on a network bind would meet the revocation guard next.
+
+A listener guard is different: it stops one listener, and `serve` keeps going. A non-loopback MLLP,
+HTTP, DICOM, raw TCP or X12 listener that has no TLS does not bind, and its Connection shows as
+failed. Raw TCP and X12 have no TLS to turn on. A Connection that sets `tls_hop_attested` with a
+reason crosses this guard, and the engine reports it as a loosening. At least two more listener
+checks act the same way under `enforce`: client-certificate revocation on a mutual-TLS listener, and
+peer control on a non-loopback HTTP listener. These checks run when each inbound Connection starts,
+in `RegistryRunner` in `messagefoundry/pipeline/wiring_runner.py`. So a running engine does not
+prove that every listener passed.
 
 **The operator socket serves TLS in every topology but one.** With no operator certificate, the
 engine mints a self-signed pair on first run and serves TLS with it. The exception is
@@ -116,8 +129,11 @@ by default, which means no restriction. At least these limits apply:
 
 - The check runs after the engine accepts the connection.
 - `/health` is exempt, and loopback is always allowed.
-- Behind a proxy the engine was not told about, or behind address translation, every client shows
-  the same address. The list then passes all of them or none.
+- It does nothing behind a proxy on the engine host that the engine was not told about. Every
+  request then shows a loopback address, so the list admits all of them and refuses none. The engine
+  logs a warning once it has seen that pattern. The warning detects the gap and does not close it.
+- Behind an undeclared proxy on another host, or behind address translation, every client shows one
+  address that is not loopback. The list then passes all of them or none.
 - It does not cover the inbound Connection listeners. Each of those takes its own
   `source_ip_allowlist`.
 
@@ -145,7 +161,7 @@ No one command gives the whole answer. Each row below has a stated gap.
 | Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` | It imports the config modules, so it runs their code. It prints each Connection's type and authored settings. It does not print the bind address, and an `env()` value shows as a placeholder |
 | What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It shows no bind address, and it fills a port for MLLP rows only. It shows only what the caller's scope and the answering engine shard cover |
 | Which protective switches are off on a running engine? | `GET /security/posture` | It reports the engine shard that answers |
-| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the `[security]` table of the authored file only. It leaves out at least `MEFOR_SECURITY_*` environment overrides, a `serve --host` override and every per-Connection loosening. Its `loosenings_scope` field names some of these gaps |
+| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | Its `values` and `set` fields are the `[security]` table of the authored file. Its loosening list also reads `[store]`, `[auth]`, `[alerts]`, `[secret_rotation]` and `[api]`, and for those five it applies the `MEFOR_*` variables of the shell that runs it, which may differ from the service's. It leaves out at least `MEFOR_SECURITY_*` environment overrides, a `serve --host` override and every per-Connection loosening. Its `loosenings_scope` field names some of these gaps |
 | Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` | It also runs the config modules. It opens no store |
 
 ## `messagefoundry verify` does not measure exposure
@@ -175,7 +191,7 @@ rest of its limits.
 
 | Input | Document | What to take from it |
 |---|---|---|
-| Component inventory | [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) | Each release carries a software bill of materials (SBOM) for Linux and one for Windows, a Vulnerability Exploitability eXchange (VEX) file, and signatures. Scan the SBOM for the platform you run. It covers the engine's core install only. It leaves out the optional extras, the web console wheel and the toolkit wheel |
+| Component inventory | [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) | Each release carries a software bill of materials (SBOM) for Linux and one for Windows, a Vulnerability Exploitability eXchange (VEX) file, and signatures. Scan the SBOM for the platform you run. It covers the engine's core install only. It leaves out at least the optional extras, the web console wheel and the toolkit wheel |
 | How the project ranks a dependency vulnerability | [.github/SECURITY.md](../.github/SECURITY.md#dependency-third-party-vulnerabilities) | Known exploited first (the CISA Known Exploited Vulnerabilities list), then the Exploit Prediction Scoring System (EPSS) score. The Common Vulnerability Scoring System (CVSS) score only breaks ties |
 | How long an old version stays covered | [SUPPORT-POLICY.md](SUPPORT-POLICY.md) | Only the latest release is supported, with no back-port. A clock runs on adopting each security release, and the page gives the days |
 
