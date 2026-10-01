@@ -8,9 +8,12 @@ path via importlib rather than imported as a module.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
+
+import pytest
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "security" / "sbom_finalize.py"
 
@@ -175,3 +178,180 @@ def test_no_sys_platform_flag_writes_no_label(tmp_path: Path):
     p = _write_bom(tmp_path)
     assert sbom_finalize.main([str(p)]) == 0
     assert "properties" not in _read(p)["metadata"]
+
+
+# --- vendored packages (BACKLOG #2498) -------------------------------------------------------------
+
+_REPO = _SCRIPT.parents[2]
+_VENDOR = _REPO / "messagefoundry" / "_vendor"
+
+
+def _vendored(doc: dict) -> list[dict]:
+    return [
+        c
+        for c in doc.get("components", [])
+        if str(c.get("bom-ref", "")).startswith(sbom_finalize.VENDORED_REF_PREFIX)
+    ]
+
+
+def _write_rooted_bom(tmp_path: Path) -> Path:
+    """A BOM shaped like cyclonedx-py's: a root bom-ref and a dependency graph hanging off it."""
+    return _write_bom(
+        tmp_path,
+        metadata={
+            "timestamp": "2026-07-21T00:00:00Z",
+            "tools": {"components": [{"name": "cyclonedx-py"}]},
+            "component": {"bom-ref": "root-component", "name": "messagefoundry"},
+        },
+        components=[{"bom-ref": "httpx==0.27.0", "name": "httpx", "version": "0.27.0"}],
+        dependencies=[
+            {"ref": "root-component", "dependsOn": ["httpx==0.27.0"]},
+            {"ref": "httpx==0.27.0"},
+        ],
+    )
+
+
+def test_every_vendored_package_is_in_the_finalized_sbom(tmp_path: Path):
+    """THE GUARD #2498 ASKS FOR: a package under messagefoundry/_vendor the SBOM omits fails here.
+
+    The packages are enumerated from the tree, not from the helper, so a helper that stopped finding
+    one cannot agree with itself. ``cyclonedx-py environment`` lists installed distributions only, so
+    without this a vendored copy is invisible to every scanner reading the SBOM.
+    """
+    packages = sorted(p.name for p in _VENDOR.iterdir() if (p / "__init__.py").is_file())
+    assert "defusedxml" in packages, f"the enumeration found {packages}; it has gone blind"
+    p = _write_rooted_bom(tmp_path)
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    listed = {
+        prop["value"]
+        for c in _vendored(_read(p))
+        for prop in c.get("properties", [])
+        if prop["name"] == sbom_finalize.VENDORED_PROPERTY
+    }
+    missing = [n for n in packages if f"messagefoundry._vendor.{n}" not in listed]
+    assert not missing, f"vendored packages missing from the finalized SBOM: {missing}"
+
+
+def _upstream_sha256(path: Path) -> str:
+    """The SHA-256 of ``path`` as upstream shipped it: a vendored module loses its two header lines."""
+    data = path.read_bytes()
+    if path.suffix == ".py":
+        data = b"".join(data.splitlines(keepends=True)[2:])
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_the_defusedxml_component_carries_the_upstream_record(tmp_path: Path):
+    """Name, version, licence and purl are what a scanner matches an advisory on. The file digests
+    are checked against the files themselves, not against the README the helper read them from."""
+    p = _write_rooted_bom(tmp_path)
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    [c] = [c for c in _vendored(_read(p)) if c["name"] == "defusedxml"]
+    assert c["type"] == "library"
+    assert c["version"] == "0.7.1"
+    assert c["purl"] == "pkg:pypi/defusedxml@0.7.1"
+    assert c["licenses"] == [{"license": {"id": "PSF-2.0"}}]
+    [dist] = [r for r in c["externalReferences"] if r["type"] == "distribution"]
+    assert dist["url"].endswith("/defusedxml-0.7.1.tar.gz")
+    assert dist["hashes"] == [{"alg": "SHA-256", "content": _DEFUSEDXML_SDIST_SHA256}]
+    files = {f["name"]: f["hashes"][0]["content"] for f in c["components"]}
+    assert set(files) == {"common.py", "ElementTree.py", "LICENSE"}
+    for name, digest in files.items():
+        assert digest == _upstream_sha256(_VENDOR / "defusedxml" / name), name
+
+
+#: The digest uv.lock records for the defusedxml 0.7.1 sdist, which the README restates.
+_DEFUSEDXML_SDIST_SHA256 = "1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69"
+
+
+def test_vendoring_is_idempotent_and_hangs_off_the_root(tmp_path: Path):
+    """A re-run must leave one component and one edge, or a consumer counts the copy twice."""
+    p = _write_rooted_bom(tmp_path)
+    for _ in range(2):
+        assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    doc = _read(p)
+    refs = [c["bom-ref"] for c in _vendored(doc)]
+    assert len(refs) == len(set(refs)) == 1
+    [root] = [d for d in doc["dependencies"] if d["ref"] == "root-component"]
+    assert root["dependsOn"] == ["httpx==0.27.0", *refs]
+    assert [d for d in doc["dependencies"] if d["ref"] in refs] == [{"ref": r} for r in refs]
+    assert {"bom-ref": "httpx==0.27.0", "name": "httpx", "version": "0.27.0"} in doc["components"]
+
+
+def test_a_resolver_emitted_copy_of_the_same_package_is_kept(tmp_path: Path):
+    """An extra (x12's pyx12) can install upstream defusedxml too. That is a second, real copy, so
+    the vendored component sits beside it rather than replacing it."""
+    resolved = {"bom-ref": "defusedxml==0.7.1", "name": "defusedxml"}
+    p = _write_bom(tmp_path, components=[resolved])
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    refs = [c.get("bom-ref") for c in _read(p)["components"] if c["name"] == "defusedxml"]
+    assert refs == ["defusedxml==0.7.1", "messagefoundry-vendored:defusedxml@0.7.1"]
+
+
+def test_no_vendored_flag_adds_no_component(tmp_path: Path):
+    """The npm and container SBOMs call this helper without the flag and must not gain one."""
+    p = _write_bom(tmp_path)
+    assert sbom_finalize.main([str(p)]) == 0
+    assert _vendored(_read(p)) == []
+
+
+def _fake_vendor(tmp_path: Path, readme: str | None) -> Path:
+    vendor = tmp_path / "_vendor"
+    pkg = vendor / "fakepkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    if readme is not None:
+        (pkg / "README.md").write_text(readme, encoding="utf-8")
+    return vendor
+
+
+_GOOD_README = (_VENDOR / "defusedxml" / "README.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("readme", "needle"),
+    [
+        (None, "no readable README.md"),
+        (_GOOD_README.replace("| Upstream version |", "| Version |"), "upstream"),
+        (_GOOD_README.replace("SPDX `PSF-2.0`", "PSF-2.0"), "licence"),
+        (_GOOD_README.replace("| sdist SHA-256 |", "| sdist hash |"), "sdist_sha256"),
+        (
+            "\n".join(ln for ln in _GOOD_README.splitlines() if not ln.startswith("| `")),
+            "per-file upstream SHA-256 rows",
+        ),
+    ],
+    ids=["no-readme", "no-version", "no-licence", "no-sdist-hash", "no-file-rows"],
+)
+def test_a_vendored_package_the_readme_cannot_describe_fails_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], readme: str | None, needle: str
+):
+    """Fail closed: a package missing from the SBOM must not be one README edit away from silent.
+    The BOM is left untouched, so a release step stops before it ships a partial one."""
+    p = _write_bom(tmp_path)
+    before = p.read_bytes()
+    rc = sbom_finalize.main([str(p), "--vendored-from", str(_fake_vendor(tmp_path, readme))])
+    assert rc == 1
+    assert needle in capsys.readouterr().err
+    assert p.read_bytes() == before
+
+
+def test_the_unedited_readme_is_accepted(tmp_path: Path):
+    """The positive control for the arms above: the same harness, the README unedited."""
+    p = _write_bom(tmp_path)
+    vendor = _fake_vendor(tmp_path, _GOOD_README)
+    assert sbom_finalize.main([str(p), "--vendored-from", str(vendor)]) == 0
+    [c] = _vendored(_read(p))
+    assert c["properties"] == [{"name": sbom_finalize.VENDORED_PROPERTY, "value": "fakepkg"}]
+
+
+def test_an_empty_or_missing_vendor_dir_fails(tmp_path: Path):
+    """A flag that claims vendored code and finds none is a broken call, not a clean result."""
+    p = _write_bom(tmp_path)
+    (tmp_path / "empty").mkdir()
+    assert sbom_finalize.main([str(p), "--vendored-from", str(tmp_path / "empty")]) == 1
+    assert sbom_finalize.main([str(p), "--vendored-from", str(tmp_path / "absent")]) == 1
+
+
+def test_vendoring_refuses_a_pre_1_5_bom(tmp_path: Path):
+    """externalReferences[].hashes, which carries the sdist digest, arrived in CycloneDX 1.5."""
+    p = _write_bom(tmp_path, specVersion="1.4")
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 1

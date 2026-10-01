@@ -568,7 +568,8 @@ jobs:
             --output-format JSON --output-file sbom-python.cdx.json
           # Declare the SBOM lifecycle (CISA "Build" type) + backfill the hatchling-dynamic root version.
           python scripts/security/sbom_finalize.py sbom-python.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
       - name: Generate the VS Code extension SBOM (npm, install-free)
         # if: always() so a Python-SBOM failure above doesn't skip this independent generator.
         if: always()
@@ -647,7 +648,31 @@ jobs:
             --pyproject pyproject.toml --mc-type application \
             --output-format JSON --output-file sbom-python-windows.cdx.json
           python scripts/security/sbom_finalize.py sbom-python-windows.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
+      - name: Score the Windows SBOM's quality (sbomqs -- advisory)
+        # The dry-run for release.yml's score of the Windows SBOM (BACKLOG #2521). Without it, sbomqs
+        # first read a Windows-resolved SBOM at a tag. The release scores this file with the LINUX
+        # build of the same sbomqs version; this runner takes the Windows build, so a fault in one
+        # platform's binary alone would not show here. The file it reads is what this rehearses.
+        # Advisory, like `sbom`'s score: continue-on-error, and the upload below runs `if: always()`.
+        continue-on-error: true
+        shell: bash
+        run: |
+          # PINNED IN-REPO, as release.yml's sbomqs step is, rather than verified against a
+          # checksums.txt from the asset's own origin. Keep VER equal to release.yml's. Recorded
+          # 2026-09-30 from three routes that agreed: checksums.txt, the releases API `digest` field,
+          # and sha256sum over the downloaded tarball. Bump VER and the digest in one commit.
+          VER=2.0.11
+          SBOMQS_SHA256=55777d63d76805bef8ff7f59c41ebf7741cd601de508b00437c593cd3bfa2ebb
+          asset="sbomqs_${VER}_Windows_x86_64.tar.gz"
+          base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
+          echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
+          # A relative archive name: Git Bash's tar reads a `D:\...` path as a remote host.
+          tar -xzf "${asset}" sbomqs.exe
+          ./sbomqs.exe score -b sbom-python-windows.cdx.json
+          ./sbomqs.exe compliance --ntia sbom-python-windows.cdx.json || true
       - name: Upload the Windows SBOM artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

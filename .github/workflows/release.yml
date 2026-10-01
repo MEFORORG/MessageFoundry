@@ -129,7 +129,8 @@ jobs:
             --pyproject pyproject.toml --mc-type application \
             --of JSON -o messagefoundry-sbom-windows.cdx.json
           python scripts/security/sbom_finalize.py messagefoundry-sbom-windows.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
 
       - name: Hand the Windows SBOM to the signing job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -139,6 +140,12 @@ jobs:
           # `error`, not `ignore`: the `release` job needs this file, and a missing one must fail HERE
           # with the cause named rather than at a download step two jobs later.
           if-no-files-found: error
+          # A hand-off, not the record: the `release` job downloads it minutes later, then signs it and
+          # attaches it to the GitHub release, which is where an operator gets it (BACKLOG #2521).
+          # A re-run of the `release` job ALONE after a day fails at its download step, by name. Re-run
+          # all jobs instead: `release` rebuilds the Linux SBOM on every run anyway, so this one being
+          # rebuilt too changes nothing it ships.
+          retention-days: 1
 
   release:
     # Source-repo only — and since the MEFORORG cutover, MEFORORG/MessageFoundry IS the source repo.
@@ -708,8 +715,12 @@ jobs:
           # Declare the SBOM's lifecycle (CISA "Build" type / draft-2025 "Generation Context") and backfill
           # the root component's version (hatchling-dynamic, so --pyproject leaves it null). Exits non-zero
           # on a structurally broken BOM, failing the release before it ships one.
+          # --vendored-from lists the third-party code the wheel carries in messagefoundry/_vendor/
+          # (defusedxml), which environment mode cannot see because nothing installs it. It also exits
+          # non-zero when a vendored package's README does not record what its component needs.
           python scripts/security/sbom_finalize.py messagefoundry-sbom.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
 
       - name: Fetch the Windows-resolved SBOM from the sbom-windows job
         # Built on a Windows runner by the unprivileged job above. It lands beside the Linux SBOM and
@@ -786,10 +797,16 @@ jobs:
           # continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG #1698).
           # The Windows-resolved SBOM is scored by the same verified binary: it was built on another
           # runner, but the scoring happens here, behind the same pin.
-          /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json
-          /usr/local/bin/sbomqs score -b messagefoundry-sbom-windows.cdx.json
+          # EACH SCORE RUNS WHATEVER THE OTHER DID (BACKLOG #2521). Under the default `bash -e`, a
+          # failing Linux score used to end the step before the Windows one ran, and continue-on-error
+          # then hid that the second SBOM was never scored. So a failure is remembered, not obeyed,
+          # and the step still ends non-zero, so the run shows the step failed.
+          rc=0
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json || rc=1
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom-windows.cdx.json || rc=1
           /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
           /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom-windows.cdx.json || true
+          exit "$rc"
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |

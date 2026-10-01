@@ -2783,6 +2783,101 @@ def test_the_sbomqs_split_refuses_each_way_back_to_a_green_pin_failure(
     assert any(needle in o for o in offences), f"expected {needle!r} among {offences}"
 
 
+#: The verified binary the release's score step calls, by the absolute path the install put it at.
+_SBOMQS_BIN = "/usr/local/bin/sbomqs"
+
+#: A stand-in for sbomqs: it logs each call to ``calls.log`` and fails a `score` of the file named by
+#: ``FAIL_SCORE``, so the step's control flow runs exactly as written with no binary to download.
+_SBOMQS_STUB = (
+    '#!/bin/sh\necho "$*" >> calls.log\n'
+    'if [ "$1" = score ] && [ "$3" = "${FAIL_SCORE:-}" ]; then exit 1; fi\nexit 0\n'
+)
+
+
+def _run_score_step(tmp_path: Path, body: str, fail: str) -> tuple[int, list[str]]:
+    """Run the release's score step body under the runner's ``bash -e`` with the stub; return
+    (exit code, the sbomqs calls it made)."""
+    assert _SBOMQS_BIN in body, f"the score step no longer calls {_SBOMQS_BIN}"
+    (tmp_path / "sbomqs").write_bytes(_SBOMQS_STUB.encode("utf-8"))
+    (tmp_path / "sbomqs").chmod(0o755)
+    script = tmp_path / "score.sh"
+    # Bytes, never write_text: on Windows a translated \r\n breaks every line of the script.
+    script.write_bytes(body.replace(_SBOMQS_BIN, "./sbomqs").encode("utf-8"))
+    env = {**_posix_tool_env(), "FAIL_SCORE": fail}
+    bash = require_bash(tmp_path, env)
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [bash, "-e", str(script)], cwd=str(tmp_path), env=env, capture_output=True, timeout=60
+    )
+    assert proc.returncode not in (126, 127), explain_returncode(proc.returncode, "the score step")
+    log = tmp_path / "calls.log"
+    calls = log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+    return proc.returncode, calls
+
+
+@pytest.mark.parametrize(
+    ("fail", "mutate", "step_fails", "windows_scored"),
+    [
+        ("messagefoundry-sbom.cdx.json", None, True, True),
+        ("messagefoundry-sbom-windows.cdx.json", None, True, True),
+        ("", None, False, True),
+        # The pre-fix body: the one arm where the hypothesis is false, so the test can fail.
+        ("messagefoundry-sbom.cdx.json", " || rc=1", True, False),
+    ],
+    ids=["linux-fails", "windows-fails", "none-fail", "pre-fix-body-skips-windows"],
+)
+def test_a_failing_sbomqs_score_does_not_skip_the_other_sbom(
+    tmp_path: Path, fail: str, mutate: str | None, step_fails: bool, windows_scored: bool
+) -> None:
+    """BACKLOG #2521 finding 3. Under the runner's ``bash -e``, a failing Linux score used to end
+    the step before the Windows SBOM was scored, and ``continue-on-error`` hid it. The step must
+    score both whatever either does, and still end non-zero when one failed, so the run shows it.
+    """
+    body = str(_release_step(_jobs()["release"], "sbomqs score")["run"])
+    if mutate is not None:
+        assert mutate in body, f"the mutation's anchor {mutate!r} is gone from the live step"
+        body = body.replace(mutate, "")
+    rc, calls = _run_score_step(tmp_path, body, fail)
+    assert (rc != 0) is step_fails, (rc, calls)
+    assert "score -b messagefoundry-sbom.cdx.json" in calls, calls
+    assert ("score -b messagefoundry-sbom-windows.cdx.json" in calls) is windows_scored, calls
+
+
+def test_the_windows_sbom_dry_run_scores_it_with_the_released_sbomqs_version() -> None:
+    """BACKLOG #2521 finding 4. security.yml's `sbom-windows` job is the pre-tag dry-run for this
+    workflow's Windows SBOM, and it once never ran sbomqs on it, so sbomqs first read that file at a
+    tag. Its score step must read the file the job builds, at the version the release pins."""
+    import yaml
+
+    security = yaml.safe_load(
+        (_REPO / ".github" / "workflows" / "security.yml").read_text(encoding="utf-8")
+    )
+    steps = security["jobs"]["sbom-windows"]["steps"]
+    scoring = [s for s in steps if "sbomqs.exe score" in _executed_shell(str(s.get("run") or ""))]
+    assert len(scoring) == 1, f"security.yml's sbom-windows job has {len(scoring)} sbomqs scores"
+    body = _executed_shell(str(scoring[0]["run"]))
+    assert "score -b sbom-python-windows.cdx.json" in body
+    assert "sha256sum -c" in body, "the Windows sbomqs download is not verified"
+
+    def version(text: str) -> str:
+        found = re.findall(r"^\s*VER=(\S+)$", text, re.MULTILINE)
+        assert len(set(found)) == 1, found
+        return found[0]
+
+    install = _release_step(_jobs()["release"], "sha256sum -c")
+    assert version(body) == version(_executed_shell(str(install["run"])))
+
+
+def test_the_windows_sbom_hand_off_is_kept_one_day() -> None:
+    """BACKLOG #2521 finding 6. The artifact is a hand-off between two jobs of one run; the signed
+    copy on the GitHub release is the record, so the default 90-day retention keeps a stray copy."""
+    [upload] = [
+        s
+        for s in _jobs()["sbom-windows"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert upload["with"].get("retention-days") == 1, upload["with"]
+
+
 def test_the_harness_smoke_runs_the_install_resolution_check() -> None:
     """The install legs of BACKLOG #1585 must run on the BUILT wheel, and nothing else shows it.
 

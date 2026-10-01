@@ -130,6 +130,11 @@ LOCK_ONLY_VENVS = (
     ("release.yml", "/tmp/sbomenv"),
     ("security.yml", "/tmp/sbomenv"),
     ("security.yml", "/tmp/lockcheck"),
+    # The Windows SBOM steps' venv (BACKLOG #2521). Missing until then, so an unhashed install into
+    # it passed this rule. `test_sbom_scan_venv_is_created_without_a_seeded_pip` now refuses any
+    # SBOM scan venv that is not listed here.
+    ("release.yml", "$RUNNER_TEMP/sbomenv"),
+    ("security.yml", "$RUNNER_TEMP/sbomenv"),
 )
 
 #: The runners the engine SBOM is built on, one step per runner in each of `release.yml` and
@@ -161,7 +166,11 @@ def _installs_into(venv: str, line: str) -> bool:
     is named before the subcommand. Each command in a ``&&``/``;``/``|`` chain is judged on its own, so
     an earlier install on the same line cannot hide a later one.
     """
-    named = re.compile(rf"{re.escape(venv)}(?:/bin/(?:pip|python)[\d.]*|/)?(?=\s|$)")
+    # Either layout, and an optional closing quote: the Windows steps name
+    # `"$RUNNER_TEMP/sbomenv/Scripts/python.exe"`.
+    named = re.compile(
+        rf'{re.escape(venv)}(?:/(?:bin|Scripts)/(?:pip|python)[\d.]*(?:\.exe)?|/)?"?(?=\s|$)'
+    )
     for command in re.split(r"&&|\|\||[;|]", line):
         match = _PIP_INSTALL.search(command)
         if match is not None and named.search(command[: match.end()]):
@@ -258,14 +267,12 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
     assert not [ln for ln in code if re.search(r"\bensurepip\b", ln)], (
         f"{workflow}'s SBOM step runs ensurepip, which re-seeds the pip `--without-pip` kept out"
     )
-    own_pip = [
-        ln
-        for ln in code
-        if re.search(
-            rf"{re.escape(venv)}/(?:bin|Scripts)/(?:pip|python(?:\.exe)?\s+-m\s+pip)\b", ln
-        )
-    ]
+    own_pip = [ln for ln in code if _own_pip_re(venv).search(ln)]
     assert not own_pip, f"{workflow} installs through the pip-less venv's own pip: {own_pip}"
+    assert (workflow, venv) in LOCK_ONLY_VENVS, (
+        f"{workflow}'s {runner} SBOM scan venv {venv!r} is not in LOCK_ONLY_VENVS, so nothing "
+        "checks that every install into it is hash-verified (BACKLOG #2521)"
+    )
     core = [ln for ln in _installs_in(shell) if "docker/locks/requirements-core.lock" in ln]
     assert len(core) == 1, f"{workflow}'s {runner} SBOM step installs the core lock {core}"
     assert re.search(rf'--python\s+"?{re.escape(venv)}/\S+\s+install\b', core[0]), (
@@ -284,6 +291,77 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
     assert "--record-sys-platform" in finalize[0].split(), (
         f"{workflow}'s {runner} SBOM is finalized without --record-sys-platform: {finalize[0]!r}"
     )
+    # Environment mode cannot see code the wheel carries in its own tree, so without this flag the
+    # SBOM omits the vendored defusedxml the engine parses untrusted XML with (BACKLOG #2498).
+    assert re.search(r"--vendored-from\s+messagefoundry/_vendor(?:\s|$)", finalize[0]), (
+        f"{workflow}'s {runner} SBOM is finalized without --vendored-from messagefoundry/_vendor: "
+        f"{finalize[0]!r}"
+    )
+
+
+def _own_pip_re(venv: str) -> re.Pattern[str]:
+    """A command run through ``venv``'s OWN pip: ``<venv>/bin/pip ...`` or ``<venv>/bin/python -m pip``.
+
+    Either layout, and the interpreter may be double-quoted, as the Windows steps'
+    ``"$RUNNER_TEMP/sbomenv/Scripts/python.exe"`` is (BACKLOG #2521: the quote used to hide it). The
+    OUTER pip's ``--python "<venv>/Scripts/python.exe" install`` is not a match: there the venv's
+    interpreter is an argument, followed by ``install`` rather than ``-m pip``.
+    """
+    return re.compile(
+        rf"{re.escape(venv)}/(?:bin|Scripts)/"
+        rf'(?:pip[\d.]*(?:\.exe)?"?(?=\s|$)|python[\d.]*(?:\.exe)?"?\s+-m\s+pip\b)'
+    )
+
+
+@pytest.mark.parametrize(
+    ("venv", "line", "own"),
+    [
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip install x", True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python -m pip install x", True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python3.14 -m pip install x", True),
+        (
+            "$RUNNER_TEMP/sbomenv",
+            '"$RUNNER_TEMP/sbomenv/Scripts/python.exe" -m pip install x',
+            True,
+        ),
+        ("$RUNNER_TEMP/sbomenv", "$RUNNER_TEMP/sbomenv/Scripts/python.exe -m pip install x", True),
+        ("$RUNNER_TEMP/sbomenv", '"$RUNNER_TEMP/sbomenv/Scripts/pip.exe" install x', True),
+        (
+            "$RUNNER_TEMP/sbomenv",
+            'python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install -r a.lock',
+            False,
+        ),
+        ("/tmp/sbomenv", "python -m pip --python /tmp/sbomenv/bin/python install -r a.lock", False),
+        (
+            "$RUNNER_TEMP/sbomenv",
+            'python -m cyclonedx_py environment "$RUNNER_TEMP/sbomenv/Scripts/python.exe" \\',
+            False,
+        ),
+    ],
+)
+def test_own_pip_pattern_sees_every_spelling(venv: str, line: str, own: bool) -> None:
+    """The SBOM test's own-pip refusal must see a quoted Windows interpreter and miss the outer pip.
+
+    The second half is the control: a pattern that matched every line naming the venv would refuse
+    the one install the pip-less venv is meant to receive.
+    """
+    assert bool(_own_pip_re(venv).search(line)) is own
+
+
+@pytest.mark.parametrize(
+    ("venv", "line"),
+    [
+        (
+            "$RUNNER_TEMP/sbomenv",
+            'python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install -r a.lock',
+        ),
+        ("/tmp/sbomenv", "python -m pip --python /tmp/sbomenv/bin/python install -r a.lock"),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip install x"),
+    ],
+)
+def test_installs_into_sees_a_quoted_windows_interpreter(venv: str, line: str) -> None:
+    """``LOCK_ONLY_VENVS`` checks only the installs this finds, so a miss is a silent pass."""
+    assert _installs_into(venv, line)
 
 
 # --- the release path: every named package must carry a version ------------------------------------
