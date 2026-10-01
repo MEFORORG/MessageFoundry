@@ -20,15 +20,18 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 from tests._root_logging import root_logging_restored
+
+if TYPE_CHECKING:
+    from messagefoundry.config.wiring import _WinConfigSourceProbes
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
@@ -181,27 +184,68 @@ def _force_aad_bind_when_requested() -> Iterator[None]:
         crypto.AesGcmCipher.__init__ = orig_init  # type: ignore[method-assign]
 
 
+#: The one account in the clean read below: it owns every path and it is the engine's own user.
+_SUITE_SID = "S-1-5-21-1-2-3-1001"
+
+
+def _clean_config_source_probes() -> _WinConfigSourceProbes:
+    """Windows config-source readers that report every path clean: owned by the engine's own
+    account, with an access list that grants nobody write."""
+    from messagefoundry.config.wiring import _WinConfigSourceProbes, _WinPathSecurity
+
+    clean = _WinPathSecurity(owner_sid=_SUITE_SID, aces=())
+    return _WinConfigSourceProbes(
+        self_sid=_SUITE_SID, read_path=lambda _path: clean, owner_in_admins=lambda _sid: False
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _allow_insecure_config_source_in_tests() -> Iterator[None]:
+def _read_the_checkout_as_a_clean_config_source() -> Iterator[
+    Callable[[], _WinConfigSourceProbes] | None
+]:
     """The suite loads sample/harness configs from the repo checkout, which is intentionally
     user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``
-    write, so the SEC-003 config-source trust guard would fail-closed on every config load. Set the
-    documented dev/test escape (``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``) so the guard downgrades its
-    production refusal to a warning here. Scoped to win32 only: POSIX checkouts aren't group/world-
-    writable, so the POSIX refusal tests must keep seeing the escape OFF. The guard's own Windows
-    refusal test pins the escape back OFF to assert the fail-closed path. Never set in production."""
+    write, so the SEC-003 config-source trust guard would fail-closed on every config load.
+
+    So on win32 only, the READERS the Windows check consults report a clean owner and access list in
+    this process. The check itself still runs and still decides, at the seam its own tests already
+    use (``_win32_config_source_probes``): a test that hands it a failing read gets the refusal. A
+    test that needs the real access list asks for it with ``real_config_source_readers``, which this
+    fixture yields (``None`` off win32). Scoped to win32 because a POSIX checkout is not
+    group/world-writable, so the Linux leg runs the real check in every test. The anchor-path
+    fixture below is scoped the same way.
+
+    This used to set ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` for the whole session. Vault BACKLOG #2599
+    clamped that escape: it is honoured only with ``MEFOR_SECURITY_ENFORCEMENT=warn`` beside it, and
+    setting the dial for a whole session would move every default-posture test to ``warn``. A child
+    process does not inherit these readers. A test that spawns one over a writable config directory
+    sets both variables in the child's environment itself."""
     if sys.platform != "win32":
-        yield
+        yield None
         return
-    prev = os.environ.get(INSECURE_CONFIG_SOURCE_ESCAPE_ENV)
-    os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = "1"
+    import messagefoundry.config.wiring as wiring
+
+    real = wiring._win32_config_source_probes
+    patch = pytest.MonkeyPatch()
+    patch.setattr(wiring, "_win32_config_source_probes", _clean_config_source_probes)
     try:
-        yield
+        yield real
     finally:
-        if prev is None:
-            os.environ.pop(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, None)
-        else:
-            os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
+        patch.undo()
+
+
+@pytest.fixture
+def real_config_source_readers(
+    monkeypatch: pytest.MonkeyPatch,
+    _read_the_checkout_as_a_clean_config_source: Callable[[], _WinConfigSourceProbes] | None,
+) -> None:
+    """Put the real Windows config-source readers back for one test, so it sees the real access
+    list. A no-op off win32, where the session fixture above installs nothing."""
+    if _read_the_checkout_as_a_clean_config_source is not None:
+        monkeypatch.setattr(
+            "messagefoundry.config.wiring._win32_config_source_probes",
+            _read_the_checkout_as_a_clean_config_source,
+        )
 
 
 #: The env gates that put a session against a live server-DB container. CI sets one of them together
@@ -257,7 +301,7 @@ def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
     stubbed: ``tests/test_anchor_path.py`` calls ``anchor_path.anchor_path_verdict`` directly, and
     its preflight receipts put the real function back. POSIX ``tmp_path`` is a trusted chain (a sticky
     ``/tmp`` holding the runner's own directory), so the Linux leg runs the real check in every
-    anchor test. The insecure-config escape above is scoped to win32 the same way."""
+    anchor test. The config-source readers above are scoped to win32 the same way."""
     if sys.platform != "win32":
         yield
         return

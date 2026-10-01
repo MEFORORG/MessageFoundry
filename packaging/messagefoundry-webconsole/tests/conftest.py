@@ -7,7 +7,7 @@ adjacent ``pyproject.toml`` — ``asyncio_mode="auto"`` + session loop scopes + 
 does NOT inherit the engine's ``tests/conftest.py``. The two pieces of that conftest the relocated
 /ui tests genuinely depend on are reproduced here:
 
-* the win32 config-source escape (``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``) — the ASGI serve/reload
+* the win32 config-source stand-in — the ASGI serve/reload
   tests load ``samples/config`` from the user-writable checkout, which the SEC-003 trust guard would
   otherwise fail-closed on the Windows CI runner; and
 * the teardown-window logging guards (BACKLOG #17) — an ASGI/engine background logger can emit AFTER
@@ -23,14 +23,12 @@ session loop scopes in ``pyproject.toml`` — not here.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
 from messagefoundry.pipeline import Engine
 
 
@@ -43,26 +41,37 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
+#: The one account in the clean read below: it owns every path and it is the engine's own user.
+_SUITE_SID = "S-1-5-21-1-2-3-1001"
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _allow_insecure_config_source_in_tests() -> Iterator[None]:
+def _read_the_checkout_as_a_clean_config_source() -> Iterator[None]:
     """The suite loads sample/harness configs from the repo checkout, which is intentionally
     user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``
-    write, so the SEC-003 config-source trust guard would fail-closed on every config load. Set the
-    documented dev/test escape (``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``) so the guard downgrades its
-    production refusal to a warning here. Scoped to win32 only: POSIX checkouts aren't group/world-
-    writable, so the POSIX refusal keeps seeing the escape OFF. Never set in production."""
+    write, so the SEC-003 config-source trust guard would fail-closed on every config load.
+
+    So on win32 only, the READERS the Windows check consults report a clean owner and access list in
+    this process, as the engine suite's conftest does and for the reason it gives: the
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape this used to set is honoured only at
+    ``[security].enforcement = warn`` now (vault BACKLOG #2599). The check itself still runs. POSIX
+    checkouts aren't group/world-writable, so the Linux leg keeps running the real readers. The
+    check's own tests live in the engine suite."""
     if sys.platform != "win32":
         yield
         return
-    prev = os.environ.get(INSECURE_CONFIG_SOURCE_ESCAPE_ENV)
-    os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = "1"
+    import messagefoundry.config.wiring as wiring
+
+    clean = wiring._WinPathSecurity(owner_sid=_SUITE_SID, aces=())
+    probes = wiring._WinConfigSourceProbes(
+        self_sid=_SUITE_SID, read_path=lambda _path: clean, owner_in_admins=lambda _sid: False
+    )
+    patch = pytest.MonkeyPatch()
+    patch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
     try:
         yield
     finally:
-        if prev is None:
-            os.environ.pop(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, None)
-        else:
-            os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
+        patch.undo()
 
 
 # Minimal source-logger set: every background-component child reaches one of these by propagation, so

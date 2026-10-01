@@ -7041,12 +7041,18 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
 
 
 def _refuse_unsafe_config_source(message: str) -> None:
-    """Raise ``WiringError(message)`` unless the explicit dev/test escape is set, then warn instead.
+    """Raise ``WiringError(message)`` unless the dev/test escape is honoured, then warn instead.
 
     Fail-closed by default: a PHI service must not execute config Python a low-privileged user can
     rewrite. ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (off by default; never set in production)
     downgrades the refusal to a loud warning for a user-writable dev/CI checkout. Symmetric across the
     POSIX and Windows guards.
+
+    **The escape is clamped (vault BACKLOG #2599).** It is honoured only with
+    ``MEFOR_SECURITY_ENFORCEMENT=warn`` in the same environment. Under ``enforce`` it is inert and the
+    refusal names it, so an operator who set it learns why it did nothing.
+    :func:`~messagefoundry.config.settings.insecure_config_source_escape_permitted` owns the rule and
+    the reasoning. Every load passes through here, so no entry point can skip the clamp.
 
     A locked install (``-LockConfigDir``) does not trip the permission arms. It can still trip a
     Windows read-failure arm (ADR 0036 Amendment B), and the cure there is to fix what made the read
@@ -7054,16 +7060,27 @@ def _refuse_unsafe_config_source(message: str) -> None:
     # Local import keeps the settings <-> wiring module load order independent (no circular import).
     from messagefoundry.config.settings import (
         INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+        SECURITY_ENFORCEMENT_ENV,
         insecure_config_source_allowed,
+        insecure_config_source_escape_permitted,
     )
 
-    if insecure_config_source_allowed():
+    if insecure_config_source_escape_permitted():
         _logger.warning(
-            "%s — proceeding because %s is set (dev/test override; NEVER set this in production)",
+            "%s — proceeding because %s is set on an instance at %s=warn (dev/test override; "
+            "NEVER set this in production)",
             message,
             INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+            SECURITY_ENFORCEMENT_ENV,
         )
         return
+    if insecure_config_source_allowed():
+        raise WiringError(
+            f"{message}. {INSECURE_CONFIG_SOURCE_ESCAPE_ENV} is set but not honoured: it is refused "
+            f"under [security].enforcement = enforce, and works only with "
+            f"{SECURITY_ENFORCEMENT_ENV}=warn in the same environment. Lock the config directory "
+            "instead (docs/SERVICE.md)"
+        )
     raise WiringError(message)
 
 

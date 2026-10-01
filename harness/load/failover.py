@@ -147,6 +147,13 @@ class EngineNode:
         self._env.setdefault("MEFOR_SECURITY_ENFORCEMENT", "warn")
         self._env.setdefault("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
         self._env.setdefault("MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND", "false")
+        # A fourth, win32 only: the node serves a harness graph out of the checkout, which a Windows
+        # runner or dev tree leaves writable to BUILTIN\Users, so the engine's config-source check
+        # refuses it. The escape is honoured only beside the warn dial above (vault BACKLOG #2599).
+        # It used to reach this child by inheritance from the test session, which no longer sets it.
+        # Not set on POSIX, where a checkout passes the check and the refusal path must stay live.
+        if sys.platform == "win32":
+            self._env.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
