@@ -379,8 +379,8 @@ def weakened_tls_escape_permitted_here() -> bool:
 INSECURE_CONFIG_SOURCE_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE"
 
 
-#: The environment spelling of the ``[security].enforcement`` dial. The config-source escape reads the
-#: dial here and nowhere else; :func:`insecure_config_source_escape_permitted` says why.
+#: The documented environment spelling of the ``[security].enforcement`` dial. The config-source
+#: escape reads the dial from the environment; :func:`insecure_config_source_escape_permitted` says why.
 SECURITY_ENFORCEMENT_ENV = "MEFOR_SECURITY_ENFORCEMENT"
 
 
@@ -427,23 +427,45 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     an environment variable, so the dial that unlocks it is read from the same place, the same way in
     every one of those processes.
 
-    **It cannot be honoured on an instance that resolves to enforce.** The environment outranks the
-    settings file in :func:`load_settings`, and no command-line override sets this dial, so
-    ``MEFOR_SECURITY_ENFORCEMENT=warn`` here means the instance IS at ``warn``.
+    **Where "never under enforce" holds.** For a process whose settings come from
+    :func:`load_settings` over this same environment, which is ``serve``, ``supervise`` and every CLI
+    command. There the environment outranks the settings file and no command-line override sets this
+    dial, so the dial being ``warn`` here means the instance resolves to ``warn``.
     ``tests/test_config_source_trust.py`` pins both halves. Only the exact value settings accept
-    counts: any other spelling either fails settings validation or is not ``warn``.
+    counts. The settings loader lowercases variable names, so on POSIX two spellings of the dial can
+    coexist; every one it would read must say ``warn``, or the escape stays inert.
 
-    **The limit, stated so nobody trips on it.** ``warn`` set only in the settings FILE does not
-    unlock the escape. Mirror it into the environment beside the escape. This is the strict
-    direction, and the escape is for a dev or CI checkout, never for a deployment.
+    **Where it does not hold.** A caller that builds an engine from settings it constructed itself,
+    and never calls :func:`load_settings`, has a dial this function cannot see. The escape follows
+    the environment there, not those settings. ``harness/load/ingress_probe.py`` is such a caller,
+    on purpose.
+
+    **Two limits, stated so nobody trips on them.** ``warn`` set only in the settings FILE does not
+    unlock the escape; mirror it into the environment beside the escape. And the dial in the
+    environment is the instance's dial: a ``check`` run with both variables judges every posture gate
+    at ``warn``, not only this one. To check a config at ``enforce``, lock its directory instead. Both
+    are the strict direction, and the escape is for a dev or CI checkout, never for a deployment.
 
     Reads ``os.environ`` unless a mapping is passed. :func:`security_loosenings` asks the same
     question, so the report and the loader cannot disagree."""
     env = os.environ if environ is None else environ
-    return (
-        insecure_config_source_allowed(env)
-        and env.get(SECURITY_ENFORCEMENT_ENV) == SecurityEnforcement.WARN.value
-    )
+    return insecure_config_source_allowed(env) and _environment_dial_is_warn(env)
+
+
+def _environment_dial_is_warn(env: Mapping[str, str]) -> bool:
+    """Whether every spelling of the enforcement dial that :func:`_env_overrides` would read says
+    ``warn``, and at least one is present.
+
+    ``_env_overrides`` lowercases what follows the prefix, so ``MEFOR_SECURITY_enforcement`` is the
+    same setting as :data:`SECURITY_ENFORCEMENT_ENV`, and on a case-sensitive platform both can be
+    set. Which one wins there is iteration order. One that disagrees fails this closed."""
+    key = SECURITY_ENFORCEMENT_ENV[len(_ENV_PREFIX) :].lower()
+    spellings = [
+        value
+        for name, value in env.items()
+        if name.startswith(_ENV_PREFIX) and name[len(_ENV_PREFIX) :].lower() == key
+    ]
+    return bool(spellings) and all(value == SecurityEnforcement.WARN.value for value in spellings)
 
 
 class StoreSettings(_Section):
@@ -6848,11 +6870,12 @@ def security_loosenings(
         out.append(
             (
                 INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
-                "the config-source check is downgraded to a warning -- config Python is loaded and "
-                "run as the engine's account from a directory or module that a broad or "
-                "low-privilege principal can write, or whose access list could not be read, so "
-                "anyone who can write there runs code as that account at the next start, reload "
-                "or worker respawn",
+                "the config-source check is downgraded to a warning -- if the config directory or "
+                "a module in it is writable by a broad or low-privilege principal, or its access "
+                "list cannot be read, the engine loads and runs it as its own account anyway, so "
+                "anyone who can write there would run code as that account at the next start, "
+                "reload or worker respawn (this names the switch, not an observed writable "
+                "directory)",
             )
         )
     if not sec.local_access_only:

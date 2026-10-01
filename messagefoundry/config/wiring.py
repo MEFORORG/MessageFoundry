@@ -6529,15 +6529,16 @@ def _evaluate_config_dacl(
     membership could **not** be determined, and that is a **refusal**, not a warning-and-proceed —
     ASVS v5.0.0 V16.5.3 (fail gracefully and securely, no fail-open when validation logic errors).
     The refusal carries the documented ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape because it is
-    raised through :func:`_refuse_unsafe_config_source`.
+    raised through :func:`_refuse_unsafe_config_source`, which says where that escape is honoured.
 
     Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
     reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
     process token could not be read) **skips** the owner comparison here, because there is nothing to
     compare an owner against. This function does not refuse on it; the caller does.
     :func:`_enforce_windows_config_source` refuses an unreadable token before any path is evaluated
-    (BACKLOG #1654), so the skip is reached only when ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has
-    downgraded that refusal, and the ACE pass still runs for that load.
+    (BACKLOG #1654), so the skip is reached only when an honoured
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has downgraded that refusal, and the ACE pass still runs
+    for that load.
 
     Kept free of ctypes so the policy is unit-testable on every platform."""
     trusted = set(_WIN_TRUSTED_SIDS)
@@ -6618,10 +6619,10 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
     enumerated, and a process token that cannot be read. Each refusal goes through
     :func:`_refuse_unsafe_config_source`, so ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` downgrades it to a
-    WARNING. That is the same shape as the owner-membership arm. A check that could not finish has not
+    WARNING where that function honours it. That is the same shape as the owner-membership arm. A check that could not finish has not
     shown the code safe to execute, and ASVS v5.0.0 V16.5.3 forbids proceeding on that.
 
-    With the escape set, an unreadable token lets the load go on with the owner comparison skipped,
+    With the escape honoured, an unreadable token lets the load go on with the owner comparison skipped,
     and the ACE pass still runs. A per-path read failure skips that one path.
 
     One read failure is not a refusal: a ``*.py`` that is gone by the time it is read, confirmed by
