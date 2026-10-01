@@ -26,7 +26,7 @@ controls (firewall, segmentation, VPN/NAC) — **never directly on the public in
 clinical-interface-engine model). The trust boundary is therefore the **org's internal network + the
 host's OS accounts**. The full operator-facing posture is [DEPLOYMENT.md](DEPLOYMENT.md).
 A data-flow diagram of the trust zones is in
-[SECURITY.md](SECURITY.md#trust-boundaries-and-phi-data-flow-at-a-glance).
+[SECURITY.md](SECURITY.md#trust-boundaries-and-phi-data-flow).
 
 This is a statement about *trust*, not about the bind interface. Three planes sit at different exposure
 levels:
