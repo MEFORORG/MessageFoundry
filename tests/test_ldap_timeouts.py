@@ -37,6 +37,7 @@ PHI-free: synthetic directory names only, no real principal or network address.
 from __future__ import annotations
 
 import ast
+import functools
 from pathlib import Path
 from typing import Any
 
@@ -99,10 +100,21 @@ class _Recorder:
         self.unbinds: list[str | None] = []
 
 
-def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> _Recorder:
+#: What ``_install_fakes(refer=...)`` answers a referred operation with (BACKLOG #2530).
+REFERRAL_RESULT: dict[str, Any] = {
+    "result": 10,  # RFC 4511 resultCode referral
+    "referrals": ["ldaps://dc9.other.example:636/DC=other"],
+}
+
+
+def _install_fakes(
+    monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True, refer: str = ""
+) -> _Recorder:
     """Install recording ``ldap3`` doubles. ``bind_ok=False`` makes every EXPLICIT bind fail, which
     is how the valid-user-wrong-password branch is driven (the service-account connection is built
-    with ``auto_bind=True``, which these doubles do not honour, so it is never an explicit bind)."""
+    with ``auto_bind=True``, which these doubles do not honour, so it is never an explicit bind).
+    ``refer`` names the operation, ``"bind"`` (explicit binds) or ``"group"`` (the group search),
+    that the directory answers with a referral instead."""
     import ldap3
 
     rec = _Recorder()
@@ -116,6 +128,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> 
             rec.connections.append({"server": server, **kwargs})
             self.entries: list[_FakeEntry] = []
             self._bind_dn: str | None = kwargs.get("user")
+            self.result: dict[str, Any] | None = None  # no referral
 
         def __enter__(self) -> FakeConnection:
             return self
@@ -125,6 +138,10 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> 
 
         def search(self, **kwargs: Any) -> bool:
             base = str(kwargs.get("search_base", ""))
+            if base.startswith("OU=Groups") and refer == "group":
+                self.result = REFERRAL_RESULT
+                self.entries = []
+                return False
             if base.startswith("OU=Groups"):
                 self.entries = [
                     _FakeEntry(
@@ -149,6 +166,9 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> 
 
         def bind(self) -> bool:
             rec.binds.append(self._bind_dn)
+            if refer == "bind":
+                self.result = REFERRAL_RESULT
+                return False
             return bind_ok
 
         def unbind(self) -> None:
@@ -372,6 +392,7 @@ def test_the_equalizing_bind_is_never_aimed_at_a_principal_the_caller_named() ->
 _REQUIRED_KWARG = {"Server": "connect_timeout", "Connection": "receive_timeout"}
 
 
+@functools.cache  # one package parse per session; tests/test_ldap_referrals.py walks it too
 def _ldap3_construction_sites() -> list[tuple[str, str, int, dict[str, ast.expr]]]:
     """``(ldap3 attribute, module, line number, {keyword: value node})`` for every ldap3 ``Server`` /
     ``Connection`` construction anywhere in the ``messagefoundry`` package.

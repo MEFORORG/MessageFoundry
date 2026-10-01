@@ -1,6 +1,6 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C; amended 2026-09-28 by BACKLOG #300 — see Amendment D; amended 2026-09-30 by BACKLOG #2494 — see Amendment E)
+- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C; amended 2026-09-28 by BACKLOG #300 — see Amendment D; amended 2026-09-30 by BACKLOG #2494 — see Amendment E; amended 2026-09-30 by BACKLOG #2530 — see Amendment F)
 - **Date:** 2026-08-28
 - **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
@@ -320,3 +320,21 @@ the post-handshake check.
 The engine now builds the LDAPS context itself, and an engine subclass of `ldap3.Tls` wraps each
 connection with it, so the replica and the `ciphers=` string of Amendment C are gone. ADR 0188's
 amendment of the same date records the change, what it keeps and what it does not cover.
+
+## Amendment F (2026-09-30) -- the AD hop follows no LDAP referral (BACKLOG #2530)
+
+Every context above guards one hop: the one to `[auth].ad_server`. ldap3 2.9.1 could leave it. By
+default it follows a referral, and on a bound connection it binds to the referred host with the
+same user and password (`strategy/base.py`, `create_referral_connection`). It builds a plain
+`ldap3.Tls` for that hop from a few attributes, so the hop has no pinned CA bytes, none of the
+narrowing, and no TLS at all for an `ldap://` referral. A first deployment would therefore send the
+service-account password to whatever host one referral named.
+
+`messagefoundry/auth/ldap.py` now builds every `Connection` with `auto_referrals=False` and every
+`Server` with `allowed_referral_hosts=[]`. Each alone stops the follow, and
+`tests/test_ldap_referrals.py` measures both arms against loopback servers. A referral answer is now
+an `LdapError` that names the referred host and nothing else from the URL. Sign-in audits it as
+`auth.login_error`, and the session reconciler reads it as unavailable, so it never revokes.
+
+A site whose users or groups live in more than one domain of a forest would need a global catalog,
+or a search base in the bound controller's own domain, instead of referrals.
