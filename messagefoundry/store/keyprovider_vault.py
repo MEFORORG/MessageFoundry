@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
 )
@@ -166,12 +167,17 @@ def _build_client(addr: str | None, token: str | None) -> Any:
         mount_strict_reply_adapter,
     )
 
-    mount_strict_reply_adapter(
-        client,
-        connector=_VAULT_TRANSIT_CONNECTOR,
-        ssl_context_factory=context_factory,
-        limit=MAX_VAULT_REPLY_BYTES,
-    )
+    try:
+        mount_strict_reply_adapter(
+            client,
+            connector=_VAULT_TRANSIT_CONNECTOR,
+            ssl_context_factory=context_factory,
+            limit=MAX_VAULT_REPLY_BYTES,
+        )
+    except InsecureHopRefused as exc:
+        # Raised as this module's own fail-closed type, which every caller handles (rotate-key,
+        # DR backups, open_store), with the refusal's fixed text kept whole.
+        raise KeyProviderError(str(exc)) from exc
     return client
 
 

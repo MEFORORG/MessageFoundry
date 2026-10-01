@@ -85,6 +85,7 @@ import urllib3.connection
 import urllib3.connectionpool
 import urllib3.exceptions
 import urllib3.poolmanager
+import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
 from messagefoundry.config.tls_policy import (
@@ -480,6 +481,22 @@ _CLEARTEXT_VAULT_HOP = (
 )
 
 
+def _vault_scheme_and_host(url: str) -> tuple[str, str]:
+    """The scheme and host urllib3 would dial for ``url``, lower-cased, or two blanks.
+
+    Parsed with ``urllib3.util.parse_url``, the parser requests' ``prepare_url`` uses, and NOT
+    with ``urllib.parse``. The two disagree on at least a backslash before ``@``: ``urlsplit``
+    reads ``http://a\\@127.0.0.1`` as host ``127.0.0.1``, while urllib3 dials ``a``. A check
+    that parsed one way while the client dialled the other would pass a remote address as on-box.
+    An address that will not parse gives two blanks rather than an error, because urllib3's error
+    text quotes the address; blanks are refused like any other non-https address."""
+    try:
+        parts = urllib3.util.parse_url(url)
+    except ValueError:  # LocationParseError
+        return "", ""
+    return (parts.scheme or "").lower(), (parts.host or "").strip("[]")
+
+
 def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str) -> None:
     """Refuse a Vault hop whose token would cross the network in cleartext (BACKLOG #2317).
 
@@ -487,10 +504,11 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     ``None``. An ``https://`` address returns at once: its token rides inside TLS to Vault, with or
     without a proxy in front, and :func:`_narrowed_pool_classes` covers both legs. Anything else
     goes to the shared cleartext-hop authority, ``tls_policy.insecure_hop_disposition``, which
-    ALLOWs only an on-box hop. Here that means an ``http://`` address whose host is proven loopback
-    with no DNS (``tls_policy.is_loopback_hop_host``) AND that requests would reach with no proxy.
-    A loopback address sent through a proxy is not on the box: the proxy reads the request, token
-    and all. A host-less address is not counted as loopback, because it names no hop at all.
+    ALLOWs only an on-box hop. Here that means an ``http://`` address whose host is
+    ``tls_policy.is_loopback_hop_host`` (``localhost``, or a literal in ``127.0.0.0/8`` or ``::1``)
+    AND that requests would reach with no proxy. A loopback address sent through a proxy is not on
+    the box: the proxy reads the request, token and all. A host-less address is not counted as
+    loopback, because it names no hop at all.
 
     **So the authority reduces to "on the box, or refused".** This hop has no posture in scope:
     the providers are built from the environment and hold no ``[security]`` section (see
@@ -503,11 +521,7 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
 
     Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a ``ValueError``, with
     fixed text."""
-    try:
-        parts = urllib.parse.urlsplit(url)
-        scheme, host = parts.scheme.lower(), parts.hostname or ""
-    except ValueError:  # a malformed IPv6 literal: not provably anything, so it is refused
-        scheme, host = "", ""
+    scheme, host = _vault_scheme_and_host(url)
     if scheme == "https":
         return
     on_box = scheme == "http" and not proxy and bool(host) and is_loopback_hop_host(host)
@@ -528,7 +542,7 @@ def _refuse_an_insecure_vault_hop(
 ) -> None:
     """Refuse at construction a Vault hop that would send its token unprotected.
 
-    Asks requests which proxy it would pick for ``url``, with the same two calls
+    For an ``http://`` address, asks requests which proxy it would pick, with the same two calls
     ``Session.request`` makes: the environment and, on Windows, the Internet Settings proxy, minus
     ``NO_PROXY``, which override the session's own proxies. Then two refusals, in this order:
 
@@ -539,17 +553,23 @@ def _refuse_an_insecure_vault_hop(
       ``http://`` address and one behind an ``http://`` proxy.
 
     An ``https://`` Vault needs no check here; :func:`_narrowed_pool_classes` covers its proxy leg.
-    Both refusals raise :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`.
-
-    The proxy settings can change after this runs, so the adapter checks again before each send.
-    A ``url`` that is not a string is left to that check."""
-    if not isinstance(url, str) or _scheme_of(url) == "https":
+    Both refusals raise :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`. A ``url``
+    that is not a string is refused rather than skipped: a check that cannot read its input fails
+    closed. The proxy settings can change after this runs, so the adapter checks again before each
+    send."""
+    address = url if isinstance(url, str) else ""
+    scheme, host = _vault_scheme_and_host(address)
+    if scheme == "https":
         return
-    settings = session.merge_environment_settings(url, {}, None, None, None)
-    proxy = requests.utils.select_proxy(url, settings["proxies"])
-    if proxy and _scheme_of(proxy) == "https":
-        raise InsecureHopRefused(_unverifiable_proxy_leg(connector))
-    _refuse_a_cleartext_vault_hop(url, proxy, connector=connector)
+    proxy = None
+    # Only an http:// address with a host could be on the box, so only it needs the proxy lookup.
+    # Anything else is refused whatever the proxy, and never reaches a parser that echoes it.
+    if scheme == "http" and host:
+        settings = session.merge_environment_settings(address, {}, None, None, None)
+        proxy = requests.utils.select_proxy(address, settings["proxies"])
+        if proxy and _scheme_of(proxy) == "https":
+            raise InsecureHopRefused(_unverifiable_proxy_leg(connector))
+    _refuse_a_cleartext_vault_hop(address, proxy, connector=connector)
 
 
 def mount_strict_reply_adapter(
@@ -577,7 +597,7 @@ def mount_strict_reply_adapter(
     :class:`ValueError`, when the Vault address is not ``https://``, unless it is loopback and
     reached with no proxy (BACKLOG #2317), and when requests would send an ``http://`` Vault
     address through an ``https://`` proxy, whose TLS leg requests would not verify (BACKLOG #300).
-    All three Vault clients call this, so it is the one place each of them is checked.
+    At least the three Vault clients the engine builds today call this; a new one must too.
     """
     session = getattr(getattr(client, "adapter", None), "session", None)
     if not isinstance(session, requests.Session):

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
 )
@@ -135,13 +136,18 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # BACKLOG #2053 (ASVS 4.2.1): read every KV reply through bounded_read rather than urllib3's
     # lenient body reader. Mounted AFTER construction, so the arguments asserted above are still
     # the ones the hop uses. The adapter also gives every connection a context from the factory
-    # (BACKLOG #300). Imported lazily: requests is on the [vault] extra, like hvac. It also refuses
-    # an address that would send the token in cleartext (BACKLOG #2317), so it runs before any I/O.
+    # (BACKLOG #300). Imported lazily: requests is on the [vault] extra, like hvac.
     from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
 
-    mount_strict_reply_adapter(
-        client, connector=_VAULT_KV_CONNECTOR, ssl_context_factory=context_factory
-    )
+    try:
+        mount_strict_reply_adapter(
+            client, connector=_VAULT_KV_CONNECTOR, ssl_context_factory=context_factory
+        )
+    except InsecureHopRefused as exc:
+        # BACKLOG #2317: the mount refuses an address that would send the token in cleartext,
+        # before any I/O. Raised as this provider's own fail-closed type, which every caller
+        # handles, with the refusal's fixed text kept whole.
+        raise SecretProviderError(str(exc)) from exc
     return client
 
 

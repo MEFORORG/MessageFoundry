@@ -411,13 +411,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   network in cleartext, directly or through an `http://` proxy. Each now refuses such an address
   when its client is built, and again before each send in case a proxy appeared since. That
   includes an address from hvac's own `VAULT_ADDR` fallback. The one `http://` address allowed is
-  a loopback Vault (`127.0.0.0/8`, `::1` or `localhost`) reached with no proxy, the shared
-  cleartext-hop rule's on-box case; hvac's built-in default, `http://localhost:8200`, is one. The
-  refusal is an `InsecureHopRefused` with fixed text that names no part of the address.
+  a loopback Vault (`localhost`, or a literal in `127.0.0.0/8` or `::1`) reached with no proxy,
+  the shared cleartext-hop rule's on-box case; hvac's built-in default, `http://localhost:8200`, is one. At
+  build, each client raises its provider's own fail-closed error (`SecretProviderError` or
+  `KeyProviderError`), caused by an `InsecureHopRefused` whose fixed text names no part of the
+  address. The `https://`-proxy refusal above now reaches callers the same way at build; it was a
+  bare `ValueError`. Before a send, the refusal is the `InsecureHopRefused` itself.
   `[security].enforcement` does not relax it, since this hop has no posture in scope and no way to
   declare an accepted risk. An `https://` Vault behind an `http://` proxy is unchanged: the token
-  rides inside the TLS tunnel. The `https://`-proxy refusal above now raises the same type.
-  (`BACKLOG #2317`, ASVS 12.3.1)
+  rides inside the TLS tunnel. (`BACKLOG #2317`, ASVS 12.3.1)
 - **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
   `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
   site proxy would have taken the loopback probe off the host and read a running engine as down.

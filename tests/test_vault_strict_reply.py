@@ -427,8 +427,9 @@ def test_a_bare_cr_head_is_refused_through_an_http_proxy(monkeypatch: pytest.Mon
     is sent to the proxy, which answers it.
 
     Since BACKLOG #2317 the adapter refuses that request before sending, because the token would
-    cross to the proxy in cleartext (the next test). So this one turns that refusal off, to keep
-    measuring the head check on the proxy's pools as a second layer under it."""
+    cross to the proxy in cleartext; tests/test_vault_cleartext_hop.py measures that refusal. So
+    this test turns it off, to keep measuring the head check on the proxy's pools as a second
+    layer under it. Shipped code no longer reaches this path; the layer is defence in depth."""
     from messagefoundry.transports import strict_requests
 
     monkeypatch.setattr(strict_requests, "_refuse_a_cleartext_vault_hop", lambda *a, **k: None)
