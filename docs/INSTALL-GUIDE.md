@@ -81,26 +81,28 @@ MessageFoundry ships **one signed wheel to many PHI-bearing instances**, so veri
 provenance *before* installing it — pinning a version (or a hash) proves you got a *fixed* file, not that
 it's the one MessageFoundry built. Every release carries **SLSA build provenance** (binding the wheel's
 SHA-256 → the source commit → the GitHub Actions builder) and a **Sigstore signature**. Check both with
-the **GitHub CLI** (`gh` ≥ 2.49), and optionally `sigstore` (`pip install sigstore`); install **only** the
+the **GitHub CLI** (`gh` ≥ 2.68), and optionally `sigstore` (`pip install sigstore`); install **only** the
 file that passes.
 
 ```powershell
-$V = "0.4.0"   # the exact version you intend to install
+$V = "0.4.0"   # the exact version you intend to install, as its wheel spells it
+# Its release tag. A pre-release wheel says 0.5.0rc1, while its tag says v0.5.0-rc1.
+$Tag = "v" + ($V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2')
 
 # Download the wheel + its Sigstore bundle from that release's assets
-gh release download "v$V" --repo MEFORORG/MessageFoundry `
+gh release download $Tag --repo MEFORORG/MessageFoundry `
   --pattern "messagefoundry-$V-*.whl" --pattern "messagefoundry-$V-*.whl.sigstore*"
 if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit $LASTEXITCODE)" }
 
 # Verify SLSA build provenance:  artifact -> source commit -> builder workflow
 gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry `
   --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml `
-  --source-ref "refs/tags/v$V"
+  --source-ref "refs/tags/$Tag"
 if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # (defense in depth) Verify the Sigstore signature pins the release workflow identity
 python -m sigstore verify identity "messagefoundry-$V-py3-none-any.whl" `
-  --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v$V" `
+  --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/$Tag" `
   --cert-oidc-issuer "https://token.actions.githubusercontent.com"
 if ($LASTEXITCODE -ne 0) { throw "sigstore identity verification FAILED (exit $LASTEXITCODE) — do not install this file" }
 
@@ -117,10 +119,9 @@ if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 
 > **Keep `--signer-workflow` and `--source-ref`.** With `--repo` alone, `gh attestation verify`
 > accepts an attestation from any workflow in the repository, on any ref
-> ([SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) says more). Both blocks fit a final release, where the tag and
-> the wheel spell the version the same way. A pre-release tag is `v0.5.0-rc1`, while its wheel says
-> `0.5.0rc1`. For a pre-release, write the tag's spelling in `gh release download`, `--source-ref`
-> and `--cert-identity`, and the wheel's spelling in the file names.
+> ([SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) says more). `--source-ref` needs `gh` 2.68 or later. Set `$V`
+> as the wheel spells the version. Each block works out `$Tag`, the tag's spelling, from it: a
+> pre-release wheel says `0.5.0rc1`, while its tag says `v0.5.0-rc1`.
 
 The same attestation also covers the **public PyPI** copy of the wheel (it is byte-identical to the
 GitHub-built artifact, so the digest matches), so you can download-verify-then-install from the index.
@@ -130,6 +131,8 @@ different file than the one you just checked:
 
 ```powershell
 $V = "0.4.0"
+# Its release tag. A pre-release wheel says 0.5.0rc1, while its tag says v0.5.0-rc1.
+$Tag = "v" + ($V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2')
 pip download "messagefoundry==$V" --no-deps -d .\verify
 if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit $LASTEXITCODE)" }
 
@@ -146,7 +149,7 @@ $wheel = $wheels[0].FullName
 
 gh attestation verify $wheel --repo MEFORORG/MessageFoundry `
   --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml `
-  --source-ref "refs/tags/v$V"
+  --source-ref "refs/tags/$Tag"
 if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # Install the EXACT file you just verified, not a re-resolution of the package name via --find-links
@@ -157,8 +160,8 @@ if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 A registry/mirror substitution or a relabelled file **fails** the check. For a fully pinned deploy, pair
 this with `pip install --require-hashes -r requirements.lock` (the identity check above is the part
 `--require-hashes` cannot give you — it proves bytes-match-lockfile, not who built them). The
-`-rc`-tagged pre-releases publish to production PyPI too; the `--cert-identity` ref above must match the
-tag you are installing (e.g. `refs/tags/v0.1.0-rc1`).
+`-rc`-tagged pre-releases publish to production PyPI too; the `--source-ref` and `--cert-identity`
+refs above must match the tag you are installing (e.g. `refs/tags/v0.5.0-rc1`), which `$Tag` gives.
 
 ---
 

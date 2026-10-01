@@ -891,7 +891,8 @@ jobs:
       #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry \
       #     --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml \
       #     --source-ref refs/tags/v<version>
-      # Keep the last two flags, and write <version> in the tag's spelling (v0.5.0-rc1, not 0.5.0rc1).
+      # Keep the last two flags, and write <version> in the tag's spelling: 0.5.0-rc1, not the
+      # wheel's 0.5.0rc1, so the ref reads refs/tags/v0.5.0-rc1.
       #
       # THE GUARD HAS TWO PARTS, AND EACH ANSWERS A DIFFERENT QUESTION.
       #

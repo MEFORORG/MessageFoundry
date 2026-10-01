@@ -291,3 +291,63 @@ def test_block_two_refuses_to_guess_which_file_to_verify(tmp_path: Path, count: 
     assert not _pip_installs(invocations), (
         f"pip install ran despite {count} matching file(s). Invocations: {invocations}"
     )
+
+
+# -- BACKLOG #2534: each block names the release tag, in the tag's spelling, as the verified ref
+
+
+@pytest.mark.parametrize(
+    ("version", "tag"),
+    [
+        ("0.4.0", "v0.4.0"),
+        ("0.5.0rc1", "v0.5.0-rc1"),
+        ("0.5.0a2", "v0.5.0-a2"),
+        ("1.0.0b1", "v1.0.0-b1"),
+    ],
+)
+def test_each_block_turns_the_wheel_version_into_the_release_tag(
+    tmp_path: Path, version: str, tag: str
+) -> None:
+    """Run each block's own ``$Tag`` line for a final and three pre-releases.
+
+    The release refuses any tag not spelled ``vX.Y.Z`` or ``vX.Y.Z-(a|b|rc)N``
+    (scripts/release/tag_spelling.py), so this one rule names every real tag.
+    """
+    blocks = _powershell_blocks()
+    lines = [line for block in blocks for line in block.splitlines() if line.startswith("$Tag = ")]
+    assert len(lines) == len(blocks) == 2, f"expected one $Tag line per block, found {lines}"
+    for i, line in enumerate(lines):
+        script = tmp_path / f"tag{i}.ps1"
+        script.write_text(f'$V = "{version}"\n{line}\nWrite-Output $Tag\n', encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == tag, f"block {i + 1}: {version} gave {proc.stdout.strip()!r}"
+
+
+def test_each_block_verifies_against_the_release_workflow_and_tag(tmp_path: Path) -> None:
+    """The verify call each block makes carries both flags, with the tag the release cut."""
+    blocks = _powershell_blocks()
+    assert len(blocks) == 2
+    for i, block in enumerate(blocks):
+        workdir = tmp_path / f"block{i}"
+        workdir.mkdir()
+        proc, invocations = _run_block(block, workdir, {"FAKE_PIP_DOWNLOAD_COUNT": "1"})
+        assert proc.returncode == 0, f"block {i + 1}:\n{proc.stdout}\n{proc.stderr}"
+        verifies = [
+            args
+            for cmd, args in invocations
+            if cmd == "gh" and args[:2] == ["attestation", "verify"]
+        ]
+        assert len(verifies) == 1, f"block {i + 1}: {invocations}"
+        args = verifies[0]
+        assert args[args.index("--signer-workflow") + 1] == (
+            "MEFORORG/MessageFoundry/.github/workflows/release.yml"
+        ), args
+        version = re.search(r'^\$V = "([^"]+)"', block, re.MULTILINE)
+        assert version is not None
+        assert args[args.index("--source-ref") + 1] == f"refs/tags/v{version[1]}", args
